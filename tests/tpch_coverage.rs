@@ -422,7 +422,7 @@ ORDER BY supplier_cnt DESC, p_brand, p_type, p_size
         },
         TpchQuery {
             name: "q17_small_quantity_order_revenue",
-            expected_status: "unsupported-sql:expected literal, got (SELECT 0.2 * avg(l_quantity) FROM lineitem WHERE l_partkey = p_partkey)",
+            expected_status: "needs-data:lineitem",
             sql: r#"
 SELECT
     sum(l_extendedprice) / 7.0 AS avg_yearly

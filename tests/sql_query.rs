@@ -1418,6 +1418,31 @@ async fn executes_join_aggregate_output_expression_sql() {
 }
 
 #[tokio::test]
+async fn filters_join_with_correlated_scalar_aggregate_subquery_sql() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let lineitem_path = tempdir.path().join("lineitem.parquet");
+    let part_path = tempdir.path().join("part.parquet");
+    write_q17_lineitem_parquet(&lineitem_path);
+    write_q17_part_parquet(&part_path);
+
+    let sql = format!(
+        "SELECT sum(l_extendedprice) / 7.0 AS avg_yearly FROM '{}' AS lineitem, '{}' AS part WHERE p_partkey = l_partkey AND p_brand = 'Brand#23' AND p_container = 'MED BOX' AND l_quantity < (SELECT 0.2 * avg(l_quantity) FROM '{}' WHERE l_partkey = p_partkey)",
+        lineitem_path.display(),
+        part_path.display(),
+        lineitem_path.display()
+    );
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute correlated scalar aggregate join filter sql");
+
+    let QueryOutput::Aggregate { batches, .. } = output else {
+        panic!("expected aggregate output");
+    };
+    assert_eq!(batches[0].schema().field(0).name(), "avg_yearly");
+    assert_eq!(f64s_from_column(&batches, 0), vec![10.0]);
+}
+
+#[tokio::test]
 async fn executes_three_table_comma_join_aggregate_sql() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let customer_path = tempdir.path().join("customer.parquet");
@@ -2953,6 +2978,48 @@ fn write_q14_part_parquet(path: &std::path::Path) {
     let types = StringArray::from_iter_values(["PROMO ANODIZED STEEL", "STANDARD BRASS"]);
     let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(partkeys), Arc::new(types)])
         .expect("record batch");
+
+    let file = File::create(path).expect("create parquet file");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+}
+
+fn write_q17_lineitem_parquet(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("l_partkey", DataType::Int32, false),
+        Field::new("l_quantity", DataType::Int64, false),
+        Field::new("l_extendedprice", DataType::Int64, false),
+    ]));
+    let partkeys = Int32Array::from_iter_values([1, 1, 1, 2]);
+    let quantities = Int64Array::from_iter_values([1, 10, 20, 50]);
+    let prices = Int64Array::from_iter_values([70, 100, 200, 300]);
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(partkeys), Arc::new(quantities), Arc::new(prices)],
+    )
+    .expect("record batch");
+
+    let file = File::create(path).expect("create parquet file");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+}
+
+fn write_q17_part_parquet(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("p_partkey", DataType::Int32, false),
+        Field::new("p_brand", DataType::Utf8, false),
+        Field::new("p_container", DataType::Utf8, false),
+    ]));
+    let partkeys = Int32Array::from_iter_values([1, 2]);
+    let brands = StringArray::from_iter_values(["Brand#23", "Brand#23"]);
+    let containers = StringArray::from_iter_values(["MED BOX", "MED BOX"]);
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(partkeys), Arc::new(brands), Arc::new(containers)],
+    )
+    .expect("record batch");
 
     let file = File::create(path).expect("create parquet file");
     let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
