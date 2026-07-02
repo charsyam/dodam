@@ -105,6 +105,33 @@ async fn executes_aggregate_with_expression_filter_sql() {
 }
 
 #[tokio::test]
+async fn executes_aggregate_with_correlated_exists_filter_sql() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let orders_path = tempdir.path().join("orders.parquet");
+    let lineitem_path = tempdir.path().join("lineitem.parquet");
+    write_q4_orders_parquet(&orders_path);
+    write_q4_lineitem_parquet(&lineitem_path);
+
+    let sql = format!(
+        "SELECT o_orderpriority, count(*) AS order_count FROM '{}' WHERE EXISTS (SELECT * FROM '{}' WHERE l_orderkey = o_orderkey AND l_commitdate < l_receiptdate) GROUP BY o_orderpriority ORDER BY o_orderpriority",
+        orders_path.display(),
+        lineitem_path.display()
+    );
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute aggregate with correlated exists filter sql");
+
+    let QueryOutput::Aggregate { batches, .. } = output else {
+        panic!("expected aggregate output");
+    };
+    assert_eq!(
+        strings_from_column(&batches, 0),
+        vec!["1-URGENT".to_string(), "3-MEDIUM".to_string()]
+    );
+    assert_eq!(u64s_from_column(&batches, 1), vec![1, 1]);
+}
+
+#[tokio::test]
 async fn executes_distinct_over_derived_table_sql() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let path = tempdir.path().join("part-000.parquet");
@@ -2732,6 +2759,50 @@ fn write_q13_orders_parquet(path: &std::path::Path) {
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(orderkeys), Arc::new(custkeys), Arc::new(comments)],
+    )
+    .expect("record batch");
+
+    let file = File::create(path).expect("create parquet file");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+}
+
+fn write_q4_orders_parquet(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("o_orderkey", DataType::Int32, false),
+        Field::new("o_orderpriority", DataType::Utf8, false),
+    ]));
+    let orderkeys = Int32Array::from_iter_values([1, 2, 3]);
+    let priorities = StringArray::from_iter_values(["1-URGENT", "3-MEDIUM", "3-MEDIUM"]);
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(orderkeys), Arc::new(priorities)],
+    )
+    .expect("record batch");
+
+    let file = File::create(path).expect("create parquet file");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+}
+
+fn write_q4_lineitem_parquet(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("l_orderkey", DataType::Int32, false),
+        Field::new("l_commitdate", DataType::Int32, false),
+        Field::new("l_receiptdate", DataType::Int32, false),
+    ]));
+    let orderkeys = Int32Array::from_iter_values([1, 2, 3]);
+    let commitdates = Int32Array::from_iter_values([10, 20, 30]);
+    let receiptdates = Int32Array::from_iter_values([11, 21, 29]);
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(orderkeys),
+            Arc::new(commitdates),
+            Arc::new(receiptdates),
+        ],
     )
     .expect("record batch");
 

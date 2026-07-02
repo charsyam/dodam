@@ -183,6 +183,11 @@
   - supports scalar expression projection over materialized derived-table rows
   - expression and subquery predicates can be split across top-level `AND` conjuncts so each side uses the appropriate evaluator
   - TPC-H inventory now advances Q22 to `needs-data:customer`
+- Added aggregate support to the row-bound correlated subquery fallback:
+  - supports grouped aggregate outer queries filtered by correlated `EXISTS` / `NOT EXISTS`
+  - binds both explicit alias references and TPC-H-style unqualified outer columns such as `o_orderkey`
+  - added SQL coverage for a Q4-shaped grouped aggregate with correlated `EXISTS`
+  - TPC-H inventory now advances Q4 to `needs-data:orders`
 - The TPC-H-lite suite caught missing `Date32` `min`/`max` aggregate support; added `Date32` aggregate state and `Date32Array` result materialization.
 - The TPC-H-lite join aggregate case caught an aggregate join output projection correctness issue around qualified column names when the cost model chooses the left side as the hash build input.
 - Fixed build-side-aware join output projection mapping for hash/materialized join output schemas and restored aggregate join output projection pushdown.

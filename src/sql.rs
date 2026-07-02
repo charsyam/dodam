@@ -435,26 +435,34 @@ async fn try_execute_correlated_subquery_filter_sql(
     reject_query_features(query)?;
     reject_select_features(select)?;
     let path = parse_from(select)?;
-    let Some(outer_alias) = path.alias.as_deref() else {
-        return Ok(None);
-    };
     let selection_sql = selection.to_string();
-    if !subquery_references_outer_alias(&selection_sql, outer_alias) {
+    if let Some(outer_alias) = path.alias.as_deref()
+        && !subquery_references_outer_alias(&selection_sql, outer_alias)
+    {
         return Ok(None);
+    }
+    if path.alias.is_none() {
+        let inferred_alias = table_ref_alias_or_name(&path);
+        let Some(prefix) = inferred_alias.chars().next() else {
+            return Ok(None);
+        };
+        if !selection_sql.contains(&format!("{prefix}_")) {
+            return Ok(None);
+        }
     }
 
     let group_by = parse_group_by(select, path.alias.as_deref())?;
     let parsed_projection = parse_projection(select, &group_by, path.alias.as_deref())?;
-    if parse_distinct(select)?
-        || !parsed_projection.aggregates.is_empty()
-        || !group_by.is_empty()
-        || select.having.is_some()
-    {
+    if parse_distinct(select)? {
         return Err(DodamError::UnsupportedSql(
-            "correlated subquery filters currently support only non-aggregate SELECT queries"
-                .to_string(),
+            "correlated subquery filters with DISTINCT are not supported yet".to_string(),
         ));
     }
+    let having = select
+        .having
+        .as_ref()
+        .map(|expr| parse_filter(expr, &parsed_projection.aliases, None, true))
+        .transpose()?;
     let order_by = parse_order_by(query, &parsed_projection.aliases, path.alias.as_deref())?;
     let limit = parse_limit(query)?;
 
@@ -467,7 +475,7 @@ async fn try_execute_correlated_subquery_filter_sql(
         let mask = evaluate_correlated_subquery_filter_mask(
             engine,
             &selection_sql,
-            outer_alias,
+            path.alias.as_deref(),
             &batch,
             path.alias.as_deref(),
             batch_size,
@@ -479,6 +487,21 @@ async fn try_execute_correlated_subquery_filter_sql(
         }
     }
 
+    if !parsed_projection.aggregates.is_empty() {
+        let stream = Box::new(MemoryExec::new(filtered)).execute()?;
+        let metrics = if group_by.is_empty() {
+            collect_aggregates(stream, 1, &parsed_projection.aggregates)?
+        } else {
+            collect_grouped_aggregates(stream, 1, &group_by, &parsed_projection.aggregates)?
+        };
+        let mut batches =
+            aggregate_metrics_to_batches(&metrics, &group_by, &parsed_projection.aggregates)?;
+        batches = apply_output_filter(batches, having.as_ref())?;
+        batches = apply_output_order_limit(batches, order_by.as_ref(), limit)?;
+        batches = rename_output_batches(batches, &parsed_projection.aliases)?;
+        return Ok(Some(QueryOutput::Aggregate { metrics, batches }));
+    }
+
     let mut batches = apply_output_order_limit(filtered, order_by.as_ref(), limit)?;
     batches = apply_output_projection(batches, &parsed_projection.projection)?;
     batches = rename_output_batches(batches, &parsed_projection.aliases)?;
@@ -488,7 +511,7 @@ async fn try_execute_correlated_subquery_filter_sql(
 async fn evaluate_correlated_subquery_filter_mask(
     engine: &DodamEngine,
     selection_sql: &str,
-    outer_alias: &str,
+    outer_alias: Option<&str>,
     batch: &RecordBatch,
     table_alias: Option<&str>,
     batch_size: usize,
@@ -621,7 +644,7 @@ async fn evaluate_correlated_exists_mask(
 ) -> Result<BooleanArray> {
     let mut values = Vec::with_capacity(batch.num_rows());
     for row in 0..batch.num_rows() {
-        let bound_sql = bind_outer_row_references(subquery_sql, outer_alias, batch, row)?;
+        let bound_sql = bind_outer_row_references(subquery_sql, Some(outer_alias), batch, row)?;
         let output = Box::pin(execute_sql(engine, &bound_sql, batch_size)).await?;
         let exists = query_output_batches(output)?
             .iter()
@@ -633,7 +656,7 @@ async fn evaluate_correlated_exists_mask(
 
 fn bind_outer_row_references(
     subquery_sql: &str,
-    outer_alias: &str,
+    outer_alias: Option<&str>,
     batch: &RecordBatch,
     row: usize,
 ) -> Result<String> {
@@ -644,12 +667,54 @@ fn bind_outer_row_references(
         } else {
             literal_value_from_array(batch.column(column_index), row)?
         };
-        sql = sql.replace(
-            &format!("{outer_alias}.{}", field.name()),
-            &sql_literal(&literal),
-        );
+        let literal = sql_literal(&literal);
+        if let Some(outer_alias) = outer_alias {
+            sql = sql.replace(&format!("{outer_alias}.{}", field.name()), &literal);
+        } else {
+            sql = replace_identifier_tokens(&sql, field.name(), &literal);
+        }
     }
     Ok(sql)
+}
+
+fn replace_identifier_tokens(input: &str, identifier: &str, replacement: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut index = 0;
+    let mut in_single_quote = false;
+    while index < input.len() {
+        let rest = &input[index..];
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        if ch == '\'' {
+            output.push(ch);
+            index += ch.len_utf8();
+            in_single_quote = !in_single_quote;
+            continue;
+        }
+        if !in_single_quote
+            && rest.starts_with(identifier)
+            && input[..index]
+                .chars()
+                .next_back()
+                .is_none_or(|ch| !is_sql_identifier_char(ch))
+            && input[index + identifier.len()..]
+                .chars()
+                .next()
+                .is_none_or(|ch| !is_sql_identifier_char(ch))
+        {
+            output.push_str(replacement);
+            index += identifier.len();
+            continue;
+        }
+        output.push(ch);
+        index += ch.len_utf8();
+    }
+    output
+}
+
+fn is_sql_identifier_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
 }
 
 fn sql_literal(value: &LiteralValue) -> String {
