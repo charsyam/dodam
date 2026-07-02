@@ -1620,6 +1620,47 @@ async fn filters_multi_comma_join_with_aggregate_expression_having_subquery_sql(
 }
 
 #[tokio::test]
+async fn executes_q22_style_derived_scalar_and_exists_subqueries_sql() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let customer_path = tempdir.path().join("customer.parquet");
+    let orders_path = tempdir.path().join("orders.parquet");
+    write_q22_customer_parquet(&customer_path);
+    write_q22_orders_parquet(&orders_path);
+
+    let sql = format!(
+        "SELECT cntrycode, count(*) AS numcust, sum(c_acctbal) AS totacctbal FROM (
+            SELECT substring(c_phone FROM 1 FOR 2) AS cntrycode, c_acctbal
+            FROM '{}'
+            WHERE substring(c_phone FROM 1 FOR 2) IN ('13', '23', '31')
+              AND c_acctbal > (
+                  SELECT avg(c_acctbal)
+                  FROM '{}'
+                  WHERE c_acctbal > 0.00
+                    AND substring(c_phone FROM 1 FOR 2) IN ('13', '23', '31')
+              )
+              AND NOT EXISTS (
+                  SELECT *
+                  FROM '{}'
+                  WHERE o_custkey = c_custkey
+              )
+        ) AS custsale GROUP BY cntrycode ORDER BY cntrycode",
+        customer_path.display(),
+        customer_path.display(),
+        orders_path.display()
+    );
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute Q22-style sql");
+
+    let QueryOutput::Aggregate { batches, .. } = output else {
+        panic!("expected aggregate output");
+    };
+    assert_eq!(strings_from_column(&batches, 0), vec!["23".to_string()]);
+    assert_eq!(u64s_from_column(&batches, 1), vec![1]);
+    assert_eq!(f64s_from_column(&batches, 2), vec![300.0]);
+}
+
+#[tokio::test]
 async fn executes_tpch_q13_style_join_aggregate_without_explicit_aliases() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let customer_path = tempdir.path().join("customer.parquet");
@@ -3291,6 +3332,49 @@ fn write_partitioned_full_right_parquet(path: &std::path::Path) {
         .set_max_row_group_row_count(Some(128))
         .build();
     let mut writer = ArrowWriter::try_new(file, schema, Some(props)).expect("parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+}
+
+fn write_q22_customer_parquet(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("c_custkey", DataType::Int64, false),
+        Field::new("c_phone", DataType::Utf8, false),
+        Field::new("c_acctbal", DataType::Float64, false),
+    ]));
+    let custkeys = Int64Array::from_iter_values([1, 2, 3, 4, 5]);
+    let phones = StringArray::from_iter_values([
+        "13-111-111-1111",
+        "23-222-222-2222",
+        "23-333-333-3333",
+        "31-444-444-4444",
+        "31-555-555-5555",
+    ]);
+    let acctbal = Float64Array::from_iter_values([100.0, 200.0, 300.0, -50.0, 400.0]);
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(custkeys), Arc::new(phones), Arc::new(acctbal)],
+    )
+    .expect("record batch");
+
+    let file = File::create(path).expect("create parquet file");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+}
+
+fn write_q22_orders_parquet(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "o_custkey",
+        DataType::Int64,
+        false,
+    )]));
+    let custkeys = Int64Array::from_iter_values([5]);
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(custkeys)]).expect("record batch");
+
+    let file = File::create(path).expect("create parquet file");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
     writer.write(&batch).expect("write parquet batch");
     writer.close().expect("close parquet writer");
 }

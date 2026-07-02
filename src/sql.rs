@@ -597,8 +597,16 @@ async fn try_execute_correlated_exists_semijoin_sql(
     }
 
     let mut batches = apply_output_order_limit(filtered, order_by.as_ref(), limit)?;
-    batches = apply_output_projection(batches, &parsed_projection.projection)?;
-    batches = rename_output_batches(batches, &parsed_projection.aliases)?;
+    let projection_requires_expression =
+        projection_requires_expression_path(&parsed_projection.expressions);
+    batches = if projection_requires_expression {
+        apply_output_expression_projection(batches, &parsed_projection.expressions)?
+    } else {
+        apply_output_projection(batches, &parsed_projection.projection)?
+    };
+    if !projection_requires_expression {
+        batches = rename_output_batches(batches, &parsed_projection.aliases)?;
+    }
     Ok(Some(QueryOutput::Scan { batches }))
 }
 
@@ -846,8 +854,16 @@ async fn try_execute_correlated_subquery_filter_sql(
     }
 
     let mut batches = apply_output_order_limit(filtered, order_by.as_ref(), limit)?;
-    batches = apply_output_projection(batches, &parsed_projection.projection)?;
-    batches = rename_output_batches(batches, &parsed_projection.aliases)?;
+    let projection_requires_expression =
+        projection_requires_expression_path(&parsed_projection.expressions);
+    batches = if projection_requires_expression {
+        apply_output_expression_projection(batches, &parsed_projection.expressions)?
+    } else {
+        apply_output_projection(batches, &parsed_projection.projection)?
+    };
+    if !projection_requires_expression {
+        batches = rename_output_batches(batches, &parsed_projection.aliases)?;
+    }
     Ok(Some(QueryOutput::Scan { batches }))
 }
 
@@ -859,28 +875,202 @@ async fn evaluate_correlated_subquery_filter_mask(
     table_alias: Option<&str>,
     batch_size: usize,
 ) -> Result<BooleanArray> {
+    let selection_expr = parse_sql_expr_fragment(selection_sql)?;
+    let selection_expr = Box::pin(rewrite_uncorrelated_scalar_subqueries_to_literals(
+        engine,
+        selection_expr,
+        batch_size,
+    ))
+    .await?;
+    let selection_sql = selection_expr.to_string();
     let mut values = Vec::with_capacity(batch.num_rows());
     for row in 0..batch.num_rows() {
-        let bound_sql = bind_outer_row_references(selection_sql, outer_alias, batch, row)?;
+        let bound_sql = bind_outer_row_references(&selection_sql, outer_alias, batch, row)?;
         let bound_expr = parse_sql_expr_fragment(&bound_sql)?;
         let row_batch = batch.slice(row, 1);
-        let expr = Box::pin(parse_filter_with_subqueries(
+        let matches = evaluate_bound_correlated_filter(
             engine,
             &bound_expr,
+            &row_batch,
+            table_alias,
+            batch_size,
+        )
+        .await?;
+        values.push(Some(matches));
+    }
+    Ok(BooleanArray::from(values))
+}
+
+async fn rewrite_uncorrelated_scalar_subqueries_to_literals(
+    engine: &DodamEngine,
+    expr: SqlExpr,
+    batch_size: usize,
+) -> Result<SqlExpr> {
+    match expr {
+        SqlExpr::Subquery(subquery) => {
+            match Box::pin(execute_sql(engine, &subquery.to_string(), batch_size)).await {
+                Ok(output) => scalar_literal_value_from_batches(query_output_batches(output)?)
+                    .map(literal_value_to_sql_expr),
+                Err(DodamError::UnsupportedSql(_)) | Err(DodamError::UnknownColumn(_)) => {
+                    Ok(SqlExpr::Subquery(subquery))
+                }
+                Err(error) => Err(error),
+            }
+        }
+        SqlExpr::BinaryOp { left, op, right } => Ok(SqlExpr::BinaryOp {
+            left: Box::new(
+                Box::pin(rewrite_uncorrelated_scalar_subqueries_to_literals(
+                    engine, *left, batch_size,
+                ))
+                .await?,
+            ),
+            op,
+            right: Box::new(
+                Box::pin(rewrite_uncorrelated_scalar_subqueries_to_literals(
+                    engine, *right, batch_size,
+                ))
+                .await?,
+            ),
+        }),
+        SqlExpr::Nested(expr) => Ok(SqlExpr::Nested(Box::new(
+            Box::pin(rewrite_uncorrelated_scalar_subqueries_to_literals(
+                engine, *expr, batch_size,
+            ))
+            .await?,
+        ))),
+        SqlExpr::UnaryOp { op, expr } => Ok(SqlExpr::UnaryOp {
+            op,
+            expr: Box::new(
+                Box::pin(rewrite_uncorrelated_scalar_subqueries_to_literals(
+                    engine, *expr, batch_size,
+                ))
+                .await?,
+            ),
+        }),
+        SqlExpr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let expr = Box::new(
+                Box::pin(rewrite_uncorrelated_scalar_subqueries_to_literals(
+                    engine, *expr, batch_size,
+                ))
+                .await?,
+            );
+            let mut rewritten = Vec::with_capacity(list.len());
+            for item in list {
+                rewritten.push(
+                    Box::pin(rewrite_uncorrelated_scalar_subqueries_to_literals(
+                        engine, item, batch_size,
+                    ))
+                    .await?,
+                );
+            }
+            Ok(SqlExpr::InList {
+                expr,
+                list: rewritten,
+                negated,
+            })
+        }
+        SqlExpr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => Ok(SqlExpr::Between {
+            expr: Box::new(
+                Box::pin(rewrite_uncorrelated_scalar_subqueries_to_literals(
+                    engine, *expr, batch_size,
+                ))
+                .await?,
+            ),
+            negated,
+            low: Box::new(
+                Box::pin(rewrite_uncorrelated_scalar_subqueries_to_literals(
+                    engine, *low, batch_size,
+                ))
+                .await?,
+            ),
+            high: Box::new(
+                Box::pin(rewrite_uncorrelated_scalar_subqueries_to_literals(
+                    engine, *high, batch_size,
+                ))
+                .await?,
+            ),
+        }),
+        SqlExpr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            special,
+            shorthand,
+        } => Ok(SqlExpr::Substring {
+            expr: Box::new(
+                Box::pin(rewrite_uncorrelated_scalar_subqueries_to_literals(
+                    engine, *expr, batch_size,
+                ))
+                .await?,
+            ),
+            substring_from: match substring_from {
+                Some(expr) => Some(Box::new(
+                    Box::pin(rewrite_uncorrelated_scalar_subqueries_to_literals(
+                        engine, *expr, batch_size,
+                    ))
+                    .await?,
+                )),
+                None => None,
+            },
+            substring_for: match substring_for {
+                Some(expr) => Some(Box::new(
+                    Box::pin(rewrite_uncorrelated_scalar_subqueries_to_literals(
+                        engine, *expr, batch_size,
+                    ))
+                    .await?,
+                )),
+                None => None,
+            },
+            special,
+            shorthand,
+        }),
+        expr => Ok(expr),
+    }
+}
+
+async fn evaluate_bound_correlated_filter(
+    engine: &DodamEngine,
+    expr: &SqlExpr,
+    row_batch: &RecordBatch,
+    table_alias: Option<&str>,
+    batch_size: usize,
+) -> Result<bool> {
+    let mut conjuncts = Vec::new();
+    collect_sql_and_conjuncts(expr, &mut conjuncts);
+    for conjunct in conjuncts {
+        let matches = if predicate_requires_expression_path(&conjunct)
+            && !expr_contains_materializable_subquery(&conjunct)
+        {
+            let mask = evaluate_scalar_predicate(row_batch, &conjunct, table_alias)?;
+            mask.is_valid(0) && mask.value(0)
+        } else if let Some(expr) = Box::pin(parse_filter_with_subqueries(
+            engine,
+            &conjunct,
             &[],
             table_alias,
             false,
             batch_size,
         ))
-        .await?;
-        let matches = if let Some(expr) = expr {
-            filter_batch(row_batch, &FilterExpr::new(expr))?.num_rows() > 0
+        .await?
+        {
+            filter_batch(row_batch.clone(), &FilterExpr::new(expr))?.num_rows() > 0
         } else {
             true
         };
-        values.push(Some(matches));
+        if !matches {
+            return Ok(false);
+        }
     }
-    Ok(BooleanArray::from(values))
+    Ok(true)
 }
 
 fn parse_sql_expr_fragment(expr: &str) -> Result<SqlExpr> {
@@ -1014,7 +1204,8 @@ fn bind_outer_row_references(
         if let Some(outer_alias) = outer_alias {
             sql = sql.replace(&format!("{outer_alias}.{}", field.name()), &literal);
         } else {
-            sql = replace_identifier_tokens(&sql, field.name(), &literal);
+            sql =
+                replace_identifier_tokens_preserving_local_subqueries(&sql, field.name(), &literal);
             if let Some((_, unqualified)) = field.name().rsplit_once('.') {
                 sql = replace_identifier_tokens_preserving_local_subqueries(
                     &sql,
@@ -2137,6 +2328,23 @@ async fn parse_filter_with_subqueries(
                 negated: *negated,
             }))
         }
+        SqlExpr::InList {
+            expr: in_expr,
+            list,
+            negated,
+        } => {
+            if let Ok(value) = sql_literal_value(in_expr) {
+                return Ok(Some(Expr::Boolean(evaluate_literal_in_list(
+                    &value, list, *negated,
+                )?)));
+            }
+            Ok(Some(sql_expr_to_filter_expr(
+                expr,
+                aliases,
+                table_alias,
+                allow_aggregates,
+            )?))
+        }
         SqlExpr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
             let left = Box::pin(parse_filter_with_subqueries(
                 engine,
@@ -3233,6 +3441,22 @@ fn sql_uses_multi_comma_join(sql: &str) -> Result<bool> {
     Ok(parse_comma_join_table_refs(select)?.is_some_and(|tables| tables.len() > 2))
 }
 
+fn sql_uses_expression_predicate(sql: &str) -> Result<bool> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(false);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(false);
+    };
+    Ok(select
+        .selection
+        .as_ref()
+        .is_some_and(predicate_requires_expression_path))
+}
+
 pub async fn try_execute_sql_streaming(
     engine: &DodamEngine,
     sql: &str,
@@ -3245,6 +3469,9 @@ pub async fn try_execute_sql_streaming(
         return Ok(None);
     }
     if sql_uses_multi_comma_join(sql)? {
+        return Ok(None);
+    }
+    if sql_uses_expression_predicate(sql)? {
         return Ok(None);
     }
     let query = parse_sql(sql)?;
@@ -3310,6 +3537,9 @@ pub async fn try_execute_sql_to_sink(
         return Ok(None);
     }
     if sql_uses_multi_comma_join(sql)? {
+        return Ok(None);
+    }
+    if sql_uses_expression_predicate(sql)? {
         return Ok(None);
     }
     let query = parse_sql(sql)?;
@@ -5323,6 +5553,17 @@ fn parse_scalar_sql_expression(
             sql_column_name(expr, table_alias)?,
         )),
         SqlExpr::Value(_) => Ok(ScalarSqlExpression::Literal(sql_literal_value(expr)?)),
+        SqlExpr::UnaryOp { op, expr }
+            if matches!(op, UnaryOperator::Minus | UnaryOperator::Plus)
+                && sql_literal_value(expr).is_ok() =>
+        {
+            Ok(ScalarSqlExpression::Literal(sql_literal_value(
+                &SqlExpr::UnaryOp {
+                    op: *op,
+                    expr: expr.clone(),
+                },
+            )?))
+        }
         SqlExpr::Nested(expr) => parse_scalar_sql_expression(expr, table_alias),
         SqlExpr::BinaryOp { left, op, right }
             if matches!(
@@ -6379,12 +6620,20 @@ fn sql_expr_to_filter_expr(
             expr,
             list,
             negated,
-        } => Ok(Expr::InList {
-            column: sql_filter_column(expr, aliases, table_alias, allow_aggregates)?,
-            negated: *negated,
-            has_null: literal_list_contains_null(list)?,
-            values: non_null_literal_values(list)?,
-        }),
+        } => match sql_filter_column(expr, aliases, table_alias, allow_aggregates) {
+            Ok(column) => Ok(Expr::InList {
+                column,
+                negated: *negated,
+                has_null: literal_list_contains_null(list)?,
+                values: non_null_literal_values(list)?,
+            }),
+            Err(error) => {
+                let value = sql_literal_value(expr).map_err(|_| error)?;
+                Ok(Expr::Boolean(evaluate_literal_in_list(
+                    &value, list, *negated,
+                )?))
+            }
+        },
         SqlExpr::Like {
             negated,
             any,
@@ -6524,10 +6773,95 @@ fn sql_literal_value(expr: &SqlExpr) -> Result<LiteralValue> {
             let right_value = sql_literal_value(right)?;
             apply_literal_arithmetic(left_value, op.clone(), right_value)
         }
+        SqlExpr::UnaryOp { op, expr }
+            if matches!(op, UnaryOperator::Minus | UnaryOperator::Plus) =>
+        {
+            let value = sql_literal_value(expr)?;
+            match (op, value) {
+                (UnaryOperator::Plus, value) => Ok(value),
+                (UnaryOperator::Minus, LiteralValue::Int64(value)) => {
+                    Ok(LiteralValue::Int64(value.checked_neg().ok_or_else(
+                        || DodamError::UnsupportedSql("integer literal overflow".to_string()),
+                    )?))
+                }
+                (UnaryOperator::Minus, LiteralValue::Float64(value)) => {
+                    Ok(LiteralValue::Float64(-value))
+                }
+                (UnaryOperator::Minus, value) => Err(DodamError::UnsupportedSql(format!(
+                    "unary minus requires a numeric literal, got {value}"
+                ))),
+                _ => unreachable!("validated unary operator"),
+            }
+        }
+        SqlExpr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            let LiteralValue::Utf8(value) = sql_literal_value(expr)? else {
+                return Err(DodamError::UnsupportedSql(format!(
+                    "SUBSTRING literal input must be a string, got {expr}"
+                )));
+            };
+            let Some(start) = substring_from else {
+                return Err(DodamError::UnsupportedSql(
+                    "SUBSTRING requires a FROM/start expression".to_string(),
+                ));
+            };
+            let start = literal_usize(start, "SUBSTRING start")?;
+            let length = substring_for
+                .as_ref()
+                .map(|expr| literal_usize(expr, "SUBSTRING length"))
+                .transpose()?;
+            Ok(LiteralValue::Utf8(substring_literal(&value, start, length)))
+        }
         _ => Err(DodamError::UnsupportedSql(format!(
             "expected literal, got {expr}"
         ))),
     }
+}
+
+fn evaluate_literal_in_list(
+    value: &LiteralValue,
+    list: &[SqlExpr],
+    negated: bool,
+) -> Result<Option<bool>> {
+    let mut has_null = false;
+    for candidate in list {
+        let candidate = sql_literal_value(candidate)?;
+        if matches!(candidate, LiteralValue::Null) {
+            has_null = true;
+            continue;
+        }
+        if compare_literal_values(value, &BinaryOperator::Eq, &candidate)? == Some(true) {
+            return Ok(Some(!negated));
+        }
+    }
+    if has_null {
+        Ok(None)
+    } else {
+        Ok(Some(negated))
+    }
+}
+
+fn literal_usize(expr: &SqlExpr, context: &str) -> Result<usize> {
+    let LiteralValue::Int64(value) = sql_literal_value(expr)? else {
+        return Err(DodamError::UnsupportedSql(format!(
+            "{context} must be an integer literal"
+        )));
+    };
+    usize::try_from(value)
+        .map_err(|_| DodamError::UnsupportedSql(format!("{context} must be non-negative")))
+}
+
+fn substring_literal(value: &str, start: usize, length: Option<usize>) -> String {
+    let start = start.saturating_sub(1);
+    value
+        .chars()
+        .skip(start)
+        .take(length.unwrap_or(usize::MAX))
+        .collect()
 }
 
 fn decimal_number_literal_arithmetic(
