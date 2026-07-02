@@ -374,7 +374,7 @@ WHERE l_partkey = p_partkey
         },
         TpchQuery {
             name: "q15_top_supplier",
-            expected_status: "unsupported-sql:WITH/FETCH/locks/settings/format/pipe clauses are not supported",
+            expected_status: "needs-data:lineitem",
             sql: r#"
 WITH revenue AS (
     SELECT

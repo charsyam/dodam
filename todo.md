@@ -504,6 +504,7 @@ Tried and rejected or neutral:
 
 - Use `tests/tpch_coverage.rs` as the TPC-H support scoreboard and reduce unsupported statuses query by query.
 - TPC-H progress notes:
+  - Q15 now supports the single CTE materialization shape used by `revenue`, including reuse in the outer comma join and `max(total_revenue)` scalar subquery.
   - Q16 now materializes the uncorrelated `NOT IN (SELECT ...)` join residual and advances to the `supplier` input requirement.
   - Q17 now evaluates correlated scalar aggregate subqueries in two-table comma join residual filters and advances to the `lineitem` input requirement.
   - Q20 now attempts the outer join `IN (SELECT ...)` materialization and advances to the `partsupp` input requirement; real-data execution is still expected to expose the nested correlated scalar aggregate blocker.

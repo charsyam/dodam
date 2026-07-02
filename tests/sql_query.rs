@@ -1443,6 +1443,40 @@ async fn filters_join_with_correlated_scalar_aggregate_subquery_sql() {
 }
 
 #[tokio::test]
+async fn executes_with_cte_join_and_scalar_subquery_sql() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let lineitem_path = tempdir.path().join("lineitem.parquet");
+    let supplier_path = tempdir.path().join("supplier.parquet");
+    write_q15_lineitem_parquet(&lineitem_path);
+    write_q15_supplier_parquet(&supplier_path);
+
+    let sql = format!(
+        "WITH revenue AS (
+            SELECT l_suppkey AS supplier_no, sum(l_extendedprice * (1 - l_discount)) AS total_revenue
+            FROM '{}'
+            WHERE l_shipdate >= DATE '1996-01-01' AND l_shipdate < DATE '1996-01-01' + INTERVAL '3' MONTH
+            GROUP BY l_suppkey
+        )
+        SELECT s_suppkey, s_name, total_revenue
+        FROM '{}' AS supplier, revenue
+        WHERE s_suppkey = supplier_no AND total_revenue = (SELECT max(total_revenue) FROM revenue)
+        ORDER BY s_suppkey",
+        lineitem_path.display(),
+        supplier_path.display()
+    );
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute WITH CTE join scalar subquery sql");
+
+    let QueryOutput::Scan { batches } = output else {
+        panic!("expected scan output");
+    };
+    assert_eq!(i64s_from_column(&batches, 0), vec![2]);
+    assert_eq!(strings_from_column(&batches, 1), vec!["supplier-2"]);
+    assert_eq!(f64s_from_column(&batches, 2), vec![200.0]);
+}
+
+#[tokio::test]
 async fn executes_three_table_comma_join_aggregate_sql() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let customer_path = tempdir.path().join("customer.parquet");
@@ -3027,6 +3061,67 @@ fn write_q17_part_parquet(path: &std::path::Path) {
     writer.close().expect("close parquet writer");
 }
 
+fn write_q15_lineitem_parquet(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("l_suppkey", DataType::Int32, false),
+        Field::new("l_extendedprice", DataType::Int64, false),
+        Field::new("l_discount", DataType::Float64, false),
+        Field::new("l_shipdate", DataType::Date32, false),
+    ]));
+    let suppkeys = Int32Array::from_iter_values([1, 1, 2, 3]);
+    let prices = Int64Array::from_iter_values([100, 50, 200, 1000]);
+    let discounts = Float64Array::from_iter_values([0.10, 0.00, 0.00, 0.00]);
+    let shipdates = Date32Array::from_iter_values([
+        date_days(1996, 1, 10),
+        date_days(1996, 2, 20),
+        date_days(1996, 3, 1),
+        date_days(1996, 5, 1),
+    ]);
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(suppkeys),
+            Arc::new(prices),
+            Arc::new(discounts),
+            Arc::new(shipdates),
+        ],
+    )
+    .expect("record batch");
+
+    let file = File::create(path).expect("create parquet file");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+}
+
+fn write_q15_supplier_parquet(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("s_suppkey", DataType::Int64, false),
+        Field::new("s_name", DataType::Utf8, false),
+        Field::new("s_address", DataType::Utf8, false),
+        Field::new("s_phone", DataType::Utf8, false),
+    ]));
+    let suppkeys = Int64Array::from_iter_values([1, 2, 3]);
+    let names = StringArray::from_iter_values(["supplier-1", "supplier-2", "supplier-3"]);
+    let addresses = StringArray::from_iter_values(["addr-1", "addr-2", "addr-3"]);
+    let phones = StringArray::from_iter_values(["phone-1", "phone-2", "phone-3"]);
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(suppkeys),
+            Arc::new(names),
+            Arc::new(addresses),
+            Arc::new(phones),
+        ],
+    )
+    .expect("record batch");
+
+    let file = File::create(path).expect("create parquet file");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+}
+
 fn write_duplicate_customers_parquet(path: &std::path::Path) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
@@ -3368,4 +3463,15 @@ fn numeric_i64s_from_column_with_nulls(batches: &[RecordBatch], column: usize) -
             }
         })
         .collect()
+}
+
+fn date_days(year: i32, month: u32, day: u32) -> i32 {
+    let year = year - i32::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month = i32::try_from(month).expect("month fits i32");
+    let day = i32::try_from(day).expect("day fits i32");
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
