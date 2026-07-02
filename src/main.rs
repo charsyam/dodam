@@ -19,7 +19,7 @@ use dodam::execution::{
 use dodam::sql::{QueryOutput, execute_sql, try_execute_sql_streaming, try_execute_sql_to_sink};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, Encoding};
-use parquet::file::properties::{EnabledStatistics, WriterProperties};
+use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
 use sqlparser::ast::{CopyOption, CopySource, CopyTarget, Ident, Statement};
 use sqlparser::dialect::GenericDialect;
@@ -959,10 +959,9 @@ impl ParquetFileQuerySink {
                 .set_max_row_group_row_count(self.options.max_row_group_rows)
                 .set_write_batch_size(self.options.write_batch_size)
                 .set_data_page_row_count_limit(self.options.data_page_row_count_limit)
-                .set_statistics_enabled(EnabledStatistics::Chunk)
                 .set_column_encoding(ColumnPath::from("f.id"), Encoding::DELTA_BINARY_PACKED)
-                .set_column_encoding(ColumnPath::from("id"), Encoding::DELTA_BINARY_PACKED)
-                .build();
+                .set_column_encoding(ColumnPath::from("id"), Encoding::DELTA_BINARY_PACKED);
+            let properties = properties.build();
             self.writer = Some(ArrowWriter::try_new(
                 BufWriter::with_capacity(buffer_size, file),
                 batch.schema(),

@@ -274,6 +274,12 @@ Effective or retained:
   - Tuned Parquet's default buffer selection to keep `8 MiB` for narrow/two-column output and use `1 MiB` for wider output unless `--copy-buffer-size` or `DODAM_COPY_BUFFER_BYTES` is set.
   - This keeps `inner_join_duplicate_build` around `35.3 ms`, `inner_join_duplicate_build_small_row_groups` around `37.8 ms`, and improves `inner_join_wide_output` to about `25.4 ms`.
   - Output sizes are close to DuckDB on the current datasets: about `2.3 MiB` vs `2.2 MiB` for the narrow join output and about `3.7 MiB` vs `3.6 MiB` for the wide join output.
+  - Disabled Parquet COPY output statistics by default after re-testing duplicate fanout output:
+    - `DODAM_PROFILE_COPY=1` showed duplicate fanout Parquet writer time drop from about `21.6 ms` to about `14.2 ms`.
+    - Criterion showed `inner_join_duplicate_build_narrow_fact` Dodam CLI improved by about `12.4%`.
+    - Criterion showed `inner_join_duplicate_build_wide_pruned_fact` Dodam CLI improved by about `13.2%`.
+    - Default `inner_join_duplicate_build` Dodam CLI is now about `34.8 ms` versus DuckDB CLI about `28.2 ms`; still slower, but the gap is smaller.
+    - `inner_join_duplicate_build_small_row_groups` remained roughly neutral at about `37.3 ms`.
 - Direct CSV sink paths:
   - Single `Int32` output helps semi joins.
   - `Int32, Utf8` output helps common inner join COPY output.
@@ -328,12 +334,26 @@ Tried and rejected or neutral:
   - Helped some duplicate fanout cases but regressed the small-row-group duplicate case.
   - Re-tested after Parquet writer tuning: it improved the small-row-group duplicate CLI case to about `41.1 ms`, but regressed the default duplicate CLI case to about `37.8 ms` and slightly worsened wide output.
   - Rejected as a global execution change; a future Parquet-specific sink preference would need more selective logic.
+- Changing default Parquet `ROW_GROUP_SIZE` from `64 Ki` to `32 Ki` after disabling COPY output statistics:
+  - Improved `inner_join_duplicate_build_small_row_groups` CLI by about `3.6%`.
+  - Regressed default/narrow/wide-pruned duplicate fanout CLI by about `14-15%`.
+  - Rejected; keep the default at `64 Ki`.
 - Parquet sink-side RecordBatch coalescing:
   - Looked better in one-off profiling, but Criterion showed regressions in duplicate fanout cases due to concat/memory churn.
   - Rejected.
+- Parquet narrow-batch coalescing re-test after later writer tuning:
+  - Reduced measured writer time in one profile run, but wall-clock median regressed to about `58.6 ms` on duplicate fanout.
+  - Rejected again because concat/memory churn outweighed fewer `ArrowWriter::write` calls.
 - Direct Parquet `Int32, Utf8` join row sink:
   - Gave only small/noisy gains and regressed the small-row-group duplicate case before the `8 Ki` writer/page fix.
   - Rejected in favor of the simpler writer/page default change.
+- Direct Parquet `Int32, Utf8` join row sink re-test after later writer tuning:
+  - Avoided part of normal join materialization but still had to build Arrow arrays for Parquet.
+  - Duplicate fanout median stayed around `46-48 ms`, so writer cost remained dominant.
+  - Rejected.
+- Adaptive disabling of `DELTA_BINARY_PACKED` for adjacent-duplicate `id`/`f.id` output:
+  - Some one-off runs looked faster, but profile showed writer time was not reliably lower and output size grew from about `2.46 MiB` to about `3.95 MiB`.
+  - Rejected; keep `DELTA_BINARY_PACKED` for `id`/`f.id`.
 - Round-major duplicate fanout row ordering:
   - Made the first rows resemble DuckDB's output order, but increased output size from about `4.0 MiB` to about `4.5 MiB`.
   - Rejected.
@@ -446,35 +466,7 @@ Tried and rejected or neutral:
   - unsupported column type fallback
   - COPY join output equivalence with SELECT
 
-### 3. Fix Local DAG Execution Quality
-
-- Reduce duplicated local DAG task work.
-- Ensure exchange consumer stages read only materialized shuffle inputs and do not accidentally keep executing producer subtrees.
-- Expose stage-level metrics in CLI profiling and/or `EXPLAIN`.
-- Use the new per-stage metrics to identify excessive task counts in row-group-heavy plans.
-- Add configurable local execution options to CLI/profile entry points when DAG execution becomes user-facing.
-
-### 4. Finish Declarative Plan Coverage
-
-- Move `EXPLAIN` for scan/join/aggregate/sort/limit/copy fully onto declarative plan representation.
-- Add aggregate execution lowering to declarative physical nodes.
-- Split aggregation into partial/final physical operators.
-- Add grouped aggregate distribution planning:
-  - partial aggregate before shuffle
-  - hash repartition by group keys
-  - final aggregate after shuffle
-- Add sort-merge join ordering requirements to physical planning.
-- Preserve current fast local execution paths while moving planning state out of ad hoc execution objects.
-
-### 5. Serialization Boundary For Future Distributed Execution
-
-- Make plan nodes serializable.
-- Make expressions, projections, aggregate expressions, join keys, table scan sources, and exchange descriptors serializable.
-- Define stable task descriptors and stable partition/shuffle descriptors.
-- Keep executor-facing APIs free from Rust trait objects crossing process boundaries.
-- Add round-trip tests for serialized logical plan, physical plan, stage plan, and task plan.
-
-### 6. More Realistic Large-Data Behavior
+### 3. More Realistic Large-Data Behavior
 
 - Add larger benchmark datasets:
   - non-dense join keys
@@ -489,7 +481,48 @@ Tried and rejected or neutral:
 - Add grouped aggregation spill support.
 - Add sort-merge join input spill/sort support.
 
-### 7. Join Improvements Still Worth Doing
+### 4. Fix Local DAG Execution Quality
+
+- Reduce duplicated local DAG task work.
+- Ensure exchange consumer stages read only materialized shuffle inputs and do not accidentally keep executing producer subtrees.
+- Expose stage-level metrics in CLI profiling and/or `EXPLAIN`.
+- Use the new per-stage metrics to identify excessive task counts in row-group-heavy plans.
+- Add configurable local execution options to CLI/profile entry points when DAG execution becomes user-facing.
+
+### 5. Finish Declarative Plan Coverage
+
+- Move `EXPLAIN` for scan/join/aggregate/sort/limit/copy fully onto declarative plan representation.
+- Add aggregate execution lowering to declarative physical nodes.
+- Split aggregation into partial/final physical operators.
+- Add grouped aggregate distribution planning:
+  - partial aggregate before shuffle
+  - hash repartition by group keys
+  - final aggregate after shuffle
+- Add sort-merge join ordering requirements to physical planning.
+- Preserve current fast local execution paths while moving planning state out of ad hoc execution objects.
+
+### 6. SQL And Compatibility Expansion
+
+- TPC-H 22 queries now execute on the current SF=0.01 real-data Parquet fixture, but general SQL compatibility is still limited.
+- Extend nested/list/struct behavior beyond projection:
+  - filtering
+  - casts
+  - CLI/COPY output compatibility
+- Expand cast/date/time literal compatibility:
+  - richer date/time literal forms
+  - timestamp timezone conversion edge cases
+  - decimal precision/scale conversion and overflow behavior
+- Add more alias, expression, and subquery combinations after the parser structure remains clean.
+
+### 7. Serialization Boundary For Future Distributed Execution
+
+- Make plan nodes serializable.
+- Make expressions, projections, aggregate expressions, join keys, table scan sources, and exchange descriptors serializable.
+- Define stable task descriptors and stable partition/shuffle descriptors.
+- Keep executor-facing APIs free from Rust trait objects crossing process boundaries.
+- Add round-trip tests for serialized logical plan, physical plan, stage plan, and task plan.
+
+### 8. Join Improvements Still Worth Doing
 
 - Generalize matched-build tracking:
   - dense `Int64` bitmap tracking
@@ -500,7 +533,7 @@ Tried and rejected or neutral:
 - Keep anti join and cross join out for now unless query patterns justify them.
 - Add non-equi join only after the planner can deliberately choose nested-loop/range join strategies.
 
-### 8. SQL Completeness
+### 9. SQL Completeness Notes
 
 - Use `tests/tpch_coverage.rs` as the TPC-H support scoreboard and reduce unsupported statuses query by query.
 - TPC-H progress notes:
