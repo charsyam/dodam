@@ -2491,12 +2491,68 @@ fn split_comma_join_selection(
         }
     }
     if left_keys.is_empty() {
+        for (left_key, right_key) in
+            common_or_comma_join_equality_keys(selection, left_alias, right_alias, table_aliases)?
+        {
+            left_keys.push(left_key);
+            right_keys.push(right_key);
+        }
+    }
+    if left_keys.is_empty() {
         return Err(DodamError::UnsupportedSql(
             "comma join requires at least one equality predicate between the two tables"
                 .to_string(),
         ));
     }
     Ok((left_keys, right_keys, combine_sql_and_conjuncts(residuals)))
+}
+
+fn common_or_comma_join_equality_keys(
+    expr: &SqlExpr,
+    left_alias: &str,
+    right_alias: &str,
+    table_aliases: &[&str],
+) -> Result<Vec<(String, String)>> {
+    match expr {
+        SqlExpr::Nested(expr) => {
+            common_or_comma_join_equality_keys(expr, left_alias, right_alias, table_aliases)
+        }
+        SqlExpr::BinaryOp {
+            left,
+            op: BinaryOperator::Or,
+            right,
+        } => {
+            let left_keys =
+                common_or_comma_join_equality_keys(left, left_alias, right_alias, table_aliases)?;
+            let right_keys =
+                common_or_comma_join_equality_keys(right, left_alias, right_alias, table_aliases)?;
+            Ok(left_keys
+                .into_iter()
+                .filter(|key| right_keys.iter().any(|right_key| right_key == key))
+                .collect())
+        }
+        expr => branch_comma_join_equality_keys(expr, left_alias, right_alias, table_aliases),
+    }
+}
+
+fn branch_comma_join_equality_keys(
+    expr: &SqlExpr,
+    left_alias: &str,
+    right_alias: &str,
+    table_aliases: &[&str],
+) -> Result<Vec<(String, String)>> {
+    let mut conjuncts = Vec::new();
+    collect_sql_and_conjuncts(expr, &mut conjuncts);
+    let mut keys = Vec::new();
+    for conjunct in conjuncts {
+        if let Some(key) =
+            comma_join_equality_keys(&conjunct, left_alias, right_alias, table_aliases)?
+            && !keys.iter().any(|existing| existing == &key)
+        {
+            keys.push(key);
+        }
+    }
+    Ok(keys)
 }
 
 fn collect_sql_and_conjuncts(expr: &SqlExpr, conjuncts: &mut Vec<SqlExpr>) {
@@ -3253,6 +3309,43 @@ fn join_expr_to_filter_expr(
         },
         SqlExpr::Nested(expr) => {
             join_expr_to_filter_expr(expr, aliases, table_aliases, allow_aggregates)
+        }
+        SqlExpr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let column = join_filter_column(expr, aliases, table_aliases, allow_aggregates)?;
+            let low = sql_literal_value(low)?;
+            let high = sql_literal_value(high)?;
+            if *negated {
+                Ok(Expr::Or(
+                    Box::new(Expr::Comparison(ComparisonExpr {
+                        column: column.clone(),
+                        op: ComparisonOp::Lt,
+                        value: low,
+                    })),
+                    Box::new(Expr::Comparison(ComparisonExpr {
+                        column,
+                        op: ComparisonOp::Gt,
+                        value: high,
+                    })),
+                ))
+            } else {
+                Ok(Expr::And(
+                    Box::new(Expr::Comparison(ComparisonExpr {
+                        column: column.clone(),
+                        op: ComparisonOp::GtEq,
+                        value: low,
+                    })),
+                    Box::new(Expr::Comparison(ComparisonExpr {
+                        column,
+                        op: ComparisonOp::LtEq,
+                        value: high,
+                    })),
+                ))
+            }
         }
         SqlExpr::UnaryOp { op, expr } if *op == UnaryOperator::Not => Ok(Expr::Not(Box::new(
             join_expr_to_filter_expr(expr, aliases, table_aliases, allow_aggregates)?,

@@ -173,6 +173,11 @@
   - reuses aggregate input expression materialization for nested `sum(l_extendedprice * (1 - l_discount))` and searched `CASE` inputs
   - added scalar predicate `LIKE` support inside expression `CASE` evaluation for join aggregate inputs
   - TPC-H inventory now advances Q14 to `needs-data:lineitem`
+- Added comma join key extraction from OR branches:
+  - detects equality join keys that are common to every top-level OR branch, then keeps the original OR predicate as the residual filter
+  - added `BETWEEN` lowering for join residual filters
+  - added SQL coverage for comma joins whose equality predicate appears inside OR branches
+  - TPC-H inventory now advances Q19 to `needs-data:lineitem`
 - The TPC-H-lite suite caught missing `Date32` `min`/`max` aggregate support; added `Date32` aggregate state and `Date32Array` result materialization.
 - The TPC-H-lite join aggregate case caught an aggregate join output projection correctness issue around qualified column names when the cost model chooses the left side as the hash build input.
 - Fixed build-side-aware join output projection mapping for hash/materialized join output schemas and restored aggregate join output projection pushdown.

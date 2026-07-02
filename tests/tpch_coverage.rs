@@ -464,7 +464,7 @@ LIMIT 100
         },
         TpchQuery {
             name: "q19_discounted_revenue",
-            expected_status: "unsupported-sql:comma join requires at least one equality predicate between the two tables",
+            expected_status: "needs-data:lineitem",
             sql: r#"
 SELECT
     sum(l_extendedprice * (1 - l_discount)) AS revenue
