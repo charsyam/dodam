@@ -410,6 +410,37 @@ async fn duckdb_differential_scalar_type_filters() {
 }
 
 #[tokio::test]
+async fn duckdb_differential_like_filters() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let path = tempdir.path().join("like_values.parquet");
+    write_like_values_parquet(&path);
+
+    let cases = [
+        "text LIKE 'alpha%'",
+        "text NOT LIKE '%requests%'",
+        "text LIKE 'a_ph_'",
+        "text LIKE '100!%%' ESCAPE '!'",
+    ];
+    for predicate in cases {
+        assert_same_as_duckdb(
+            &format!(
+                "SELECT id FROM '{}' WHERE {predicate} ORDER BY id",
+                path.display()
+            ),
+            &format!(
+                "SELECT id FROM read_parquet('{}') WHERE {predicate} ORDER BY id",
+                path.display()
+            ),
+            tempdir.path(),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
 async fn duckdb_differential_scalar_projection_expressions() {
     let Some(_duckdb) = DuckDbGuard::new() else {
         return;
@@ -924,6 +955,23 @@ fn write_dim_parquet(path: &Path) {
     let keys = Int32Array::from_iter_values([1, 2, 2, 4]);
     let names = StringArray::from_iter_values(["one", "two-a", "two-b", "four"]);
     write_parquet(path, schema, vec![Arc::new(keys), Arc::new(names)]);
+}
+
+fn write_like_values_parquet(path: &Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("text", DataType::Utf8, true),
+    ]));
+    let ids = Int32Array::from_iter_values([1, 2, 3, 4, 5, 6]);
+    let text = StringArray::from(vec![
+        Some("alpha"),
+        Some("alphabet"),
+        Some("special requests"),
+        Some("100% match"),
+        Some("aleph"),
+        None,
+    ]);
+    write_parquet(path, schema, vec![Arc::new(ids), Arc::new(text)]);
 }
 
 fn write_multi_left_parquet(path: &Path) {

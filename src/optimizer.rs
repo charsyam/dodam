@@ -139,6 +139,19 @@ fn rewrite_join_side_expr(expr: &Expr, prefix: &str) -> Expr {
             negated: *negated,
             has_null: *has_null,
         },
+        Expr::Like {
+            column,
+            pattern,
+            negated,
+            escape,
+        } => Expr::Like {
+            column: strip_join_prefix(column, prefix)
+                .unwrap_or(column)
+                .to_string(),
+            pattern: pattern.clone(),
+            negated: *negated,
+            escape: *escape,
+        },
         Expr::IsNull { column, negated } => Expr::IsNull {
             column: strip_join_prefix(column, prefix)
                 .unwrap_or(column)
@@ -167,7 +180,7 @@ fn collect_expr_referenced_columns(expr: &Expr, columns: &mut Vec<String>) {
     match expr {
         Expr::Boolean(_) => {}
         Expr::Comparison(comparison) => add_column_once(columns, comparison.column.clone()),
-        Expr::InList { column, .. } | Expr::IsNull { column, .. } => {
+        Expr::InList { column, .. } | Expr::Like { column, .. } | Expr::IsNull { column, .. } => {
             add_column_once(columns, column.clone());
         }
         Expr::Not(expr) => collect_expr_referenced_columns(expr, columns),

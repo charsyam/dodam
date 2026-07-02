@@ -1741,6 +1741,7 @@ fn partition_predicate_matches(
                 })
         }
         Expr::Boolean(_)
+        | Expr::Like { .. }
         | Expr::IsNull { .. }
         | Expr::Not(_)
         | Expr::And(_, _)

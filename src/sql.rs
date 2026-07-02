@@ -68,6 +68,7 @@ struct SqlJoin {
     right_alias: String,
     left_keys: Vec<String>,
     right_keys: Vec<String>,
+    right_filter: Option<FilterExpr>,
     join_type: JoinType,
 }
 
@@ -162,7 +163,10 @@ pub async fn execute_sql(
                 left_projection: join_plan.left_projection,
                 right_projection: join_plan.right_projection,
                 left_filter: join_plan.left_filter,
-                right_filter: join_plan.right_filter,
+                right_filter: combine_filter_options(
+                    join_plan.right_filter,
+                    join.right_filter.clone(),
+                ),
                 output_projection,
                 join_memory_limit_bytes: default_join_memory_limit_bytes(),
                 join_algorithm: JoinAlgorithm::Auto,
@@ -1147,7 +1151,8 @@ async fn try_execute_derived_join_sql(
     let right = materialize_join_relation(engine, &join.relation, batch_size).await?;
     let left_alias = left.alias.clone();
     let right_alias = right.alias.clone();
-    let (join_type, left_keys, right_keys) = parse_join_condition(join, &left_alias, &right_alias)?;
+    let (join_type, left_keys, right_keys, right_filter) =
+        parse_join_condition(join, &left_alias, &right_alias)?;
     let exec_left_alias = left_alias.clone();
     let exec_right_alias = right_alias.clone();
     let output_aliases = if join_type == JoinType::Semi {
@@ -1173,7 +1178,10 @@ async fn try_execute_derived_join_sql(
 
     let stream = Box::new(HashJoinExec::new(
         Box::new(MemoryExec::new(left.batches)),
-        Box::new(MemoryExec::new(right.batches)),
+        Box::new(MemoryExec::new(apply_output_filter(
+            right.batches,
+            right_filter.as_ref(),
+        )?)),
         left_keys,
         right_keys,
         exec_left_alias,
@@ -1257,9 +1265,7 @@ async fn materialize_join_relation(
         }
         TableFactor::Table { .. } => {
             let table = parse_table_factor(relation)?;
-            let alias = table.alias.clone().ok_or_else(|| {
-                DodamError::UnsupportedSql("JOIN inputs must have table aliases".to_string())
-            })?;
+            let alias = table_ref_alias_or_name(&table);
             let stream = engine
                 .scan_parquet_batches(table.path, batch_size, None, Projection::All, None)
                 .await?;
@@ -1635,7 +1641,7 @@ pub async fn try_execute_sql_streaming(
             left_projection: join_plan.left_projection,
             right_projection: join_plan.right_projection,
             left_filter: join_plan.left_filter,
-            right_filter: join_plan.right_filter,
+            right_filter: combine_filter_options(join_plan.right_filter, join.right_filter.clone()),
             output_projection,
             join_memory_limit_bytes: default_join_memory_limit_bytes(),
             join_algorithm: JoinAlgorithm::Auto,
@@ -1697,7 +1703,7 @@ pub async fn try_execute_sql_to_sink(
             left_projection: join_plan.left_projection,
             right_projection: join_plan.right_projection,
             left_filter: join_plan.left_filter,
-            right_filter: join_plan.right_filter,
+            right_filter: combine_filter_options(join_plan.right_filter, join.right_filter.clone()),
             output_projection,
             join_memory_limit_bytes: default_join_memory_limit_bytes(),
             join_algorithm: JoinAlgorithm::Auto,
@@ -1774,7 +1780,10 @@ async fn explain_query(engine: &DodamEngine, query: SqlQuery, batch_size: usize)
                 left_projection: join_plan.left_projection,
                 right_projection: join_plan.right_projection,
                 left_filter: join_plan.left_filter,
-                right_filter: join_plan.right_filter,
+                right_filter: combine_filter_options(
+                    join_plan.right_filter,
+                    join.right_filter.clone(),
+                ),
                 output_projection: Projection::All,
                 join_memory_limit_bytes: default_join_memory_limit_bytes(),
                 join_algorithm: JoinAlgorithm::Auto,
@@ -1927,13 +1936,10 @@ fn parse_join_select(query: &Query, select: &Select) -> Result<SqlQuery> {
     };
     let left = parse_table_factor(&table.relation)?;
     let right = parse_table_factor(&join.relation)?;
-    let left_alias = left.alias.clone().ok_or_else(|| {
-        DodamError::UnsupportedSql("JOIN inputs must have table aliases".to_string())
-    })?;
-    let right_alias = right.alias.clone().ok_or_else(|| {
-        DodamError::UnsupportedSql("JOIN inputs must have table aliases".to_string())
-    })?;
-    let (join_type, left_keys, right_keys) = parse_join_condition(join, &left_alias, &right_alias)?;
+    let left_alias = table_ref_alias_or_name(&left);
+    let right_alias = table_ref_alias_or_name(&right);
+    let (join_type, left_keys, right_keys, right_filter) =
+        parse_join_condition(join, &left_alias, &right_alias)?;
     let join_aliases = [left_alias.as_str(), right_alias.as_str()];
     let output_aliases = if join_type == JoinType::Semi {
         vec![left_alias.as_str()]
@@ -1964,6 +1970,7 @@ fn parse_join_select(query: &Query, select: &Select) -> Result<SqlQuery> {
             right_alias,
             left_keys,
             right_keys,
+            right_filter,
             join_type,
         }),
         projection: projection.projection,
@@ -2060,6 +2067,18 @@ struct SqlTableRef {
     alias: Option<String>,
 }
 
+fn table_ref_alias_or_name(table: &SqlTableRef) -> String {
+    table.alias.clone().unwrap_or_else(|| {
+        table
+            .path
+            .file_stem()
+            .or_else(|| table.path.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or_else(|| table.path.to_str().unwrap_or(""))
+            .to_string()
+    })
+}
+
 fn parse_from(select: &Select) -> Result<SqlTableRef> {
     let [table] = select.from.as_slice() else {
         return Err(DodamError::UnsupportedSql(
@@ -2124,7 +2143,7 @@ fn parse_join_condition(
     join: &sqlparser::ast::Join,
     left_alias: &str,
     right_alias: &str,
-) -> Result<(JoinType, Vec<String>, Vec<String>)> {
+) -> Result<(JoinType, Vec<String>, Vec<String>, Option<FilterExpr>)> {
     let (join_type, constraint) = match &join.join_operator {
         JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => {
             (JoinType::Inner, constraint)
@@ -2153,14 +2172,27 @@ fn parse_join_condition(
 
     let mut left_keys = Vec::new();
     let mut right_keys = Vec::new();
+    let mut right_filters = Vec::new();
     collect_join_equalities(
         expr,
         left_alias,
         right_alias,
         &mut left_keys,
         &mut right_keys,
+        &mut right_filters,
+        join_type,
     )?;
-    Ok((join_type, left_keys, right_keys))
+    if left_keys.is_empty() {
+        return Err(DodamError::UnsupportedSql(
+            "JOIN requires at least one equality ON condition".to_string(),
+        ));
+    }
+    Ok((
+        join_type,
+        left_keys,
+        right_keys,
+        combine_expr_filters(right_filters),
+    ))
 }
 
 fn collect_join_equalities(
@@ -2169,6 +2201,8 @@ fn collect_join_equalities(
     right_alias: &str,
     left_keys: &mut Vec<String>,
     right_keys: &mut Vec<String>,
+    right_filters: &mut Vec<Expr>,
+    join_type: JoinType,
 ) -> Result<()> {
     match expr {
         SqlExpr::BinaryOp {
@@ -2176,14 +2210,38 @@ fn collect_join_equalities(
             op: BinaryOperator::And,
             right,
         } => {
-            collect_join_equalities(left, left_alias, right_alias, left_keys, right_keys)?;
-            collect_join_equalities(right, left_alias, right_alias, left_keys, right_keys)
+            collect_join_equalities(
+                left,
+                left_alias,
+                right_alias,
+                left_keys,
+                right_keys,
+                right_filters,
+                join_type,
+            )?;
+            collect_join_equalities(
+                right,
+                left_alias,
+                right_alias,
+                left_keys,
+                right_keys,
+                right_filters,
+                join_type,
+            )
         }
         SqlExpr::BinaryOp {
             left,
             op: BinaryOperator::Eq,
             right,
         } => {
+            if let (Some(left_column), Some(right_column)) = (
+                unqualified_column_identifier(left),
+                unqualified_column_identifier(right),
+            ) {
+                left_keys.push(left_column);
+                right_keys.push(right_column);
+                return Ok(());
+            }
             let left_column = qualified_join_column(left, &[left_alias, right_alias])?;
             let right_column = qualified_join_column(right, &[left_alias, right_alias])?;
             let (left_column, right_column) = if left_column.starts_with(&format!("{left_alias}."))
@@ -2215,8 +2273,149 @@ fn collect_join_equalities(
         }
         _ => Err(DodamError::UnsupportedSql(
             "JOIN requires equality ON conditions joined by AND".to_string(),
-        )),
+        ))
+        .or_else(|_| {
+            let filter = join_expr_to_filter_expr(expr, &[], &[left_alias, right_alias], false)?;
+            let filter =
+                normalize_right_join_on_filter(filter, left_alias, right_alias, join_type)?;
+            right_filters.push(filter);
+            Ok(())
+        }),
     }
+}
+
+fn unqualified_column_identifier(expr: &SqlExpr) -> Option<String> {
+    match expr {
+        SqlExpr::Identifier(ident) => Some(ident.value.clone()),
+        SqlExpr::CompoundIdentifier(parts) => {
+            let [ident] = parts.as_slice() else {
+                return None;
+            };
+            Some(ident.value.clone())
+        }
+        _ => None,
+    }
+}
+
+fn normalize_right_join_on_filter(
+    expr: Expr,
+    left_alias: &str,
+    right_alias: &str,
+    join_type: JoinType,
+) -> Result<Expr> {
+    if !matches!(join_type, JoinType::Inner | JoinType::Left | JoinType::Semi) {
+        return Err(DodamError::UnsupportedSql(
+            "JOIN ON residual filters are only supported for INNER, LEFT, and SEMI joins"
+                .to_string(),
+        ));
+    }
+    let mut columns = Vec::new();
+    collect_filter_columns(&expr, &mut columns);
+    if columns
+        .iter()
+        .any(|column| column == left_alias || column.starts_with(&format!("{left_alias}.")))
+    {
+        return Err(DodamError::UnsupportedSql(
+            "JOIN ON residual filters may only reference the right input".to_string(),
+        ));
+    }
+    Ok(strip_filter_prefix(expr, right_alias))
+}
+
+fn combine_expr_filters(mut filters: Vec<Expr>) -> Option<FilterExpr> {
+    let first = filters.pop()?;
+    Some(FilterExpr::new(
+        filters.into_iter().fold(first, |right, left| {
+            Expr::And(Box::new(left), Box::new(right))
+        }),
+    ))
+}
+
+fn combine_filter_options(
+    left: Option<FilterExpr>,
+    right: Option<FilterExpr>,
+) -> Option<FilterExpr> {
+    match (left, right) {
+        (None, None) => None,
+        (Some(filter), None) | (None, Some(filter)) => Some(filter),
+        (Some(left), Some(right)) => Some(FilterExpr::new(Expr::And(
+            Box::new(left.expr().clone()),
+            Box::new(right.expr().clone()),
+        ))),
+    }
+}
+
+fn collect_filter_columns(expr: &Expr, columns: &mut Vec<String>) {
+    match expr {
+        Expr::Boolean(_) => {}
+        Expr::Comparison(comparison) => add_filter_column(columns, &comparison.column),
+        Expr::InList { column, .. } | Expr::Like { column, .. } | Expr::IsNull { column, .. } => {
+            add_filter_column(columns, column);
+        }
+        Expr::Not(expr) => collect_filter_columns(expr, columns),
+        Expr::And(left, right) | Expr::Or(left, right) => {
+            collect_filter_columns(left, columns);
+            collect_filter_columns(right, columns);
+        }
+    }
+}
+
+fn add_filter_column(columns: &mut Vec<String>, column: &str) {
+    if !columns.iter().any(|existing| existing == column) {
+        columns.push(column.to_string());
+    }
+}
+
+fn strip_filter_prefix(expr: Expr, prefix: &str) -> Expr {
+    match expr {
+        Expr::Boolean(value) => Expr::Boolean(value),
+        Expr::Comparison(mut comparison) => {
+            comparison.column = strip_column_prefix(&comparison.column, prefix);
+            Expr::Comparison(comparison)
+        }
+        Expr::InList {
+            column,
+            values,
+            negated,
+            has_null,
+        } => Expr::InList {
+            column: strip_column_prefix(&column, prefix),
+            values,
+            negated,
+            has_null,
+        },
+        Expr::Like {
+            column,
+            pattern,
+            negated,
+            escape,
+        } => Expr::Like {
+            column: strip_column_prefix(&column, prefix),
+            pattern,
+            negated,
+            escape,
+        },
+        Expr::IsNull { column, negated } => Expr::IsNull {
+            column: strip_column_prefix(&column, prefix),
+            negated,
+        },
+        Expr::Not(expr) => Expr::Not(Box::new(strip_filter_prefix(*expr, prefix))),
+        Expr::And(left, right) => Expr::And(
+            Box::new(strip_filter_prefix(*left, prefix)),
+            Box::new(strip_filter_prefix(*right, prefix)),
+        ),
+        Expr::Or(left, right) => Expr::Or(
+            Box::new(strip_filter_prefix(*left, prefix)),
+            Box::new(strip_filter_prefix(*right, prefix)),
+        ),
+    }
+}
+
+fn strip_column_prefix(column: &str, prefix: &str) -> String {
+    column
+        .strip_prefix(&format!("{prefix}."))
+        .unwrap_or(column)
+        .to_string()
 }
 
 fn parse_join_projection(
@@ -2466,6 +2665,28 @@ fn join_expr_to_filter_expr(
             has_null: literal_list_contains_null(list)?,
             values: non_null_literal_values(list)?,
         }),
+        SqlExpr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => {
+            if *any {
+                return Err(DodamError::UnsupportedSql(
+                    "LIKE ANY is not supported".to_string(),
+                ));
+            }
+            Ok(Expr::Like {
+                column: join_filter_column(expr, aliases, table_aliases, allow_aggregates)?,
+                pattern: sql_like_pattern(pattern)?,
+                negated: *negated,
+                escape: sql_like_escape(escape_char)?,
+            })
+        }
+        SqlExpr::ILike { .. } => Err(DodamError::UnsupportedSql(
+            "ILIKE is not supported".to_string(),
+        )),
         _ => Err(DodamError::UnsupportedSql(format!(
             "unsupported JOIN WHERE expression: {expr}"
         ))),
@@ -3303,6 +3524,28 @@ fn sql_expr_to_filter_expr(
             has_null: literal_list_contains_null(list)?,
             values: non_null_literal_values(list)?,
         }),
+        SqlExpr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => {
+            if *any {
+                return Err(DodamError::UnsupportedSql(
+                    "LIKE ANY is not supported".to_string(),
+                ));
+            }
+            Ok(Expr::Like {
+                column: sql_filter_column(expr, aliases, table_alias, allow_aggregates)?,
+                pattern: sql_like_pattern(pattern)?,
+                negated: *negated,
+                escape: sql_like_escape(escape_char)?,
+            })
+        }
+        SqlExpr::ILike { .. } => Err(DodamError::UnsupportedSql(
+            "ILIKE is not supported".to_string(),
+        )),
         _ => Err(DodamError::UnsupportedSql(format!(
             "unsupported WHERE expression: {expr}"
         ))),
@@ -3327,6 +3570,41 @@ fn sql_filter_column(
             "expected column or aggregate expression, got {expr}"
         ))),
     }
+}
+
+fn sql_like_pattern(expr: &SqlExpr) -> Result<String> {
+    match sql_literal_value(expr)? {
+        LiteralValue::Utf8(pattern) => Ok(pattern),
+        LiteralValue::Null => Err(DodamError::UnsupportedSql(
+            "LIKE NULL patterns are not supported yet".to_string(),
+        )),
+        value => Err(DodamError::UnsupportedSql(format!(
+            "LIKE pattern must be a string literal, got {value}"
+        ))),
+    }
+}
+
+fn sql_like_escape(escape_char: &Option<sqlparser::ast::ValueWithSpan>) -> Result<Option<char>> {
+    let Some(escape_char) = escape_char else {
+        return Ok(None);
+    };
+    let Value::SingleQuotedString(value) = &escape_char.value else {
+        return Err(DodamError::UnsupportedSql(
+            "LIKE ESCAPE must be a string literal".to_string(),
+        ));
+    };
+    let mut chars = value.chars();
+    let Some(ch) = chars.next() else {
+        return Err(DodamError::UnsupportedSql(
+            "LIKE ESCAPE must contain exactly one character".to_string(),
+        ));
+    };
+    if chars.next().is_some() {
+        return Err(DodamError::UnsupportedSql(
+            "LIKE ESCAPE must contain exactly one character".to_string(),
+        ));
+    }
+    Ok(Some(ch))
 }
 
 fn sql_literal_value(expr: &SqlExpr) -> Result<LiteralValue> {

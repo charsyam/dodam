@@ -8506,6 +8506,12 @@ fn evaluate_filter(batch: &RecordBatch, expr: &Expr) -> Result<BooleanArray> {
             negated,
             has_null,
         } => evaluate_in_list(batch, column, values, *negated, *has_null),
+        Expr::Like {
+            column,
+            pattern,
+            negated,
+            escape,
+        } => evaluate_like(batch, column, pattern, *negated, *escape),
         Expr::IsNull { column, negated } => evaluate_is_null(batch, column, *negated),
         Expr::Not(expr) => {
             let mask = evaluate_filter(batch, expr)?;
@@ -8847,6 +8853,96 @@ fn evaluate_in_list(
         return Ok(not_mask(&mask));
     }
     Ok(mask)
+}
+
+fn evaluate_like(
+    batch: &RecordBatch,
+    column: &str,
+    pattern: &str,
+    negated: bool,
+    escape: Option<char>,
+) -> Result<BooleanArray> {
+    let column_index = column_index(batch, column)?;
+    let column_array = batch.column(column_index);
+    let values = column_array
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| DodamError::UnsupportedFilterType {
+            column: column.to_string(),
+            data_type: column_array.data_type().clone(),
+        })?;
+    let tokens = like_pattern_tokens(pattern, escape)?;
+    let mut builder = BooleanBuilder::with_capacity(values.len());
+    for row in 0..values.len() {
+        if values.is_null(row) {
+            builder.append_null();
+            continue;
+        }
+        let matched = like_matches(values.value(row), &tokens);
+        builder.append_value(if negated { !matched } else { matched });
+    }
+    Ok(builder.finish())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LikeToken {
+    AnyMany,
+    AnyOne,
+    Literal(char),
+}
+
+fn like_pattern_tokens(pattern: &str, escape: Option<char>) -> Result<Vec<LikeToken>> {
+    let mut tokens = Vec::new();
+    let mut chars = pattern.chars();
+    while let Some(ch) = chars.next() {
+        if Some(ch) == escape {
+            let Some(escaped) = chars.next() else {
+                return Err(DodamError::InvalidFilter(format!(
+                    "LIKE pattern ends with escape character: {pattern}"
+                )));
+            };
+            tokens.push(LikeToken::Literal(escaped));
+        } else if ch == '%' {
+            if !matches!(tokens.last(), Some(LikeToken::AnyMany)) {
+                tokens.push(LikeToken::AnyMany);
+            }
+        } else if ch == '_' {
+            tokens.push(LikeToken::AnyOne);
+        } else {
+            tokens.push(LikeToken::Literal(ch));
+        }
+    }
+    Ok(tokens)
+}
+
+fn like_matches(value: &str, pattern: &[LikeToken]) -> bool {
+    let value = value.chars().collect::<Vec<_>>();
+    let mut matched = vec![false; value.len() + 1];
+    matched[0] = true;
+    for token in pattern {
+        let mut next = vec![false; value.len() + 1];
+        match token {
+            LikeToken::AnyMany => {
+                let mut reachable = false;
+                for index in 0..=value.len() {
+                    reachable |= matched[index];
+                    next[index] = reachable;
+                }
+            }
+            LikeToken::AnyOne => {
+                for index in 0..value.len() {
+                    next[index + 1] = matched[index];
+                }
+            }
+            LikeToken::Literal(expected) => {
+                for index in 0..value.len() {
+                    next[index + 1] = matched[index] && value[index] == *expected;
+                }
+            }
+        }
+        matched = next;
+    }
+    matched[value.len()]
 }
 
 fn nullify_false_values(mask: &BooleanArray) -> BooleanArray {

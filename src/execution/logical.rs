@@ -214,6 +214,12 @@ pub enum Expr {
         negated: bool,
         has_null: bool,
     },
+    Like {
+        column: String,
+        pattern: String,
+        negated: bool,
+        escape: Option<char>,
+    },
     IsNull {
         column: String,
         negated: bool,
@@ -828,7 +834,7 @@ fn collect_referenced_columns(expr: &Expr, columns: &mut Vec<String>) {
                 columns.push(comparison.column.clone());
             }
         }
-        Expr::InList { column, .. } | Expr::IsNull { column, .. } => {
+        Expr::InList { column, .. } | Expr::Like { column, .. } | Expr::IsNull { column, .. } => {
             if !columns.iter().any(|existing| existing == column) {
                 columns.push(column.clone());
             }
@@ -855,6 +861,7 @@ fn collect_conjuncts(expr: &Expr, conjuncts: &mut Vec<Expr>) {
         | Expr::Or(_, _)
         | Expr::Not(_)
         | Expr::InList { .. }
+        | Expr::Like { .. }
         | Expr::IsNull { .. } => {}
         expr => conjuncts.push(expr.clone()),
     }

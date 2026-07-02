@@ -341,7 +341,7 @@ ORDER BY l_shipmode
         },
         TpchQuery {
             name: "q13_customer_distribution",
-            expected_status: "unsupported-sql:JOIN inputs must have table aliases",
+            expected_status: "unsupported-sql:expected qualified column, got c_custkey",
             sql: r#"
 SELECT
     c_count,

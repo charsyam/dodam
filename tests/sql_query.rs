@@ -1162,6 +1162,33 @@ async fn executes_inner_join_sql() {
 }
 
 #[tokio::test]
+async fn executes_join_sql_without_explicit_aliases() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let orders_path = tempdir.path().join("orders.parquet");
+    let customers_path = tempdir.path().join("customers.parquet");
+    write_orders_parquet(&orders_path);
+    write_customers_parquet(&customers_path);
+
+    let sql = format!(
+        "SELECT orders.id, customers.name FROM '{}' JOIN '{}' ON customer_id = id WHERE customers.name = 'alice' ORDER BY orders.id",
+        orders_path.display(),
+        customers_path.display()
+    );
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute sql");
+
+    let QueryOutput::Scan { batches } = output else {
+        panic!("expected scan output");
+    };
+    assert_eq!(i32s_from_column(&batches, 0), vec![10, 12]);
+    assert_eq!(
+        strings_from_column(&batches, 1),
+        vec!["alice".to_string(), "alice".to_string()]
+    );
+}
+
+#[tokio::test]
 async fn executes_multi_column_inner_join_sql() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let left_path = tempdir.path().join("left.parquet");
@@ -1598,6 +1625,28 @@ async fn executes_left_and_right_outer_join_sql() {
         vec![
             Some("alice".to_string()),
             Some("bob".to_string()),
+            Some("alice".to_string()),
+            None,
+        ]
+    );
+
+    let left_residual_sql = format!(
+        "SELECT o.id, c.name FROM '{}' AS o LEFT JOIN '{}' AS c ON o.customer_id = c.id AND c.name NOT LIKE 'bob%' ORDER BY o.id",
+        orders_path.display(),
+        customers_path.display()
+    );
+    let QueryOutput::Scan { batches } = execute_sql(&DodamEngine::default(), &left_residual_sql, 2)
+        .await
+        .expect("execute left join with right-side ON residual")
+    else {
+        panic!("expected scan output");
+    };
+    assert_eq!(i32s_from_column(&batches, 0), vec![10, 11, 12, 13]);
+    assert_eq!(
+        optional_strings_from_column(&batches, 1),
+        vec![
+            Some("alice".to_string()),
+            None,
             Some("alice".to_string()),
             None,
         ]

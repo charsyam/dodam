@@ -131,6 +131,15 @@
   - uses ratio-style `l_discount` values such as `0.06`
   - compares `sum(l_extendedprice * l_discount)` with decimal literal bounds `0.06 +/- 0.01`
   - fixed literal folding so numeric `0.06 + 0.01` preserves decimal scale before converting to `Float64`; naive f64 folding produced `0.069999...` and incorrectly excluded the `0.07` boundary row
+- Added first-stage SQL `LIKE` / `NOT LIKE` filters for `Utf8` columns:
+  - supports `%`, `_`, and single-character `ESCAPE`
+  - keeps `NULL LIKE pattern` as SQL unknown/null in filter masks
+  - added DuckDB differential coverage for `LIKE`, `NOT LIKE`, `_`, `%`, `ESCAPE`, and null inputs
+- Advanced TPC-H Q13 planning:
+  - explicit table aliases are no longer required for JOIN inputs; unaliased joins use the table/file stem as the execution prefix
+  - unqualified equality columns in JOIN `ON` are accepted left-to-right, covering canonical `c_custkey = o_custkey` style predicates
+  - right-side-only residual predicates in `INNER`/`LEFT`/`SEMI` JOIN `ON` clauses are pushed into the right input filter, covering `AND o_comment NOT LIKE ...`
+  - current Q13 blocker moved to unqualified join projection/group/aggregate column resolution (`c_custkey`, `o_orderkey`)
 - The TPC-H-lite suite caught missing `Date32` `min`/`max` aggregate support; added `Date32` aggregate state and `Date32Array` result materialization.
 - The TPC-H-lite join aggregate case caught an aggregate join output projection correctness issue around qualified column names when the cost model chooses the left side as the hash build input.
 - Fixed build-side-aware join output projection mapping for hash/materialized join output schemas and restored aggregate join output projection pushdown.

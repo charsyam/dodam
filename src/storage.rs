@@ -492,7 +492,11 @@ fn row_group_may_match(
             && row_group_may_match(builder, row_group_index, right)?),
         Expr::Or(left, right) => Ok(row_group_may_match(builder, row_group_index, left)?
             || row_group_may_match(builder, row_group_index, right)?),
-        Expr::Boolean(_) | Expr::InList { .. } | Expr::IsNull { .. } | Expr::Not(_) => Ok(true),
+        Expr::Boolean(_)
+        | Expr::InList { .. }
+        | Expr::Like { .. }
+        | Expr::IsNull { .. }
+        | Expr::Not(_) => Ok(true),
     }
 }
 
