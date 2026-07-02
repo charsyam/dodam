@@ -84,7 +84,7 @@ ORDER BY l_returnflag, l_linestatus
         },
         TpchQuery {
             name: "q02_minimum_cost_supplier",
-            expected_status: "unsupported-sql:expected exactly one FROM table",
+            expected_status: "needs-data:part",
             sql: r#"
 SELECT
     s_acctbal,
@@ -118,7 +118,7 @@ LIMIT 100
         },
         TpchQuery {
             name: "q03_shipping_priority",
-            expected_status: "unsupported-sql:comma joins currently support exactly two FROM tables",
+            expected_status: "needs-data:customer",
             sql: r#"
 SELECT
     l_orderkey,
@@ -158,7 +158,7 @@ ORDER BY o_orderpriority
         },
         TpchQuery {
             name: "q05_local_supplier_volume",
-            expected_status: "unsupported-sql:comma joins currently support exactly two FROM tables",
+            expected_status: "needs-data:customer",
             sql: r#"
 SELECT
     n_name,
@@ -192,7 +192,7 @@ WHERE l_shipdate >= DATE '1994-01-01'
         },
         TpchQuery {
             name: "q07_volume_shipping",
-            expected_status: "unsupported-sql:comma joins currently support exactly two FROM tables",
+            expected_status: "needs-data:supplier",
             sql: r#"
 SELECT
     supp_nation,
@@ -221,7 +221,7 @@ ORDER BY supp_nation, cust_nation, l_year
         },
         TpchQuery {
             name: "q08_national_market_share",
-            expected_status: "unsupported-sql:comma joins currently support exactly two FROM tables",
+            expected_status: "needs-data:part",
             sql: r#"
 SELECT
     o_year,
@@ -249,7 +249,7 @@ ORDER BY o_year
         },
         TpchQuery {
             name: "q09_product_type_profit",
-            expected_status: "unsupported-sql:comma joins currently support exactly two FROM tables",
+            expected_status: "needs-data:part",
             sql: r#"
 SELECT
     nation,
@@ -275,7 +275,7 @@ ORDER BY nation, o_year DESC
         },
         TpchQuery {
             name: "q10_returned_item",
-            expected_status: "unsupported-sql:comma joins currently support exactly two FROM tables",
+            expected_status: "needs-data:customer",
             sql: r#"
 SELECT
     c_custkey,
@@ -300,7 +300,7 @@ LIMIT 20
         },
         TpchQuery {
             name: "q11_important_stock",
-            expected_status: "unsupported-sql:comma joins currently support exactly two FROM tables",
+            expected_status: "needs-data:partsupp",
             sql: r#"
 SELECT
     ps_partkey,
@@ -439,7 +439,7 @@ WHERE p_partkey = l_partkey
         },
         TpchQuery {
             name: "q18_large_volume_customer",
-            expected_status: "unsupported-sql:expected exactly one FROM table",
+            expected_status: "needs-data:customer",
             sql: r#"
 SELECT
     c_name,
@@ -528,7 +528,7 @@ ORDER BY s_name
         },
         TpchQuery {
             name: "q21_suppliers_who_kept_orders_waiting",
-            expected_status: "unsupported-sql:expected exactly one FROM table",
+            expected_status: "needs-data:supplier",
             sql: r#"
 SELECT
     s_name,

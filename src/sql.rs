@@ -110,6 +110,9 @@ pub async fn execute_sql(
     if let Some(output) = try_execute_derived_sql(engine, sql, batch_size).await? {
         return Ok(output);
     }
+    if let Some(output) = try_execute_multi_comma_join_sql(engine, sql, batch_size).await? {
+        return Ok(output);
+    }
     if let Some(output) =
         try_execute_correlated_subquery_filter_sql(engine, sql, batch_size).await?
     {
@@ -1391,6 +1394,190 @@ async fn try_execute_derived_sql(
     Ok(Some(QueryOutput::Scan { batches }))
 }
 
+async fn try_execute_multi_comma_join_sql(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    if select.from.len() <= 2 {
+        return Ok(None);
+    }
+    reject_query_features(query)?;
+    reject_select_features(select)?;
+    if select.from.iter().any(|table| !table.joins.is_empty()) {
+        return Err(DodamError::UnsupportedSql(
+            "mixed comma and explicit JOIN syntax is not supported".to_string(),
+        ));
+    }
+
+    let tables = select
+        .from
+        .iter()
+        .map(|table| parse_table_factor(&table.relation))
+        .collect::<Result<Vec<_>>>()?;
+    let aliases = tables
+        .iter()
+        .map(table_ref_alias_or_name)
+        .collect::<Vec<_>>();
+    let alias_refs = aliases.iter().map(String::as_str).collect::<Vec<_>>();
+    let mut conjuncts = Vec::new();
+    let selection = select.selection.as_ref().ok_or_else(|| {
+        DodamError::UnsupportedSql("comma join requires an equality predicate in WHERE".to_string())
+    })?;
+    collect_sql_and_conjuncts(selection, &mut conjuncts);
+
+    let mut current = scan_table_for_comma_join(engine, &tables[0], batch_size).await?;
+    let mut joined_aliases = vec![aliases[0].clone()];
+    let mut used_conjuncts = vec![false; conjuncts.len()];
+    for (table, alias) in tables.iter().zip(&aliases).skip(1) {
+        let right = scan_table_for_comma_join(engine, table, batch_size).await?;
+        let mut left_keys = Vec::new();
+        let mut right_keys = Vec::new();
+        for (index, conjunct) in conjuncts.iter().enumerate() {
+            if used_conjuncts[index] {
+                continue;
+            }
+            if let Some((left_key, right_key)) =
+                comma_join_keys_for_next(conjunct, &joined_aliases, alias, &alias_refs)?
+            {
+                left_keys.push(left_key);
+                right_keys.push(right_key);
+                used_conjuncts[index] = true;
+            }
+        }
+        if left_keys.is_empty() {
+            return Err(DodamError::UnsupportedSql(format!(
+                "comma join could not find equality predicate for table {alias}"
+            )));
+        }
+        let left_prefix = if joined_aliases.len() == 1 {
+            joined_aliases[0].as_str()
+        } else {
+            "__dodam_join"
+        };
+        let stream = Box::new(HashJoinExec::new(
+            Box::new(MemoryExec::new(current)),
+            Box::new(MemoryExec::new(right)),
+            left_keys,
+            right_keys,
+            left_prefix.to_string(),
+            alias.clone(),
+            JoinBuildSide::Right,
+            JoinType::Inner,
+            Projection::All,
+        ))
+        .execute()?;
+        current = collect_batches(stream)?;
+        if left_prefix == "__dodam_join" {
+            current = strip_batch_field_prefix(current, "__dodam_join.")?;
+        }
+        joined_aliases.push(alias.clone());
+    }
+
+    let residual = conjuncts
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, conjunct)| (!used_conjuncts[index]).then_some(conjunct))
+        .collect::<Vec<_>>();
+    let residual = combine_sql_and_conjuncts(residual);
+    let group_by = parse_join_group_by(select, &alias_refs)?;
+    let projection = parse_join_projection(select, &alias_refs, &group_by)?;
+    let distinct = parse_distinct(select)?;
+    validate_distinct(
+        distinct,
+        &projection.projection,
+        &projection.aggregates,
+        None,
+    )?;
+    let filter = residual
+        .as_ref()
+        .map(|expr| parse_join_filter(expr, &projection.aliases, &alias_refs, false))
+        .transpose()?;
+    let having = select
+        .having
+        .as_ref()
+        .map(|expr| parse_join_filter(expr, &projection.aliases, &alias_refs, true))
+        .transpose()?;
+    let order_by = parse_join_order_by(query, &projection.aliases, &alias_refs)?;
+    let limit = parse_limit(query)?;
+
+    let mut batches = apply_output_filter(current, filter.as_ref())?;
+    if !projection.aggregates.is_empty() {
+        batches = append_aggregate_expression_columns(batches, &projection.aggregate_expressions)?;
+        let stream = Box::new(MemoryExec::new(batches)).execute()?;
+        let metrics = if group_by.is_empty() {
+            collect_aggregates(stream, 1, &projection.aggregates)?
+        } else {
+            collect_grouped_aggregates(stream, 1, &group_by, &projection.aggregates)?
+        };
+        let mut batches =
+            aggregate_metrics_to_batches(&metrics, &group_by, &projection.aggregates)?;
+        batches = apply_output_filter(batches, having.as_ref())?;
+        batches = apply_output_order_limit(batches, order_by.as_ref(), limit)?;
+        batches = rename_output_batches(batches, &projection.aliases)?;
+        return Ok(Some(QueryOutput::Aggregate { metrics, batches }));
+    }
+    batches = apply_output_projection(batches, &projection.projection)?;
+    if distinct {
+        batches = collect_batches(
+            Box::new(DistinctExec::new(Box::new(MemoryExec::new(batches)))).execute()?,
+        )?;
+    }
+    batches = apply_output_order_limit(batches, order_by.as_ref(), limit)?;
+    batches = rename_output_batches(batches, &projection.aliases)?;
+    Ok(Some(QueryOutput::Scan { batches }))
+}
+
+async fn scan_table_for_comma_join(
+    engine: &DodamEngine,
+    table: &SqlTableRef,
+    batch_size: usize,
+) -> Result<Vec<RecordBatch>> {
+    let stream = engine
+        .scan_parquet_batches(table.path.clone(), batch_size, None, Projection::All, None)
+        .await?;
+    collect_batches(stream)
+}
+
+fn strip_batch_field_prefix(batches: Vec<RecordBatch>, prefix: &str) -> Result<Vec<RecordBatch>> {
+    batches
+        .into_iter()
+        .map(|batch| {
+            let fields = batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| {
+                    let name = field
+                        .name()
+                        .as_str()
+                        .strip_prefix(prefix)
+                        .unwrap_or(field.name().as_str())
+                        .to_string();
+                    Arc::new(Field::new(
+                        name,
+                        field.data_type().clone(),
+                        field.is_nullable(),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            Ok(RecordBatch::try_new(
+                Arc::new(Schema::new(fields)),
+                batch.columns().to_vec(),
+            )?)
+        })
+        .collect()
+}
+
 fn parse_derived_from(select: &Select) -> Result<Option<(&Query, String)>> {
     let [table] = select.from.as_slice() else {
         return Ok(None);
@@ -2359,6 +2546,69 @@ fn comma_join_equality_keys(
         )));
     }
     Ok(None)
+}
+
+fn comma_join_keys_for_next(
+    expr: &SqlExpr,
+    joined_aliases: &[String],
+    next_alias: &str,
+    table_aliases: &[&str],
+) -> Result<Option<(String, String)>> {
+    let SqlExpr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = expr
+    else {
+        return Ok(None);
+    };
+    let Some(left_column) = maybe_join_column_name(left, table_aliases)? else {
+        return Ok(None);
+    };
+    let Some(right_column) = maybe_join_column_name(right, table_aliases)? else {
+        return Ok(None);
+    };
+    let Some(left_owner) = join_column_owner(&left_column, table_aliases) else {
+        return Ok(None);
+    };
+    let Some(right_owner) = join_column_owner(&right_column, table_aliases) else {
+        return Ok(None);
+    };
+    if left_owner == next_alias && joined_aliases.iter().any(|alias| alias == right_owner) {
+        return Ok(Some((
+            joined_comma_join_key(&right_column, right_owner, joined_aliases),
+            unqualified_join_column(&left_column, next_alias),
+        )));
+    }
+    if right_owner == next_alias && joined_aliases.iter().any(|alias| alias == left_owner) {
+        return Ok(Some((
+            joined_comma_join_key(&left_column, left_owner, joined_aliases),
+            unqualified_join_column(&right_column, next_alias),
+        )));
+    }
+    Ok(None)
+}
+
+fn join_column_owner<'a>(column: &str, table_aliases: &'a [&str]) -> Option<&'a str> {
+    table_aliases
+        .iter()
+        .copied()
+        .find(|alias| column.starts_with(&format!("{alias}.")))
+}
+
+fn joined_comma_join_key(column: &str, owner: &str, joined_aliases: &[String]) -> String {
+    if joined_aliases.len() == 1 && joined_aliases[0] == owner {
+        unqualified_join_column(column, owner)
+    } else {
+        column.to_string()
+    }
+}
+
+fn unqualified_join_column(column: &str, alias: &str) -> String {
+    column
+        .strip_prefix(&format!("{alias}."))
+        .expect("qualified join column")
+        .to_string()
 }
 
 fn maybe_join_column_name(expr: &SqlExpr, table_aliases: &[&str]) -> Result<Option<String>> {

@@ -1244,6 +1244,33 @@ async fn executes_comma_join_aggregate_expression_sql() {
 }
 
 #[tokio::test]
+async fn executes_three_table_comma_join_aggregate_sql() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let customer_path = tempdir.path().join("customer.parquet");
+    let orders_path = tempdir.path().join("orders.parquet");
+    let lineitem_path = tempdir.path().join("lineitem.parquet");
+    write_q13_customer_parquet(&customer_path);
+    write_q13_orders_parquet(&orders_path);
+    write_q13_lineitem_parquet(&lineitem_path);
+
+    let sql = format!(
+        "SELECT c_custkey, sum(l_quantity) AS total_quantity FROM '{}' AS customer, '{}' AS orders, '{}' AS lineitem WHERE c_custkey = o_custkey AND o_orderkey = l_orderkey GROUP BY c_custkey ORDER BY c_custkey",
+        customer_path.display(),
+        orders_path.display(),
+        lineitem_path.display()
+    );
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute three table comma join aggregate sql");
+
+    let QueryOutput::Aggregate { batches, .. } = output else {
+        panic!("expected aggregate output");
+    };
+    assert_eq!(i64s_from_column(&batches, 0), vec![1, 2, 3]);
+    assert_eq!(i64s_from_column(&batches, 1), vec![12, 3, 11]);
+}
+
+#[tokio::test]
 async fn executes_tpch_q13_style_join_aggregate_without_explicit_aliases() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let customer_path = tempdir.path().join("customer.parquet");
@@ -2603,6 +2630,25 @@ fn write_q13_orders_parquet(path: &std::path::Path) {
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(orderkeys), Arc::new(custkeys), Arc::new(comments)],
+    )
+    .expect("record batch");
+
+    let file = File::create(path).expect("create parquet file");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+}
+
+fn write_q13_lineitem_parquet(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("l_orderkey", DataType::Int32, false),
+        Field::new("l_quantity", DataType::Int64, false),
+    ]));
+    let orderkeys = Int32Array::from_iter_values([10, 11, 12, 13]);
+    let quantities = Int64Array::from_iter_values([5, 7, 3, 11]);
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(orderkeys), Arc::new(quantities)],
     )
     .expect("record batch");
 

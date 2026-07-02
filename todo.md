@@ -119,7 +119,7 @@
 - Added a full TPC-H 22-query support inventory harness:
   - records the current parser/planner support status for each canonical TPC-H query
   - turns unsupported reasons into a regression-tested baseline
-  - current dominant blockers are comma/multi-table `FROM` planning, `WITH`, `SUBSTRING`, `LIKE`/`NOT LIKE`, `count(DISTINCT ...)`, and richer nested/correlated subquery shapes
+  - current dominant blockers are `WITH`, column-to-column predicates, `count(DISTINCT ...)`, scalar expressions over aggregate outputs, join equality extraction under `OR`, and richer nested/correlated subquery shapes
 - Improved TPC-H Q1/Q6 coverage:
   - added aggregate input expressions such as `sum(l_extendedprice * l_discount)` by materializing deterministic temporary expression columns before aggregation
   - added constant folding for numeric literal arithmetic in predicates
@@ -153,6 +153,11 @@
   - supports explicit aliases and TPC-H-style inferred unqualified columns through the existing join column resolver
   - added SQL coverage comparing comma join output with the existing join path
   - TPC-H inventory now advances Q12/Q14/Q19 from FROM-list parsing to join aggregate expression blockers, while 3+ table queries report the explicit 2-table comma join limitation
+- Added correctness-first multi-table comma join planning:
+  - supports 3+ table `FROM a, b, c...` inner joins by materializing left-deep hash joins over equality predicates from top-level `AND` filters
+  - preserves residual filters, grouped aggregates, aggregate input expressions, `ORDER BY`, `LIMIT`, aliases, and `DISTINCT` over the final joined batches
+  - added SQL coverage for a 3-table TPC-H-shaped `customer/orders/lineitem` grouped aggregate
+  - TPC-H inventory now advances Q2/Q3/Q5/Q7/Q8/Q9/Q10/Q11/Q18/Q21 past the previous multi-table `FROM` parser/planner blockers to `needs-data:*`
 - Added join aggregate input expression support:
   - materializes deterministic temporary expression columns over join output before aggregation, matching the existing single-table aggregate expression path
   - supports arithmetic and searched `CASE` inside join aggregate inputs
