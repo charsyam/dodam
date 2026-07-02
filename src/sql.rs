@@ -957,6 +957,48 @@ async fn rewrite_uncorrelated_scalar_subqueries_to_literals(
     batch_size: usize,
 ) -> Result<SqlExpr> {
     match expr {
+        SqlExpr::Exists { subquery, negated } => {
+            match Box::pin(execute_sql(engine, &subquery.to_string(), batch_size)).await {
+                Ok(output) => {
+                    let exists = query_output_batches(output)?
+                        .iter()
+                        .any(|batch| batch.num_rows() > 0);
+                    Ok(SqlExpr::Value(
+                        Value::Boolean(if negated { !exists } else { exists }).with_empty_span(),
+                    ))
+                }
+                Err(DodamError::UnsupportedSql(_)) | Err(DodamError::UnknownColumn(_)) => {
+                    Ok(SqlExpr::Exists { subquery, negated })
+                }
+                Err(error) => Err(error),
+            }
+        }
+        SqlExpr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => match Box::pin(execute_sql(engine, &subquery.to_string(), batch_size)).await {
+            Ok(output) => {
+                let values =
+                    literal_values_from_single_column_batches(query_output_batches(output)?)?;
+                if values.is_empty() {
+                    return Ok(SqlExpr::Value(Value::Boolean(negated).with_empty_span()));
+                }
+                Ok(SqlExpr::InList {
+                    expr,
+                    list: values.into_iter().map(literal_value_to_sql_expr).collect(),
+                    negated,
+                })
+            }
+            Err(DodamError::UnsupportedSql(_)) | Err(DodamError::UnknownColumn(_)) => {
+                Ok(SqlExpr::InSubquery {
+                    expr,
+                    subquery,
+                    negated,
+                })
+            }
+            Err(error) => Err(error),
+        },
         SqlExpr::Subquery(subquery) => {
             match Box::pin(execute_sql(engine, &subquery.to_string(), batch_size)).await {
                 Ok(output) => scalar_literal_value_from_batches(query_output_batches(output)?)
@@ -6954,6 +6996,13 @@ fn sql_expr_to_filter_expr(
         SqlExpr::Nested(expr) => {
             sql_expr_to_filter_expr(expr, aliases, table_alias, allow_aggregates)
         }
+        SqlExpr::Value(value) => match &value.value {
+            Value::Boolean(value) => Ok(Expr::Boolean(Some(*value))),
+            Value::Null => Ok(Expr::Boolean(None)),
+            _ => Err(DodamError::UnsupportedSql(format!(
+                "unsupported WHERE expression: {expr}"
+            ))),
+        },
         SqlExpr::Between {
             expr,
             negated,

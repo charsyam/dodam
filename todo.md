@@ -512,7 +512,7 @@ Tried and rejected or neutral:
   - Added tpchgen-rs based real-data workflow:
     - `scripts/gen_tpchgen_parquet.sh` generates parquet TPC-H data via `tpchgen-cli`
     - `scripts/run_tpch_real.py` rewrites canonical TPC-H table refs to parquet paths and runs all 22 queries through Dodam
-    - SF=0.01 tpchgen parquet currently runs 21/22 queries after correlated scalar residual filtering and Decimal128 min/max support; the remaining blocker is Q20 runtime/timeout.
+    - SF=0.01 tpchgen parquet currently runs 22/22 queries after correlated scalar residual filtering, Decimal128 min/max support, and pre-row-loop literalization of executable `EXISTS`/`IN` subqueries.
   - Materialized join subquery rewrite is intentionally scoped to multi-FROM queries and falls back to the original parser path when subquery execution is unsupported.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.

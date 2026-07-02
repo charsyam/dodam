@@ -41,6 +41,34 @@ async fn executes_projection_filter_order_limit_sql() {
 }
 
 #[tokio::test]
+async fn filters_with_boolean_literal_sql() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let path = tempdir.path().join("part-000.parquet");
+    write_test_parquet(&path);
+
+    let sql = format!("SELECT id FROM '{}' WHERE true ORDER BY id", path.display());
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute true filter sql");
+    let QueryOutput::Scan { batches } = output else {
+        panic!("expected scan output");
+    };
+    assert_eq!(ids_from_batches(&batches), vec![0, 1, 2, 3, 4, 5]);
+
+    let sql = format!(
+        "SELECT id FROM '{}' WHERE false ORDER BY id",
+        path.display()
+    );
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute false filter sql");
+    let QueryOutput::Scan { batches } = output else {
+        panic!("expected scan output");
+    };
+    assert!(ids_from_batches(&batches).is_empty());
+}
+
+#[tokio::test]
 async fn executes_derived_table_sql() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let path = tempdir.path().join("part-000.parquet");
