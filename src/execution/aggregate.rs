@@ -4,7 +4,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 
 use arrow::array::{
     Array, ArrayRef, Date32Array, Date64Array, Float64Array, Int32Array, Int64Array, StringArray,
-    TimestampMillisecondArray,
+    TimestampMillisecondArray, UInt64Array,
 };
 use arrow::compute::kernels::aggregate::{max, max_string, min, min_string, sum};
 use arrow::datatypes::{DataType, TimeUnit};
@@ -246,7 +246,7 @@ fn collect_single_key_count_sum_groups(
         let key_column = batch.column(column_index(&batch, &group_by[0])?);
         if !matches!(
             key_column.data_type(),
-            DataType::Utf8 | DataType::Int32 | DataType::Int64
+            DataType::Utf8 | DataType::Int32 | DataType::Int64 | DataType::UInt64
         ) {
             return collect_grouped_aggregates_generic(
                 stream,
@@ -326,6 +326,10 @@ enum CountSumGroupIndex {
         groups: AggregateHashMap<i64, usize>,
         null_group: Option<usize>,
     },
+    UInt64 {
+        groups: AggregateHashMap<u64, usize>,
+        null_group: Option<usize>,
+    },
 }
 
 impl CountSumGroupIndex {
@@ -343,6 +347,10 @@ impl CountSumGroupIndex {
                 null_group: None,
             },
             DataType::Int64 => Self::Int64 {
+                groups: AggregateHashMap::default(),
+                null_group: None,
+            },
+            DataType::UInt64 => Self::UInt64 {
                 groups: AggregateHashMap::default(),
                 null_group: None,
             },
@@ -428,6 +436,28 @@ impl CountSumGroupIndex {
                 let group_id = groups_out.len();
                 groups.insert(key, group_id);
                 groups_out.push(CountSumGroup::new(GroupValue::Int64(Some(key)), sum_input));
+                Ok(group_id)
+            }
+            Self::UInt64 { groups, null_group } => {
+                let values = key_column
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .expect("UInt64 group key");
+                if values.is_null(row) {
+                    return Ok(count_sum_null_group_id(
+                        null_group,
+                        groups_out,
+                        GroupValue::UInt64(None),
+                        sum_input,
+                    ));
+                }
+                let key = values.value(row);
+                if let Some(group_id) = groups.get(&key).copied() {
+                    return Ok(group_id);
+                }
+                let group_id = groups_out.len();
+                groups.insert(key, group_id);
+                groups_out.push(CountSumGroup::new(GroupValue::UInt64(Some(key)), sum_input));
                 Ok(group_id)
             }
             Self::Unset => unreachable!("group index type should be initialized"),
@@ -651,7 +681,7 @@ fn collect_single_key_groups(
         let key_column = batch.column(column_index(&batch, &group_by[0])?);
         if !matches!(
             key_column.data_type(),
-            DataType::Utf8 | DataType::Int32 | DataType::Int64
+            DataType::Utf8 | DataType::Int32 | DataType::Int64 | DataType::UInt64
         ) {
             return collect_grouped_aggregates_generic(
                 stream,
@@ -697,6 +727,10 @@ enum SingleKeyGroupIndex {
         groups: AggregateHashMap<i64, usize>,
         null_group: Option<usize>,
     },
+    UInt64 {
+        groups: AggregateHashMap<u64, usize>,
+        null_group: Option<usize>,
+    },
 }
 
 impl SingleKeyGroupIndex {
@@ -714,6 +748,10 @@ impl SingleKeyGroupIndex {
                 null_group: None,
             },
             DataType::Int64 => Self::Int64 {
+                groups: AggregateHashMap::default(),
+                null_group: None,
+            },
+            DataType::UInt64 => Self::UInt64 {
                 groups: AggregateHashMap::default(),
                 null_group: None,
             },
@@ -799,6 +837,28 @@ impl SingleKeyGroupIndex {
                 let group_id = groups_out.len();
                 groups.insert(key, group_id);
                 groups_out.push(SingleKeyGroup::new(GroupValue::Int64(Some(key)), inputs));
+                Ok(group_id)
+            }
+            Self::UInt64 { groups, null_group } => {
+                let values = key_column
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .expect("UInt64 group key");
+                if values.is_null(row) {
+                    return Ok(group_id_for_null(
+                        null_group,
+                        groups_out,
+                        GroupValue::UInt64(None),
+                        inputs,
+                    ));
+                }
+                let key = values.value(row);
+                if let Some(group_id) = groups.get(&key).copied() {
+                    return Ok(group_id);
+                }
+                let group_id = groups_out.len();
+                groups.insert(key, group_id);
+                groups_out.push(SingleKeyGroup::new(GroupValue::UInt64(Some(key)), inputs));
                 Ok(group_id)
             }
             Self::Unset => unreachable!("group index type should be initialized"),
@@ -1366,6 +1426,15 @@ fn group_key(columns: &[(&str, &ArrayRef)], row: usize) -> Result<Vec<GroupValue
                     values.is_valid(row).then(|| values.value(row)),
                 ))
             }
+            DataType::UInt64 => {
+                let values = column
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .expect("UInt64 data type");
+                Ok(GroupValue::UInt64(
+                    values.is_valid(row).then(|| values.value(row)),
+                ))
+            }
             DataType::Utf8 => {
                 let values = column
                     .as_any()
@@ -1388,9 +1457,16 @@ fn compare_group_keys(left: &[GroupValue], right: &[GroupValue]) -> std::cmp::Or
         .zip(right)
         .map(|(left, right)| match (left, right) {
             (GroupValue::Int64(left), GroupValue::Int64(right)) => left.cmp(right),
+            (GroupValue::UInt64(left), GroupValue::UInt64(right)) => left.cmp(right),
             (GroupValue::Utf8(left), GroupValue::Utf8(right)) => left.cmp(right),
-            (GroupValue::Int64(_), GroupValue::Utf8(_)) => std::cmp::Ordering::Less,
-            (GroupValue::Utf8(_), GroupValue::Int64(_)) => std::cmp::Ordering::Greater,
+            (GroupValue::Int64(_), GroupValue::UInt64(_) | GroupValue::Utf8(_)) => {
+                std::cmp::Ordering::Less
+            }
+            (GroupValue::UInt64(_), GroupValue::Int64(_)) => std::cmp::Ordering::Greater,
+            (GroupValue::UInt64(_), GroupValue::Utf8(_)) => std::cmp::Ordering::Less,
+            (GroupValue::Utf8(_), GroupValue::Int64(_) | GroupValue::UInt64(_)) => {
+                std::cmp::Ordering::Greater
+            }
         })
         .find(|ordering| *ordering != std::cmp::Ordering::Equal)
         .unwrap_or_else(|| left.len().cmp(&right.len()))

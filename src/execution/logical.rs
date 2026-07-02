@@ -58,6 +58,7 @@ pub struct GroupAggregateResult {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum GroupValue {
     Int64(Option<i64>),
+    UInt64(Option<u64>),
     Utf8(Option<String>),
 }
 
@@ -65,8 +66,11 @@ impl std::fmt::Display for GroupValue {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Int64(Some(value)) => write!(formatter, "{value}"),
+            Self::UInt64(Some(value)) => write!(formatter, "{value}"),
             Self::Utf8(Some(value)) => formatter.write_str(value),
-            Self::Int64(None) | Self::Utf8(None) => formatter.write_str("NULL"),
+            Self::Int64(None) | Self::UInt64(None) | Self::Utf8(None) => {
+                formatter.write_str("NULL")
+            }
         }
     }
 }

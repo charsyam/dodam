@@ -1189,6 +1189,30 @@ async fn executes_join_sql_without_explicit_aliases() {
 }
 
 #[tokio::test]
+async fn executes_tpch_q13_style_join_aggregate_without_explicit_aliases() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let customer_path = tempdir.path().join("customer.parquet");
+    let orders_path = tempdir.path().join("orders.parquet");
+    write_q13_customer_parquet(&customer_path);
+    write_q13_orders_parquet(&orders_path);
+
+    let sql = format!(
+        "SELECT c_count, count(*) AS custdist FROM (SELECT c_custkey, count(o_orderkey) AS c_count FROM '{}' LEFT OUTER JOIN '{}' ON c_custkey = o_custkey AND o_comment NOT LIKE '%special%requests%' GROUP BY c_custkey) AS c_orders GROUP BY c_count ORDER BY custdist DESC, c_count DESC",
+        customer_path.display(),
+        orders_path.display()
+    );
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute TPC-H Q13-style sql");
+
+    let QueryOutput::Aggregate { batches, .. } = output else {
+        panic!("expected aggregate output");
+    };
+    assert_eq!(u64s_from_column(&batches, 0), vec![1, 0]);
+    assert_eq!(u64s_from_column(&batches, 1), vec![2, 1]);
+}
+
+#[tokio::test]
 async fn executes_multi_column_inner_join_sql() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let left_path = tempdir.path().join("left.parquet");
@@ -2488,6 +2512,47 @@ fn write_customers_parquet(path: &std::path::Path) {
         .set_max_row_group_row_count(Some(2))
         .build();
     let mut writer = ArrowWriter::try_new(file, schema, Some(props)).expect("parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+}
+
+fn write_q13_customer_parquet(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "c_custkey",
+        DataType::Int32,
+        false,
+    )]));
+    let keys = Int32Array::from_iter_values([1, 2, 3]);
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(keys)]).expect("record batch");
+
+    let file = File::create(path).expect("create parquet file");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+}
+
+fn write_q13_orders_parquet(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("o_orderkey", DataType::Int32, false),
+        Field::new("o_custkey", DataType::Int32, false),
+        Field::new("o_comment", DataType::Utf8, false),
+    ]));
+    let orderkeys = Int32Array::from_iter_values([10, 11, 12, 13]);
+    let custkeys = Int32Array::from_iter_values([1, 1, 2, 3]);
+    let comments = StringArray::from_iter_values([
+        "ordinary order",
+        "special pending requests",
+        "regular request",
+        "special requests",
+    ]);
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(orderkeys), Arc::new(custkeys), Arc::new(comments)],
+    )
+    .expect("record batch");
+
+    let file = File::create(path).expect("create parquet file");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
     writer.write(&batch).expect("write parquet batch");
     writer.close().expect("close parquet writer");
 }

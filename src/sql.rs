@@ -2431,15 +2431,17 @@ fn parse_join_projection(
     for item in &select.projection {
         match item {
             SelectItem::Wildcard(_) => wildcard = true,
-            SelectItem::UnnamedExpr(expr @ SqlExpr::CompoundIdentifier(_)) => {
-                columns.push(qualified_join_column(expr, table_aliases)?);
+            SelectItem::UnnamedExpr(
+                expr @ (SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_)),
+            ) => {
+                columns.push(join_column_name(expr, table_aliases)?);
             }
             SelectItem::UnnamedExpr(SqlExpr::Function(function)) => {
                 aggregates.push(parse_join_aggregate(function, table_aliases)?);
             }
             SelectItem::ExprWithAlias { expr, alias } => match expr {
-                SqlExpr::CompoundIdentifier(_) => {
-                    let column = qualified_join_column(expr, table_aliases)?;
+                SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
+                    let column = join_column_name(expr, table_aliases)?;
                     aliases.push((alias.value.clone(), column.clone()));
                     columns.push(column);
                 }
@@ -2519,7 +2521,7 @@ fn parse_join_group_by(select: &Select, table_aliases: &[&str]) -> Result<Vec<St
     match &select.group_by {
         GroupByExpr::Expressions(expressions, modifiers) if modifiers.is_empty() => expressions
             .iter()
-            .map(|expr| qualified_join_column(expr, table_aliases))
+            .map(|expr| join_column_name(expr, table_aliases))
             .collect::<Result<Vec<_>>>(),
         GroupByExpr::Expressions(_, _) | GroupByExpr::All(_) => Err(DodamError::UnsupportedSql(
             "GROUP BY modifiers and GROUP BY ALL are not supported".to_string(),
@@ -2555,9 +2557,7 @@ fn parse_join_order_by(
             }
             let column = match &order.expr {
                 SqlExpr::Identifier(ident) => resolve_alias(&ident.value, aliases),
-                SqlExpr::CompoundIdentifier(_) => {
-                    qualified_join_column(&order.expr, table_aliases)?
-                }
+                SqlExpr::CompoundIdentifier(_) => join_column_name(&order.expr, table_aliases)?,
                 SqlExpr::Function(function) => resolve_alias(
                     &parse_join_aggregate(function, table_aliases)?.to_string(),
                     aliases,
@@ -2700,8 +2700,15 @@ fn join_filter_column(
     allow_aggregates: bool,
 ) -> Result<String> {
     match expr {
-        SqlExpr::Identifier(ident) => Ok(resolve_alias(&ident.value, aliases)),
-        SqlExpr::CompoundIdentifier(_) => qualified_join_column(expr, table_aliases),
+        SqlExpr::Identifier(ident) => {
+            let resolved = resolve_alias(&ident.value, aliases);
+            if resolved == ident.value {
+                join_column_name(expr, table_aliases)
+            } else {
+                Ok(resolved)
+            }
+        }
+        SqlExpr::CompoundIdentifier(_) => join_column_name(expr, table_aliases),
         SqlExpr::Function(function) if allow_aggregates => {
             Ok(parse_join_aggregate(function, table_aliases)?.to_string())
         }
@@ -2733,6 +2740,50 @@ fn qualified_join_column(expr: &SqlExpr, table_aliases: &[&str]) -> Result<Strin
         )));
     }
     Ok(format!("{}.{}", qualifier.value, column.value))
+}
+
+fn join_column_name(expr: &SqlExpr, table_aliases: &[&str]) -> Result<String> {
+    match expr {
+        SqlExpr::Identifier(ident) => infer_unqualified_join_column(&ident.value, table_aliases),
+        SqlExpr::CompoundIdentifier(parts) => match parts.as_slice() {
+            [_] => infer_unqualified_join_column(&parts[0].value, table_aliases),
+            [_, _] => qualified_join_column(expr, table_aliases),
+            _ => Err(DodamError::UnsupportedSql(format!(
+                "only table-qualified columns are supported, got {expr}"
+            ))),
+        },
+        _ => Err(DodamError::UnsupportedSql(format!(
+            "expected JOIN column, got {expr}"
+        ))),
+    }
+}
+
+fn infer_unqualified_join_column(column: &str, table_aliases: &[&str]) -> Result<String> {
+    let Some((prefix, _)) = column.split_once('_') else {
+        return Err(DodamError::UnsupportedSql(format!(
+            "expected qualified column, got {column}"
+        )));
+    };
+    let Some(prefix_initial) = prefix.chars().next() else {
+        return Err(DodamError::UnsupportedSql(format!(
+            "cannot infer JOIN table for unqualified column {column}"
+        )));
+    };
+    let matches = table_aliases
+        .iter()
+        .filter(|alias| {
+            alias
+                .chars()
+                .next()
+                .is_some_and(|initial| initial.eq_ignore_ascii_case(&prefix_initial))
+        })
+        .collect::<Vec<_>>();
+    let [alias] = matches.as_slice() else {
+        return Err(DodamError::UnsupportedSql(format!(
+            "cannot infer JOIN table for unqualified column {column}"
+        )));
+    };
+    Ok(format!("{alias}.{column}"))
 }
 
 #[derive(Debug)]
@@ -3285,12 +3336,14 @@ fn parse_join_aggregate(
             )));
         }
         [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)] => "*".to_string(),
-        [FunctionArg::Unnamed(FunctionArgExpr::Expr(expr @ SqlExpr::CompoundIdentifier(_)))] => {
-            qualified_join_column(expr, table_aliases)?
-        }
+        [
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                expr @ (SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_)),
+            )),
+        ] => join_column_name(expr, table_aliases)?,
         _ => {
             return Err(DodamError::UnsupportedSql(format!(
-                "JOIN aggregate arguments must be * or qualified columns, got {}",
+                "JOIN aggregate arguments must be * or columns, got {}",
                 function.args
             )));
         }
@@ -5019,6 +5072,7 @@ fn group_values_to_column(
         .iter()
         .find_map(|value| match value {
             Some(crate::execution::GroupValue::Utf8(_)) => Some(DataType::Utf8),
+            Some(crate::execution::GroupValue::UInt64(_)) => Some(DataType::UInt64),
             Some(crate::execution::GroupValue::Int64(_)) => Some(DataType::Int64),
             None => None,
         })
@@ -5036,6 +5090,19 @@ fn group_values_to_column(
             (
                 Field::new(name, DataType::Utf8, true),
                 Arc::new(StringArray::from(values)),
+            )
+        }
+        DataType::UInt64 => {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    Some(crate::execution::GroupValue::UInt64(value)) => *value,
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (
+                Field::new(name, DataType::UInt64, true),
+                Arc::new(UInt64Array::from(values)),
             )
         }
         _ => {
