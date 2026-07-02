@@ -509,6 +509,10 @@ Tried and rejected or neutral:
   - Q17 now evaluates correlated scalar aggregate subqueries in two-table comma join residual filters and advances to the `lineitem` input requirement.
   - Q20 now attempts the outer join `IN (SELECT ...)` materialization and advances to the `partsupp` input requirement; real-data execution is still expected to expose the nested correlated scalar aggregate blocker.
   - Q7 now executes against the SF=0.01 parquet fixture, including `EXTRACT(YEAR FROM ...)`, arithmetic derived-table projections, multi-table comma joins, and grouped aggregation over the derived result.
+  - Added tpchgen-rs based real-data workflow:
+    - `scripts/gen_tpchgen_parquet.sh` generates parquet TPC-H data via `tpchgen-cli`
+    - `scripts/run_tpch_real.py` rewrites canonical TPC-H table refs to parquet paths and runs all 22 queries through Dodam
+    - SF=0.01 tpchgen parquet currently runs 19/22 queries; remaining blockers are Q2 outer column binding in a correlated scalar subquery, Q20 nested correlated subquery runtime/timeout, and Q21 `NOT EXISTS` join residual support.
   - Materialized join subquery rewrite is intentionally scoped to multi-FROM queries and falls back to the original parser path when subquery execution is unsupported.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.

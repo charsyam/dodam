@@ -600,8 +600,15 @@ async fn try_execute_correlated_exists_semijoin_sql(
         let mut batches =
             aggregate_metrics_to_batches(&metrics, &group_by, &parsed_projection.aggregates)?;
         batches = apply_output_filter(batches, having.as_ref())?;
+        let has_output_expressions =
+            projection_requires_expression_path(&parsed_projection.expressions);
+        if has_output_expressions {
+            batches = apply_output_expression_projection(batches, &parsed_projection.expressions)?;
+        }
         batches = apply_output_order_limit(batches, order_by.as_ref(), limit)?;
-        batches = rename_output_batches(batches, &parsed_projection.aliases)?;
+        if !has_output_expressions {
+            batches = rename_output_batches(batches, &parsed_projection.aliases)?;
+        }
         return Ok(Some(QueryOutput::Aggregate { metrics, batches }));
     }
 
@@ -798,6 +805,8 @@ async fn try_execute_correlated_subquery_filter_sql(
     let selection_sql = selection.to_string();
     if let Some(outer_alias) = path.alias.as_deref()
         && !subquery_references_outer_alias(&selection_sql, outer_alias)
+        && !tpch_alias_prefix(outer_alias)
+            .is_some_and(|prefix| selection_sql.contains(&format!("{prefix}_")))
     {
         return Ok(None);
     }
@@ -857,8 +866,15 @@ async fn try_execute_correlated_subquery_filter_sql(
         let mut batches =
             aggregate_metrics_to_batches(&metrics, &group_by, &parsed_projection.aggregates)?;
         batches = apply_output_filter(batches, having.as_ref())?;
+        let has_output_expressions =
+            projection_requires_expression_path(&parsed_projection.expressions);
+        if has_output_expressions {
+            batches = apply_output_expression_projection(batches, &parsed_projection.expressions)?;
+        }
         batches = apply_output_order_limit(batches, order_by.as_ref(), limit)?;
-        batches = rename_output_batches(batches, &parsed_projection.aliases)?;
+        if !has_output_expressions {
+            batches = rename_output_batches(batches, &parsed_projection.aliases)?;
+        }
         return Ok(Some(QueryOutput::Aggregate { metrics, batches }));
     }
 
@@ -1212,6 +1228,13 @@ fn bind_outer_row_references(
         let literal = sql_literal(&literal);
         if let Some(outer_alias) = outer_alias {
             sql = sql.replace(&format!("{outer_alias}.{}", field.name()), &literal);
+            if unqualified_column_matches_table_alias(field.name(), Some(outer_alias)) {
+                sql = replace_identifier_tokens_preserving_local_subqueries(
+                    &sql,
+                    field.name(),
+                    &literal,
+                );
+            }
         } else {
             sql =
                 replace_identifier_tokens_preserving_local_subqueries(&sql, field.name(), &literal);
@@ -1796,6 +1819,11 @@ fn collect_predicate_expression_columns(
                 collect_predicate_expression_columns(item, table_alias, columns)?;
             }
         }
+        SqlExpr::Exists { subquery, .. }
+        | SqlExpr::InSubquery { subquery, .. }
+        | SqlExpr::Subquery(subquery) => {
+            collect_subquery_outer_columns(subquery, table_alias, columns)?;
+        }
         SqlExpr::Cast { expr, .. } => {
             collect_predicate_expression_columns(expr, table_alias, columns)?;
         }
@@ -1803,6 +1831,94 @@ fn collect_predicate_expression_columns(
         _ => {}
     }
     Ok(())
+}
+
+fn collect_subquery_outer_columns(
+    query: &Query,
+    table_alias: Option<&str>,
+    columns: &mut Vec<String>,
+) -> Result<()> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(());
+    };
+    if let Some(selection) = select.selection.as_ref() {
+        collect_outer_column_candidates(selection, table_alias, columns)?;
+    }
+    Ok(())
+}
+
+fn collect_outer_column_candidates(
+    expr: &SqlExpr,
+    table_alias: Option<&str>,
+    columns: &mut Vec<String>,
+) -> Result<()> {
+    match expr {
+        SqlExpr::BinaryOp { left, right, .. } => {
+            collect_outer_column_candidates(left, table_alias, columns)?;
+            collect_outer_column_candidates(right, table_alias, columns)?;
+        }
+        SqlExpr::UnaryOp { expr, .. }
+        | SqlExpr::Nested(expr)
+        | SqlExpr::IsNull(expr)
+        | SqlExpr::IsNotNull(expr)
+        | SqlExpr::Cast { expr, .. } => {
+            collect_outer_column_candidates(expr, table_alias, columns)?;
+        }
+        SqlExpr::Identifier(ident) => {
+            if unqualified_column_matches_table_alias(&ident.value, table_alias) {
+                add_column_once(columns, ident.value.clone());
+            }
+        }
+        SqlExpr::CompoundIdentifier(parts) => {
+            if let [qualifier, column] = parts.as_slice()
+                && table_alias.is_some_and(|alias| qualifier.value.eq_ignore_ascii_case(alias))
+            {
+                add_column_once(columns, column.value.clone());
+            }
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            collect_outer_column_candidates(expr, table_alias, columns)?;
+            for item in list {
+                collect_outer_column_candidates(item, table_alias, columns)?;
+            }
+        }
+        SqlExpr::Exists { subquery, .. }
+        | SqlExpr::InSubquery { subquery, .. }
+        | SqlExpr::Subquery(subquery) => {
+            collect_subquery_outer_columns(subquery, table_alias, columns)?;
+        }
+        SqlExpr::Function(function) => {
+            for arg in function_arg_exprs(function) {
+                collect_outer_column_candidates(arg, table_alias, columns)?;
+            }
+        }
+        SqlExpr::Value(_) => {}
+        _ => {}
+    }
+    Ok(())
+}
+
+fn unqualified_column_matches_table_alias(column: &str, table_alias: Option<&str>) -> bool {
+    let Some(table_alias) = table_alias else {
+        return false;
+    };
+    let Some((prefix, _)) = column.split_once('_') else {
+        return false;
+    };
+    infer_tpch_table_alias(prefix, &[table_alias]).is_some_and(|alias| alias == table_alias)
+}
+
+fn function_arg_exprs(function: &sqlparser::ast::Function) -> Vec<&SqlExpr> {
+    let FunctionArguments::List(args) = &function.args else {
+        return Vec::new();
+    };
+    args.args
+        .iter()
+        .filter_map(|arg| match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Some(expr),
+            _ => None,
+        })
+        .collect()
 }
 
 fn expr_contains_materializable_subquery(expr: &SqlExpr) -> bool {
@@ -2107,6 +2223,11 @@ async fn rewrite_materializable_subqueries_to_literals(
                 };
             let values = literal_values_from_single_column_batches(query_output_batches(output)?)?;
             *changed = true;
+            if values.is_empty() {
+                return Ok(Some(SqlExpr::Value(
+                    Value::Boolean(negated).with_empty_span(),
+                )));
+            }
             Ok(Some(SqlExpr::InList {
                 expr,
                 list: values.into_iter().map(literal_value_to_sql_expr).collect(),
@@ -2963,7 +3084,11 @@ async fn try_execute_derived_sql(
     let limit = parse_limit(query)?;
 
     if !parsed_projection.aggregates.is_empty() {
-        let filtered_batches = apply_output_filter(inner_batches, filter.as_ref())?;
+        let mut filtered_batches = apply_output_filter(inner_batches, filter.as_ref())?;
+        filtered_batches = append_aggregate_expression_columns(
+            filtered_batches,
+            &parsed_projection.aggregate_expressions,
+        )?;
         let stream = Box::new(MemoryExec::new(filtered_batches)).execute()?;
         let metrics = if group_by.is_empty() {
             collect_aggregates(stream, 1, &parsed_projection.aggregates)?
@@ -2973,8 +3098,15 @@ async fn try_execute_derived_sql(
         let mut batches =
             aggregate_metrics_to_batches(&metrics, &group_by, &parsed_projection.aggregates)?;
         batches = apply_output_filter(batches, having.as_ref())?;
+        let has_output_expressions =
+            projection_requires_expression_path(&parsed_projection.expressions);
+        if has_output_expressions {
+            batches = apply_output_expression_projection(batches, &parsed_projection.expressions)?;
+        }
         batches = apply_output_order_limit(batches, order_by.as_ref(), limit)?;
-        batches = rename_output_batches(batches, &parsed_projection.aliases)?;
+        if !has_output_expressions {
+            batches = rename_output_batches(batches, &parsed_projection.aliases)?;
+        }
         return Ok(Some(QueryOutput::Aggregate { metrics, batches }));
     }
 
@@ -3040,27 +3172,56 @@ async fn try_execute_multi_comma_join_sql(
     let mut current = scan_table_for_comma_join(engine, &tables[0], batch_size).await?;
     let mut joined_aliases = vec![aliases[0].clone()];
     let mut used_conjuncts = vec![false; conjuncts.len()];
-    for (table, alias) in tables.iter().zip(&aliases).skip(1) {
-        let right = scan_table_for_comma_join(engine, table, batch_size).await?;
-        let mut left_keys = Vec::new();
-        let mut right_keys = Vec::new();
-        for (index, conjunct) in conjuncts.iter().enumerate() {
-            if used_conjuncts[index] {
-                continue;
+    let mut remaining = (1..tables.len()).collect::<Vec<_>>();
+    while !remaining.is_empty() {
+        let mut selected = None;
+        for (remaining_index, table_index) in remaining.iter().copied().enumerate() {
+            let alias = &aliases[table_index];
+            let mut left_keys = Vec::new();
+            let mut right_keys = Vec::new();
+            let mut conjunct_indexes = Vec::new();
+            for (index, conjunct) in conjuncts.iter().enumerate() {
+                if used_conjuncts[index] {
+                    continue;
+                }
+                if let Some((left_key, right_key)) =
+                    comma_join_keys_for_next(conjunct, &joined_aliases, alias, &alias_refs)?
+                {
+                    left_keys.push(left_key);
+                    right_keys.push(right_key);
+                    conjunct_indexes.push(index);
+                }
             }
-            if let Some((left_key, right_key)) =
-                comma_join_keys_for_next(conjunct, &joined_aliases, alias, &alias_refs)?
-            {
-                left_keys.push(left_key);
-                right_keys.push(right_key);
-                used_conjuncts[index] = true;
+            if !left_keys.is_empty() {
+                selected = Some((
+                    remaining_index,
+                    table_index,
+                    left_keys,
+                    right_keys,
+                    conjunct_indexes,
+                ));
+                break;
             }
         }
-        if left_keys.is_empty() {
+        let Some((remaining_index, table_index, left_keys, right_keys, conjunct_indexes)) =
+            selected
+        else {
             return Err(DodamError::UnsupportedSql(format!(
-                "comma join could not find equality predicate for table {alias}"
+                "comma join could not find equality predicate for remaining tables: {}",
+                remaining
+                    .iter()
+                    .map(|index| aliases[*index].as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )));
+        };
+        for index in conjunct_indexes {
+            used_conjuncts[index] = true;
         }
+        remaining.remove(remaining_index);
+        let table = &tables[table_index];
+        let alias = &aliases[table_index];
+        let right = scan_table_for_comma_join(engine, table, batch_size).await?;
         let left_prefix = if joined_aliases.len() == 1 {
             joined_aliases[0].as_str()
         } else {
@@ -5026,6 +5187,13 @@ fn join_expr_to_filter_expr(
         SqlExpr::Nested(expr) => {
             join_expr_to_filter_expr(expr, aliases, table_aliases, allow_aggregates)
         }
+        SqlExpr::Value(value) => match &value.value {
+            Value::Boolean(value) => Ok(Expr::Boolean(Some(*value))),
+            Value::Null => Ok(Expr::Boolean(None)),
+            _ => Err(DodamError::UnsupportedSql(format!(
+                "unsupported JOIN WHERE expression: {expr}"
+            ))),
+        },
         SqlExpr::Between {
             expr,
             negated,
@@ -5262,6 +5430,20 @@ fn infer_tpch_table_alias<'a>(prefix: &str, table_aliases: &'a [&str]) -> Option
         .iter()
         .copied()
         .find(|alias| alias.eq_ignore_ascii_case(table))
+}
+
+fn tpch_alias_prefix(alias: &str) -> Option<&'static str> {
+    match alias.to_ascii_lowercase().as_str() {
+        "customer" => Some("c"),
+        "orders" => Some("o"),
+        "lineitem" => Some("l"),
+        "part" => Some("p"),
+        "partsupp" => Some("ps"),
+        "supplier" => Some("s"),
+        "nation" => Some("n"),
+        "region" => Some("r"),
+        _ => None,
+    }
 }
 
 #[derive(Debug)]

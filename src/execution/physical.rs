@@ -8672,9 +8672,7 @@ fn decimal_string_as_i128(value: &str, scale: usize, column: &str) -> Result<i12
     if whole.is_empty() || !whole.chars().all(|ch| ch.is_ascii_digit()) {
         return Err(DodamError::InvalidFilter(format!("{column}={value}")));
     }
-    if !fractional.chars().all(|ch| ch.is_ascii_digit())
-        || (fractional.len() > scale && fractional[scale..].chars().any(|ch| ch != '0'))
-    {
+    if !fractional.chars().all(|ch| ch.is_ascii_digit()) {
         return Err(DodamError::InvalidFilter(format!("{column}={value}")));
     }
     let fractional = &fractional[..fractional.len().min(scale)];

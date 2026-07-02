@@ -1504,6 +1504,33 @@ async fn executes_join_aggregate_output_expression_sql() {
 }
 
 #[tokio::test]
+async fn executes_derived_aggregate_output_expression_sql() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let lineitem_path = tempdir.path().join("lineitem.parquet");
+    write_tpch_like_lineitem_parquet(&lineitem_path);
+
+    let sql = format!(
+        "SELECT o_year, sum(CASE WHEN nation = 'MAIL' THEN volume ELSE 0 END) / sum(volume) AS share
+         FROM (
+             SELECT l_orderkey AS o_year, l_shipmode AS nation, l_extendedprice * (1 - l_discount) AS volume
+             FROM '{}'
+         ) AS all_nations
+         GROUP BY o_year
+         ORDER BY o_year",
+        lineitem_path.display()
+    );
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute derived aggregate output expression sql");
+
+    let QueryOutput::Aggregate { batches, .. } = output else {
+        panic!("expected aggregate output");
+    };
+    assert_eq!(i64s_from_column(&batches, 0), vec![1, 2, 3]);
+    assert_eq!(f64s_from_column(&batches, 1), vec![1.0, 1.0, 0.0]);
+}
+
+#[tokio::test]
 async fn filters_join_with_correlated_scalar_aggregate_subquery_sql() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let lineitem_path = tempdir.path().join("lineitem.parquet");
