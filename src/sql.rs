@@ -1815,10 +1815,15 @@ async fn try_execute_materialized_join_subquery_sql(
     let SetExpr::Select(select) = query.body.as_ref() else {
         return Ok(None);
     };
-    let Some(selection) = select.selection.as_ref() else {
-        return Ok(None);
-    };
-    if select.from.len() <= 1 || !expr_contains_materializable_subquery(selection) {
+    let has_materializable_subquery = select
+        .selection
+        .as_ref()
+        .is_some_and(expr_contains_materializable_subquery)
+        || select
+            .having
+            .as_ref()
+            .is_some_and(expr_contains_materializable_subquery);
+    if select.from.len() <= 1 || !has_materializable_subquery {
         return Ok(None);
     }
     reject_query_features(query)?;
@@ -1828,24 +1833,36 @@ async fn try_execute_materialized_join_subquery_sql(
     let SetExpr::Select(rewritten_select) = rewritten_query.body.as_mut() else {
         return Ok(None);
     };
-    let Some(rewritten_selection) = rewritten_select.selection.take() else {
-        return Ok(None);
-    };
     let mut changed = false;
-    let Some(rewritten_selection) = Box::pin(rewrite_materializable_subqueries_to_literals(
-        engine,
-        rewritten_selection,
-        batch_size,
-        &mut changed,
-    ))
-    .await?
-    else {
-        return Ok(None);
-    };
+    if let Some(rewritten_selection) = rewritten_select.selection.take() {
+        let Some(rewritten_selection) = Box::pin(rewrite_materializable_subqueries_to_literals(
+            engine,
+            rewritten_selection,
+            batch_size,
+            &mut changed,
+        ))
+        .await?
+        else {
+            return Ok(None);
+        };
+        rewritten_select.selection = Some(rewritten_selection);
+    }
+    if let Some(rewritten_having) = rewritten_select.having.take() {
+        let Some(rewritten_having) = Box::pin(rewrite_materializable_subqueries_to_literals(
+            engine,
+            rewritten_having,
+            batch_size,
+            &mut changed,
+        ))
+        .await?
+        else {
+            return Ok(None);
+        };
+        rewritten_select.having = Some(rewritten_having);
+    }
     if !changed {
         return Ok(None);
     }
-    rewritten_select.selection = Some(rewritten_selection);
     Box::pin(execute_sql(
         engine,
         &rewritten_query.to_string(),
@@ -3196,7 +3213,11 @@ fn sql_uses_materialized_subquery(sql: &str) -> Result<bool> {
         || select.selection.as_ref().is_some_and(|expr| {
             top_level_exists_subquery(Some(expr)).is_some()
                 || expr_contains_materializable_subquery(expr)
-        }))
+        })
+        || select
+            .having
+            .as_ref()
+            .is_some_and(expr_contains_materializable_subquery))
 }
 
 fn sql_uses_multi_comma_join(sql: &str) -> Result<bool> {
@@ -4434,6 +4455,7 @@ fn parse_join_projection(
                     }
                     aggregate_expressions.push(expression);
                 }
+                aliases.push((function.to_string(), aggregate.to_string()));
                 aggregates.push(aggregate);
             }
             SelectItem::UnnamedExpr(expr) => {
@@ -4481,6 +4503,7 @@ fn parse_join_projection(
                         }
                         aggregate_expressions.push(expression);
                     }
+                    aliases.push((function.to_string(), aggregate.to_string()));
                     aliases.push((alias.value.clone(), aggregate.to_string()));
                     aggregates.push(aggregate);
                 }
@@ -4822,7 +4845,13 @@ fn join_filter_column(
         }
         SqlExpr::CompoundIdentifier(_) => join_column_name(expr, table_aliases),
         SqlExpr::Function(function) if allow_aggregates => {
-            Ok(parse_join_aggregate(function, table_aliases)?.to_string())
+            let function_name = function.to_string();
+            let resolved = resolve_alias(&function_name, aliases);
+            if resolved == function_name {
+                Ok(parse_join_aggregate(function, table_aliases)?.to_string())
+            } else {
+                Ok(resolved)
+            }
         }
         SqlExpr::Nested(expr) => join_filter_column(expr, aliases, table_aliases, allow_aggregates),
         _ => Err(DodamError::UnsupportedSql(format!(
@@ -8084,7 +8113,7 @@ fn rename_output_batches(
                 .map(|field| {
                     let name = aliases
                         .iter()
-                        .find(|(_, target)| target == field.name())
+                        .find(|(alias, target)| !alias.contains('(') && target == field.name())
                         .map(|(alias, _)| alias.as_str())
                         .unwrap_or_else(|| field.name().as_str());
                     Field::new(name, field.data_type().clone(), field.is_nullable())

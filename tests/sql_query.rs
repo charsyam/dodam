@@ -1590,6 +1590,36 @@ async fn executes_three_table_comma_join_aggregate_sql() {
 }
 
 #[tokio::test]
+async fn filters_multi_comma_join_with_aggregate_expression_having_subquery_sql() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let customer_path = tempdir.path().join("customer.parquet");
+    let orders_path = tempdir.path().join("orders.parquet");
+    let lineitem_path = tempdir.path().join("lineitem.parquet");
+    write_q13_customer_parquet(&customer_path);
+    write_q13_orders_parquet(&orders_path);
+    write_q13_lineitem_parquet(&lineitem_path);
+
+    let sql = format!(
+        "SELECT c_custkey, sum(l_quantity * 2.0) AS value FROM '{}' AS customer, '{}' AS orders, '{}' AS lineitem WHERE c_custkey = o_custkey AND o_orderkey = l_orderkey GROUP BY c_custkey HAVING sum(l_quantity * 2.0) > (SELECT sum(l_quantity * 2.0) * 0.4 FROM '{}' AS customer, '{}' AS orders, '{}' AS lineitem WHERE c_custkey = o_custkey AND o_orderkey = l_orderkey) ORDER BY value DESC",
+        customer_path.display(),
+        orders_path.display(),
+        lineitem_path.display(),
+        customer_path.display(),
+        orders_path.display(),
+        lineitem_path.display()
+    );
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute aggregate expression HAVING subquery sql");
+
+    let QueryOutput::Aggregate { batches, .. } = output else {
+        panic!("expected aggregate output");
+    };
+    assert_eq!(i64s_from_column(&batches, 0), vec![1, 3]);
+    assert_eq!(f64s_from_column(&batches, 1), vec![24.0, 22.0]);
+}
+
+#[tokio::test]
 async fn executes_tpch_q13_style_join_aggregate_without_explicit_aliases() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let customer_path = tempdir.path().join("customer.parquet");
