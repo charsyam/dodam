@@ -926,6 +926,31 @@ async fn evaluate_correlated_subquery_filter_mask(
     Ok(BooleanArray::from(values))
 }
 
+async fn apply_correlated_subquery_filter_batches(
+    engine: &DodamEngine,
+    batches: Vec<RecordBatch>,
+    selection_sql: &str,
+    batch_size: usize,
+) -> Result<Vec<RecordBatch>> {
+    let mut filtered = Vec::new();
+    for batch in batches {
+        let mask = evaluate_correlated_subquery_filter_mask(
+            engine,
+            selection_sql,
+            None,
+            &batch,
+            None,
+            batch_size,
+        )
+        .await?;
+        let batch = filter_record_batch(&batch, &mask)?;
+        if batch.num_rows() > 0 {
+            filtered.push(batch);
+        }
+    }
+    Ok(filtered)
+}
+
 async fn rewrite_uncorrelated_scalar_subqueries_to_literals(
     engine: &DodamEngine,
     expr: SqlExpr,
@@ -1072,10 +1097,16 @@ async fn evaluate_bound_correlated_filter(
     let mut conjuncts = Vec::new();
     collect_sql_and_conjuncts(expr, &mut conjuncts);
     for conjunct in conjuncts {
-        let matches = if predicate_requires_expression_path(&conjunct)
-            && !expr_contains_materializable_subquery(&conjunct)
+        let conjunct = if expr_contains_materializable_subquery(&conjunct) {
+            Box::pin(rewrite_uncorrelated_scalar_subqueries_to_literals(
+                engine, conjunct, batch_size,
+            ))
+            .await?
+        } else {
+            conjunct
+        };
+        let matches = if let Ok(mask) = evaluate_scalar_predicate(row_batch, &conjunct, table_alias)
         {
-            let mask = evaluate_scalar_predicate(row_batch, &conjunct, table_alias)?;
             mask.is_valid(0) && mask.value(0)
         } else if let Some(expr) = Box::pin(parse_filter_with_subqueries(
             engine,
@@ -1338,22 +1369,32 @@ fn subquery_local_prefixes(subquery_sql: &str) -> Vec<String> {
     let Some(from_index) = lowercase.find(" from ") else {
         return Vec::new();
     };
-    let after_from = subquery_sql[from_index + " from ".len()..].trim_start();
-    let Some(table_token) = after_from.split_whitespace().next() else {
-        return Vec::new();
-    };
-    let table_name = table_token
-        .trim_matches('\'')
-        .trim_matches('"')
-        .rsplit('/')
-        .next()
-        .unwrap_or(table_token);
-    let table_name = table_name.strip_suffix(".parquet").unwrap_or(table_name);
     let mut prefixes = Vec::new();
-    if let Some(prefix) = table_name.split('_').next()
-        && let Some(initial) = prefix.chars().next()
-    {
-        prefixes.push(initial.to_string());
+    let after_from = &subquery_sql[from_index + " from ".len()..];
+    let end = after_from
+        .to_ascii_lowercase()
+        .find(" where ")
+        .or_else(|| after_from.to_ascii_lowercase().find(" group "))
+        .or_else(|| after_from.to_ascii_lowercase().find(" order "))
+        .unwrap_or(after_from.len());
+    for relation in after_from[..end].split(',') {
+        let Some(table_token) = relation.split_whitespace().next() else {
+            continue;
+        };
+        let table_name = table_token
+            .trim_matches('\'')
+            .trim_matches('"')
+            .rsplit('/')
+            .next()
+            .unwrap_or(table_token);
+        let table_name = table_name.strip_suffix(".parquet").unwrap_or(table_name);
+        if let Some(prefix) = tpch_alias_prefix(table_name) {
+            add_column_once(&mut prefixes, prefix.to_string());
+        } else if let Some(prefix) = table_name.split('_').next()
+            && let Some(initial) = prefix.chars().next()
+        {
+            add_column_once(&mut prefixes, initial.to_string());
+        }
     }
     prefixes
 }
@@ -2199,7 +2240,9 @@ async fn rewrite_materializable_subqueries_to_literals(
             let output =
                 match Box::pin(execute_sql(engine, &subquery.to_string(), batch_size)).await {
                     Ok(output) => output,
-                    Err(DodamError::UnsupportedSql(_)) => return Ok(None),
+                    Err(DodamError::UnsupportedSql(_)) | Err(DodamError::UnknownColumn(_)) => {
+                        return Ok(None);
+                    }
                     Err(error) => return Err(error),
                 };
             let exists = query_output_batches(output)?
@@ -2218,7 +2261,9 @@ async fn rewrite_materializable_subqueries_to_literals(
             let output =
                 match Box::pin(execute_sql(engine, &subquery.to_string(), batch_size)).await {
                     Ok(output) => output,
-                    Err(DodamError::UnsupportedSql(_)) => return Ok(None),
+                    Err(DodamError::UnsupportedSql(_)) | Err(DodamError::UnknownColumn(_)) => {
+                        return Ok(None);
+                    }
                     Err(error) => return Err(error),
                 };
             let values = literal_values_from_single_column_batches(query_output_batches(output)?)?;
@@ -2238,7 +2283,9 @@ async fn rewrite_materializable_subqueries_to_literals(
             let output =
                 match Box::pin(execute_sql(engine, &subquery.to_string(), batch_size)).await {
                     Ok(output) => output,
-                    Err(DodamError::UnsupportedSql(_)) => return Ok(None),
+                    Err(DodamError::UnsupportedSql(_)) | Err(DodamError::UnknownColumn(_)) => {
+                        return Ok(None);
+                    }
                     Err(error) => return Err(error),
                 };
             let value = scalar_literal_value_from_batches(query_output_batches(output)?)?;
@@ -3261,7 +3308,8 @@ async fn try_execute_multi_comma_join_sql(
         &projection.aggregates,
         None,
     )?;
-    let filter = residual
+    let (filter_residual, subquery_residual) = split_subquery_residual(residual);
+    let filter = filter_residual
         .as_ref()
         .map(|expr| parse_join_filter(expr, &projection.aliases, &alias_refs, false))
         .transpose()?;
@@ -3274,6 +3322,15 @@ async fn try_execute_multi_comma_join_sql(
     let limit = parse_limit(query)?;
 
     let mut batches = apply_output_filter(current, filter.as_ref())?;
+    if let Some(residual) = subquery_residual.as_ref() {
+        batches = apply_correlated_subquery_filter_batches(
+            engine,
+            batches,
+            &residual.to_string(),
+            batch_size,
+        )
+        .await?;
+    }
     if !projection.aggregates.is_empty() {
         batches = append_aggregate_expression_columns(batches, &projection.aggregate_expressions)?;
         let stream = Box::new(MemoryExec::new(batches)).execute()?;
@@ -4364,6 +4421,27 @@ fn split_comma_join_selection(
     Ok((left_keys, right_keys, combine_sql_and_conjuncts(residuals)))
 }
 
+fn split_subquery_residual(residual: Option<SqlExpr>) -> (Option<SqlExpr>, Option<SqlExpr>) {
+    let Some(residual) = residual else {
+        return (None, None);
+    };
+    let mut conjuncts = Vec::new();
+    collect_sql_and_conjuncts(&residual, &mut conjuncts);
+    let mut filter_conjuncts = Vec::new();
+    let mut subquery_conjuncts = Vec::new();
+    for conjunct in conjuncts {
+        if expr_contains_materializable_subquery(&conjunct) {
+            subquery_conjuncts.push(conjunct);
+        } else {
+            filter_conjuncts.push(conjunct);
+        }
+    }
+    (
+        combine_sql_and_conjuncts(filter_conjuncts),
+        combine_sql_and_conjuncts(subquery_conjuncts),
+    )
+}
+
 fn common_or_comma_join_equality_keys(
     expr: &SqlExpr,
     left_alias: &str,
@@ -5166,7 +5244,19 @@ fn join_expr_to_filter_expr(
             | BinaryOperator::GtEq
             | BinaryOperator::Lt
             | BinaryOperator::LtEq => {
-                let left = join_filter_column(left, aliases, table_aliases, allow_aggregates)?;
+                let left_column =
+                    join_filter_column(left, aliases, table_aliases, allow_aggregates);
+                if left_column.is_err()
+                    && let Some(right_column) =
+                        maybe_join_filter_column(right, aliases, table_aliases, allow_aggregates)?
+                {
+                    return Ok(Expr::Comparison(ComparisonExpr {
+                        column: right_column,
+                        op: reverse_comparison_op(sql_comparison_op(op)),
+                        value: sql_literal_value(left)?,
+                    }));
+                }
+                let left = left_column?;
                 let op = sql_comparison_op(op);
                 if let Some(right) =
                     maybe_join_filter_column(right, aliases, table_aliases, allow_aggregates)?
@@ -5277,6 +5367,17 @@ fn join_expr_to_filter_expr(
         _ => Err(DodamError::UnsupportedSql(format!(
             "unsupported JOIN WHERE expression: {expr}"
         ))),
+    }
+}
+
+fn reverse_comparison_op(op: ComparisonOp) -> ComparisonOp {
+    match op {
+        ComparisonOp::Eq => ComparisonOp::Eq,
+        ComparisonOp::NotEq => ComparisonOp::NotEq,
+        ComparisonOp::Gt => ComparisonOp::Lt,
+        ComparisonOp::GtEq => ComparisonOp::LtEq,
+        ComparisonOp::Lt => ComparisonOp::Gt,
+        ComparisonOp::LtEq => ComparisonOp::GtEq,
     }
 }
 
@@ -8924,6 +9025,9 @@ fn aggregate_values_to_column(
             crate::execution::AggregateValue::TimestampMillisecond(_, timezone) => {
                 DataType::Timestamp(TimeUnit::Millisecond, timezone.clone().map(Into::into))
             }
+            crate::execution::AggregateValue::Decimal128(_, precision, scale) => {
+                DataType::Decimal128(*precision, *scale)
+            }
             crate::execution::AggregateValue::Utf8(_) => DataType::Utf8,
         })
         .next()
@@ -8993,6 +9097,23 @@ fn aggregate_values_to_column(
             (
                 Field::new(name, DataType::Date64, true),
                 Arc::new(Date64Array::from(values)),
+            )
+        }
+        DataType::Decimal128(precision, scale) => {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    crate::execution::AggregateValue::Decimal128(value, _, _) => *value,
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (
+                Field::new(name, DataType::Decimal128(precision, scale), true),
+                Arc::new(
+                    Decimal128Array::from(values)
+                        .with_precision_and_scale(precision, scale)
+                        .expect("valid Decimal128 aggregate type"),
+                ),
             )
         }
         DataType::Timestamp(TimeUnit::Millisecond, timezone) => {

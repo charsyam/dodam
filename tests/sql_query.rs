@@ -1065,7 +1065,10 @@ async fn aggregates_decimal_values_sql() {
     let path = tempdir.path().join("rich.parquet");
     write_rich_type_parquet(&path);
 
-    let sql = format!("SELECT sum(amount), avg(amount) FROM '{}'", path.display());
+    let sql = format!(
+        "SELECT sum(amount), avg(amount), min(amount), max(amount) FROM '{}'",
+        path.display()
+    );
     let output = execute_sql(&DodamEngine::default(), &sql, 2)
         .await
         .expect("execute decimal aggregate sql");
@@ -1075,6 +1078,22 @@ async fn aggregates_decimal_values_sql() {
     };
     assert_eq!(f64s_from_column(&batches, 0), vec![116.45]);
     assert!((f64s_from_column(&batches, 1)[0] - 38.8166666667).abs() < 0.0000001);
+    assert_eq!(
+        batches[0].schema().field(2).data_type(),
+        &DataType::Decimal128(10, 2)
+    );
+    let min_amount = batches[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("decimal min");
+    let max_amount = batches[0]
+        .column(3)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("decimal max");
+    assert_eq!(min_amount.value(0), -700);
+    assert_eq!(max_amount.value(0), 12345);
 }
 
 #[tokio::test]

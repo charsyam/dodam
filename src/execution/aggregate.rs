@@ -937,6 +937,12 @@ enum FastAggregateInput<'a> {
         values: &'a TimestampMillisecondArray,
         timezone: Option<String>,
     },
+    Decimal128 {
+        expr: AggregateExpr,
+        values: &'a Decimal128Array,
+        precision: u8,
+        scale: i8,
+    },
     Utf8 {
         expr: AggregateExpr,
         values: &'a StringArray,
@@ -1042,6 +1048,15 @@ fn typed_fast_inputs<'a>(
                             timezone: timezone.as_ref().map(ToString::to_string),
                         })
                     }
+                    DataType::Decimal128(precision, scale) => Ok(FastAggregateInput::Decimal128 {
+                        expr,
+                        values: values
+                            .as_any()
+                            .downcast_ref::<Decimal128Array>()
+                            .expect("Decimal128 min/max input"),
+                        precision: *precision,
+                        scale: *scale,
+                    }),
                     DataType::Utf8 => Ok(FastAggregateInput::Utf8 {
                         expr,
                         values: values
@@ -1116,6 +1131,12 @@ impl FastAggregateState {
                 expr,
                 AggregateValue::TimestampMillisecond(None, timezone.clone()),
             ),
+            FastAggregateInput::Decimal128 {
+                expr,
+                precision,
+                scale,
+                ..
+            } => min_max_fast_state(expr, AggregateValue::Decimal128(None, *precision, *scale)),
             FastAggregateInput::Utf8 { expr, .. } => {
                 min_max_fast_state(expr, AggregateValue::Utf8(None))
             }
@@ -1219,6 +1240,23 @@ impl FastAggregateState {
                             Some(values.value(row)),
                             timezone.clone(),
                         ),
+                    );
+                }
+            }
+            FastAggregateInput::Decimal128 {
+                values,
+                precision,
+                scale,
+                ..
+            } if values.is_valid(row) => {
+                if let Self::MinMax {
+                    expr, value: state, ..
+                } = self
+                {
+                    update_min_max_value(
+                        expr,
+                        state,
+                        AggregateValue::Decimal128(Some(values.value(row)), *precision, *scale),
                     );
                 }
             }
@@ -1384,6 +1422,16 @@ fn update_min_max_value(
             AggregateExpr::Max(_),
             Some(AggregateValue::TimestampMillisecond(Some(current), _)),
             AggregateValue::TimestampMillisecond(Some(candidate), _),
+        ) => candidate > current,
+        (
+            AggregateExpr::Min(_),
+            Some(AggregateValue::Decimal128(Some(current), _, _)),
+            AggregateValue::Decimal128(Some(candidate), _, _),
+        ) => candidate < current,
+        (
+            AggregateExpr::Max(_),
+            Some(AggregateValue::Decimal128(Some(current), _, _)),
+            AggregateValue::Decimal128(Some(candidate), _, _),
         ) => candidate > current,
         (
             AggregateExpr::Min(_),
@@ -1970,6 +2018,21 @@ impl MinMaxState {
                 }
                 Ok(())
             }
+            DataType::Decimal128(precision, scale) => {
+                let values = column
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("Decimal128 data type");
+                let value = if replace(std::cmp::Ordering::Less, std::cmp::Ordering::Equal) {
+                    values.iter().flatten().min()
+                } else {
+                    values.iter().flatten().max()
+                };
+                if let Some(value) = value {
+                    self.update_decimal128(value, *precision, *scale, &replace);
+                }
+                Ok(())
+            }
             DataType::Utf8 => {
                 let values = column
                     .as_any()
@@ -2050,6 +2113,14 @@ impl MinMaxState {
                     timezone.as_ref().map(ToString::to_string),
                     &replace,
                 );
+                Ok(())
+            }
+            DataType::Decimal128(precision, scale) => {
+                let values = column
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("Decimal128 data type");
+                self.update_decimal128(values.value(row), *precision, *scale, &replace);
                 Ok(())
             }
             DataType::Utf8 => {
@@ -2133,6 +2204,26 @@ impl MinMaxState {
                 self.value = Some(AggregateValue::TimestampMillisecond(
                     Some(candidate),
                     timezone,
+                ))
+            }
+        }
+    }
+
+    fn update_decimal128(
+        &mut self,
+        candidate: i128,
+        precision: u8,
+        scale: i8,
+        replace: &impl Fn(std::cmp::Ordering, std::cmp::Ordering) -> bool,
+    ) {
+        match &self.value {
+            Some(AggregateValue::Decimal128(Some(current), _, _))
+                if !replace(candidate.cmp(current), std::cmp::Ordering::Equal) => {}
+            _ => {
+                self.value = Some(AggregateValue::Decimal128(
+                    Some(candidate),
+                    precision,
+                    scale,
                 ))
             }
         }
