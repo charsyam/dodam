@@ -1438,6 +1438,17 @@ fn group_key(columns: &[(&str, &ArrayRef)], row: usize) -> Result<Vec<GroupValue
                     values.is_valid(row).then(|| values.value(row)),
                 ))
             }
+            DataType::Decimal128(precision, scale) => {
+                let values = column
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("Decimal128 data type");
+                Ok(GroupValue::Decimal128(
+                    values.is_valid(row).then(|| values.value(row)),
+                    *precision,
+                    *scale,
+                ))
+            }
             DataType::Date32 => {
                 let values = column
                     .as_any()
@@ -1479,19 +1490,31 @@ fn compare_group_keys(left: &[GroupValue], right: &[GroupValue]) -> std::cmp::Or
         .map(|(left, right)| match (left, right) {
             (GroupValue::Int64(left), GroupValue::Int64(right)) => left.cmp(right),
             (GroupValue::UInt64(left), GroupValue::UInt64(right)) => left.cmp(right),
+            (
+                GroupValue::Decimal128(left, left_precision, left_scale),
+                GroupValue::Decimal128(right, right_precision, right_scale),
+            ) => (left_scale, left_precision, left).cmp(&(right_scale, right_precision, right)),
             (GroupValue::Date32(left), GroupValue::Date32(right)) => left.cmp(right),
             (GroupValue::Date64(left), GroupValue::Date64(right)) => left.cmp(right),
             (GroupValue::Utf8(left), GroupValue::Utf8(right)) => left.cmp(right),
             (GroupValue::Int64(_), _) => std::cmp::Ordering::Less,
             (GroupValue::UInt64(_), GroupValue::Int64(_)) => std::cmp::Ordering::Greater,
             (GroupValue::UInt64(_), _) => std::cmp::Ordering::Less,
-            (GroupValue::Date32(_), GroupValue::Int64(_) | GroupValue::UInt64(_)) => {
+            (GroupValue::Decimal128(_, _, _), GroupValue::Int64(_) | GroupValue::UInt64(_)) => {
                 std::cmp::Ordering::Greater
             }
+            (GroupValue::Decimal128(_, _, _), _) => std::cmp::Ordering::Less,
+            (
+                GroupValue::Date32(_),
+                GroupValue::Int64(_) | GroupValue::UInt64(_) | GroupValue::Decimal128(_, _, _),
+            ) => std::cmp::Ordering::Greater,
             (GroupValue::Date32(_), _) => std::cmp::Ordering::Less,
             (
                 GroupValue::Date64(_),
-                GroupValue::Int64(_) | GroupValue::UInt64(_) | GroupValue::Date32(_),
+                GroupValue::Int64(_)
+                | GroupValue::UInt64(_)
+                | GroupValue::Decimal128(_, _, _)
+                | GroupValue::Date32(_),
             ) => std::cmp::Ordering::Greater,
             (GroupValue::Date64(_), _) => std::cmp::Ordering::Less,
             (GroupValue::Utf8(_), _) => std::cmp::Ordering::Greater,
@@ -2165,6 +2188,17 @@ fn distinct_group_value(column: &ArrayRef, row: usize) -> Result<Option<GroupVal
                 .expect("UInt64 distinct input")
                 .value(row),
         )))),
+        DataType::Decimal128(precision, scale) => Ok(Some(GroupValue::Decimal128(
+            Some(
+                column
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("Decimal128 distinct input")
+                    .value(row),
+            ),
+            *precision,
+            *scale,
+        ))),
         DataType::Date32 => Ok(Some(GroupValue::Date32(Some(
             column
                 .as_any()

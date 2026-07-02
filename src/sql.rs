@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -125,6 +126,11 @@ pub async fn execute_sql(
         return Ok(output);
     }
     if let Some(output) = try_execute_multi_comma_join_sql(engine, sql, batch_size).await? {
+        return Ok(output);
+    }
+    if let Some(output) =
+        try_execute_correlated_exists_semijoin_sql(engine, sql, batch_size).await?
+    {
         return Ok(output);
     }
     if let Some(output) =
@@ -423,6 +429,327 @@ fn top_level_exists_subquery(expr: Option<&SqlExpr>) -> Option<(&Query, bool)> {
         SqlExpr::Nested(expr) => top_level_exists_subquery(Some(expr)),
         _ => None,
     }
+}
+
+async fn try_execute_correlated_exists_semijoin_sql(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let Some(selection) = select.selection.as_ref() else {
+        return Ok(None);
+    };
+    reject_query_features(query)?;
+    reject_select_features(select)?;
+    if select.from.len() != 1
+        || select
+            .from
+            .first()
+            .is_some_and(|table| !table.joins.is_empty())
+    {
+        return Ok(None);
+    }
+
+    let outer_path = parse_from(select)?;
+    let outer_alias = table_ref_alias_or_name(&outer_path);
+    let mut outer_conjuncts = Vec::new();
+    collect_sql_and_conjuncts(selection, &mut outer_conjuncts);
+    let Some((exists_index, exists_subquery)) =
+        outer_conjuncts
+            .iter()
+            .enumerate()
+            .find_map(|(index, expr)| match expr {
+                SqlExpr::Exists { subquery, negated } if !negated => {
+                    Some((index, subquery.as_ref()))
+                }
+                SqlExpr::Nested(expr) => match expr.as_ref() {
+                    SqlExpr::Exists { subquery, negated } if !negated => {
+                        Some((index, subquery.as_ref()))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+    else {
+        return Ok(None);
+    };
+
+    let SetExpr::Select(inner_select) = exists_subquery.body.as_ref() else {
+        return Ok(None);
+    };
+    reject_query_features(exists_subquery)?;
+    reject_select_features(inner_select)?;
+    if inner_select.from.len() != 1
+        || inner_select
+            .from
+            .first()
+            .is_some_and(|table| !table.joins.is_empty())
+        || parse_distinct(inner_select)?
+        || inner_select.having.is_some()
+        || !parse_group_by(inner_select, None)?.is_empty()
+    {
+        return Ok(None);
+    }
+
+    let inner_path = parse_from(inner_select)?;
+    let inner_alias = table_ref_alias_or_name(&inner_path);
+    let mut inner_conjuncts = Vec::new();
+    let Some(inner_selection) = inner_select.selection.as_ref() else {
+        return Ok(None);
+    };
+    collect_sql_and_conjuncts(inner_selection, &mut inner_conjuncts);
+    let Some((join_index, inner_key, outer_key)) =
+        semijoin_exists_key_pair(&inner_conjuncts, &inner_alias, &outer_alias)?
+    else {
+        return Ok(None);
+    };
+
+    let inner_residual = inner_conjuncts
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, conjunct)| (index != join_index).then_some(conjunct))
+        .collect::<Vec<_>>();
+    let inner_filter = combine_sql_and_conjuncts(inner_residual)
+        .as_ref()
+        .map(|expr| parse_filter(expr, &[], inner_path.alias.as_deref(), false))
+        .transpose()?;
+    let inner_keys = collect_semijoin_key_set(
+        engine,
+        inner_path.path,
+        &inner_key,
+        inner_filter,
+        batch_size,
+    )
+    .await?;
+
+    let outer_residual = outer_conjuncts
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, conjunct)| (index != exists_index).then_some(conjunct))
+        .collect::<Vec<_>>();
+    let outer_filter = combine_sql_and_conjuncts(outer_residual)
+        .as_ref()
+        .map(|expr| parse_filter(expr, &[], outer_path.alias.as_deref(), false))
+        .transpose()?;
+
+    let group_by = parse_group_by(select, outer_path.alias.as_deref())?;
+    let parsed_projection = parse_projection(select, &group_by, outer_path.alias.as_deref())?;
+    let distinct = parse_distinct(select)?;
+    let having = select
+        .having
+        .as_ref()
+        .map(|expr| parse_filter(expr, &parsed_projection.aliases, None, true))
+        .transpose()?;
+    let order_by = parse_order_by(
+        query,
+        &parsed_projection.aliases,
+        outer_path.alias.as_deref(),
+    )?;
+    let limit = parse_limit(query)?;
+    validate_distinct(
+        distinct,
+        &parsed_projection.projection,
+        &parsed_projection.aggregates,
+        order_by.as_ref(),
+    )?;
+
+    let stream = engine
+        .scan_parquet_batches(
+            outer_path.path,
+            batch_size,
+            None,
+            Projection::All,
+            outer_filter,
+        )
+        .await?;
+    let outer_batches = collect_batches(stream)?;
+    let mut filtered = Vec::new();
+    for batch in outer_batches {
+        let mask = semijoin_membership_mask(&batch, &outer_key, &inner_keys)?;
+        let batch = filter_record_batch(&batch, &mask)?;
+        if batch.num_rows() > 0 {
+            filtered.push(batch);
+        }
+    }
+
+    if !parsed_projection.aggregates.is_empty() {
+        let stream = Box::new(MemoryExec::new(filtered)).execute()?;
+        let metrics = if group_by.is_empty() {
+            collect_aggregates(stream, 1, &parsed_projection.aggregates)?
+        } else {
+            collect_grouped_aggregates(stream, 1, &group_by, &parsed_projection.aggregates)?
+        };
+        let mut batches =
+            aggregate_metrics_to_batches(&metrics, &group_by, &parsed_projection.aggregates)?;
+        batches = apply_output_filter(batches, having.as_ref())?;
+        batches = apply_output_order_limit(batches, order_by.as_ref(), limit)?;
+        batches = rename_output_batches(batches, &parsed_projection.aliases)?;
+        return Ok(Some(QueryOutput::Aggregate { metrics, batches }));
+    }
+
+    let mut batches = apply_output_order_limit(filtered, order_by.as_ref(), limit)?;
+    batches = apply_output_projection(batches, &parsed_projection.projection)?;
+    batches = rename_output_batches(batches, &parsed_projection.aliases)?;
+    Ok(Some(QueryOutput::Scan { batches }))
+}
+
+fn semijoin_exists_key_pair(
+    conjuncts: &[SqlExpr],
+    inner_alias: &str,
+    outer_alias: &str,
+) -> Result<Option<(usize, String, String)>> {
+    for (index, conjunct) in conjuncts.iter().enumerate() {
+        let SqlExpr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } = conjunct
+        else {
+            continue;
+        };
+        let Some(left_column) = semijoin_column_name(left)? else {
+            continue;
+        };
+        let Some(right_column) = semijoin_column_name(right)? else {
+            continue;
+        };
+        let left_owner = semijoin_column_owner(&left_column, inner_alias, outer_alias);
+        let right_owner = semijoin_column_owner(&right_column, inner_alias, outer_alias);
+        match (left_owner, right_owner) {
+            (Some(SemijoinColumnOwner::Inner), Some(SemijoinColumnOwner::Outer)) => {
+                return Ok(Some((
+                    index,
+                    unqualified_semijoin_column(&left_column),
+                    unqualified_semijoin_column(&right_column),
+                )));
+            }
+            (Some(SemijoinColumnOwner::Outer), Some(SemijoinColumnOwner::Inner)) => {
+                return Ok(Some((
+                    index,
+                    unqualified_semijoin_column(&right_column),
+                    unqualified_semijoin_column(&left_column),
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemijoinColumnOwner {
+    Inner,
+    Outer,
+}
+
+fn semijoin_column_name(expr: &SqlExpr) -> Result<Option<String>> {
+    match expr {
+        SqlExpr::Identifier(ident) => Ok(Some(ident.value.clone())),
+        SqlExpr::CompoundIdentifier(parts) => {
+            let [qualifier, column] = parts.as_slice() else {
+                return Err(DodamError::UnsupportedSql(format!(
+                    "only table-qualified columns are supported, got {expr}"
+                )));
+            };
+            Ok(Some(format!("{}.{}", qualifier.value, column.value)))
+        }
+        SqlExpr::Nested(expr) => semijoin_column_name(expr),
+        _ => Ok(None),
+    }
+}
+
+fn semijoin_column_owner(
+    column: &str,
+    inner_alias: &str,
+    outer_alias: &str,
+) -> Option<SemijoinColumnOwner> {
+    if column.starts_with(&format!("{inner_alias}.")) {
+        return Some(SemijoinColumnOwner::Inner);
+    }
+    if column.starts_with(&format!("{outer_alias}.")) {
+        return Some(SemijoinColumnOwner::Outer);
+    }
+    let unqualified = unqualified_semijoin_column(column);
+    if unqualified.starts_with(&semijoin_unqualified_prefix(inner_alias)?) {
+        return Some(SemijoinColumnOwner::Inner);
+    }
+    if unqualified.starts_with(&semijoin_unqualified_prefix(outer_alias)?) {
+        return Some(SemijoinColumnOwner::Outer);
+    }
+    None
+}
+
+fn semijoin_unqualified_prefix(alias: &str) -> Option<String> {
+    Some(format!("{}_", alias.chars().next()?))
+}
+
+fn unqualified_semijoin_column(column: &str) -> String {
+    column
+        .rsplit_once('.')
+        .map(|(_, column)| column)
+        .unwrap_or(column)
+        .to_string()
+}
+
+async fn collect_semijoin_key_set(
+    engine: &DodamEngine,
+    path: PathBuf,
+    key_column: &str,
+    filter: Option<FilterExpr>,
+    batch_size: usize,
+) -> Result<HashSet<String>> {
+    let stream = engine
+        .scan_parquet_batches(path, batch_size, None, Projection::All, filter)
+        .await?;
+    let batches = collect_batches(stream)?;
+    let mut keys = HashSet::new();
+    for batch in batches {
+        let column_index = batch
+            .schema()
+            .index_of(key_column)
+            .map_err(|_| DodamError::UnknownColumn(key_column.to_string()))?;
+        let column = batch.column(column_index);
+        for row in 0..batch.num_rows() {
+            if let Some(key) = semijoin_key_at(column, row)? {
+                keys.insert(key);
+            }
+        }
+    }
+    Ok(keys)
+}
+
+fn semijoin_membership_mask(
+    batch: &RecordBatch,
+    key_column: &str,
+    keys: &HashSet<String>,
+) -> Result<BooleanArray> {
+    let column_index = batch
+        .schema()
+        .index_of(key_column)
+        .map_err(|_| DodamError::UnknownColumn(key_column.to_string()))?;
+    let column = batch.column(column_index);
+    let values = (0..batch.num_rows())
+        .map(|row| {
+            semijoin_key_at(column, row).map(|key| key.is_some_and(|key| keys.contains(&key)))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(BooleanArray::from(values))
+}
+
+fn semijoin_key_at(column: &ArrayRef, row: usize) -> Result<Option<String>> {
+    if column.is_null(row) {
+        return Ok(None);
+    }
+    Ok(Some(sql_literal(&literal_value_from_array(column, row)?)))
 }
 
 async fn try_execute_correlated_subquery_filter_sql(
@@ -7750,6 +8077,9 @@ fn group_values_to_column(
             Some(crate::execution::GroupValue::Utf8(_)) => Some(DataType::Utf8),
             Some(crate::execution::GroupValue::Date64(_)) => Some(DataType::Date64),
             Some(crate::execution::GroupValue::Date32(_)) => Some(DataType::Date32),
+            Some(crate::execution::GroupValue::Decimal128(_, precision, scale)) => {
+                Some(DataType::Decimal128(*precision, *scale))
+            }
             Some(crate::execution::GroupValue::UInt64(_)) => Some(DataType::UInt64),
             Some(crate::execution::GroupValue::Int64(_)) => Some(DataType::Int64),
             None => None,
@@ -7781,6 +8111,23 @@ fn group_values_to_column(
             (
                 Field::new(name, DataType::UInt64, true),
                 Arc::new(UInt64Array::from(values)),
+            )
+        }
+        DataType::Decimal128(precision, scale) => {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    Some(crate::execution::GroupValue::Decimal128(value, _, _)) => *value,
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (
+                Field::new(name, DataType::Decimal128(precision, scale), true),
+                Arc::new(
+                    Decimal128Array::from(values)
+                        .with_precision_and_scale(precision, scale)
+                        .expect("valid Decimal128 group type"),
+                ),
             )
         }
         DataType::Date32 => {

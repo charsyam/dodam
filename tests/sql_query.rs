@@ -1127,6 +1127,22 @@ async fn groups_by_date_and_uses_decimal_in_subquery_sql() {
         panic!("expected scan output");
     };
     assert_eq!(ids_from_batches(&batches), vec![1]);
+
+    let sql = format!(
+        "SELECT amount, count(*) FROM '{}' WHERE amount IS NOT NULL GROUP BY amount ORDER BY amount",
+        path.display()
+    );
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute decimal group by sql");
+    let QueryOutput::Aggregate { batches, .. } = output else {
+        panic!("expected aggregate output");
+    };
+    assert_eq!(
+        batches[0].schema().field(0).data_type(),
+        &DataType::Decimal128(10, 2)
+    );
+    assert_eq!(u64s_from_column(&batches, 1), vec![1, 1, 1]);
 }
 
 #[tokio::test]

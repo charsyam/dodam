@@ -59,6 +59,7 @@ pub struct GroupAggregateResult {
 pub enum GroupValue {
     Int64(Option<i64>),
     UInt64(Option<u64>),
+    Decimal128(Option<i128>, u8, i8),
     Date32(Option<i32>),
     Date64(Option<i64>),
     Utf8(Option<String>),
@@ -69,16 +70,39 @@ impl std::fmt::Display for GroupValue {
         match self {
             Self::Int64(Some(value)) => write!(formatter, "{value}"),
             Self::UInt64(Some(value)) => write!(formatter, "{value}"),
+            Self::Decimal128(Some(value), _, scale) => write_decimal128(formatter, *value, *scale),
             Self::Date32(Some(value)) => write!(formatter, "{value}"),
             Self::Date64(Some(value)) => write!(formatter, "{value}"),
             Self::Utf8(Some(value)) => formatter.write_str(value),
             Self::Int64(None)
             | Self::UInt64(None)
+            | Self::Decimal128(None, _, _)
             | Self::Date32(None)
             | Self::Date64(None)
             | Self::Utf8(None) => formatter.write_str("NULL"),
         }
     }
+}
+
+fn write_decimal128(
+    formatter: &mut std::fmt::Formatter<'_>,
+    value: i128,
+    scale: i8,
+) -> std::fmt::Result {
+    if scale <= 0 {
+        return write!(formatter, "{value}");
+    }
+    let scale = u32::try_from(scale).expect("positive scale");
+    let factor = 10_i128.pow(scale);
+    let sign = if value < 0 { "-" } else { "" };
+    let absolute = value.abs();
+    let whole = absolute / factor;
+    let fraction = absolute % factor;
+    write!(
+        formatter,
+        "{sign}{whole}.{fraction:0width$}",
+        width = scale as usize
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

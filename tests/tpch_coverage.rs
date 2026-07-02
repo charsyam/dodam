@@ -138,7 +138,7 @@ LIMIT 10
         },
         TpchQuery {
             name: "q04_order_priority",
-            expected_status: "needs-data:orders",
+            expected_status: "needs-data:lineitem",
             sql: r#"
 SELECT
     o_orderpriority,
