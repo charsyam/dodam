@@ -2768,22 +2768,14 @@ async fn try_execute_multi_comma_join_sql(
     let SetExpr::Select(select) = query.body.as_ref() else {
         return Ok(None);
     };
-    if select.from.len() <= 2 {
+    let Some(tables) = parse_comma_join_table_refs(select)? else {
+        return Ok(None);
+    };
+    if tables.len() <= 2 {
         return Ok(None);
     }
     reject_query_features(query)?;
     reject_select_features(select)?;
-    if select.from.iter().any(|table| !table.joins.is_empty()) {
-        return Err(DodamError::UnsupportedSql(
-            "mixed comma and explicit JOIN syntax is not supported".to_string(),
-        ));
-    }
-
-    let tables = select
-        .from
-        .iter()
-        .map(|table| parse_table_factor(&table.relation))
-        .collect::<Result<Vec<_>>>()?;
     let aliases = tables
         .iter()
         .map(table_ref_alias_or_name)
@@ -3207,6 +3199,19 @@ fn sql_uses_materialized_subquery(sql: &str) -> Result<bool> {
         }))
 }
 
+fn sql_uses_multi_comma_join(sql: &str) -> Result<bool> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(false);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(false);
+    };
+    Ok(parse_comma_join_table_refs(select)?.is_some_and(|tables| tables.len() > 2))
+}
+
 pub async fn try_execute_sql_streaming(
     engine: &DodamEngine,
     sql: &str,
@@ -3216,6 +3221,9 @@ pub async fn try_execute_sql_streaming(
         return Ok(None);
     }
     if sql_uses_materialized_subquery(sql)? {
+        return Ok(None);
+    }
+    if sql_uses_multi_comma_join(sql)? {
         return Ok(None);
     }
     let query = parse_sql(sql)?;
@@ -3278,6 +3286,9 @@ pub async fn try_execute_sql_to_sink(
         return Ok(None);
     }
     if sql_uses_materialized_subquery(sql)? {
+        return Ok(None);
+    }
+    if sql_uses_multi_comma_join(sql)? {
         return Ok(None);
     }
     let query = parse_sql(sql)?;
@@ -3553,18 +3564,16 @@ fn parse_select(query: &Query, select: &Select) -> Result<SqlQuery> {
 }
 
 fn parse_comma_join_select(query: &Query, select: &Select) -> Result<SqlQuery> {
-    let [left_table, right_table] = select.from.as_slice() else {
+    let Some(tables) = parse_comma_join_table_refs(select)? else {
         return Err(DodamError::UnsupportedSql(
             "comma joins currently support exactly two FROM tables".to_string(),
         ));
     };
-    if !left_table.joins.is_empty() || !right_table.joins.is_empty() {
+    let [left, right] = tables.as_slice() else {
         return Err(DodamError::UnsupportedSql(
-            "mixed comma and explicit JOIN syntax is not supported".to_string(),
+            "comma joins currently support exactly two FROM tables".to_string(),
         ));
-    }
-    let left = parse_table_factor(&left_table.relation)?;
-    let right = parse_table_factor(&right_table.relation)?;
+    };
     let left_alias = table_ref_alias_or_name(&left);
     let right_alias = table_ref_alias_or_name(&right);
     let output_aliases = vec![left_alias.as_str(), right_alias.as_str()];
@@ -3590,9 +3599,9 @@ fn parse_comma_join_select(query: &Query, select: &Select) -> Result<SqlQuery> {
     let limit = parse_limit(query)?;
 
     Ok(SqlQuery {
-        path: left.path,
+        path: left.path.clone(),
         join: Some(SqlJoin {
-            right,
+            right: right.clone(),
             left_alias,
             right_alias,
             left_keys,
@@ -3783,6 +3792,40 @@ fn parse_from(select: &Select) -> Result<SqlTableRef> {
         ));
     }
     parse_table_factor(&table.relation)
+}
+
+fn parse_comma_join_table_refs(select: &Select) -> Result<Option<Vec<SqlTableRef>>> {
+    if select.from.is_empty() {
+        return Ok(None);
+    }
+    if select.from.len() > 1 {
+        if select.from.iter().any(|table| !table.joins.is_empty()) {
+            return Err(DodamError::UnsupportedSql(
+                "mixed comma and explicit JOIN syntax is not supported".to_string(),
+            ));
+        }
+        return select
+            .from
+            .iter()
+            .map(|table| parse_table_factor(&table.relation))
+            .collect::<Result<Vec<_>>>()
+            .map(Some);
+    }
+
+    let table = &select.from[0];
+    if table.joins.is_empty() {
+        return Ok(None);
+    }
+    let mut tables = vec![parse_table_factor(&table.relation)?];
+    for join in &table.joins {
+        match &join.join_operator {
+            JoinOperator::CrossJoin(JoinConstraint::None) => {
+                tables.push(parse_table_factor(&join.relation)?);
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(tables))
 }
 
 fn parse_table_factor(relation: &TableFactor) -> Result<SqlTableRef> {
