@@ -118,7 +118,7 @@ LIMIT 100
         },
         TpchQuery {
             name: "q03_shipping_priority",
-            expected_status: "unsupported-sql:expected exactly one FROM table",
+            expected_status: "unsupported-sql:comma joins currently support exactly two FROM tables",
             sql: r#"
 SELECT
     l_orderkey,
@@ -158,7 +158,7 @@ ORDER BY o_orderpriority
         },
         TpchQuery {
             name: "q05_local_supplier_volume",
-            expected_status: "unsupported-sql:expected exactly one FROM table",
+            expected_status: "unsupported-sql:comma joins currently support exactly two FROM tables",
             sql: r#"
 SELECT
     n_name,
@@ -192,7 +192,7 @@ WHERE l_shipdate >= DATE '1994-01-01'
         },
         TpchQuery {
             name: "q07_volume_shipping",
-            expected_status: "unsupported-sql:expected exactly one FROM table",
+            expected_status: "unsupported-sql:comma joins currently support exactly two FROM tables",
             sql: r#"
 SELECT
     supp_nation,
@@ -221,7 +221,7 @@ ORDER BY supp_nation, cust_nation, l_year
         },
         TpchQuery {
             name: "q08_national_market_share",
-            expected_status: "unsupported-sql:expected exactly one FROM table",
+            expected_status: "unsupported-sql:comma joins currently support exactly two FROM tables",
             sql: r#"
 SELECT
     o_year,
@@ -249,7 +249,7 @@ ORDER BY o_year
         },
         TpchQuery {
             name: "q09_product_type_profit",
-            expected_status: "unsupported-sql:expected exactly one FROM table",
+            expected_status: "unsupported-sql:comma joins currently support exactly two FROM tables",
             sql: r#"
 SELECT
     nation,
@@ -275,7 +275,7 @@ ORDER BY nation, o_year DESC
         },
         TpchQuery {
             name: "q10_returned_item",
-            expected_status: "unsupported-sql:expected exactly one FROM table",
+            expected_status: "unsupported-sql:comma joins currently support exactly two FROM tables",
             sql: r#"
 SELECT
     c_custkey,
@@ -300,7 +300,7 @@ LIMIT 20
         },
         TpchQuery {
             name: "q11_important_stock",
-            expected_status: "unsupported-sql:expected exactly one FROM table",
+            expected_status: "unsupported-sql:comma joins currently support exactly two FROM tables",
             sql: r#"
 SELECT
     ps_partkey,
@@ -322,7 +322,7 @@ ORDER BY value DESC
         },
         TpchQuery {
             name: "q12_shipping_modes",
-            expected_status: "unsupported-sql:expected exactly one FROM table",
+            expected_status: "unsupported-sql:JOIN aggregate arguments must be * or columns, got (CASE WHEN o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH' THEN 1 ELSE 0 END)",
             sql: r#"
 SELECT
     l_shipmode,
@@ -361,7 +361,7 @@ ORDER BY custdist DESC, c_count DESC
         },
         TpchQuery {
             name: "q14_promotion_effect",
-            expected_status: "unsupported-sql:expected exactly one FROM table",
+            expected_status: "unsupported-sql:unsupported JOIN SELECT item: 100.00 * sum(CASE WHEN p_type LIKE 'PROMO%' THEN l_extendedprice * (1 - l_discount) ELSE 0 END) / sum(l_extendedprice * (1 - l_discount)) AS promo_revenue",
             sql: r#"
 SELECT
     100.00 * sum(CASE WHEN p_type LIKE 'PROMO%' THEN l_extendedprice * (1 - l_discount) ELSE 0 END)
@@ -464,7 +464,7 @@ LIMIT 100
         },
         TpchQuery {
             name: "q19_discounted_revenue",
-            expected_status: "unsupported-sql:expected exactly one FROM table",
+            expected_status: "unsupported-sql:JOIN aggregate arguments must be * or columns, got (l_extendedprice * (1 - l_discount))",
             sql: r#"
 SELECT
     sum(l_extendedprice * (1 - l_discount)) AS revenue

@@ -1189,6 +1189,33 @@ async fn executes_join_sql_without_explicit_aliases() {
 }
 
 #[tokio::test]
+async fn executes_two_table_comma_join_sql() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let orders_path = tempdir.path().join("orders.parquet");
+    let customers_path = tempdir.path().join("customers.parquet");
+    write_orders_parquet(&orders_path);
+    write_customers_parquet(&customers_path);
+
+    let sql = format!(
+        "SELECT o.id AS order_id, c.name AS customer_name FROM '{}' AS o, '{}' AS c WHERE o.customer_id = c.id AND c.name = 'alice' ORDER BY order_id",
+        orders_path.display(),
+        customers_path.display()
+    );
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute comma join sql");
+
+    let QueryOutput::Scan { batches } = output else {
+        panic!("expected scan output");
+    };
+    assert_eq!(i32s_from_column(&batches, 0), vec![10, 12]);
+    assert_eq!(
+        strings_from_column(&batches, 1),
+        vec!["alice".to_string(), "alice".to_string()]
+    );
+}
+
+#[tokio::test]
 async fn executes_tpch_q13_style_join_aggregate_without_explicit_aliases() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let customer_path = tempdir.path().join("customer.parquet");

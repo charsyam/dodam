@@ -147,6 +147,12 @@
   - uses SQL 1-based character indexing and preserves NULL propagation
   - added DuckDB differential coverage for projection and WHERE `IN`
   - TPC-H Q22 now advances past SELECT expression parsing; current blocker is subquery-aware filter lowering for `SUBSTRING(...) IN (...)` mixed with scalar/correlated subqueries
+- Added first-stage 2-table comma join planning:
+  - lowers `FROM a, b WHERE a_key = b_key AND ...` to the existing inner hash join execution path
+  - extracts one or more equality join keys from top-level `AND` predicates and keeps the remaining predicates as post-join filters
+  - supports explicit aliases and TPC-H-style inferred unqualified columns through the existing join column resolver
+  - added SQL coverage comparing comma join output with the existing join path
+  - TPC-H inventory now advances Q12/Q14/Q19 from FROM-list parsing to join aggregate expression blockers, while 3+ table queries report the explicit 2-table comma join limitation
 - The TPC-H-lite suite caught missing `Date32` `min`/`max` aggregate support; added `Date32` aggregate state and `Date32Array` result materialization.
 - The TPC-H-lite join aggregate case caught an aggregate join output projection correctness issue around qualified column names when the cost model chooses the left side as the hash build input.
 - Fixed build-side-aware join output projection mapping for hash/materialized join output schemas and restored aggregate join output projection pushdown.

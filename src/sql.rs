@@ -297,6 +297,9 @@ async fn try_execute_exists_subquery_sql(
     };
     reject_query_features(query)?;
     reject_select_features(select)?;
+    if select.from.len() != 1 {
+        return Ok(None);
+    }
     if select
         .from
         .first()
@@ -743,6 +746,9 @@ async fn try_execute_projection_expression_sql(
     };
     reject_query_features(query)?;
     reject_select_features(select)?;
+    if select.from.len() != 1 {
+        return Ok(None);
+    }
     if select
         .from
         .first()
@@ -1894,6 +1900,9 @@ fn default_join_memory_limit_bytes() -> u64 {
 
 fn parse_select(query: &Query, select: &Select) -> Result<SqlQuery> {
     reject_select_features(select)?;
+    if select.from.len() > 1 {
+        return parse_comma_join_select(query, select);
+    }
     if select
         .from
         .first()
@@ -1937,6 +1946,67 @@ fn parse_select(query: &Query, select: &Select) -> Result<SqlQuery> {
         aggregate_expressions: parsed_projection.aggregate_expressions,
         group_by,
         aliases: parsed_projection.aliases,
+    })
+}
+
+fn parse_comma_join_select(query: &Query, select: &Select) -> Result<SqlQuery> {
+    let [left_table, right_table] = select.from.as_slice() else {
+        return Err(DodamError::UnsupportedSql(
+            "comma joins currently support exactly two FROM tables".to_string(),
+        ));
+    };
+    if !left_table.joins.is_empty() || !right_table.joins.is_empty() {
+        return Err(DodamError::UnsupportedSql(
+            "mixed comma and explicit JOIN syntax is not supported".to_string(),
+        ));
+    }
+    let left = parse_table_factor(&left_table.relation)?;
+    let right = parse_table_factor(&right_table.relation)?;
+    let left_alias = table_ref_alias_or_name(&left);
+    let right_alias = table_ref_alias_or_name(&right);
+    let output_aliases = vec![left_alias.as_str(), right_alias.as_str()];
+    let group_by = parse_join_group_by(select, &output_aliases)?;
+    let projection = parse_join_projection(select, &output_aliases, &group_by)?;
+    let distinct = parse_distinct(select)?;
+    let (left_keys, right_keys, residual) = split_comma_join_selection(
+        select.selection.as_ref(),
+        &left_alias,
+        &right_alias,
+        &output_aliases,
+    )?;
+    let filter = residual
+        .as_ref()
+        .map(|expr| parse_join_filter(expr, &projection.aliases, &output_aliases, false))
+        .transpose()?;
+    let having = select
+        .having
+        .as_ref()
+        .map(|expr| parse_join_filter(expr, &projection.aliases, &output_aliases, true))
+        .transpose()?;
+    let order_by = parse_join_order_by(query, &projection.aliases, &output_aliases)?;
+    let limit = parse_limit(query)?;
+
+    Ok(SqlQuery {
+        path: left.path,
+        join: Some(SqlJoin {
+            right,
+            left_alias,
+            right_alias,
+            left_keys,
+            right_keys,
+            right_filter: None,
+            join_type: JoinType::Inner,
+        }),
+        projection: projection.projection,
+        filter,
+        having,
+        order_by,
+        limit,
+        distinct,
+        aggregates: projection.aggregates,
+        aggregate_expressions: projection.aggregate_expressions,
+        group_by,
+        aliases: projection.aliases,
     })
 }
 
@@ -2154,6 +2224,126 @@ fn parse_table_factor(relation: &TableFactor) -> Result<SqlTableRef> {
         path: PathBuf::from(object_name_to_string(name)?),
         alias: alias.as_ref().map(|alias| alias.name.value.clone()),
     })
+}
+
+fn split_comma_join_selection(
+    selection: Option<&SqlExpr>,
+    left_alias: &str,
+    right_alias: &str,
+    table_aliases: &[&str],
+) -> Result<(Vec<String>, Vec<String>, Option<SqlExpr>)> {
+    let Some(selection) = selection else {
+        return Err(DodamError::UnsupportedSql(
+            "comma join requires an equality predicate in WHERE".to_string(),
+        ));
+    };
+    let mut conjuncts = Vec::new();
+    collect_sql_and_conjuncts(selection, &mut conjuncts);
+    let mut left_keys = Vec::new();
+    let mut right_keys = Vec::new();
+    let mut residuals = Vec::new();
+    for conjunct in conjuncts {
+        match comma_join_equality_keys(&conjunct, left_alias, right_alias, table_aliases)? {
+            Some((left_key, right_key)) => {
+                left_keys.push(left_key);
+                right_keys.push(right_key);
+            }
+            None => residuals.push(conjunct),
+        }
+    }
+    if left_keys.is_empty() {
+        return Err(DodamError::UnsupportedSql(
+            "comma join requires at least one equality predicate between the two tables"
+                .to_string(),
+        ));
+    }
+    Ok((left_keys, right_keys, combine_sql_and_conjuncts(residuals)))
+}
+
+fn collect_sql_and_conjuncts(expr: &SqlExpr, conjuncts: &mut Vec<SqlExpr>) {
+    match expr {
+        SqlExpr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            collect_sql_and_conjuncts(left, conjuncts);
+            collect_sql_and_conjuncts(right, conjuncts);
+        }
+        SqlExpr::Nested(expr) => collect_sql_and_conjuncts(expr, conjuncts),
+        expr => conjuncts.push(expr.clone()),
+    }
+}
+
+fn combine_sql_and_conjuncts(mut conjuncts: Vec<SqlExpr>) -> Option<SqlExpr> {
+    let first = conjuncts.pop()?;
+    Some(
+        conjuncts
+            .into_iter()
+            .fold(first, |right, left| SqlExpr::BinaryOp {
+                left: Box::new(left),
+                op: BinaryOperator::And,
+                right: Box::new(right),
+            }),
+    )
+}
+
+fn comma_join_equality_keys(
+    expr: &SqlExpr,
+    left_alias: &str,
+    right_alias: &str,
+    table_aliases: &[&str],
+) -> Result<Option<(String, String)>> {
+    let SqlExpr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = expr
+    else {
+        return Ok(None);
+    };
+    let Some(left_column) = maybe_join_column_name(left, table_aliases)? else {
+        return Ok(None);
+    };
+    let Some(right_column) = maybe_join_column_name(right, table_aliases)? else {
+        return Ok(None);
+    };
+    let left_prefix = format!("{left_alias}.");
+    let right_prefix = format!("{right_alias}.");
+    if left_column.starts_with(&left_prefix) && right_column.starts_with(&right_prefix) {
+        return Ok(Some((
+            left_column
+                .strip_prefix(&left_prefix)
+                .expect("left prefix")
+                .to_string(),
+            right_column
+                .strip_prefix(&right_prefix)
+                .expect("right prefix")
+                .to_string(),
+        )));
+    }
+    if left_column.starts_with(&right_prefix) && right_column.starts_with(&left_prefix) {
+        return Ok(Some((
+            right_column
+                .strip_prefix(&left_prefix)
+                .expect("left prefix")
+                .to_string(),
+            left_column
+                .strip_prefix(&right_prefix)
+                .expect("right prefix")
+                .to_string(),
+        )));
+    }
+    Ok(None)
+}
+
+fn maybe_join_column_name(expr: &SqlExpr, table_aliases: &[&str]) -> Result<Option<String>> {
+    match expr {
+        SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
+            join_column_name(expr, table_aliases).map(Some)
+        }
+        _ => Ok(None),
+    }
 }
 
 fn parse_join_condition(
