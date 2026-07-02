@@ -322,7 +322,7 @@ ORDER BY value DESC
         },
         TpchQuery {
             name: "q12_shipping_modes",
-            expected_status: "unsupported-sql:JOIN aggregate arguments must be * or columns, got (CASE WHEN o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH' THEN 1 ELSE 0 END)",
+            expected_status: "unsupported-sql:expected literal, got l_commitdate",
             sql: r#"
 SELECT
     l_shipmode,
@@ -464,7 +464,7 @@ LIMIT 100
         },
         TpchQuery {
             name: "q19_discounted_revenue",
-            expected_status: "unsupported-sql:JOIN aggregate arguments must be * or columns, got (l_extendedprice * (1 - l_discount))",
+            expected_status: "unsupported-sql:comma join requires at least one equality predicate between the two tables",
             sql: r#"
 SELECT
     sum(l_extendedprice * (1 - l_discount)) AS revenue

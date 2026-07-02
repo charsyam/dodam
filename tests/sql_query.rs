@@ -1216,6 +1216,34 @@ async fn executes_two_table_comma_join_sql() {
 }
 
 #[tokio::test]
+async fn executes_comma_join_aggregate_expression_sql() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let orders_path = tempdir.path().join("orders.parquet");
+    let lineitem_path = tempdir.path().join("lineitem.parquet");
+    write_tpch_like_orders_parquet(&orders_path);
+    write_tpch_like_lineitem_parquet(&lineitem_path);
+
+    let sql = format!(
+        "SELECT l_shipmode, sum(CASE WHEN o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH' THEN 1 ELSE 0 END) AS high_line_count, sum(l_extendedprice * (1 - l_discount)) AS revenue FROM '{}' AS orders, '{}' AS lineitem WHERE o_orderkey = l_orderkey GROUP BY l_shipmode ORDER BY l_shipmode",
+        orders_path.display(),
+        lineitem_path.display()
+    );
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute comma join aggregate expression sql");
+
+    let QueryOutput::Aggregate { batches, .. } = output else {
+        panic!("expected aggregate output");
+    };
+    assert_eq!(
+        strings_from_column(&batches, 0),
+        vec!["MAIL".to_string(), "SHIP".to_string()]
+    );
+    assert_eq!(i64s_from_column(&batches, 1), vec![1, 1]);
+    assert_eq!(f64s_from_column(&batches, 2), vec![1400.0, 380.0]);
+}
+
+#[tokio::test]
 async fn executes_tpch_q13_style_join_aggregate_without_explicit_aliases() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let customer_path = tempdir.path().join("customer.parquet");
@@ -2584,6 +2612,53 @@ fn write_q13_orders_parquet(path: &std::path::Path) {
     writer.close().expect("close parquet writer");
 }
 
+fn write_tpch_like_orders_parquet(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("o_orderkey", DataType::Int32, false),
+        Field::new("o_orderpriority", DataType::Utf8, false),
+    ]));
+    let orderkeys = Int32Array::from_iter_values([1, 2, 3]);
+    let priorities = StringArray::from_iter_values(["1-URGENT", "3-MEDIUM", "2-HIGH"]);
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(orderkeys), Arc::new(priorities)],
+    )
+    .expect("record batch");
+
+    let file = File::create(path).expect("create parquet file");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+}
+
+fn write_tpch_like_lineitem_parquet(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("l_orderkey", DataType::Int32, false),
+        Field::new("l_shipmode", DataType::Utf8, false),
+        Field::new("l_extendedprice", DataType::Int64, false),
+        Field::new("l_discount", DataType::Float64, false),
+    ]));
+    let orderkeys = Int32Array::from_iter_values([1, 2, 3]);
+    let shipmodes = StringArray::from_iter_values(["MAIL", "MAIL", "SHIP"]);
+    let prices = Int64Array::from_iter_values([1000, 500, 400]);
+    let discounts = Float64Array::from_iter_values([0.05, 0.10, 0.05]);
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(orderkeys),
+            Arc::new(shipmodes),
+            Arc::new(prices),
+            Arc::new(discounts),
+        ],
+    )
+    .expect("record batch");
+
+    let file = File::create(path).expect("create parquet file");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+}
+
 fn write_duplicate_customers_parquet(path: &std::path::Path) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
@@ -2861,6 +2936,22 @@ fn i64s_from_column(batches: &[RecordBatch], column: usize) -> Vec<i64> {
                 .expect("i64 column")
                 .iter()
                 .map(|value| value.expect("non-null i64"))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn f64s_from_column(batches: &[RecordBatch], column: usize) -> Vec<f64> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("f64 column")
+                .iter()
+                .map(|value| value.expect("non-null f64"))
                 .collect::<Vec<_>>()
         })
         .collect()

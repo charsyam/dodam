@@ -153,6 +153,12 @@
   - supports explicit aliases and TPC-H-style inferred unqualified columns through the existing join column resolver
   - added SQL coverage comparing comma join output with the existing join path
   - TPC-H inventory now advances Q12/Q14/Q19 from FROM-list parsing to join aggregate expression blockers, while 3+ table queries report the explicit 2-table comma join limitation
+- Added join aggregate input expression support:
+  - materializes deterministic temporary expression columns over join output before aggregation, matching the existing single-table aggregate expression path
+  - supports arithmetic and searched `CASE` inside join aggregate inputs
+  - disables join projection narrowing for aggregate-expression joins to keep correctness simple
+  - Q12 now advances to column-to-column residual predicate support (`l_commitdate < l_receiptdate`)
+  - Q19 now advances to join equality extraction under OR branches
 - The TPC-H-lite suite caught missing `Date32` `min`/`max` aggregate support; added `Date32` aggregate state and `Date32Array` result materialization.
 - The TPC-H-lite join aggregate case caught an aggregate join output projection correctness issue around qualified column names when the cost model chooses the left side as the hash build input.
 - Fixed build-side-aware join output projection mapping for hash/materialized join output schemas and restored aggregate join output projection pushdown.

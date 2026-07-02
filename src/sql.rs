@@ -140,8 +140,13 @@ pub async fn execute_sql(
         let is_aggregate = query.is_aggregate();
         let aggregates = query.aggregates.clone();
         let group_by = query.group_by.clone();
+        let join_input_projection = if query.aggregate_expressions.is_empty() {
+            &query.projection
+        } else {
+            &Projection::All
+        };
         let join_plan = plan_join_inputs(
-            &query.projection,
+            join_input_projection,
             query.filter.as_ref(),
             query.order_by.as_ref(),
             &join.left_alias,
@@ -175,6 +180,15 @@ pub async fn execute_sql(
             .await?;
         if is_aggregate {
             let stream = apply_output_filter_stream(stream, query.filter.clone());
+            let stream: SendableBatchStream = if query.aggregate_expressions.is_empty() {
+                stream
+            } else {
+                let batches = append_aggregate_expression_columns(
+                    collect_batches(stream)?,
+                    &query.aggregate_expressions,
+                )?;
+                Box::new(MemoryExec::new(batches)).execute()?
+            };
             let metrics = if group_by.is_empty() {
                 collect_aggregates(stream, 2, &aggregates)?
             } else {
@@ -1217,6 +1231,8 @@ async fn try_execute_derived_join_sql(
     let mut batches = collect_batches(stream)?;
     batches = apply_output_filter(batches, filter.as_ref())?;
     if !projection.aggregates.is_empty() {
+        let batches =
+            append_aggregate_expression_columns(batches, &projection.aggregate_expressions)?;
         let stream = Box::new(MemoryExec::new(batches)).execute()?;
         let metrics = if group_by.is_empty() {
             collect_aggregates(stream, 1, &projection.aggregates)?
@@ -1857,6 +1873,9 @@ fn pushed_join_output_projection(query: &SqlQuery) -> Projection {
     if !matches!(join.join_type, JoinType::Inner | JoinType::Semi) {
         return Projection::All;
     }
+    if !query.aggregate_expressions.is_empty() {
+        return Projection::All;
+    }
     if query.is_aggregate() {
         return aggregate_join_output_projection(query);
     }
@@ -1874,6 +1893,11 @@ fn aggregate_join_output_projection(query: &SqlQuery) -> Projection {
     let mut columns = columns.clone();
     if let Some(filter) = &query.filter {
         for column in filter.referenced_columns() {
+            add_column_once(&mut columns, column);
+        }
+    }
+    for expression in &query.aggregate_expressions {
+        for column in scalar_expression_columns(&expression.expr) {
             add_column_once(&mut columns, column);
         }
     }
@@ -2632,6 +2656,8 @@ fn parse_join_projection(
 ) -> Result<ParsedProjection> {
     let mut columns = Vec::new();
     let mut aggregates = Vec::new();
+    let mut aggregate_expressions = Vec::new();
+    let mut aggregate_expression_columns = Vec::new();
     let mut aliases = Vec::new();
     let mut wildcard = false;
 
@@ -2644,7 +2670,18 @@ fn parse_join_projection(
                 columns.push(join_column_name(expr, table_aliases)?);
             }
             SelectItem::UnnamedExpr(SqlExpr::Function(function)) => {
-                aggregates.push(parse_join_aggregate(function, table_aliases)?);
+                let (aggregate, expression) = parse_join_aggregate_with_input_expression(
+                    function,
+                    table_aliases,
+                    aggregate_expressions.len(),
+                )?;
+                if let Some(expression) = expression {
+                    for column in join_scalar_expression_columns(&expression.expr, table_aliases)? {
+                        add_column_once(&mut aggregate_expression_columns, column);
+                    }
+                    aggregate_expressions.push(expression);
+                }
+                aggregates.push(aggregate);
             }
             SelectItem::ExprWithAlias { expr, alias } => match expr {
                 SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
@@ -2653,7 +2690,19 @@ fn parse_join_projection(
                     columns.push(column);
                 }
                 SqlExpr::Function(function) => {
-                    let aggregate = parse_join_aggregate(function, table_aliases)?;
+                    let (aggregate, expression) = parse_join_aggregate_with_input_expression(
+                        function,
+                        table_aliases,
+                        aggregate_expressions.len(),
+                    )?;
+                    if let Some(expression) = expression {
+                        for column in
+                            join_scalar_expression_columns(&expression.expr, table_aliases)?
+                        {
+                            add_column_once(&mut aggregate_expression_columns, column);
+                        }
+                        aggregate_expressions.push(expression);
+                    }
                     aliases.push((alias.value.clone(), aggregate.to_string()));
                     aggregates.push(aggregate);
                 }
@@ -2702,10 +2751,13 @@ fn parse_join_projection(
                 add_column_once(&mut projected_columns, column.to_string());
             }
         }
+        for column in aggregate_expression_columns {
+            add_column_once(&mut projected_columns, column);
+        }
         return Ok(ParsedProjection {
             projection: Projection::Columns(projected_columns),
             aggregates,
-            aggregate_expressions: Vec::new(),
+            aggregate_expressions,
             aliases,
             expressions: Vec::new(),
         });
@@ -2718,7 +2770,7 @@ fn parse_join_projection(
             Projection::Columns(columns)
         },
         aggregates,
-        aggregate_expressions: Vec::new(),
+        aggregate_expressions,
         aliases,
         expressions: Vec::new(),
     })
@@ -2763,7 +2815,14 @@ fn parse_join_order_by(
                 ));
             }
             let column = match &order.expr {
-                SqlExpr::Identifier(ident) => resolve_alias(&ident.value, aliases),
+                SqlExpr::Identifier(ident) => {
+                    let resolved = resolve_alias(&ident.value, aliases);
+                    if resolved == ident.value {
+                        join_column_name(&order.expr, table_aliases)?
+                    } else {
+                        resolved
+                    }
+                }
                 SqlExpr::CompoundIdentifier(_) => join_column_name(&order.expr, table_aliases)?,
                 SqlExpr::Function(function) => resolve_alias(
                     &parse_join_aggregate(function, table_aliases)?.to_string(),
@@ -3379,10 +3438,214 @@ fn parse_scalar_sql_expression(
     }
 }
 
+fn parse_join_scalar_sql_expression(
+    expr: &SqlExpr,
+    table_aliases: &[&str],
+) -> Result<ScalarSqlExpression> {
+    match expr {
+        SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => Ok(ScalarSqlExpression::Column(
+            join_column_name(expr, table_aliases)?,
+        )),
+        SqlExpr::Value(_) => Ok(ScalarSqlExpression::Literal(sql_literal_value(expr)?)),
+        SqlExpr::Nested(expr) => parse_join_scalar_sql_expression(expr, table_aliases),
+        SqlExpr::BinaryOp { left, op, right }
+            if matches!(
+                op,
+                BinaryOperator::Plus
+                    | BinaryOperator::Minus
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+            ) =>
+        {
+            Ok(ScalarSqlExpression::Binary {
+                left: Box::new(parse_join_scalar_sql_expression(left, table_aliases)?),
+                op: op.clone(),
+                right: Box::new(parse_join_scalar_sql_expression(right, table_aliases)?),
+            })
+        }
+        SqlExpr::Cast {
+            expr, data_type, ..
+        } => Ok(ScalarSqlExpression::Cast {
+            expr: Box::new(parse_join_scalar_sql_expression(expr, table_aliases)?),
+            target: data_type.to_string(),
+        }),
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if operand.is_some() {
+                return Err(DodamError::UnsupportedSql(
+                    "simple CASE operand is not supported yet".to_string(),
+                ));
+            }
+            Ok(ScalarSqlExpression::Case {
+                conditions: conditions
+                    .iter()
+                    .map(|when| rewrite_join_scalar_predicate(&when.condition, table_aliases))
+                    .collect::<Result<Vec<_>>>()?,
+                results: conditions
+                    .iter()
+                    .map(|when| parse_join_scalar_sql_expression(&when.result, table_aliases))
+                    .collect::<Result<Vec<_>>>()?,
+                else_result: else_result
+                    .as_ref()
+                    .map(|expr| parse_join_scalar_sql_expression(expr, table_aliases).map(Box::new))
+                    .transpose()?,
+            })
+        }
+        _ => Err(DodamError::UnsupportedSql(format!(
+            "unsupported JOIN scalar expression: {expr}"
+        ))),
+    }
+}
+
+fn rewrite_join_scalar_predicate(expr: &SqlExpr, table_aliases: &[&str]) -> Result<SqlExpr> {
+    match expr {
+        SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
+            let column = join_column_name(expr, table_aliases)?;
+            Ok(sql_column_expr(&column))
+        }
+        SqlExpr::BinaryOp { left, op, right } => Ok(SqlExpr::BinaryOp {
+            left: Box::new(rewrite_join_scalar_predicate(left, table_aliases)?),
+            op: op.clone(),
+            right: Box::new(rewrite_join_scalar_predicate(right, table_aliases)?),
+        }),
+        SqlExpr::Nested(expr) => Ok(SqlExpr::Nested(Box::new(rewrite_join_scalar_predicate(
+            expr,
+            table_aliases,
+        )?))),
+        SqlExpr::UnaryOp { op, expr } => Ok(SqlExpr::UnaryOp {
+            op: op.clone(),
+            expr: Box::new(rewrite_join_scalar_predicate(expr, table_aliases)?),
+        }),
+        SqlExpr::IsNull(expr) => Ok(SqlExpr::IsNull(Box::new(rewrite_join_scalar_predicate(
+            expr,
+            table_aliases,
+        )?))),
+        SqlExpr::IsNotNull(expr) => Ok(SqlExpr::IsNotNull(Box::new(
+            rewrite_join_scalar_predicate(expr, table_aliases)?,
+        ))),
+        SqlExpr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => Ok(SqlExpr::Like {
+            negated: *negated,
+            any: *any,
+            expr: Box::new(rewrite_join_scalar_predicate(expr, table_aliases)?),
+            pattern: Box::new(rewrite_join_scalar_predicate(pattern, table_aliases)?),
+            escape_char: escape_char.clone(),
+        }),
+        SqlExpr::Value(_) => Ok(expr.clone()),
+        _ => Ok(expr.clone()),
+    }
+}
+
+fn sql_column_expr(column: &str) -> SqlExpr {
+    SqlExpr::Identifier(sqlparser::ast::Ident::new(column))
+}
+
 fn scalar_expression_columns(expr: &ScalarSqlExpression) -> Vec<String> {
     let mut columns = Vec::new();
     collect_scalar_expression_columns(expr, &mut columns);
     columns
+}
+
+fn join_scalar_expression_columns(
+    expr: &ScalarSqlExpression,
+    table_aliases: &[&str],
+) -> Result<Vec<String>> {
+    let mut columns = Vec::new();
+    collect_join_scalar_expression_columns(expr, table_aliases, &mut columns)?;
+    Ok(columns)
+}
+
+fn collect_join_scalar_expression_columns(
+    expr: &ScalarSqlExpression,
+    table_aliases: &[&str],
+    columns: &mut Vec<String>,
+) -> Result<()> {
+    match expr {
+        ScalarSqlExpression::Column(column) => add_column_once(columns, column.clone()),
+        ScalarSqlExpression::Literal(_) => {}
+        ScalarSqlExpression::Binary { left, right, .. } => {
+            collect_join_scalar_expression_columns(left, table_aliases, columns)?;
+            collect_join_scalar_expression_columns(right, table_aliases, columns)?;
+        }
+        ScalarSqlExpression::Cast { expr, .. } => {
+            collect_join_scalar_expression_columns(expr, table_aliases, columns)?;
+        }
+        ScalarSqlExpression::Coalesce(values) => {
+            for value in values {
+                collect_join_scalar_expression_columns(value, table_aliases, columns)?;
+            }
+        }
+        ScalarSqlExpression::Lower(expr)
+        | ScalarSqlExpression::Upper(expr)
+        | ScalarSqlExpression::Length(expr) => {
+            collect_join_scalar_expression_columns(expr, table_aliases, columns)?;
+        }
+        ScalarSqlExpression::Substring {
+            expr,
+            start,
+            length,
+        } => {
+            collect_join_scalar_expression_columns(expr, table_aliases, columns)?;
+            collect_join_scalar_expression_columns(start, table_aliases, columns)?;
+            if let Some(length) = length {
+                collect_join_scalar_expression_columns(length, table_aliases, columns)?;
+            }
+        }
+        ScalarSqlExpression::Case {
+            conditions,
+            results,
+            else_result,
+        } => {
+            for condition in conditions {
+                collect_join_predicate_columns(condition, table_aliases, columns)?;
+            }
+            for result in results {
+                collect_join_scalar_expression_columns(result, table_aliases, columns)?;
+            }
+            if let Some(else_result) = else_result {
+                collect_join_scalar_expression_columns(else_result, table_aliases, columns)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_join_predicate_columns(
+    expr: &SqlExpr,
+    table_aliases: &[&str],
+    columns: &mut Vec<String>,
+) -> Result<()> {
+    match expr {
+        SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
+            add_column_once(columns, join_column_name(expr, table_aliases)?);
+        }
+        SqlExpr::BinaryOp { left, right, .. } => {
+            collect_join_predicate_columns(left, table_aliases, columns)?;
+            collect_join_predicate_columns(right, table_aliases, columns)?;
+        }
+        SqlExpr::UnaryOp { expr, .. }
+        | SqlExpr::Nested(expr)
+        | SqlExpr::IsNull(expr)
+        | SqlExpr::IsNotNull(expr) => {
+            collect_join_predicate_columns(expr, table_aliases, columns)?;
+        }
+        SqlExpr::Like { expr, pattern, .. } => {
+            collect_join_predicate_columns(expr, table_aliases, columns)?;
+            collect_join_predicate_columns(pattern, table_aliases, columns)?;
+        }
+        SqlExpr::Value(_) => {}
+        _ => {}
+    }
+    Ok(())
 }
 
 fn collect_scalar_expression_columns(expr: &ScalarSqlExpression, columns: &mut Vec<String>) {
@@ -3592,6 +3855,67 @@ fn parse_join_aggregate(
         }
     };
     AggregateExpr::parse(&format!("{name}({argument})"))
+}
+
+fn parse_join_aggregate_with_input_expression(
+    function: &sqlparser::ast::Function,
+    table_aliases: &[&str],
+    expression_index: usize,
+) -> Result<(AggregateExpr, Option<ProjectionExpression>)> {
+    match parse_join_aggregate(function, table_aliases) {
+        Ok(aggregate) => return Ok((aggregate, None)),
+        Err(DodamError::UnsupportedSql(message))
+            if message.starts_with("JOIN aggregate arguments must be") => {}
+        Err(error) => return Err(error),
+    }
+
+    if function.filter.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+        || function.null_treatment.is_some()
+        || !matches!(function.parameters, FunctionArguments::None)
+    {
+        return Err(DodamError::UnsupportedSql(
+            "aggregate filters, windows, within group, null treatment, and parameters are not supported"
+                .to_string(),
+        ));
+    }
+    let name = object_name_to_string(&function.name)?;
+    if !matches!(
+        name.to_ascii_lowercase().as_str(),
+        "sum" | "avg" | "min" | "max"
+    ) {
+        return Err(DodamError::UnsupportedSql(format!(
+            "aggregate expression input is not supported for {name}"
+        )));
+    }
+    let FunctionArguments::List(args) = &function.args else {
+        return Err(DodamError::UnsupportedSql(format!(
+            "unsupported function arguments: {}",
+            function.args
+        )));
+    };
+    if !args.clauses.is_empty() || args.duplicate_treatment.is_some() {
+        return Err(DodamError::UnsupportedSql(format!(
+            "unsupported function arguments: {}",
+            function.args
+        )));
+    }
+    let [FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))] = args.args.as_slice() else {
+        return Err(DodamError::UnsupportedSql(format!(
+            "unsupported function arguments: {}",
+            function.args
+        )));
+    };
+    let column = format!("__dodam_join_agg_expr_{expression_index}");
+    let expression = ProjectionExpression {
+        output_name: column.clone(),
+        expr: parse_join_scalar_sql_expression(expr, table_aliases)?,
+    };
+    Ok((
+        AggregateExpr::parse(&format!("{name}({column})"))?,
+        Some(expression),
+    ))
 }
 
 fn parse_group_by(select: &Select, table_alias: Option<&str>) -> Result<Vec<String>> {
