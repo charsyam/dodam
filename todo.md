@@ -503,6 +503,10 @@ Tried and rejected or neutral:
 ### 8. SQL Completeness
 
 - Use `tests/tpch_coverage.rs` as the TPC-H support scoreboard and reduce unsupported statuses query by query.
+- TPC-H progress notes:
+  - Q16 now materializes the uncorrelated `NOT IN (SELECT ...)` join residual and advances to the `supplier` input requirement.
+  - Q20 now attempts the outer join `IN (SELECT ...)` materialization and advances to the `partsupp` input requirement; real-data execution is still expected to expose the nested correlated scalar aggregate blocker.
+  - Materialized join subquery rewrite is intentionally scoped to multi-FROM queries and falls back to the original parser path when subquery execution is unsupported.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.

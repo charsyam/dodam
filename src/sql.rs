@@ -111,6 +111,11 @@ pub async fn execute_sql(
     if let Some(output) = try_execute_derived_sql(engine, sql, batch_size).await? {
         return Ok(output);
     }
+    if let Some(output) =
+        try_execute_materialized_join_subquery_sql(engine, sql, batch_size).await?
+    {
+        return Ok(output);
+    }
     if let Some(output) = try_execute_multi_comma_join_sql(engine, sql, batch_size).await? {
         return Ok(output);
     }
@@ -1169,6 +1174,285 @@ fn expr_contains_materializable_subquery(expr: &SqlExpr) -> bool {
         }
         _ => false,
     }
+}
+
+async fn try_execute_materialized_join_subquery_sql(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let Some(selection) = select.selection.as_ref() else {
+        return Ok(None);
+    };
+    if select.from.len() <= 1 || !expr_contains_materializable_subquery(selection) {
+        return Ok(None);
+    }
+    reject_query_features(query)?;
+    reject_select_features(select)?;
+
+    let mut rewritten_query = query.as_ref().clone();
+    let SetExpr::Select(rewritten_select) = rewritten_query.body.as_mut() else {
+        return Ok(None);
+    };
+    let Some(rewritten_selection) = rewritten_select.selection.take() else {
+        return Ok(None);
+    };
+    let mut changed = false;
+    let Some(rewritten_selection) = Box::pin(rewrite_materializable_subqueries_to_literals(
+        engine,
+        rewritten_selection,
+        batch_size,
+        &mut changed,
+    ))
+    .await?
+    else {
+        return Ok(None);
+    };
+    if !changed {
+        return Ok(None);
+    }
+    rewritten_select.selection = Some(rewritten_selection);
+    Box::pin(execute_sql(
+        engine,
+        &rewritten_query.to_string(),
+        batch_size,
+    ))
+    .await
+    .map(Some)
+}
+
+async fn rewrite_materializable_subqueries_to_literals(
+    engine: &DodamEngine,
+    expr: SqlExpr,
+    batch_size: usize,
+    changed: &mut bool,
+) -> Result<Option<SqlExpr>> {
+    match expr {
+        SqlExpr::Exists { subquery, negated } => {
+            let output =
+                match Box::pin(execute_sql(engine, &subquery.to_string(), batch_size)).await {
+                    Ok(output) => output,
+                    Err(DodamError::UnsupportedSql(_)) => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+            let exists = query_output_batches(output)?
+                .iter()
+                .any(|batch| batch.num_rows() > 0);
+            *changed = true;
+            Ok(Some(SqlExpr::Value(
+                Value::Boolean(if negated { !exists } else { exists }).with_empty_span(),
+            )))
+        }
+        SqlExpr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            let output =
+                match Box::pin(execute_sql(engine, &subquery.to_string(), batch_size)).await {
+                    Ok(output) => output,
+                    Err(DodamError::UnsupportedSql(_)) => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+            let values = literal_values_from_single_column_batches(query_output_batches(output)?)?;
+            *changed = true;
+            Ok(Some(SqlExpr::InList {
+                expr,
+                list: values.into_iter().map(literal_value_to_sql_expr).collect(),
+                negated,
+            }))
+        }
+        SqlExpr::Subquery(subquery) => {
+            let output =
+                match Box::pin(execute_sql(engine, &subquery.to_string(), batch_size)).await {
+                    Ok(output) => output,
+                    Err(DodamError::UnsupportedSql(_)) => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+            let value = scalar_literal_value_from_batches(query_output_batches(output)?)?;
+            *changed = true;
+            Ok(Some(literal_value_to_sql_expr(value)))
+        }
+        SqlExpr::BinaryOp { left, op, right } => {
+            let Some(left) = Box::pin(rewrite_materializable_subqueries_to_literals(
+                engine, *left, batch_size, changed,
+            ))
+            .await?
+            else {
+                return Ok(None);
+            };
+            let Some(right) = Box::pin(rewrite_materializable_subqueries_to_literals(
+                engine, *right, batch_size, changed,
+            ))
+            .await?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(SqlExpr::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            }))
+        }
+        SqlExpr::Nested(expr) => {
+            let Some(expr) = Box::pin(rewrite_materializable_subqueries_to_literals(
+                engine, *expr, batch_size, changed,
+            ))
+            .await?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(SqlExpr::Nested(Box::new(expr))))
+        }
+        SqlExpr::UnaryOp { op, expr } => {
+            let Some(expr) = Box::pin(rewrite_materializable_subqueries_to_literals(
+                engine, *expr, batch_size, changed,
+            ))
+            .await?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(SqlExpr::UnaryOp {
+                op,
+                expr: Box::new(expr),
+            }))
+        }
+        SqlExpr::IsNull(expr) => {
+            let Some(expr) = Box::pin(rewrite_materializable_subqueries_to_literals(
+                engine, *expr, batch_size, changed,
+            ))
+            .await?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(SqlExpr::IsNull(Box::new(expr))))
+        }
+        SqlExpr::IsNotNull(expr) => {
+            let Some(expr) = Box::pin(rewrite_materializable_subqueries_to_literals(
+                engine, *expr, batch_size, changed,
+            ))
+            .await?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(SqlExpr::IsNotNull(Box::new(expr))))
+        }
+        SqlExpr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let Some(expr) = Box::pin(rewrite_materializable_subqueries_to_literals(
+                engine, *expr, batch_size, changed,
+            ))
+            .await?
+            else {
+                return Ok(None);
+            };
+            let mut rewritten_list = Vec::with_capacity(list.len());
+            for item in list {
+                let Some(item) = Box::pin(rewrite_materializable_subqueries_to_literals(
+                    engine, item, batch_size, changed,
+                ))
+                .await?
+                else {
+                    return Ok(None);
+                };
+                rewritten_list.push(item);
+            }
+            Ok(Some(SqlExpr::InList {
+                expr: Box::new(expr),
+                list: rewritten_list,
+                negated,
+            }))
+        }
+        SqlExpr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let Some(expr) = Box::pin(rewrite_materializable_subqueries_to_literals(
+                engine, *expr, batch_size, changed,
+            ))
+            .await?
+            else {
+                return Ok(None);
+            };
+            let Some(low) = Box::pin(rewrite_materializable_subqueries_to_literals(
+                engine, *low, batch_size, changed,
+            ))
+            .await?
+            else {
+                return Ok(None);
+            };
+            let Some(high) = Box::pin(rewrite_materializable_subqueries_to_literals(
+                engine, *high, batch_size, changed,
+            ))
+            .await?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(SqlExpr::Between {
+                expr: Box::new(expr),
+                negated,
+                low: Box::new(low),
+                high: Box::new(high),
+            }))
+        }
+        SqlExpr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => {
+            let Some(expr) = Box::pin(rewrite_materializable_subqueries_to_literals(
+                engine, *expr, batch_size, changed,
+            ))
+            .await?
+            else {
+                return Ok(None);
+            };
+            let Some(pattern) = Box::pin(rewrite_materializable_subqueries_to_literals(
+                engine, *pattern, batch_size, changed,
+            ))
+            .await?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(SqlExpr::Like {
+                negated,
+                any,
+                expr: Box::new(expr),
+                pattern: Box::new(pattern),
+                escape_char,
+            }))
+        }
+        expr => Ok(Some(expr)),
+    }
+}
+
+fn literal_value_to_sql_expr(value: LiteralValue) -> SqlExpr {
+    SqlExpr::Value(
+        match value {
+            LiteralValue::Null => Value::Null,
+            LiteralValue::Boolean(value) => Value::Boolean(value),
+            LiteralValue::Int64(value) => Value::Number(value.to_string(), false),
+            LiteralValue::Float64(value) => Value::Number(value.to_string(), false),
+            LiteralValue::Utf8(value) => Value::SingleQuotedString(value),
+        }
+        .with_empty_span(),
+    )
 }
 
 async fn parse_filter_with_subqueries(

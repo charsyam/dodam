@@ -84,7 +84,7 @@ ORDER BY l_returnflag, l_linestatus
         },
         TpchQuery {
             name: "q02_minimum_cost_supplier",
-            expected_status: "needs-data:part",
+            expected_status: "needs-data:partsupp",
             sql: r#"
 SELECT
     s_acctbal,
@@ -399,7 +399,7 @@ ORDER BY s_suppkey
         },
         TpchQuery {
             name: "q16_parts_supplier_relationship",
-            expected_status: "unsupported-sql:unsupported JOIN WHERE expression: ps_suppkey NOT IN (SELECT s_suppkey FROM supplier WHERE s_comment LIKE '%Customer%Complaints%')",
+            expected_status: "needs-data:supplier",
             sql: r#"
 SELECT
     p_brand,
@@ -439,7 +439,7 @@ WHERE p_partkey = l_partkey
         },
         TpchQuery {
             name: "q18_large_volume_customer",
-            expected_status: "needs-data:customer",
+            expected_status: "needs-data:lineitem",
             sql: r#"
 SELECT
     c_name,
@@ -498,7 +498,7 @@ WHERE (
         },
         TpchQuery {
             name: "q20_potential_part_promotion",
-            expected_status: "unsupported-sql:unsupported JOIN WHERE expression: s_suppkey IN (SELECT ps_suppkey FROM partsupp WHERE ps_partkey IN (SELECT p_partkey FROM part WHERE p_name LIKE 'forest%') AND ps_availqty > (SELECT 0.5 * sum(l_quantity) FROM lineitem WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey AND l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1994-01-01' + INTERVAL '1' YEAR))",
+            expected_status: "needs-data:partsupp",
             sql: r#"
 SELECT
     s_name,
