@@ -4459,13 +4459,31 @@ fn hash_join_materialize_context<'a>(
             build_side,
             output_projection,
         )?,
-        semi_output_schema: single_side_output_schema(
+        semi_output_schema: semi_output_schema(
             probe,
+            build,
+            build_side,
             left_prefix,
             output_projection.left_columns.as_ref(),
         )?,
         metrics,
     })
+}
+
+fn semi_output_schema(
+    probe: &RecordBatch,
+    build: &HashJoinBuild,
+    build_side: JoinBuildSide,
+    left_prefix: &str,
+    left_columns: Option<&Vec<String>>,
+) -> Result<Arc<Schema>> {
+    let left_batch = match build_side {
+        JoinBuildSide::Left => build.batches.first().ok_or_else(|| {
+            DodamError::UnsupportedSql("hash join build input is empty".to_string())
+        })?,
+        JoinBuildSide::Right => probe,
+    };
+    single_side_output_schema(left_batch, left_prefix, left_columns)
 }
 
 fn hash_join_output_schema(
@@ -8000,16 +8018,20 @@ fn materialize_join_pairs(
     probe_indices: &[u32],
     build_indices: &[u32],
 ) -> Result<RecordBatch> {
-    let probe_taken = take_record_batch_by_indices_projected(
-        context.probe,
-        probe_indices,
-        context.output_projection.left_columns.as_ref(),
-    )?;
-    let build_taken = take_record_batch_by_indices_projected(
-        context.build,
-        build_indices,
-        context.output_projection.right_columns.as_ref(),
-    )?;
+    let (probe_columns, build_columns) = match context.build_side {
+        JoinBuildSide::Left => (
+            context.output_projection.right_columns.as_ref(),
+            context.output_projection.left_columns.as_ref(),
+        ),
+        JoinBuildSide::Right => (
+            context.output_projection.left_columns.as_ref(),
+            context.output_projection.right_columns.as_ref(),
+        ),
+    };
+    let probe_taken =
+        take_record_batch_by_indices_projected(context.probe, probe_indices, probe_columns)?;
+    let build_taken =
+        take_record_batch_by_indices_projected(context.build, build_indices, build_columns)?;
     let (left_taken, right_taken) = match context.build_side {
         JoinBuildSide::Left => (build_taken, probe_taken),
         JoinBuildSide::Right => (probe_taken, build_taken),

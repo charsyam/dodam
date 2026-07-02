@@ -1804,13 +1804,26 @@ fn pushed_join_output_projection(query: &SqlQuery) -> Projection {
         return Projection::All;
     }
     if query.is_aggregate() {
-        return Projection::All;
+        return aggregate_join_output_projection(query);
     }
     if query.filter.is_some() || query.order_by.is_some() {
         Projection::All
     } else {
         query.projection.clone()
     }
+}
+
+fn aggregate_join_output_projection(query: &SqlQuery) -> Projection {
+    let Projection::Columns(columns) = &query.projection else {
+        return Projection::All;
+    };
+    let mut columns = columns.clone();
+    if let Some(filter) = &query.filter {
+        for column in filter.referenced_columns() {
+            add_column_once(&mut columns, column);
+        }
+    }
+    Projection::Columns(columns)
 }
 
 fn parse_query(query: &Query) -> Result<SqlQuery> {
