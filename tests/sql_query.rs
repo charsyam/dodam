@@ -1216,6 +1216,40 @@ async fn executes_two_table_comma_join_sql() {
 }
 
 #[tokio::test]
+async fn filters_with_column_to_column_comparison_sql() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let orders_path = tempdir.path().join("orders.parquet");
+    let customers_path = tempdir.path().join("customers.parquet");
+    write_orders_parquet(&orders_path);
+    write_customers_parquet(&customers_path);
+
+    let sql = format!(
+        "SELECT id FROM '{}' WHERE customer_id < id AND id < 12 ORDER BY id",
+        orders_path.display()
+    );
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute column comparison sql");
+    let QueryOutput::Scan { batches } = output else {
+        panic!("expected scan output");
+    };
+    assert_eq!(i32s_from_column(&batches, 0), vec![10, 11]);
+
+    let sql = format!(
+        "SELECT o.id FROM '{}' AS o, '{}' AS c WHERE o.customer_id = c.id AND o.customer_id < o.id ORDER BY o.id",
+        orders_path.display(),
+        customers_path.display()
+    );
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute join residual column comparison sql");
+    let QueryOutput::Scan { batches } = output else {
+        panic!("expected scan output");
+    };
+    assert_eq!(i32s_from_column(&batches, 0), vec![10, 11, 12]);
+}
+
+#[tokio::test]
 async fn executes_comma_join_aggregate_expression_sql() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let orders_path = tempdir.path().join("orders.parquet");

@@ -322,7 +322,7 @@ ORDER BY value DESC
         },
         TpchQuery {
             name: "q12_shipping_modes",
-            expected_status: "unsupported-sql:expected literal, got l_commitdate",
+            expected_status: "needs-data:orders",
             sql: r#"
 SELECT
     l_shipmode,

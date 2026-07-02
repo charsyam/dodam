@@ -8500,6 +8500,9 @@ fn evaluate_filter(batch: &RecordBatch, expr: &Expr) -> Result<BooleanArray> {
     match expr {
         Expr::Boolean(value) => Ok(BooleanArray::from(vec![*value; batch.num_rows()])),
         Expr::Comparison(comparison) => evaluate_comparison(batch, comparison),
+        Expr::ColumnComparison { left, op, right } => {
+            evaluate_column_comparison(batch, left, *op, right)
+        }
         Expr::InList {
             column,
             values,
@@ -8619,6 +8622,22 @@ fn evaluate_comparison(batch: &RecordBatch, comparison: &ComparisonExpr) -> Resu
     };
 
     Ok(mask)
+}
+
+fn evaluate_column_comparison(
+    batch: &RecordBatch,
+    left: &str,
+    op: ComparisonOp,
+    right: &str,
+) -> Result<BooleanArray> {
+    let left_index = column_index(batch, left)?;
+    let right_index = column_index(batch, right)?;
+    let left_column = batch.column(left_index);
+    let right_column = batch.column(right_index);
+    if left_column.data_type() != right_column.data_type() {
+        return Err(DodamError::InvalidFilter(format!("{left} {op:?} {right}")));
+    }
+    Ok(compare_columns(left_column, right_column, op)?)
 }
 
 fn decimal_literal_as_i128(
@@ -8980,6 +8999,21 @@ fn compare<T: arrow::array::Array>(
         ComparisonOp::LtEq => lt_eq(column, scalar),
         ComparisonOp::Gt => gt(column, scalar),
         ComparisonOp::GtEq => gt_eq(column, scalar),
+    }
+}
+
+fn compare_columns(
+    left: &ArrayRef,
+    right: &ArrayRef,
+    op: ComparisonOp,
+) -> arrow::error::Result<BooleanArray> {
+    match op {
+        ComparisonOp::Eq => eq(left, right),
+        ComparisonOp::NotEq => neq(left, right),
+        ComparisonOp::Lt => lt(left, right),
+        ComparisonOp::LtEq => lt_eq(left, right),
+        ComparisonOp::Gt => gt(left, right),
+        ComparisonOp::GtEq => gt_eq(left, right),
     }
 }
 

@@ -2830,6 +2830,10 @@ fn collect_filter_columns(expr: &Expr, columns: &mut Vec<String>) {
     match expr {
         Expr::Boolean(_) => {}
         Expr::Comparison(comparison) => add_filter_column(columns, &comparison.column),
+        Expr::ColumnComparison { left, right, .. } => {
+            add_filter_column(columns, left);
+            add_filter_column(columns, right);
+        }
         Expr::InList { column, .. } | Expr::Like { column, .. } | Expr::IsNull { column, .. } => {
             add_filter_column(columns, column);
         }
@@ -2854,6 +2858,11 @@ fn strip_filter_prefix(expr: Expr, prefix: &str) -> Expr {
             comparison.column = strip_column_prefix(&comparison.column, prefix);
             Expr::Comparison(comparison)
         }
+        Expr::ColumnComparison { left, op, right } => Expr::ColumnComparison {
+            left: strip_column_prefix(&left, prefix),
+            op,
+            right: strip_column_prefix(&right, prefix),
+        },
         Expr::InList {
             column,
             values,
@@ -3148,11 +3157,21 @@ fn join_expr_to_filter_expr(
             | BinaryOperator::Gt
             | BinaryOperator::GtEq
             | BinaryOperator::Lt
-            | BinaryOperator::LtEq => Ok(Expr::Comparison(ComparisonExpr {
-                column: join_filter_column(left, aliases, table_aliases, allow_aggregates)?,
-                op: sql_comparison_op(op),
-                value: sql_literal_value(right)?,
-            })),
+            | BinaryOperator::LtEq => {
+                let left = join_filter_column(left, aliases, table_aliases, allow_aggregates)?;
+                let op = sql_comparison_op(op);
+                if let Some(right) =
+                    maybe_join_filter_column(right, aliases, table_aliases, allow_aggregates)?
+                {
+                    Ok(Expr::ColumnComparison { left, op, right })
+                } else {
+                    Ok(Expr::Comparison(ComparisonExpr {
+                        column: left,
+                        op,
+                        value: sql_literal_value(right)?,
+                    }))
+                }
+            }
             _ => Err(DodamError::UnsupportedSql(format!(
                 "unsupported JOIN WHERE operator: {op}"
             ))),
@@ -3232,6 +3251,20 @@ fn join_filter_column(
         _ => Err(DodamError::UnsupportedSql(format!(
             "expected JOIN column or aggregate expression, got {expr}"
         ))),
+    }
+}
+
+fn maybe_join_filter_column(
+    expr: &SqlExpr,
+    aliases: &[(String, String)],
+    table_aliases: &[&str],
+    allow_aggregates: bool,
+) -> Result<Option<String>> {
+    match expr {
+        SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) | SqlExpr::Nested(_) => {
+            join_filter_column(expr, aliases, table_aliases, allow_aggregates).map(Some)
+        }
+        _ => Ok(None),
     }
 }
 
@@ -4324,11 +4357,21 @@ fn sql_expr_to_filter_expr(
             | BinaryOperator::Gt
             | BinaryOperator::GtEq
             | BinaryOperator::Lt
-            | BinaryOperator::LtEq => Ok(Expr::Comparison(ComparisonExpr {
-                column: sql_filter_column(left, aliases, table_alias, allow_aggregates)?,
-                op: sql_comparison_op(op),
-                value: sql_literal_value(right)?,
-            })),
+            | BinaryOperator::LtEq => {
+                let left = sql_filter_column(left, aliases, table_alias, allow_aggregates)?;
+                let op = sql_comparison_op(op);
+                if let Some(right) =
+                    maybe_sql_filter_column(right, aliases, table_alias, allow_aggregates)?
+                {
+                    Ok(Expr::ColumnComparison { left, op, right })
+                } else {
+                    Ok(Expr::Comparison(ComparisonExpr {
+                        column: left,
+                        op,
+                        value: sql_literal_value(right)?,
+                    }))
+                }
+            }
             _ => Err(DodamError::UnsupportedSql(format!(
                 "unsupported WHERE operator: {op}"
             ))),
@@ -4439,6 +4482,20 @@ fn sql_filter_column(
         _ => Err(DodamError::UnsupportedSql(format!(
             "expected column or aggregate expression, got {expr}"
         ))),
+    }
+}
+
+fn maybe_sql_filter_column(
+    expr: &SqlExpr,
+    aliases: &[(String, String)],
+    table_alias: Option<&str>,
+    allow_aggregates: bool,
+) -> Result<Option<String>> {
+    match expr {
+        SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) | SqlExpr::Nested(_) => {
+            sql_filter_column(expr, aliases, table_alias, allow_aggregates).map(Some)
+        }
+        _ => Ok(None),
     }
 }
 

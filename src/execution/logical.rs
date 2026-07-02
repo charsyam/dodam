@@ -212,6 +212,11 @@ pub struct FilterExpr(Expr);
 pub enum Expr {
     Boolean(Option<bool>),
     Comparison(ComparisonExpr),
+    ColumnComparison {
+        left: String,
+        op: ComparisonOp,
+        right: String,
+    },
     InList {
         column: String,
         values: Vec<LiteralValue>,
@@ -836,6 +841,14 @@ fn collect_referenced_columns(expr: &Expr, columns: &mut Vec<String>) {
         Expr::Comparison(comparison) => {
             if !columns.iter().any(|column| column == &comparison.column) {
                 columns.push(comparison.column.clone());
+            }
+        }
+        Expr::ColumnComparison { left, right, .. } => {
+            if !columns.iter().any(|column| column == left) {
+                columns.push(left.clone());
+            }
+            if !columns.iter().any(|column| column == right) {
+                columns.push(right.clone());
             }
         }
         Expr::InList { column, .. } | Expr::Like { column, .. } | Expr::IsNull { column, .. } => {

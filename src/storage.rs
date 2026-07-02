@@ -493,6 +493,7 @@ fn row_group_may_match(
         Expr::Or(left, right) => Ok(row_group_may_match(builder, row_group_index, left)?
             || row_group_may_match(builder, row_group_index, right)?),
         Expr::Boolean(_)
+        | Expr::ColumnComparison { .. }
         | Expr::InList { .. }
         | Expr::Like { .. }
         | Expr::IsNull { .. }

@@ -126,6 +126,13 @@ fn rewrite_join_side_expr(expr: &Expr, prefix: &str) -> Expr {
             op: comparison.op,
             value: comparison.value.clone(),
         }),
+        Expr::ColumnComparison { left, op, right } => Expr::ColumnComparison {
+            left: strip_join_prefix(left, prefix).unwrap_or(left).to_string(),
+            op: *op,
+            right: strip_join_prefix(right, prefix)
+                .unwrap_or(right)
+                .to_string(),
+        },
         Expr::InList {
             column,
             values,
@@ -180,6 +187,10 @@ fn collect_expr_referenced_columns(expr: &Expr, columns: &mut Vec<String>) {
     match expr {
         Expr::Boolean(_) => {}
         Expr::Comparison(comparison) => add_column_once(columns, comparison.column.clone()),
+        Expr::ColumnComparison { left, right, .. } => {
+            add_column_once(columns, left.clone());
+            add_column_once(columns, right.clone());
+        }
         Expr::InList { column, .. } | Expr::Like { column, .. } | Expr::IsNull { column, .. } => {
             add_column_once(columns, column.clone());
         }
