@@ -119,7 +119,7 @@
 - Added a full TPC-H 22-query support inventory harness:
   - records the current parser/planner support status for each canonical TPC-H query
   - turns unsupported reasons into a regression-tested baseline
-  - current dominant blockers are `WITH`, `count(DISTINCT ...)`, join equality extraction under `OR`, and richer nested/correlated subquery shapes
+  - current dominant blockers are `WITH`, `count(DISTINCT ...)`, and richer nested/correlated subquery shapes
 - Improved TPC-H Q1/Q6 coverage:
   - added aggregate input expressions such as `sum(l_extendedprice * l_discount)` by materializing deterministic temporary expression columns before aggregation
   - added constant folding for numeric literal arithmetic in predicates
@@ -146,7 +146,7 @@
   - works in projection and computed `WHERE` expression filters, including expression `IN (...)`
   - uses SQL 1-based character indexing and preserves NULL propagation
   - added DuckDB differential coverage for projection and WHERE `IN`
-  - TPC-H Q22 now advances past SELECT expression parsing; current blocker is subquery-aware filter lowering for `SUBSTRING(...) IN (...)` mixed with scalar/correlated subqueries
+  - TPC-H Q22 advanced past SELECT expression parsing; later expression-filter/subquery work advances it to `needs-data:customer`
 - Added first-stage 2-table comma join planning:
   - lowers `FROM a, b WHERE a_key = b_key AND ...` to the existing inner hash join execution path
   - extracts one or more equality join keys from top-level `AND` predicates and keeps the remaining predicates as post-join filters
@@ -178,6 +178,11 @@
   - added `BETWEEN` lowering for join residual filters
   - added SQL coverage for comma joins whose equality predicate appears inside OR branches
   - TPC-H inventory now advances Q19 to `needs-data:lineitem`
+- Added expression-filter aggregate and derived projection coverage:
+  - supports aggregate queries with scalar expression predicates such as `avg(c_acctbal) WHERE substring(c_phone...) IN (...)`
+  - supports scalar expression projection over materialized derived-table rows
+  - expression and subquery predicates can be split across top-level `AND` conjuncts so each side uses the appropriate evaluator
+  - TPC-H inventory now advances Q22 to `needs-data:customer`
 - The TPC-H-lite suite caught missing `Date32` `min`/`max` aggregate support; added `Date32` aggregate state and `Date32Array` result materialization.
 - The TPC-H-lite join aggregate case caught an aggregate join output projection correctness issue around qualified column names when the cost model chooses the left side as the hash build input.
 - Fixed build-side-aware join output projection mapping for hash/materialized join output schemas and restored aggregate join output projection pushdown.

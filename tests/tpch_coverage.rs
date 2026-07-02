@@ -560,7 +560,7 @@ LIMIT 100
         },
         TpchQuery {
             name: "q22_global_sales_opportunity",
-            expected_status: "unsupported-sql:expected column or aggregate expression, got SUBSTRING(c_phone FROM 1 FOR 2)",
+            expected_status: "needs-data:customer",
             sql: r#"
 SELECT
     cntrycode,

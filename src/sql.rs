@@ -704,16 +704,26 @@ async fn try_execute_in_subquery_sql(
         ));
     }
     let distinct = parse_distinct(select)?;
-    let filter = Box::pin(parse_filter_with_subqueries(
-        engine,
-        select.selection.as_ref().expect("selection checked"),
-        &[],
-        path.alias.as_deref(),
-        false,
-        batch_size,
-    ))
-    .await?
-    .map(FilterExpr::new);
+    let selection = select.selection.as_ref().expect("selection checked");
+    let filter_requires_expression = predicate_requires_expression_path(selection);
+    let (filter, expression_filters) = if filter_requires_expression {
+        split_subquery_and_expression_filters(engine, selection, path.alias.as_deref(), batch_size)
+            .await?
+    } else {
+        (
+            Box::pin(parse_filter_with_subqueries(
+                engine,
+                selection,
+                &[],
+                path.alias.as_deref(),
+                false,
+                batch_size,
+            ))
+            .await?
+            .map(FilterExpr::new),
+            Vec::new(),
+        )
+    };
     let order_by = parse_order_by(query, &parsed_projection.aliases, path.alias.as_deref())?;
     let limit = parse_limit(query)?;
     validate_distinct(
@@ -723,13 +733,21 @@ async fn try_execute_in_subquery_sql(
         order_by.as_ref(),
     )?;
 
+    let mut scan_projection = parsed_projection.projection.clone();
+    if filter_requires_expression {
+        add_projection_columns(
+            &mut scan_projection,
+            predicate_expression_columns(selection, path.alias.as_deref())?,
+        );
+    }
+
     let stream = if distinct {
         engine
             .scan_parquet_distinct_batches(
                 path.path,
                 batch_size,
                 limit,
-                parsed_projection.projection,
+                scan_projection,
                 filter,
                 order_by,
             )
@@ -740,24 +758,65 @@ async fn try_execute_in_subquery_sql(
                 path.path,
                 batch_size,
                 limit,
-                parsed_projection.projection,
+                scan_projection,
                 filter,
                 order_by,
             )
             .await?
     } else {
         engine
-            .scan_parquet_batches(
-                path.path,
-                batch_size,
-                limit,
-                parsed_projection.projection,
-                filter,
-            )
+            .scan_parquet_batches(path.path, batch_size, limit, scan_projection, filter)
             .await?
     };
-    let batches = rename_output_batches(collect_batches(stream)?, &parsed_projection.aliases)?;
+    let mut batches = collect_batches(stream)?;
+    for expression_filter in expression_filters {
+        batches =
+            apply_output_expression_filter(batches, &expression_filter, path.alias.as_deref())?;
+    }
+    let projection_requires_expression =
+        projection_requires_expression_path(&parsed_projection.expressions);
+    batches = if projection_requires_expression {
+        apply_output_expression_projection(batches, &parsed_projection.expressions)?
+    } else {
+        apply_output_projection(batches, &parsed_projection.projection)?
+    };
+    if !projection_requires_expression {
+        batches = rename_output_batches(batches, &parsed_projection.aliases)?;
+    }
     Ok(Some(QueryOutput::Scan { batches }))
+}
+
+async fn split_subquery_and_expression_filters(
+    engine: &DodamEngine,
+    selection: &SqlExpr,
+    table_alias: Option<&str>,
+    batch_size: usize,
+) -> Result<(Option<FilterExpr>, Vec<SqlExpr>)> {
+    let mut conjuncts = Vec::new();
+    collect_sql_and_conjuncts(selection, &mut conjuncts);
+    let mut filters = Vec::new();
+    let mut expression_filters = Vec::new();
+    for conjunct in conjuncts {
+        if predicate_requires_expression_path(&conjunct)
+            && !expr_contains_materializable_subquery(&conjunct)
+        {
+            expression_filters.push(conjunct);
+            continue;
+        }
+        if let Some(filter) = Box::pin(parse_filter_with_subqueries(
+            engine,
+            &conjunct,
+            &[],
+            table_alias,
+            false,
+            batch_size,
+        ))
+        .await?
+        {
+            filters.push(filter);
+        }
+    }
+    Ok((combine_expr_filters(filters), expression_filters))
 }
 
 async fn try_execute_projection_expression_sql(
@@ -798,14 +857,44 @@ async fn try_execute_projection_expression_sql(
     if !projection_requires_expression && !filter_requires_expression {
         return Ok(None);
     }
-    if !parsed_projection.aggregates.is_empty() || !group_by.is_empty() || select.having.is_some() {
-        return Ok(None);
-    }
     if parse_distinct(select)? {
         return Err(DodamError::UnsupportedSql(
             "projection expressions currently support only non-aggregate SELECT queries"
                 .to_string(),
         ));
+    }
+    if !parsed_projection.aggregates.is_empty() || !group_by.is_empty() || select.having.is_some() {
+        if projection_requires_expression || select.having.is_some() {
+            return Ok(None);
+        }
+        let Some(selection) = select.selection.as_ref() else {
+            return Ok(None);
+        };
+        let mut scan_projection = parsed_projection.projection.clone();
+        add_projection_columns(
+            &mut scan_projection,
+            predicate_expression_columns(selection, path.alias.as_deref())?,
+        );
+        let stream = engine
+            .scan_parquet_batches(path.path, batch_size, None, scan_projection, None)
+            .await?;
+        let mut batches = collect_batches(stream)?;
+        batches = apply_output_expression_filter(batches, selection, path.alias.as_deref())?;
+        batches =
+            append_aggregate_expression_columns(batches, &parsed_projection.aggregate_expressions)?;
+        let stream = Box::new(MemoryExec::new(batches)).execute()?;
+        let metrics = if group_by.is_empty() {
+            collect_aggregates(stream, 1, &parsed_projection.aggregates)?
+        } else {
+            collect_grouped_aggregates(stream, 1, &group_by, &parsed_projection.aggregates)?
+        };
+        let mut batches =
+            aggregate_metrics_to_batches(&metrics, &group_by, &parsed_projection.aggregates)?;
+        let order_by = parse_order_by(query, &parsed_projection.aliases, path.alias.as_deref())?;
+        let limit = parse_limit(query)?;
+        batches = apply_output_order_limit(batches, order_by.as_ref(), limit)?;
+        batches = rename_output_batches(batches, &parsed_projection.aliases)?;
+        return Ok(Some(QueryOutput::Aggregate { metrics, batches }));
     }
 
     let filter = if filter_requires_expression {
@@ -922,8 +1011,8 @@ fn predicate_requires_expression_path(expr: &SqlExpr) -> bool {
 fn scalar_predicate_side_requires_expression(expr: &SqlExpr) -> bool {
     !matches!(
         expr,
-        SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) | SqlExpr::Value(_)
-    )
+        SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_)
+    ) && sql_literal_value(expr).is_err()
 }
 
 fn add_projection_columns(projection: &mut Projection, columns: Vec<String>) {
@@ -1402,14 +1491,22 @@ async fn try_execute_derived_sql(
         order_by.as_ref(),
     )?;
     let mut batches = apply_output_filter(inner_batches, filter.as_ref())?;
-    batches = apply_output_projection(batches, &parsed_projection.projection)?;
+    let projection_requires_expression =
+        projection_requires_expression_path(&parsed_projection.expressions);
+    batches = if projection_requires_expression {
+        apply_output_expression_projection(batches, &parsed_projection.expressions)?
+    } else {
+        apply_output_projection(batches, &parsed_projection.projection)?
+    };
     if distinct {
         batches = collect_batches(
             Box::new(DistinctExec::new(Box::new(MemoryExec::new(batches)))).execute()?,
         )?;
     }
     batches = apply_output_order_limit(batches, order_by.as_ref(), limit)?;
-    batches = rename_output_batches(batches, &parsed_projection.aliases)?;
+    if !projection_requires_expression {
+        batches = rename_output_batches(batches, &parsed_projection.aliases)?;
+    }
     Ok(Some(QueryOutput::Scan { batches }))
 }
 
@@ -3695,6 +3792,13 @@ fn parse_projection(
         }
     }
     let mut projected_columns = columns.clone();
+    for aggregate in &aggregates {
+        if let Some(column) = aggregate.referenced_column() {
+            if !column.starts_with("__dodam_agg_expr_") {
+                add_column_once(&mut projected_columns, column.to_string());
+            }
+        }
+    }
     for column in aggregate_expression_columns {
         add_column_once(&mut projected_columns, column);
     }

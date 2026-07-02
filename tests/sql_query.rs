@@ -84,6 +84,27 @@ async fn executes_aggregate_over_derived_table_sql() {
 }
 
 #[tokio::test]
+async fn executes_aggregate_with_expression_filter_sql() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let path = tempdir.path().join("part-000.parquet");
+    write_test_parquet(&path);
+
+    let sql = format!(
+        "SELECT count(*), avg(id) FROM '{}' WHERE substring(payload FROM 1 FOR 1) IN ('a')",
+        path.display()
+    );
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute aggregate with expression filter sql");
+
+    let QueryOutput::Aggregate { batches, .. } = output else {
+        panic!("expected aggregate output");
+    };
+    assert_eq!(u64s_from_column(&batches, 0), vec![3]);
+    assert_eq!(f64s_from_column(&batches, 1), vec![2.0]);
+}
+
+#[tokio::test]
 async fn executes_distinct_over_derived_table_sql() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let path = tempdir.path().join("part-000.parquet");
