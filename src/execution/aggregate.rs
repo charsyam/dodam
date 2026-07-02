@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 
 use arrow::array::{
-    Array, ArrayRef, Date32Array, Date64Array, Float64Array, Int32Array, Int64Array, StringArray,
-    TimestampMillisecondArray, UInt64Array,
+    Array, ArrayRef, Date32Array, Date64Array, Decimal128Array, Float64Array, Int32Array,
+    Int64Array, StringArray, TimestampMillisecondArray, UInt64Array,
 };
 use arrow::compute::kernels::aggregate::{max, max_string, min, min_string, sum};
 use arrow::datatypes::{DataType, TimeUnit};
@@ -1688,6 +1688,19 @@ impl NumericState {
                 self.count += (values.len() - values.null_count()) as u64;
                 Ok(())
             }
+            DataType::Decimal128(_, scale) => {
+                self.output.get_or_insert(NumericOutput::Float64);
+                let values = column
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("Decimal128 data type");
+                let scale = decimal_scale_factor(*scale);
+                for value in values.iter().flatten() {
+                    self.sum_f64 += value as f64 / scale;
+                    self.count += 1;
+                }
+                Ok(())
+            }
             data_type => unsupported_aggregate_type(expr, data_type),
         }
     }
@@ -1730,6 +1743,18 @@ impl NumericState {
                 }
                 Ok(())
             }
+            DataType::Decimal128(_, scale) => {
+                self.output.get_or_insert(NumericOutput::Float64);
+                let values = column
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("Decimal128 data type");
+                if values.is_valid(row) {
+                    self.sum_f64 += values.value(row) as f64 / decimal_scale_factor(*scale);
+                    self.count += 1;
+                }
+                Ok(())
+            }
             data_type => unsupported_aggregate_type(expr, data_type),
         }
     }
@@ -1758,6 +1783,10 @@ impl NumericState {
             _ => AggregateValue::Float64(None),
         }
     }
+}
+
+fn decimal_scale_factor(scale: i8) -> f64 {
+    10_f64.powi(i32::from(scale))
 }
 
 #[derive(Default)]

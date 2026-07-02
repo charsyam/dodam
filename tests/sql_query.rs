@@ -1060,6 +1060,44 @@ async fn aggregates_temporal_min_max_sql() {
 }
 
 #[tokio::test]
+async fn aggregates_decimal_values_sql() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let path = tempdir.path().join("rich.parquet");
+    write_rich_type_parquet(&path);
+
+    let sql = format!("SELECT sum(amount), avg(amount) FROM '{}'", path.display());
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute decimal aggregate sql");
+
+    let QueryOutput::Aggregate { batches, .. } = output else {
+        panic!("expected aggregate output");
+    };
+    assert_eq!(f64s_from_column(&batches, 0), vec![116.45]);
+    assert!((f64s_from_column(&batches, 1)[0] - 38.8166666667).abs() < 0.0000001);
+}
+
+#[tokio::test]
+async fn evaluates_decimal_scalar_expressions_sql() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let path = tempdir.path().join("rich.parquet");
+    write_rich_type_parquet(&path);
+
+    let sql = format!(
+        "SELECT amount * 2.0 AS doubled FROM '{}' WHERE amount IS NOT NULL ORDER BY id",
+        path.display()
+    );
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute decimal scalar expression sql");
+
+    let QueryOutput::Scan { batches } = output else {
+        panic!("expected scan output");
+    };
+    assert_eq!(f64s_from_column(&batches, 0), vec![246.9, -14.0, 0.0]);
+}
+
+#[tokio::test]
 async fn projects_nested_and_richer_parquet_types_sql() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let path = tempdir.path().join("rich.parquet");

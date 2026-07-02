@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float64Array, Int32Array, Int64Array,
-    StringArray, TimestampMillisecondArray, UInt64Array,
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float64Array,
+    Int32Array, Int64Array, StringArray, TimestampMillisecondArray, UInt64Array,
 };
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -7328,6 +7328,19 @@ fn evaluated_column(batch: &RecordBatch, column: &str) -> Result<EvaluatedScalar
                 .downcast_ref::<Float64Array>()
                 .expect("Float64");
             Ok(EvaluatedScalar::Float64(values.iter().collect()))
+        }
+        DataType::Decimal128(_, scale) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("Decimal128");
+            let scale = 10_f64.powi(i32::from(*scale));
+            Ok(EvaluatedScalar::Float64(
+                values
+                    .iter()
+                    .map(|value| value.map(|value| value as f64 / scale))
+                    .collect(),
+            ))
         }
         DataType::Utf8 => {
             let values = array.as_any().downcast_ref::<StringArray>().expect("Utf8");
