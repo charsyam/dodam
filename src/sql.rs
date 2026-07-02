@@ -3361,6 +3361,9 @@ fn sql_literal_value(expr: &SqlExpr) -> Result<LiteralValue> {
         SqlExpr::BinaryOp { left, op, right }
             if matches!(op, BinaryOperator::Plus | BinaryOperator::Minus) =>
         {
+            if let Some(value) = decimal_number_literal_arithmetic(left, op, right)? {
+                return Ok(value);
+            }
             let left_value = sql_literal_value(left)?;
             if let Some((amount, field)) = interval_literal(right)? {
                 return apply_date_interval(left_value, op.clone(), amount, field);
@@ -3372,6 +3375,104 @@ fn sql_literal_value(expr: &SqlExpr) -> Result<LiteralValue> {
             "expected literal, got {expr}"
         ))),
     }
+}
+
+fn decimal_number_literal_arithmetic(
+    left: &SqlExpr,
+    op: &BinaryOperator,
+    right: &SqlExpr,
+) -> Result<Option<LiteralValue>> {
+    let Some(left) = numeric_literal_text(left) else {
+        return Ok(None);
+    };
+    let Some(right) = numeric_literal_text(right) else {
+        return Ok(None);
+    };
+    let scale = decimal_scale(left).max(decimal_scale(right));
+    let left = decimal_literal_to_scaled(left, scale)?;
+    let right = decimal_literal_to_scaled(right, scale)?;
+    let value = match op {
+        BinaryOperator::Plus => left + right,
+        BinaryOperator::Minus => left - right,
+        _ => unreachable!("validated arithmetic operator"),
+    };
+    if scale == 0 {
+        return Ok(Some(LiteralValue::Int64(i64::try_from(value).map_err(
+            |_| DodamError::UnsupportedSql("numeric literal overflow".to_string()),
+        )?)));
+    }
+    let negative = value < 0;
+    let value = value.abs();
+    let factor =
+        10_i128.pow(u32::try_from(scale).map_err(|_| {
+            DodamError::UnsupportedSql("numeric literal scale overflow".to_string())
+        })?);
+    let whole = value / factor;
+    let fractional = value % factor;
+    let literal = format!(
+        "{}{}.{:0width$}",
+        if negative { "-" } else { "" },
+        whole,
+        fractional,
+        width = scale
+    );
+    Ok(Some(LiteralValue::Float64(
+        literal.parse::<f64>().map_err(|_| {
+            DodamError::UnsupportedSql(format!("unsupported numeric literal: {literal}"))
+        })?,
+    )))
+}
+
+fn numeric_literal_text(expr: &SqlExpr) -> Option<&str> {
+    let SqlExpr::Value(value) = expr else {
+        return None;
+    };
+    let Value::Number(value, false) = &value.value else {
+        return None;
+    };
+    Some(value)
+}
+
+fn decimal_scale(value: &str) -> usize {
+    value
+        .split_once('.')
+        .map(|(_, fractional)| fractional.len())
+        .unwrap_or(0)
+}
+
+fn decimal_literal_to_scaled(value: &str, scale: usize) -> Result<i128> {
+    let negative = value.starts_with('-');
+    let unsigned = value.strip_prefix(['-', '+']).unwrap_or(value);
+    let (whole, fractional) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    if whole.is_empty()
+        || !whole.chars().all(|ch| ch.is_ascii_digit())
+        || !fractional.chars().all(|ch| ch.is_ascii_digit())
+        || fractional.len() > scale
+    {
+        return Err(DodamError::UnsupportedSql(format!(
+            "unsupported numeric literal: {value}"
+        )));
+    }
+    let mut result = whole
+        .parse::<i128>()
+        .map_err(|_| DodamError::UnsupportedSql(format!("unsupported numeric literal: {value}")))?
+        .checked_mul(10_i128.pow(u32::try_from(scale).map_err(|_| {
+            DodamError::UnsupportedSql("numeric literal scale overflow".to_string())
+        })?))
+        .ok_or_else(|| DodamError::UnsupportedSql("numeric literal overflow".to_string()))?;
+    let mut fractional_value = fractional.parse::<i128>().unwrap_or(0);
+    for _ in fractional.len()..scale {
+        fractional_value = fractional_value
+            .checked_mul(10)
+            .ok_or_else(|| DodamError::UnsupportedSql("numeric literal overflow".to_string()))?;
+    }
+    result = result
+        .checked_add(fractional_value)
+        .ok_or_else(|| DodamError::UnsupportedSql("numeric literal overflow".to_string()))?;
+    if negative {
+        result = -result;
+    }
+    Ok(result)
 }
 
 fn apply_literal_arithmetic(

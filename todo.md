@@ -127,6 +127,10 @@
   - added `BETWEEN` / `NOT BETWEEN` lowering to comparison predicates
   - TPC-H inventory now advances Q1 and Q6 to `needs-data:lineitem`
   - TPC-H-lite Q6 now executes expression aggregate + `BETWEEN` + date interval arithmetic under DuckDB differential comparison
+- Added a canonical-shape TPC-H Q6 DuckDB differential fixture:
+  - uses ratio-style `l_discount` values such as `0.06`
+  - compares `sum(l_extendedprice * l_discount)` with decimal literal bounds `0.06 +/- 0.01`
+  - fixed literal folding so numeric `0.06 + 0.01` preserves decimal scale before converting to `Float64`; naive f64 folding produced `0.069999...` and incorrectly excluded the `0.07` boundary row
 - The TPC-H-lite suite caught missing `Date32` `min`/`max` aggregate support; added `Date32` aggregate state and `Date32Array` result materialization.
 - The TPC-H-lite join aggregate case caught an aggregate join output projection correctness issue around qualified column names when the cost model chooses the left side as the hash build input.
 - Fixed build-side-aware join output projection mapping for hash/materialized join output schemas and restored aggregate join output projection pushdown.
@@ -438,7 +442,7 @@ Tried and rejected or neutral:
 - Use `tests/tpch_coverage.rs` as the TPC-H support scoreboard and reduce unsupported statuses query by query.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
-  - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs; next step is real TPC-H table fixtures and then multi-table `FROM` planning.
+  - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.
 - Add SQL tests for more alias and expression combinations.
 - Extend richer Parquet type support beyond residual filtering:
   - explicit behavior for nested/list/struct projection in SQL and CLI output

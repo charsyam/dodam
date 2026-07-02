@@ -560,6 +560,29 @@ async fn duckdb_differential_tpch_lite_queries() {
 }
 
 #[tokio::test]
+async fn duckdb_differential_tpch_q6_canonical_shape() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let lineitem_path = tempdir.path().join("lineitem.parquet");
+    write_tpch_q6_lineitem_parquet(&lineitem_path);
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT sum(l_extendedprice * l_discount) AS revenue FROM '{}' WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1994-01-01' + INTERVAL '1' YEAR AND l_discount BETWEEN 0.06 - 0.01 AND 0.06 + 0.01 AND l_quantity < 24",
+            lineitem_path.display()
+        ),
+        &format!(
+            "SELECT sum(l_extendedprice * l_discount) AS revenue FROM read_parquet('{}') WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1994-01-01' + INTERVAL '1' YEAR AND l_discount BETWEEN 0.06 - 0.01 AND 0.06 + 0.01 AND l_quantity < 24",
+            lineitem_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn duckdb_differential_in_subquery() {
     let Some(_duckdb) = DuckDbGuard::new() else {
         return;
@@ -1033,6 +1056,41 @@ fn write_tpch_lineitem_parquet(path: &Path) {
             Arc::new(orderkeys),
             Arc::new(returnflags),
             Arc::new(linestatuses),
+            Arc::new(quantities),
+            Arc::new(extendedprices),
+            Arc::new(discounts),
+            Arc::new(shipdates),
+        ],
+    );
+}
+
+fn write_tpch_q6_lineitem_parquet(path: &Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("l_quantity", DataType::Int64, false),
+        Field::new("l_extendedprice", DataType::Float64, false),
+        Field::new("l_discount", DataType::Float64, false),
+        Field::new("l_shipdate", DataType::Date32, false),
+    ]));
+    let quantities = Int64Array::from_iter_values([10, 20, 15, 30, 5, 22, 40, 12]);
+    let extendedprices = Float64Array::from_iter_values([
+        1000.0, 2000.0, 1500.0, 3000.0, 500.0, 2200.0, 4000.0, 1200.0,
+    ]);
+    let discounts =
+        Float64Array::from_iter_values([0.05, 0.07, 0.06, 0.03, 0.08, 0.06, 0.04, 0.06]);
+    let shipdates = Date32Array::from_iter_values([
+        date_days(1994, 1, 15),
+        date_days(1994, 6, 30),
+        date_days(1995, 3, 10),
+        date_days(1998, 9, 2),
+        date_days(1998, 9, 3),
+        date_days(1994, 12, 31),
+        date_days(1993, 12, 31),
+        date_days(1994, 2, 1),
+    ]);
+    write_parquet(
+        path,
+        schema,
+        vec![
             Arc::new(quantities),
             Arc::new(extendedprices),
             Arc::new(discounts),
