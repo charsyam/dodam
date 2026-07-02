@@ -532,11 +532,11 @@ async fn duckdb_differential_tpch_lite_queries() {
 
     assert_same_as_duckdb(
         &format!(
-            "SELECT count(*), sum(l_extendedprice), sum(l_discount) FROM '{}' WHERE l_shipdate >= '1994-01-01' AND l_shipdate < '1995-01-01' AND l_discount >= 5 AND l_discount <= 7 AND l_quantity < 24",
+            "SELECT sum(l_extendedprice * l_discount) FROM '{}' WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1994-01-01' + INTERVAL '1' YEAR AND l_discount BETWEEN 5 AND 7 AND l_quantity < 24",
             lineitem_path.display()
         ),
         &format!(
-            "SELECT count(*), sum(l_extendedprice), sum(l_discount) FROM read_parquet('{}') WHERE l_shipdate >= '1994-01-01' AND l_shipdate < '1995-01-01' AND l_discount >= 5 AND l_discount <= 7 AND l_quantity < 24",
+            "SELECT sum(l_extendedprice * l_discount) FROM read_parquet('{}') WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1994-01-01' + INTERVAL '1' YEAR AND l_discount BETWEEN 5 AND 7 AND l_quantity < 24",
             lineitem_path.display()
         ),
         tempdir.path(),

@@ -119,7 +119,14 @@
 - Added a full TPC-H 22-query support inventory harness:
   - records the current parser/planner support status for each canonical TPC-H query
   - turns unsupported reasons into a regression-tested baseline
-  - current dominant blockers are comma/multi-table `FROM` planning, aggregate input expressions such as `sum(l_extendedprice * l_discount)`, `WITH`, `SUBSTRING`, `LIKE`/`NOT LIKE`, date interval arithmetic, `BETWEEN`, and richer nested/correlated subquery shapes
+  - current dominant blockers are comma/multi-table `FROM` planning, `WITH`, `SUBSTRING`, `LIKE`/`NOT LIKE`, `count(DISTINCT ...)`, and richer nested/correlated subquery shapes
+- Improved TPC-H Q1/Q6 coverage:
+  - added aggregate input expressions such as `sum(l_extendedprice * l_discount)` by materializing deterministic temporary expression columns before aggregation
+  - added constant folding for numeric literal arithmetic in predicates
+  - added `DATE 'YYYY-MM-DD' +/- INTERVAL` folding for day/month/year intervals
+  - added `BETWEEN` / `NOT BETWEEN` lowering to comparison predicates
+  - TPC-H inventory now advances Q1 and Q6 to `needs-data:lineitem`
+  - TPC-H-lite Q6 now executes expression aggregate + `BETWEEN` + date interval arithmetic under DuckDB differential comparison
 - The TPC-H-lite suite caught missing `Date32` `min`/`max` aggregate support; added `Date32` aggregate state and `Date32Array` result materialization.
 - The TPC-H-lite join aggregate case caught an aggregate join output projection correctness issue around qualified column names when the cost model chooses the left side as the hash build input.
 - Fixed build-side-aware join output projection mapping for hash/materialized join output schemas and restored aggregate join output projection pushdown.
@@ -431,6 +438,7 @@ Tried and rejected or neutral:
 - Use `tests/tpch_coverage.rs` as the TPC-H support scoreboard and reduce unsupported statuses query by query.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
+  - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs; next step is real TPC-H table fixtures and then multi-table `FROM` planning.
 - Add SQL tests for more alias and expression combinations.
 - Extend richer Parquet type support beyond residual filtering:
   - explicit behavior for nested/list/struct projection in SQL and CLI output

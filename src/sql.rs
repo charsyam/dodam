@@ -12,9 +12,10 @@ use arrow_ord::sort::{SortColumn, SortOptions, lexsort_to_indices};
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take_record_batch;
 use sqlparser::ast::{
-    BinaryOperator, Distinct, Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart,
-    OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableFactor, UnaryOperator, Value,
+    BinaryOperator, DateTimeField, Distinct, Expr as SqlExpr, FunctionArg, FunctionArgExpr,
+    FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, LimitClause, ObjectName,
+    ObjectNamePart, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
+    UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -55,6 +56,7 @@ pub struct SqlQuery {
     limit: Option<usize>,
     distinct: bool,
     aggregates: Vec<AggregateExpr>,
+    aggregate_expressions: Vec<ProjectionExpression>,
     group_by: Vec<String>,
     aliases: Vec<(String, String)>,
 }
@@ -193,7 +195,27 @@ pub async fn execute_sql(
     if query.is_aggregate() {
         let aggregates = query.aggregates.clone();
         let group_by = query.group_by.clone();
-        let metrics = if query.group_by.is_empty() {
+        let metrics = if !query.aggregate_expressions.is_empty() {
+            let stream = engine
+                .scan_parquet_batches(
+                    query.path,
+                    batch_size,
+                    None,
+                    query.projection.clone(),
+                    query.filter,
+                )
+                .await?;
+            let batches = append_aggregate_expression_columns(
+                collect_batches(stream)?,
+                &query.aggregate_expressions,
+            )?;
+            let stream = Box::new(MemoryExec::new(batches)).execute()?;
+            if query.group_by.is_empty() {
+                collect_aggregates(stream, 1, &aggregates)?
+            } else {
+                collect_grouped_aggregates(stream, 1, &group_by, &aggregates)?
+            }
+        } else if query.group_by.is_empty() {
             engine
                 .aggregate_parquet(query.path, batch_size, aggregates.clone(), query.filter)
                 .await?
@@ -1886,6 +1908,7 @@ fn parse_select(query: &Query, select: &Select) -> Result<SqlQuery> {
         limit,
         distinct,
         aggregates: parsed_projection.aggregates,
+        aggregate_expressions: parsed_projection.aggregate_expressions,
         group_by,
         aliases: parsed_projection.aliases,
     })
@@ -1950,6 +1973,7 @@ fn parse_join_select(query: &Query, select: &Select) -> Result<SqlQuery> {
         limit,
         distinct,
         aggregates: projection.aggregates,
+        aggregate_expressions: projection.aggregate_expressions,
         group_by,
         aliases: projection.aliases,
     })
@@ -2273,6 +2297,7 @@ fn parse_join_projection(
         return Ok(ParsedProjection {
             projection: Projection::Columns(projected_columns),
             aggregates,
+            aggregate_expressions: Vec::new(),
             aliases,
             expressions: Vec::new(),
         });
@@ -2285,6 +2310,7 @@ fn parse_join_projection(
             Projection::Columns(columns)
         },
         aggregates,
+        aggregate_expressions: Vec::new(),
         aliases,
         expressions: Vec::new(),
     })
@@ -2492,17 +2518,18 @@ fn qualified_join_column(expr: &SqlExpr, table_aliases: &[&str]) -> Result<Strin
 struct ParsedProjection {
     projection: Projection,
     aggregates: Vec<AggregateExpr>,
+    aggregate_expressions: Vec<ProjectionExpression>,
     aliases: Vec<(String, String)>,
     expressions: Vec<ProjectionExpression>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct ProjectionExpression {
     output_name: String,
     expr: ScalarSqlExpression,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum ScalarSqlExpression {
     Column(String),
     Literal(LiteralValue),
@@ -2533,6 +2560,8 @@ fn parse_projection(
 ) -> Result<ParsedProjection> {
     let mut columns = Vec::new();
     let mut aggregates = Vec::new();
+    let mut aggregate_expressions = Vec::new();
+    let mut aggregate_expression_columns = Vec::new();
     let mut aliases = Vec::new();
     let mut expressions = Vec::new();
     let mut wildcard = false;
@@ -2557,7 +2586,18 @@ fn parse_projection(
                     }
                     expressions.push(expr);
                 } else {
-                    aggregates.push(parse_aggregate(function, table_alias)?);
+                    let (aggregate, expression) = parse_aggregate_with_input_expression(
+                        function,
+                        table_alias,
+                        aggregate_expressions.len(),
+                    )?;
+                    if let Some(expression) = expression {
+                        for column in scalar_expression_columns(&expression.expr) {
+                            add_column_once(&mut aggregate_expression_columns, column);
+                        }
+                        aggregate_expressions.push(expression);
+                    }
+                    aggregates.push(aggregate);
                 }
             }
             SelectItem::UnnamedExpr(expr) => {
@@ -2586,11 +2626,19 @@ fn parse_projection(
                         }
                         expressions.push(expr);
                     } else {
-                        aggregates.push(parse_aggregate(function, table_alias)?);
-                        aliases.push((
-                            alias.value.clone(),
-                            parse_aggregate(function, table_alias)?.to_string(),
-                        ));
+                        let (aggregate, expression) = parse_aggregate_with_input_expression(
+                            function,
+                            table_alias,
+                            aggregate_expressions.len(),
+                        )?;
+                        if let Some(expression) = expression {
+                            for column in scalar_expression_columns(&expression.expr) {
+                                add_column_once(&mut aggregate_expression_columns, column);
+                            }
+                            aggregate_expressions.push(expression);
+                        }
+                        aliases.push((alias.value.clone(), aggregate.to_string()));
+                        aggregates.push(aggregate);
                     }
                 }
                 _ => {
@@ -2629,6 +2677,7 @@ fn parse_projection(
                 Projection::Columns(columns)
             },
             aggregates,
+            aggregate_expressions,
             aliases,
             expressions: if wildcard { Vec::new() } else { expressions },
         });
@@ -2651,9 +2700,14 @@ fn parse_projection(
             )));
         }
     }
+    let mut projected_columns = columns.clone();
+    for column in aggregate_expression_columns {
+        add_column_once(&mut projected_columns, column);
+    }
     Ok(ParsedProjection {
-        projection: Projection::Columns(columns),
+        projection: Projection::Columns(projected_columns),
         aggregates,
+        aggregate_expressions,
         aliases,
         expressions,
     })
@@ -2913,6 +2967,67 @@ fn parse_aggregate(
     AggregateExpr::parse(&format!("{name}({argument})"))
 }
 
+fn parse_aggregate_with_input_expression(
+    function: &sqlparser::ast::Function,
+    table_alias: Option<&str>,
+    expression_index: usize,
+) -> Result<(AggregateExpr, Option<ProjectionExpression>)> {
+    match parse_aggregate(function, table_alias) {
+        Ok(aggregate) => return Ok((aggregate, None)),
+        Err(DodamError::UnsupportedSql(message))
+            if message.starts_with("unsupported function arguments:") => {}
+        Err(error) => return Err(error),
+    }
+
+    if function.filter.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+        || function.null_treatment.is_some()
+        || !matches!(function.parameters, FunctionArguments::None)
+    {
+        return Err(DodamError::UnsupportedSql(
+            "aggregate filters, windows, within group, null treatment, and parameters are not supported"
+                .to_string(),
+        ));
+    }
+    let name = object_name_to_string(&function.name)?;
+    if !matches!(
+        name.to_ascii_lowercase().as_str(),
+        "sum" | "avg" | "min" | "max"
+    ) {
+        return Err(DodamError::UnsupportedSql(format!(
+            "aggregate expression input is not supported for {name}"
+        )));
+    }
+    let FunctionArguments::List(args) = &function.args else {
+        return Err(DodamError::UnsupportedSql(format!(
+            "unsupported function arguments: {}",
+            function.args
+        )));
+    };
+    if !args.clauses.is_empty() || args.duplicate_treatment.is_some() {
+        return Err(DodamError::UnsupportedSql(format!(
+            "unsupported function arguments: {}",
+            function.args
+        )));
+    }
+    let [FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))] = args.args.as_slice() else {
+        return Err(DodamError::UnsupportedSql(format!(
+            "unsupported function arguments: {}",
+            function.args
+        )));
+    };
+    let column = format!("__dodam_agg_expr_{expression_index}");
+    let expression = ProjectionExpression {
+        output_name: column.clone(),
+        expr: parse_scalar_sql_expression(expr, table_alias)?,
+    };
+    Ok((
+        AggregateExpr::parse(&format!("{name}({column})"))?,
+        Some(expression),
+    ))
+}
+
 fn parse_join_aggregate(
     function: &sqlparser::ast::Function,
     table_aliases: &[&str],
@@ -3130,6 +3245,43 @@ fn sql_expr_to_filter_expr(
         SqlExpr::Nested(expr) => {
             sql_expr_to_filter_expr(expr, aliases, table_alias, allow_aggregates)
         }
+        SqlExpr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let column = sql_filter_column(expr, aliases, table_alias, allow_aggregates)?;
+            let low = sql_literal_value(low)?;
+            let high = sql_literal_value(high)?;
+            if *negated {
+                Ok(Expr::Or(
+                    Box::new(Expr::Comparison(ComparisonExpr {
+                        column: column.clone(),
+                        op: ComparisonOp::Lt,
+                        value: low,
+                    })),
+                    Box::new(Expr::Comparison(ComparisonExpr {
+                        column,
+                        op: ComparisonOp::Gt,
+                        value: high,
+                    })),
+                ))
+            } else {
+                Ok(Expr::And(
+                    Box::new(Expr::Comparison(ComparisonExpr {
+                        column: column.clone(),
+                        op: ComparisonOp::GtEq,
+                        value: low,
+                    })),
+                    Box::new(Expr::Comparison(ComparisonExpr {
+                        column,
+                        op: ComparisonOp::LtEq,
+                        value: high,
+                    })),
+                ))
+            }
+        }
         SqlExpr::UnaryOp { op, expr } if *op == UnaryOperator::Not => Ok(Expr::Not(Box::new(
             sql_expr_to_filter_expr(expr, aliases, table_alias, allow_aggregates)?,
         ))),
@@ -3196,10 +3348,207 @@ fn sql_literal_value(expr: &SqlExpr) -> Result<LiteralValue> {
                 "unsupported literal: {value}"
             ))),
         },
+        SqlExpr::TypedString(typed) if typed.data_type.to_string().eq_ignore_ascii_case("date") => {
+            match &typed.value.value {
+                Value::SingleQuotedString(value) | Value::DoubleQuotedString(value) => {
+                    Ok(LiteralValue::Utf8(value.clone()))
+                }
+                value => Err(DodamError::UnsupportedSql(format!(
+                    "unsupported DATE literal: {value}"
+                ))),
+            }
+        }
+        SqlExpr::BinaryOp { left, op, right }
+            if matches!(op, BinaryOperator::Plus | BinaryOperator::Minus) =>
+        {
+            let left_value = sql_literal_value(left)?;
+            if let Some((amount, field)) = interval_literal(right)? {
+                return apply_date_interval(left_value, op.clone(), amount, field);
+            }
+            let right_value = sql_literal_value(right)?;
+            apply_literal_arithmetic(left_value, op.clone(), right_value)
+        }
         _ => Err(DodamError::UnsupportedSql(format!(
             "expected literal, got {expr}"
         ))),
     }
+}
+
+fn apply_literal_arithmetic(
+    left: LiteralValue,
+    op: BinaryOperator,
+    right: LiteralValue,
+) -> Result<LiteralValue> {
+    match (left, right) {
+        (LiteralValue::Int64(left), LiteralValue::Int64(right)) => {
+            Ok(LiteralValue::Int64(match op {
+                BinaryOperator::Plus => left + right,
+                BinaryOperator::Minus => left - right,
+                _ => unreachable!("validated arithmetic operator"),
+            }))
+        }
+        (left, right) => {
+            let left = literal_as_f64(&left)?;
+            let right = literal_as_f64(&right)?;
+            Ok(LiteralValue::Float64(match op {
+                BinaryOperator::Plus => left + right,
+                BinaryOperator::Minus => left - right,
+                _ => unreachable!("validated arithmetic operator"),
+            }))
+        }
+    }
+}
+
+fn literal_as_f64(value: &LiteralValue) -> Result<f64> {
+    match value {
+        LiteralValue::Int64(value) => Ok(*value as f64),
+        LiteralValue::Float64(value) => Ok(*value),
+        _ => Err(DodamError::UnsupportedSql(format!(
+            "expected numeric literal, got {value}"
+        ))),
+    }
+}
+
+fn interval_literal(expr: &SqlExpr) -> Result<Option<(i64, DateTimeField)>> {
+    let SqlExpr::Interval(interval) = expr else {
+        return Ok(None);
+    };
+    let SqlExpr::Value(value) = interval.value.as_ref() else {
+        return Err(DodamError::UnsupportedSql(format!(
+            "unsupported INTERVAL value: {}",
+            interval.value
+        )));
+    };
+    let amount = match &value.value {
+        Value::SingleQuotedString(value) | Value::DoubleQuotedString(value) => value,
+        value => {
+            return Err(DodamError::UnsupportedSql(format!(
+                "unsupported INTERVAL literal: {value}"
+            )));
+        }
+    }
+    .parse::<i64>()
+    .map_err(|_| DodamError::UnsupportedSql(format!("unsupported INTERVAL: {expr}")))?;
+    let field = interval.leading_field.clone().ok_or_else(|| {
+        DodamError::UnsupportedSql(format!("INTERVAL requires a leading field: {expr}"))
+    })?;
+    Ok(Some((amount, field)))
+}
+
+fn apply_date_interval(
+    value: LiteralValue,
+    op: BinaryOperator,
+    amount: i64,
+    field: DateTimeField,
+) -> Result<LiteralValue> {
+    let LiteralValue::Utf8(date) = value else {
+        return Err(DodamError::UnsupportedSql(
+            "INTERVAL arithmetic currently requires a DATE literal".to_string(),
+        ));
+    };
+    let amount = match op {
+        BinaryOperator::Plus => amount,
+        BinaryOperator::Minus => -amount,
+        _ => unreachable!("validated arithmetic operator"),
+    };
+    let (year, month, day) = parse_ymd(&date)?;
+    let (year, month, day) = match field {
+        DateTimeField::Day => {
+            let days = days_from_civil(year, month, day)? + amount;
+            civil_from_days(days)?
+        }
+        DateTimeField::Month => add_months(year, month, day, amount)?,
+        DateTimeField::Year => add_months(year, month, day, amount * 12)?,
+        field => {
+            return Err(DodamError::UnsupportedSql(format!(
+                "unsupported INTERVAL field for DATE arithmetic: {field}"
+            )));
+        }
+    };
+    Ok(LiteralValue::Utf8(format!("{year:04}-{month:02}-{day:02}")))
+}
+
+fn parse_ymd(value: &str) -> Result<(i32, u32, u32)> {
+    let mut parts = value.split('-');
+    let year = parts
+        .next()
+        .and_then(|value| value.parse::<i32>().ok())
+        .ok_or_else(|| DodamError::UnsupportedSql(format!("invalid DATE literal: {value}")))?;
+    let month = parts
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| DodamError::UnsupportedSql(format!("invalid DATE literal: {value}")))?;
+    let day = parts
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| DodamError::UnsupportedSql(format!("invalid DATE literal: {value}")))?;
+    if parts.next().is_some()
+        || !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_month(year, month)
+    {
+        return Err(DodamError::UnsupportedSql(format!(
+            "invalid DATE literal: {value}"
+        )));
+    }
+    Ok((year, month, day))
+}
+
+fn add_months(year: i32, month: u32, day: u32, months: i64) -> Result<(i32, u32, u32)> {
+    let month_index = i64::from(year) * 12 + i64::from(month - 1) + months;
+    let year = month_index.div_euclid(12);
+    let month = month_index.rem_euclid(12) + 1;
+    let year = i32::try_from(year)
+        .map_err(|_| DodamError::UnsupportedSql("DATE arithmetic overflow".to_string()))?;
+    let month = u32::try_from(month)
+        .map_err(|_| DodamError::UnsupportedSql("DATE arithmetic overflow".to_string()))?;
+    Ok((year, month, day.min(days_in_month(year, month))))
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> Result<i64> {
+    let year = i64::from(year) - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month = i64::from(month);
+    let day = i64::from(day);
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Ok(era * 146_097 + doe - 719_468)
+}
+
+fn civil_from_days(days: i64) -> Result<(i32, u32, u32)> {
+    let days = days + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let doe = days - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = year + i64::from(month <= 2);
+    Ok((
+        i32::try_from(year)
+            .map_err(|_| DodamError::UnsupportedSql("DATE arithmetic overflow".to_string()))?,
+        u32::try_from(month)
+            .map_err(|_| DodamError::UnsupportedSql("DATE arithmetic overflow".to_string()))?,
+        u32::try_from(day)
+            .map_err(|_| DodamError::UnsupportedSql("DATE arithmetic overflow".to_string()))?,
+    ))
 }
 
 fn sql_comparison_op(op: &BinaryOperator) -> ComparisonOp {
@@ -3601,6 +3950,35 @@ fn apply_output_expression_projection(
                     value.data_type(),
                     value.is_nullable(),
                 ));
+                columns.push(value.into_array(batch.num_rows()));
+            }
+            Ok(RecordBatch::try_new(
+                Arc::new(Schema::new(fields)),
+                columns,
+            )?)
+        })
+        .collect()
+}
+
+fn append_aggregate_expression_columns(
+    batches: Vec<RecordBatch>,
+    expressions: &[ProjectionExpression],
+) -> Result<Vec<RecordBatch>> {
+    if expressions.is_empty() {
+        return Ok(batches);
+    }
+    batches
+        .into_iter()
+        .map(|batch| {
+            let mut fields = batch.schema().fields().to_vec();
+            let mut columns = batch.columns().to_vec();
+            for expression in expressions {
+                let value = evaluate_scalar_expression(&batch, &expression.expr)?;
+                fields.push(Arc::new(Field::new(
+                    expression.output_name.clone(),
+                    value.data_type(),
+                    value.is_nullable(),
+                )));
                 columns.push(value.into_array(batch.num_rows()));
             }
             Ok(RecordBatch::try_new(

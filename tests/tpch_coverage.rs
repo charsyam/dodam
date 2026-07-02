@@ -6,10 +6,21 @@ const BATCH_SIZE: usize = 4;
 
 #[tokio::test]
 async fn tpch_query_support_inventory() {
+    let mut mismatches = Vec::new();
     for query in tpch_queries() {
         let status = classify_query_support(query.sql).await;
-        assert_eq!(status, query.expected_status, "{}", query.name);
+        if status != query.expected_status {
+            mismatches.push(format!(
+                "{}\n  expected: {}\n  actual:   {status}",
+                query.name, query.expected_status
+            ));
+        }
     }
+    assert!(
+        mismatches.is_empty(),
+        "TPC-H support inventory changed:\n{}",
+        mismatches.join("\n")
+    );
 }
 
 async fn classify_query_support(sql: &str) -> String {
@@ -52,7 +63,7 @@ fn tpch_queries() -> Vec<TpchQuery> {
     vec![
         TpchQuery {
             name: "q01_pricing_summary",
-            expected_status: "unsupported-sql:unsupported function arguments: (l_extendedprice * (1 - l_discount))",
+            expected_status: "needs-data:lineitem",
             sql: r#"
 SELECT
     l_returnflag,
@@ -168,7 +179,7 @@ ORDER BY revenue DESC
         },
         TpchQuery {
             name: "q06_forecast_revenue",
-            expected_status: "unsupported-sql:unsupported function arguments: (l_extendedprice * l_discount)",
+            expected_status: "needs-data:lineitem",
             sql: r#"
 SELECT
     sum(l_extendedprice * l_discount) AS revenue
