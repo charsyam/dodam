@@ -2825,6 +2825,31 @@ fn literal_value_from_array(column: &ArrayRef, row: usize) -> Result<LiteralValu
                 .expect("Float64 data type");
             Ok(LiteralValue::Float64(values.value(row)))
         }
+        DataType::Decimal128(_, scale) => {
+            let values = column
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("Decimal128 data type");
+            Ok(LiteralValue::Float64(
+                values.value(row) as f64 / 10_f64.powi(i32::from(*scale)),
+            ))
+        }
+        DataType::Date32 => {
+            let values = column
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .expect("Date32 data type");
+            let (year, month, day) = civil_from_days(i64::from(values.value(row)))?;
+            Ok(LiteralValue::Utf8(format!("{year:04}-{month:02}-{day:02}")))
+        }
+        DataType::Date64 => {
+            let values = column
+                .as_any()
+                .downcast_ref::<Date64Array>()
+                .expect("Date64 data type");
+            let (year, month, day) = civil_from_days(values.value(row) / 86_400_000)?;
+            Ok(LiteralValue::Utf8(format!("{year:04}-{month:02}-{day:02}")))
+        }
         DataType::Utf8 => {
             let values = column
                 .as_any()
@@ -7723,6 +7748,8 @@ fn group_values_to_column(
         .iter()
         .find_map(|value| match value {
             Some(crate::execution::GroupValue::Utf8(_)) => Some(DataType::Utf8),
+            Some(crate::execution::GroupValue::Date64(_)) => Some(DataType::Date64),
+            Some(crate::execution::GroupValue::Date32(_)) => Some(DataType::Date32),
             Some(crate::execution::GroupValue::UInt64(_)) => Some(DataType::UInt64),
             Some(crate::execution::GroupValue::Int64(_)) => Some(DataType::Int64),
             None => None,
@@ -7754,6 +7781,32 @@ fn group_values_to_column(
             (
                 Field::new(name, DataType::UInt64, true),
                 Arc::new(UInt64Array::from(values)),
+            )
+        }
+        DataType::Date32 => {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    Some(crate::execution::GroupValue::Date32(value)) => *value,
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (
+                Field::new(name, DataType::Date32, true),
+                Arc::new(Date32Array::from(values)),
+            )
+        }
+        DataType::Date64 => {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    Some(crate::execution::GroupValue::Date64(value)) => *value,
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (
+                Field::new(name, DataType::Date64, true),
+                Arc::new(Date64Array::from(values)),
             )
         }
         _ => {

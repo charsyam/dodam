@@ -1098,6 +1098,38 @@ async fn evaluates_decimal_scalar_expressions_sql() {
 }
 
 #[tokio::test]
+async fn groups_by_date_and_uses_decimal_in_subquery_sql() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let path = tempdir.path().join("rich.parquet");
+    write_rich_type_parquet(&path);
+
+    let sql = format!(
+        "SELECT event_date, count(*) FROM '{}' GROUP BY event_date ORDER BY event_date",
+        path.display()
+    );
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute date group by sql");
+    let QueryOutput::Aggregate { batches, .. } = output else {
+        panic!("expected aggregate output");
+    };
+    assert_eq!(u64s_from_column(&batches, 1), vec![1, 1, 1, 1]);
+
+    let sql = format!(
+        "SELECT id FROM '{}' WHERE amount IN (SELECT amount FROM '{}' WHERE id = 1) ORDER BY id",
+        path.display(),
+        path.display()
+    );
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute decimal IN subquery sql");
+    let QueryOutput::Scan { batches } = output else {
+        panic!("expected scan output");
+    };
+    assert_eq!(ids_from_batches(&batches), vec![1]);
+}
+
+#[tokio::test]
 async fn projects_nested_and_richer_parquet_types_sql() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let path = tempdir.path().join("rich.parquet");

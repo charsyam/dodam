@@ -1438,6 +1438,24 @@ fn group_key(columns: &[(&str, &ArrayRef)], row: usize) -> Result<Vec<GroupValue
                     values.is_valid(row).then(|| values.value(row)),
                 ))
             }
+            DataType::Date32 => {
+                let values = column
+                    .as_any()
+                    .downcast_ref::<Date32Array>()
+                    .expect("Date32 data type");
+                Ok(GroupValue::Date32(
+                    values.is_valid(row).then(|| values.value(row)),
+                ))
+            }
+            DataType::Date64 => {
+                let values = column
+                    .as_any()
+                    .downcast_ref::<Date64Array>()
+                    .expect("Date64 data type");
+                Ok(GroupValue::Date64(
+                    values.is_valid(row).then(|| values.value(row)),
+                ))
+            }
             DataType::Utf8 => {
                 let values = column
                     .as_any()
@@ -1461,15 +1479,22 @@ fn compare_group_keys(left: &[GroupValue], right: &[GroupValue]) -> std::cmp::Or
         .map(|(left, right)| match (left, right) {
             (GroupValue::Int64(left), GroupValue::Int64(right)) => left.cmp(right),
             (GroupValue::UInt64(left), GroupValue::UInt64(right)) => left.cmp(right),
+            (GroupValue::Date32(left), GroupValue::Date32(right)) => left.cmp(right),
+            (GroupValue::Date64(left), GroupValue::Date64(right)) => left.cmp(right),
             (GroupValue::Utf8(left), GroupValue::Utf8(right)) => left.cmp(right),
-            (GroupValue::Int64(_), GroupValue::UInt64(_) | GroupValue::Utf8(_)) => {
-                std::cmp::Ordering::Less
-            }
+            (GroupValue::Int64(_), _) => std::cmp::Ordering::Less,
             (GroupValue::UInt64(_), GroupValue::Int64(_)) => std::cmp::Ordering::Greater,
-            (GroupValue::UInt64(_), GroupValue::Utf8(_)) => std::cmp::Ordering::Less,
-            (GroupValue::Utf8(_), GroupValue::Int64(_) | GroupValue::UInt64(_)) => {
+            (GroupValue::UInt64(_), _) => std::cmp::Ordering::Less,
+            (GroupValue::Date32(_), GroupValue::Int64(_) | GroupValue::UInt64(_)) => {
                 std::cmp::Ordering::Greater
             }
+            (GroupValue::Date32(_), _) => std::cmp::Ordering::Less,
+            (
+                GroupValue::Date64(_),
+                GroupValue::Int64(_) | GroupValue::UInt64(_) | GroupValue::Date32(_),
+            ) => std::cmp::Ordering::Greater,
+            (GroupValue::Date64(_), _) => std::cmp::Ordering::Less,
+            (GroupValue::Utf8(_), _) => std::cmp::Ordering::Greater,
         })
         .find(|ordering| *ordering != std::cmp::Ordering::Equal)
         .unwrap_or_else(|| left.len().cmp(&right.len()))
@@ -2138,6 +2163,20 @@ fn distinct_group_value(column: &ArrayRef, row: usize) -> Result<Option<GroupVal
                 .as_any()
                 .downcast_ref::<UInt64Array>()
                 .expect("UInt64 distinct input")
+                .value(row),
+        )))),
+        DataType::Date32 => Ok(Some(GroupValue::Date32(Some(
+            column
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .expect("Date32 distinct input")
+                .value(row),
+        )))),
+        DataType::Date64 => Ok(Some(GroupValue::Date64(Some(
+            column
+                .as_any()
+                .downcast_ref::<Date64Array>()
+                .expect("Date64 distinct input")
                 .value(row),
         )))),
         DataType::Utf8 => Ok(Some(GroupValue::Utf8(Some(

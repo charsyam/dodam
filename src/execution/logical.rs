@@ -59,6 +59,8 @@ pub struct GroupAggregateResult {
 pub enum GroupValue {
     Int64(Option<i64>),
     UInt64(Option<u64>),
+    Date32(Option<i32>),
+    Date64(Option<i64>),
     Utf8(Option<String>),
 }
 
@@ -67,10 +69,14 @@ impl std::fmt::Display for GroupValue {
         match self {
             Self::Int64(Some(value)) => write!(formatter, "{value}"),
             Self::UInt64(Some(value)) => write!(formatter, "{value}"),
+            Self::Date32(Some(value)) => write!(formatter, "{value}"),
+            Self::Date64(Some(value)) => write!(formatter, "{value}"),
             Self::Utf8(Some(value)) => formatter.write_str(value),
-            Self::Int64(None) | Self::UInt64(None) | Self::Utf8(None) => {
-                formatter.write_str("NULL")
-            }
+            Self::Int64(None)
+            | Self::UInt64(None)
+            | Self::Date32(None)
+            | Self::Date64(None)
+            | Self::Utf8(None) => formatter.write_str("NULL"),
         }
     }
 }
