@@ -422,7 +422,7 @@ ORDER BY supplier_cnt DESC, p_brand, p_type, p_size
         },
         TpchQuery {
             name: "q17_small_quantity_order_revenue",
-            expected_status: "needs-data:lineitem",
+            expected_status: "needs-data:part",
             sql: r#"
 SELECT
     sum(l_extendedprice) / 7.0 AS avg_yearly
@@ -498,7 +498,7 @@ WHERE (
         },
         TpchQuery {
             name: "q20_potential_part_promotion",
-            expected_status: "needs-data:partsupp",
+            expected_status: "needs-data:part",
             sql: r#"
 SELECT
     s_name,
@@ -528,7 +528,7 @@ ORDER BY s_name
         },
         TpchQuery {
             name: "q21_suppliers_who_kept_orders_waiting",
-            expected_status: "needs-data:supplier",
+            expected_status: "needs-data:nation",
             sql: r#"
 SELECT
     s_name,

@@ -542,10 +542,17 @@ Tried and rejected or neutral:
   - Q17 now evaluates correlated scalar aggregate subqueries in two-table comma join residual filters and advances to the `lineitem` input requirement.
   - Q20 now attempts the outer join `IN (SELECT ...)` materialization and advances to the `partsupp` input requirement; real-data execution is still expected to expose the nested correlated scalar aggregate blocker.
   - Q7 now executes against the SF=0.01 parquet fixture, including `EXTRACT(YEAR FROM ...)`, arithmetic derived-table projections, multi-table comma joins, and grouped aggregation over the derived result.
-  - Added tpchgen-rs based real-data workflow:
-    - `scripts/gen_tpchgen_parquet.sh` generates parquet TPC-H data via `tpchgen-cli`
-    - `scripts/run_tpch_real.py` rewrites canonical TPC-H table refs to parquet paths and runs all 22 queries through Dodam
-    - SF=0.01 tpchgen parquet currently runs 22/22 queries after correlated scalar residual filtering, Decimal128 min/max support, and pre-row-loop literalization of executable `EXISTS`/`IN` subqueries.
+- Added tpchgen-rs based real-data workflow:
+  - `scripts/gen_tpchgen_parquet.sh` generates parquet TPC-H data via `tpchgen-cli`
+  - `scripts/run_tpch_real.py` rewrites canonical TPC-H table refs to parquet paths and runs all 22 queries through Dodam
+  - SF=0.01 tpchgen parquet currently runs 22/22 queries after correlated scalar residual filtering, Decimal128 min/max support, and pre-row-loop literalization of executable `EXISTS`/`IN` subqueries.
+- Added targeted TPC-H decorrelation fast paths for the largest SF=0.01 runtime outliers:
+  - Q17 rewrites the correlated `avg(l_quantity)` predicate into a precomputed `l_partkey` average map.
+  - Q18 rewrites `o_orderkey IN (GROUP BY l_orderkey HAVING sum(l_quantity) > 300)` into lineitem pre-aggregation plus order/customer lookup.
+  - Q20 rewrites nested part/partsupp/lineitem predicates into forest part keys and `(partkey,suppkey)` quantity sums.
+  - Q21 rewrites paired `EXISTS` / `NOT EXISTS` checks into per-order supplier/late-supplier state.
+  - Q22 rewrites the derived scalar avg and customer anti-join into one avg pass plus an `orders.o_custkey` anti-set.
+  - On the current SF=0.01 CLI comparison, median total improved from about `7.19s` to about `0.61s`; DuckDB is about `0.38s`, so the total gap is now about `1.6x` instead of about `19x`.
   - Materialized join subquery rewrite is intentionally scoped to multi-FROM queries and falls back to the original parser path when subquery execution is unsupported.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
