@@ -508,6 +508,7 @@ Tried and rejected or neutral:
   - Q16 now materializes the uncorrelated `NOT IN (SELECT ...)` join residual and advances to the `supplier` input requirement.
   - Q17 now evaluates correlated scalar aggregate subqueries in two-table comma join residual filters and advances to the `lineitem` input requirement.
   - Q20 now attempts the outer join `IN (SELECT ...)` materialization and advances to the `partsupp` input requirement; real-data execution is still expected to expose the nested correlated scalar aggregate blocker.
+  - Q7 now executes against the SF=0.01 parquet fixture, including `EXTRACT(YEAR FROM ...)`, arithmetic derived-table projections, multi-table comma joins, and grouped aggregation over the derived result.
   - Materialized join subquery rewrite is intentionally scoped to multi-FROM queries and falls back to the original parser path when subquery execution is unsupported.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.

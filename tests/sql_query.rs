@@ -1563,6 +1563,44 @@ async fn executes_with_cte_join_and_scalar_subquery_sql() {
 }
 
 #[tokio::test]
+async fn groups_join_derived_extract_year_projection_sql() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let lineitem_path = tempdir.path().join("lineitem.parquet");
+    let supplier_path = tempdir.path().join("supplier.parquet");
+    write_q15_lineitem_parquet(&lineitem_path);
+    write_q7_supplier_parquet(&supplier_path);
+
+    let sql = format!(
+        "SELECT s_name, l_year, sum(volume) AS revenue FROM (
+            SELECT s_name, EXTRACT(YEAR FROM l_shipdate) AS l_year, l_extendedprice * (1 - l_discount) AS volume
+            FROM '{}' AS lineitem, '{}' AS supplier
+            WHERE l_suppkey = s_suppkey
+        ) AS shipping
+        GROUP BY s_name, l_year
+        ORDER BY s_name, l_year",
+        lineitem_path.display(),
+        supplier_path.display()
+    );
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute derived EXTRACT year aggregate sql");
+
+    let QueryOutput::Aggregate { batches, .. } = output else {
+        panic!("expected aggregate output");
+    };
+    assert_eq!(
+        strings_from_column(&batches, 0),
+        vec![
+            "supplier-1".to_string(),
+            "supplier-2".to_string(),
+            "supplier-3".to_string()
+        ]
+    );
+    assert_eq!(i64s_from_column(&batches, 1), vec![1996, 1996, 1996]);
+    assert_eq!(f64s_from_column(&batches, 2), vec![140.0, 200.0, 1000.0]);
+}
+
+#[tokio::test]
 async fn executes_three_table_comma_join_aggregate_sql() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let customer_path = tempdir.path().join("customer.parquet");
@@ -3251,34 +3289,6 @@ fn write_q15_lineitem_parquet(path: &std::path::Path) {
     writer.close().expect("close parquet writer");
 }
 
-fn write_q15_supplier_parquet(path: &std::path::Path) {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("s_suppkey", DataType::Int64, false),
-        Field::new("s_name", DataType::Utf8, false),
-        Field::new("s_address", DataType::Utf8, false),
-        Field::new("s_phone", DataType::Utf8, false),
-    ]));
-    let suppkeys = Int64Array::from_iter_values([1, 2, 3]);
-    let names = StringArray::from_iter_values(["supplier-1", "supplier-2", "supplier-3"]);
-    let addresses = StringArray::from_iter_values(["addr-1", "addr-2", "addr-3"]);
-    let phones = StringArray::from_iter_values(["phone-1", "phone-2", "phone-3"]);
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(suppkeys),
-            Arc::new(names),
-            Arc::new(addresses),
-            Arc::new(phones),
-        ],
-    )
-    .expect("record batch");
-
-    let file = File::create(path).expect("create parquet file");
-    let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
-    writer.write(&batch).expect("write parquet batch");
-    writer.close().expect("close parquet writer");
-}
-
 fn write_duplicate_customers_parquet(path: &std::path::Path) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
@@ -3332,6 +3342,50 @@ fn write_partitioned_full_right_parquet(path: &std::path::Path) {
         .set_max_row_group_row_count(Some(128))
         .build();
     let mut writer = ArrowWriter::try_new(file, schema, Some(props)).expect("parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+}
+
+fn write_q7_supplier_parquet(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("s_suppkey", DataType::Int32, false),
+        Field::new("s_name", DataType::Utf8, false),
+    ]));
+    let suppkeys = Int32Array::from_iter_values([1, 2, 3]);
+    let names = StringArray::from_iter_values(["supplier-1", "supplier-2", "supplier-3"]);
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(suppkeys), Arc::new(names)])
+        .expect("record batch");
+
+    let file = File::create(path).expect("create parquet file");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+}
+
+fn write_q15_supplier_parquet(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("s_suppkey", DataType::Int64, false),
+        Field::new("s_name", DataType::Utf8, false),
+        Field::new("s_address", DataType::Utf8, false),
+        Field::new("s_phone", DataType::Utf8, false),
+    ]));
+    let suppkeys = Int64Array::from_iter_values([1, 2, 3]);
+    let names = StringArray::from_iter_values(["supplier-1", "supplier-2", "supplier-3"]);
+    let addresses = StringArray::from_iter_values(["addr-1", "addr-2", "addr-3"]);
+    let phones = StringArray::from_iter_values(["phone-1", "phone-2", "phone-3"]);
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(suppkeys),
+            Arc::new(names),
+            Arc::new(addresses),
+            Arc::new(phones),
+        ],
+    )
+    .expect("record batch");
+
+    let file = File::create(path).expect("create parquet file");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
     writer.write(&batch).expect("write parquet batch");
     writer.close().expect("close parquet writer");
 }
