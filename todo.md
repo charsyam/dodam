@@ -142,6 +142,11 @@
   - unqualified join projection, `GROUP BY`, and aggregate arguments can now be inferred from TPC-H-style column prefixes such as `c_` and `o_`
   - added `UInt64` group key support so outer grouping by `count(...)` aliases such as Q13's `c_count` preserves the count result type
   - TPC-H inventory now advances Q13 to `needs-data:customer`
+- Added first-stage SQL `SUBSTRING(expr FROM start FOR length)` scalar expression support:
+  - works in projection and computed `WHERE` expression filters, including expression `IN (...)`
+  - uses SQL 1-based character indexing and preserves NULL propagation
+  - added DuckDB differential coverage for projection and WHERE `IN`
+  - TPC-H Q22 now advances past SELECT expression parsing; current blocker is subquery-aware filter lowering for `SUBSTRING(...) IN (...)` mixed with scalar/correlated subqueries
 - The TPC-H-lite suite caught missing `Date32` `min`/`max` aggregate support; added `Date32` aggregate state and `Date32Array` result materialization.
 - The TPC-H-lite join aggregate case caught an aggregate join output projection correctness issue around qualified column names when the cost model chooses the left side as the hash build input.
 - Fixed build-side-aware join output projection mapping for hash/materialized join output schemas and restored aggregate join output projection pushdown.

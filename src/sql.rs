@@ -875,6 +875,10 @@ fn predicate_requires_expression_path(expr: &SqlExpr) -> bool {
         SqlExpr::IsNull(expr) | SqlExpr::IsNotNull(expr) => {
             scalar_predicate_side_requires_expression(expr)
         }
+        SqlExpr::InList { expr, list, .. } => {
+            scalar_predicate_side_requires_expression(expr)
+                || list.iter().any(scalar_predicate_side_requires_expression)
+        }
         _ => false,
     }
 }
@@ -926,6 +930,19 @@ fn collect_predicate_expression_columns(
                 for column in scalar_expression_columns(&expression.expr) {
                     add_column_once(columns, column);
                 }
+            }
+        }
+        SqlExpr::Substring { .. } => {
+            for column in
+                scalar_expression_columns(&parse_scalar_sql_expression(expr, table_alias)?)
+            {
+                add_column_once(columns, column);
+            }
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            collect_predicate_expression_columns(expr, table_alias, columns)?;
+            for item in list {
+                collect_predicate_expression_columns(item, table_alias, columns)?;
             }
         }
         SqlExpr::Cast { expr, .. } => {
@@ -2818,6 +2835,11 @@ enum ScalarSqlExpression {
     Lower(Box<ScalarSqlExpression>),
     Upper(Box<ScalarSqlExpression>),
     Length(Box<ScalarSqlExpression>),
+    Substring {
+        expr: Box<ScalarSqlExpression>,
+        start: Box<ScalarSqlExpression>,
+        length: Option<Box<ScalarSqlExpression>>,
+    },
     Case {
         conditions: Vec<SqlExpr>,
         results: Vec<ScalarSqlExpression>,
@@ -3115,6 +3137,26 @@ fn parse_scalar_sql_expression(
             };
             Ok(projection.expr)
         }
+        SqlExpr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            let Some(start) = substring_from else {
+                return Err(DodamError::UnsupportedSql(
+                    "SUBSTRING requires a FROM/start expression".to_string(),
+                ));
+            };
+            Ok(ScalarSqlExpression::Substring {
+                expr: Box::new(parse_scalar_sql_expression(expr, table_alias)?),
+                start: Box::new(parse_scalar_sql_expression(start, table_alias)?),
+                length: substring_for
+                    .as_ref()
+                    .map(|expr| parse_scalar_sql_expression(expr, table_alias).map(Box::new))
+                    .transpose()?,
+            })
+        }
         SqlExpr::Case {
             operand,
             conditions,
@@ -3170,6 +3212,17 @@ fn collect_scalar_expression_columns(expr: &ScalarSqlExpression, columns: &mut V
         ScalarSqlExpression::Lower(expr)
         | ScalarSqlExpression::Upper(expr)
         | ScalarSqlExpression::Length(expr) => collect_scalar_expression_columns(expr, columns),
+        ScalarSqlExpression::Substring {
+            expr,
+            start,
+            length,
+        } => {
+            collect_scalar_expression_columns(expr, columns);
+            collect_scalar_expression_columns(start, columns);
+            if let Some(length) = length {
+                collect_scalar_expression_columns(length, columns);
+            }
+        }
         ScalarSqlExpression::Case {
             conditions,
             results,
@@ -4286,6 +4339,28 @@ fn evaluate_scalar_predicate(
                     .collect::<Vec<_>>(),
             ))
         }
+        SqlExpr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let value = evaluate_scalar_expression(
+                batch,
+                &parse_scalar_sql_expression(expr, table_alias)?,
+            )?;
+            let values = list
+                .iter()
+                .map(|expr| {
+                    evaluate_scalar_expression(
+                        batch,
+                        &parse_scalar_sql_expression(expr, table_alias)?,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(BooleanArray::from(evaluate_scalar_in_list(
+                value, &values, *negated,
+            )?))
+        }
         _ => Err(DodamError::UnsupportedSql(format!(
             "unsupported expression WHERE predicate: {predicate}"
         ))),
@@ -4430,6 +4505,15 @@ enum EvaluatedScalar {
 }
 
 impl EvaluatedScalar {
+    fn len(&self) -> usize {
+        match self {
+            Self::Int64(values) => values.len(),
+            Self::Float64(values) => values.len(),
+            Self::Utf8(values) => values.len(),
+            Self::Boolean(values) => values.len(),
+        }
+    }
+
     fn data_type(&self) -> DataType {
         match self {
             Self::Int64(_) => DataType::Int64,
@@ -4517,6 +4601,29 @@ fn evaluate_scalar_expression(
                     .collect(),
             ))
         }
+        ScalarSqlExpression::Substring {
+            expr,
+            start,
+            length,
+        } => {
+            let values = scalar_as_utf8(evaluate_scalar_expression(batch, expr)?)?;
+            let starts = scalar_as_i64(evaluate_scalar_expression(batch, start)?)?;
+            let lengths = length
+                .as_ref()
+                .map(|expr| scalar_as_i64(evaluate_scalar_expression(batch, expr)?))
+                .transpose()?;
+            Ok(EvaluatedScalar::Utf8(
+                (0..batch.num_rows())
+                    .map(|row| {
+                        substring_value(
+                            values[row].as_deref(),
+                            starts[row],
+                            lengths.as_ref().map(|values| values[row]),
+                        )
+                    })
+                    .collect(),
+            ))
+        }
         ScalarSqlExpression::Case {
             conditions,
             results,
@@ -4566,6 +4673,103 @@ fn evaluate_case_expression(
         set_scalar_value_from(&mut output, row, selected)?;
     }
     Ok(output)
+}
+
+fn evaluate_scalar_in_list(
+    value: EvaluatedScalar,
+    values: &[EvaluatedScalar],
+    negated: bool,
+) -> Result<Vec<Option<bool>>> {
+    let value_kind = evaluated_scalar_kind(&value).unwrap_or(EvaluatedScalarKind::Utf8);
+    let mut output = Vec::with_capacity(value.len());
+    for row in 0..value.len() {
+        let candidate = scalar_value_at(&value, row)?;
+        if candidate.is_none() {
+            output.push(None);
+            continue;
+        }
+        let mut matched = false;
+        let mut has_null = false;
+        for value in values {
+            let value = scalar_value_at(&cast_scalar_for_kind(value.clone(), value_kind)?, row)?;
+            match value {
+                Some(value) => {
+                    if Some(value) == candidate {
+                        matched = true;
+                        break;
+                    }
+                }
+                None => has_null = true,
+            }
+        }
+        let result = if matched {
+            Some(!negated)
+        } else if has_null {
+            None
+        } else {
+            Some(negated)
+        };
+        output.push(result);
+    }
+    Ok(output)
+}
+
+fn substring_value(
+    value: Option<&str>,
+    start: Option<i64>,
+    length: Option<Option<i64>>,
+) -> Option<String> {
+    let value = value?;
+    let start = start?;
+    let chars = value.chars().collect::<Vec<_>>();
+    let start_index = if start <= 1 {
+        0
+    } else {
+        usize::try_from(start - 1).ok()?
+    };
+    let available = chars.len().saturating_sub(start_index);
+    let take = match length {
+        Some(Some(length)) if length <= 0 => 0,
+        Some(Some(length)) => usize::try_from(length).ok()?.min(available),
+        Some(None) => return None,
+        None => available,
+    };
+    Some(chars.iter().skip(start_index).take(take).collect())
+}
+
+#[derive(Clone, PartialEq)]
+enum ScalarValue {
+    Int64(i64),
+    Float64(f64),
+    Utf8(String),
+    Boolean(bool),
+}
+
+fn scalar_value_at(value: &EvaluatedScalar, row: usize) -> Result<Option<ScalarValue>> {
+    Ok(match value {
+        EvaluatedScalar::Int64(values) => values[row].map(ScalarValue::Int64),
+        EvaluatedScalar::Float64(values) => values[row].map(ScalarValue::Float64),
+        EvaluatedScalar::Utf8(values) => values[row].clone().map(ScalarValue::Utf8),
+        EvaluatedScalar::Boolean(values) => values[row].map(ScalarValue::Boolean),
+    })
+}
+
+fn cast_scalar_for_kind(
+    value: EvaluatedScalar,
+    kind: EvaluatedScalarKind,
+) -> Result<EvaluatedScalar> {
+    match kind {
+        EvaluatedScalarKind::Int64 => Ok(EvaluatedScalar::Int64(scalar_as_i64(value)?)),
+        EvaluatedScalarKind::Float64 => Ok(EvaluatedScalar::Float64(scalar_as_f64(value)?)),
+        EvaluatedScalarKind::Utf8 => Ok(EvaluatedScalar::Utf8(scalar_as_utf8(value)?)),
+        EvaluatedScalarKind::Boolean => match value {
+            EvaluatedScalar::Boolean(_) => Ok(value),
+            other => Err(DodamError::UnsupportedSql(format!(
+                "cannot use {} in boolean IN list",
+                other.data_type()
+            ))),
+        },
+    }
 }
 
 #[derive(Clone, Copy)]

@@ -536,6 +536,42 @@ async fn duckdb_differential_string_functions_and_case() {
 }
 
 #[tokio::test]
+async fn duckdb_differential_substring_expression() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let types_path = tempdir.path().join("types.parquet");
+    write_types_parquet(&types_path);
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, substring(note FROM 1 FOR 2) AS prefix FROM '{}' ORDER BY id",
+            types_path.display()
+        ),
+        &format!(
+            "SELECT id, substring(note FROM 1 FOR 2) AS prefix FROM read_parquet('{}') ORDER BY id",
+            types_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id FROM '{}' WHERE substring(note FROM 1 FOR 1) IN ('a', 'g') ORDER BY id",
+            types_path.display()
+        ),
+        &format!(
+            "SELECT id FROM read_parquet('{}') WHERE substring(note FROM 1 FOR 1) IN ('a', 'g') ORDER BY id",
+            types_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn duckdb_differential_tpch_lite_queries() {
     let Some(_duckdb) = DuckDbGuard::new() else {
         return;
