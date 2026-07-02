@@ -24,6 +24,8 @@ pub enum AggregateValue {
     Int64(Option<i64>),
     Float64(Option<f64>),
     Date32(Option<i32>),
+    Date64(Option<i64>),
+    TimestampMillisecond(Option<i64>, Option<String>),
     Utf8(Option<String>),
 }
 
@@ -34,10 +36,15 @@ impl std::fmt::Display for AggregateValue {
             Self::Int64(Some(value)) => write!(formatter, "{value}"),
             Self::Float64(Some(value)) => write!(formatter, "{value}"),
             Self::Date32(Some(value)) => write!(formatter, "{value}"),
+            Self::Date64(Some(value)) => write!(formatter, "{value}"),
+            Self::TimestampMillisecond(Some(value), _) => write!(formatter, "{value}"),
             Self::Utf8(Some(value)) => formatter.write_str(value),
-            Self::Int64(None) | Self::Float64(None) | Self::Date32(None) | Self::Utf8(None) => {
-                formatter.write_str("NULL")
-            }
+            Self::Int64(None)
+            | Self::Float64(None)
+            | Self::Date32(None)
+            | Self::Date64(None)
+            | Self::TimestampMillisecond(None, _)
+            | Self::Utf8(None) => formatter.write_str("NULL"),
         }
     }
 }

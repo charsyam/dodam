@@ -918,6 +918,79 @@ async fn filters_richer_parquet_types_sql() {
 }
 
 #[tokio::test]
+async fn aggregates_temporal_min_max_sql() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let path = tempdir.path().join("rich.parquet");
+    write_rich_type_parquet(&path);
+
+    let sql = format!(
+        "SELECT min(event_date), max(event_date), min(event_date64), max(event_date64), min(created_at), max(created_at), min(created_at_utc), max(created_at_utc) FROM '{}'",
+        path.display()
+    );
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute temporal aggregate sql");
+
+    let QueryOutput::Aggregate { batches, .. } = output else {
+        panic!("expected aggregate output");
+    };
+    let batch = &batches[0];
+    let min_date = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .unwrap();
+    let max_date = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .unwrap();
+    let min_date64 = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Date64Array>()
+        .unwrap();
+    let max_date64 = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Date64Array>()
+        .unwrap();
+    let min_ts = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<TimestampMillisecondArray>()
+        .unwrap();
+    let max_ts = batch
+        .column(5)
+        .as_any()
+        .downcast_ref::<TimestampMillisecondArray>()
+        .unwrap();
+    let min_ts_utc = batch
+        .column(6)
+        .as_any()
+        .downcast_ref::<TimestampMillisecondArray>()
+        .unwrap();
+    let max_ts_utc = batch
+        .column(7)
+        .as_any()
+        .downcast_ref::<TimestampMillisecondArray>()
+        .unwrap();
+
+    assert_eq!(min_date.value(0), 0);
+    assert_eq!(max_date.value(0), 19_724);
+    assert_eq!(min_date64.value(0), 0);
+    assert_eq!(max_date64.value(0), 1_704_153_600_000);
+    assert_eq!(min_ts.value(0), 0);
+    assert_eq!(max_ts.value(0), 1_704_153_600_000);
+    assert_eq!(min_ts_utc.value(0), 0);
+    assert_eq!(max_ts_utc.value(0), 1_704_153_600_000);
+    assert_eq!(
+        batch.schema().field(6).data_type(),
+        &DataType::Timestamp(TimeUnit::Millisecond, Some("+00:00".into()))
+    );
+}
+
+#[tokio::test]
 async fn projects_nested_and_richer_parquet_types_sql() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let path = tempdir.path().join("rich.parquet");

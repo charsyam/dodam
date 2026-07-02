@@ -2,11 +2,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array, StringArray,
-    UInt64Array,
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float64Array, Int32Array, Int64Array,
+    StringArray, TimestampMillisecondArray, UInt64Array,
 };
 use arrow::compute::filter_record_batch;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use arrow_ord::sort::{SortColumn, SortOptions, lexsort_to_indices};
 use arrow_select::concat::concat_batches;
@@ -4308,6 +4308,10 @@ fn aggregate_values_to_column(
             crate::execution::AggregateValue::Int64(_) => DataType::Int64,
             crate::execution::AggregateValue::Float64(_) => DataType::Float64,
             crate::execution::AggregateValue::Date32(_) => DataType::Date32,
+            crate::execution::AggregateValue::Date64(_) => DataType::Date64,
+            crate::execution::AggregateValue::TimestampMillisecond(_, timezone) => {
+                DataType::Timestamp(TimeUnit::Millisecond, timezone.clone().map(Into::into))
+            }
             crate::execution::AggregateValue::Utf8(_) => DataType::Utf8,
         })
         .next()
@@ -4364,6 +4368,42 @@ fn aggregate_values_to_column(
             (
                 Field::new(name, DataType::Date32, true),
                 Arc::new(Date32Array::from(values)),
+            )
+        }
+        DataType::Date64 => {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    crate::execution::AggregateValue::Date64(value) => *value,
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (
+                Field::new(name, DataType::Date64, true),
+                Arc::new(Date64Array::from(values)),
+            )
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, timezone) => {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    crate::execution::AggregateValue::TimestampMillisecond(value, _) => *value,
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let array = TimestampMillisecondArray::from(values);
+            let array = if let Some(timezone) = timezone.as_ref() {
+                array.with_timezone(timezone.clone())
+            } else {
+                array
+            };
+            (
+                Field::new(
+                    name,
+                    DataType::Timestamp(TimeUnit::Millisecond, timezone),
+                    true,
+                ),
+                Arc::new(array),
             )
         }
         _ => {

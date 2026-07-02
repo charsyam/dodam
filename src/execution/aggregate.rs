@@ -3,10 +3,11 @@ use std::collections::hash_map::Entry;
 use std::hash::{BuildHasherDefault, Hasher};
 
 use arrow::array::{
-    Array, ArrayRef, Date32Array, Float64Array, Int32Array, Int64Array, StringArray,
+    Array, ArrayRef, Date32Array, Date64Array, Float64Array, Int32Array, Int64Array, StringArray,
+    TimestampMillisecondArray,
 };
 use arrow::compute::kernels::aggregate::{max, max_string, min, min_string, sum};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use arrow_row::{OwnedRow, RowConverter, SortField};
 
@@ -867,6 +868,15 @@ enum FastAggregateInput<'a> {
         expr: AggregateExpr,
         values: &'a Date32Array,
     },
+    Date64 {
+        expr: AggregateExpr,
+        values: &'a Date64Array,
+    },
+    TimestampMillisecond {
+        expr: AggregateExpr,
+        values: &'a TimestampMillisecondArray,
+        timezone: Option<String>,
+    },
     Utf8 {
         expr: AggregateExpr,
         values: &'a StringArray,
@@ -952,6 +962,23 @@ fn typed_fast_inputs<'a>(
                             .downcast_ref::<Date32Array>()
                             .expect("Date32 min/max input"),
                     }),
+                    DataType::Date64 => Ok(FastAggregateInput::Date64 {
+                        expr,
+                        values: values
+                            .as_any()
+                            .downcast_ref::<Date64Array>()
+                            .expect("Date64 min/max input"),
+                    }),
+                    DataType::Timestamp(TimeUnit::Millisecond, timezone) => {
+                        Ok(FastAggregateInput::TimestampMillisecond {
+                            expr,
+                            values: values
+                                .as_any()
+                                .downcast_ref::<TimestampMillisecondArray>()
+                                .expect("TimestampMillisecond min/max input"),
+                            timezone: timezone.as_ref().map(ToString::to_string),
+                        })
+                    }
                     DataType::Utf8 => Ok(FastAggregateInput::Utf8 {
                         expr,
                         values: values
@@ -1019,6 +1046,13 @@ impl FastAggregateState {
             FastAggregateInput::Date32 { expr, .. } => {
                 min_max_fast_state(expr, AggregateValue::Date32(None))
             }
+            FastAggregateInput::Date64 { expr, .. } => {
+                min_max_fast_state(expr, AggregateValue::Date64(None))
+            }
+            FastAggregateInput::TimestampMillisecond { expr, timezone, .. } => min_max_fast_state(
+                expr,
+                AggregateValue::TimestampMillisecond(None, timezone.clone()),
+            ),
             FastAggregateInput::Utf8 { expr, .. } => {
                 min_max_fast_state(expr, AggregateValue::Utf8(None))
             }
@@ -1093,6 +1127,35 @@ impl FastAggregateState {
                         expr,
                         state,
                         AggregateValue::Date32(Some(values.value(row))),
+                    );
+                }
+            }
+            FastAggregateInput::Date64 { values, .. } if values.is_valid(row) => {
+                if let Self::MinMax {
+                    expr, value: state, ..
+                } = self
+                {
+                    update_min_max_value(
+                        expr,
+                        state,
+                        AggregateValue::Date64(Some(values.value(row))),
+                    );
+                }
+            }
+            FastAggregateInput::TimestampMillisecond {
+                values, timezone, ..
+            } if values.is_valid(row) => {
+                if let Self::MinMax {
+                    expr, value: state, ..
+                } = self
+                {
+                    update_min_max_value(
+                        expr,
+                        state,
+                        AggregateValue::TimestampMillisecond(
+                            Some(values.value(row)),
+                            timezone.clone(),
+                        ),
                     );
                 }
             }
@@ -1238,6 +1301,26 @@ fn update_min_max_value(
             AggregateExpr::Max(_),
             Some(AggregateValue::Date32(Some(current))),
             AggregateValue::Date32(Some(candidate)),
+        ) => candidate > current,
+        (
+            AggregateExpr::Min(_),
+            Some(AggregateValue::Date64(Some(current))),
+            AggregateValue::Date64(Some(candidate)),
+        ) => candidate < current,
+        (
+            AggregateExpr::Max(_),
+            Some(AggregateValue::Date64(Some(current))),
+            AggregateValue::Date64(Some(candidate)),
+        ) => candidate > current,
+        (
+            AggregateExpr::Min(_),
+            Some(AggregateValue::TimestampMillisecond(Some(current), _)),
+            AggregateValue::TimestampMillisecond(Some(candidate), _),
+        ) => candidate < current,
+        (
+            AggregateExpr::Max(_),
+            Some(AggregateValue::TimestampMillisecond(Some(current), _)),
+            AggregateValue::TimestampMillisecond(Some(candidate), _),
         ) => candidate > current,
         (
             AggregateExpr::Min(_),
@@ -1668,6 +1751,40 @@ impl MinMaxState {
                 }
                 Ok(())
             }
+            DataType::Date64 => {
+                let values = column
+                    .as_any()
+                    .downcast_ref::<Date64Array>()
+                    .expect("Date64 data type");
+                if let Some(value) = if replace(std::cmp::Ordering::Less, std::cmp::Ordering::Equal)
+                {
+                    min(values)
+                } else {
+                    max(values)
+                } {
+                    self.update_date64(value, &replace);
+                }
+                Ok(())
+            }
+            DataType::Timestamp(TimeUnit::Millisecond, timezone) => {
+                let values = column
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .expect("TimestampMillisecond data type");
+                if let Some(value) = if replace(std::cmp::Ordering::Less, std::cmp::Ordering::Equal)
+                {
+                    min(values)
+                } else {
+                    max(values)
+                } {
+                    self.update_timestamp_millisecond(
+                        value,
+                        timezone.as_ref().map(ToString::to_string),
+                        &replace,
+                    );
+                }
+                Ok(())
+            }
             DataType::Utf8 => {
                 let values = column
                     .as_any()
@@ -1730,6 +1847,26 @@ impl MinMaxState {
                 self.update_date32(values.value(row), &replace);
                 Ok(())
             }
+            DataType::Date64 => {
+                let values = column
+                    .as_any()
+                    .downcast_ref::<Date64Array>()
+                    .expect("Date64 data type");
+                self.update_date64(values.value(row), &replace);
+                Ok(())
+            }
+            DataType::Timestamp(TimeUnit::Millisecond, timezone) => {
+                let values = column
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .expect("TimestampMillisecond data type");
+                self.update_timestamp_millisecond(
+                    values.value(row),
+                    timezone.as_ref().map(ToString::to_string),
+                    &replace,
+                );
+                Ok(())
+            }
             DataType::Utf8 => {
                 let values = column
                     .as_any()
@@ -1783,6 +1920,36 @@ impl MinMaxState {
             Some(AggregateValue::Date32(Some(current)))
                 if !replace(candidate.cmp(current), std::cmp::Ordering::Equal) => {}
             _ => self.value = Some(AggregateValue::Date32(Some(candidate))),
+        }
+    }
+
+    fn update_date64(
+        &mut self,
+        candidate: i64,
+        replace: &impl Fn(std::cmp::Ordering, std::cmp::Ordering) -> bool,
+    ) {
+        match &self.value {
+            Some(AggregateValue::Date64(Some(current)))
+                if !replace(candidate.cmp(current), std::cmp::Ordering::Equal) => {}
+            _ => self.value = Some(AggregateValue::Date64(Some(candidate))),
+        }
+    }
+
+    fn update_timestamp_millisecond(
+        &mut self,
+        candidate: i64,
+        timezone: Option<String>,
+        replace: &impl Fn(std::cmp::Ordering, std::cmp::Ordering) -> bool,
+    ) {
+        match &self.value {
+            Some(AggregateValue::TimestampMillisecond(Some(current), _))
+                if !replace(candidate.cmp(current), std::cmp::Ordering::Equal) => {}
+            _ => {
+                self.value = Some(AggregateValue::TimestampMillisecond(
+                    Some(candidate),
+                    timezone,
+                ))
+            }
         }
     }
 

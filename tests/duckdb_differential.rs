@@ -4,8 +4,8 @@ use std::process::Command;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int32Array, Int64Array,
-    StringArray, TimestampMillisecondArray,
+    ArrayRef, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float64Array, Int32Array,
+    Int64Array, StringArray, TimestampMillisecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -953,6 +953,7 @@ fn write_types_parquet(path: &Path) {
             true,
         ),
         Field::new("event_date", DataType::Date32, true),
+        Field::new("event_date64", DataType::Date64, true),
     ]));
     let ids = Int32Array::from_iter_values([1, 2, 3, 4]);
     let flags = BooleanArray::from(vec![Some(true), Some(false), None, Some(true)]);
@@ -975,6 +976,12 @@ fn write_types_parquet(path: &Path) {
     ])
     .with_timezone("+00:00");
     let event_date = Date32Array::from(vec![Some(19_723), Some(19_724), None, Some(0)]);
+    let event_date64 = Date64Array::from(vec![
+        Some(1_704_067_200_000),
+        Some(1_704_153_600_000),
+        None,
+        Some(0),
+    ]);
     write_parquet(
         path,
         schema,
@@ -987,6 +994,7 @@ fn write_types_parquet(path: &Path) {
             Arc::new(created_at),
             Arc::new(created_at_utc),
             Arc::new(event_date),
+            Arc::new(event_date64),
         ],
     );
 }

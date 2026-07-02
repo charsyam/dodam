@@ -119,6 +119,10 @@
 - The TPC-H-lite suite caught missing `Date32` `min`/`max` aggregate support; added `Date32` aggregate state and `Date32Array` result materialization.
 - The TPC-H-lite join aggregate case caught an aggregate join output projection correctness issue around qualified column names when the cost model chooses the left side as the hash build input.
 - Fixed build-side-aware join output projection mapping for hash/materialized join output schemas and restored aggregate join output projection pushdown.
+- Extended temporal `min`/`max` aggregate support beyond `Date32`:
+  - `Date64`
+  - `Timestamp(Millisecond)` with timezone metadata preserved in SQL result batches
+  - Added SQL tests that validate output Arrow types and epoch values directly; DuckDB CSV differential is intentionally avoided for these output values because DuckDB CLI formats `Date64`/timestamp results differently.
 - The first differential grouped-aggregate case caught a real correctness bug: grouped `min(Utf8)` / `max(Utf8)` on the single-key fast path produced `NULL` because empty min/max state defaulted to `Int64(NULL)`.
 - Fixed the grouped aggregate fast path so min/max states keep the expected output null type (`Int64`, `Float64`, or `Utf8`) even when a group starts with nulls.
 - Added first-stage subquery support for `FROM (SELECT ...) AS alias` by materializing the inner query to in-memory `RecordBatch`es and applying the outer projection/filter/group/order/limit over those batches.
