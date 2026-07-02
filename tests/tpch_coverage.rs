@@ -399,7 +399,7 @@ ORDER BY s_suppkey
         },
         TpchQuery {
             name: "q16_parts_supplier_relationship",
-            expected_status: "unsupported-sql:expected exactly one FROM table",
+            expected_status: "unsupported-sql:unsupported JOIN WHERE expression: ps_suppkey NOT IN (SELECT s_suppkey FROM supplier WHERE s_comment LIKE '%Customer%Complaints%')",
             sql: r#"
 SELECT
     p_brand,
@@ -422,7 +422,7 @@ ORDER BY supplier_cnt DESC, p_brand, p_type, p_size
         },
         TpchQuery {
             name: "q17_small_quantity_order_revenue",
-            expected_status: "unsupported-sql:expected exactly one FROM table",
+            expected_status: "unsupported-sql:expected literal, got (SELECT 0.2 * avg(l_quantity) FROM lineitem WHERE l_partkey = p_partkey)",
             sql: r#"
 SELECT
     sum(l_extendedprice) / 7.0 AS avg_yearly
@@ -498,7 +498,7 @@ WHERE (
         },
         TpchQuery {
             name: "q20_potential_part_promotion",
-            expected_status: "unsupported-sql:expected exactly one FROM table",
+            expected_status: "unsupported-sql:unsupported JOIN WHERE expression: s_suppkey IN (SELECT ps_suppkey FROM partsupp WHERE ps_partkey IN (SELECT p_partkey FROM part WHERE p_name LIKE 'forest%') AND ps_availqty > (SELECT 0.5 * sum(l_quantity) FROM lineitem WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey AND l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1994-01-01' + INTERVAL '1' YEAR))",
             sql: r#"
 SELECT
     s_name,

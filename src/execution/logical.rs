@@ -79,6 +79,7 @@ impl std::fmt::Display for GroupValue {
 pub enum AggregateExpr {
     CountStar,
     Count(String),
+    CountDistinct(String),
     Sum(String),
     Avg(String),
     Min(String),
@@ -99,6 +100,7 @@ impl AggregateExpr {
         let column = column.trim();
         match function.to_ascii_lowercase().as_str() {
             "count" if column == "*" => Ok(Self::CountStar),
+            "count_distinct" if !column.is_empty() => Ok(Self::CountDistinct(column.to_string())),
             "count" if !column.is_empty() => Ok(Self::Count(column.to_string())),
             "sum" if !column.is_empty() => Ok(Self::Sum(column.to_string())),
             "avg" if !column.is_empty() => Ok(Self::Avg(column.to_string())),
@@ -112,6 +114,7 @@ impl AggregateExpr {
         match self {
             Self::CountStar => None,
             Self::Count(column)
+            | Self::CountDistinct(column)
             | Self::Sum(column)
             | Self::Avg(column)
             | Self::Min(column)
@@ -125,6 +128,7 @@ impl std::fmt::Display for AggregateExpr {
         match self {
             Self::CountStar => formatter.write_str("count(*)"),
             Self::Count(column) => write!(formatter, "count({column})"),
+            Self::CountDistinct(column) => write!(formatter, "count(DISTINCT {column})"),
             Self::Sum(column) => write!(formatter, "sum({column})"),
             Self::Avg(column) => write!(formatter, "avg({column})"),
             Self::Min(column) => write!(formatter, "min({column})"),

@@ -188,6 +188,12 @@
   - binds both explicit alias references and TPC-H-style unqualified outer columns such as `o_orderkey`
   - added SQL coverage for a Q4-shaped grouped aggregate with correlated `EXISTS`
   - TPC-H inventory now advances Q4 to `needs-data:orders`
+- Added first-stage `count(DISTINCT column)` aggregate support:
+  - supports global and grouped distinct counts through the generic aggregate accumulator
+  - keeps fast aggregate paths on non-distinct aggregates and falls back to generic for distinct counts
+  - added SQL coverage for grouped `count(DISTINCT id)`
+  - TPC-H inventory now advances Q16 to the join residual `NOT IN (subquery)` blocker
+  - TPC-H Q17/Q20 also advance past earlier FROM-list routing blockers to their scalar/nested subquery blockers
 - The TPC-H-lite suite caught missing `Date32` `min`/`max` aggregate support; added `Date32` aggregate state and `Date32Array` result materialization.
 - The TPC-H-lite join aggregate case caught an aggregate join output projection correctness issue around qualified column names when the cost model chooses the left side as the hash build input.
 - Fixed build-side-aware join output projection mapping for hash/materialized join output schemas and restored aggregate join output projection pushdown.

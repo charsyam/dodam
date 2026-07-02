@@ -12,10 +12,10 @@ use arrow_ord::sort::{SortColumn, SortOptions, lexsort_to_indices};
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take_record_batch;
 use sqlparser::ast::{
-    BinaryOperator, DateTimeField, Distinct, Expr as SqlExpr, FunctionArg, FunctionArgExpr,
-    FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, LimitClause, ObjectName,
-    ObjectNamePart, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
-    UnaryOperator, Value,
+    BinaryOperator, DateTimeField, Distinct, DuplicateTreatment, Expr as SqlExpr, FunctionArg,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, LimitClause,
+    ObjectName, ObjectNamePart, OrderByKind, Query, Select, SelectItem, SetExpr, Statement,
+    TableFactor, UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -434,6 +434,9 @@ async fn try_execute_correlated_subquery_filter_sql(
     }
     reject_query_features(query)?;
     reject_select_features(select)?;
+    if select.from.len() != 1 {
+        return Ok(None);
+    }
     let path = parse_from(select)?;
     let selection_sql = selection.to_string();
     if let Some(outer_alias) = path.alias.as_deref()
@@ -750,6 +753,9 @@ async fn try_execute_in_subquery_sql(
     }
     reject_query_features(query)?;
     reject_select_features(select)?;
+    if select.from.len() != 1 {
+        return Ok(None);
+    }
     if select
         .from
         .first()
@@ -3643,6 +3649,9 @@ fn infer_unqualified_join_column(column: &str, table_aliases: &[&str]) -> Result
             "expected qualified column, got {column}"
         )));
     };
+    if let Some(alias) = infer_tpch_table_alias(prefix, table_aliases) {
+        return Ok(format!("{alias}.{column}"));
+    }
     let Some(prefix_initial) = prefix.chars().next() else {
         return Err(DodamError::UnsupportedSql(format!(
             "cannot infer JOIN table for unqualified column {column}"
@@ -3663,6 +3672,24 @@ fn infer_unqualified_join_column(column: &str, table_aliases: &[&str]) -> Result
         )));
     };
     Ok(format!("{alias}.{column}"))
+}
+
+fn infer_tpch_table_alias<'a>(prefix: &str, table_aliases: &'a [&str]) -> Option<&'a str> {
+    let table = match prefix.to_ascii_lowercase().as_str() {
+        "c" => "customer",
+        "o" => "orders",
+        "l" => "lineitem",
+        "p" => "part",
+        "ps" => "partsupp",
+        "s" => "supplier",
+        "n" => "nation",
+        "r" => "region",
+        _ => return None,
+    };
+    table_aliases
+        .iter()
+        .copied()
+        .find(|alias| alias.eq_ignore_ascii_case(table))
 }
 
 #[derive(Debug)]
@@ -4423,11 +4450,9 @@ fn parse_aggregate(
         ));
     }
     let name = object_name_to_string(&function.name)?;
-    let args = match &function.args {
-        FunctionArguments::List(args)
-            if args.clauses.is_empty() && args.duplicate_treatment.is_none() =>
-        {
-            &args.args
+    let (args, duplicate_treatment) = match &function.args {
+        FunctionArguments::List(args) if args.clauses.is_empty() => {
+            (&args.args, args.duplicate_treatment)
         }
         _ => {
             return Err(DodamError::UnsupportedSql(format!(
@@ -4436,6 +4461,12 @@ fn parse_aggregate(
             )));
         }
     };
+    if matches!(duplicate_treatment, Some(DuplicateTreatment::All)) {
+        return Err(DodamError::UnsupportedSql(format!(
+            "unsupported function arguments: {}",
+            function.args
+        )));
+    }
     let argument = match args.as_slice() {
         [] => {
             return Err(DodamError::UnsupportedSql(format!(
@@ -4455,7 +4486,16 @@ fn parse_aggregate(
             )));
         }
     };
-    AggregateExpr::parse(&format!("{name}({argument})"))
+    if duplicate_treatment == Some(DuplicateTreatment::Distinct) {
+        if !name.eq_ignore_ascii_case("count") || argument == "*" {
+            return Err(DodamError::UnsupportedSql(format!(
+                "only count(DISTINCT column) is supported, got {function}"
+            )));
+        }
+        AggregateExpr::parse(&format!("count_distinct({argument})"))
+    } else {
+        AggregateExpr::parse(&format!("{name}({argument})"))
+    }
 }
 
 fn parse_aggregate_with_input_expression(
@@ -4535,11 +4575,9 @@ fn parse_join_aggregate(
         ));
     }
     let name = object_name_to_string(&function.name)?;
-    let args = match &function.args {
-        FunctionArguments::List(args)
-            if args.clauses.is_empty() && args.duplicate_treatment.is_none() =>
-        {
-            &args.args
+    let (args, duplicate_treatment) = match &function.args {
+        FunctionArguments::List(args) if args.clauses.is_empty() => {
+            (&args.args, args.duplicate_treatment)
         }
         _ => {
             return Err(DodamError::UnsupportedSql(format!(
@@ -4548,6 +4586,12 @@ fn parse_join_aggregate(
             )));
         }
     };
+    if matches!(duplicate_treatment, Some(DuplicateTreatment::All)) {
+        return Err(DodamError::UnsupportedSql(format!(
+            "unsupported function arguments: {}",
+            function.args
+        )));
+    }
     let argument = match args.as_slice() {
         [] => {
             return Err(DodamError::UnsupportedSql(format!(
@@ -4567,7 +4611,16 @@ fn parse_join_aggregate(
             )));
         }
     };
-    AggregateExpr::parse(&format!("{name}({argument})"))
+    if duplicate_treatment == Some(DuplicateTreatment::Distinct) {
+        if !name.eq_ignore_ascii_case("count") || argument == "*" {
+            return Err(DodamError::UnsupportedSql(format!(
+                "only count(DISTINCT column) is supported, got {function}"
+            )));
+        }
+        AggregateExpr::parse(&format!("count_distinct({argument})"))
+    } else {
+        AggregateExpr::parse(&format!("{name}({argument})"))
+    }
 }
 
 fn parse_join_aggregate_with_input_expression(

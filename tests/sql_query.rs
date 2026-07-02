@@ -797,6 +797,27 @@ async fn executes_grouped_aggregate_sql() {
 }
 
 #[tokio::test]
+async fn executes_count_distinct_grouped_aggregate_sql() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let path = tempdir.path().join("part-000.parquet");
+    write_test_parquet(&path);
+
+    let sql = format!(
+        "SELECT payload, count(DISTINCT id) AS distinct_ids FROM '{}' GROUP BY payload ORDER BY payload",
+        path.display()
+    );
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute count distinct grouped aggregate sql");
+
+    let QueryOutput::Aggregate { batches, .. } = output else {
+        panic!("expected aggregate output");
+    };
+    assert_eq!(strings_from_column(&batches, 0), vec!["a", "b", "c"]);
+    assert_eq!(u64s_from_column(&batches, 1), vec![3, 2, 1]);
+}
+
+#[tokio::test]
 async fn supports_table_alias_in_grouped_aggregate_sql() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let path = tempdir.path().join("part-000.parquet");

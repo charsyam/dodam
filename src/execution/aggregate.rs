@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 
 use arrow::array::{
@@ -951,6 +951,9 @@ fn typed_fast_inputs<'a>(
         .iter()
         .map(|aggregate| match aggregate {
             AggregateExpr::CountStar => Ok(FastAggregateInput::CountStar),
+            AggregateExpr::CountDistinct(_) => {
+                Err(DodamError::InvalidAggregate(aggregate.to_string()))
+            }
             AggregateExpr::Count(column) => {
                 let values = batch.column(column_index(batch, column)?);
                 Ok(FastAggregateInput::Count {
@@ -1480,6 +1483,10 @@ enum AggregateAccumulator {
         expr: AggregateExpr,
         count: u64,
     },
+    CountDistinct {
+        expr: AggregateExpr,
+        values: HashSet<GroupValue>,
+    },
     Sum {
         expr: AggregateExpr,
         state: NumericState,
@@ -1503,6 +1510,10 @@ impl AggregateAccumulator {
         match expr {
             AggregateExpr::CountStar => Self::CountStar { count: 0 },
             AggregateExpr::Count(_) => Self::Count { expr, count: 0 },
+            AggregateExpr::CountDistinct(_) => Self::CountDistinct {
+                expr,
+                values: HashSet::new(),
+            },
             AggregateExpr::Sum(_) => Self::Sum {
                 expr,
                 state: NumericState::default(),
@@ -1533,6 +1544,15 @@ impl AggregateAccumulator {
                 *count += (column.len() - column.null_count()) as u64;
                 Ok(())
             }
+            Self::CountDistinct { expr, values } => {
+                let column = aggregate_column(batch, expr)?;
+                for row in 0..column.len() {
+                    if let Some(value) = distinct_group_value(column, row)? {
+                        values.insert(value);
+                    }
+                }
+                Ok(())
+            }
             Self::Sum { expr, state } | Self::Avg { expr, state } => {
                 state.update(aggregate_column(batch, expr)?, expr)
             }
@@ -1552,6 +1572,14 @@ impl AggregateAccumulator {
                     column.ok_or_else(|| DodamError::InvalidAggregate(expr.to_string()))?;
                 if column.is_valid(row) {
                     *count += 1;
+                }
+                Ok(())
+            }
+            Self::CountDistinct { expr, values } => {
+                let column =
+                    column.ok_or_else(|| DodamError::InvalidAggregate(expr.to_string()))?;
+                if let Some(value) = distinct_group_value(column, row)? {
+                    values.insert(value);
                 }
                 Ok(())
             }
@@ -1582,6 +1610,10 @@ impl AggregateAccumulator {
             Self::Count { expr, count } => AggregateResult {
                 expr,
                 value: AggregateValue::Count(count),
+            },
+            Self::CountDistinct { expr, values } => AggregateResult {
+                expr,
+                value: AggregateValue::Count(values.len() as u64),
             },
             Self::Sum { expr, state } => AggregateResult {
                 expr,
@@ -2053,6 +2085,46 @@ fn aggregate_column<'a>(batch: &'a RecordBatch, expr: &AggregateExpr) -> Result<
     Ok(batch.column(column_index(batch, column)?))
 }
 
+fn distinct_group_value(column: &ArrayRef, row: usize) -> Result<Option<GroupValue>> {
+    if column.is_null(row) {
+        return Ok(None);
+    }
+    match column.data_type() {
+        DataType::Int32 => Ok(Some(GroupValue::Int64(Some(i64::from(
+            column
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("Int32 distinct input")
+                .value(row),
+        ))))),
+        DataType::Int64 => Ok(Some(GroupValue::Int64(Some(
+            column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 distinct input")
+                .value(row),
+        )))),
+        DataType::UInt64 => Ok(Some(GroupValue::UInt64(Some(
+            column
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("UInt64 distinct input")
+                .value(row),
+        )))),
+        DataType::Utf8 => Ok(Some(GroupValue::Utf8(Some(
+            column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("Utf8 distinct input")
+                .value(row)
+                .to_string(),
+        )))),
+        data_type => {
+            unsupported_aggregate_type(&AggregateExpr::CountDistinct("*".to_string()), data_type)
+        }
+    }
+}
+
 fn unsupported_aggregate_type<T>(expr: &AggregateExpr, data_type: &DataType) -> Result<T> {
     let column = expr.referenced_column().unwrap_or("*").to_string();
     Err(DodamError::UnsupportedAggregateType {
@@ -2064,7 +2136,9 @@ fn unsupported_aggregate_type<T>(expr: &AggregateExpr, data_type: &DataType) -> 
 
 fn aggregate_function_name(expr: &AggregateExpr) -> &'static str {
     match expr {
-        AggregateExpr::CountStar | AggregateExpr::Count(_) => "count",
+        AggregateExpr::CountStar | AggregateExpr::Count(_) | AggregateExpr::CountDistinct(_) => {
+            "count"
+        }
         AggregateExpr::Sum(_) => "sum",
         AggregateExpr::Avg(_) => "avg",
         AggregateExpr::Min(_) => "min",
