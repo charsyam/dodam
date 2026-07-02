@@ -119,7 +119,7 @@
 - Added a full TPC-H 22-query support inventory harness:
   - records the current parser/planner support status for each canonical TPC-H query
   - turns unsupported reasons into a regression-tested baseline
-  - current dominant blockers are `WITH`, `count(DISTINCT ...)`, scalar expressions over aggregate outputs, join equality extraction under `OR`, and richer nested/correlated subquery shapes
+  - current dominant blockers are `WITH`, `count(DISTINCT ...)`, join equality extraction under `OR`, and richer nested/correlated subquery shapes
 - Improved TPC-H Q1/Q6 coverage:
   - added aggregate input expressions such as `sum(l_extendedprice * l_discount)` by materializing deterministic temporary expression columns before aggregation
   - added constant folding for numeric literal arithmetic in predicates
@@ -168,6 +168,11 @@
   - compares Arrow arrays directly and keeps row-group/partition pruning conservative for these predicates
   - added SQL coverage for single-table and comma-join residual column comparisons
   - TPC-H inventory now advances Q12 to `needs-data:orders`
+- Added aggregate-output scalar projection for join aggregates:
+  - supports expressions such as `100.00 * sum(...) / sum(...)` by evaluating scalar expressions over the aggregate result batch
+  - reuses aggregate input expression materialization for nested `sum(l_extendedprice * (1 - l_discount))` and searched `CASE` inputs
+  - added scalar predicate `LIKE` support inside expression `CASE` evaluation for join aggregate inputs
+  - TPC-H inventory now advances Q14 to `needs-data:lineitem`
 - The TPC-H-lite suite caught missing `Date32` `min`/`max` aggregate support; added `Date32` aggregate state and `Date32Array` result materialization.
 - The TPC-H-lite join aggregate case caught an aggregate join output projection correctness issue around qualified column names when the cost model chooses the left side as the hash build input.
 - Fixed build-side-aware join output projection mapping for hash/materialized join output schemas and restored aggregate join output projection pushdown.

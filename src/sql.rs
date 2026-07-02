@@ -57,6 +57,7 @@ pub struct SqlQuery {
     distinct: bool,
     aggregates: Vec<AggregateExpr>,
     aggregate_expressions: Vec<ProjectionExpression>,
+    expressions: Vec<ProjectionExpression>,
     group_by: Vec<String>,
     aliases: Vec<(String, String)>,
 }
@@ -199,8 +200,14 @@ pub async fn execute_sql(
             };
             let mut batches = aggregate_metrics_to_batches(&metrics, &group_by, &aggregates)?;
             batches = apply_output_filter(batches, query.having.as_ref())?;
+            let has_output_expressions = projection_requires_expression_path(&query.expressions);
+            if has_output_expressions {
+                batches = apply_output_expression_projection(batches, &query.expressions)?;
+            }
             batches = apply_output_order_limit(batches, query.order_by.as_ref(), query.limit)?;
-            batches = rename_output_batches(batches, &query.aliases)?;
+            if !has_output_expressions {
+                batches = rename_output_batches(batches, &query.aliases)?;
+            }
             return Ok(QueryOutput::Aggregate { metrics, batches });
         }
         let mut batches = collect_batches(stream)?;
@@ -253,8 +260,14 @@ pub async fn execute_sql(
         };
         let mut batches = aggregate_metrics_to_batches(&metrics, &group_by, &aggregates)?;
         batches = apply_output_filter(batches, query.having.as_ref())?;
+        let has_output_expressions = projection_requires_expression_path(&query.expressions);
+        if has_output_expressions {
+            batches = apply_output_expression_projection(batches, &query.expressions)?;
+        }
         batches = apply_output_order_limit(batches, query.order_by.as_ref(), query.limit)?;
-        batches = rename_output_batches(batches, &query.aliases)?;
+        if !has_output_expressions {
+            batches = rename_output_batches(batches, &query.aliases)?;
+        }
         return Ok(QueryOutput::Aggregate { metrics, batches });
     }
 
@@ -1250,8 +1263,14 @@ async fn try_execute_derived_join_sql(
             .map(|expr| parse_join_filter(expr, &projection.aliases, &output_aliases, true))
             .transpose()?;
         batches = apply_output_filter(batches, having.as_ref())?;
+        let has_output_expressions = projection_requires_expression_path(&projection.expressions);
+        if has_output_expressions {
+            batches = apply_output_expression_projection(batches, &projection.expressions)?;
+        }
         batches = apply_output_order_limit(batches, order_by.as_ref(), limit)?;
-        batches = rename_output_batches(batches, &projection.aliases)?;
+        if !has_output_expressions {
+            batches = rename_output_batches(batches, &projection.aliases)?;
+        }
         return Ok(Some(QueryOutput::Aggregate { metrics, batches }));
     }
     batches = apply_output_projection(batches, &projection.projection)?;
@@ -1522,8 +1541,14 @@ async fn try_execute_multi_comma_join_sql(
         let mut batches =
             aggregate_metrics_to_batches(&metrics, &group_by, &projection.aggregates)?;
         batches = apply_output_filter(batches, having.as_ref())?;
+        let has_output_expressions = projection_requires_expression_path(&projection.expressions);
+        if has_output_expressions {
+            batches = apply_output_expression_projection(batches, &projection.expressions)?;
+        }
         batches = apply_output_order_limit(batches, order_by.as_ref(), limit)?;
-        batches = rename_output_batches(batches, &projection.aliases)?;
+        if !has_output_expressions {
+            batches = rename_output_batches(batches, &projection.aliases)?;
+        }
         return Ok(Some(QueryOutput::Aggregate { metrics, batches }));
     }
     batches = apply_output_projection(batches, &projection.projection)?;
@@ -2155,6 +2180,7 @@ fn parse_select(query: &Query, select: &Select) -> Result<SqlQuery> {
         distinct,
         aggregates: parsed_projection.aggregates,
         aggregate_expressions: parsed_projection.aggregate_expressions,
+        expressions: parsed_projection.expressions,
         group_by,
         aliases: parsed_projection.aliases,
     })
@@ -2216,6 +2242,7 @@ fn parse_comma_join_select(query: &Query, select: &Select) -> Result<SqlQuery> {
         distinct,
         aggregates: projection.aggregates,
         aggregate_expressions: projection.aggregate_expressions,
+        expressions: projection.expressions,
         group_by,
         aliases: projection.aliases,
     })
@@ -2279,6 +2306,7 @@ fn parse_join_select(query: &Query, select: &Select) -> Result<SqlQuery> {
         distinct,
         aggregates: projection.aggregates,
         aggregate_expressions: projection.aggregate_expressions,
+        expressions: projection.expressions,
         group_by,
         aliases: projection.aliases,
     })
@@ -2918,6 +2946,7 @@ fn parse_join_projection(
     let mut aggregate_expressions = Vec::new();
     let mut aggregate_expression_columns = Vec::new();
     let mut aliases = Vec::new();
+    let mut expressions = Vec::new();
     let mut wildcard = false;
 
     for item in &select.projection {
@@ -2941,6 +2970,31 @@ fn parse_join_projection(
                     aggregate_expressions.push(expression);
                 }
                 aggregates.push(aggregate);
+            }
+            SelectItem::UnnamedExpr(expr) => {
+                let mut expression_columns = Vec::new();
+                let mut found_aggregate = false;
+                let expression = ProjectionExpression {
+                    output_name: expr.to_string(),
+                    expr: parse_join_aggregate_output_expression(
+                        expr,
+                        table_aliases,
+                        &mut aggregates,
+                        &mut aggregate_expressions,
+                        &mut aggregate_expression_columns,
+                        &mut expression_columns,
+                        &mut found_aggregate,
+                    )?,
+                };
+                if !found_aggregate {
+                    return Err(DodamError::UnsupportedSql(format!(
+                        "unsupported JOIN SELECT item: {item}"
+                    )));
+                }
+                for column in expression_columns {
+                    add_column_once(&mut columns, column);
+                }
+                expressions.push(expression);
             }
             SelectItem::ExprWithAlias { expr, alias } => match expr {
                 SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
@@ -2966,9 +3020,30 @@ fn parse_join_projection(
                     aggregates.push(aggregate);
                 }
                 _ => {
-                    return Err(DodamError::UnsupportedSql(format!(
-                        "unsupported JOIN SELECT item: {item}"
-                    )));
+                    let mut expression_columns = Vec::new();
+                    let mut found_aggregate = false;
+                    let expression = ProjectionExpression {
+                        output_name: alias.value.clone(),
+                        expr: parse_join_aggregate_output_expression(
+                            expr,
+                            table_aliases,
+                            &mut aggregates,
+                            &mut aggregate_expressions,
+                            &mut aggregate_expression_columns,
+                            &mut expression_columns,
+                            &mut found_aggregate,
+                        )?,
+                    };
+                    if !found_aggregate {
+                        return Err(DodamError::UnsupportedSql(format!(
+                            "unsupported JOIN SELECT item: {item}"
+                        )));
+                    }
+                    for column in expression_columns {
+                        add_column_once(&mut columns, column);
+                    }
+                    aliases.push((alias.value.clone(), alias.value.clone()));
+                    expressions.push(expression);
                 }
             },
             SelectItem::QualifiedWildcard(_, _) => {
@@ -3018,7 +3093,7 @@ fn parse_join_projection(
             aggregates,
             aggregate_expressions,
             aliases,
-            expressions: Vec::new(),
+            expressions,
         });
     }
 
@@ -3031,7 +3106,7 @@ fn parse_join_projection(
         aggregates,
         aggregate_expressions,
         aliases,
-        expressions: Vec::new(),
+        expressions,
     })
 }
 
@@ -3780,6 +3855,99 @@ fn parse_join_scalar_sql_expression(
         }
         _ => Err(DodamError::UnsupportedSql(format!(
             "unsupported JOIN scalar expression: {expr}"
+        ))),
+    }
+}
+
+fn parse_join_aggregate_output_expression(
+    expr: &SqlExpr,
+    table_aliases: &[&str],
+    aggregates: &mut Vec<AggregateExpr>,
+    aggregate_expressions: &mut Vec<ProjectionExpression>,
+    aggregate_expression_columns: &mut Vec<String>,
+    expression_columns: &mut Vec<String>,
+    found_aggregate: &mut bool,
+) -> Result<ScalarSqlExpression> {
+    match expr {
+        SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
+            let column = join_column_name(expr, table_aliases)?;
+            add_column_once(expression_columns, column.clone());
+            Ok(ScalarSqlExpression::Column(column))
+        }
+        SqlExpr::Value(_) => Ok(ScalarSqlExpression::Literal(sql_literal_value(expr)?)),
+        SqlExpr::Nested(expr) => parse_join_aggregate_output_expression(
+            expr,
+            table_aliases,
+            aggregates,
+            aggregate_expressions,
+            aggregate_expression_columns,
+            expression_columns,
+            found_aggregate,
+        ),
+        SqlExpr::BinaryOp { left, op, right }
+            if matches!(
+                op,
+                BinaryOperator::Plus
+                    | BinaryOperator::Minus
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+            ) =>
+        {
+            Ok(ScalarSqlExpression::Binary {
+                left: Box::new(parse_join_aggregate_output_expression(
+                    left,
+                    table_aliases,
+                    aggregates,
+                    aggregate_expressions,
+                    aggregate_expression_columns,
+                    expression_columns,
+                    found_aggregate,
+                )?),
+                op: op.clone(),
+                right: Box::new(parse_join_aggregate_output_expression(
+                    right,
+                    table_aliases,
+                    aggregates,
+                    aggregate_expressions,
+                    aggregate_expression_columns,
+                    expression_columns,
+                    found_aggregate,
+                )?),
+            })
+        }
+        SqlExpr::Cast {
+            expr, data_type, ..
+        } => Ok(ScalarSqlExpression::Cast {
+            expr: Box::new(parse_join_aggregate_output_expression(
+                expr,
+                table_aliases,
+                aggregates,
+                aggregate_expressions,
+                aggregate_expression_columns,
+                expression_columns,
+                found_aggregate,
+            )?),
+            target: data_type.to_string(),
+        }),
+        SqlExpr::Function(function) => {
+            let (aggregate, expression) = parse_join_aggregate_with_input_expression(
+                function,
+                table_aliases,
+                aggregate_expressions.len(),
+            )?;
+            if let Some(expression) = expression {
+                for column in join_scalar_expression_columns(&expression.expr, table_aliases)? {
+                    add_column_once(aggregate_expression_columns, column);
+                }
+                aggregate_expressions.push(expression);
+            }
+            let column = aggregate.to_string();
+            aggregates.push(aggregate);
+            *found_aggregate = true;
+            Ok(ScalarSqlExpression::Column(column))
+        }
+        _ => Err(DodamError::UnsupportedSql(format!(
+            "unsupported JOIN aggregate output expression: {expr}"
         ))),
     }
 }
@@ -4886,7 +5054,11 @@ fn sql_column_name(expr: &SqlExpr, table_alias: Option<&str>) -> Result<String> 
                     qualifier.value
                 )));
             }
-            Ok(column.value.clone())
+            Ok(if table_alias.is_some() {
+                column.value.clone()
+            } else {
+                format!("{}.{}", qualifier.value, column.value)
+            })
         }
         _ => Err(DodamError::UnsupportedSql(format!(
             "expected column identifier, got {expr}"
@@ -5181,6 +5353,37 @@ fn evaluate_scalar_predicate(
             Ok(BooleanArray::from(evaluate_scalar_in_list(
                 value, &values, *negated,
             )?))
+        }
+        SqlExpr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => {
+            if *any {
+                return Err(DodamError::UnsupportedSql(
+                    "LIKE ANY is not supported".to_string(),
+                ));
+            }
+            let value = scalar_as_utf8(evaluate_scalar_expression(
+                batch,
+                &parse_scalar_sql_expression(expr, table_alias)?,
+            )?)?;
+            let pattern = sql_like_pattern(pattern)?;
+            let escape = sql_like_escape(escape_char)?;
+            let tokens = scalar_like_pattern_tokens(&pattern, escape)?;
+            Ok(BooleanArray::from(
+                value
+                    .into_iter()
+                    .map(|value| {
+                        value.map(|value| {
+                            let matched = scalar_like_matches(&value, &tokens);
+                            if *negated { !matched } else { matched }
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            ))
         }
         _ => Err(DodamError::UnsupportedSql(format!(
             "unsupported expression WHERE predicate: {predicate}"
@@ -5533,6 +5736,60 @@ fn evaluate_scalar_in_list(
         output.push(result);
     }
     Ok(output)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScalarLikeToken {
+    Any,
+    One,
+    Char(char),
+}
+
+fn scalar_like_pattern_tokens(pattern: &str, escape: Option<char>) -> Result<Vec<ScalarLikeToken>> {
+    let mut tokens = Vec::new();
+    let mut chars = pattern.chars();
+    while let Some(ch) = chars.next() {
+        if Some(ch) == escape {
+            let escaped = chars.next().ok_or_else(|| {
+                DodamError::InvalidFilter("LIKE ESCAPE at end of pattern".to_string())
+            })?;
+            tokens.push(ScalarLikeToken::Char(escaped));
+        } else {
+            tokens.push(match ch {
+                '%' => ScalarLikeToken::Any,
+                '_' => ScalarLikeToken::One,
+                ch => ScalarLikeToken::Char(ch),
+            });
+        }
+    }
+    Ok(tokens)
+}
+
+fn scalar_like_matches(value: &str, pattern: &[ScalarLikeToken]) -> bool {
+    fn matches_from(
+        value: &[char],
+        pattern: &[ScalarLikeToken],
+        value_index: usize,
+        pattern_index: usize,
+    ) -> bool {
+        if pattern_index == pattern.len() {
+            return value_index == value.len();
+        }
+        match pattern[pattern_index] {
+            ScalarLikeToken::Char(ch) => {
+                value.get(value_index).is_some_and(|value| *value == ch)
+                    && matches_from(value, pattern, value_index + 1, pattern_index + 1)
+            }
+            ScalarLikeToken::One => {
+                value_index < value.len()
+                    && matches_from(value, pattern, value_index + 1, pattern_index + 1)
+            }
+            ScalarLikeToken::Any => (value_index..=value.len())
+                .any(|index| matches_from(value, pattern, index, pattern_index + 1)),
+        }
+    }
+    let value = value.chars().collect::<Vec<_>>();
+    matches_from(&value, pattern, 0, 0)
 }
 
 fn substring_value(
