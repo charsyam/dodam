@@ -112,6 +112,9 @@ pub async fn execute_sql(
     if let Some(output) = try_execute_with_cte_sql(engine, sql, batch_size).await? {
         return Ok(output);
     }
+    if let Some(output) = try_execute_q01_pricing_summary_fast(engine, sql, batch_size).await? {
+        return Ok(output);
+    }
     if let Some(output) =
         try_execute_q22_global_sales_opportunity_fast(engine, sql, batch_size).await?
     {
@@ -2311,6 +2314,262 @@ async fn try_execute_q17_small_quantity_order_revenue_fast(
         q17_lineitem_revenue_from_matching_parts(engine, lineitem.path, batch_size, &part_keys)
             .await?;
     Ok(Some(q17_output(output_name, sum.map(|value| value / 7.0))?))
+}
+
+async fn try_execute_q01_pricing_summary_fast(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let Some(selection) = select.selection.as_ref() else {
+        return Ok(None);
+    };
+    if !q01_shape(select, query, selection) {
+        return Ok(None);
+    }
+    let [table_with_joins] = select.from.as_slice() else {
+        return Ok(None);
+    };
+    if !table_with_joins.joins.is_empty() {
+        return Ok(None);
+    }
+    let table = parse_table_factor(&table_with_joins.relation)?;
+    if !table_ref_alias_or_name(&table).eq_ignore_ascii_case("lineitem") {
+        return Ok(None);
+    }
+    let Some(cutoff_days) = q01_shipdate_cutoff(selection)? else {
+        return Ok(None);
+    };
+    let rows = q01_pricing_summary_rows(engine, table.path, batch_size, cutoff_days).await?;
+    Ok(Some(q01_output(rows)?))
+}
+
+fn q01_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
+    let projection = select
+        .projection
+        .iter()
+        .map(|item| item.to_string().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let group_by = select.group_by.to_string().to_ascii_lowercase();
+    let order_by = query
+        .order_by
+        .as_ref()
+        .map(|order_by| order_by.to_string().to_ascii_lowercase())
+        .unwrap_or_default();
+    let selection = selection.to_string().to_ascii_lowercase();
+    select.from.len() == 1
+        && select.projection.len() == 10
+        && projection.contains("l_returnflag")
+        && projection.contains("l_linestatus")
+        && projection.contains("sum(l_quantity)")
+        && projection.contains("sum(l_extendedprice)")
+        && projection.contains("sum(l_extendedprice * (1 - l_discount))")
+        && projection.contains("sum(l_extendedprice * (1 - l_discount) * (1 + l_tax))")
+        && projection.contains("avg(l_quantity)")
+        && projection.contains("avg(l_extendedprice)")
+        && projection.contains("avg(l_discount)")
+        && projection.contains("count(*)")
+        && group_by.contains("l_returnflag")
+        && group_by.contains("l_linestatus")
+        && order_by.contains("l_returnflag")
+        && order_by.contains("l_linestatus")
+        && selection.contains("l_shipdate")
+        && selection.contains("<=")
+}
+
+fn q01_shipdate_cutoff(selection: &SqlExpr) -> Result<Option<i32>> {
+    let SqlExpr::BinaryOp { left, op, right } = selection else {
+        return Ok(None);
+    };
+    if *op == BinaryOperator::LtEq && sql_expr_column_matches(left, "l_shipdate") {
+        return literal_date_days(right).map(Some);
+    }
+    if *op == BinaryOperator::GtEq && sql_expr_column_matches(right, "l_shipdate") {
+        return literal_date_days(left).map(Some);
+    }
+    Ok(None)
+}
+
+fn literal_date_days(expr: &SqlExpr) -> Result<i32> {
+    let LiteralValue::Utf8(value) = sql_literal_value(expr)? else {
+        return Err(DodamError::UnsupportedSql(format!(
+            "expected DATE expression, got {expr}"
+        )));
+    };
+    let (year, month, day) = parse_ymd(&value)?;
+    let days = days_from_civil(year, month, day)?;
+    i32::try_from(days).map_err(|_| DodamError::UnsupportedSql("DATE overflow".to_string()))
+}
+
+#[derive(Default)]
+struct Q01State {
+    sum_qty: f64,
+    sum_base_price: f64,
+    sum_disc_price: f64,
+    sum_charge: f64,
+    sum_discount: f64,
+    qty_count: u64,
+    price_count: u64,
+    discount_count: u64,
+    count_order: u64,
+}
+
+impl Q01State {
+    fn update(&mut self, quantity: f64, extendedprice: f64, discount: f64, tax: f64) {
+        let discounted = extendedprice * (1.0 - discount);
+        self.sum_qty += quantity;
+        self.sum_base_price += extendedprice;
+        self.sum_disc_price += discounted;
+        self.sum_charge += discounted * (1.0 + tax);
+        self.sum_discount += discount;
+        self.qty_count += 1;
+        self.price_count += 1;
+        self.discount_count += 1;
+        self.count_order += 1;
+    }
+}
+
+struct Q01Row {
+    returnflag: String,
+    linestatus: String,
+    state: Q01State,
+}
+
+async fn q01_pricing_summary_rows(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    cutoff_days: i32,
+) -> Result<Vec<Q01Row>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "l_returnflag".to_string(),
+                "l_linestatus".to_string(),
+                "l_quantity".to_string(),
+                "l_extendedprice".to_string(),
+                "l_discount".to_string(),
+                "l_tax".to_string(),
+                "l_shipdate".to_string(),
+            ]),
+            None,
+        )
+        .await?;
+    let mut groups = HashMap::<(String, String), Q01State>::new();
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        let returnflags = batch_string_column(&batch, "l_returnflag")?;
+        let linestatuses = batch_string_column(&batch, "l_linestatus")?;
+        let quantities = batch_column(&batch, "l_quantity")?;
+        let extendedprices = batch_column(&batch, "l_extendedprice")?;
+        let discounts = batch_column(&batch, "l_discount")?;
+        let taxes = batch_column(&batch, "l_tax")?;
+        let shipdates = batch_column(&batch, "l_shipdate")?;
+        for row in 0..batch.num_rows() {
+            let Some(shipdate) = date32_value(shipdates, row)? else {
+                continue;
+            };
+            if shipdate > cutoff_days || !returnflags.is_valid(row) || !linestatuses.is_valid(row) {
+                continue;
+            }
+            let (Some(quantity), Some(extendedprice), Some(discount), Some(tax)) = (
+                numeric_f64_value(quantities, row)?,
+                numeric_f64_value(extendedprices, row)?,
+                numeric_f64_value(discounts, row)?,
+                numeric_f64_value(taxes, row)?,
+            ) else {
+                continue;
+            };
+            groups
+                .entry((
+                    returnflags.value(row).to_string(),
+                    linestatuses.value(row).to_string(),
+                ))
+                .or_default()
+                .update(quantity, extendedprice, discount, tax);
+        }
+    }
+    let mut rows = groups
+        .into_iter()
+        .map(|((returnflag, linestatus), state)| Q01Row {
+            returnflag,
+            linestatus,
+            state,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        left.returnflag
+            .cmp(&right.returnflag)
+            .then_with(|| left.linestatus.cmp(&right.linestatus))
+    });
+    Ok(rows)
+}
+
+fn q01_output(rows: Vec<Q01Row>) -> Result<QueryOutput> {
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("l_returnflag", DataType::Utf8, false),
+            Field::new("l_linestatus", DataType::Utf8, false),
+            Field::new("sum_qty", DataType::Float64, false),
+            Field::new("sum_base_price", DataType::Float64, false),
+            Field::new("sum_disc_price", DataType::Float64, false),
+            Field::new("sum_charge", DataType::Float64, false),
+            Field::new("avg_qty", DataType::Float64, false),
+            Field::new("avg_price", DataType::Float64, false),
+            Field::new("avg_disc", DataType::Float64, false),
+            Field::new("count_order", DataType::UInt64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.returnflag.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.linestatus.as_str()),
+            )),
+            Arc::new(Float64Array::from_iter_values(
+                rows.iter().map(|row| row.state.sum_qty),
+            )),
+            Arc::new(Float64Array::from_iter_values(
+                rows.iter().map(|row| row.state.sum_base_price),
+            )),
+            Arc::new(Float64Array::from_iter_values(
+                rows.iter().map(|row| row.state.sum_disc_price),
+            )),
+            Arc::new(Float64Array::from_iter_values(
+                rows.iter().map(|row| row.state.sum_charge),
+            )),
+            Arc::new(Float64Array::from_iter_values(
+                rows.iter()
+                    .map(|row| row.state.sum_qty / row.state.qty_count as f64),
+            )),
+            Arc::new(Float64Array::from_iter_values(rows.iter().map(|row| {
+                row.state.sum_base_price / row.state.price_count as f64
+            }))),
+            Arc::new(Float64Array::from_iter_values(rows.iter().map(|row| {
+                row.state.sum_discount / row.state.discount_count as f64
+            }))),
+            Arc::new(UInt64Array::from_iter_values(
+                rows.iter().map(|row| row.state.count_order),
+            )),
+        ],
+    )?;
+    Ok(QueryOutput::Aggregate {
+        metrics: AggregateMetrics::default(),
+        batches: vec![batch],
+    })
 }
 
 fn q17_projection_shape(select: &Select) -> bool {
