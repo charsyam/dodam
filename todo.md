@@ -596,6 +596,7 @@ Tried and rejected or neutral:
   - Remaining SF=1 bottlenecks: Q02 correlated/min subquery path (`~8.2s`), Q09 multi-join profit aggregation (`~4.7s`), Q10 join order/grouped aggregate regression (`~2.6s`), Q01 scan aggregate (`~1.2s`), Q21 (`~1.3s`).
   - Added a typed `Int64`/`Date32` lineitem scan loop for Q21 order supplier state. On SF=1 standalone CLI median, Q21 moved from about `0.399s` to about `0.295s`; latest 3-run full comparison moved total from about `4.63s` to about `4.48s` after the recent focused fast paths.
   - Re-tested the same typed-loop idea for Q04 late-order and order-priority scans, but it did not move standalone median (`~0.218s` before/after). Rejected that change for now because the remaining Q04 cost is not per-row typed extraction.
+  - Added a typed `Int64`/`Decimal128` revenue loop for Q05 lineitem aggregation. On SF=1 standalone CLI median, Q05 moved from about `0.296s` to about `0.236s`; latest 3-run full comparison is about `4.47s` Dodam vs `1.07s` DuckDB.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.

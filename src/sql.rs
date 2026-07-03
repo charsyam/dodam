@@ -4845,6 +4845,17 @@ async fn q05_revenue_by_nation(
         let suppkeys = batch_column(&batch, "l_suppkey")?;
         let extendedprices = batch_column(&batch, "l_extendedprice")?;
         let discounts = batch_column(&batch, "l_discount")?;
+        if q05_update_revenue_decimal_batch(
+            orderkeys,
+            suppkeys,
+            extendedprices,
+            discounts,
+            order_customer_nations,
+            supplier_nations,
+            &mut groups,
+        )? {
+            continue;
+        }
         for row in 0..batch.num_rows() {
             let (Some(orderkey), Some(suppkey)) = (
                 numeric_i64_value(orderkeys, row)?,
@@ -4886,6 +4897,47 @@ async fn q05_revenue_by_nation(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     Ok(rows)
+}
+
+fn q05_update_revenue_decimal_batch(
+    orderkeys: &ArrayRef,
+    suppkeys: &ArrayRef,
+    extendedprices: &ArrayRef,
+    discounts: &ArrayRef,
+    order_customer_nations: &HashMap<i64, i64>,
+    supplier_nations: &HashMap<i64, i64>,
+    groups: &mut HashMap<i64, f64>,
+) -> Result<bool> {
+    let (Some(orderkeys), Some(suppkeys), Some(extendedprices), Some(discounts)) = (
+        orderkeys.as_any().downcast_ref::<Int64Array>(),
+        suppkeys.as_any().downcast_ref::<Int64Array>(),
+        q01_decimal_input(extendedprices)?,
+        q01_decimal_input(discounts)?,
+    ) else {
+        return Ok(false);
+    };
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row)
+            || suppkeys.is_null(row)
+            || extendedprices.is_null(row)
+            || discounts.is_null(row)
+        {
+            continue;
+        }
+        let orderkey = orderkeys.value(row);
+        let suppkey = suppkeys.value(row);
+        let (Some(customer_nation), Some(supplier_nation)) = (
+            order_customer_nations.get(&orderkey).copied(),
+            supplier_nations.get(&suppkey).copied(),
+        ) else {
+            continue;
+        };
+        if customer_nation == supplier_nation {
+            *groups.entry(customer_nation).or_insert(0.0) +=
+                extendedprices.value(row) * (1.0 - discounts.value(row));
+        }
+    }
+    Ok(true)
 }
 
 fn q05_output(rows: Vec<Q05Row>) -> Result<QueryOutput> {
