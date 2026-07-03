@@ -2825,10 +2825,6 @@ async fn try_execute_q10_returned_item_fast(
     let Some((start_days, end_days)) = date_range_bounds(&conjuncts, "o_orderdate")? else {
         return Ok(None);
     };
-    let customers = q10_customer_rows(engine, customer.path, batch_size).await?;
-    if customers.is_empty() {
-        return Ok(Some(q10_output(Vec::new())?));
-    }
     let nation_names = q10_nation_names(engine, nation.path, batch_size).await?;
     let order_customers =
         q10_order_customers(engine, orders.path, batch_size, start_days, end_days).await?;
@@ -2838,6 +2834,12 @@ async fn try_execute_q10_returned_item_fast(
     let revenue_by_customer =
         q10_returned_revenue_by_customer(engine, lineitem.path, batch_size, &order_customers)
             .await?;
+    if revenue_by_customer.is_empty() {
+        return Ok(Some(q10_output(Vec::new())?));
+    }
+    let revenue_customer_keys = revenue_by_customer.keys().copied().collect::<HashSet<_>>();
+    let customers =
+        q10_customer_rows(engine, customer.path, batch_size, &revenue_customer_keys).await?;
     let mut rows = revenue_by_customer
         .into_iter()
         .filter_map(|(custkey, revenue)| {
@@ -3006,6 +3008,7 @@ async fn q10_customer_rows(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
+    customer_keys: &HashSet<i64>,
 ) -> Result<HashMap<i64, Q10Customer>> {
     let mut stream = engine
         .scan_parquet_batches(
@@ -3035,8 +3038,13 @@ async fn q10_customer_rows(
         let phones = batch_string_column(&batch, "c_phone")?;
         let comments = batch_string_column(&batch, "c_comment")?;
         for row in 0..batch.num_rows() {
-            let (Some(custkey), Some(acctbal), Some(nationkey)) = (
-                numeric_i64_value(custkeys, row)?,
+            let Some(custkey) = numeric_i64_value(custkeys, row)? else {
+                continue;
+            };
+            if !customer_keys.contains(&custkey) {
+                continue;
+            }
+            let (Some(acctbal), Some(nationkey)) = (
                 numeric_f64_value(acctbals, row)?,
                 numeric_i64_value(nationkeys, row)?,
             ) else {
@@ -7478,31 +7486,20 @@ async fn q17_lineitem_revenue_from_matching_parts(
             None,
         )
         .await?;
-    let mut states = HashMap::<i64, (f64, u64)>::with_capacity(part_keys.len());
-    let mut candidate_rows = Vec::<(i64, f64, f64)>::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let partkey = batch_column(&batch, "l_partkey")?;
-        let quantity = batch_column(&batch, "l_quantity")?;
-        let extendedprice = batch_column(&batch, "l_extendedprice")?;
-        for row in 0..batch.num_rows() {
-            let Some(partkey) = numeric_i64_value(partkey, row)? else {
-                continue;
-            };
-            if !part_keys.contains(&partkey) {
-                continue;
-            }
-            let (Some(quantity), Some(extendedprice)) = (
-                numeric_f64_value(quantity, row)?,
-                numeric_f64_value(extendedprice, row)?,
-            ) else {
-                continue;
-            };
-            let state = states.entry(partkey).or_insert((0.0, 0));
-            state.0 += quantity;
-            state.1 += 1;
-            candidate_rows.push((partkey, quantity, extendedprice));
-        }
+    let part_key_count = part_keys.len();
+    let part_keys = Arc::new(part_keys.clone());
+    let (states, candidate_rows) = parallel_batch_fold(
+        &mut stream,
+        move |batch| q17_lineitem_revenue_batch(batch, &part_keys),
+        (
+            HashMap::<i64, (f64, u64)>::with_capacity(part_key_count),
+            Vec::<(i64, f64, f64)>::new(),
+        ),
+        q17_merge_lineitem_revenue_batch,
+        "Q17 lineitem revenue aggregate",
+    )?;
+    if candidate_rows.is_empty() {
+        return Ok(None);
     }
     let mut sum = 0.0;
     let mut count = 0_usize;
@@ -7516,6 +7513,85 @@ async fn q17_lineitem_revenue_from_matching_parts(
         }
     }
     Ok((count > 0).then_some(sum))
+}
+
+type Q17LineitemPartial = (HashMap<i64, (f64, u64)>, Vec<(i64, f64, f64)>);
+
+fn q17_lineitem_revenue_batch(
+    batch: RecordBatch,
+    part_keys: &HashSet<i64>,
+) -> Result<Q17LineitemPartial> {
+    let partkeys = batch_column(&batch, "l_partkey")?;
+    let quantities = batch_column(&batch, "l_quantity")?;
+    let extendedprices = batch_column(&batch, "l_extendedprice")?;
+    if let Some(partial) =
+        q17_lineitem_revenue_batch_typed(partkeys, quantities, extendedprices, part_keys)?
+    {
+        return Ok(partial);
+    }
+    let mut states = HashMap::<i64, (f64, u64)>::with_capacity(part_keys.len());
+    let mut candidate_rows = Vec::<(i64, f64, f64)>::new();
+    for row in 0..batch.num_rows() {
+        let Some(partkey) = numeric_i64_value(partkeys, row)? else {
+            continue;
+        };
+        if !part_keys.contains(&partkey) {
+            continue;
+        }
+        let (Some(quantity), Some(extendedprice)) = (
+            numeric_f64_value(quantities, row)?,
+            numeric_f64_value(extendedprices, row)?,
+        ) else {
+            continue;
+        };
+        let state = states.entry(partkey).or_insert((0.0, 0));
+        state.0 += quantity;
+        state.1 += 1;
+        candidate_rows.push((partkey, quantity, extendedprice));
+    }
+    Ok((states, candidate_rows))
+}
+
+fn q17_lineitem_revenue_batch_typed(
+    partkeys: &ArrayRef,
+    quantities: &ArrayRef,
+    extendedprices: &ArrayRef,
+    part_keys: &HashSet<i64>,
+) -> Result<Option<Q17LineitemPartial>> {
+    let (Some(partkeys), Some(quantities), Some(extendedprices)) = (
+        partkeys.as_any().downcast_ref::<Int64Array>(),
+        q01_decimal_input(quantities)?,
+        q01_decimal_input(extendedprices)?,
+    ) else {
+        return Ok(None);
+    };
+    let mut states = HashMap::<i64, (f64, u64)>::with_capacity(part_keys.len());
+    let mut candidate_rows = Vec::<(i64, f64, f64)>::new();
+    for row in 0..partkeys.len() {
+        if partkeys.is_null(row) || quantities.is_null(row) || extendedprices.is_null(row) {
+            continue;
+        }
+        let partkey = partkeys.value(row);
+        if !part_keys.contains(&partkey) {
+            continue;
+        }
+        let quantity = quantities.value(row);
+        let extendedprice = extendedprices.value(row);
+        let state = states.entry(partkey).or_insert((0.0, 0));
+        state.0 += quantity;
+        state.1 += 1;
+        candidate_rows.push((partkey, quantity, extendedprice));
+    }
+    Ok(Some((states, candidate_rows)))
+}
+
+fn q17_merge_lineitem_revenue_batch(output: &mut Q17LineitemPartial, batch: Q17LineitemPartial) {
+    for (partkey, (quantity_sum, quantity_count)) in batch.0 {
+        let state = output.0.entry(partkey).or_insert((0.0, 0));
+        state.0 += quantity_sum;
+        state.1 += quantity_count;
+    }
+    output.1.extend(batch.1);
 }
 
 fn q17_output(name: String, value: Option<f64>) -> Result<QueryOutput> {

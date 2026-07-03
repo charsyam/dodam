@@ -275,7 +275,7 @@ ORDER BY nation, o_year DESC
         },
         TpchQuery {
             name: "q10_returned_item",
-            expected_status: "needs-data:customer",
+            expected_status: "needs-data:nation",
             sql: r#"
 SELECT
     c_custkey,
