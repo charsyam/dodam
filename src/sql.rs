@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -12,6 +13,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_ord::sort::{SortColumn, SortOptions, lexsort_to_indices};
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take_record_batch;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use sqlparser::ast::{
     BinaryOperator, DateTimeField, Distinct, DuplicateTreatment, Expr as SqlExpr, FunctionArg,
     FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, LimitClause,
@@ -4810,7 +4812,12 @@ async fn collect_dense_right_counts(
     batch_size: usize,
 ) -> Result<Vec<u64>> {
     let count_column = strip_column_prefix(count_column, &join.right_alias);
-    let mut right_projection = vec![join.right_keys[0].clone(), count_column.clone()];
+    let count_column_required = count_column != join.right_keys[0]
+        && !parquet_column_is_non_nullable(&join.right.path, &count_column)?;
+    let mut right_projection = vec![join.right_keys[0].clone()];
+    if count_column_required {
+        add_column_once(&mut right_projection, count_column.clone());
+    }
     if let Some(filter) = &join.right_filter {
         for column in filter.referenced_columns() {
             add_column_once(
@@ -4832,7 +4839,11 @@ async fn collect_dense_right_counts(
     while let Some(batch) = right_stream.next() {
         let batch = batch?;
         let key_index = batch_column_index(&batch, &join.right_keys[0])?;
-        let count_index = batch_column_index(&batch, &count_column)?;
+        let count_index = if count_column_required {
+            Some(batch_column_index(&batch, &count_column)?)
+        } else {
+            None
+        };
         let Some(keys) = batch
             .column(key_index)
             .as_any()
@@ -4840,9 +4851,9 @@ async fn collect_dense_right_counts(
         else {
             return Ok(Vec::new());
         };
-        let values = batch.column(count_index);
+        let values = count_index.map(|index| batch.column(index));
         for row in 0..batch.num_rows() {
-            if keys.is_null(row) || values.is_null(row) {
+            if keys.is_null(row) || values.is_some_and(|values| values.is_null(row)) {
                 continue;
             }
             let key = keys.value(row);
@@ -4857,6 +4868,20 @@ async fn collect_dense_right_counts(
         }
     }
     Ok(dense_counts)
+}
+
+fn parquet_column_is_non_nullable(path: &PathBuf, column: &str) -> Result<bool> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let file = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    Ok(builder
+        .schema()
+        .fields()
+        .iter()
+        .find(|field| field.name() == column)
+        .is_some_and(|field| !field.is_nullable()))
 }
 
 async fn collect_left_count_distribution(

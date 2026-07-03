@@ -582,6 +582,7 @@ Tried and rejected or neutral:
     - Adding `UInt64, UInt64` stdout CSV hot paths and skipping a redundant pre-sort before `ORDER BY` reduced stdout overhead in some runs but did not produce a stable Q13 median improvement.
     - Re-testing a direct single-`Int64` left-join `count(right_col)` distribution path again did not beat the existing join/grouped-aggregate path; the extra scan/hash-map/distribution work outweighed avoided join materialization at SF=0.01.
     - Re-tested the inner-only direct left-join count aggregate with streaming scans and dense `Int64` vectors instead of `HashMap`; this removed some overhead but still stayed around the existing Q13 median (`~0.0185s`) because the outer distribution still had to consume the intermediate groups.
+    - Skipping the `count(col)` input column when Parquet schema marks it non-null is correctness-safe and slightly reduced Q13 standalone median from about `0.0183s` to about `0.0180s`; it is not enough to close the remaining DuckDB gap by itself.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.
