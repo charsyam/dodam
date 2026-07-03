@@ -4352,8 +4352,10 @@ fn q09_order_years_batch_into(batch: &RecordBatch, years: &mut Q09OrderYears) ->
             if orderkeys.is_null(row) || orderdates.is_null(row) {
                 continue;
             }
-            let (year, _, _) = civil_from_days(i64::from(orderdates.value(row)))?;
-            years.insert(orderkeys.value(row), year);
+            years.insert(
+                orderkeys.value(row),
+                year_from_days(i64::from(orderdates.value(row)))?,
+            );
         }
         return Ok(());
     }
@@ -4364,8 +4366,7 @@ fn q09_order_years_batch_into(batch: &RecordBatch, years: &mut Q09OrderYears) ->
         ) else {
             continue;
         };
-        let (year, _, _) = civil_from_days(i64::from(orderdate))?;
-        years.insert(orderkey, year);
+        years.insert(orderkey, year_from_days(i64::from(orderdate))?);
     }
     Ok(())
 }
@@ -7802,9 +7803,12 @@ fn q07_volume_batch(
         ) else {
             continue;
         };
-        let (year, _, _) = civil_from_days(i64::from(shipdate))?;
         *groups
-            .entry((supp_nation.clone(), cust_nation.clone(), year))
+            .entry((
+                supp_nation.clone(),
+                cust_nation.clone(),
+                year_from_days(i64::from(shipdate))?,
+            ))
             .or_insert(0.0) += extendedprice * (1.0 - discount);
     }
     Ok(groups)
@@ -8121,8 +8125,7 @@ fn q08_order_years_batch(
             && orderdate <= end_days
             && customer_nations.contains_key(&custkey)
         {
-            let (year, _, _) = civil_from_days(i64::from(orderdate))?;
-            orders.insert(orderkey, year);
+            orders.insert(orderkey, year_from_days(i64::from(orderdate))?);
         }
     }
     Ok(orders)
@@ -8153,8 +8156,7 @@ fn q08_order_years_batch_typed(
             && orderdate <= end_days
             && customer_nations.contains_key(&custkeys.value(row))
         {
-            let (year, _, _) = civil_from_days(i64::from(orderdate))?;
-            orders.insert(orderkeys.value(row), year);
+            orders.insert(orderkeys.value(row), year_from_days(i64::from(orderdate))?);
         }
     }
     Ok(Some(orders))
@@ -17789,6 +17791,19 @@ fn civil_from_days(days: i64) -> Result<(i32, u32, u32)> {
         u32::try_from(day)
             .map_err(|_| DodamError::UnsupportedSql("DATE arithmetic overflow".to_string()))?,
     ))
+}
+
+fn year_from_days(days: i64) -> Result<i32> {
+    let days = days + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let doe = days - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    i32::try_from(year + i64::from(month <= 2))
+        .map_err(|_| DodamError::UnsupportedSql("DATE arithmetic overflow".to_string()))
 }
 
 fn sql_comparison_op(op: &BinaryOperator) -> ComparisonOp {
