@@ -3476,7 +3476,7 @@ async fn q09_profit_rows(
             None,
         )
         .await?;
-    let mut groups = HashMap::<(String, i32), f64>::new();
+    let mut groups = HashMap::<(i64, i32), f64>::new();
     while let Some(batch) = stream.next() {
         let batch = batch?;
         let orderkeys = batch_column(&batch, "l_orderkey")?;
@@ -3485,6 +3485,21 @@ async fn q09_profit_rows(
         let quantities = batch_column(&batch, "l_quantity")?;
         let extendedprices = batch_column(&batch, "l_extendedprice")?;
         let discounts = batch_column(&batch, "l_discount")?;
+        if q09_update_profit_decimal_batch(
+            orderkeys,
+            partkeys,
+            suppkeys,
+            quantities,
+            extendedprices,
+            discounts,
+            part_keys,
+            supplier_nations,
+            order_years,
+            supply_costs,
+            &mut groups,
+        )? {
+            continue;
+        }
         for row in 0..batch.num_rows() {
             let (Some(orderkey), Some(partkey), Some(suppkey)) = (
                 numeric_i64_value(orderkeys, row)?,
@@ -3503,9 +3518,6 @@ async fn q09_profit_rows(
             ) else {
                 continue;
             };
-            let Some(nation) = nation_names.get(&nationkey) else {
-                continue;
-            };
             let (Some(quantity), Some(extendedprice), Some(discount)) = (
                 numeric_f64_value(quantities, row)?,
                 numeric_f64_value(extendedprices, row)?,
@@ -3514,15 +3526,17 @@ async fn q09_profit_rows(
                 continue;
             };
             let amount = extendedprice * (1.0 - discount) - supplycost * quantity;
-            *groups.entry((nation.clone(), o_year)).or_insert(0.0) += amount;
+            *groups.entry((nationkey, o_year)).or_insert(0.0) += amount;
         }
     }
     let mut rows = groups
         .into_iter()
-        .map(|((nation, o_year), sum_profit)| Q09Row {
-            nation,
-            o_year,
-            sum_profit,
+        .filter_map(|((nationkey, o_year), sum_profit)| {
+            nation_names.get(&nationkey).map(|nation| Q09Row {
+                nation: nation.clone(),
+                o_year,
+                sum_profit,
+            })
         })
         .collect::<Vec<_>>();
     rows.sort_by(|left, right| {
@@ -3531,6 +3545,68 @@ async fn q09_profit_rows(
             .then_with(|| right.o_year.cmp(&left.o_year))
     });
     Ok(rows)
+}
+
+fn q09_update_profit_decimal_batch(
+    orderkeys: &ArrayRef,
+    partkeys: &ArrayRef,
+    suppkeys: &ArrayRef,
+    quantities: &ArrayRef,
+    extendedprices: &ArrayRef,
+    discounts: &ArrayRef,
+    part_keys: &HashSet<i64>,
+    supplier_nations: &HashMap<i64, i64>,
+    order_years: &HashMap<i64, i32>,
+    supply_costs: &HashMap<(i64, i64), f64>,
+    groups: &mut HashMap<(i64, i32), f64>,
+) -> Result<bool> {
+    let (
+        Some(orderkeys),
+        Some(partkeys),
+        Some(suppkeys),
+        Some(quantities),
+        Some(extendedprices),
+        Some(discounts),
+    ) = (
+        orderkeys.as_any().downcast_ref::<Int64Array>(),
+        partkeys.as_any().downcast_ref::<Int64Array>(),
+        suppkeys.as_any().downcast_ref::<Int64Array>(),
+        q01_decimal_input(quantities)?,
+        q01_decimal_input(extendedprices)?,
+        q01_decimal_input(discounts)?,
+    )
+    else {
+        return Ok(false);
+    };
+
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row)
+            || partkeys.is_null(row)
+            || suppkeys.is_null(row)
+            || quantities.is_null(row)
+            || extendedprices.is_null(row)
+            || discounts.is_null(row)
+        {
+            continue;
+        }
+        let partkey = partkeys.value(row);
+        if !part_keys.contains(&partkey) {
+            continue;
+        }
+        let orderkey = orderkeys.value(row);
+        let suppkey = suppkeys.value(row);
+        let (Some(o_year), Some(nationkey), Some(supplycost)) = (
+            order_years.get(&orderkey).copied(),
+            supplier_nations.get(&suppkey).copied(),
+            supply_costs.get(&(partkey, suppkey)).copied(),
+        ) else {
+            continue;
+        };
+        let amount = extendedprices.value(row) * (1.0 - discounts.value(row))
+            - supplycost * quantities.value(row);
+        *groups.entry((nationkey, o_year)).or_insert(0.0) += amount;
+    }
+    Ok(true)
 }
 
 fn q09_output(rows: Vec<Q09Row>) -> Result<QueryOutput> {
