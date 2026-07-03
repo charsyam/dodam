@@ -325,6 +325,62 @@ impl DenseI64F64Sum {
     }
 }
 
+struct DenseI64I32Map {
+    dense: Vec<i32>,
+    missing: i32,
+    fallback: Option<AdaptiveI64Map<i32>>,
+}
+
+impl DenseI64I32Map {
+    fn new(missing: i32) -> Self {
+        Self {
+            dense: Vec::new(),
+            missing,
+            fallback: None,
+        }
+    }
+
+    fn get(&self, key: i64) -> Option<i32> {
+        if let Some(fallback) = self.fallback.as_ref() {
+            return fallback.get(key);
+        }
+        let index = usize::try_from(key).ok()?;
+        self.dense
+            .get(index)
+            .copied()
+            .filter(|value| *value != self.missing)
+    }
+
+    fn reserve_dense_to(&mut self, max_key: usize) {
+        if self.fallback.is_none() && max_key >= self.dense.len() {
+            self.dense.resize(max_key + 1, self.missing);
+        }
+    }
+
+    fn insert_dense_index(&mut self, index: usize, value: i32) {
+        debug_assert!(self.fallback.is_none());
+        self.dense[index] = value;
+    }
+
+    fn fallback_mut(&mut self) -> Option<&mut AdaptiveI64Map<i32>> {
+        self.fallback.as_mut()
+    }
+
+    fn convert_to_fallback(&mut self) {
+        if self.fallback.is_some() {
+            return;
+        }
+        let mut fallback = AdaptiveI64Map::<i32>::new_dense();
+        for (key, value) in self.dense.iter().copied().enumerate() {
+            if value != self.missing {
+                fallback.insert(key as i64, value);
+            }
+        }
+        self.dense.clear();
+        self.fallback = Some(fallback);
+    }
+}
+
 fn try_for_each_i64_date32_str<Visit>(
     int_values: &ArrayRef,
     date_values: &ArrayRef,
@@ -4507,7 +4563,7 @@ async fn q09_order_years(
             None,
         )
         .await?;
-    let mut years = Q09OrderYears::new_dense();
+    let mut years = Q09OrderYears::new(0);
     while let Some(batch) = stream.next() {
         let batch = batch?;
         q09_order_years_batch_into(&batch, &mut years)?;
@@ -4515,26 +4571,55 @@ async fn q09_order_years(
     Ok(years)
 }
 
-type Q09OrderYears = AdaptiveI64Map<i32>;
+type Q09OrderYears = DenseI64I32Map;
 
 fn q09_order_years_batch_into(batch: &RecordBatch, years: &mut Q09OrderYears) -> Result<()> {
+    if let Some(fallback) = years.fallback_mut() {
+        return q09_order_years_batch_into_fallback(batch, fallback);
+    }
     let orderkeys = batch_column(batch, "o_orderkey")?;
     let orderdates = batch_column(batch, "o_orderdate")?;
     if let (Some(orderkeys), Some(orderdates)) = (
         orderkeys.as_any().downcast_ref::<Int64Array>(),
         orderdates.as_any().downcast_ref::<Date32Array>(),
     ) {
+        let mut max_orderkey = None::<usize>;
         for row in 0..orderkeys.len() {
             if orderkeys.is_null(row) || orderdates.is_null(row) {
                 continue;
             }
-            years.insert(
-                orderkeys.value(row),
-                year_from_days(i64::from(orderdates.value(row)))?,
-            );
+            let Some(orderkey) =
+                adaptive_dense_index(orderkeys.value(row), DEFAULT_MAX_DENSE_I64_KEY)
+            else {
+                years.convert_to_fallback();
+                let fallback = years.fallback_mut().expect("converted q09 fallback");
+                return q09_order_years_batch_into_fallback(batch, fallback);
+            };
+            max_orderkey = Some(max_orderkey.map_or(orderkey, |max| max.max(orderkey)));
+        }
+        if let Some(max_orderkey) = max_orderkey {
+            years.reserve_dense_to(max_orderkey);
+        }
+        for row in 0..orderkeys.len() {
+            if orderkeys.is_null(row) || orderdates.is_null(row) {
+                continue;
+            }
+            let orderkey = usize::try_from(orderkeys.value(row)).expect("validated q09 orderkey");
+            years.insert_dense_index(orderkey, year_from_days(i64::from(orderdates.value(row)))?);
         }
         return Ok(());
     }
+    years.convert_to_fallback();
+    let fallback = years.fallback_mut().expect("converted q09 fallback");
+    q09_order_years_batch_into_fallback(batch, fallback)
+}
+
+fn q09_order_years_batch_into_fallback(
+    batch: &RecordBatch,
+    years: &mut AdaptiveI64Map<i32>,
+) -> Result<()> {
+    let orderkeys = batch_column(batch, "o_orderkey")?;
+    let orderdates = batch_column(batch, "o_orderdate")?;
     for row in 0..orderkeys.len() {
         let (Some(orderkey), Some(orderdate)) = (
             numeric_i64_value(orderkeys, row)?,
@@ -10176,14 +10261,14 @@ async fn try_execute_q21_suppliers_who_kept_orders_waiting_fast(
     let stage = tpch_profile_start();
     let mut counts = HashMap::<i64, u64>::with_capacity(suppliers.len());
     for state in order_states.into_values() {
-        if !state.has_multiple_suppliers || !state.has_single_late_supplier() {
+        if !state.has_multiple_suppliers() || !state.has_single_late_supplier() {
             continue;
         }
         let suppkey = state.late_supplier;
         if !suppliers.contains_key(&suppkey) {
             continue;
         }
-        *counts.entry(suppkey).or_insert(0) += state.late_row_count;
+        *counts.entry(suppkey).or_insert(0) += u64::from(state.late_row_count);
     }
     let mut rows = counts
         .into_iter()
@@ -10338,64 +10423,84 @@ fn q21_final_orders_batch_into(batch: &RecordBatch, keys: &mut Q21FinalOrders) -
 #[derive(Default)]
 struct Q21OrderState {
     first_supplier: i64,
-    has_supplier: bool,
-    has_multiple_suppliers: bool,
     late_supplier: i64,
-    has_late_supplier: bool,
-    has_multiple_late_suppliers: bool,
-    late_row_count: u64,
+    late_row_count: u32,
+    flags: u8,
 }
 
 impl Q21OrderState {
+    const HAS_SUPPLIER: u8 = 1 << 0;
+    const HAS_MULTIPLE_SUPPLIERS: u8 = 1 << 1;
+    const HAS_LATE_SUPPLIER: u8 = 1 << 2;
+    const HAS_MULTIPLE_LATE_SUPPLIERS: u8 = 1 << 3;
+
+    fn has_supplier(&self) -> bool {
+        self.flags & Self::HAS_SUPPLIER != 0
+    }
+
+    fn has_multiple_suppliers(&self) -> bool {
+        self.flags & Self::HAS_MULTIPLE_SUPPLIERS != 0
+    }
+
+    fn has_late_supplier(&self) -> bool {
+        self.flags & Self::HAS_LATE_SUPPLIER != 0
+    }
+
+    fn has_multiple_late_suppliers(&self) -> bool {
+        self.flags & Self::HAS_MULTIPLE_LATE_SUPPLIERS != 0
+    }
+
     fn add_supplier(&mut self, suppkey: i64) {
-        if !self.has_supplier {
+        if !self.has_supplier() {
             self.first_supplier = suppkey;
-            self.has_supplier = true;
+            self.flags |= Self::HAS_SUPPLIER;
         } else if suppkey != self.first_supplier {
-            self.has_multiple_suppliers = true;
+            self.flags |= Self::HAS_MULTIPLE_SUPPLIERS;
         }
     }
 
     fn add_late_supplier(&mut self, suppkey: i64) {
-        if !self.has_late_supplier {
+        if !self.has_late_supplier() {
             self.late_supplier = suppkey;
-            self.has_late_supplier = true;
+            self.flags |= Self::HAS_LATE_SUPPLIER;
             self.late_row_count = 1;
         } else if suppkey == self.late_supplier {
             self.late_row_count += 1;
         } else {
-            self.has_multiple_late_suppliers = true;
+            self.flags |= Self::HAS_MULTIPLE_LATE_SUPPLIERS;
         }
     }
 
     fn has_single_late_supplier(&self) -> bool {
-        self.has_late_supplier && !self.has_multiple_late_suppliers
+        self.has_late_supplier() && !self.has_multiple_late_suppliers()
     }
 
     fn merge(&mut self, other: Q21OrderState) {
-        if other.has_supplier {
+        if other.has_supplier() {
             self.add_supplier(other.first_supplier);
-            if other.has_multiple_suppliers {
-                self.has_multiple_suppliers = true;
+            if other.has_multiple_suppliers() {
+                self.flags |= Self::HAS_MULTIPLE_SUPPLIERS;
             }
         }
-        if !other.has_late_supplier {
+        if !other.has_late_supplier() {
             return;
         }
-        if !self.has_late_supplier {
+        if !self.has_late_supplier() {
             self.late_supplier = other.late_supplier;
-            self.has_late_supplier = true;
+            self.flags |= Self::HAS_LATE_SUPPLIER;
             self.late_row_count = other.late_row_count;
-            self.has_multiple_late_suppliers = other.has_multiple_late_suppliers;
+            if other.has_multiple_late_suppliers() {
+                self.flags |= Self::HAS_MULTIPLE_LATE_SUPPLIERS;
+            }
             return;
         }
         if self.late_supplier == other.late_supplier {
             self.late_row_count += other.late_row_count;
         } else {
-            self.has_multiple_late_suppliers = true;
+            self.flags |= Self::HAS_MULTIPLE_LATE_SUPPLIERS;
         }
-        if other.has_multiple_late_suppliers {
-            self.has_multiple_late_suppliers = true;
+        if other.has_multiple_late_suppliers() {
+            self.flags |= Self::HAS_MULTIPLE_LATE_SUPPLIERS;
         }
     }
 }
