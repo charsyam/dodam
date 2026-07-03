@@ -162,6 +162,13 @@ where
         }
     }
 
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Dense { len, .. } => *len == 0,
+            Self::Hash(values) => values.is_empty(),
+        }
+    }
+
     fn insert(&mut self, key: i64, value: V) {
         match self {
             Self::Dense {
@@ -2999,9 +3006,16 @@ async fn q01_pricing_summary_rows(
             None,
         )
         .await?;
-    let groups = parallel_batch_fold(
+    let groups = parallel_batch_fold_chunks(
         &mut stream,
-        move |batch| q01_pricing_summary_batch(batch, cutoff_days),
+        4,
+        move |batches| {
+            let mut rows = Vec::<Q01Row>::with_capacity(4);
+            for batch in batches {
+                q01_merge_rows(&mut rows, q01_pricing_summary_batch(batch, cutoff_days)?);
+            }
+            Ok(rows)
+        },
         Vec::<Q01Row>::with_capacity(4),
         |groups, rows| q01_merge_rows(groups, rows),
         "Q01 aggregate",
@@ -3098,6 +3112,66 @@ where
             .unwrap_or_default();
         eprintln!(
             "[dodam:tpch-profile] {label}: total={:.3} ms worker_wait_merge={:.3} ms batches={pending_batches}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            merge_ms
+        );
+    }
+    Ok(output)
+}
+
+fn parallel_batch_fold_chunks<Partial, Output, Map, Merge>(
+    stream: &mut SendableBatchStream,
+    chunk_size: usize,
+    map: Map,
+    mut output: Output,
+    mut merge: Merge,
+    label: &str,
+) -> Result<Output>
+where
+    Partial: Send + 'static,
+    Map: Fn(Vec<RecordBatch>) -> Result<Partial> + Send + Sync + Clone + 'static,
+    Merge: FnMut(&mut Output, Partial),
+{
+    let profile = tpch_profile_enabled();
+    let started = profile.then(Instant::now);
+    let (sender, receiver) = mpsc::channel();
+    let mut pending_chunks = 0_usize;
+    let mut chunk = Vec::with_capacity(chunk_size.max(1));
+    while let Some(batch) = stream.next() {
+        chunk.push(batch?);
+        if chunk.len() < chunk_size.max(1) {
+            continue;
+        }
+        let sender = sender.clone();
+        let map = map.clone();
+        let task_chunk = std::mem::replace(&mut chunk, Vec::with_capacity(chunk_size.max(1)));
+        pending_chunks += 1;
+        rayon::spawn(move || {
+            let _ = sender.send(map(task_chunk));
+        });
+    }
+    if !chunk.is_empty() {
+        let sender = sender.clone();
+        let map = map.clone();
+        pending_chunks += 1;
+        rayon::spawn(move || {
+            let _ = sender.send(map(chunk));
+        });
+    }
+    drop(sender);
+    let merge_started = profile.then(Instant::now);
+    for _ in 0..pending_chunks {
+        let partial = receiver
+            .recv()
+            .map_err(|_| DodamError::UnsupportedSql(format!("{label} worker stopped")))??;
+        merge(&mut output, partial);
+    }
+    if let Some(started) = started {
+        let merge_ms = merge_started
+            .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or_default();
+        eprintln!(
+            "[dodam:tpch-profile] {label}: total={:.3} ms worker_wait_merge={:.3} ms chunks={pending_chunks}",
             started.elapsed().as_secs_f64() * 1000.0,
             merge_ms
         );
@@ -8221,17 +8295,28 @@ async fn q06_revenue_sum(
             None,
         )
         .await?;
-    parallel_batch_fold(
+    parallel_batch_fold_chunks(
         &mut stream,
-        move |batch| {
-            q06_revenue_sum_batch(
-                batch,
-                start_days,
-                end_days,
-                discount_low,
-                discount_high,
-                quantity_limit,
-            )
+        4,
+        move |batches| {
+            let mut sum = 0.0;
+            let mut count = 0_u64;
+            for batch in batches {
+                let Some((batch_sum, batch_count)) = q06_revenue_sum_batch(
+                    batch,
+                    start_days,
+                    end_days,
+                    discount_low,
+                    discount_high,
+                    quantity_limit,
+                )?
+                else {
+                    return Ok(None);
+                };
+                sum += batch_sum;
+                count += batch_count;
+            }
+            Ok(Some((sum, count)))
         },
         Some((0.0, 0_u64)),
         |total, batch| {
@@ -10629,7 +10714,7 @@ async fn q19_matching_part_masks(
     path: PathBuf,
     batch_size: usize,
     rules: &[Q19Rule],
-) -> Result<HashMap<i64, u8>> {
+) -> Result<AdaptiveI64Map<u8>> {
     let mut stream = engine
         .scan_parquet_batches(
             path,
@@ -10644,7 +10729,7 @@ async fn q19_matching_part_masks(
             None,
         )
         .await?;
-    let mut masks = HashMap::<i64, u8>::new();
+    let mut masks = AdaptiveI64Map::<u8>::new_dense();
     while let Some(batch) = stream.next() {
         let batch = batch?;
         let partkeys = batch_column(&batch, "p_partkey")?;
@@ -10684,7 +10769,7 @@ async fn q19_lineitem_revenue(
     path: PathBuf,
     batch_size: usize,
     rules: Arc<Vec<Q19Rule>>,
-    part_masks: Arc<HashMap<i64, u8>>,
+    part_masks: Arc<AdaptiveI64Map<u8>>,
 ) -> Result<(f64, u64)> {
     let mut stream = engine
         .scan_parquet_batches(
@@ -10702,9 +10787,20 @@ async fn q19_lineitem_revenue(
             None,
         )
         .await?;
-    parallel_batch_fold(
+    parallel_batch_fold_chunks(
         &mut stream,
-        move |batch| q19_lineitem_revenue_batch(batch, &rules, &part_masks),
+        4,
+        move |batches| {
+            let mut sum = 0.0;
+            let mut count = 0_u64;
+            for batch in batches {
+                let (batch_sum, batch_count) =
+                    q19_lineitem_revenue_batch(batch, &rules, &part_masks)?;
+                sum += batch_sum;
+                count += batch_count;
+            }
+            Ok((sum, count))
+        },
         (0.0, 0_u64),
         |total, batch| {
             total.0 += batch.0;
@@ -10717,7 +10813,7 @@ async fn q19_lineitem_revenue(
 fn q19_lineitem_revenue_batch(
     batch: RecordBatch,
     rules: &[Q19Rule],
-    part_masks: &HashMap<i64, u8>,
+    part_masks: &AdaptiveI64Map<u8>,
 ) -> Result<(f64, u64)> {
     let partkeys = batch_column(&batch, "l_partkey")?;
     let quantities = batch_column(&batch, "l_quantity")?;
@@ -10743,7 +10839,7 @@ fn q19_lineitem_revenue_batch(
             {
                 continue;
             }
-            let Some(mask) = part_masks.get(&partkeys.value(row)).copied() else {
+            let Some(mask) = part_masks.get(partkeys.value(row)) else {
                 continue;
             };
             let quantity = quantities.value(row);
@@ -10773,7 +10869,7 @@ fn q19_lineitem_revenue_batch(
         ) else {
             continue;
         };
-        let Some(mask) = part_masks.get(&partkey).copied() else {
+        let Some(mask) = part_masks.get(partkey) else {
             continue;
         };
         if q19_rule_matches_lineitem(
