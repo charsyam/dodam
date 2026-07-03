@@ -8812,6 +8812,33 @@ impl Q21OrderState {
     fn has_single_late_supplier(&self) -> bool {
         self.has_late_supplier && !self.has_multiple_late_suppliers
     }
+
+    fn merge(&mut self, other: Q21OrderState) {
+        if other.has_supplier {
+            self.add_supplier(other.first_supplier);
+            if other.has_multiple_suppliers {
+                self.has_multiple_suppliers = true;
+            }
+        }
+        if !other.has_late_supplier {
+            return;
+        }
+        if !self.has_late_supplier {
+            self.late_supplier = other.late_supplier;
+            self.has_late_supplier = true;
+            self.late_row_count = other.late_row_count;
+            self.has_multiple_late_suppliers = other.has_multiple_late_suppliers;
+            return;
+        }
+        if self.late_supplier == other.late_supplier {
+            self.late_row_count += other.late_row_count;
+        } else {
+            self.has_multiple_late_suppliers = true;
+        }
+        if other.has_multiple_late_suppliers {
+            self.has_multiple_late_suppliers = true;
+        }
+    }
 }
 
 async fn q21_lineitem_order_states(
@@ -8834,64 +8861,70 @@ async fn q21_lineitem_order_states(
             None,
         )
         .await?;
-    let mut states = HashMap::<i64, Q21OrderState>::with_capacity(final_orders.len());
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let orderkeys = batch_column(&batch, "l_orderkey")?;
-        let suppkeys = batch_column(&batch, "l_suppkey")?;
-        let receipt = batch_column(&batch, "l_receiptdate")?;
-        let commit = batch_column(&batch, "l_commitdate")?;
-        if q21_update_lineitem_states_typed(
-            orderkeys,
-            suppkeys,
-            receipt,
-            commit,
-            final_orders,
-            &mut states,
-        ) {
+    let output_capacity = final_orders.len();
+    let final_orders = Arc::new(final_orders.clone());
+    parallel_batch_fold(
+        &mut stream,
+        move |batch| q21_lineitem_order_states_batch(batch, &final_orders),
+        HashMap::<i64, Q21OrderState>::with_capacity(output_capacity),
+        q21_merge_order_states,
+        "Q21 lineitem order states",
+    )
+}
+
+fn q21_lineitem_order_states_batch(
+    batch: RecordBatch,
+    final_orders: &HashSet<i64>,
+) -> Result<HashMap<i64, Q21OrderState>> {
+    let orderkeys = batch_column(&batch, "l_orderkey")?;
+    let suppkeys = batch_column(&batch, "l_suppkey")?;
+    let receipt = batch_column(&batch, "l_receiptdate")?;
+    let commit = batch_column(&batch, "l_commitdate")?;
+    if let Some(states) =
+        q21_lineitem_order_states_typed(orderkeys, suppkeys, receipt, commit, final_orders)
+    {
+        return Ok(states);
+    }
+    let mut states = HashMap::<i64, Q21OrderState>::new();
+    for row in 0..batch.num_rows() {
+        let (Some(orderkey), Some(suppkey)) = (
+            numeric_i64_value(orderkeys, row)?,
+            numeric_i64_value(suppkeys, row)?,
+        ) else {
+            continue;
+        };
+        if !final_orders.contains(&orderkey) {
             continue;
         }
-        for row in 0..batch.num_rows() {
-            let (Some(orderkey), Some(suppkey)) = (
-                numeric_i64_value(orderkeys, row)?,
-                numeric_i64_value(suppkeys, row)?,
-            ) else {
-                continue;
-            };
-            if !final_orders.contains(&orderkey) {
-                continue;
-            }
-            let state = states.entry(orderkey).or_default();
-            state.add_supplier(suppkey);
-            let (Some(receipt), Some(commit)) =
-                (date32_value(receipt, row)?, date32_value(commit, row)?)
-            else {
-                continue;
-            };
-            if receipt > commit {
-                state.add_late_supplier(suppkey);
-            }
+        let state = states.entry(orderkey).or_default();
+        state.add_supplier(suppkey);
+        let (Some(receipt), Some(commit)) = (date32_value(receipt, row)?, date32_value(commit, row)?)
+        else {
+            continue;
+        };
+        if receipt > commit {
+            state.add_late_supplier(suppkey);
         }
     }
     Ok(states)
 }
 
-fn q21_update_lineitem_states_typed(
+fn q21_lineitem_order_states_typed(
     orderkeys: &ArrayRef,
     suppkeys: &ArrayRef,
     receipt: &ArrayRef,
     commit: &ArrayRef,
     final_orders: &HashSet<i64>,
-    states: &mut HashMap<i64, Q21OrderState>,
-) -> bool {
+) -> Option<HashMap<i64, Q21OrderState>> {
     let (Some(orderkeys), Some(suppkeys), Some(receipt), Some(commit)) = (
         orderkeys.as_any().downcast_ref::<Int64Array>(),
         suppkeys.as_any().downcast_ref::<Int64Array>(),
         receipt.as_any().downcast_ref::<Date32Array>(),
         commit.as_any().downcast_ref::<Date32Array>(),
     ) else {
-        return false;
+        return None;
     };
+    let mut states = HashMap::<i64, Q21OrderState>::new();
     for row in 0..orderkeys.len() {
         if orderkeys.is_null(row) || suppkeys.is_null(row) {
             continue;
@@ -8910,7 +8943,16 @@ fn q21_update_lineitem_states_typed(
             state.add_late_supplier(suppkey);
         }
     }
-    true
+    Some(states)
+}
+
+fn q21_merge_order_states(
+    states: &mut HashMap<i64, Q21OrderState>,
+    batch_states: HashMap<i64, Q21OrderState>,
+) {
+    for (orderkey, batch_state) in batch_states {
+        states.entry(orderkey).or_default().merge(batch_state);
+    }
 }
 
 struct Q21Row {
