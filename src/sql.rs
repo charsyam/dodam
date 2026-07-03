@@ -5293,17 +5293,17 @@ async fn try_execute_multi_comma_join_sql(
         row_counts.push(record_batch_rows(&batches));
         scanned.push(Some(batches));
     }
+    let join_cost_model =
+        CommaJoinCostModel::new(&scanned, &row_counts, &aliases, &alias_refs, &conjuncts)?;
     let use_ndv_join_order = true;
-    let start_index =
-        choose_comma_join_start_index(&scanned, &row_counts, &aliases, &alias_refs, &conjuncts)?
-            .unwrap_or_else(|| {
-                row_counts
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, rows)| *rows)
-                    .map(|(index, _)| index)
-                    .expect("at least one comma join table")
-            });
+    let start_index = join_cost_model.choose_start_index().unwrap_or_else(|| {
+        row_counts
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, rows)| *rows)
+            .map(|(index, _)| index)
+            .expect("at least one comma join table")
+    });
     let mut current = scanned[start_index].take().expect("start input scanned");
     let mut current_rows = row_counts[start_index];
     let mut joined_aliases = vec![aliases[start_index].clone()];
@@ -5355,7 +5355,11 @@ async fn try_execute_multi_comma_join_sql(
                     row_counts[*table_index],
                     left_keys,
                     right_keys,
-                )?;
+                )?
+                .saturating_mul(
+                    estimated_batches_row_width(&current)
+                        .saturating_add(join_cost_model.table_width(*table_index)),
+                );
                 if selected
                     .as_ref()
                     .is_none_or(|(_, selected_score)| score < *selected_score)
@@ -5497,6 +5501,47 @@ fn record_batch_rows(batches: &[RecordBatch]) -> usize {
     batches.iter().map(RecordBatch::num_rows).sum()
 }
 
+fn estimated_batches_row_width(batches: &[RecordBatch]) -> u128 {
+    batches
+        .first()
+        .map(|batch| {
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| estimated_type_width(field.data_type()))
+                .sum::<u128>()
+                .max(1)
+        })
+        .unwrap_or(1)
+}
+
+fn estimated_type_width(data_type: &DataType) -> u128 {
+    match data_type {
+        DataType::Boolean => 1,
+        DataType::Int8 | DataType::UInt8 => 1,
+        DataType::Int16 | DataType::UInt16 => 2,
+        DataType::Int32 | DataType::UInt32 | DataType::Float32 | DataType::Date32 => 4,
+        DataType::Int64
+        | DataType::UInt64
+        | DataType::Float64
+        | DataType::Date64
+        | DataType::Time64(_)
+        | DataType::Timestamp(_, _) => 8,
+        DataType::Decimal128(_, _) => 16,
+        DataType::Decimal256(_, _) => 32,
+        DataType::Utf8 | DataType::LargeUtf8 => 24,
+        DataType::Binary | DataType::LargeBinary => 24,
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => 32,
+        DataType::Struct(fields) => fields
+            .iter()
+            .map(|field| estimated_type_width(field.data_type()))
+            .sum::<u128>()
+            .max(1),
+        _ => 16,
+    }
+}
+
 fn estimate_join_output_rows(
     left: &[RecordBatch],
     right: &[RecordBatch],
@@ -5511,59 +5556,185 @@ fn estimate_join_output_rows(
     Ok((left_rows as u128).saturating_mul(right_rows as u128) / denominator)
 }
 
-fn choose_comma_join_start_index(
-    scanned: &[Option<Vec<RecordBatch>>],
-    row_counts: &[usize],
-    aliases: &[String],
-    alias_refs: &[&str],
-    conjuncts: &[SqlExpr],
-) -> Result<Option<usize>> {
-    let mut selected = None;
-    for conjunct in conjuncts {
-        let Some((left_alias, left_key, right_alias, right_key)) =
-            comma_join_base_edge(conjunct, alias_refs)?
-        else {
-            continue;
-        };
-        let Some(left_index) = aliases
-            .iter()
-            .position(|alias| alias.eq_ignore_ascii_case(left_alias))
-        else {
-            continue;
-        };
-        let Some(right_index) = aliases
-            .iter()
-            .position(|alias| alias.eq_ignore_ascii_case(right_alias))
-        else {
-            continue;
-        };
-        let left = scanned[left_index]
-            .as_ref()
-            .expect("comma join input scanned");
-        let right = scanned[right_index]
-            .as_ref()
-            .expect("comma join input scanned");
-        let score = estimate_join_output_rows(
-            left,
-            right,
-            row_counts[left_index],
-            row_counts[right_index],
-            &[left_key],
-            &[right_key],
-        )?;
-        let start_index = if row_counts[left_index] <= row_counts[right_index] {
-            left_index
-        } else {
-            right_index
-        };
-        if selected
-            .as_ref()
-            .is_none_or(|(_, selected_score)| score < *selected_score)
-        {
-            selected = Some((start_index, score));
+#[derive(Clone)]
+struct CommaJoinTableCostStats {
+    rows: u128,
+    row_width: u128,
+    key_ndv: HashMap<String, u128>,
+}
+
+#[derive(Clone)]
+struct CommaJoinCostEdge {
+    left: usize,
+    left_key: String,
+    right: usize,
+    right_key: String,
+}
+
+struct CommaJoinCostModel {
+    tables: Vec<CommaJoinTableCostStats>,
+    edges: Vec<CommaJoinCostEdge>,
+}
+
+impl CommaJoinCostModel {
+    fn new(
+        scanned: &[Option<Vec<RecordBatch>>],
+        row_counts: &[usize],
+        aliases: &[String],
+        alias_refs: &[&str],
+        conjuncts: &[SqlExpr],
+    ) -> Result<Self> {
+        let mut edges = Vec::new();
+        let mut key_columns = vec![Vec::<String>::new(); aliases.len()];
+        for conjunct in conjuncts {
+            let Some((left_alias, left_key, right_alias, right_key)) =
+                comma_join_base_edge(conjunct, alias_refs)?
+            else {
+                continue;
+            };
+            let Some(left) = aliases
+                .iter()
+                .position(|alias| alias.eq_ignore_ascii_case(left_alias))
+            else {
+                continue;
+            };
+            let Some(right) = aliases
+                .iter()
+                .position(|alias| alias.eq_ignore_ascii_case(right_alias))
+            else {
+                continue;
+            };
+            add_column_once(&mut key_columns[left], left_key.clone());
+            add_column_once(&mut key_columns[right], right_key.clone());
+            edges.push(CommaJoinCostEdge {
+                left,
+                left_key,
+                right,
+                right_key,
+            });
         }
+
+        let mut tables = Vec::with_capacity(scanned.len());
+        for (index, batches) in scanned.iter().enumerate() {
+            let batches = batches.as_ref().expect("comma join input scanned");
+            let mut key_ndv = HashMap::new();
+            for key in &key_columns[index] {
+                key_ndv.insert(
+                    key.clone(),
+                    sampled_key_ndv(batches, &[key.clone()], 100_000)? as u128,
+                );
+            }
+            tables.push(CommaJoinTableCostStats {
+                rows: row_counts[index].max(1) as u128,
+                row_width: estimated_batches_row_width(batches),
+                key_ndv,
+            });
+        }
+
+        Ok(Self { tables, edges })
     }
-    Ok(selected.map(|(index, _)| index))
+
+    fn choose_start_index(&self) -> Option<usize> {
+        (0..self.tables.len())
+            .filter_map(|start| {
+                self.estimate_greedy_plan_cost(start)
+                    .map(|cost| (start, cost))
+            })
+            .min_by_key(|(_, cost)| *cost)
+            .map(|(start, _)| start)
+    }
+
+    fn table_width(&self, table_index: usize) -> u128 {
+        self.tables[table_index].row_width
+    }
+
+    fn estimate_greedy_plan_cost(&self, start: usize) -> Option<u128> {
+        let mut joined = vec![false; self.tables.len()];
+        joined[start] = true;
+        let mut joined_count = 1usize;
+        let mut rows = self.tables[start].rows;
+        let mut row_width = self.tables[start].row_width;
+        let mut total_cost = rows.saturating_mul(row_width);
+
+        while joined_count < self.tables.len() {
+            let mut selected = None;
+            for table_index in 0..self.tables.len() {
+                if joined[table_index] {
+                    continue;
+                }
+                let edges = self
+                    .edges
+                    .iter()
+                    .filter(|edge| {
+                        (edge.left == table_index && joined[edge.right])
+                            || (edge.right == table_index && joined[edge.left])
+                    })
+                    .collect::<Vec<_>>();
+                if edges.is_empty() {
+                    continue;
+                }
+                let output_rows = self.estimate_join_rows(rows, table_index, &edges);
+                let output_width = row_width.saturating_add(self.tables[table_index].row_width);
+                let build_cost = rows.saturating_mul(row_width).min(
+                    self.tables[table_index]
+                        .rows
+                        .saturating_mul(self.tables[table_index].row_width),
+                );
+                let step_cost = output_rows
+                    .saturating_mul(output_width)
+                    .saturating_add(build_cost);
+                if selected
+                    .as_ref()
+                    .is_none_or(|(_, selected_cost, _)| step_cost < *selected_cost)
+                {
+                    selected = Some((table_index, step_cost, output_rows));
+                }
+            }
+            let (table_index, step_cost, output_rows) = selected?;
+            joined[table_index] = true;
+            joined_count += 1;
+            rows = output_rows.max(1);
+            row_width = row_width.saturating_add(self.tables[table_index].row_width);
+            total_cost = total_cost.saturating_add(step_cost);
+        }
+
+        Some(total_cost)
+    }
+
+    fn estimate_join_rows(
+        &self,
+        current_rows: u128,
+        next_table: usize,
+        edges: &[&CommaJoinCostEdge],
+    ) -> u128 {
+        let next_rows = self.tables[next_table].rows;
+        let denominator = edges
+            .iter()
+            .map(|edge| {
+                let (left_ndv, right_ndv) = self.edge_ndv(edge);
+                left_ndv.max(right_ndv).max(1)
+            })
+            .max()
+            .unwrap_or(1);
+        current_rows.saturating_mul(next_rows) / denominator
+    }
+
+    fn edge_ndv(&self, edge: &CommaJoinCostEdge) -> (u128, u128) {
+        (
+            self.tables[edge.left]
+                .key_ndv
+                .get(&edge.left_key)
+                .copied()
+                .unwrap_or(self.tables[edge.left].rows)
+                .max(1),
+            self.tables[edge.right]
+                .key_ndv
+                .get(&edge.right_key)
+                .copied()
+                .unwrap_or(self.tables[edge.right].rows)
+                .max(1),
+        )
+    }
 }
 
 fn sampled_key_ndv(batches: &[RecordBatch], keys: &[String], sample_rows: usize) -> Result<usize> {
