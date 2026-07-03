@@ -584,9 +584,16 @@ Tried and rejected or neutral:
     - Re-tested the inner-only direct left-join count aggregate with streaming scans and dense `Int64` vectors instead of `HashMap`; this removed some overhead but still stayed around the existing Q13 median (`~0.0185s`) because the outer distribution still had to consume the intermediate groups.
     - Skipping the `count(col)` input column when Parquet schema marks it non-null is correctness-safe and slightly reduced Q13 standalone median from about `0.0183s` to about `0.0180s`; it is not enough to close the remaining DuckDB gap by itself.
     - Adding a general fast LIKE matcher for patterns without `_` or `ESCAPE` fixed the real Q13 bottleneck (`o_comment NOT LIKE '%special%requests%'`): Q13 standalone median moved to about `0.0086s` vs DuckDB about `0.0157s`.
-    - Latest SF=0.01 7-run full comparison after fast LIKE: Dodam about `0.241s`, DuckDB about `0.368s`, total ratio about `0.65x`; no TPC-H query is above `1.1x`.
-    - Refining fast LIKE into compiled exact/prefix/suffix/contains/ordered variants and using `memchr::memmem::Finder` for repeated substring search moved Q13 standalone median further to about `0.0058s`; latest full comparison remains about `0.240s` vs DuckDB about `0.368s`.
-    - Avoiding filtered `RecordBatch` materialization in the derived left-join count-distribution path when the right filter contains LIKE moved Q13 standalone median to about `0.0056s`; latest full comparison is about `0.239s` vs DuckDB about `0.369s`.
+  - Latest SF=0.01 7-run full comparison after fast LIKE: Dodam about `0.241s`, DuckDB about `0.368s`, total ratio about `0.65x`; no TPC-H query is above `1.1x`.
+  - Refining fast LIKE into compiled exact/prefix/suffix/contains/ordered variants and using `memchr::memmem::Finder` for repeated substring search moved Q13 standalone median further to about `0.0058s`; latest full comparison remains about `0.240s` vs DuckDB about `0.368s`.
+  - Avoiding filtered `RecordBatch` materialization in the derived left-join count-distribution path when the right filter contains LIKE moved Q13 standalone median to about `0.0056s`; latest full comparison is about `0.239s` vs DuckDB about `0.369s`.
+- SF=1 TPC-H scale check:
+  - Generated `/tmp/dodam-tpchgen-sf1` with `tpchgen-cli`; Dodam executes 22/22 queries successfully.
+  - Baseline SF=1 3-run median comparison showed Dodam about `49.2s` vs DuckDB about `1.08s`, exposing scale gaps hidden by SF=0.01.
+  - Multi-comma joins now scan all inputs with per-table filters/projections, start from the smallest filtered input, choose the smaller hash-join build side, and use sampled NDV fanout estimates only when multiple next joins are available and no materialized subquery is present.
+  - This moved the SF=1 total to about `23.0s`; Q05 improved from about `12.6s` to about `0.45s`, Q07 from about `2.75s` to about `0.50s`, Q08 from about `3.36s` to about `0.23s`, and Q09 from about `9.58s` to about `4.7s`.
+  - Rejected start-node NDV scoring for now: it regressed Q02 to about `20s` and Q05/Q07/Q08 as well. Keep start selection as smallest filtered input until a better planner exists.
+  - Remaining SF=1 bottlenecks: Q02 correlated/min subquery path (`~8.2s`), Q09 multi-join profit aggregation (`~4.7s`), Q10 join order/grouped aggregate regression (`~2.6s`), Q01 scan aggregate (`~1.2s`), Q21 (`~1.3s`).
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.

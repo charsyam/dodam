@@ -5284,18 +5284,35 @@ async fn try_execute_multi_comma_join_sql(
         having.as_ref(),
         order_by.as_ref(),
     )?;
-    let mut current = scan_table_for_comma_join(
-        engine,
-        &tables[0],
-        batch_size,
-        scan_filters[0].as_ref(),
-        &scan_projections[0],
-    )
-    .await?;
-    let mut joined_aliases = vec![aliases[0].clone()];
-    let mut remaining = (1..tables.len()).collect::<Vec<_>>();
+    let mut scanned = Vec::with_capacity(tables.len());
+    let mut row_counts = Vec::with_capacity(tables.len());
+    for index in 0..tables.len() {
+        let batches = scan_table_for_comma_join(
+            engine,
+            &tables[index],
+            batch_size,
+            scan_filters[index].as_ref(),
+            &scan_projections[index],
+        )
+        .await?;
+        row_counts.push(record_batch_rows(&batches));
+        scanned.push(Some(batches));
+    }
+    let use_ndv_join_order = !conjuncts.iter().any(expr_contains_materializable_subquery);
+    let start_index = row_counts
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, rows)| *rows)
+        .map(|(index, _)| index)
+        .expect("at least one comma join table");
+    let mut current = scanned[start_index].take().expect("start input scanned");
+    let mut current_rows = row_counts[start_index];
+    let mut joined_aliases = vec![aliases[start_index].clone()];
+    let mut remaining = (0..tables.len())
+        .filter(|index| *index != start_index)
+        .collect::<Vec<_>>();
     while !remaining.is_empty() {
-        let mut selected = None;
+        let mut candidates = Vec::new();
         for (remaining_index, table_index) in remaining.iter().copied().enumerate() {
             let alias = &aliases[table_index];
             let mut left_keys = Vec::new();
@@ -5314,16 +5331,41 @@ async fn try_execute_multi_comma_join_sql(
                 }
             }
             if !left_keys.is_empty() {
-                selected = Some((
+                candidates.push((
                     remaining_index,
                     table_index,
                     left_keys,
                     right_keys,
                     conjunct_indexes,
                 ));
-                break;
             }
         }
+        let selected = if candidates.len() <= 1 || !use_ndv_join_order {
+            candidates.into_iter().next()
+        } else {
+            let mut selected = None;
+            for candidate in candidates {
+                let (_, table_index, left_keys, right_keys, _) = &candidate;
+                let right = scanned[*table_index]
+                    .as_ref()
+                    .expect("remaining input scanned");
+                let score = estimate_join_output_rows(
+                    &current,
+                    right,
+                    current_rows,
+                    row_counts[*table_index],
+                    left_keys,
+                    right_keys,
+                )?;
+                if selected
+                    .as_ref()
+                    .is_none_or(|(_, selected_score)| score < *selected_score)
+                {
+                    selected = Some((candidate, score));
+                }
+            }
+            selected.map(|(candidate, _)| candidate)
+        };
         let Some((remaining_index, table_index, left_keys, right_keys, conjunct_indexes)) =
             selected
         else {
@@ -5340,20 +5382,20 @@ async fn try_execute_multi_comma_join_sql(
             used_conjuncts[index] = true;
         }
         remaining.remove(remaining_index);
-        let table = &tables[table_index];
         let alias = &aliases[table_index];
-        let right = scan_table_for_comma_join(
-            engine,
-            table,
-            batch_size,
-            scan_filters[table_index].as_ref(),
-            &scan_projections[table_index],
-        )
-        .await?;
+        let right = scanned[table_index]
+            .take()
+            .expect("remaining input scanned");
+        let right_rows = row_counts[table_index];
         let left_prefix = if joined_aliases.len() == 1 {
             joined_aliases[0].as_str()
         } else {
             "__dodam_join"
+        };
+        let build_side = if current_rows <= right_rows {
+            JoinBuildSide::Left
+        } else {
+            JoinBuildSide::Right
         };
         let stream = Box::new(HashJoinExec::new(
             Box::new(MemoryExec::new(current)),
@@ -5362,12 +5404,13 @@ async fn try_execute_multi_comma_join_sql(
             right_keys,
             left_prefix.to_string(),
             alias.clone(),
-            JoinBuildSide::Right,
+            build_side,
             JoinType::Inner,
             Projection::All,
         ))
         .execute()?;
         current = collect_batches(stream)?;
+        current_rows = record_batch_rows(&current);
         if left_prefix == "__dodam_join" {
             current = strip_batch_field_prefix(current, "__dodam_join.")?;
         }
@@ -5434,6 +5477,59 @@ async fn try_execute_multi_comma_join_sql(
         batches = rename_output_batches(batches, &projection.aliases)?;
     }
     Ok(Some(QueryOutput::Scan { batches }))
+}
+
+fn record_batch_rows(batches: &[RecordBatch]) -> usize {
+    batches.iter().map(RecordBatch::num_rows).sum()
+}
+
+fn estimate_join_output_rows(
+    left: &[RecordBatch],
+    right: &[RecordBatch],
+    left_rows: usize,
+    right_rows: usize,
+    left_keys: &[String],
+    right_keys: &[String],
+) -> Result<u128> {
+    let left_ndv = sampled_key_ndv(left, left_keys, 100_000)?.max(1);
+    let right_ndv = sampled_key_ndv(right, right_keys, 100_000)?.max(1);
+    let denominator = left_ndv.max(right_ndv) as u128;
+    Ok((left_rows as u128).saturating_mul(right_rows as u128) / denominator)
+}
+
+fn sampled_key_ndv(batches: &[RecordBatch], keys: &[String], sample_rows: usize) -> Result<usize> {
+    let mut values = HashSet::new();
+    let mut sampled = 0usize;
+    for batch in batches {
+        if sampled >= sample_rows {
+            break;
+        }
+        let key_indices = keys
+            .iter()
+            .map(|key| batch_column_index(batch, key))
+            .collect::<Result<Vec<_>>>()?;
+        for row in 0..batch.num_rows() {
+            if sampled >= sample_rows {
+                break;
+            }
+            sampled += 1;
+            let mut parts = Vec::with_capacity(key_indices.len());
+            let mut has_null = false;
+            for index in &key_indices {
+                match semijoin_key_at(batch.column(*index), row)? {
+                    Some(value) => parts.push(value),
+                    None => {
+                        has_null = true;
+                        break;
+                    }
+                }
+            }
+            if !has_null {
+                values.insert(parts.join("\x1f"));
+            }
+        }
+    }
+    Ok(values.len())
 }
 
 fn comma_join_single_table_filters(
