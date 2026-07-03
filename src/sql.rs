@@ -55,6 +55,194 @@ fn tpch_profile_elapsed(label: &str, started: Option<Instant>) {
     }
 }
 
+const DEFAULT_MAX_DENSE_I64_KEY: usize = 20_000_000;
+
+enum AdaptiveI64Set {
+    Dense { contains: Vec<bool>, len: usize },
+    Hash(HashSet<i64>),
+}
+
+impl AdaptiveI64Set {
+    fn new_dense() -> Self {
+        Self::Dense {
+            contains: Vec::new(),
+            len: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Dense { len, .. } => *len,
+            Self::Hash(keys) => keys.len(),
+        }
+    }
+
+    fn contains(&self, key: i64) -> bool {
+        match self {
+            Self::Dense { contains, .. } => usize::try_from(key)
+                .ok()
+                .and_then(|index| contains.get(index))
+                .copied()
+                .unwrap_or(false),
+            Self::Hash(keys) => keys.contains(&key),
+        }
+    }
+
+    fn insert(&mut self, key: i64) {
+        match self {
+            Self::Dense { contains, len } => {
+                let Some(index) = adaptive_dense_index(key, DEFAULT_MAX_DENSE_I64_KEY) else {
+                    let mut keys = adaptive_i64_set_dense_to_hash(contains);
+                    keys.insert(key);
+                    *self = Self::Hash(keys);
+                    return;
+                };
+                if index >= contains.len() {
+                    contains.resize(index + 1, false);
+                }
+                if !contains[index] {
+                    contains[index] = true;
+                    *len += 1;
+                }
+            }
+            Self::Hash(keys) => {
+                keys.insert(key);
+            }
+        }
+    }
+}
+
+fn adaptive_i64_set_dense_to_hash(contains: &[bool]) -> HashSet<i64> {
+    contains
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(key, contains)| contains.then_some(key as i64))
+        .collect()
+}
+
+enum AdaptiveI64Map<V> {
+    Dense {
+        values: Vec<V>,
+        present: Vec<bool>,
+        len: usize,
+    },
+    Hash(HashMap<i64, V>),
+}
+
+impl<V> AdaptiveI64Map<V>
+where
+    V: Copy + Default,
+{
+    fn new_dense() -> Self {
+        Self::Dense {
+            values: Vec::new(),
+            present: Vec::new(),
+            len: 0,
+        }
+    }
+
+    fn get(&self, key: i64) -> Option<V> {
+        match self {
+            Self::Dense {
+                values, present, ..
+            } => {
+                let index = usize::try_from(key).ok()?;
+                present
+                    .get(index)
+                    .copied()
+                    .filter(|present| *present)
+                    .map(|_| values[index])
+            }
+            Self::Hash(values) => values.get(&key).copied(),
+        }
+    }
+
+    fn insert(&mut self, key: i64, value: V) {
+        self.update(key, || value, |slot| *slot = value);
+    }
+
+    fn update<Init, Update>(&mut self, key: i64, init: Init, update: Update)
+    where
+        Init: FnOnce() -> V,
+        Update: FnOnce(&mut V),
+    {
+        match self {
+            Self::Dense {
+                values,
+                present,
+                len,
+            } => {
+                let Some(index) = adaptive_dense_index(key, DEFAULT_MAX_DENSE_I64_KEY) else {
+                    let mut hash = adaptive_i64_map_dense_to_hash(values, present);
+                    let entry = hash.entry(key).or_insert_with(init);
+                    update(entry);
+                    *self = Self::Hash(hash);
+                    return;
+                };
+                if index >= values.len() {
+                    values.resize(index + 1, V::default());
+                    present.resize(index + 1, false);
+                }
+                if !present[index] {
+                    values[index] = init();
+                    present[index] = true;
+                    *len += 1;
+                }
+                update(&mut values[index]);
+            }
+            Self::Hash(values) => {
+                let entry = values.entry(key).or_insert_with(init);
+                update(entry);
+            }
+        }
+    }
+
+    fn into_filtered_hash<P>(self, predicate: P) -> HashMap<i64, V>
+    where
+        P: Fn(V) -> bool,
+    {
+        match self {
+            Self::Dense {
+                values, present, ..
+            } => values
+                .into_iter()
+                .zip(present)
+                .enumerate()
+                .filter_map(|(key, (value, present))| {
+                    (present && predicate(value)).then_some((key as i64, value))
+                })
+                .collect(),
+            Self::Hash(values) => values
+                .into_iter()
+                .filter(|(_, value)| predicate(*value))
+                .collect(),
+        }
+    }
+}
+
+fn adaptive_i64_map_dense_to_hash<V>(values: &[V], present: &[bool]) -> HashMap<i64, V>
+where
+    V: Copy,
+{
+    values
+        .iter()
+        .copied()
+        .zip(present.iter().copied())
+        .enumerate()
+        .filter_map(|(key, (value, present))| present.then_some((key as i64, value)))
+        .collect()
+}
+
+fn adaptive_dense_index(key: i64, max_dense_key: usize) -> Option<usize> {
+    let index = usize::try_from(key).ok()?;
+    (index <= max_dense_key).then_some(index)
+}
+
 #[derive(Debug)]
 pub enum QueryOutput {
     Scan {
@@ -4118,111 +4306,19 @@ async fn q09_order_years(
             None,
         )
         .await?;
-    let mut years = Q09OrderYearsBuilder::Dense(Vec::new());
+    let mut years = Q09OrderYears::new_dense();
     while let Some(batch) = stream.next() {
         let batch = batch?;
-        years.add_batch(&batch)?;
+        q09_order_years_batch_into(&batch, &mut years)?;
     }
-    Ok(years.finish())
+    Ok(years)
 }
 
-const Q09_MAX_DENSE_ORDERKEY: usize = 20_000_000;
+type Q09OrderYears = AdaptiveI64Map<i32>;
 
-enum Q09OrderYears {
-    Dense(Vec<i16>),
-    Hash(HashMap<i64, i32>),
-}
-
-impl Q09OrderYears {
-    fn get(&self, orderkey: i64) -> Option<i32> {
-        match self {
-            Self::Dense(years) => {
-                let index = usize::try_from(orderkey).ok()?;
-                years
-                    .get(index)
-                    .copied()
-                    .filter(|year| *year != 0)
-                    .map(i32::from)
-            }
-            Self::Hash(years) => years.get(&orderkey).copied(),
-        }
-    }
-}
-
-enum Q09OrderYearsBuilder {
-    Dense(Vec<i16>),
-    Hash(HashMap<i64, i32>),
-}
-
-impl Q09OrderYearsBuilder {
-    fn add_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        let orderkeys = batch_column(batch, "o_orderkey")?;
-        let orderdates = batch_column(batch, "o_orderdate")?;
-        match self {
-            Self::Dense(years) => {
-                if q09_order_years_batch_dense(orderkeys, orderdates, years)? {
-                    Ok(())
-                } else {
-                    let mut hash = q09_dense_order_years_to_hash(years);
-                    q09_order_years_batch_hash(orderkeys, orderdates, &mut hash)?;
-                    *self = Self::Hash(hash);
-                    Ok(())
-                }
-            }
-            Self::Hash(years) => q09_order_years_batch_hash(orderkeys, orderdates, years),
-        }
-    }
-
-    fn finish(self) -> Q09OrderYears {
-        match self {
-            Self::Dense(years) => Q09OrderYears::Dense(years),
-            Self::Hash(years) => Q09OrderYears::Hash(years),
-        }
-    }
-}
-
-fn q09_order_years_batch_dense(
-    orderkeys: &ArrayRef,
-    orderdates: &ArrayRef,
-    years: &mut Vec<i16>,
-) -> Result<bool> {
-    let (Some(orderkeys), Some(orderdates)) = (
-        orderkeys.as_any().downcast_ref::<Int64Array>(),
-        orderdates.as_any().downcast_ref::<Date32Array>(),
-    ) else {
-        return Ok(false);
-    };
-    for row in 0..orderkeys.len() {
-        if orderkeys.is_null(row) || orderdates.is_null(row) {
-            continue;
-        }
-        let orderkey = orderkeys.value(row);
-        if orderkey < 0 {
-            return Ok(false);
-        }
-        let Ok(index) = usize::try_from(orderkey) else {
-            return Ok(false);
-        };
-        if index > Q09_MAX_DENSE_ORDERKEY {
-            return Ok(false);
-        }
-        if index >= years.len() {
-            years.resize(index + 1, 0);
-        }
-        let (year, _, _) = civil_from_days(i64::from(orderdates.value(row)))?;
-        let Ok(year) = i16::try_from(year) else {
-            return Ok(false);
-        };
-        years[index] = year;
-    }
-    Ok(true)
-}
-
-fn q09_order_years_batch_hash(
-    orderkeys: &ArrayRef,
-    orderdates: &ArrayRef,
-    years: &mut HashMap<i64, i32>,
-) -> Result<()> {
+fn q09_order_years_batch_into(batch: &RecordBatch, years: &mut Q09OrderYears) -> Result<()> {
+    let orderkeys = batch_column(batch, "o_orderkey")?;
+    let orderdates = batch_column(batch, "o_orderdate")?;
     if let (Some(orderkeys), Some(orderdates)) = (
         orderkeys.as_any().downcast_ref::<Int64Array>(),
         orderdates.as_any().downcast_ref::<Date32Array>(),
@@ -4247,15 +4343,6 @@ fn q09_order_years_batch_hash(
         years.insert(orderkey, year);
     }
     Ok(())
-}
-
-fn q09_dense_order_years_to_hash(years: &[i16]) -> HashMap<i64, i32> {
-    years
-        .iter()
-        .copied()
-        .enumerate()
-        .filter_map(|(orderkey, year)| (year != 0).then_some((orderkey as i64, i32::from(year))))
-        .collect()
 }
 
 async fn q09_supply_costs(
@@ -8975,8 +9062,6 @@ struct Q18Row {
     quantity: f64,
 }
 
-const Q18_MAX_DENSE_ORDERKEY: usize = 20_000_000;
-
 async fn q18_qualifying_order_quantities(
     engine: &DodamEngine,
     path: PathBuf,
@@ -8992,93 +9077,17 @@ async fn q18_qualifying_order_quantities(
             None,
         )
         .await?;
-    let mut accumulator = Q18QuantityAccumulator::Dense(Vec::new());
+    let mut sums = AdaptiveI64Map::<f64>::new_dense();
     while let Some(batch) = stream.next() {
         let batch = batch?;
-        accumulator.add_batch(&batch)?;
+        q18_quantity_batch_into(&batch, &mut sums)?;
     }
-    Ok(accumulator.into_qualifying(threshold))
+    Ok(sums.into_filtered_hash(|quantity| quantity > threshold))
 }
 
-enum Q18QuantityAccumulator {
-    Dense(Vec<f64>),
-    Hash(HashMap<i64, f64>),
-}
-
-impl Q18QuantityAccumulator {
-    fn add_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        let orderkeys = batch_column(batch, "l_orderkey")?;
-        let quantities = batch_column(batch, "l_quantity")?;
-        match self {
-            Self::Dense(sums) => {
-                if q18_quantity_batch_dense(orderkeys, quantities, sums)? {
-                    Ok(())
-                } else {
-                    let mut hash = q18_dense_quantities_to_hash(sums);
-                    q18_quantity_batch_hash(orderkeys, quantities, &mut hash)?;
-                    *self = Self::Hash(hash);
-                    Ok(())
-                }
-            }
-            Self::Hash(sums) => q18_quantity_batch_hash(orderkeys, quantities, sums),
-        }
-    }
-
-    fn into_qualifying(self, threshold: f64) -> HashMap<i64, f64> {
-        match self {
-            Self::Dense(sums) => sums
-                .into_iter()
-                .enumerate()
-                .filter_map(|(orderkey, quantity)| {
-                    (quantity > threshold).then_some((orderkey as i64, quantity))
-                })
-                .collect(),
-            Self::Hash(sums) => sums
-                .into_iter()
-                .filter(|(_, quantity)| *quantity > threshold)
-                .collect(),
-        }
-    }
-}
-
-fn q18_quantity_batch_dense(
-    orderkeys: &ArrayRef,
-    quantities: &ArrayRef,
-    sums: &mut Vec<f64>,
-) -> Result<bool> {
-    let (Some(orderkeys), Some(quantities)) = (
-        orderkeys.as_any().downcast_ref::<Int64Array>(),
-        q01_decimal_input(quantities)?,
-    ) else {
-        return Ok(false);
-    };
-    for row in 0..orderkeys.len() {
-        if orderkeys.is_null(row) || quantities.is_null(row) {
-            continue;
-        }
-        let orderkey = orderkeys.value(row);
-        if orderkey < 0 {
-            return Ok(false);
-        }
-        let Ok(index) = usize::try_from(orderkey) else {
-            return Ok(false);
-        };
-        if index > Q18_MAX_DENSE_ORDERKEY {
-            return Ok(false);
-        }
-        if index >= sums.len() {
-            sums.resize(index + 1, 0.0);
-        }
-        sums[index] += quantities.value(row);
-    }
-    Ok(true)
-}
-
-fn q18_quantity_batch_hash(
-    orderkeys: &ArrayRef,
-    quantities: &ArrayRef,
-    sums: &mut HashMap<i64, f64>,
-) -> Result<()> {
+fn q18_quantity_batch_into(batch: &RecordBatch, sums: &mut AdaptiveI64Map<f64>) -> Result<()> {
+    let orderkeys = batch_column(batch, "l_orderkey")?;
+    let quantities = batch_column(batch, "l_quantity")?;
     if let (Some(orderkeys), Some(quantities)) = (
         orderkeys.as_any().downcast_ref::<Int64Array>(),
         q01_decimal_input(quantities)?,
@@ -9087,7 +9096,11 @@ fn q18_quantity_batch_hash(
             if orderkeys.is_null(row) || quantities.is_null(row) {
                 continue;
             }
-            *sums.entry(orderkeys.value(row)).or_insert(0.0) += quantities.value(row);
+            sums.update(
+                orderkeys.value(row),
+                || 0.0,
+                |sum| *sum += quantities.value(row),
+            );
         }
         return Ok(());
     }
@@ -9098,17 +9111,9 @@ fn q18_quantity_batch_hash(
         ) else {
             continue;
         };
-        *sums.entry(orderkey).or_insert(0.0) += quantity;
+        sums.update(orderkey, || 0.0, |sum| *sum += quantity);
     }
     Ok(())
-}
-
-fn q18_dense_quantities_to_hash(sums: &[f64]) -> HashMap<i64, f64> {
-    sums.iter()
-        .copied()
-        .enumerate()
-        .filter_map(|(orderkey, quantity)| (quantity != 0.0).then_some((orderkey as i64, quantity)))
-        .collect()
 }
 
 async fn q18_qualifying_orders(
@@ -9742,7 +9747,7 @@ async fn try_execute_q21_suppliers_who_kept_orders_waiting_fast(
     }
     let stage = tpch_profile_start();
     let order_states =
-        q21_lineitem_order_states(engine, lineitem.path, batch_size, &final_orders).await?;
+        q21_lineitem_order_states(engine, lineitem.path, batch_size, final_orders).await?;
     tpch_profile_elapsed("Q21 lineitem order states", stage);
     let stage = tpch_profile_start();
     let mut counts = HashMap::<i64, u64>::with_capacity(suppliers.len());
@@ -9863,7 +9868,7 @@ async fn q21_final_order_keys(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-) -> Result<HashSet<i64>> {
+) -> Result<Q21FinalOrders> {
     let mut stream = engine
         .scan_parquet_batches(
             path,
@@ -9873,21 +9878,28 @@ async fn q21_final_order_keys(
             None,
         )
         .await?;
-    let mut keys = HashSet::new();
+    let mut keys = Q21FinalOrders::new_dense();
     while let Some(batch) = stream.next() {
         let batch = batch?;
-        let orderkeys = batch_column(&batch, "o_orderkey")?;
-        let statuses = batch_string_column(&batch, "o_orderstatus")?;
-        for row in 0..batch.num_rows() {
-            if statuses.is_valid(row)
-                && statuses.value(row) == "F"
-                && let Some(key) = numeric_i64_value(orderkeys, row)?
-            {
-                keys.insert(key);
-            }
-        }
+        q21_final_orders_batch_into(&batch, &mut keys)?;
     }
     Ok(keys)
+}
+
+type Q21FinalOrders = AdaptiveI64Set;
+
+fn q21_final_orders_batch_into(batch: &RecordBatch, keys: &mut Q21FinalOrders) -> Result<()> {
+    let orderkeys = batch_column(batch, "o_orderkey")?;
+    let statuses = batch_string_column(batch, "o_orderstatus")?;
+    for row in 0..orderkeys.len() {
+        if statuses.is_null(row) || statuses.value(row) != "F" {
+            continue;
+        }
+        if let Some(key) = numeric_i64_value(orderkeys, row)? {
+            keys.insert(key);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -9959,7 +9971,7 @@ async fn q21_lineitem_order_states(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-    final_orders: &HashSet<i64>,
+    final_orders: Q21FinalOrders,
 ) -> Result<HashMap<i64, Q21OrderState>> {
     let mut stream = engine
         .scan_parquet_batches(
@@ -9976,7 +9988,7 @@ async fn q21_lineitem_order_states(
         )
         .await?;
     let output_capacity = final_orders.len();
-    let final_orders = Arc::new(final_orders.clone());
+    let final_orders = Arc::new(final_orders);
     parallel_batch_fold(
         &mut stream,
         move |batch| q21_lineitem_order_states_batch(batch, &final_orders),
@@ -9988,7 +10000,7 @@ async fn q21_lineitem_order_states(
 
 fn q21_lineitem_order_states_batch(
     batch: RecordBatch,
-    final_orders: &HashSet<i64>,
+    final_orders: &Q21FinalOrders,
 ) -> Result<HashMap<i64, Q21OrderState>> {
     let orderkeys = batch_column(&batch, "l_orderkey")?;
     let suppkeys = batch_column(&batch, "l_suppkey")?;
@@ -10007,7 +10019,7 @@ fn q21_lineitem_order_states_batch(
         ) else {
             continue;
         };
-        if !final_orders.contains(&orderkey) {
+        if !final_orders.contains(orderkey) {
             continue;
         }
         let state = states.entry(orderkey).or_default();
@@ -10029,7 +10041,7 @@ fn q21_lineitem_order_states_typed(
     suppkeys: &ArrayRef,
     receipt: &ArrayRef,
     commit: &ArrayRef,
-    final_orders: &HashSet<i64>,
+    final_orders: &Q21FinalOrders,
 ) -> Option<HashMap<i64, Q21OrderState>> {
     let (Some(orderkeys), Some(suppkeys), Some(receipt), Some(commit)) = (
         orderkeys.as_any().downcast_ref::<Int64Array>(),
@@ -10045,7 +10057,7 @@ fn q21_lineitem_order_states_typed(
             continue;
         }
         let orderkey = orderkeys.value(row);
-        if !final_orders.contains(&orderkey) {
+        if !final_orders.contains(orderkey) {
             continue;
         }
         let suppkey = suppkeys.value(row);
