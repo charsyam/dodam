@@ -2381,7 +2381,17 @@ async fn q17_matching_part_keys(
     container: &str,
 ) -> Result<HashSet<i64>> {
     let mut stream = engine
-        .scan_parquet_batches(path, batch_size, None, Projection::All, None)
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "p_partkey".to_string(),
+                "p_brand".to_string(),
+                "p_container".to_string(),
+            ]),
+            None,
+        )
         .await?;
     let mut keys = HashSet::new();
     while let Some(batch) = stream.next() {
@@ -2409,7 +2419,13 @@ async fn q17_lineitem_quantity_averages(
     batch_size: usize,
 ) -> Result<HashMap<i64, f64>> {
     let mut stream = engine
-        .scan_parquet_batches(path, batch_size, None, Projection::All, None)
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec!["l_partkey".to_string(), "l_quantity".to_string()]),
+            None,
+        )
         .await?;
     let mut states = HashMap::<i64, (f64, u64)>::new();
     while let Some(batch) = stream.next() {
@@ -2442,7 +2458,17 @@ async fn q17_filtered_extendedprice_sum(
     averages: &HashMap<i64, f64>,
 ) -> Result<Option<f64>> {
     let mut stream = engine
-        .scan_parquet_batches(path, batch_size, None, Projection::All, None)
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "l_partkey".to_string(),
+                "l_quantity".to_string(),
+                "l_extendedprice".to_string(),
+            ]),
+            None,
+        )
         .await?;
     let mut sum = 0.0;
     let mut count = 0_usize;
@@ -2689,7 +2715,13 @@ async fn q22_average_positive_acctbal(
     country_codes: &HashSet<&str>,
 ) -> Result<f64> {
     let mut stream = engine
-        .scan_parquet_batches(path, batch_size, None, Projection::All, None)
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec!["c_phone".to_string(), "c_acctbal".to_string()]),
+            None,
+        )
         .await?;
     let mut sum = 0.0;
     let mut count = 0_u64;
@@ -2723,7 +2755,13 @@ async fn q22_order_customer_keys(
     batch_size: usize,
 ) -> Result<HashSet<i64>> {
     let mut stream = engine
-        .scan_parquet_batches(path, batch_size, None, Projection::All, None)
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec!["o_custkey".to_string()]),
+            None,
+        )
         .await?;
     let mut keys = HashSet::new();
     while let Some(batch) = stream.next() {
@@ -2753,7 +2791,17 @@ async fn q22_customer_groups(
     order_customers: &HashSet<i64>,
 ) -> Result<Vec<Q22Group>> {
     let mut stream = engine
-        .scan_parquet_batches(path, batch_size, None, Projection::All, None)
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "c_custkey".to_string(),
+                "c_phone".to_string(),
+                "c_acctbal".to_string(),
+            ]),
+            None,
+        )
         .await?;
     let mut groups = HashMap::<String, (u64, f64)>::new();
     while let Some(batch) = stream.next() {
@@ -2929,7 +2977,13 @@ async fn grouped_numeric_sum(
     value_column: &str,
 ) -> Result<HashMap<i64, f64>> {
     let mut stream = engine
-        .scan_parquet_batches(path, batch_size, None, Projection::All, None)
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![key_column.to_string(), value_column.to_string()]),
+            None,
+        )
         .await?;
     let mut sums = HashMap::<i64, f64>::new();
     while let Some(batch) = stream.next() {
@@ -2971,7 +3025,18 @@ async fn q18_qualifying_orders(
     qualifying_orders: &HashSet<i64>,
 ) -> Result<HashMap<i64, Q18Order>> {
     let mut stream = engine
-        .scan_parquet_batches(path, batch_size, None, Projection::All, None)
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "o_orderkey".to_string(),
+                "o_custkey".to_string(),
+                "o_orderdate".to_string(),
+                "o_totalprice".to_string(),
+            ]),
+            None,
+        )
         .await?;
     let mut orders = HashMap::new();
     while let Some(batch) = stream.next() {
@@ -3013,7 +3078,13 @@ async fn q18_customer_names(
     batch_size: usize,
 ) -> Result<HashMap<i64, String>> {
     let mut stream = engine
-        .scan_parquet_batches(path, batch_size, None, Projection::All, None)
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec!["c_custkey".to_string(), "c_name".to_string()]),
+            None,
+        )
         .await?;
     let mut customers = HashMap::new();
     while let Some(batch) = stream.next() {
@@ -3216,7 +3287,13 @@ async fn q21_nation_keys(
     nation_name: &str,
 ) -> Result<HashSet<i64>> {
     let mut stream = engine
-        .scan_parquet_batches(path, batch_size, None, Projection::All, None)
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec!["n_nationkey".to_string(), "n_name".to_string()]),
+            None,
+        )
         .await?;
     let mut keys = HashSet::new();
     while let Some(batch) = stream.next() {
@@ -3242,7 +3319,17 @@ async fn q21_supplier_names(
     nation_keys: &HashSet<i64>,
 ) -> Result<HashMap<i64, String>> {
     let mut stream = engine
-        .scan_parquet_batches(path, batch_size, None, Projection::All, None)
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "s_suppkey".to_string(),
+                "s_nationkey".to_string(),
+                "s_name".to_string(),
+            ]),
+            None,
+        )
         .await?;
     let mut suppliers = HashMap::new();
     while let Some(batch) = stream.next() {
@@ -3271,7 +3358,13 @@ async fn q21_final_order_keys(
     batch_size: usize,
 ) -> Result<HashSet<i64>> {
     let mut stream = engine
-        .scan_parquet_batches(path, batch_size, None, Projection::All, None)
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec!["o_orderkey".to_string(), "o_orderstatus".to_string()]),
+            None,
+        )
         .await?;
     let mut keys = HashSet::new();
     while let Some(batch) = stream.next() {
@@ -3304,7 +3397,18 @@ async fn q21_lineitem_order_states(
     final_orders: &HashSet<i64>,
 ) -> Result<HashMap<i64, Q21OrderState>> {
     let mut stream = engine
-        .scan_parquet_batches(path, batch_size, None, Projection::All, None)
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "l_orderkey".to_string(),
+                "l_suppkey".to_string(),
+                "l_receiptdate".to_string(),
+                "l_commitdate".to_string(),
+            ]),
+            None,
+        )
         .await?;
     let mut states = HashMap::<i64, Q21OrderState>::new();
     while let Some(batch) = stream.next() {
@@ -3461,7 +3565,13 @@ async fn q20_forest_part_keys(
     batch_size: usize,
 ) -> Result<HashSet<i64>> {
     let mut stream = engine
-        .scan_parquet_batches(path, batch_size, None, Projection::All, None)
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec!["p_partkey".to_string(), "p_name".to_string()]),
+            None,
+        )
         .await?;
     let mut keys = HashSet::new();
     while let Some(batch) = stream.next() {
@@ -3486,7 +3596,18 @@ async fn q20_lineitem_quantity_sums(
     batch_size: usize,
 ) -> Result<HashMap<(i64, i64), f64>> {
     let mut stream = engine
-        .scan_parquet_batches(path, batch_size, None, Projection::All, None)
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "l_partkey".to_string(),
+                "l_suppkey".to_string(),
+                "l_quantity".to_string(),
+                "l_shipdate".to_string(),
+            ]),
+            None,
+        )
         .await?;
     let mut sums = HashMap::<(i64, i64), f64>::new();
     while let Some(batch) = stream.next() {
@@ -3523,7 +3644,17 @@ async fn q20_eligible_supplier_keys(
     lineitem_sums: &HashMap<(i64, i64), f64>,
 ) -> Result<HashSet<i64>> {
     let mut stream = engine
-        .scan_parquet_batches(path, batch_size, None, Projection::All, None)
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "ps_partkey".to_string(),
+                "ps_suppkey".to_string(),
+                "ps_availqty".to_string(),
+            ]),
+            None,
+        )
         .await?;
     let mut suppliers = HashSet::new();
     while let Some(batch) = stream.next() {
@@ -3566,7 +3697,18 @@ async fn q20_supplier_rows(
     eligible_suppliers: &HashSet<i64>,
 ) -> Result<Vec<Q20Row>> {
     let mut stream = engine
-        .scan_parquet_batches(path, batch_size, None, Projection::All, None)
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "s_suppkey".to_string(),
+                "s_nationkey".to_string(),
+                "s_name".to_string(),
+                "s_address".to_string(),
+            ]),
+            None,
+        )
         .await?;
     let mut rows = Vec::new();
     while let Some(batch) = stream.next() {
