@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float64Array,
@@ -2460,6 +2460,18 @@ impl Q01State {
         self.discount_count += 1;
         self.count_order += 1;
     }
+
+    fn merge(&mut self, other: Q01State) {
+        self.sum_qty += other.sum_qty;
+        self.sum_base_price += other.sum_base_price;
+        self.sum_disc_price += other.sum_disc_price;
+        self.sum_charge += other.sum_charge;
+        self.sum_discount += other.sum_discount;
+        self.qty_count += other.qty_count;
+        self.price_count += other.price_count;
+        self.discount_count += other.discount_count;
+        self.count_order += other.count_order;
+    }
 }
 
 struct Q01Row {
@@ -2492,50 +2504,22 @@ async fn q01_pricing_summary_rows(
         )
         .await?;
     let mut groups = Vec::<Q01Row>::with_capacity(4);
+    let (sender, receiver) = mpsc::channel();
+    let mut pending_batches = 0_usize;
     while let Some(batch) = stream.next() {
         let batch = batch?;
-        let returnflags = batch_string_column(&batch, "l_returnflag")?;
-        let linestatuses = batch_string_column(&batch, "l_linestatus")?;
-        let quantities = batch_column(&batch, "l_quantity")?;
-        let extendedprices = batch_column(&batch, "l_extendedprice")?;
-        let discounts = batch_column(&batch, "l_discount")?;
-        let taxes = batch_column(&batch, "l_tax")?;
-        let shipdates = batch_column(&batch, "l_shipdate")?;
-        if q01_update_decimal_batch(
-            returnflags,
-            linestatuses,
-            quantities,
-            extendedprices,
-            discounts,
-            taxes,
-            shipdates,
-            cutoff_days,
-            &mut groups,
-        )? {
-            continue;
-        }
-        for row in 0..batch.num_rows() {
-            let Some(shipdate) = date32_value(shipdates, row)? else {
-                continue;
-            };
-            if shipdate > cutoff_days || !returnflags.is_valid(row) || !linestatuses.is_valid(row) {
-                continue;
-            }
-            let (Some(quantity), Some(extendedprice), Some(discount), Some(tax)) = (
-                numeric_f64_value(quantities, row)?,
-                numeric_f64_value(extendedprices, row)?,
-                numeric_f64_value(discounts, row)?,
-                numeric_f64_value(taxes, row)?,
-            ) else {
-                continue;
-            };
-            q01_group_state(&mut groups, returnflags.value(row), linestatuses.value(row)).update(
-                quantity,
-                extendedprice,
-                discount,
-                tax,
-            );
-        }
+        let sender = sender.clone();
+        pending_batches += 1;
+        rayon::spawn(move || {
+            let _ = sender.send(q01_pricing_summary_batch(batch, cutoff_days));
+        });
+    }
+    drop(sender);
+    for _ in 0..pending_batches {
+        let rows = receiver.recv().map_err(|_| {
+            DodamError::UnsupportedSql("Q01 aggregate worker stopped".to_string())
+        })??;
+        q01_merge_rows(&mut groups, rows);
     }
     let mut rows = groups;
     rows.sort_by(|left, right| {
@@ -2544,6 +2528,59 @@ async fn q01_pricing_summary_rows(
             .then_with(|| left.linestatus.cmp(&right.linestatus))
     });
     Ok(rows)
+}
+
+fn q01_pricing_summary_batch(batch: RecordBatch, cutoff_days: i32) -> Result<Vec<Q01Row>> {
+    let returnflags = batch_string_column(&batch, "l_returnflag")?;
+    let linestatuses = batch_string_column(&batch, "l_linestatus")?;
+    let quantities = batch_column(&batch, "l_quantity")?;
+    let extendedprices = batch_column(&batch, "l_extendedprice")?;
+    let discounts = batch_column(&batch, "l_discount")?;
+    let taxes = batch_column(&batch, "l_tax")?;
+    let shipdates = batch_column(&batch, "l_shipdate")?;
+    let mut groups = Vec::<Q01Row>::with_capacity(4);
+    if q01_update_decimal_batch(
+        returnflags,
+        linestatuses,
+        quantities,
+        extendedprices,
+        discounts,
+        taxes,
+        shipdates,
+        cutoff_days,
+        &mut groups,
+    )? {
+        return Ok(groups);
+    }
+    for row in 0..batch.num_rows() {
+        let Some(shipdate) = date32_value(shipdates, row)? else {
+            continue;
+        };
+        if shipdate > cutoff_days || !returnflags.is_valid(row) || !linestatuses.is_valid(row) {
+            continue;
+        }
+        let (Some(quantity), Some(extendedprice), Some(discount), Some(tax)) = (
+            numeric_f64_value(quantities, row)?,
+            numeric_f64_value(extendedprices, row)?,
+            numeric_f64_value(discounts, row)?,
+            numeric_f64_value(taxes, row)?,
+        ) else {
+            continue;
+        };
+        q01_group_state(&mut groups, returnflags.value(row), linestatuses.value(row)).update(
+            quantity,
+            extendedprice,
+            discount,
+            tax,
+        );
+    }
+    Ok(groups)
+}
+
+fn q01_merge_rows(groups: &mut Vec<Q01Row>, rows: Vec<Q01Row>) {
+    for row in rows {
+        q01_group_state(groups, &row.returnflag, &row.linestatus).merge(row.state);
+    }
 }
 
 fn q01_update_decimal_batch(
