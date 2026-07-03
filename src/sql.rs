@@ -5905,6 +5905,9 @@ async fn grouped_numeric_sum(
         let batch = batch?;
         let keys = batch_column(&batch, key_column)?;
         let values = batch_column(&batch, value_column)?;
+        if update_i64_decimal_sums(keys, values, &mut sums)? {
+            continue;
+        }
         for row in 0..batch.num_rows() {
             let (Some(key), Some(value)) = (
                 numeric_i64_value(keys, row)?,
@@ -5916,6 +5919,26 @@ async fn grouped_numeric_sum(
         }
     }
     Ok(sums)
+}
+
+fn update_i64_decimal_sums(
+    keys: &ArrayRef,
+    values: &ArrayRef,
+    sums: &mut HashMap<i64, f64>,
+) -> Result<bool> {
+    let (Some(keys), Some(values)) = (
+        keys.as_any().downcast_ref::<Int64Array>(),
+        q01_decimal_input(values)?,
+    ) else {
+        return Ok(false);
+    };
+    for row in 0..keys.len() {
+        if keys.is_null(row) || values.is_null(row) {
+            continue;
+        }
+        *sums.entry(keys.value(row)).or_insert(0.0) += values.value(row);
+    }
+    Ok(true)
 }
 
 struct Q18Order {
