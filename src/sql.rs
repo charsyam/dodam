@@ -9002,8 +9002,13 @@ async fn try_execute_q18_large_volume_customer_fast(
     let order_rows =
         q18_qualifying_orders(engine, orders.path, batch_size, &qualifying_order_keys).await?;
     tpch_profile_elapsed("Q18 qualifying orders", stage);
+    let customer_keys = order_rows
+        .values()
+        .map(|order| order.custkey)
+        .collect::<HashSet<_>>();
     let stage = tpch_profile_start();
-    let customer_names = q18_customer_names(engine, customer.path, batch_size).await?;
+    let customer_names =
+        q18_customer_names(engine, customer.path, batch_size, &customer_keys).await?;
     tpch_profile_elapsed("Q18 customer names", stage);
 
     let stage = tpch_profile_start();
@@ -9234,6 +9239,7 @@ async fn q18_customer_names(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
+    customer_keys: &HashSet<i64>,
 ) -> Result<HashMap<i64, String>> {
     let mut stream = engine
         .scan_parquet_batches(
@@ -9245,6 +9251,9 @@ async fn q18_customer_names(
         )
         .await?;
     let mut customers = HashMap::new();
+    if customer_keys.is_empty() {
+        return Ok(customers);
+    }
     while let Some(batch) = stream.next() {
         let batch = batch?;
         let keys = batch_column(&batch, "c_custkey")?;
@@ -9254,8 +9263,14 @@ async fn q18_customer_names(
                 continue;
             }
             if let Some(key) = numeric_i64_value(keys, row)? {
+                if !customer_keys.contains(&key) {
+                    continue;
+                }
                 customers.insert(key, names.value(row).to_string());
             }
+        }
+        if customers.len() == customer_keys.len() {
+            break;
         }
     }
     Ok(customers)
