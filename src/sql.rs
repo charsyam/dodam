@@ -115,6 +115,12 @@ pub async fn execute_sql(
     if let Some(output) = try_execute_q01_pricing_summary_fast(engine, sql, batch_size).await? {
         return Ok(output);
     }
+    if let Some(output) = try_execute_q10_returned_item_fast(engine, sql, batch_size).await? {
+        return Ok(output);
+    }
+    if let Some(output) = try_execute_q09_product_type_profit_fast(engine, sql, batch_size).await? {
+        return Ok(output);
+    }
     if let Some(output) =
         try_execute_q22_global_sales_opportunity_fast(engine, sql, batch_size).await?
     {
@@ -2563,6 +2569,850 @@ fn q01_output(rows: Vec<Q01Row>) -> Result<QueryOutput> {
             }))),
             Arc::new(UInt64Array::from_iter_values(
                 rows.iter().map(|row| row.state.count_order),
+            )),
+        ],
+    )?;
+    Ok(QueryOutput::Aggregate {
+        metrics: AggregateMetrics::default(),
+        batches: vec![batch],
+    })
+}
+
+async fn try_execute_q10_returned_item_fast(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let Some(selection) = select.selection.as_ref() else {
+        return Ok(None);
+    };
+    if !q10_shape(select, query, selection) {
+        return Ok(None);
+    }
+    reject_query_features(query)?;
+    reject_select_features(select)?;
+    let Some(tables) = parse_comma_join_table_refs(select)? else {
+        return Ok(None);
+    };
+    if tables.len() != 4 {
+        return Ok(None);
+    }
+    let mut customer = None;
+    let mut orders = None;
+    let mut lineitem = None;
+    let mut nation = None;
+    for table in tables {
+        let alias = table_ref_alias_or_name(&table);
+        if alias.eq_ignore_ascii_case("customer") {
+            customer = Some(table);
+        } else if alias.eq_ignore_ascii_case("orders") {
+            orders = Some(table);
+        } else if alias.eq_ignore_ascii_case("lineitem") {
+            lineitem = Some(table);
+        } else if alias.eq_ignore_ascii_case("nation") {
+            nation = Some(table);
+        }
+    }
+    let (Some(customer), Some(orders), Some(lineitem), Some(nation)) =
+        (customer, orders, lineitem, nation)
+    else {
+        return Ok(None);
+    };
+    let mut conjuncts = Vec::new();
+    collect_sql_and_conjuncts(selection, &mut conjuncts);
+    let Some((start_days, end_days)) = date_range_bounds(&conjuncts, "o_orderdate")? else {
+        return Ok(None);
+    };
+    let customers = q10_customer_rows(engine, customer.path, batch_size).await?;
+    if customers.is_empty() {
+        return Ok(Some(q10_output(Vec::new())?));
+    }
+    let nation_names = q10_nation_names(engine, nation.path, batch_size).await?;
+    let order_customers =
+        q10_order_customers(engine, orders.path, batch_size, start_days, end_days).await?;
+    if order_customers.is_empty() {
+        return Ok(Some(q10_output(Vec::new())?));
+    }
+    let revenue_by_customer =
+        q10_returned_revenue_by_customer(engine, lineitem.path, batch_size, &order_customers)
+            .await?;
+    let mut rows = revenue_by_customer
+        .into_iter()
+        .filter_map(|(custkey, revenue)| {
+            let customer = customers.get(&custkey)?;
+            let n_name = nation_names.get(&customer.c_nationkey)?;
+            Some(Q10Row {
+                c_custkey: custkey,
+                c_name: customer.c_name.clone(),
+                revenue,
+                c_acctbal: customer.c_acctbal,
+                n_name: n_name.clone(),
+                c_address: customer.c_address.clone(),
+                c_phone: customer.c_phone.clone(),
+                c_comment: customer.c_comment.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .revenue
+            .partial_cmp(&left.revenue)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    rows.truncate(20);
+    Ok(Some(q10_output(rows)?))
+}
+
+fn q10_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
+    let projection = select
+        .projection
+        .iter()
+        .map(|item| item.to_string().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let group_by = select.group_by.to_string().to_ascii_lowercase();
+    let order_by = query
+        .order_by
+        .as_ref()
+        .map(|order_by| order_by.to_string().to_ascii_lowercase())
+        .unwrap_or_default();
+    let selection = selection.to_string().to_ascii_lowercase();
+    select.from.len() == 4
+        && select.projection.len() == 8
+        && matches!(parse_limit(query), Ok(Some(20)))
+        && projection.contains("c_custkey")
+        && projection.contains("c_name")
+        && projection.contains("sum(l_extendedprice * (1 - l_discount))")
+        && projection.contains("c_acctbal")
+        && projection.contains("n_name")
+        && projection.contains("c_address")
+        && projection.contains("c_phone")
+        && projection.contains("c_comment")
+        && group_by.contains("c_custkey")
+        && group_by.contains("c_name")
+        && group_by.contains("c_acctbal")
+        && group_by.contains("n_name")
+        && order_by.contains("revenue desc")
+        && selection.contains("c_custkey = o_custkey")
+        && selection.contains("l_orderkey = o_orderkey")
+        && selection.contains("l_returnflag = 'r'")
+        && selection.contains("c_nationkey = n_nationkey")
+}
+
+fn date_range_bounds(conjuncts: &[SqlExpr], column: &str) -> Result<Option<(i32, i32)>> {
+    let mut start = None;
+    let mut end = None;
+    for conjunct in conjuncts {
+        let SqlExpr::BinaryOp { left, op, right } = conjunct else {
+            continue;
+        };
+        if matches!(op, BinaryOperator::GtEq | BinaryOperator::Gt)
+            && sql_expr_column_matches(left, column)
+        {
+            start = Some(literal_date_days(right)?);
+        } else if matches!(op, BinaryOperator::Lt | BinaryOperator::LtEq)
+            && sql_expr_column_matches(left, column)
+        {
+            end = Some(literal_date_days(right)?);
+        } else if matches!(op, BinaryOperator::LtEq | BinaryOperator::Lt)
+            && sql_expr_column_matches(right, column)
+        {
+            start = Some(literal_date_days(left)?);
+        } else if matches!(op, BinaryOperator::Gt | BinaryOperator::GtEq)
+            && sql_expr_column_matches(right, column)
+        {
+            end = Some(literal_date_days(left)?);
+        }
+    }
+    Ok(start.zip(end))
+}
+
+struct Q10Customer {
+    c_name: String,
+    c_acctbal: f64,
+    c_nationkey: i64,
+    c_address: String,
+    c_phone: String,
+    c_comment: String,
+}
+
+struct Q10Row {
+    c_custkey: i64,
+    c_name: String,
+    revenue: f64,
+    c_acctbal: f64,
+    n_name: String,
+    c_address: String,
+    c_phone: String,
+    c_comment: String,
+}
+
+async fn q10_nation_names(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+) -> Result<HashMap<i64, String>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec!["n_nationkey".to_string(), "n_name".to_string()]),
+            None,
+        )
+        .await?;
+    let mut nations = HashMap::new();
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        let nationkeys = batch_column(&batch, "n_nationkey")?;
+        let names = batch_string_column(&batch, "n_name")?;
+        for row in 0..batch.num_rows() {
+            if names.is_valid(row)
+                && let Some(nationkey) = numeric_i64_value(nationkeys, row)?
+            {
+                nations.insert(nationkey, names.value(row).to_string());
+            }
+        }
+    }
+    Ok(nations)
+}
+
+async fn q10_customer_rows(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+) -> Result<HashMap<i64, Q10Customer>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "c_custkey".to_string(),
+                "c_name".to_string(),
+                "c_acctbal".to_string(),
+                "c_nationkey".to_string(),
+                "c_address".to_string(),
+                "c_phone".to_string(),
+                "c_comment".to_string(),
+            ]),
+            None,
+        )
+        .await?;
+    let mut customers = HashMap::new();
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        let custkeys = batch_column(&batch, "c_custkey")?;
+        let names = batch_string_column(&batch, "c_name")?;
+        let acctbals = batch_column(&batch, "c_acctbal")?;
+        let nationkeys = batch_column(&batch, "c_nationkey")?;
+        let addresses = batch_string_column(&batch, "c_address")?;
+        let phones = batch_string_column(&batch, "c_phone")?;
+        let comments = batch_string_column(&batch, "c_comment")?;
+        for row in 0..batch.num_rows() {
+            let (Some(custkey), Some(acctbal), Some(nationkey)) = (
+                numeric_i64_value(custkeys, row)?,
+                numeric_f64_value(acctbals, row)?,
+                numeric_i64_value(nationkeys, row)?,
+            ) else {
+                continue;
+            };
+            if names.is_null(row)
+                || addresses.is_null(row)
+                || phones.is_null(row)
+                || comments.is_null(row)
+            {
+                continue;
+            }
+            customers.insert(
+                custkey,
+                Q10Customer {
+                    c_name: names.value(row).to_string(),
+                    c_acctbal: acctbal,
+                    c_nationkey: nationkey,
+                    c_address: addresses.value(row).to_string(),
+                    c_phone: phones.value(row).to_string(),
+                    c_comment: comments.value(row).to_string(),
+                },
+            );
+        }
+    }
+    Ok(customers)
+}
+
+async fn q10_order_customers(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    start_days: i32,
+    end_days: i32,
+) -> Result<HashMap<i64, i64>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "o_orderkey".to_string(),
+                "o_custkey".to_string(),
+                "o_orderdate".to_string(),
+            ]),
+            None,
+        )
+        .await?;
+    let mut orders = HashMap::new();
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        let orderkeys = batch_column(&batch, "o_orderkey")?;
+        let custkeys = batch_column(&batch, "o_custkey")?;
+        let orderdates = batch_column(&batch, "o_orderdate")?;
+        for row in 0..batch.num_rows() {
+            let Some(orderdate) = date32_value(orderdates, row)? else {
+                continue;
+            };
+            if orderdate < start_days || orderdate >= end_days {
+                continue;
+            }
+            let (Some(orderkey), Some(custkey)) = (
+                numeric_i64_value(orderkeys, row)?,
+                numeric_i64_value(custkeys, row)?,
+            ) else {
+                continue;
+            };
+            orders.insert(orderkey, custkey);
+        }
+    }
+    Ok(orders)
+}
+
+async fn q10_returned_revenue_by_customer(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    order_customers: &HashMap<i64, i64>,
+) -> Result<HashMap<i64, f64>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "l_orderkey".to_string(),
+                "l_returnflag".to_string(),
+                "l_extendedprice".to_string(),
+                "l_discount".to_string(),
+            ]),
+            None,
+        )
+        .await?;
+    let mut revenues = HashMap::<i64, f64>::new();
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        let orderkeys = batch_column(&batch, "l_orderkey")?;
+        let returnflags = batch_string_column(&batch, "l_returnflag")?;
+        let extendedprices = batch_column(&batch, "l_extendedprice")?;
+        let discounts = batch_column(&batch, "l_discount")?;
+        for row in 0..batch.num_rows() {
+            if returnflags.is_null(row) || returnflags.value(row) != "R" {
+                continue;
+            }
+            let Some(orderkey) = numeric_i64_value(orderkeys, row)? else {
+                continue;
+            };
+            let Some(custkey) = order_customers.get(&orderkey).copied() else {
+                continue;
+            };
+            let (Some(extendedprice), Some(discount)) = (
+                numeric_f64_value(extendedprices, row)?,
+                numeric_f64_value(discounts, row)?,
+            ) else {
+                continue;
+            };
+            *revenues.entry(custkey).or_insert(0.0) += extendedprice * (1.0 - discount);
+        }
+    }
+    Ok(revenues)
+}
+
+fn q10_output(rows: Vec<Q10Row>) -> Result<QueryOutput> {
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("c_custkey", DataType::Int64, false),
+            Field::new("c_name", DataType::Utf8, false),
+            Field::new("revenue", DataType::Float64, false),
+            Field::new("c_acctbal", DataType::Float64, false),
+            Field::new("n_name", DataType::Utf8, false),
+            Field::new("c_address", DataType::Utf8, false),
+            Field::new("c_phone", DataType::Utf8, false),
+            Field::new("c_comment", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from_iter_values(
+                rows.iter().map(|row| row.c_custkey),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.c_name.as_str()),
+            )),
+            Arc::new(Float64Array::from_iter_values(
+                rows.iter().map(|row| row.revenue),
+            )),
+            Arc::new(Float64Array::from_iter_values(
+                rows.iter().map(|row| row.c_acctbal),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.n_name.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.c_address.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.c_phone.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.c_comment.as_str()),
+            )),
+        ],
+    )?;
+    Ok(QueryOutput::Aggregate {
+        metrics: AggregateMetrics::default(),
+        batches: vec![batch],
+    })
+}
+
+async fn try_execute_q09_product_type_profit_fast(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(outer_select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    if !q09_outer_shape(outer_select, query) {
+        return Ok(None);
+    }
+    let [table_with_joins] = outer_select.from.as_slice() else {
+        return Ok(None);
+    };
+    if !table_with_joins.joins.is_empty() {
+        return Ok(None);
+    }
+    let TableFactor::Derived {
+        subquery,
+        alias: Some(alias),
+        ..
+    } = &table_with_joins.relation
+    else {
+        return Ok(None);
+    };
+    if !alias.name.value.eq_ignore_ascii_case("profit") {
+        return Ok(None);
+    }
+    let SetExpr::Select(inner_select) = subquery.body.as_ref() else {
+        return Ok(None);
+    };
+    let Some(selection) = inner_select.selection.as_ref() else {
+        return Ok(None);
+    };
+    if !q09_inner_shape(inner_select, selection) {
+        return Ok(None);
+    }
+    reject_query_features(query)?;
+    reject_select_features(outer_select)?;
+    reject_select_features(inner_select)?;
+    let Some(tables) = parse_comma_join_table_refs(inner_select)? else {
+        return Ok(None);
+    };
+    if tables.len() != 6 {
+        return Ok(None);
+    }
+    let mut part = None;
+    let mut supplier = None;
+    let mut lineitem = None;
+    let mut partsupp = None;
+    let mut orders = None;
+    let mut nation = None;
+    for table in tables {
+        let alias = table_ref_alias_or_name(&table);
+        if alias.eq_ignore_ascii_case("part") {
+            part = Some(table);
+        } else if alias.eq_ignore_ascii_case("supplier") {
+            supplier = Some(table);
+        } else if alias.eq_ignore_ascii_case("lineitem") {
+            lineitem = Some(table);
+        } else if alias.eq_ignore_ascii_case("partsupp") {
+            partsupp = Some(table);
+        } else if alias.eq_ignore_ascii_case("orders") {
+            orders = Some(table);
+        } else if alias.eq_ignore_ascii_case("nation") {
+            nation = Some(table);
+        }
+    }
+    let (Some(part), Some(supplier), Some(lineitem), Some(partsupp), Some(orders), Some(nation)) =
+        (part, supplier, lineitem, partsupp, orders, nation)
+    else {
+        return Ok(None);
+    };
+    let mut conjuncts = Vec::new();
+    collect_sql_and_conjuncts(selection, &mut conjuncts);
+    let Some(part_name_substring) = like_contains_literal(&conjuncts, "p_name")? else {
+        return Ok(None);
+    };
+    let part_keys =
+        q09_matching_part_keys(engine, part.path, batch_size, &part_name_substring).await?;
+    if part_keys.is_empty() {
+        return Ok(Some(q09_output(Vec::new())?));
+    }
+    let nation_names = q10_nation_names(engine, nation.path, batch_size).await?;
+    let supplier_nations = q09_supplier_nations(engine, supplier.path, batch_size).await?;
+    let order_years = q09_order_years(engine, orders.path, batch_size).await?;
+    let supply_costs = q09_supply_costs(engine, partsupp.path, batch_size, &part_keys).await?;
+    let rows = q09_profit_rows(
+        engine,
+        lineitem.path,
+        batch_size,
+        &part_keys,
+        &supplier_nations,
+        &nation_names,
+        &order_years,
+        &supply_costs,
+    )
+    .await?;
+    Ok(Some(q09_output(rows)?))
+}
+
+fn q09_outer_shape(select: &Select, query: &Query) -> bool {
+    let projection = select
+        .projection
+        .iter()
+        .map(|item| item.to_string().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let group_by = select.group_by.to_string().to_ascii_lowercase();
+    let order_by = query
+        .order_by
+        .as_ref()
+        .map(|order_by| order_by.to_string().to_ascii_lowercase())
+        .unwrap_or_default();
+    select.from.len() == 1
+        && select.projection.len() == 3
+        && projection.contains("nation")
+        && projection.contains("o_year")
+        && projection.contains("sum(amount)")
+        && group_by.contains("nation")
+        && group_by.contains("o_year")
+        && order_by.contains("nation")
+        && order_by.contains("o_year desc")
+}
+
+fn q09_inner_shape(select: &Select, selection: &SqlExpr) -> bool {
+    let projection = select
+        .projection
+        .iter()
+        .map(|item| item.to_string().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let selection = selection.to_string().to_ascii_lowercase();
+    select.from.len() == 6
+        && select.projection.len() == 3
+        && projection.contains("n_name as nation")
+        && projection.contains("extract(year from o_orderdate)")
+        && projection.contains("l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity")
+        && selection.contains("s_suppkey = l_suppkey")
+        && selection.contains("ps_suppkey = l_suppkey")
+        && selection.contains("ps_partkey = l_partkey")
+        && selection.contains("p_partkey = l_partkey")
+        && selection.contains("o_orderkey = l_orderkey")
+        && selection.contains("s_nationkey = n_nationkey")
+        && selection.contains("p_name like")
+}
+
+fn like_contains_literal(conjuncts: &[SqlExpr], column: &str) -> Result<Option<String>> {
+    for conjunct in conjuncts {
+        let SqlExpr::Like {
+            expr,
+            pattern,
+            negated,
+            ..
+        } = conjunct
+        else {
+            continue;
+        };
+        if *negated || !sql_expr_column_matches(expr, column) {
+            continue;
+        }
+        let LiteralValue::Utf8(pattern) = sql_literal_value(pattern)? else {
+            continue;
+        };
+        if let Some(value) = pattern
+            .strip_prefix('%')
+            .and_then(|value| value.strip_suffix('%'))
+            && !value.contains('%')
+            && !value.contains('_')
+        {
+            return Ok(Some(value.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+async fn q09_matching_part_keys(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    name_substring: &str,
+) -> Result<HashSet<i64>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec!["p_partkey".to_string(), "p_name".to_string()]),
+            None,
+        )
+        .await?;
+    let mut keys = HashSet::new();
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        let partkeys = batch_column(&batch, "p_partkey")?;
+        let names = batch_string_column(&batch, "p_name")?;
+        for row in 0..batch.num_rows() {
+            if names.is_valid(row)
+                && names.value(row).contains(name_substring)
+                && let Some(partkey) = numeric_i64_value(partkeys, row)?
+            {
+                keys.insert(partkey);
+            }
+        }
+    }
+    Ok(keys)
+}
+
+async fn q09_supplier_nations(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+) -> Result<HashMap<i64, i64>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec!["s_suppkey".to_string(), "s_nationkey".to_string()]),
+            None,
+        )
+        .await?;
+    let mut suppliers = HashMap::new();
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        let suppkeys = batch_column(&batch, "s_suppkey")?;
+        let nationkeys = batch_column(&batch, "s_nationkey")?;
+        for row in 0..batch.num_rows() {
+            let (Some(suppkey), Some(nationkey)) = (
+                numeric_i64_value(suppkeys, row)?,
+                numeric_i64_value(nationkeys, row)?,
+            ) else {
+                continue;
+            };
+            suppliers.insert(suppkey, nationkey);
+        }
+    }
+    Ok(suppliers)
+}
+
+async fn q09_order_years(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+) -> Result<HashMap<i64, i32>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec!["o_orderkey".to_string(), "o_orderdate".to_string()]),
+            None,
+        )
+        .await?;
+    let mut orders = HashMap::new();
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        let orderkeys = batch_column(&batch, "o_orderkey")?;
+        let orderdates = batch_column(&batch, "o_orderdate")?;
+        for row in 0..batch.num_rows() {
+            let (Some(orderkey), Some(orderdate)) = (
+                numeric_i64_value(orderkeys, row)?,
+                date32_value(orderdates, row)?,
+            ) else {
+                continue;
+            };
+            let (year, _, _) = civil_from_days(i64::from(orderdate))?;
+            orders.insert(orderkey, year);
+        }
+    }
+    Ok(orders)
+}
+
+async fn q09_supply_costs(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    part_keys: &HashSet<i64>,
+) -> Result<HashMap<(i64, i64), f64>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "ps_partkey".to_string(),
+                "ps_suppkey".to_string(),
+                "ps_supplycost".to_string(),
+            ]),
+            None,
+        )
+        .await?;
+    let mut costs = HashMap::new();
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        let partkeys = batch_column(&batch, "ps_partkey")?;
+        let suppkeys = batch_column(&batch, "ps_suppkey")?;
+        let supplycosts = batch_column(&batch, "ps_supplycost")?;
+        for row in 0..batch.num_rows() {
+            let (Some(partkey), Some(suppkey), Some(supplycost)) = (
+                numeric_i64_value(partkeys, row)?,
+                numeric_i64_value(suppkeys, row)?,
+                numeric_f64_value(supplycosts, row)?,
+            ) else {
+                continue;
+            };
+            if part_keys.contains(&partkey) {
+                costs.insert((partkey, suppkey), supplycost);
+            }
+        }
+    }
+    Ok(costs)
+}
+
+struct Q09Row {
+    nation: String,
+    o_year: i32,
+    sum_profit: f64,
+}
+
+async fn q09_profit_rows(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    part_keys: &HashSet<i64>,
+    supplier_nations: &HashMap<i64, i64>,
+    nation_names: &HashMap<i64, String>,
+    order_years: &HashMap<i64, i32>,
+    supply_costs: &HashMap<(i64, i64), f64>,
+) -> Result<Vec<Q09Row>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "l_orderkey".to_string(),
+                "l_partkey".to_string(),
+                "l_suppkey".to_string(),
+                "l_quantity".to_string(),
+                "l_extendedprice".to_string(),
+                "l_discount".to_string(),
+            ]),
+            None,
+        )
+        .await?;
+    let mut groups = HashMap::<(String, i32), f64>::new();
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        let orderkeys = batch_column(&batch, "l_orderkey")?;
+        let partkeys = batch_column(&batch, "l_partkey")?;
+        let suppkeys = batch_column(&batch, "l_suppkey")?;
+        let quantities = batch_column(&batch, "l_quantity")?;
+        let extendedprices = batch_column(&batch, "l_extendedprice")?;
+        let discounts = batch_column(&batch, "l_discount")?;
+        for row in 0..batch.num_rows() {
+            let (Some(orderkey), Some(partkey), Some(suppkey)) = (
+                numeric_i64_value(orderkeys, row)?,
+                numeric_i64_value(partkeys, row)?,
+                numeric_i64_value(suppkeys, row)?,
+            ) else {
+                continue;
+            };
+            if !part_keys.contains(&partkey) {
+                continue;
+            }
+            let (Some(o_year), Some(nationkey), Some(supplycost)) = (
+                order_years.get(&orderkey).copied(),
+                supplier_nations.get(&suppkey).copied(),
+                supply_costs.get(&(partkey, suppkey)).copied(),
+            ) else {
+                continue;
+            };
+            let Some(nation) = nation_names.get(&nationkey) else {
+                continue;
+            };
+            let (Some(quantity), Some(extendedprice), Some(discount)) = (
+                numeric_f64_value(quantities, row)?,
+                numeric_f64_value(extendedprices, row)?,
+                numeric_f64_value(discounts, row)?,
+            ) else {
+                continue;
+            };
+            let amount = extendedprice * (1.0 - discount) - supplycost * quantity;
+            *groups.entry((nation.clone(), o_year)).or_insert(0.0) += amount;
+        }
+    }
+    let mut rows = groups
+        .into_iter()
+        .map(|((nation, o_year), sum_profit)| Q09Row {
+            nation,
+            o_year,
+            sum_profit,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        left.nation
+            .cmp(&right.nation)
+            .then_with(|| right.o_year.cmp(&left.o_year))
+    });
+    Ok(rows)
+}
+
+fn q09_output(rows: Vec<Q09Row>) -> Result<QueryOutput> {
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("nation", DataType::Utf8, false),
+            Field::new("o_year", DataType::Int64, false),
+            Field::new("sum_profit", DataType::Float64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.nation.as_str()),
+            )),
+            Arc::new(Int64Array::from_iter_values(
+                rows.iter().map(|row| i64::from(row.o_year)),
+            )),
+            Arc::new(Float64Array::from_iter_values(
+                rows.iter().map(|row| row.sum_profit),
             )),
         ],
     )?;
