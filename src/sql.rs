@@ -3099,29 +3099,72 @@ async fn q10_order_customers(
             None,
         )
         .await?;
+    parallel_batch_fold(
+        &mut stream,
+        move |batch| q10_order_customers_batch(batch, start_days, end_days),
+        HashMap::<i64, i64>::new(),
+        merge_maps,
+        "Q10 order customers",
+    )
+}
+
+fn q10_order_customers_batch(
+    batch: RecordBatch,
+    start_days: i32,
+    end_days: i32,
+) -> Result<HashMap<i64, i64>> {
+    let orderkeys = batch_column(&batch, "o_orderkey")?;
+    let custkeys = batch_column(&batch, "o_custkey")?;
+    let orderdates = batch_column(&batch, "o_orderdate")?;
+    if let Some(orders) =
+        q10_order_customers_batch_typed(orderkeys, custkeys, orderdates, start_days, end_days)
+    {
+        return Ok(orders);
+    }
     let mut orders = HashMap::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let orderkeys = batch_column(&batch, "o_orderkey")?;
-        let custkeys = batch_column(&batch, "o_custkey")?;
-        let orderdates = batch_column(&batch, "o_orderdate")?;
-        for row in 0..batch.num_rows() {
-            let Some(orderdate) = date32_value(orderdates, row)? else {
-                continue;
-            };
-            if orderdate < start_days || orderdate >= end_days {
-                continue;
-            }
-            let (Some(orderkey), Some(custkey)) = (
-                numeric_i64_value(orderkeys, row)?,
-                numeric_i64_value(custkeys, row)?,
-            ) else {
-                continue;
-            };
-            orders.insert(orderkey, custkey);
+    for row in 0..batch.num_rows() {
+        let Some(orderdate) = date32_value(orderdates, row)? else {
+            continue;
+        };
+        if orderdate < start_days || orderdate >= end_days {
+            continue;
         }
+        let (Some(orderkey), Some(custkey)) = (
+            numeric_i64_value(orderkeys, row)?,
+            numeric_i64_value(custkeys, row)?,
+        ) else {
+            continue;
+        };
+        orders.insert(orderkey, custkey);
     }
     Ok(orders)
+}
+
+fn q10_order_customers_batch_typed(
+    orderkeys: &ArrayRef,
+    custkeys: &ArrayRef,
+    orderdates: &ArrayRef,
+    start_days: i32,
+    end_days: i32,
+) -> Option<HashMap<i64, i64>> {
+    let (Some(orderkeys), Some(custkeys), Some(orderdates)) = (
+        orderkeys.as_any().downcast_ref::<Int64Array>(),
+        custkeys.as_any().downcast_ref::<Int64Array>(),
+        orderdates.as_any().downcast_ref::<Date32Array>(),
+    ) else {
+        return None;
+    };
+    let mut orders = HashMap::new();
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || custkeys.is_null(row) || orderdates.is_null(row) {
+            continue;
+        }
+        let orderdate = orderdates.value(row);
+        if orderdate >= start_days && orderdate < end_days {
+            orders.insert(orderkeys.value(row), custkeys.value(row));
+        }
+    }
+    Some(orders)
 }
 
 async fn q10_returned_revenue_by_customer(
@@ -4507,7 +4550,7 @@ struct Q12Row {
     low_line_count: u64,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Q12PendingOrder {
     counts: HashMap<String, u64>,
 }
@@ -4620,32 +4663,14 @@ async fn q12_shipping_mode_counts_from_orders(
             None,
         )
         .await?;
-    let mut groups = HashMap::<String, Q12State>::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let orderkeys = batch_column(&batch, "o_orderkey")?;
-        let orderpriorities = batch_string_column(&batch, "o_orderpriority")?;
-        for row in 0..batch.num_rows() {
-            if orderpriorities.is_null(row) {
-                continue;
-            }
-            let Some(orderkey) = numeric_i64_value(orderkeys, row)? else {
-                continue;
-            };
-            let Some(order) = pending.get(&orderkey) else {
-                continue;
-            };
-            let is_high_priority = matches!(orderpriorities.value(row), "1-URGENT" | "2-HIGH");
-            for (mode, count) in &order.counts {
-                let group = groups.entry(mode.clone()).or_default();
-                if is_high_priority {
-                    group.high_line_count += *count;
-                } else {
-                    group.low_line_count += *count;
-                }
-            }
-        }
-    }
+    let pending = Arc::new((*pending).clone());
+    let groups = parallel_batch_fold(
+        &mut stream,
+        move |batch| q12_shipping_mode_counts_batch(batch, &pending),
+        HashMap::<String, Q12State>::new(),
+        q12_merge_shipping_mode_counts,
+        "Q12 orders aggregate",
+    )?;
     let mut rows = groups
         .into_iter()
         .map(|(shipmode, state)| Q12Row {
@@ -4656,6 +4681,47 @@ async fn q12_shipping_mode_counts_from_orders(
         .collect::<Vec<_>>();
     rows.sort_by(|left, right| left.shipmode.cmp(&right.shipmode));
     Ok(rows)
+}
+
+fn q12_shipping_mode_counts_batch(
+    batch: RecordBatch,
+    pending: &HashMap<i64, Q12PendingOrder>,
+) -> Result<HashMap<String, Q12State>> {
+    let orderkeys = batch_column(&batch, "o_orderkey")?;
+    let orderpriorities = batch_string_column(&batch, "o_orderpriority")?;
+    let mut groups = HashMap::<String, Q12State>::new();
+    for row in 0..batch.num_rows() {
+        if orderpriorities.is_null(row) {
+            continue;
+        }
+        let Some(orderkey) = numeric_i64_value(orderkeys, row)? else {
+            continue;
+        };
+        let Some(order) = pending.get(&orderkey) else {
+            continue;
+        };
+        let is_high_priority = matches!(orderpriorities.value(row), "1-URGENT" | "2-HIGH");
+        for (mode, count) in &order.counts {
+            let group = groups.entry(mode.clone()).or_default();
+            if is_high_priority {
+                group.high_line_count += *count;
+            } else {
+                group.low_line_count += *count;
+            }
+        }
+    }
+    Ok(groups)
+}
+
+fn q12_merge_shipping_mode_counts(
+    groups: &mut HashMap<String, Q12State>,
+    batch_groups: HashMap<String, Q12State>,
+) {
+    for (shipmode, state) in batch_groups {
+        let group = groups.entry(shipmode).or_default();
+        group.high_line_count += state.high_line_count;
+        group.low_line_count += state.low_line_count;
+    }
 }
 
 fn q12_output(rows: Vec<Q12Row>) -> Result<QueryOutput> {
