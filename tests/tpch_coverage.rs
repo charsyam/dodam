@@ -300,7 +300,7 @@ LIMIT 20
         },
         TpchQuery {
             name: "q11_important_stock",
-            expected_status: "needs-data:partsupp",
+            expected_status: "needs-data:nation",
             sql: r#"
 SELECT
     ps_partkey,

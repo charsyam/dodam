@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
+use std::time::Instant;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float64Array,
@@ -35,6 +36,24 @@ use crate::execution::{
     evaluate_filter_mask, filter_batch,
 };
 use crate::optimizer::plan_join_inputs;
+
+fn tpch_profile_enabled() -> bool {
+    std::env::var("DODAM_TPCH_PROFILE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn tpch_profile_start() -> Option<Instant> {
+    tpch_profile_enabled().then(Instant::now)
+}
+
+fn tpch_profile_elapsed(label: &str, started: Option<Instant>) {
+    if let Some(started) = started {
+        eprintln!(
+            "[dodam:tpch-profile] {label}: {:.3} ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
 
 #[derive(Debug)]
 pub enum QueryOutput {
@@ -123,6 +142,9 @@ pub async fn execute_sql(
         return Ok(output);
     }
     if let Some(output) = try_execute_q09_product_type_profit_fast(engine, sql, batch_size).await? {
+        return Ok(output);
+    }
+    if let Some(output) = try_execute_q11_important_stock_fast(engine, sql, batch_size).await? {
         return Ok(output);
     }
     if let Some(output) =
@@ -2601,6 +2623,8 @@ where
     Map: Fn(RecordBatch) -> Result<Partial> + Send + Sync + Clone + 'static,
     Merge: FnMut(&mut Output, Partial),
 {
+    let profile = tpch_profile_enabled();
+    let started = profile.then(Instant::now);
     let (sender, receiver) = mpsc::channel();
     let mut pending_batches = 0_usize;
     while let Some(batch) = stream.next() {
@@ -2613,11 +2637,82 @@ where
         });
     }
     drop(sender);
+    let merge_started = profile.then(Instant::now);
     for _ in 0..pending_batches {
         let partial = receiver
             .recv()
             .map_err(|_| DodamError::UnsupportedSql(format!("{label} worker stopped")))??;
         merge(&mut output, partial);
+    }
+    if let Some(started) = started {
+        let merge_ms = merge_started
+            .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or_default();
+        eprintln!(
+            "[dodam:tpch-profile] {label}: total={:.3} ms worker_wait_merge={:.3} ms batches={pending_batches}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            merge_ms
+        );
+    }
+    Ok(output)
+}
+
+fn parallel_batch_fold_chunked<Partial, Output, Map, Merge>(
+    stream: &mut SendableBatchStream,
+    chunk_size: usize,
+    map: Map,
+    mut output: Output,
+    mut merge: Merge,
+    label: &str,
+) -> Result<Output>
+where
+    Partial: Send + 'static,
+    Map: Fn(Vec<RecordBatch>) -> Result<Partial> + Send + Sync + Clone + 'static,
+    Merge: FnMut(&mut Output, Partial),
+{
+    let profile = tpch_profile_enabled();
+    let started = profile.then(Instant::now);
+    let (sender, receiver) = mpsc::channel();
+    let mut pending_chunks = 0_usize;
+    let mut chunk = Vec::with_capacity(chunk_size);
+    while let Some(batch) = stream.next() {
+        chunk.push(batch?);
+        if chunk.len() < chunk_size {
+            continue;
+        }
+        let sender = sender.clone();
+        let map = map.clone();
+        let batches = std::mem::take(&mut chunk);
+        pending_chunks += 1;
+        rayon::spawn(move || {
+            let _ = sender.send(map(batches));
+        });
+    }
+    if !chunk.is_empty() {
+        let sender = sender.clone();
+        let map = map.clone();
+        pending_chunks += 1;
+        rayon::spawn(move || {
+            let _ = sender.send(map(chunk));
+        });
+    }
+    drop(sender);
+    let merge_started = profile.then(Instant::now);
+    for _ in 0..pending_chunks {
+        let partial = receiver
+            .recv()
+            .map_err(|_| DodamError::UnsupportedSql(format!("{label} worker stopped")))??;
+        merge(&mut output, partial);
+    }
+    if let Some(started) = started {
+        let merge_ms = merge_started
+            .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or_default();
+        eprintln!(
+            "[dodam:tpch-profile] {label}: total={:.3} ms worker_wait_merge={:.3} ms chunks={pending_chunks}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            merge_ms
+        );
     }
     Ok(output)
 }
@@ -3886,15 +3981,26 @@ async fn try_execute_q09_product_type_profit_fast(
     let Some(part_name_substring) = like_contains_literal(&conjuncts, "p_name")? else {
         return Ok(None);
     };
+    let stage = tpch_profile_start();
     let part_keys =
         q09_matching_part_keys(engine, part.path, batch_size, &part_name_substring).await?;
+    tpch_profile_elapsed("Q09 matching part keys", stage);
     if part_keys.is_empty() {
         return Ok(Some(q09_output(Vec::new())?));
     }
+    let stage = tpch_profile_start();
     let nation_names = q10_nation_names(engine, nation.path, batch_size).await?;
+    tpch_profile_elapsed("Q09 nation names", stage);
+    let stage = tpch_profile_start();
     let supplier_nations = q09_supplier_nations(engine, supplier.path, batch_size).await?;
+    tpch_profile_elapsed("Q09 supplier nations", stage);
+    let stage = tpch_profile_start();
     let order_years = q09_order_years(engine, orders.path, batch_size).await?;
+    tpch_profile_elapsed("Q09 order years", stage);
+    let stage = tpch_profile_start();
     let supply_costs = q09_supply_costs(engine, partsupp.path, batch_size, &part_keys).await?;
+    tpch_profile_elapsed("Q09 supply costs", stage);
+    let stage = tpch_profile_start();
     let rows = q09_profit_rows(
         engine,
         lineitem.path,
@@ -3906,6 +4012,7 @@ async fn try_execute_q09_product_type_profit_fast(
         &supply_costs,
     )
     .await?;
+    tpch_profile_elapsed("Q09 lineitem profit rows", stage);
     Ok(Some(q09_output(rows)?))
 }
 
@@ -4408,6 +4515,286 @@ fn q09_output(rows: Vec<Q09Row>) -> Result<QueryOutput> {
             )),
             Arc::new(Float64Array::from_iter_values(
                 rows.iter().map(|row| row.sum_profit),
+            )),
+        ],
+    )?;
+    Ok(QueryOutput::Aggregate {
+        metrics: AggregateMetrics::default(),
+        batches: vec![batch],
+    })
+}
+
+async fn try_execute_q11_important_stock_fast(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let Some(selection) = select.selection.as_ref() else {
+        return Ok(None);
+    };
+    if !q11_shape(select, query, selection) {
+        return Ok(None);
+    }
+    reject_query_features(query)?;
+    reject_select_features(select)?;
+    let Some(tables) = parse_comma_join_table_refs(select)? else {
+        return Ok(None);
+    };
+    if tables.len() != 3 {
+        return Ok(None);
+    }
+    let mut partsupp = None;
+    let mut supplier = None;
+    let mut nation = None;
+    for table in tables {
+        let alias = table_ref_alias_or_name(&table);
+        if alias.eq_ignore_ascii_case("partsupp") {
+            partsupp = Some(table);
+        } else if alias.eq_ignore_ascii_case("supplier") {
+            supplier = Some(table);
+        } else if alias.eq_ignore_ascii_case("nation") {
+            nation = Some(table);
+        }
+    }
+    let (Some(partsupp), Some(supplier), Some(nation)) = (partsupp, supplier, nation) else {
+        return Ok(None);
+    };
+    let mut conjuncts = Vec::new();
+    collect_sql_and_conjuncts(selection, &mut conjuncts);
+    let Some(nation_name) = string_equality_literal(&conjuncts, "n_name")? else {
+        return Ok(None);
+    };
+    let stage = tpch_profile_start();
+    let nation_keys = q21_nation_keys(engine, nation.path, batch_size, &nation_name).await?;
+    tpch_profile_elapsed("Q11 nation keys", stage);
+    if nation_keys.is_empty() {
+        return Ok(Some(q11_output(Vec::new())?));
+    }
+    let stage = tpch_profile_start();
+    let supplier_keys = q11_supplier_keys(engine, supplier.path, batch_size, &nation_keys).await?;
+    tpch_profile_elapsed("Q11 supplier keys", stage);
+    if supplier_keys.is_empty() {
+        return Ok(Some(q11_output(Vec::new())?));
+    }
+    let stage = tpch_profile_start();
+    let rows = q11_important_stock_rows(engine, partsupp.path, batch_size, &supplier_keys).await?;
+    tpch_profile_elapsed("Q11 partsupp grouped value", stage);
+    Ok(Some(q11_output(rows)?))
+}
+
+fn q11_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
+    let projection = select
+        .projection
+        .iter()
+        .map(|item| item.to_string().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let group_by = select.group_by.to_string().to_ascii_lowercase();
+    let having = select
+        .having
+        .as_ref()
+        .map(|expr| expr.to_string().to_ascii_lowercase())
+        .unwrap_or_default();
+    let order_by = query
+        .order_by
+        .as_ref()
+        .map(|order_by| order_by.to_string().to_ascii_lowercase())
+        .unwrap_or_default();
+    let selection = selection.to_string().to_ascii_lowercase();
+    select.from.len() == 3
+        && select.projection.len() == 2
+        && projection.contains("ps_partkey")
+        && projection.contains("sum(ps_supplycost * ps_availqty)")
+        && group_by.contains("ps_partkey")
+        && having.contains("sum(ps_supplycost * ps_availqty)")
+        && having.contains("* 0.0001")
+        && order_by.contains("value desc")
+        && selection.contains("ps_suppkey = s_suppkey")
+        && selection.contains("s_nationkey = n_nationkey")
+        && selection.contains("n_name")
+}
+
+async fn q11_supplier_keys(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    nation_keys: &HashSet<i64>,
+) -> Result<HashSet<i64>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec!["s_suppkey".to_string(), "s_nationkey".to_string()]),
+            None,
+        )
+        .await?;
+    let mut suppliers = HashSet::new();
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        let suppkeys = batch_column(&batch, "s_suppkey")?;
+        let nationkeys = batch_column(&batch, "s_nationkey")?;
+        for row in 0..batch.num_rows() {
+            let (Some(suppkey), Some(nationkey)) = (
+                numeric_i64_value(suppkeys, row)?,
+                numeric_i64_value(nationkeys, row)?,
+            ) else {
+                continue;
+            };
+            if nation_keys.contains(&nationkey) {
+                suppliers.insert(suppkey);
+            }
+        }
+    }
+    Ok(suppliers)
+}
+
+async fn q11_important_stock_rows(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    supplier_keys: &HashSet<i64>,
+) -> Result<Vec<Q11Row>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "ps_partkey".to_string(),
+                "ps_suppkey".to_string(),
+                "ps_supplycost".to_string(),
+                "ps_availqty".to_string(),
+            ]),
+            None,
+        )
+        .await?;
+    let supplier_keys = Arc::new(supplier_keys.clone());
+    let (values, total) = parallel_batch_fold(
+        &mut stream,
+        move |batch| q11_important_stock_batch(batch, &supplier_keys),
+        (HashMap::<i64, f64>::new(), 0.0_f64),
+        |(values, total), (batch_values, batch_total)| {
+            *total += batch_total;
+            for (partkey, value) in batch_values {
+                *values.entry(partkey).or_insert(0.0) += value;
+            }
+        },
+        "Q11 partsupp value",
+    )?;
+    let threshold = total * 0.0001;
+    let mut rows = values
+        .into_iter()
+        .filter_map(|(ps_partkey, value)| {
+            (value > threshold).then_some(Q11Row { ps_partkey, value })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .value
+            .partial_cmp(&left.value)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.ps_partkey.cmp(&right.ps_partkey))
+    });
+    Ok(rows)
+}
+
+fn q11_important_stock_batch(
+    batch: RecordBatch,
+    supplier_keys: &HashSet<i64>,
+) -> Result<(HashMap<i64, f64>, f64)> {
+    let partkeys = batch_column(&batch, "ps_partkey")?;
+    let suppkeys = batch_column(&batch, "ps_suppkey")?;
+    let supplycosts = batch_column(&batch, "ps_supplycost")?;
+    let availqtys = batch_column(&batch, "ps_availqty")?;
+    if let Some(result) =
+        q11_important_stock_batch_typed(partkeys, suppkeys, supplycosts, availqtys, supplier_keys)?
+    {
+        return Ok(result);
+    }
+    let mut values = HashMap::new();
+    let mut total = 0.0_f64;
+    for row in 0..batch.num_rows() {
+        let (Some(partkey), Some(suppkey), Some(supplycost), Some(availqty)) = (
+            numeric_i64_value(partkeys, row)?,
+            numeric_i64_value(suppkeys, row)?,
+            numeric_f64_value(supplycosts, row)?,
+            numeric_f64_value(availqtys, row)?,
+        ) else {
+            continue;
+        };
+        if !supplier_keys.contains(&suppkey) {
+            continue;
+        }
+        let value = supplycost * availqty;
+        total += value;
+        *values.entry(partkey).or_insert(0.0) += value;
+    }
+    Ok((values, total))
+}
+
+fn q11_important_stock_batch_typed(
+    partkeys: &ArrayRef,
+    suppkeys: &ArrayRef,
+    supplycosts: &ArrayRef,
+    availqtys: &ArrayRef,
+    supplier_keys: &HashSet<i64>,
+) -> Result<Option<(HashMap<i64, f64>, f64)>> {
+    let (Some(partkeys), Some(suppkeys), Some(supplycosts), Some(availqtys)) = (
+        partkeys.as_any().downcast_ref::<Int64Array>(),
+        suppkeys.as_any().downcast_ref::<Int64Array>(),
+        q01_decimal_input(supplycosts)?,
+        availqtys.as_any().downcast_ref::<Int32Array>(),
+    ) else {
+        return Ok(None);
+    };
+    let mut values = HashMap::new();
+    let mut total = 0.0_f64;
+    for row in 0..partkeys.len() {
+        if partkeys.is_null(row)
+            || suppkeys.is_null(row)
+            || supplycosts.is_null(row)
+            || availqtys.is_null(row)
+        {
+            continue;
+        }
+        let suppkey = suppkeys.value(row);
+        if !supplier_keys.contains(&suppkey) {
+            continue;
+        }
+        let value = supplycosts.value(row) * f64::from(availqtys.value(row));
+        total += value;
+        *values.entry(partkeys.value(row)).or_insert(0.0) += value;
+    }
+    Ok(Some((values, total)))
+}
+
+struct Q11Row {
+    ps_partkey: i64,
+    value: f64,
+}
+
+fn q11_output(rows: Vec<Q11Row>) -> Result<QueryOutput> {
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("ps_partkey", DataType::Int64, false),
+            Field::new("value", DataType::Float64, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from_iter_values(
+                rows.iter().map(|row| row.ps_partkey),
+            )),
+            Arc::new(Float64Array::from_iter_values(
+                rows.iter().map(|row| row.value),
             )),
         ],
     )?;
@@ -5747,12 +6134,15 @@ async fn try_execute_q04_order_priority_fast(
     let Some((start_days, end_days)) = date_range_bounds(&conjuncts, "o_orderdate")? else {
         return Ok(None);
     };
+    let stage = tpch_profile_start();
     let (mut candidate_priorities, priority_labels) =
         q04_candidate_order_priorities(engine, orders.path, batch_size, start_days, end_days)
             .await?;
+    tpch_profile_elapsed("Q04 candidate order priorities", stage);
     if priority_labels.is_empty() {
         return Ok(Some(q04_output(Vec::new())?));
     }
+    let stage = tpch_profile_start();
     let counts = q04_count_late_candidate_priorities(
         engine,
         lineitem_path,
@@ -5761,7 +6151,10 @@ async fn try_execute_q04_order_priority_fast(
         priority_labels.len(),
     )
     .await?;
+    tpch_profile_elapsed("Q04 late lineitem probe", stage);
+    let stage = tpch_profile_start();
     let rows = q04_priority_count_rows(priority_labels, counts);
+    tpch_profile_elapsed("Q04 final rows", stage);
     Ok(Some(q04_output(rows)?))
 }
 
@@ -5798,10 +6191,7 @@ fn q04_lineitem_path(selection: &SqlExpr) -> Result<Option<PathBuf>> {
                 let SetExpr::Select(select) = subquery.body.as_ref() else {
                     continue;
                 };
-                let Some(tables) = parse_comma_join_table_refs(select)? else {
-                    continue;
-                };
-                for table in tables {
+                for table in q04_subquery_tables(select)? {
                     if table_ref_alias_or_name(&table).eq_ignore_ascii_case("lineitem") {
                         return Ok(Some(table.path));
                     }
@@ -5816,6 +6206,23 @@ fn q04_lineitem_path(selection: &SqlExpr) -> Result<Option<PathBuf>> {
         }
     }
     Ok(None)
+}
+
+fn q04_subquery_tables(select: &Select) -> Result<Vec<SqlTableRef>> {
+    if let Some(tables) = parse_comma_join_table_refs(select)? {
+        return Ok(tables);
+    }
+    if select.from.is_empty() {
+        return Ok(Vec::new());
+    }
+    if select.from.iter().any(|table| !table.joins.is_empty()) {
+        return Ok(Vec::new());
+    }
+    select
+        .from
+        .iter()
+        .map(|table| parse_table_factor(&table.relation))
+        .collect::<Result<Vec<_>>>()
 }
 
 struct Q04Row {
@@ -8466,6 +8873,7 @@ async fn try_execute_q18_large_volume_customer_fast(
         return Ok(None);
     };
 
+    let stage = tpch_profile_start();
     let order_quantity_sums = grouped_numeric_sum(
         engine,
         lineitem.path.clone(),
@@ -8474,18 +8882,26 @@ async fn try_execute_q18_large_volume_customer_fast(
         "l_quantity",
     )
     .await?;
+    tpch_profile_elapsed("Q18 lineitem quantity sums", stage);
+    let stage = tpch_profile_start();
     let qualifying_orders = order_quantity_sums
         .into_iter()
         .filter(|(_, sum)| *sum > 300.0)
         .collect::<HashMap<_, _>>();
+    tpch_profile_elapsed("Q18 qualifying filter", stage);
     if qualifying_orders.is_empty() {
         return Ok(Some(q18_output(Vec::new())?));
     }
     let qualifying_order_keys = qualifying_orders.keys().copied().collect::<HashSet<_>>();
+    let stage = tpch_profile_start();
     let order_rows =
         q18_qualifying_orders(engine, orders.path, batch_size, &qualifying_order_keys).await?;
+    tpch_profile_elapsed("Q18 qualifying orders", stage);
+    let stage = tpch_profile_start();
     let customer_names = q18_customer_names(engine, customer.path, batch_size).await?;
+    tpch_profile_elapsed("Q18 customer names", stage);
 
+    let stage = tpch_profile_start();
     let mut rows = Vec::new();
     for (orderkey, order) in order_rows {
         let Some(name) = customer_names.get(&order.custkey) else {
@@ -8511,6 +8927,7 @@ async fn try_execute_q18_large_volume_customer_fast(
             .then_with(|| left.o_orderdate.cmp(&right.o_orderdate))
     });
     rows.truncate(100);
+    tpch_profile_elapsed("Q18 final rows", stage);
     Ok(Some(q18_output(rows)?))
 }
 
@@ -8543,26 +8960,39 @@ async fn grouped_numeric_sum(
         .await?;
     let key_column = key_column.to_string();
     let value_column = value_column.to_string();
-    parallel_batch_fold(
+    parallel_batch_fold_chunked(
         &mut stream,
-        move |batch| grouped_numeric_sum_batch(batch, &key_column, &value_column),
+        16,
+        move |batches| grouped_numeric_sum_batches(batches, &key_column, &value_column),
         HashMap::<i64, f64>::new(),
         merge_f64_groups,
         "grouped numeric sum",
     )
 }
 
-fn grouped_numeric_sum_batch(
-    batch: RecordBatch,
+fn grouped_numeric_sum_batches(
+    batches: Vec<RecordBatch>,
     key_column: &str,
     value_column: &str,
 ) -> Result<HashMap<i64, f64>> {
+    let mut sums = HashMap::<i64, f64>::new();
+    for batch in batches {
+        grouped_numeric_sum_batch_into(&batch, key_column, value_column, &mut sums)?;
+    }
+    Ok(sums)
+}
+
+fn grouped_numeric_sum_batch_into(
+    batch: &RecordBatch,
+    key_column: &str,
+    value_column: &str,
+    sums: &mut HashMap<i64, f64>,
+) -> Result<()> {
     let keys = batch_column(&batch, key_column)?;
     let values = batch_column(&batch, value_column)?;
-    if let Some(sums) = i64_decimal_sums(keys, values)? {
-        return Ok(sums);
+    if i64_decimal_sums_into(keys, values, sums)? {
+        return Ok(());
     }
-    let mut sums = HashMap::<i64, f64>::new();
     for row in 0..batch.num_rows() {
         let (Some(key), Some(value)) = (
             numeric_i64_value(keys, row)?,
@@ -8572,24 +9002,27 @@ fn grouped_numeric_sum_batch(
         };
         *sums.entry(key).or_insert(0.0) += value;
     }
-    Ok(sums)
+    Ok(())
 }
 
-fn i64_decimal_sums(keys: &ArrayRef, values: &ArrayRef) -> Result<Option<HashMap<i64, f64>>> {
+fn i64_decimal_sums_into(
+    keys: &ArrayRef,
+    values: &ArrayRef,
+    sums: &mut HashMap<i64, f64>,
+) -> Result<bool> {
     let (Some(keys), Some(values)) = (
         keys.as_any().downcast_ref::<Int64Array>(),
         q01_decimal_input(values)?,
     ) else {
-        return Ok(None);
+        return Ok(false);
     };
-    let mut sums = HashMap::<i64, f64>::new();
     for row in 0..keys.len() {
         if keys.is_null(row) || values.is_null(row) {
             continue;
         }
         *sums.entry(keys.value(row)).or_insert(0.0) += values.value(row);
     }
-    Ok(Some(sums))
+    Ok(true)
 }
 
 struct Q18Order {
@@ -9221,17 +9654,26 @@ async fn try_execute_q21_suppliers_who_kept_orders_waiting_fast(
     else {
         return Ok(None);
     };
+    let stage = tpch_profile_start();
     let nation_keys = q21_nation_keys(engine, nation.path, batch_size, "SAUDI ARABIA").await?;
+    tpch_profile_elapsed("Q21 nation keys", stage);
+    let stage = tpch_profile_start();
     let suppliers = q21_supplier_names(engine, supplier.path, batch_size, &nation_keys).await?;
+    tpch_profile_elapsed("Q21 supplier names", stage);
     if suppliers.is_empty() {
         return Ok(Some(q21_output(Vec::new())?));
     }
+    let stage = tpch_profile_start();
     let final_orders = q21_final_order_keys(engine, orders.path, batch_size).await?;
+    tpch_profile_elapsed("Q21 final order keys", stage);
     if final_orders.is_empty() {
         return Ok(Some(q21_output(Vec::new())?));
     }
+    let stage = tpch_profile_start();
     let order_states =
         q21_lineitem_order_states(engine, lineitem.path, batch_size, &final_orders).await?;
+    tpch_profile_elapsed("Q21 lineitem order states", stage);
+    let stage = tpch_profile_start();
     let mut counts = HashMap::<i64, u64>::with_capacity(suppliers.len());
     for state in order_states.into_values() {
         if !state.has_multiple_suppliers || !state.has_single_late_supplier() {
@@ -9259,6 +9701,7 @@ async fn try_execute_q21_suppliers_who_kept_orders_waiting_fast(
             .then_with(|| left.s_name.cmp(&right.s_name))
     });
     rows.truncate(100);
+    tpch_profile_elapsed("Q21 final rows", stage);
     Ok(Some(q21_output(rows)?))
 }
 
