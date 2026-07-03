@@ -2839,10 +2839,21 @@ async fn try_execute_q10_returned_item_fast(
     if revenue_by_customer.is_empty() {
         return Ok(Some(q10_output(Vec::new())?));
     }
-    let revenue_customer_keys = revenue_by_customer.keys().copied().collect::<HashSet<_>>();
+    let mut top_revenues = revenue_by_customer.into_iter().collect::<Vec<_>>();
+    top_revenues.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    top_revenues.truncate(20);
+    let top_customer_keys = top_revenues
+        .iter()
+        .map(|(custkey, _)| *custkey)
+        .collect::<HashSet<_>>();
     let customers =
-        q10_customer_rows(engine, customer.path, batch_size, &revenue_customer_keys).await?;
-    let mut rows = revenue_by_customer
+        q10_customer_rows(engine, customer.path, batch_size, &top_customer_keys).await?;
+    let rows = top_revenues
         .into_iter()
         .filter_map(|(custkey, revenue)| {
             let customer = customers.get(&custkey)?;
@@ -2859,13 +2870,6 @@ async fn try_execute_q10_returned_item_fast(
             })
         })
         .collect::<Vec<_>>();
-    rows.sort_by(|left, right| {
-        right
-            .revenue
-            .partial_cmp(&left.revenue)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    rows.truncate(20);
     Ok(Some(q10_output(rows)?))
 }
 
@@ -5617,19 +5621,21 @@ async fn try_execute_q04_order_priority_fast(
     let Some((start_days, end_days)) = date_range_bounds(&conjuncts, "o_orderdate")? else {
         return Ok(None);
     };
-    let late_orders = q04_late_order_keys(engine, lineitem_path, batch_size).await?;
-    if late_orders.is_empty() {
+    let (mut candidate_priorities, priority_labels) =
+        q04_candidate_order_priorities(engine, orders.path, batch_size, start_days, end_days)
+            .await?;
+    if priority_labels.is_empty() {
         return Ok(Some(q04_output(Vec::new())?));
     }
-    let rows = q04_priority_counts(
+    let counts = q04_count_late_candidate_priorities(
         engine,
-        orders.path,
+        lineitem_path,
         batch_size,
-        &late_orders,
-        start_days,
-        end_days,
+        &mut candidate_priorities,
+        priority_labels.len(),
     )
     .await?;
+    let rows = q04_priority_count_rows(priority_labels, counts);
     Ok(Some(q04_output(rows)?))
 }
 
@@ -5686,59 +5692,18 @@ fn q04_lineitem_path(selection: &SqlExpr) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-async fn q04_late_order_keys(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-) -> Result<HashSet<i64>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec![
-                "l_orderkey".to_string(),
-                "l_commitdate".to_string(),
-                "l_receiptdate".to_string(),
-            ]),
-            None,
-        )
-        .await?;
-    let mut keys = HashSet::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let orderkeys = batch_column(&batch, "l_orderkey")?;
-        let commitdates = batch_column(&batch, "l_commitdate")?;
-        let receiptdates = batch_column(&batch, "l_receiptdate")?;
-        for row in 0..batch.num_rows() {
-            let (Some(orderkey), Some(commitdate), Some(receiptdate)) = (
-                numeric_i64_value(orderkeys, row)?,
-                date32_value(commitdates, row)?,
-                date32_value(receiptdates, row)?,
-            ) else {
-                continue;
-            };
-            if commitdate < receiptdate {
-                keys.insert(orderkey);
-            }
-        }
-    }
-    Ok(keys)
-}
-
 struct Q04Row {
     priority: String,
     count: u64,
 }
 
-async fn q04_priority_counts(
+async fn q04_candidate_order_priorities(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-    late_orders: &HashSet<i64>,
     start_days: i32,
     end_days: i32,
-) -> Result<Vec<Q04Row>> {
+) -> Result<(Vec<u8>, Vec<String>)> {
     let mut stream = engine
         .scan_parquet_batches(
             path,
@@ -5752,14 +5717,16 @@ async fn q04_priority_counts(
             None,
         )
         .await?;
-    let mut counts = HashMap::<String, u64>::new();
+    let mut priorities = Vec::<u8>::new();
+    let mut labels = Vec::<String>::new();
+    let mut label_indices = HashMap::<String, u8>::new();
     while let Some(batch) = stream.next() {
         let batch = batch?;
         let orderkeys = batch_column(&batch, "o_orderkey")?;
         let orderdates = batch_column(&batch, "o_orderdate")?;
-        let priorities = batch_string_column(&batch, "o_orderpriority")?;
+        let orderpriorities = batch_string_column(&batch, "o_orderpriority")?;
         for row in 0..batch.num_rows() {
-            if priorities.is_null(row) {
+            if orderpriorities.is_null(row) {
                 continue;
             }
             let (Some(orderkey), Some(orderdate)) = (
@@ -5768,17 +5735,143 @@ async fn q04_priority_counts(
             ) else {
                 continue;
             };
-            if orderdate >= start_days && orderdate < end_days && late_orders.contains(&orderkey) {
-                *counts.entry(priorities.value(row).to_string()).or_insert(0) += 1;
+            if orderdate < start_days || orderdate >= end_days || orderkey < 0 {
+                continue;
             }
+            let priority_index = if let Some(index) = label_indices.get(orderpriorities.value(row))
+            {
+                *index
+            } else {
+                let next_index = u8::try_from(labels.len()).map_err(|_| {
+                    DodamError::UnsupportedSql("too many Q04 order priorities".to_string())
+                })?;
+                labels.push(orderpriorities.value(row).to_string());
+                label_indices.insert(orderpriorities.value(row).to_string(), next_index);
+                next_index
+            };
+            let orderkey = usize::try_from(orderkey)
+                .map_err(|_| DodamError::UnsupportedSql("order key overflow".to_string()))?;
+            if orderkey >= priorities.len() {
+                priorities.resize(orderkey + 1, 0);
+            }
+            priorities[orderkey] = priority_index + 1;
         }
     }
-    let mut rows = counts
+    Ok((priorities, labels))
+}
+
+async fn q04_count_late_candidate_priorities(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    candidate_priorities: &mut [u8],
+    priority_count: usize,
+) -> Result<Vec<u64>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "l_orderkey".to_string(),
+                "l_commitdate".to_string(),
+                "l_receiptdate".to_string(),
+            ]),
+            None,
+        )
+        .await?;
+    let mut counts = vec![0_u64; priority_count];
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        let orderkeys = batch_column(&batch, "l_orderkey")?;
+        let commitdates = batch_column(&batch, "l_commitdate")?;
+        let receiptdates = batch_column(&batch, "l_receiptdate")?;
+        if q04_count_late_candidate_priorities_typed(
+            orderkeys,
+            commitdates,
+            receiptdates,
+            candidate_priorities,
+            &mut counts,
+        )? {
+            continue;
+        }
+        for row in 0..batch.num_rows() {
+            let (Some(orderkey), Some(commitdate), Some(receiptdate)) = (
+                numeric_i64_value(orderkeys, row)?,
+                date32_value(commitdates, row)?,
+                date32_value(receiptdates, row)?,
+            ) else {
+                continue;
+            };
+            if commitdate >= receiptdate || orderkey < 0 {
+                continue;
+            }
+            let Ok(orderkey) = usize::try_from(orderkey) else {
+                continue;
+            };
+            let Some(priority_marker) = candidate_priorities.get_mut(orderkey) else {
+                continue;
+            };
+            if *priority_marker == 0 {
+                continue;
+            }
+            let priority_index = usize::from(*priority_marker - 1);
+            counts[priority_index] += 1;
+            *priority_marker = 0;
+        }
+    }
+    Ok(counts)
+}
+
+fn q04_count_late_candidate_priorities_typed(
+    orderkeys: &ArrayRef,
+    commitdates: &ArrayRef,
+    receiptdates: &ArrayRef,
+    candidate_priorities: &mut [u8],
+    counts: &mut [u64],
+) -> Result<bool> {
+    let (Some(orderkeys), Some(commitdates), Some(receiptdates)) = (
+        orderkeys.as_any().downcast_ref::<Int64Array>(),
+        commitdates.as_any().downcast_ref::<Date32Array>(),
+        receiptdates.as_any().downcast_ref::<Date32Array>(),
+    ) else {
+        return Ok(false);
+    };
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || commitdates.is_null(row) || receiptdates.is_null(row) {
+            continue;
+        }
+        if commitdates.value(row) >= receiptdates.value(row) {
+            continue;
+        }
+        let orderkey = orderkeys.value(row);
+        if orderkey < 0 {
+            continue;
+        }
+        let Ok(orderkey) = usize::try_from(orderkey) else {
+            continue;
+        };
+        let Some(priority_marker) = candidate_priorities.get_mut(orderkey) else {
+            continue;
+        };
+        if *priority_marker == 0 {
+            continue;
+        }
+        let priority_index = usize::from(*priority_marker - 1);
+        counts[priority_index] += 1;
+        *priority_marker = 0;
+    }
+    Ok(true)
+}
+
+fn q04_priority_count_rows(priority_labels: Vec<String>, counts: Vec<u64>) -> Vec<Q04Row> {
+    let mut rows = priority_labels
         .into_iter()
-        .map(|(priority, count)| Q04Row { priority, count })
+        .zip(counts)
+        .filter_map(|(priority, count)| (count > 0).then_some(Q04Row { priority, count }))
         .collect::<Vec<_>>();
     rows.sort_by(|left, right| left.priority.cmp(&right.priority));
-    Ok(rows)
+    rows
 }
 
 fn q04_output(rows: Vec<Q04Row>) -> Result<QueryOutput> {
@@ -8260,38 +8353,98 @@ async fn q18_qualifying_orders(
             None,
         )
         .await?;
+    let qualifying_orders = Arc::new(qualifying_orders.clone());
+    parallel_batch_fold(
+        &mut stream,
+        move |batch| q18_qualifying_orders_batch(batch, &qualifying_orders),
+        HashMap::<i64, Q18Order>::new(),
+        merge_maps,
+        "Q18 qualifying orders",
+    )
+}
+
+fn q18_qualifying_orders_batch(
+    batch: RecordBatch,
+    qualifying_orders: &HashSet<i64>,
+) -> Result<HashMap<i64, Q18Order>> {
+    let orderkeys = batch_column(&batch, "o_orderkey")?;
+    let custkeys = batch_column(&batch, "o_custkey")?;
+    let orderdates = batch_column(&batch, "o_orderdate")?;
+    let totalprices = batch_column(&batch, "o_totalprice")?;
+    if let Some(orders) = q18_qualifying_orders_batch_typed(
+        orderkeys,
+        custkeys,
+        orderdates,
+        totalprices,
+        qualifying_orders,
+    )? {
+        return Ok(orders);
+    }
     let mut orders = HashMap::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let orderkeys = batch_column(&batch, "o_orderkey")?;
-        let custkeys = batch_column(&batch, "o_custkey")?;
-        let orderdates = batch_column(&batch, "o_orderdate")?;
-        let totalprices = batch_column(&batch, "o_totalprice")?;
-        for row in 0..batch.num_rows() {
-            let Some(orderkey) = numeric_i64_value(orderkeys, row)? else {
-                continue;
-            };
-            if !qualifying_orders.contains(&orderkey) {
-                continue;
-            }
-            let (Some(custkey), Some(orderdate), Some(totalprice)) = (
-                numeric_i64_value(custkeys, row)?,
-                date32_value(orderdates, row)?,
-                numeric_f64_value(totalprices, row)?,
-            ) else {
-                continue;
-            };
-            orders.insert(
-                orderkey,
-                Q18Order {
-                    custkey,
-                    orderdate,
-                    totalprice,
-                },
-            );
+    for row in 0..batch.num_rows() {
+        let Some(orderkey) = numeric_i64_value(orderkeys, row)? else {
+            continue;
+        };
+        if !qualifying_orders.contains(&orderkey) {
+            continue;
         }
+        let (Some(custkey), Some(orderdate), Some(totalprice)) = (
+            numeric_i64_value(custkeys, row)?,
+            date32_value(orderdates, row)?,
+            numeric_f64_value(totalprices, row)?,
+        ) else {
+            continue;
+        };
+        orders.insert(
+            orderkey,
+            Q18Order {
+                custkey,
+                orderdate,
+                totalprice,
+            },
+        );
     }
     Ok(orders)
+}
+
+fn q18_qualifying_orders_batch_typed(
+    orderkeys: &ArrayRef,
+    custkeys: &ArrayRef,
+    orderdates: &ArrayRef,
+    totalprices: &ArrayRef,
+    qualifying_orders: &HashSet<i64>,
+) -> Result<Option<HashMap<i64, Q18Order>>> {
+    let (Some(orderkeys), Some(custkeys), Some(orderdates), Some(totalprices)) = (
+        orderkeys.as_any().downcast_ref::<Int64Array>(),
+        custkeys.as_any().downcast_ref::<Int64Array>(),
+        orderdates.as_any().downcast_ref::<Date32Array>(),
+        q01_decimal_input(totalprices)?,
+    ) else {
+        return Ok(None);
+    };
+    let mut orders = HashMap::new();
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row)
+            || custkeys.is_null(row)
+            || orderdates.is_null(row)
+            || totalprices.is_null(row)
+        {
+            continue;
+        }
+        let orderkey = orderkeys.value(row);
+        if !qualifying_orders.contains(&orderkey) {
+            continue;
+        }
+        orders.insert(
+            orderkey,
+            Q18Order {
+                custkey: custkeys.value(row),
+                orderdate: orderdates.value(row),
+                totalprice: totalprices.value(row),
+            },
+        );
+    }
+    Ok(Some(orders))
 }
 
 async fn q18_customer_names(
