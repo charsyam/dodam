@@ -5407,34 +5407,94 @@ async fn q03_order_rows(
             None,
         )
         .await?;
+    let customers = Arc::new(customers.clone());
+    parallel_batch_fold(
+        &mut stream,
+        move |batch| q03_order_rows_batch(batch, &customers, order_cutoff),
+        HashMap::<i64, Q03Order>::new(),
+        merge_maps,
+        "Q03 order rows",
+    )
+}
+
+fn q03_order_rows_batch(
+    batch: RecordBatch,
+    customers: &HashSet<i64>,
+    order_cutoff: i32,
+) -> Result<HashMap<i64, Q03Order>> {
+    let orderkeys = batch_column(&batch, "o_orderkey")?;
+    let custkeys = batch_column(&batch, "o_custkey")?;
+    let orderdates = batch_column(&batch, "o_orderdate")?;
+    let priorities = batch_column(&batch, "o_shippriority")?;
+    if let Some(orders) = q03_order_rows_batch_typed(
+        orderkeys,
+        custkeys,
+        orderdates,
+        priorities,
+        customers,
+        order_cutoff,
+    )? {
+        return Ok(orders);
+    }
     let mut orders = HashMap::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let orderkeys = batch_column(&batch, "o_orderkey")?;
-        let custkeys = batch_column(&batch, "o_custkey")?;
-        let orderdates = batch_column(&batch, "o_orderdate")?;
-        let priorities = batch_column(&batch, "o_shippriority")?;
-        for row in 0..batch.num_rows() {
-            let (Some(orderkey), Some(custkey), Some(orderdate), Some(priority)) = (
-                numeric_i64_value(orderkeys, row)?,
-                numeric_i64_value(custkeys, row)?,
-                date32_value(orderdates, row)?,
-                numeric_i64_value(priorities, row)?,
-            ) else {
-                continue;
-            };
-            if customers.contains(&custkey) && orderdate < order_cutoff {
-                orders.insert(
-                    orderkey,
-                    Q03Order {
-                        o_orderdate: orderdate,
-                        o_shippriority: priority,
-                    },
-                );
-            }
+    for row in 0..batch.num_rows() {
+        let (Some(orderkey), Some(custkey), Some(orderdate), Some(priority)) = (
+            numeric_i64_value(orderkeys, row)?,
+            numeric_i64_value(custkeys, row)?,
+            date32_value(orderdates, row)?,
+            numeric_i64_value(priorities, row)?,
+        ) else {
+            continue;
+        };
+        if customers.contains(&custkey) && orderdate < order_cutoff {
+            orders.insert(
+                orderkey,
+                Q03Order {
+                    o_orderdate: orderdate,
+                    o_shippriority: priority,
+                },
+            );
         }
     }
     Ok(orders)
+}
+
+fn q03_order_rows_batch_typed(
+    orderkeys: &ArrayRef,
+    custkeys: &ArrayRef,
+    orderdates: &ArrayRef,
+    priorities: &ArrayRef,
+    customers: &HashSet<i64>,
+    order_cutoff: i32,
+) -> Result<Option<HashMap<i64, Q03Order>>> {
+    let (Some(orderkeys), Some(custkeys), Some(orderdates), Some(priorities)) = (
+        orderkeys.as_any().downcast_ref::<Int64Array>(),
+        custkeys.as_any().downcast_ref::<Int64Array>(),
+        orderdates.as_any().downcast_ref::<Date32Array>(),
+        priorities.as_any().downcast_ref::<Int64Array>(),
+    ) else {
+        return Ok(None);
+    };
+    let mut orders = HashMap::new();
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row)
+            || custkeys.is_null(row)
+            || orderdates.is_null(row)
+            || priorities.is_null(row)
+        {
+            continue;
+        }
+        if orderdates.value(row) < order_cutoff && customers.contains(&custkeys.value(row)) {
+            orders.insert(
+                orderkeys.value(row),
+                Q03Order {
+                    o_orderdate: orderdates.value(row),
+                    o_shippriority: priorities.value(row),
+                },
+            );
+        }
+    }
+    Ok(Some(orders))
 }
 
 struct Q03Row {
@@ -6194,31 +6254,87 @@ async fn q05_order_customer_nations(
             None,
         )
         .await?;
+    let customer_nations = Arc::new(customer_nations.clone());
+    parallel_batch_fold(
+        &mut stream,
+        move |batch| {
+            q05_order_customer_nations_batch(batch, &customer_nations, start_days, end_days)
+        },
+        HashMap::<i64, i64>::new(),
+        merge_maps,
+        "Q05 order customer nations",
+    )
+}
+
+fn q05_order_customer_nations_batch(
+    batch: RecordBatch,
+    customer_nations: &HashMap<i64, i64>,
+    start_days: i32,
+    end_days: i32,
+) -> Result<HashMap<i64, i64>> {
+    let orderkeys = batch_column(&batch, "o_orderkey")?;
+    let custkeys = batch_column(&batch, "o_custkey")?;
+    let orderdates = batch_column(&batch, "o_orderdate")?;
+    if let Some(orders) = q05_order_customer_nations_batch_typed(
+        orderkeys,
+        custkeys,
+        orderdates,
+        customer_nations,
+        start_days,
+        end_days,
+    ) {
+        return Ok(orders);
+    }
     let mut orders = HashMap::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let orderkeys = batch_column(&batch, "o_orderkey")?;
-        let custkeys = batch_column(&batch, "o_custkey")?;
-        let orderdates = batch_column(&batch, "o_orderdate")?;
-        for row in 0..batch.num_rows() {
-            let Some(orderdate) = date32_value(orderdates, row)? else {
-                continue;
-            };
-            if orderdate < start_days || orderdate >= end_days {
-                continue;
-            }
-            let (Some(orderkey), Some(custkey)) = (
-                numeric_i64_value(orderkeys, row)?,
-                numeric_i64_value(custkeys, row)?,
-            ) else {
-                continue;
-            };
-            if let Some(nationkey) = customer_nations.get(&custkey).copied() {
-                orders.insert(orderkey, nationkey);
-            }
+    for row in 0..batch.num_rows() {
+        let Some(orderdate) = date32_value(orderdates, row)? else {
+            continue;
+        };
+        if orderdate < start_days || orderdate >= end_days {
+            continue;
+        }
+        let (Some(orderkey), Some(custkey)) = (
+            numeric_i64_value(orderkeys, row)?,
+            numeric_i64_value(custkeys, row)?,
+        ) else {
+            continue;
+        };
+        if let Some(nationkey) = customer_nations.get(&custkey).copied() {
+            orders.insert(orderkey, nationkey);
         }
     }
     Ok(orders)
+}
+
+fn q05_order_customer_nations_batch_typed(
+    orderkeys: &ArrayRef,
+    custkeys: &ArrayRef,
+    orderdates: &ArrayRef,
+    customer_nations: &HashMap<i64, i64>,
+    start_days: i32,
+    end_days: i32,
+) -> Option<HashMap<i64, i64>> {
+    let (Some(orderkeys), Some(custkeys), Some(orderdates)) = (
+        orderkeys.as_any().downcast_ref::<Int64Array>(),
+        custkeys.as_any().downcast_ref::<Int64Array>(),
+        orderdates.as_any().downcast_ref::<Date32Array>(),
+    ) else {
+        return None;
+    };
+    let mut orders = HashMap::new();
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || custkeys.is_null(row) || orderdates.is_null(row) {
+            continue;
+        }
+        let orderdate = orderdates.value(row);
+        if orderdate < start_days || orderdate >= end_days {
+            continue;
+        }
+        if let Some(nationkey) = customer_nations.get(&custkeys.value(row)).copied() {
+            orders.insert(orderkeys.value(row), nationkey);
+        }
+    }
+    Some(orders)
 }
 
 struct Q05Row {
@@ -6897,24 +7013,61 @@ async fn q07_order_customers(
             None,
         )
         .await?;
+    let customer_nations = Arc::new(customer_nations.clone());
+    parallel_batch_fold(
+        &mut stream,
+        move |batch| q07_order_customers_batch(batch, &customer_nations),
+        HashMap::<i64, i64>::new(),
+        merge_maps,
+        "Q07 order customer nations",
+    )
+}
+
+fn q07_order_customers_batch(
+    batch: RecordBatch,
+    customer_nations: &HashMap<i64, i64>,
+) -> Result<HashMap<i64, i64>> {
+    let orderkeys = batch_column(&batch, "o_orderkey")?;
+    let custkeys = batch_column(&batch, "o_custkey")?;
+    if let Some(orders) = q07_order_customers_batch_typed(orderkeys, custkeys, customer_nations) {
+        return Ok(orders);
+    }
     let mut orders = HashMap::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let orderkeys = batch_column(&batch, "o_orderkey")?;
-        let custkeys = batch_column(&batch, "o_custkey")?;
-        for row in 0..batch.num_rows() {
-            let (Some(orderkey), Some(custkey)) = (
-                numeric_i64_value(orderkeys, row)?,
-                numeric_i64_value(custkeys, row)?,
-            ) else {
-                continue;
-            };
-            if let Some(nationkey) = customer_nations.get(&custkey).copied() {
-                orders.insert(orderkey, nationkey);
-            }
+    for row in 0..batch.num_rows() {
+        let (Some(orderkey), Some(custkey)) = (
+            numeric_i64_value(orderkeys, row)?,
+            numeric_i64_value(custkeys, row)?,
+        ) else {
+            continue;
+        };
+        if let Some(nationkey) = customer_nations.get(&custkey).copied() {
+            orders.insert(orderkey, nationkey);
         }
     }
     Ok(orders)
+}
+
+fn q07_order_customers_batch_typed(
+    orderkeys: &ArrayRef,
+    custkeys: &ArrayRef,
+    customer_nations: &HashMap<i64, i64>,
+) -> Option<HashMap<i64, i64>> {
+    let (Some(orderkeys), Some(custkeys)) = (
+        orderkeys.as_any().downcast_ref::<Int64Array>(),
+        custkeys.as_any().downcast_ref::<Int64Array>(),
+    ) else {
+        return None;
+    };
+    let mut orders = HashMap::new();
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || custkeys.is_null(row) {
+            continue;
+        }
+        if let Some(nationkey) = customer_nations.get(&custkeys.value(row)).copied() {
+            orders.insert(orderkeys.value(row), nationkey);
+        }
+    }
+    Some(orders)
 }
 
 struct Q07Row {
@@ -7311,30 +7464,85 @@ async fn q08_order_years(
             None,
         )
         .await?;
+    let customer_nations = Arc::new(customer_nations.clone());
+    parallel_batch_fold(
+        &mut stream,
+        move |batch| q08_order_years_batch(batch, &customer_nations, start_days, end_days),
+        HashMap::<i64, i32>::new(),
+        merge_maps,
+        "Q08 order years",
+    )
+}
+
+fn q08_order_years_batch(
+    batch: RecordBatch,
+    customer_nations: &HashMap<i64, i64>,
+    start_days: i32,
+    end_days: i32,
+) -> Result<HashMap<i64, i32>> {
+    let orderkeys = batch_column(&batch, "o_orderkey")?;
+    let custkeys = batch_column(&batch, "o_custkey")?;
+    let orderdates = batch_column(&batch, "o_orderdate")?;
+    if let Some(orders) = q08_order_years_batch_typed(
+        orderkeys,
+        custkeys,
+        orderdates,
+        customer_nations,
+        start_days,
+        end_days,
+    )? {
+        return Ok(orders);
+    }
     let mut orders = HashMap::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let orderkeys = batch_column(&batch, "o_orderkey")?;
-        let custkeys = batch_column(&batch, "o_custkey")?;
-        let orderdates = batch_column(&batch, "o_orderdate")?;
-        for row in 0..batch.num_rows() {
-            let (Some(orderkey), Some(custkey), Some(orderdate)) = (
-                numeric_i64_value(orderkeys, row)?,
-                numeric_i64_value(custkeys, row)?,
-                date32_value(orderdates, row)?,
-            ) else {
-                continue;
-            };
-            if orderdate >= start_days
-                && orderdate <= end_days
-                && customer_nations.contains_key(&custkey)
-            {
-                let (year, _, _) = civil_from_days(i64::from(orderdate))?;
-                orders.insert(orderkey, year);
-            }
+    for row in 0..batch.num_rows() {
+        let (Some(orderkey), Some(custkey), Some(orderdate)) = (
+            numeric_i64_value(orderkeys, row)?,
+            numeric_i64_value(custkeys, row)?,
+            date32_value(orderdates, row)?,
+        ) else {
+            continue;
+        };
+        if orderdate >= start_days
+            && orderdate <= end_days
+            && customer_nations.contains_key(&custkey)
+        {
+            let (year, _, _) = civil_from_days(i64::from(orderdate))?;
+            orders.insert(orderkey, year);
         }
     }
     Ok(orders)
+}
+
+fn q08_order_years_batch_typed(
+    orderkeys: &ArrayRef,
+    custkeys: &ArrayRef,
+    orderdates: &ArrayRef,
+    customer_nations: &HashMap<i64, i64>,
+    start_days: i32,
+    end_days: i32,
+) -> Result<Option<HashMap<i64, i32>>> {
+    let (Some(orderkeys), Some(custkeys), Some(orderdates)) = (
+        orderkeys.as_any().downcast_ref::<Int64Array>(),
+        custkeys.as_any().downcast_ref::<Int64Array>(),
+        orderdates.as_any().downcast_ref::<Date32Array>(),
+    ) else {
+        return Ok(None);
+    };
+    let mut orders = HashMap::new();
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || custkeys.is_null(row) || orderdates.is_null(row) {
+            continue;
+        }
+        let orderdate = orderdates.value(row);
+        if orderdate >= start_days
+            && orderdate <= end_days
+            && customer_nations.contains_key(&custkeys.value(row))
+        {
+            let (year, _, _) = civil_from_days(i64::from(orderdate))?;
+            orders.insert(orderkeys.value(row), year);
+        }
+    }
+    Ok(Some(orders))
 }
 
 async fn q08_supplier_nation_names(
