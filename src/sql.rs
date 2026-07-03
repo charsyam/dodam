@@ -5294,12 +5294,16 @@ async fn try_execute_multi_comma_join_sql(
         scanned.push(Some(batches));
     }
     let use_ndv_join_order = true;
-    let start_index = row_counts
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, rows)| *rows)
-        .map(|(index, _)| index)
-        .expect("at least one comma join table");
+    let start_index =
+        choose_comma_join_start_index(&scanned, &row_counts, &aliases, &alias_refs, &conjuncts)?
+            .unwrap_or_else(|| {
+                row_counts
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, rows)| *rows)
+                    .map(|(index, _)| index)
+                    .expect("at least one comma join table")
+            });
     let mut current = scanned[start_index].take().expect("start input scanned");
     let mut current_rows = row_counts[start_index];
     let mut joined_aliases = vec![aliases[start_index].clone()];
@@ -5505,6 +5509,61 @@ fn estimate_join_output_rows(
     let right_ndv = sampled_key_ndv(right, right_keys, 100_000)?.max(1);
     let denominator = left_ndv.max(right_ndv) as u128;
     Ok((left_rows as u128).saturating_mul(right_rows as u128) / denominator)
+}
+
+fn choose_comma_join_start_index(
+    scanned: &[Option<Vec<RecordBatch>>],
+    row_counts: &[usize],
+    aliases: &[String],
+    alias_refs: &[&str],
+    conjuncts: &[SqlExpr],
+) -> Result<Option<usize>> {
+    let mut selected = None;
+    for conjunct in conjuncts {
+        let Some((left_alias, left_key, right_alias, right_key)) =
+            comma_join_base_edge(conjunct, alias_refs)?
+        else {
+            continue;
+        };
+        let Some(left_index) = aliases
+            .iter()
+            .position(|alias| alias.eq_ignore_ascii_case(left_alias))
+        else {
+            continue;
+        };
+        let Some(right_index) = aliases
+            .iter()
+            .position(|alias| alias.eq_ignore_ascii_case(right_alias))
+        else {
+            continue;
+        };
+        let left = scanned[left_index]
+            .as_ref()
+            .expect("comma join input scanned");
+        let right = scanned[right_index]
+            .as_ref()
+            .expect("comma join input scanned");
+        let score = estimate_join_output_rows(
+            left,
+            right,
+            row_counts[left_index],
+            row_counts[right_index],
+            &[left_key],
+            &[right_key],
+        )?;
+        let start_index = if row_counts[left_index] <= row_counts[right_index] {
+            left_index
+        } else {
+            right_index
+        };
+        if selected
+            .as_ref()
+            .is_none_or(|(_, selected_score)| score < *selected_score)
+        {
+            selected = Some((start_index, score));
+        }
+    }
+    Ok(selected.map(|(index, _)| index))
 }
 
 fn sampled_key_ndv(batches: &[RecordBatch], keys: &[String], sample_rows: usize) -> Result<usize> {
@@ -7385,6 +7444,41 @@ fn comma_join_keys_for_next(
         )));
     }
     Ok(None)
+}
+
+fn comma_join_base_edge<'a>(
+    expr: &SqlExpr,
+    table_aliases: &'a [&'a str],
+) -> Result<Option<(&'a str, String, &'a str, String)>> {
+    let SqlExpr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = expr
+    else {
+        return Ok(None);
+    };
+    let Some(left_column) = maybe_join_column_name(left, table_aliases)? else {
+        return Ok(None);
+    };
+    let Some(right_column) = maybe_join_column_name(right, table_aliases)? else {
+        return Ok(None);
+    };
+    let Some(left_owner) = join_column_owner(&left_column, table_aliases) else {
+        return Ok(None);
+    };
+    let Some(right_owner) = join_column_owner(&right_column, table_aliases) else {
+        return Ok(None);
+    };
+    if left_owner == right_owner {
+        return Ok(None);
+    }
+    Ok(Some((
+        left_owner,
+        unqualified_join_column(&left_column, left_owner),
+        right_owner,
+        unqualified_join_column(&right_column, right_owner),
+    )))
 }
 
 fn join_column_owner<'a>(column: &str, table_aliases: &'a [&str]) -> Option<&'a str> {
