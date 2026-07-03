@@ -249,6 +249,8 @@
 - Added SQL aggregate execution over streamed join output and narrowed aggregate-join output projection so aggregate `ORDER BY` does not force full join row materialization when only grouped/aggregate input columns are needed.
 - Avoided `concat_batches` for single-batch sort/order-limit paths. Benchmark impact was neutral, but it removes unnecessary work in the common single-batch case.
 - Avoided collecting hash-join `all_rows` for inner/semi builds that do not need unmatched-build emission. This improved `inner_join_non_dense_i32` from about `21.5 ms` Dodam CLI to about `20.5 ms`, making it slightly faster than DuckDB CLI on the current file-output benchmark.
+- Made query stdout output row-oriented instead of `RecordBatch` debug output for CSV-compatible Arrow types, with `DODAM_QUERY_SUMMARY=1` retaining the old aggregate summary when needed.
+- Added a derived-aggregate fast path for `GROUP BY <derived aggregate column>, count(*)`, so Q13-style outer count distributions can be computed directly from inner aggregate metrics instead of scanning a materialized aggregate result batch again.
 
 ### Benchmark Tuning Attempts
 
@@ -300,6 +302,14 @@ Effective or retained:
 - Utf8 build-column gather:
   - Removed the extra byte-count pass before building gathered `StringArray` output; this improved duplicate fanout engine time from about `9.0 ms` to about `8.7 ms`.
   - CLI impact is smaller because Parquet write still dominates, but duplicate fanout COPY improved to about `35.1 ms` and small-row-group duplicate COPY to about `37.0 ms` in the retained configuration.
+- Query stdout formatting:
+  - Replaced default query `RecordBatch` debug output with a compact row-oriented writer for CSV-compatible types, falling back to debug output for unsupported stdout-only types.
+  - Aggregate summaries are now opt-in with `DODAM_QUERY_SUMMARY=1`.
+  - This removed most of Q13's stdout-capture overhead in CLI comparison.
+- Derived aggregate count distribution:
+  - Retained a general fast path for outer `GROUP BY` + `count(*)` over a derived aggregate output column.
+  - This covers Q13's `GROUP BY c_count` shape without matching on query names or table names.
+  - Latest Q13 standalone CLI median improved from about `0.025s` to about `0.018s` under stdout capture.
 
 Tried and rejected or neutral:
 
@@ -558,7 +568,7 @@ Tried and rejected or neutral:
   - Multi-table comma joins now push deterministic single-table `WHERE` conjuncts into each scan before joining. This is a general rule and is not keyed to TPC-H query names. On SF=0.01 median CLI comparison, the main wins were Q03/Q05/Q07/Q08/Q09/Q10, and total moved from about `0.60s` to about `0.39s`.
   - Two-table join input planning now derives safe side filters through boolean `AND`/`OR` branches when the derived predicate is implied by the original filter. This makes Q19's mixed OR branches push `lineitem`/`part` filters without a Q19-specific rewrite; Q19 moved from about `1.6x` slower than DuckDB to roughly tied.
   - Multi-table comma joins now prune each input scan to the columns required by join keys, filters, grouping, aggregate input expressions, projection, HAVING, and ORDER BY. Subquery-bearing predicates stay on `Projection::All` for safety. This moved the main multi-comma queries from slower-than-DuckDB to faster-than-DuckDB on the current fixture.
-  - Latest SF=0.01 5-run median CLI comparison: Dodam about `0.289s`, DuckDB about `0.373s`, total ratio about `0.77x`; only Q13 remains above `1.2x` (`~1.25x`).
+  - Latest SF=0.01 7-run median CLI comparison after Q13 stdout/derived-aggregate work: Dodam about `0.281s`, DuckDB about `0.368s`, total ratio about `0.76x`; Q04 and Q13 are the only queries above `1.1x`, both under `1.2x`.
   - Rejected as retained defaults: row-count-only multi-comma join reordering regressed Q05/Q09; applying ready residual filters after each intermediate comma join added overhead/regressed Q03; moving Q18 ahead of its fast path onto the generic materialized `IN` rewrite was correct but too slow (`~0.77s` median for Q18 alone); direct Rust row-loop handling for Q13's left-join count distribution did not beat the existing hash join/grouped aggregate path.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.

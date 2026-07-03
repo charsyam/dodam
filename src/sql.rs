@@ -25,10 +25,11 @@ use crate::engine::{DodamEngine, JoinAlgorithm, JoinParquetRequest};
 use crate::error::{DodamError, Result};
 use crate::execution::JoinType;
 use crate::execution::{
-    AggregateExpr, AggregateMetrics, ComparisonExpr, ComparisonOp, DistinctExec, Expr, FilterExpr,
-    HashJoinExec, JoinBuildSide, LiteralValue, MemoryExec, PhysicalPlan, Projection,
-    RecordBatchSink, ScanPlanMetrics, SendableBatchStream, SortExpr, SortKey, collect_aggregates,
-    collect_grouped_aggregates, filter_batch,
+    AggregateExpr, AggregateMetrics, AggregateResult, AggregateValue, ComparisonExpr, ComparisonOp,
+    DistinctExec, Expr, FilterExpr, GroupAggregateResult, GroupValue, HashJoinExec, JoinBuildSide,
+    LiteralValue, MemoryExec, PhysicalPlan, Projection, RecordBatchSink, ScanPlanMetrics,
+    SendableBatchStream, SortExpr, SortKey, collect_aggregates, collect_grouped_aggregates,
+    filter_batch,
 };
 use crate::optimizer::plan_join_inputs;
 
@@ -4538,6 +4539,189 @@ async fn materialize_join_relation(
     }
 }
 
+async fn execute_parsed_join_query(
+    engine: &DodamEngine,
+    query: SqlQuery,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let Some(join) = query.join.clone() else {
+        return Ok(None);
+    };
+    if query.distinct {
+        return Err(DodamError::UnsupportedSql(
+            "JOIN with DISTINCT is not supported".to_string(),
+        ));
+    }
+    let is_aggregate = query.is_aggregate();
+    let aggregates = query.aggregates.clone();
+    let group_by = query.group_by.clone();
+    let join_input_projection = if query.aggregate_expressions.is_empty() {
+        &query.projection
+    } else {
+        &Projection::All
+    };
+    let join_plan = plan_join_inputs(
+        join_input_projection,
+        query.filter.as_ref(),
+        query.order_by.as_ref(),
+        &join.left_alias,
+        &join.left_keys,
+        &join.right_alias,
+        &join.right_keys,
+    );
+    let output_projection = pushed_join_output_projection(&query);
+    let output_projection_pushed = !matches!(output_projection, Projection::All);
+    let stream = engine
+        .join_parquet_batches(JoinParquetRequest {
+            left_path: query.path.clone(),
+            right_path: join.right.path,
+            batch_size,
+            left_keys: join.left_keys,
+            right_keys: join.right_keys,
+            left_prefix: join.left_alias,
+            right_prefix: join.right_alias,
+            left_projection: join_plan.left_projection,
+            right_projection: join_plan.right_projection,
+            left_filter: join_plan.left_filter,
+            right_filter: combine_filter_options(join_plan.right_filter, join.right_filter.clone()),
+            output_projection,
+            join_memory_limit_bytes: default_join_memory_limit_bytes(),
+            join_algorithm: JoinAlgorithm::Auto,
+            join_type: join.join_type,
+        })
+        .await?;
+    if is_aggregate {
+        let stream = apply_output_filter_stream(stream, query.filter.clone());
+        let stream: SendableBatchStream = if query.aggregate_expressions.is_empty() {
+            stream
+        } else {
+            let batches = append_aggregate_expression_columns(
+                collect_batches(stream)?,
+                &query.aggregate_expressions,
+            )?;
+            Box::new(MemoryExec::new(batches)).execute()?
+        };
+        let metrics = if group_by.is_empty() {
+            collect_aggregates(stream, 2, &aggregates)?
+        } else {
+            collect_grouped_aggregates(stream, 2, &group_by, &aggregates)?
+        };
+        let mut batches = aggregate_metrics_to_batches(&metrics, &group_by, &aggregates)?;
+        batches = apply_output_filter(batches, query.having.as_ref())?;
+        let has_output_expressions = projection_requires_expression_path(&query.expressions);
+        if has_output_expressions {
+            batches = apply_output_expression_projection(batches, &query.expressions)?;
+        }
+        batches = apply_output_order_limit(batches, query.order_by.as_ref(), query.limit)?;
+        if !has_output_expressions {
+            batches = rename_output_batches(batches, &query.aliases)?;
+        }
+        return Ok(Some(QueryOutput::Aggregate { metrics, batches }));
+    }
+    let mut batches = collect_batches(stream)?;
+    batches = apply_output_filter(batches, query.filter.as_ref())?;
+    let projection_requires_expression = projection_requires_expression_path(&query.expressions);
+    if projection_requires_expression {
+        batches = apply_output_expression_projection(batches, &query.expressions)?;
+        batches = apply_output_order_limit(batches, query.order_by.as_ref(), query.limit)?;
+    } else {
+        batches = apply_output_order_limit(batches, query.order_by.as_ref(), query.limit)?;
+        if !output_projection_pushed {
+            batches = apply_output_projection(batches, &query.projection)?;
+        }
+    }
+    if !projection_requires_expression {
+        batches = rename_output_batches(batches, &query.aliases)?;
+    }
+    Ok(Some(QueryOutput::Scan { batches }))
+}
+
+fn try_count_derived_aggregate_groups(
+    inner_metrics: &AggregateMetrics,
+    inner_batches: &[RecordBatch],
+    group_by: &[String],
+    projection: &ParsedProjection,
+    filter: Option<&FilterExpr>,
+    having: Option<&FilterExpr>,
+    order_by: Option<&SortKey>,
+    limit: Option<usize>,
+) -> Result<Option<QueryOutput>> {
+    if group_by.len() != 1
+        || !matches!(projection.aggregates.as_slice(), [AggregateExpr::CountStar])
+        || !projection.aggregate_expressions.is_empty()
+        || projection_requires_expression_path(&projection.expressions)
+        || filter.is_some()
+        || having.is_some()
+        || inner_metrics.groups.is_empty()
+    {
+        return Ok(None);
+    }
+    let Some(schema_batch) = inner_batches.first() else {
+        return Ok(None);
+    };
+    let Some(output_column_index) = schema_batch
+        .schema()
+        .fields()
+        .iter()
+        .position(|field| field.name() == &group_by[0])
+    else {
+        return Ok(None);
+    };
+    let inner_key_count = inner_metrics.groups[0].keys.len();
+    let mut counts: HashMap<GroupValue, u64> = HashMap::new();
+    for group in &inner_metrics.groups {
+        let key = if output_column_index < inner_key_count {
+            group.keys[output_column_index].clone()
+        } else {
+            let value_index = output_column_index - inner_key_count;
+            let Some(value) = group.values.get(value_index) else {
+                return Ok(None);
+            };
+            let Some(key) = aggregate_value_to_group_value(&value.value) else {
+                return Ok(None);
+            };
+            key
+        };
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    let mut groups = counts
+        .into_iter()
+        .map(|(key, count)| GroupAggregateResult {
+            keys: vec![key],
+            values: vec![AggregateResult {
+                expr: AggregateExpr::CountStar,
+                value: AggregateValue::Count(count),
+            }],
+        })
+        .collect::<Vec<_>>();
+    groups.sort_by(|left, right| left.keys[0].to_string().cmp(&right.keys[0].to_string()));
+    let metrics = AggregateMetrics {
+        fragments: 1,
+        batches: 1,
+        rows: inner_metrics.groups.len(),
+        values: Vec::new(),
+        groups,
+    };
+    let mut batches = aggregate_metrics_to_batches(&metrics, group_by, &projection.aggregates)?;
+    batches = apply_output_order_limit(batches, order_by, limit)?;
+    batches = rename_output_batches(batches, &projection.aliases)?;
+    Ok(Some(QueryOutput::Aggregate { metrics, batches }))
+}
+
+fn aggregate_value_to_group_value(value: &AggregateValue) -> Option<GroupValue> {
+    match value {
+        AggregateValue::Count(value) => Some(GroupValue::UInt64(Some(*value))),
+        AggregateValue::Int64(value) => Some(GroupValue::Int64(*value)),
+        AggregateValue::Date32(value) => Some(GroupValue::Date32(*value)),
+        AggregateValue::Date64(value) => Some(GroupValue::Date64(*value)),
+        AggregateValue::Decimal128(value, precision, scale) => {
+            Some(GroupValue::Decimal128(*value, *precision, *scale))
+        }
+        AggregateValue::Utf8(value) => Some(GroupValue::Utf8(value.clone())),
+        AggregateValue::Float64(_) | AggregateValue::TimestampMillisecond(_, _) => None,
+    }
+}
+
 async fn try_execute_derived_sql(
     engine: &DodamEngine,
     sql: &str,
@@ -4559,8 +4743,20 @@ async fn try_execute_derived_sql(
     reject_select_features(select)?;
 
     let distinct = parse_distinct(select)?;
-    let inner_output = Box::pin(execute_sql(engine, &subquery.to_string(), batch_size)).await?;
-    let inner_batches = query_output_batches(inner_output)?;
+    let parsed_inner = match parse_query(subquery) {
+        Ok(query) => Some(query),
+        Err(DodamError::UnsupportedSql(_)) | Err(DodamError::UnknownColumn(_)) => None,
+        Err(error) => return Err(error),
+    };
+    let inner_output = if let Some(parsed_inner) = parsed_inner {
+        if let Some(output) = execute_parsed_join_query(engine, parsed_inner, batch_size).await? {
+            output
+        } else {
+            Box::pin(execute_sql(engine, &subquery.to_string(), batch_size)).await?
+        }
+    } else {
+        Box::pin(execute_sql(engine, &subquery.to_string(), batch_size)).await?
+    };
     let group_by = parse_group_by(select, Some(&alias))?;
     let parsed_projection = parse_projection(select, &group_by, Some(&alias))?;
     let filter = select
@@ -4576,6 +4772,26 @@ async fn try_execute_derived_sql(
     let order_by = parse_order_by(query, &parsed_projection.aliases, Some(&alias))?;
     let limit = parse_limit(query)?;
 
+    if let QueryOutput::Aggregate {
+        metrics: inner_metrics,
+        batches: inner_batches,
+    } = &inner_output
+    {
+        if let Some(output) = try_count_derived_aggregate_groups(
+            inner_metrics,
+            inner_batches,
+            &group_by,
+            &parsed_projection,
+            filter.as_ref(),
+            having.as_ref(),
+            order_by.as_ref(),
+            limit,
+        )? {
+            return Ok(Some(output));
+        }
+    }
+
+    let inner_batches = query_output_batches(inner_output)?;
     if !parsed_projection.aggregates.is_empty() {
         let mut filtered_batches = apply_output_filter(inner_batches, filter.as_ref())?;
         filtered_batches = append_aggregate_expression_columns(

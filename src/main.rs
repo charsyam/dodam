@@ -1603,7 +1603,9 @@ impl StdoutQuerySink {
             QueryOutput::Scan { batches } => self.write_batches(batches)?,
             QueryOutput::Aggregate { metrics, batches } => {
                 self.write_batches(batches)?;
-                self.write_aggregate_summary(&metrics);
+                if query_summary_enabled() {
+                    self.write_aggregate_summary(&metrics);
+                }
             }
             QueryOutput::Explain { plan } => println!("{plan}"),
         }
@@ -1617,10 +1619,42 @@ impl StdoutQuerySink {
         Ok(())
     }
 
-    fn write_stdout_batch(&mut self, batch: &RecordBatch) {
-        if batch.num_rows() > 0 {
-            println!("{batch:?}");
+    fn write_stdout_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
         }
+        let columns = match batch
+            .columns()
+            .iter()
+            .map(|array| CsvColumn::try_from_array(array.as_ref(), batch.num_rows()))
+            .collect::<Result<Vec<_>>>()
+        {
+            Ok(columns) => columns,
+            Err(DodamError::UnsupportedSql(_)) => {
+                println!("{batch:?}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let mut buffer = Vec::with_capacity(
+            batch
+                .num_rows()
+                .saturating_mul(columns.len())
+                .saturating_mul(16),
+        );
+        if !write_specialized_csv_batch(&columns, batch.num_rows(), &mut buffer) {
+            for row in 0..batch.num_rows() {
+                for (column_index, column) in columns.iter().enumerate() {
+                    if column_index > 0 {
+                        buffer.push(b',');
+                    }
+                    column.write_value(row, &mut buffer)?;
+                }
+                buffer.push(b'\n');
+            }
+        }
+        std::io::stdout().write_all(&buffer)?;
+        Ok(())
     }
 
     fn write_aggregate_summary(&mut self, metrics: &AggregateMetrics) {
@@ -1665,11 +1699,16 @@ impl StdoutQuerySink {
 
 impl RecordBatchSink for StdoutQuerySink {
     fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        self.write_stdout_batch(batch);
-        Ok(())
+        self.write_stdout_batch(batch)
     }
 }
 
 fn nanos_to_micros(nanos: u64) -> u64 {
     nanos / 1_000
+}
+
+fn query_summary_enabled() -> bool {
+    std::env::var("DODAM_QUERY_SUMMARY")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
