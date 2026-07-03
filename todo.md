@@ -572,6 +572,10 @@ Tried and rejected or neutral:
   - Added a general derived left-join count-distribution fast path for `GROUP BY count(right_col)` over a derived `LEFT JOIN ... GROUP BY left_key, count(right_col)` shape.
     - This avoids materializing the intermediate left-join aggregate rows for Q13-style queries and computes the final count distribution directly with dense single-`Int64` key vectors.
     - Latest Q13 standalone median improved to about `0.0175s`; latest SF=0.01 7-run full comparison shows Q13 around `1.11x` DuckDB, with Q04 now the larger remaining gap.
+  - Generalized two more projection-pruning improvements:
+    - Correlated `EXISTS` semijoin decorrelation now scans only the semijoin key plus filter/projection columns on both inner and outer inputs. This moved Q04 standalone median to about `0.010s` vs DuckDB about `0.016s` on the current SF=0.01 fixture.
+    - Two-table join aggregate expressions now keep scan input projection pushdown enabled and collect `CASE` expression columns through join-aware SQL expression traversal. This moved Q12 standalone median to about `0.012s` vs DuckDB about `0.015s`.
+    - Latest SF=0.01 7-run full comparison after these changes: Dodam about `0.252s`, DuckDB about `0.367s`, total ratio about `0.69x`; Q13 is the only remaining query above `1.1x`.
   - Rejected as retained defaults: row-count-only multi-comma join reordering regressed Q05/Q09; applying ready residual filters after each intermediate comma join added overhead/regressed Q03; moving Q18 ahead of its fast path onto the generic materialized `IN` rewrite was correct but too slow (`~0.77s` median for Q18 alone); direct Rust row-loop handling for Q13's left-join count distribution did not beat the existing hash join/grouped aggregate path.
   - Re-tested Q13 follow-up optimizations after the derived aggregate output fast path:
     - Skipping the inner derived aggregate result batch and using only metrics regressed Q13 standalone median from about `0.018s` to about `0.019s`.

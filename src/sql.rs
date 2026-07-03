@@ -194,11 +194,7 @@ pub async fn execute_sql(
         let is_aggregate = query.is_aggregate();
         let aggregates = query.aggregates.clone();
         let group_by = query.group_by.clone();
-        let join_input_projection = if query.aggregate_expressions.is_empty() {
-            &query.projection
-        } else {
-            &Projection::All
-        };
+        let join_input_projection = &query.projection;
         let join_plan = plan_join_inputs(
             join_input_projection,
             query.filter.as_ref(),
@@ -4626,11 +4622,7 @@ async fn execute_parsed_join_query(
     let is_aggregate = query.is_aggregate();
     let aggregates = query.aggregates.clone();
     let group_by = query.group_by.clone();
-    let join_input_projection = if query.aggregate_expressions.is_empty() {
-        &query.projection
-    } else {
-        &Projection::All
-    };
+    let join_input_projection = &query.projection;
     let join_plan = plan_join_inputs(
         join_input_projection,
         query.filter.as_ref(),
@@ -5607,6 +5599,23 @@ fn collect_join_column_candidates(
             collect_join_column_candidates(expr, table_aliases, columns)?;
             collect_join_column_candidates(pattern, table_aliases, columns)?;
         }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                collect_join_column_candidates(operand, table_aliases, columns)?;
+            }
+            for when in conditions {
+                collect_join_column_candidates(&when.condition, table_aliases, columns)?;
+                collect_join_column_candidates(&when.result, table_aliases, columns)?;
+            }
+            if let Some(else_result) = else_result {
+                collect_join_column_candidates(else_result, table_aliases, columns)?;
+            }
+        }
         SqlExpr::Value(_) => {}
         SqlExpr::Exists { .. } | SqlExpr::InSubquery { .. } | SqlExpr::Subquery(_) => {}
         _ => {}
@@ -6235,14 +6244,20 @@ fn aggregate_join_output_projection(query: &SqlQuery) -> Projection {
     let Projection::Columns(columns) = &query.projection else {
         return Projection::All;
     };
+    let Some(join) = &query.join else {
+        return Projection::All;
+    };
     let mut columns = columns.clone();
     if let Some(filter) = &query.filter {
         for column in filter.referenced_columns() {
             add_column_once(&mut columns, column);
         }
     }
+    let aliases = [join.left_alias.as_str(), join.right_alias.as_str()];
     for expression in &query.aggregate_expressions {
-        for column in scalar_expression_columns(&expression.expr) {
+        for column in join_scalar_expression_columns(&expression.expr, &aliases)
+            .unwrap_or_else(|_| scalar_expression_columns(&expression.expr))
+        {
             add_column_once(&mut columns, column);
         }
     }
@@ -7214,6 +7229,12 @@ fn parse_join_projection(
                     for column in join_scalar_expression_columns(&expression.expr, table_aliases)? {
                         add_column_once(&mut aggregate_expression_columns, column);
                     }
+                    for column in join_sql_expression_columns(
+                        &SqlExpr::Function(function.clone()),
+                        table_aliases,
+                    )? {
+                        add_column_once(&mut aggregate_expression_columns, column);
+                    }
                     aggregate_expressions.push(expression);
                 }
                 aliases.push((function.to_string(), aggregate.to_string()));
@@ -7266,6 +7287,9 @@ fn parse_join_projection(
                         for column in
                             join_scalar_expression_columns(&expression.expr, table_aliases)?
                         {
+                            add_column_once(&mut aggregate_expression_columns, column);
+                        }
+                        for column in join_sql_expression_columns(expr, table_aliases)? {
                             add_column_once(&mut aggregate_expression_columns, column);
                         }
                         aggregate_expressions.push(expression);
@@ -7703,7 +7727,20 @@ fn qualified_join_column(expr: &SqlExpr, table_aliases: &[&str]) -> Result<Strin
 
 fn join_column_name(expr: &SqlExpr, table_aliases: &[&str]) -> Result<String> {
     match expr {
-        SqlExpr::Identifier(ident) => infer_unqualified_join_column(&ident.value, table_aliases),
+        SqlExpr::Identifier(ident) => {
+            if let Some((qualifier, column)) = ident.value.split_once('.') {
+                if !table_aliases
+                    .iter()
+                    .any(|table_alias| table_alias.eq_ignore_ascii_case(qualifier))
+                {
+                    return Err(DodamError::UnsupportedSql(format!(
+                        "unknown table qualifier: {qualifier}"
+                    )));
+                }
+                return Ok(format!("{qualifier}.{column}"));
+            }
+            infer_unqualified_join_column(&ident.value, table_aliases)
+        }
         SqlExpr::CompoundIdentifier(parts) => match parts.as_slice() {
             [_] => infer_unqualified_join_column(&parts[0].value, table_aliases),
             [_, _] => qualified_join_column(expr, table_aliases),
@@ -8484,6 +8521,12 @@ fn join_scalar_expression_columns(
 ) -> Result<Vec<String>> {
     let mut columns = Vec::new();
     collect_join_scalar_expression_columns(expr, table_aliases, &mut columns)?;
+    Ok(columns)
+}
+
+fn join_sql_expression_columns(expr: &SqlExpr, table_aliases: &[&str]) -> Result<Vec<String>> {
+    let mut columns = Vec::new();
+    collect_join_column_candidates(expr, table_aliases, &mut columns)?;
     Ok(columns)
 }
 
