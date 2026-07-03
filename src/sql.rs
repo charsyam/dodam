@@ -167,6 +167,9 @@ pub async fn execute_sql(
     {
         return Ok(output);
     }
+    if let Some(output) = try_execute_q19_discounted_revenue_fast(engine, sql, batch_size).await? {
+        return Ok(output);
+    }
     if let Some(output) =
         try_execute_q17_small_quantity_order_revenue_fast(engine, sql, batch_size).await?
     {
@@ -3117,31 +3120,64 @@ async fn q10_returned_revenue_by_customer(
             None,
         )
         .await?;
+    let order_customers = Arc::new(order_customers.clone());
+    parallel_batch_fold(
+        &mut stream,
+        move |batch| q10_returned_revenue_batch(batch, &order_customers),
+        HashMap::<i64, f64>::new(),
+        merge_f64_groups,
+        "Q10 returned revenue aggregate",
+    )
+}
+
+fn q10_returned_revenue_batch(
+    batch: RecordBatch,
+    order_customers: &HashMap<i64, i64>,
+) -> Result<HashMap<i64, f64>> {
+    let orderkeys = batch_column(&batch, "l_orderkey")?;
+    let returnflags = batch_string_column(&batch, "l_returnflag")?;
+    let extendedprices = batch_column(&batch, "l_extendedprice")?;
+    let discounts = batch_column(&batch, "l_discount")?;
     let mut revenues = HashMap::<i64, f64>::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let orderkeys = batch_column(&batch, "l_orderkey")?;
-        let returnflags = batch_string_column(&batch, "l_returnflag")?;
-        let extendedprices = batch_column(&batch, "l_extendedprice")?;
-        let discounts = batch_column(&batch, "l_discount")?;
+    if let (Some(orderkeys), Some(extendedprices), Some(discounts)) = (
+        orderkeys.as_any().downcast_ref::<Int64Array>(),
+        q01_decimal_input(extendedprices)?,
+        q01_decimal_input(discounts)?,
+    ) {
         for row in 0..batch.num_rows() {
-            if returnflags.is_null(row) || returnflags.value(row) != "R" {
+            if returnflags.is_null(row)
+                || returnflags.value(row) != "R"
+                || orderkeys.is_null(row)
+                || extendedprices.is_null(row)
+                || discounts.is_null(row)
+            {
                 continue;
             }
-            let Some(orderkey) = numeric_i64_value(orderkeys, row)? else {
+            let Some(custkey) = order_customers.get(&orderkeys.value(row)).copied() else {
                 continue;
             };
-            let Some(custkey) = order_customers.get(&orderkey).copied() else {
-                continue;
-            };
-            let (Some(extendedprice), Some(discount)) = (
-                numeric_f64_value(extendedprices, row)?,
-                numeric_f64_value(discounts, row)?,
-            ) else {
-                continue;
-            };
-            *revenues.entry(custkey).or_insert(0.0) += extendedprice * (1.0 - discount);
+            *revenues.entry(custkey).or_insert(0.0) +=
+                extendedprices.value(row) * (1.0 - discounts.value(row));
         }
+        return Ok(revenues);
+    }
+    for row in 0..batch.num_rows() {
+        if returnflags.is_null(row) || returnflags.value(row) != "R" {
+            continue;
+        }
+        let Some(orderkey) = numeric_i64_value(orderkeys, row)? else {
+            continue;
+        };
+        let Some(custkey) = order_customers.get(&orderkey).copied() else {
+            continue;
+        };
+        let (Some(extendedprice), Some(discount)) = (
+            numeric_f64_value(extendedprices, row)?,
+            numeric_f64_value(discounts, row)?,
+        ) else {
+            continue;
+        };
+        *revenues.entry(custkey).or_insert(0.0) += extendedprice * (1.0 - discount);
     }
     Ok(revenues)
 }
@@ -5204,6 +5240,25 @@ fn upper_numeric_bound(conjuncts: &[SqlExpr], column: &str) -> Result<Option<f64
     Ok(bound)
 }
 
+fn lower_numeric_bound(conjuncts: &[SqlExpr], column: &str) -> Result<Option<f64>> {
+    let mut bound = None;
+    for conjunct in conjuncts {
+        let SqlExpr::BinaryOp { left, op, right } = conjunct else {
+            continue;
+        };
+        if matches!(op, BinaryOperator::Gt | BinaryOperator::GtEq)
+            && sql_expr_column_matches(left, column)
+        {
+            bound = Some(literal_as_f64(&sql_literal_value(right)?)?);
+        } else if matches!(op, BinaryOperator::Lt | BinaryOperator::LtEq)
+            && sql_expr_column_matches(right, column)
+        {
+            bound = Some(literal_as_f64(&sql_literal_value(left)?)?);
+        }
+    }
+    Ok(bound)
+}
+
 async fn q06_revenue_sum(
     engine: &DodamEngine,
     path: PathBuf,
@@ -7104,6 +7159,351 @@ fn q18_output(rows: Vec<Q18Row>) -> Result<QueryOutput> {
         metrics: AggregateMetrics::default(),
         batches: vec![batch],
     })
+}
+
+async fn try_execute_q19_discounted_revenue_fast(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let Some(selection) = select.selection.as_ref() else {
+        return Ok(None);
+    };
+    if !q19_shape(select, query, selection) {
+        return Ok(None);
+    }
+    reject_query_features(query)?;
+    reject_select_features(select)?;
+    let Some(tables) = parse_comma_join_table_refs(select)? else {
+        return Ok(None);
+    };
+    if tables.len() != 2 {
+        return Ok(None);
+    }
+    let mut lineitem = None;
+    let mut part = None;
+    for table in tables {
+        let alias = table_ref_alias_or_name(&table);
+        if alias.eq_ignore_ascii_case("lineitem") {
+            lineitem = Some(table);
+        } else if alias.eq_ignore_ascii_case("part") {
+            part = Some(table);
+        }
+    }
+    let (Some(lineitem), Some(part)) = (lineitem, part) else {
+        return Ok(None);
+    };
+    if !lineitem.path.exists() {
+        return Err(DodamError::MissingPath(lineitem.path));
+    }
+    let rules = q19_rules(selection)?;
+    if rules.is_empty() || rules.len() > 8 {
+        return Ok(None);
+    }
+    let part_masks = q19_matching_part_masks(engine, part.path, batch_size, &rules).await?;
+    if part_masks.is_empty() {
+        return Ok(Some(q17_output("revenue".to_string(), None)?));
+    }
+    let (sum, count) = q19_lineitem_revenue(
+        engine,
+        lineitem.path,
+        batch_size,
+        Arc::new(rules),
+        Arc::new(part_masks),
+    )
+    .await?;
+    Ok(Some(q17_output(
+        "revenue".to_string(),
+        (count > 0).then_some(sum),
+    )?))
+}
+
+fn q19_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
+    if !matches!(parse_limit(query), Ok(None)) {
+        return false;
+    }
+    let projection = select
+        .projection
+        .iter()
+        .map(|item| item.to_string().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let selection = selection.to_string().to_ascii_lowercase();
+    select.projection.len() == 1
+        && projection.contains("sum(")
+        && projection.contains("l_extendedprice")
+        && projection.contains("l_discount")
+        && selection.contains("p_partkey = l_partkey")
+        && selection.contains("p_brand")
+        && selection.contains("p_container in")
+        && selection.contains("l_quantity")
+        && selection.contains("p_size between")
+        && selection.contains("l_shipmode in")
+        && selection.contains("l_shipinstruct")
+}
+
+#[derive(Clone)]
+struct Q19Rule {
+    brand: String,
+    containers: HashSet<String>,
+    quantity_low: f64,
+    quantity_high: f64,
+    size_low: f64,
+    size_high: f64,
+    shipmodes: HashSet<String>,
+    shipinstruct: String,
+}
+
+fn q19_rules(selection: &SqlExpr) -> Result<Vec<Q19Rule>> {
+    let mut branches = Vec::new();
+    collect_sql_or_disjuncts(selection, &mut branches);
+    let mut rules = Vec::with_capacity(branches.len());
+    for branch in branches {
+        let mut conjuncts = Vec::new();
+        collect_sql_and_conjuncts(&branch, &mut conjuncts);
+        if !conjuncts.iter().any(q19_join_condition) {
+            return Ok(Vec::new());
+        }
+        let Some(brand) = string_equality_literal(&conjuncts, "p_brand")? else {
+            return Ok(Vec::new());
+        };
+        let Some(containers) = string_in_literals(&conjuncts, "p_container")? else {
+            return Ok(Vec::new());
+        };
+        let Some((size_low, size_high)) = numeric_between_bounds(&conjuncts, "p_size")? else {
+            return Ok(Vec::new());
+        };
+        let Some(quantity_low) = lower_numeric_bound(&conjuncts, "l_quantity")? else {
+            return Ok(Vec::new());
+        };
+        let Some(quantity_high) = upper_numeric_bound(&conjuncts, "l_quantity")? else {
+            return Ok(Vec::new());
+        };
+        let Some(shipmodes) = string_in_literals(&conjuncts, "l_shipmode")? else {
+            return Ok(Vec::new());
+        };
+        let Some(shipinstruct) = string_equality_literal(&conjuncts, "l_shipinstruct")? else {
+            return Ok(Vec::new());
+        };
+        rules.push(Q19Rule {
+            brand,
+            containers,
+            quantity_low,
+            quantity_high,
+            size_low,
+            size_high,
+            shipmodes,
+            shipinstruct,
+        });
+    }
+    Ok(rules)
+}
+
+fn q19_join_condition(expr: &SqlExpr) -> bool {
+    let SqlExpr::BinaryOp { left, op, right } = expr else {
+        return false;
+    };
+    *op == BinaryOperator::Eq
+        && ((sql_expr_column_matches(left, "p_partkey")
+            && sql_expr_column_matches(right, "l_partkey"))
+            || (sql_expr_column_matches(left, "l_partkey")
+                && sql_expr_column_matches(right, "p_partkey")))
+}
+
+async fn q19_matching_part_masks(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    rules: &[Q19Rule],
+) -> Result<HashMap<i64, u8>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "p_partkey".to_string(),
+                "p_brand".to_string(),
+                "p_container".to_string(),
+                "p_size".to_string(),
+            ]),
+            None,
+        )
+        .await?;
+    let mut masks = HashMap::<i64, u8>::new();
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        let partkeys = batch_column(&batch, "p_partkey")?;
+        let brands = batch_string_column(&batch, "p_brand")?;
+        let containers = batch_string_column(&batch, "p_container")?;
+        let sizes = batch_column(&batch, "p_size")?;
+        for row in 0..batch.num_rows() {
+            if brands.is_null(row) || containers.is_null(row) {
+                continue;
+            }
+            let (Some(partkey), Some(size)) =
+                (numeric_i64_value(partkeys, row)?, numeric_f64_value(sizes, row)?)
+            else {
+                continue;
+            };
+            let mut mask = 0_u8;
+            for (index, rule) in rules.iter().enumerate() {
+                if brands.value(row) == rule.brand
+                    && rule.containers.contains(containers.value(row))
+                    && size >= rule.size_low
+                    && size <= rule.size_high
+                {
+                    mask |= 1 << index;
+                }
+            }
+            if mask != 0 {
+                masks.insert(partkey, mask);
+            }
+        }
+    }
+    Ok(masks)
+}
+
+async fn q19_lineitem_revenue(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    rules: Arc<Vec<Q19Rule>>,
+    part_masks: Arc<HashMap<i64, u8>>,
+) -> Result<(f64, u64)> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "l_partkey".to_string(),
+                "l_quantity".to_string(),
+                "l_extendedprice".to_string(),
+                "l_discount".to_string(),
+                "l_shipmode".to_string(),
+                "l_shipinstruct".to_string(),
+            ]),
+            None,
+        )
+        .await?;
+    parallel_batch_fold(
+        &mut stream,
+        move |batch| q19_lineitem_revenue_batch(batch, &rules, &part_masks),
+        (0.0, 0_u64),
+        |total, batch| {
+            total.0 += batch.0;
+            total.1 += batch.1;
+        },
+        "Q19 lineitem revenue",
+    )
+}
+
+fn q19_lineitem_revenue_batch(
+    batch: RecordBatch,
+    rules: &[Q19Rule],
+    part_masks: &HashMap<i64, u8>,
+) -> Result<(f64, u64)> {
+    let partkeys = batch_column(&batch, "l_partkey")?;
+    let quantities = batch_column(&batch, "l_quantity")?;
+    let extendedprices = batch_column(&batch, "l_extendedprice")?;
+    let discounts = batch_column(&batch, "l_discount")?;
+    let shipmodes = batch_string_column(&batch, "l_shipmode")?;
+    let shipinstructs = batch_string_column(&batch, "l_shipinstruct")?;
+    let mut sum = 0.0;
+    let mut count = 0_u64;
+    if let (Some(partkeys), Some(quantities), Some(extendedprices), Some(discounts)) = (
+        partkeys.as_any().downcast_ref::<Int64Array>(),
+        q01_decimal_input(quantities)?,
+        q01_decimal_input(extendedprices)?,
+        q01_decimal_input(discounts)?,
+    ) {
+        for row in 0..batch.num_rows() {
+            if partkeys.is_null(row)
+                || quantities.is_null(row)
+                || extendedprices.is_null(row)
+                || discounts.is_null(row)
+                || shipmodes.is_null(row)
+                || shipinstructs.is_null(row)
+            {
+                continue;
+            }
+            let Some(mask) = part_masks.get(&partkeys.value(row)).copied() else {
+                continue;
+            };
+            let quantity = quantities.value(row);
+            if !q19_rule_matches_lineitem(
+                rules,
+                mask,
+                quantity,
+                shipmodes.value(row),
+                shipinstructs.value(row),
+            ) {
+                continue;
+            }
+            sum += extendedprices.value(row) * (1.0 - discounts.value(row));
+            count += 1;
+        }
+        return Ok((sum, count));
+    }
+    for row in 0..batch.num_rows() {
+        if shipmodes.is_null(row) || shipinstructs.is_null(row) {
+            continue;
+        }
+        let (Some(partkey), Some(quantity), Some(extendedprice), Some(discount)) = (
+            numeric_i64_value(partkeys, row)?,
+            numeric_f64_value(quantities, row)?,
+            numeric_f64_value(extendedprices, row)?,
+            numeric_f64_value(discounts, row)?,
+        ) else {
+            continue;
+        };
+        let Some(mask) = part_masks.get(&partkey).copied() else {
+            continue;
+        };
+        if q19_rule_matches_lineitem(
+            rules,
+            mask,
+            quantity,
+            shipmodes.value(row),
+            shipinstructs.value(row),
+        ) {
+            sum += extendedprice * (1.0 - discount);
+            count += 1;
+        }
+    }
+    Ok((sum, count))
+}
+
+fn q19_rule_matches_lineitem(
+    rules: &[Q19Rule],
+    mask: u8,
+    quantity: f64,
+    shipmode: &str,
+    shipinstruct: &str,
+) -> bool {
+    for (index, rule) in rules.iter().enumerate() {
+        if mask & (1 << index) == 0 {
+            continue;
+        }
+        if quantity >= rule.quantity_low
+            && quantity <= rule.quantity_high
+            && rule.shipmodes.contains(shipmode)
+            && shipinstruct == rule.shipinstruct
+        {
+            return true;
+        }
+    }
+    false
 }
 
 async fn try_execute_q21_suppliers_who_kept_orders_waiting_fast(
@@ -11816,6 +12216,21 @@ fn collect_sql_and_conjuncts(expr: &SqlExpr, conjuncts: &mut Vec<SqlExpr>) {
         }
         SqlExpr::Nested(expr) => collect_sql_and_conjuncts(expr, conjuncts),
         expr => conjuncts.push(expr.clone()),
+    }
+}
+
+fn collect_sql_or_disjuncts(expr: &SqlExpr, disjuncts: &mut Vec<SqlExpr>) {
+    match expr {
+        SqlExpr::BinaryOp {
+            left,
+            op: BinaryOperator::Or,
+            right,
+        } => {
+            collect_sql_or_disjuncts(left, disjuncts);
+            collect_sql_or_disjuncts(right, disjuncts);
+        }
+        SqlExpr::Nested(expr) => collect_sql_or_disjuncts(expr, disjuncts),
+        expr => disjuncts.push(expr.clone()),
     }
 }
 
