@@ -8889,16 +8889,91 @@ fn evaluate_like(
             data_type: column_array.data_type().clone(),
         })?;
     let tokens = like_pattern_tokens(pattern, escape)?;
+    let fast_pattern = fast_like_pattern(pattern, escape);
     let mut builder = BooleanBuilder::with_capacity(values.len());
     for row in 0..values.len() {
         if values.is_null(row) {
             builder.append_null();
             continue;
         }
-        let matched = like_matches(values.value(row), &tokens);
+        let matched = fast_pattern
+            .as_ref()
+            .map(|pattern| pattern.matches(values.value(row)))
+            .unwrap_or_else(|| like_matches(values.value(row), &tokens));
         builder.append_value(if negated { !matched } else { matched });
     }
     Ok(builder.finish())
+}
+
+#[derive(Debug, Clone)]
+struct FastLikePattern<'a> {
+    starts_with_any: bool,
+    ends_with_any: bool,
+    segments: Vec<&'a str>,
+}
+
+impl FastLikePattern<'_> {
+    fn matches(&self, value: &str) -> bool {
+        if self.segments.is_empty() {
+            return true;
+        }
+        if !self.starts_with_any && !self.ends_with_any && self.segments.len() == 1 {
+            return value == self.segments[0];
+        }
+        if !self.starts_with_any && !value.starts_with(self.segments[0]) {
+            return false;
+        }
+        if !self.ends_with_any
+            && !value.ends_with(self.segments[self.segments.len().saturating_sub(1)])
+        {
+            return false;
+        }
+
+        let mut offset = 0;
+        for (index, segment) in self.segments.iter().enumerate() {
+            if segment.is_empty() {
+                continue;
+            }
+            if index == 0 && !self.starts_with_any {
+                offset = segment.len();
+                continue;
+            }
+            if index + 1 == self.segments.len() && !self.ends_with_any {
+                let suffix_start = value.len().saturating_sub(segment.len());
+                if suffix_start < offset {
+                    return false;
+                }
+                offset = suffix_start + segment.len();
+                continue;
+            }
+            let Some(relative) = value[offset..].find(segment) else {
+                return false;
+            };
+            offset += relative + segment.len();
+        }
+        true
+    }
+}
+
+fn fast_like_pattern(pattern: &str, escape: Option<char>) -> Option<FastLikePattern<'_>> {
+    if escape.is_some() || pattern.contains('_') {
+        return None;
+    }
+    if !pattern.contains('%') {
+        return Some(FastLikePattern {
+            starts_with_any: false,
+            ends_with_any: false,
+            segments: vec![pattern],
+        });
+    }
+    Some(FastLikePattern {
+        starts_with_any: pattern.starts_with('%'),
+        ends_with_any: pattern.ends_with('%'),
+        segments: pattern
+            .split('%')
+            .filter(|segment| !segment.is_empty())
+            .collect(),
+    })
 }
 
 #[derive(Debug, Clone, Copy)]

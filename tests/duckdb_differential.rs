@@ -419,7 +419,10 @@ async fn duckdb_differential_like_filters() {
     write_like_values_parquet(&path);
 
     let cases = [
+        "text LIKE 'alpha'",
         "text LIKE 'alpha%'",
+        "text LIKE '%beta'",
+        "text LIKE '%special%requests%'",
         "text NOT LIKE '%requests%'",
         "text LIKE 'a_ph_'",
         "text LIKE '100!%%' ESCAPE '!'",
