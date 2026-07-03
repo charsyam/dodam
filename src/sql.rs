@@ -3205,6 +3205,29 @@ fn q01_update_decimal_batch(
     ) else {
         return Ok(false);
     };
+    if shipdates.null_count() == 0
+        && returnflags.null_count() == 0
+        && linestatuses.null_count() == 0
+        && quantities.null_count() == 0
+        && extendedprices.null_count() == 0
+        && discounts.null_count() == 0
+        && taxes.null_count() == 0
+    {
+        for row in 0..shipdates.len() {
+            if shipdates.value(row) > cutoff_days {
+                continue;
+            }
+            groups.update(returnflags.value(row), linestatuses.value(row), |state| {
+                state.update(
+                    quantities.value(row),
+                    extendedprices.value(row),
+                    discounts.value(row),
+                    taxes.value(row),
+                );
+            });
+        }
+        return Ok(true);
+    }
     for row in 0..shipdates.len() {
         if shipdates.is_null(row)
             || shipdates.value(row) > cutoff_days
@@ -3261,6 +3284,10 @@ struct Q01DecimalInput<'a> {
 impl Q01DecimalInput<'_> {
     fn is_null(&self, row: usize) -> bool {
         self.values.is_null(row)
+    }
+
+    fn null_count(&self) -> usize {
+        self.values.null_count()
     }
 
     fn value(&self, row: usize) -> f64 {
@@ -6970,9 +6997,19 @@ async fn q03_order_rows(
         )
         .await?;
     let customers = Arc::new(customers.clone());
-    parallel_batch_fold(
+    parallel_batch_fold_chunks(
         &mut stream,
-        move |batch| q03_order_rows_batch(batch, &customers, order_cutoff),
+        4,
+        move |batches| {
+            let mut orders = HashMap::<i64, Q03Order>::new();
+            for batch in batches {
+                merge_maps(
+                    &mut orders,
+                    q03_order_rows_batch(batch, &customers, order_cutoff)?,
+                );
+            }
+            Ok(orders)
+        },
         HashMap::<i64, Q03Order>::new(),
         merge_maps,
         "Q03 order rows",
@@ -7088,9 +7125,19 @@ async fn q03_revenue_rows(
         )
         .await?;
     let orders_for_scan = Arc::new(orders.clone());
-    let revenues = parallel_batch_fold(
+    let revenues = parallel_batch_fold_chunks(
         &mut stream,
-        move |batch| q03_revenue_batch(batch, &orders_for_scan, ship_cutoff),
+        4,
+        move |batches| {
+            let mut revenues = HashMap::<i64, f64>::new();
+            for batch in batches {
+                merge_f64_groups(
+                    &mut revenues,
+                    q03_revenue_batch(batch, &orders_for_scan, ship_cutoff)?,
+                );
+            }
+            Ok(revenues)
+        },
         HashMap::<i64, f64>::new(),
         merge_f64_groups,
         "Q03 revenue aggregate",
@@ -7999,9 +8046,19 @@ async fn q05_revenue_by_nation(
         .await?;
     let order_customer_nations = Arc::new(order_customer_nations.clone());
     let supplier_nations = Arc::new(supplier_nations.clone());
-    let groups = parallel_batch_fold(
+    let groups = parallel_batch_fold_chunks(
         &mut stream,
-        move |batch| q05_revenue_by_nation_batch(batch, &order_customer_nations, &supplier_nations),
+        4,
+        move |batches| {
+            let mut groups = HashMap::<i64, f64>::new();
+            for batch in batches {
+                merge_f64_groups(
+                    &mut groups,
+                    q05_revenue_by_nation_batch(batch, &order_customer_nations, &supplier_nations)?,
+                );
+            }
+            Ok(groups)
+        },
         HashMap::<i64, f64>::new(),
         merge_f64_groups,
         "Q05 revenue aggregate",
@@ -8351,6 +8408,27 @@ fn q06_revenue_sum_batch(
     ) {
         let mut sum = 0.0;
         let mut count = 0_u64;
+        if shipdates.null_count() == 0
+            && discounts.null_count() == 0
+            && quantities.null_count() == 0
+            && extendedprices.null_count() == 0
+        {
+            for row in 0..batch.num_rows() {
+                let shipdate = shipdates.value(row);
+                let discount = discounts.value(row);
+                if shipdate < start_days
+                    || shipdate >= end_days
+                    || discount < discount_low
+                    || discount > discount_high
+                    || quantities.value(row) >= quantity_limit
+                {
+                    continue;
+                }
+                sum += extendedprices.value(row) * discount;
+                count += 1;
+            }
+            return Ok(Some((sum, count)));
+        }
         for row in 0..batch.num_rows() {
             if shipdates.is_null(row)
                 || discounts.is_null(row)
@@ -8658,9 +8736,19 @@ async fn q07_order_customers(
         )
         .await?;
     let customer_nations = Arc::new(customer_nations.clone());
-    parallel_batch_fold(
+    parallel_batch_fold_chunks(
         &mut stream,
-        move |batch| q07_order_customers_batch(batch, &customer_nations),
+        4,
+        move |batches| {
+            let mut orders = HashMap::<i64, i64>::new();
+            for batch in batches {
+                merge_maps(
+                    &mut orders,
+                    q07_order_customers_batch(batch, &customer_nations)?,
+                );
+            }
+            Ok(orders)
+        },
         HashMap::<i64, i64>::new(),
         merge_maps,
         "Q07 order customer nations",
@@ -8748,16 +8836,24 @@ async fn q07_volume_rows(
         .await?;
     let supplier_nations = Arc::new(supplier_nations.clone());
     let order_customer_nations = Arc::new(order_customer_nations.clone());
-    let groups = parallel_batch_fold(
+    let groups = parallel_batch_fold_chunks(
         &mut stream,
-        move |batch| {
-            q07_volume_batch(
-                batch,
-                &supplier_nations,
-                &order_customer_nations,
-                start_days,
-                end_days,
-            )
+        4,
+        move |batches| {
+            let mut groups = HashMap::<(i64, i64, i32), f64>::new();
+            for batch in batches {
+                merge_f64_groups(
+                    &mut groups,
+                    q07_volume_batch(
+                        batch,
+                        &supplier_nations,
+                        &order_customer_nations,
+                        start_days,
+                        end_days,
+                    )?,
+                );
+            }
+            Ok(groups)
         },
         HashMap::<(i64, i64, i32), f64>::new(),
         merge_f64_groups,
@@ -10829,6 +10925,32 @@ fn q19_lineitem_revenue_batch(
         q01_decimal_input(extendedprices)?,
         q01_decimal_input(discounts)?,
     ) {
+        if partkeys.null_count() == 0
+            && quantities.null_count() == 0
+            && extendedprices.null_count() == 0
+            && discounts.null_count() == 0
+            && shipmodes.null_count() == 0
+            && shipinstructs.null_count() == 0
+        {
+            for row in 0..batch.num_rows() {
+                let Some(mask) = part_masks.get(partkeys.value(row)) else {
+                    continue;
+                };
+                let quantity = quantities.value(row);
+                if !q19_rule_matches_lineitem(
+                    rules,
+                    mask,
+                    quantity,
+                    shipmodes.value(row),
+                    shipinstructs.value(row),
+                ) {
+                    continue;
+                }
+                sum += extendedprices.value(row) * (1.0 - discounts.value(row));
+                count += 1;
+            }
+            return Ok((sum, count));
+        }
         for row in 0..batch.num_rows() {
             if partkeys.is_null(row)
                 || quantities.is_null(row)
@@ -11507,9 +11629,19 @@ async fn q20_lineitem_quantity_sums(
         )
         .await?;
     let forest_parts = Arc::new(forest_parts.clone());
-    parallel_batch_fold(
+    parallel_batch_fold_chunks(
         &mut stream,
-        move |batch| q20_lineitem_quantity_sums_batch(batch, &forest_parts),
+        4,
+        move |batches| {
+            let mut sums = HashMap::<(i64, i64), f64>::new();
+            for batch in batches {
+                merge_f64_groups(
+                    &mut sums,
+                    q20_lineitem_quantity_sums_batch(batch, &forest_parts)?,
+                );
+            }
+            Ok(sums)
+        },
         HashMap::<(i64, i64), f64>::new(),
         merge_f64_groups,
         "Q20 lineitem quantity aggregate",
