@@ -77,43 +77,44 @@ fn add_column_once(columns: &mut Vec<String>, column: String) {
 }
 
 fn join_side_filter(filter: &FilterExpr, prefix: &str) -> Option<FilterExpr> {
-    let conjuncts = join_side_conjuncts(filter.expr(), prefix);
-    combine_filters(
-        conjuncts
-            .into_iter()
-            .map(|expr| rewrite_join_side_expr(&expr, prefix))
-            .collect(),
-    )
-    .map(FilterExpr::new)
+    derive_join_side_filter(filter.expr(), prefix).map(FilterExpr::new)
 }
 
-fn join_side_conjuncts(expr: &Expr, prefix: &str) -> Vec<Expr> {
+fn derive_join_side_filter(expr: &Expr, prefix: &str) -> Option<Expr> {
+    let referenced = expr_referenced_columns(expr);
+    if !referenced.is_empty()
+        && referenced
+            .iter()
+            .all(|column| strip_join_prefix(column, prefix).is_some())
+    {
+        return Some(rewrite_join_side_expr(expr, prefix));
+    }
+
     match expr {
-        Expr::And(left, right) => {
-            let mut conjuncts = join_side_conjuncts(left, prefix);
-            conjuncts.extend(join_side_conjuncts(right, prefix));
-            conjuncts
+        Expr::And(left, right) => combine_optional_filters(
+            derive_join_side_filter(left, prefix),
+            derive_join_side_filter(right, prefix),
+            Expr::And,
+        ),
+        Expr::Or(left, right) => {
+            let left = derive_join_side_filter(left, prefix)?;
+            let right = derive_join_side_filter(right, prefix)?;
+            Some(Expr::Or(Box::new(left), Box::new(right)))
         }
-        expr => {
-            let referenced = expr_referenced_columns(expr);
-            if !referenced.is_empty()
-                && referenced
-                    .iter()
-                    .all(|column| strip_join_prefix(column, prefix).is_some())
-            {
-                vec![expr.clone()]
-            } else {
-                Vec::new()
-            }
-        }
+        _ => None,
     }
 }
 
-fn combine_filters(mut filters: Vec<Expr>) -> Option<Expr> {
-    let first = filters.pop()?;
-    Some(filters.into_iter().fold(first, |right, left| {
-        Expr::And(Box::new(left), Box::new(right))
-    }))
+fn combine_optional_filters(
+    left: Option<Expr>,
+    right: Option<Expr>,
+    combine: impl FnOnce(Box<Expr>, Box<Expr>) -> Expr,
+) -> Option<Expr> {
+    match (left, right) {
+        (None, None) => None,
+        (Some(expr), None) | (None, Some(expr)) => Some(expr),
+        (Some(left), Some(right)) => Some(combine(Box::new(left), Box::new(right))),
+    }
 }
 
 fn rewrite_join_side_expr(expr: &Expr, prefix: &str) -> Expr {
@@ -317,5 +318,78 @@ mod tests {
 
         assert_eq!(plan.left_filter, None);
         assert!(plan.right_filter.is_some());
+    }
+
+    #[test]
+    fn join_input_plan_derives_side_filters_from_or_branches() {
+        let filter = FilterExpr::new(Expr::Or(
+            Box::new(Expr::And(
+                Box::new(Expr::Comparison(ComparisonExpr {
+                    column: "o.status".to_string(),
+                    op: ComparisonOp::Eq,
+                    value: LiteralValue::Utf8("open".to_string()),
+                })),
+                Box::new(Expr::Comparison(ComparisonExpr {
+                    column: "c.region".to_string(),
+                    op: ComparisonOp::Eq,
+                    value: LiteralValue::Utf8("EU".to_string()),
+                })),
+            )),
+            Box::new(Expr::And(
+                Box::new(Expr::Comparison(ComparisonExpr {
+                    column: "o.status".to_string(),
+                    op: ComparisonOp::Eq,
+                    value: LiteralValue::Utf8("hold".to_string()),
+                })),
+                Box::new(Expr::Comparison(ComparisonExpr {
+                    column: "c.region".to_string(),
+                    op: ComparisonOp::Eq,
+                    value: LiteralValue::Utf8("ASIA".to_string()),
+                })),
+            )),
+        ));
+
+        let left_keys = vec!["customer_id".to_string()];
+        let right_keys = vec!["id".to_string()];
+        let plan = plan_join_inputs(
+            &Projection::Columns(vec!["o.id".to_string(), "c.name".to_string()]),
+            Some(&filter),
+            None,
+            "o",
+            &left_keys,
+            "c",
+            &right_keys,
+        );
+
+        assert_eq!(
+            plan.left_filter,
+            Some(FilterExpr::new(Expr::Or(
+                Box::new(Expr::Comparison(ComparisonExpr {
+                    column: "status".to_string(),
+                    op: ComparisonOp::Eq,
+                    value: LiteralValue::Utf8("open".to_string()),
+                })),
+                Box::new(Expr::Comparison(ComparisonExpr {
+                    column: "status".to_string(),
+                    op: ComparisonOp::Eq,
+                    value: LiteralValue::Utf8("hold".to_string()),
+                })),
+            )))
+        );
+        assert_eq!(
+            plan.right_filter,
+            Some(FilterExpr::new(Expr::Or(
+                Box::new(Expr::Comparison(ComparisonExpr {
+                    column: "region".to_string(),
+                    op: ComparisonOp::Eq,
+                    value: LiteralValue::Utf8("EU".to_string()),
+                })),
+                Box::new(Expr::Comparison(ComparisonExpr {
+                    column: "region".to_string(),
+                    op: ComparisonOp::Eq,
+                    value: LiteralValue::Utf8("ASIA".to_string()),
+                })),
+            )))
+        );
     }
 }

@@ -4662,9 +4662,43 @@ async fn try_execute_multi_comma_join_sql(
     })?;
     collect_sql_and_conjuncts(selection, &mut conjuncts);
 
-    let mut current = scan_table_for_comma_join(engine, &tables[0], batch_size).await?;
-    let mut joined_aliases = vec![aliases[0].clone()];
     let mut used_conjuncts = vec![false; conjuncts.len()];
+    let scan_filters =
+        comma_join_single_table_filters(&conjuncts, &aliases, &alias_refs, &mut used_conjuncts)?;
+    let group_by = parse_join_group_by(select, &alias_refs)?;
+    let projection = parse_join_projection(select, &alias_refs, &group_by)?;
+    let distinct = parse_distinct(select)?;
+    validate_distinct(
+        distinct,
+        &projection.projection,
+        &projection.aggregates,
+        None,
+    )?;
+    let having = select
+        .having
+        .as_ref()
+        .map(|expr| parse_join_filter(expr, &projection.aliases, &alias_refs, true))
+        .transpose()?;
+    let order_by = parse_join_order_by(query, &projection.aliases, &alias_refs)?;
+    let limit = parse_limit(query)?;
+    let scan_projections = comma_join_scan_projections(
+        &conjuncts,
+        &aliases,
+        &alias_refs,
+        &group_by,
+        &projection,
+        having.as_ref(),
+        order_by.as_ref(),
+    )?;
+    let mut current = scan_table_for_comma_join(
+        engine,
+        &tables[0],
+        batch_size,
+        scan_filters[0].as_ref(),
+        &scan_projections[0],
+    )
+    .await?;
+    let mut joined_aliases = vec![aliases[0].clone()];
     let mut remaining = (1..tables.len()).collect::<Vec<_>>();
     while !remaining.is_empty() {
         let mut selected = None;
@@ -4714,7 +4748,14 @@ async fn try_execute_multi_comma_join_sql(
         remaining.remove(remaining_index);
         let table = &tables[table_index];
         let alias = &aliases[table_index];
-        let right = scan_table_for_comma_join(engine, table, batch_size).await?;
+        let right = scan_table_for_comma_join(
+            engine,
+            table,
+            batch_size,
+            scan_filters[table_index].as_ref(),
+            &scan_projections[table_index],
+        )
+        .await?;
         let left_prefix = if joined_aliases.len() == 1 {
             joined_aliases[0].as_str()
         } else {
@@ -4745,27 +4786,11 @@ async fn try_execute_multi_comma_join_sql(
         .filter_map(|(index, conjunct)| (!used_conjuncts[index]).then_some(conjunct))
         .collect::<Vec<_>>();
     let residual = combine_sql_and_conjuncts(residual);
-    let group_by = parse_join_group_by(select, &alias_refs)?;
-    let projection = parse_join_projection(select, &alias_refs, &group_by)?;
-    let distinct = parse_distinct(select)?;
-    validate_distinct(
-        distinct,
-        &projection.projection,
-        &projection.aggregates,
-        None,
-    )?;
     let (filter_residual, subquery_residual) = split_subquery_residual(residual);
     let filter = filter_residual
         .as_ref()
         .map(|expr| parse_join_filter(expr, &projection.aliases, &alias_refs, false))
         .transpose()?;
-    let having = select
-        .having
-        .as_ref()
-        .map(|expr| parse_join_filter(expr, &projection.aliases, &alias_refs, true))
-        .transpose()?;
-    let order_by = parse_join_order_by(query, &projection.aliases, &alias_refs)?;
-    let limit = parse_limit(query)?;
 
     let mut batches = apply_output_filter(current, filter.as_ref())?;
     if let Some(residual) = subquery_residual.as_ref() {
@@ -4817,13 +4842,248 @@ async fn try_execute_multi_comma_join_sql(
     Ok(Some(QueryOutput::Scan { batches }))
 }
 
+fn comma_join_single_table_filters(
+    conjuncts: &[SqlExpr],
+    aliases: &[String],
+    alias_refs: &[&str],
+    used_conjuncts: &mut [bool],
+) -> Result<Vec<Option<FilterExpr>>> {
+    let mut filters = vec![Vec::<SqlExpr>::new(); aliases.len()];
+    for (index, conjunct) in conjuncts.iter().enumerate() {
+        if expr_contains_materializable_subquery(conjunct) {
+            continue;
+        }
+        let Some(alias) = single_table_conjunct_alias(conjunct, alias_refs)? else {
+            continue;
+        };
+        let Some(table_index) = aliases
+            .iter()
+            .position(|candidate| candidate.eq_ignore_ascii_case(alias))
+        else {
+            continue;
+        };
+        if parse_filter(conjunct, &[], Some(alias), false).is_err() {
+            continue;
+        }
+        filters[table_index].push(conjunct.clone());
+        used_conjuncts[index] = true;
+    }
+    filters
+        .into_iter()
+        .zip(aliases)
+        .map(|(filters, alias)| {
+            let Some(expr) = combine_sql_and_conjuncts(filters) else {
+                return Ok(None);
+            };
+            parse_filter(&expr, &[], Some(alias), false).map(Some)
+        })
+        .collect()
+}
+
+fn comma_join_scan_projections(
+    conjuncts: &[SqlExpr],
+    aliases: &[String],
+    alias_refs: &[&str],
+    group_by: &[String],
+    projection: &ParsedProjection,
+    having: Option<&FilterExpr>,
+    order_by: Option<&SortKey>,
+) -> Result<Vec<Projection>> {
+    if conjuncts.iter().any(expr_contains_materializable_subquery) {
+        return Ok(vec![Projection::All; aliases.len()]);
+    }
+
+    let mut columns = vec![Vec::<String>::new(); aliases.len()];
+    for conjunct in conjuncts {
+        add_comma_join_expr_columns(&mut columns, conjunct, aliases, alias_refs)?;
+    }
+    for column in group_by {
+        add_comma_join_column(&mut columns, column, aliases)?;
+    }
+    if let Projection::Columns(projected) = &projection.projection {
+        for column in projected {
+            add_comma_join_column(&mut columns, column, aliases)?;
+        }
+    } else {
+        return Ok(vec![Projection::All; aliases.len()]);
+    }
+    for aggregate in &projection.aggregates {
+        if let Some(column) = aggregate.referenced_column() {
+            add_comma_join_column(&mut columns, column, aliases)?;
+        }
+    }
+    for expression in &projection.aggregate_expressions {
+        for column in join_scalar_expression_columns(&expression.expr, alias_refs)? {
+            add_comma_join_column(&mut columns, &column, aliases)?;
+        }
+    }
+    for expression in &projection.expressions {
+        for column in join_scalar_expression_columns(&expression.expr, alias_refs)? {
+            add_comma_join_column(&mut columns, &column, aliases)?;
+        }
+    }
+    if let Some(having) = having {
+        for column in having.referenced_columns() {
+            add_comma_join_column(&mut columns, &column, aliases)?;
+        }
+    }
+    if let Some(order_by) = order_by {
+        for sort in &order_by.expressions {
+            add_comma_join_column(&mut columns, &sort.column, aliases)?;
+        }
+    }
+
+    Ok(columns
+        .into_iter()
+        .map(|columns| {
+            if columns.is_empty() {
+                Projection::All
+            } else {
+                Projection::Columns(columns)
+            }
+        })
+        .collect())
+}
+
+fn add_comma_join_expr_columns(
+    output: &mut [Vec<String>],
+    expr: &SqlExpr,
+    aliases: &[String],
+    alias_refs: &[&str],
+) -> Result<()> {
+    let mut columns = Vec::new();
+    collect_join_column_candidates(expr, alias_refs, &mut columns)?;
+    for column in columns {
+        add_comma_join_column(output, &column, aliases)?;
+    }
+    Ok(())
+}
+
+fn add_comma_join_column(
+    output: &mut [Vec<String>],
+    qualified_column: &str,
+    aliases: &[String],
+) -> Result<()> {
+    let Some((alias, column)) = qualified_column.split_once('.') else {
+        return Ok(());
+    };
+    let Some(index) = aliases
+        .iter()
+        .position(|candidate| candidate.eq_ignore_ascii_case(alias))
+    else {
+        return Ok(());
+    };
+    add_column_once(&mut output[index], column.to_string());
+    Ok(())
+}
+
+fn single_table_conjunct_alias<'a>(
+    expr: &SqlExpr,
+    table_aliases: &'a [&str],
+) -> Result<Option<&'a str>> {
+    let mut columns = Vec::new();
+    collect_join_column_candidates(expr, table_aliases, &mut columns)?;
+    let mut owner: Option<&'a str> = None;
+    for column in columns {
+        let Some((alias, _)) = column.split_once('.') else {
+            return Ok(None);
+        };
+        let Some(alias) = table_aliases
+            .iter()
+            .copied()
+            .find(|candidate| candidate.eq_ignore_ascii_case(alias))
+        else {
+            return Ok(None);
+        };
+        if let Some(existing) = owner {
+            if !existing.eq_ignore_ascii_case(alias) {
+                return Ok(None);
+            }
+        } else {
+            owner = Some(alias);
+        }
+    }
+    Ok(owner)
+}
+
+fn collect_join_column_candidates(
+    expr: &SqlExpr,
+    table_aliases: &[&str],
+    columns: &mut Vec<String>,
+) -> Result<()> {
+    match expr {
+        SqlExpr::BinaryOp { left, right, .. } => {
+            collect_join_column_candidates(left, table_aliases, columns)?;
+            collect_join_column_candidates(right, table_aliases, columns)?;
+        }
+        SqlExpr::UnaryOp { expr, .. }
+        | SqlExpr::Nested(expr)
+        | SqlExpr::IsNull(expr)
+        | SqlExpr::IsNotNull(expr)
+        | SqlExpr::Cast { expr, .. } => {
+            collect_join_column_candidates(expr, table_aliases, columns)?;
+        }
+        SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
+            add_column_once(columns, join_column_name(expr, table_aliases)?);
+        }
+        SqlExpr::Function(function) => {
+            for arg in function_arg_exprs(function) {
+                collect_join_column_candidates(arg, table_aliases, columns)?;
+            }
+        }
+        SqlExpr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            collect_join_column_candidates(expr, table_aliases, columns)?;
+            if let Some(expr) = substring_from {
+                collect_join_column_candidates(expr, table_aliases, columns)?;
+            }
+            if let Some(expr) = substring_for {
+                collect_join_column_candidates(expr, table_aliases, columns)?;
+            }
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            collect_join_column_candidates(expr, table_aliases, columns)?;
+            for item in list {
+                collect_join_column_candidates(item, table_aliases, columns)?;
+            }
+        }
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            collect_join_column_candidates(expr, table_aliases, columns)?;
+            collect_join_column_candidates(low, table_aliases, columns)?;
+            collect_join_column_candidates(high, table_aliases, columns)?;
+        }
+        SqlExpr::Like { expr, pattern, .. } => {
+            collect_join_column_candidates(expr, table_aliases, columns)?;
+            collect_join_column_candidates(pattern, table_aliases, columns)?;
+        }
+        SqlExpr::Value(_) => {}
+        SqlExpr::Exists { .. } | SqlExpr::InSubquery { .. } | SqlExpr::Subquery(_) => {}
+        _ => {}
+    }
+    Ok(())
+}
+
 async fn scan_table_for_comma_join(
     engine: &DodamEngine,
     table: &SqlTableRef,
     batch_size: usize,
+    filter: Option<&FilterExpr>,
+    projection: &Projection,
 ) -> Result<Vec<RecordBatch>> {
     let stream = engine
-        .scan_parquet_batches(table.path.clone(), batch_size, None, Projection::All, None)
+        .scan_parquet_batches(
+            table.path.clone(),
+            batch_size,
+            None,
+            projection.clone(),
+            filter.cloned(),
+        )
         .await?;
     collect_batches(stream)
 }
@@ -5407,14 +5667,14 @@ fn pushed_join_output_projection(query: &SqlQuery) -> Projection {
     let Some(join) = &query.join else {
         return Projection::All;
     };
-    if !matches!(join.join_type, JoinType::Inner | JoinType::Semi) {
-        return Projection::All;
-    }
     if !query.aggregate_expressions.is_empty() {
         return Projection::All;
     }
     if query.is_aggregate() {
         return aggregate_join_output_projection(query);
+    }
+    if !matches!(join.join_type, JoinType::Inner | JoinType::Semi) {
+        return Projection::All;
     }
     if projection_requires_expression_path(&query.expressions)
         || query.filter.is_some()

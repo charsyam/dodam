@@ -554,6 +554,12 @@ Tried and rejected or neutral:
   - Q22 rewrites the derived scalar avg and customer anti-join into one avg pass plus an `orders.o_custkey` anti-set.
   - On the current SF=0.01 CLI comparison, median total improved from about `7.19s` to about `0.61s`; DuckDB is about `0.38s`, so the total gap is now about `1.6x` instead of about `19x`.
   - Materialized join subquery rewrite is intentionally scoped to multi-FROM queries and falls back to the original parser path when subquery execution is unsupported.
+- Generalized two DuckDB-comparison speedups out of TPC-H-specific work:
+  - Multi-table comma joins now push deterministic single-table `WHERE` conjuncts into each scan before joining. This is a general rule and is not keyed to TPC-H query names. On SF=0.01 median CLI comparison, the main wins were Q03/Q05/Q07/Q08/Q09/Q10, and total moved from about `0.60s` to about `0.39s`.
+  - Two-table join input planning now derives safe side filters through boolean `AND`/`OR` branches when the derived predicate is implied by the original filter. This makes Q19's mixed OR branches push `lineitem`/`part` filters without a Q19-specific rewrite; Q19 moved from about `1.6x` slower than DuckDB to roughly tied.
+  - Multi-table comma joins now prune each input scan to the columns required by join keys, filters, grouping, aggregate input expressions, projection, HAVING, and ORDER BY. Subquery-bearing predicates stay on `Projection::All` for safety. This moved the main multi-comma queries from slower-than-DuckDB to faster-than-DuckDB on the current fixture.
+  - Latest SF=0.01 5-run median CLI comparison: Dodam about `0.289s`, DuckDB about `0.373s`, total ratio about `0.77x`; only Q13 remains above `1.2x` (`~1.25x`).
+  - Rejected as retained defaults: row-count-only multi-comma join reordering regressed Q05/Q09; applying ready residual filters after each intermediate comma join added overhead/regressed Q03; moving Q18 ahead of its fast path onto the generic materialized `IN` rewrite was correct but too slow (`~0.77s` median for Q18 alone); direct Rust row-loop handling for Q13's left-join count distribution did not beat the existing hash join/grouped aggregate path.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.
