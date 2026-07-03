@@ -13,6 +13,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_ord::sort::{SortColumn, SortOptions, lexsort_to_indices};
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take_record_batch;
+use memchr::memmem::Finder;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use sqlparser::ast::{
     BinaryOperator, DateTimeField, Distinct, DuplicateTreatment, Expr as SqlExpr, FunctionArg,
@@ -124,7 +125,8 @@ pub async fn execute_sql(
     if let Some(output) = try_execute_q09_product_type_profit_fast(engine, sql, batch_size).await? {
         return Ok(output);
     }
-    if let Some(output) = try_execute_q02_minimum_cost_supplier_fast(engine, sql, batch_size).await?
+    if let Some(output) =
+        try_execute_q02_minimum_cost_supplier_fast(engine, sql, batch_size).await?
     {
         return Ok(output);
     }
@@ -3950,18 +3952,27 @@ async fn q09_matching_part_keys(
             None,
         )
         .await?;
+    let name_substring = name_substring.to_string();
+    parallel_batch_fold(
+        &mut stream,
+        move |batch| q09_matching_part_keys_batch(batch, &name_substring),
+        HashSet::<i64>::new(),
+        merge_sets,
+        "Q09 matching part keys",
+    )
+}
+
+fn q09_matching_part_keys_batch(batch: RecordBatch, name_substring: &str) -> Result<HashSet<i64>> {
+    let partkeys = batch_column(&batch, "p_partkey")?;
+    let names = batch_string_column(&batch, "p_name")?;
+    let finder = Finder::new(name_substring.as_bytes());
     let mut keys = HashSet::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let partkeys = batch_column(&batch, "p_partkey")?;
-        let names = batch_string_column(&batch, "p_name")?;
-        for row in 0..batch.num_rows() {
-            if names.is_valid(row)
-                && names.value(row).contains(name_substring)
-                && let Some(partkey) = numeric_i64_value(partkeys, row)?
-            {
-                keys.insert(partkey);
-            }
+    for row in 0..batch.num_rows() {
+        if names.is_valid(row)
+            && finder.find(names.value(row).as_bytes()).is_some()
+            && let Some(partkey) = numeric_i64_value(partkeys, row)?
+        {
+            keys.insert(partkey);
         }
     }
     Ok(keys)
@@ -4013,23 +4024,54 @@ async fn q09_order_years(
             None,
         )
         .await?;
+    parallel_batch_fold(
+        &mut stream,
+        q09_order_years_batch,
+        HashMap::<i64, i32>::new(),
+        merge_maps,
+        "Q09 order years",
+    )
+}
+
+fn q09_order_years_batch(batch: RecordBatch) -> Result<HashMap<i64, i32>> {
+    let orderkeys = batch_column(&batch, "o_orderkey")?;
+    let orderdates = batch_column(&batch, "o_orderdate")?;
+    if let Some(orders) = q09_order_years_batch_typed(orderkeys, orderdates)? {
+        return Ok(orders);
+    }
     let mut orders = HashMap::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let orderkeys = batch_column(&batch, "o_orderkey")?;
-        let orderdates = batch_column(&batch, "o_orderdate")?;
-        for row in 0..batch.num_rows() {
-            let (Some(orderkey), Some(orderdate)) = (
-                numeric_i64_value(orderkeys, row)?,
-                date32_value(orderdates, row)?,
-            ) else {
-                continue;
-            };
-            let (year, _, _) = civil_from_days(i64::from(orderdate))?;
-            orders.insert(orderkey, year);
-        }
+    for row in 0..batch.num_rows() {
+        let (Some(orderkey), Some(orderdate)) = (
+            numeric_i64_value(orderkeys, row)?,
+            date32_value(orderdates, row)?,
+        ) else {
+            continue;
+        };
+        let (year, _, _) = civil_from_days(i64::from(orderdate))?;
+        orders.insert(orderkey, year);
     }
     Ok(orders)
+}
+
+fn q09_order_years_batch_typed(
+    orderkeys: &ArrayRef,
+    orderdates: &ArrayRef,
+) -> Result<Option<HashMap<i64, i32>>> {
+    let (Some(orderkeys), Some(orderdates)) = (
+        orderkeys.as_any().downcast_ref::<Int64Array>(),
+        orderdates.as_any().downcast_ref::<Date32Array>(),
+    ) else {
+        return Ok(None);
+    };
+    let mut orders = HashMap::new();
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || orderdates.is_null(row) {
+            continue;
+        }
+        let (year, _, _) = civil_from_days(i64::from(orderdates.value(row)))?;
+        orders.insert(orderkeys.value(row), year);
+    }
+    Ok(Some(orders))
 }
 
 async fn q09_supply_costs(
@@ -4051,26 +4093,66 @@ async fn q09_supply_costs(
             None,
         )
         .await?;
+    let part_keys = Arc::new(part_keys.clone());
+    parallel_batch_fold(
+        &mut stream,
+        move |batch| q09_supply_costs_batch(batch, &part_keys),
+        HashMap::<(i64, i64), f64>::new(),
+        merge_maps,
+        "Q09 supply costs",
+    )
+}
+
+fn q09_supply_costs_batch(
+    batch: RecordBatch,
+    part_keys: &HashSet<i64>,
+) -> Result<HashMap<(i64, i64), f64>> {
+    let partkeys = batch_column(&batch, "ps_partkey")?;
+    let suppkeys = batch_column(&batch, "ps_suppkey")?;
+    let supplycosts = batch_column(&batch, "ps_supplycost")?;
+    if let Some(costs) = q09_supply_costs_batch_typed(partkeys, suppkeys, supplycosts, part_keys)? {
+        return Ok(costs);
+    }
     let mut costs = HashMap::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let partkeys = batch_column(&batch, "ps_partkey")?;
-        let suppkeys = batch_column(&batch, "ps_suppkey")?;
-        let supplycosts = batch_column(&batch, "ps_supplycost")?;
-        for row in 0..batch.num_rows() {
-            let (Some(partkey), Some(suppkey), Some(supplycost)) = (
-                numeric_i64_value(partkeys, row)?,
-                numeric_i64_value(suppkeys, row)?,
-                numeric_f64_value(supplycosts, row)?,
-            ) else {
-                continue;
-            };
-            if part_keys.contains(&partkey) {
-                costs.insert((partkey, suppkey), supplycost);
-            }
+    for row in 0..batch.num_rows() {
+        let (Some(partkey), Some(suppkey), Some(supplycost)) = (
+            numeric_i64_value(partkeys, row)?,
+            numeric_i64_value(suppkeys, row)?,
+            numeric_f64_value(supplycosts, row)?,
+        ) else {
+            continue;
+        };
+        if part_keys.contains(&partkey) {
+            costs.insert((partkey, suppkey), supplycost);
         }
     }
     Ok(costs)
+}
+
+fn q09_supply_costs_batch_typed(
+    partkeys: &ArrayRef,
+    suppkeys: &ArrayRef,
+    supplycosts: &ArrayRef,
+    part_keys: &HashSet<i64>,
+) -> Result<Option<HashMap<(i64, i64), f64>>> {
+    let (Some(partkeys), Some(suppkeys), Some(supplycosts)) = (
+        partkeys.as_any().downcast_ref::<Int64Array>(),
+        suppkeys.as_any().downcast_ref::<Int64Array>(),
+        q01_decimal_input(supplycosts)?,
+    ) else {
+        return Ok(None);
+    };
+    let mut costs = HashMap::new();
+    for row in 0..partkeys.len() {
+        if partkeys.is_null(row) || suppkeys.is_null(row) || supplycosts.is_null(row) {
+            continue;
+        }
+        let partkey = partkeys.value(row);
+        if part_keys.contains(&partkey) {
+            costs.insert((partkey, suppkeys.value(row)), supplycosts.value(row));
+        }
+    }
+    Ok(Some(costs))
 }
 
 struct Q09Row {
@@ -4148,7 +4230,7 @@ fn q09_profit_batch(
     supplier_nations: &HashMap<i64, i64>,
     order_years: &HashMap<i64, i32>,
     supply_costs: &HashMap<(i64, i64), f64>,
-)-> Result<HashMap<(i64, i32), f64>> {
+) -> Result<HashMap<(i64, i32), f64>> {
     let orderkeys = batch_column(&batch, "l_orderkey")?;
     let partkeys = batch_column(&batch, "l_partkey")?;
     let suppkeys = batch_column(&batch, "l_suppkey")?;
@@ -4650,9 +4732,15 @@ async fn try_execute_q14_promotion_effect_fast(
     if promo_parts.is_empty() {
         return Ok(Some(q17_output("promo_revenue".to_string(), None)?));
     }
-    let (promo, total) =
-        q14_promo_revenue(engine, lineitem.path, batch_size, start_days, end_days, promo_parts)
-            .await?;
+    let (promo, total) = q14_promo_revenue(
+        engine,
+        lineitem.path,
+        batch_size,
+        start_days,
+        end_days,
+        promo_parts,
+    )
+    .await?;
     Ok(Some(q17_output(
         "promo_revenue".to_string(),
         (total != 0.0).then_some(100.0 * promo / total),
@@ -5438,6 +5526,14 @@ fn merge_f64_groups<K: Eq + std::hash::Hash>(groups: &mut HashMap<K, f64>, batch
     for (key, value) in batch {
         *groups.entry(key).or_insert(0.0) += value;
     }
+}
+
+fn merge_maps<K: Eq + std::hash::Hash, V>(output: &mut HashMap<K, V>, batch: HashMap<K, V>) {
+    output.extend(batch);
+}
+
+fn merge_sets<K: Eq + std::hash::Hash>(output: &mut HashSet<K>, batch: HashSet<K>) {
+    output.extend(batch);
 }
 
 fn q03_output(rows: Vec<Q03Row>) -> Result<QueryOutput> {
@@ -8492,9 +8588,10 @@ async fn q19_matching_part_masks(
             if brands.is_null(row) || containers.is_null(row) {
                 continue;
             }
-            let (Some(partkey), Some(size)) =
-                (numeric_i64_value(partkeys, row)?, numeric_f64_value(sizes, row)?)
-            else {
+            let (Some(partkey), Some(size)) = (
+                numeric_i64_value(partkeys, row)?,
+                numeric_f64_value(sizes, row)?,
+            ) else {
                 continue;
             };
             let mut mask = 0_u8;
@@ -8974,7 +9071,8 @@ fn q21_lineitem_order_states_batch(
         }
         let state = states.entry(orderkey).or_default();
         state.add_supplier(suppkey);
-        let (Some(receipt), Some(commit)) = (date32_value(receipt, row)?, date32_value(commit, row)?)
+        let (Some(receipt), Some(commit)) =
+            (date32_value(receipt, row)?, date32_value(commit, row)?)
         else {
             continue;
         };

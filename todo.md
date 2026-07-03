@@ -621,6 +621,9 @@ Tried and rejected or neutral:
   - Delayed Q10 customer payload materialization until after returned-revenue customer keys are known. This avoids copying all customer string payloads for the top-20 query. On SF=1 standalone Parquet COPY median, Q10 moved from about `0.208s` to about `0.171s`; latest 3-run full comparison is about `2.42s` Dodam vs `1.07s` DuckDB.
   - Re-tested the same customer-name late-materialization idea for Q18, but it stayed flat/slightly slower (`~0.21s`). Rejected because Q18's remaining bottleneck is not copying customer names.
   - Latest SF=1 3-run full Parquet COPY comparison after reverting the neutral Q18 attempt: Dodam about `2.41s`, DuckDB about `1.07s`, total ratio about `2.24x`.
+  - Parallelized Q09's supporting map builds for `orders` year lookup and matching `partsupp` supply costs, and moved the part-name contains scan to batch-local `memmem::Finder` matching. On SF=1 standalone Parquet COPY median, Q09 moved from about `0.274s` to about `0.216s`; latest 3-run full comparison is about `2.38s` Dodam vs `1.08s` DuckDB.
+  - Re-tested typed decimal/date loops for Q03 and Q07 lineitem aggregation, but full-run median regressed/noised upward versus the Q09-only state. Rejected because the existing generic extraction was not the dominant bottleneck there.
+  - Re-tested Q21 final-order key set construction with batch-local HashSet merge, but Q21 regressed to about `0.177s`. Rejected because the orders status scan is not expensive enough to offset parallel task/map merge overhead.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.
