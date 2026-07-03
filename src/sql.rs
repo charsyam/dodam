@@ -4094,59 +4094,25 @@ async fn q09_profit_rows(
             None,
         )
         .await?;
-    let mut groups = HashMap::<(i64, i32), f64>::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let orderkeys = batch_column(&batch, "l_orderkey")?;
-        let partkeys = batch_column(&batch, "l_partkey")?;
-        let suppkeys = batch_column(&batch, "l_suppkey")?;
-        let quantities = batch_column(&batch, "l_quantity")?;
-        let extendedprices = batch_column(&batch, "l_extendedprice")?;
-        let discounts = batch_column(&batch, "l_discount")?;
-        if q09_update_profit_decimal_batch(
-            orderkeys,
-            partkeys,
-            suppkeys,
-            quantities,
-            extendedprices,
-            discounts,
-            part_keys,
-            supplier_nations,
-            order_years,
-            supply_costs,
-            &mut groups,
-        )? {
-            continue;
-        }
-        for row in 0..batch.num_rows() {
-            let (Some(orderkey), Some(partkey), Some(suppkey)) = (
-                numeric_i64_value(orderkeys, row)?,
-                numeric_i64_value(partkeys, row)?,
-                numeric_i64_value(suppkeys, row)?,
-            ) else {
-                continue;
-            };
-            if !part_keys.contains(&partkey) {
-                continue;
-            }
-            let (Some(o_year), Some(nationkey), Some(supplycost)) = (
-                order_years.get(&orderkey).copied(),
-                supplier_nations.get(&suppkey).copied(),
-                supply_costs.get(&(partkey, suppkey)).copied(),
-            ) else {
-                continue;
-            };
-            let (Some(quantity), Some(extendedprice), Some(discount)) = (
-                numeric_f64_value(quantities, row)?,
-                numeric_f64_value(extendedprices, row)?,
-                numeric_f64_value(discounts, row)?,
-            ) else {
-                continue;
-            };
-            let amount = extendedprice * (1.0 - discount) - supplycost * quantity;
-            *groups.entry((nationkey, o_year)).or_insert(0.0) += amount;
-        }
-    }
+    let part_keys = Arc::new(part_keys.clone());
+    let supplier_nations = Arc::new(supplier_nations.clone());
+    let order_years = Arc::new(order_years.clone());
+    let supply_costs = Arc::new(supply_costs.clone());
+    let groups = parallel_batch_fold(
+        &mut stream,
+        move |batch| {
+            q09_profit_batch(
+                batch,
+                &part_keys,
+                &supplier_nations,
+                &order_years,
+                &supply_costs,
+            )
+        },
+        HashMap::<(i64, i32), f64>::new(),
+        merge_f64_groups,
+        "Q09 profit aggregate",
+    )?;
     let mut rows = groups
         .into_iter()
         .filter_map(|((nationkey, o_year), sum_profit)| {
@@ -4165,7 +4131,66 @@ async fn q09_profit_rows(
     Ok(rows)
 }
 
-fn q09_update_profit_decimal_batch(
+fn q09_profit_batch(
+    batch: RecordBatch,
+    part_keys: &HashSet<i64>,
+    supplier_nations: &HashMap<i64, i64>,
+    order_years: &HashMap<i64, i32>,
+    supply_costs: &HashMap<(i64, i64), f64>,
+)-> Result<HashMap<(i64, i32), f64>> {
+    let orderkeys = batch_column(&batch, "l_orderkey")?;
+    let partkeys = batch_column(&batch, "l_partkey")?;
+    let suppkeys = batch_column(&batch, "l_suppkey")?;
+    let quantities = batch_column(&batch, "l_quantity")?;
+    let extendedprices = batch_column(&batch, "l_extendedprice")?;
+    let discounts = batch_column(&batch, "l_discount")?;
+    if let Some(groups) = q09_profit_decimal_batch(
+        orderkeys,
+        partkeys,
+        suppkeys,
+        quantities,
+        extendedprices,
+        discounts,
+        part_keys,
+        supplier_nations,
+        order_years,
+        supply_costs,
+    )? {
+        return Ok(groups);
+    }
+    let mut groups = HashMap::<(i64, i32), f64>::new();
+    for row in 0..batch.num_rows() {
+        let (Some(orderkey), Some(partkey), Some(suppkey)) = (
+            numeric_i64_value(orderkeys, row)?,
+            numeric_i64_value(partkeys, row)?,
+            numeric_i64_value(suppkeys, row)?,
+        ) else {
+            continue;
+        };
+        if !part_keys.contains(&partkey) {
+            continue;
+        }
+        let (Some(o_year), Some(nationkey), Some(supplycost)) = (
+            order_years.get(&orderkey).copied(),
+            supplier_nations.get(&suppkey).copied(),
+            supply_costs.get(&(partkey, suppkey)).copied(),
+        ) else {
+            continue;
+        };
+        let (Some(quantity), Some(extendedprice), Some(discount)) = (
+            numeric_f64_value(quantities, row)?,
+            numeric_f64_value(extendedprices, row)?,
+            numeric_f64_value(discounts, row)?,
+        ) else {
+            continue;
+        };
+        let amount = extendedprice * (1.0 - discount) - supplycost * quantity;
+        *groups.entry((nationkey, o_year)).or_insert(0.0) += amount;
+    }
+    Ok(groups)
+}
+
+fn q09_profit_decimal_batch(
     orderkeys: &ArrayRef,
     partkeys: &ArrayRef,
     suppkeys: &ArrayRef,
@@ -4176,8 +4201,7 @@ fn q09_update_profit_decimal_batch(
     supplier_nations: &HashMap<i64, i64>,
     order_years: &HashMap<i64, i32>,
     supply_costs: &HashMap<(i64, i64), f64>,
-    groups: &mut HashMap<(i64, i32), f64>,
-) -> Result<bool> {
+) -> Result<Option<HashMap<(i64, i32), f64>>> {
     let (
         Some(orderkeys),
         Some(partkeys),
@@ -4194,9 +4218,10 @@ fn q09_update_profit_decimal_batch(
         q01_decimal_input(discounts)?,
     )
     else {
-        return Ok(false);
+        return Ok(None);
     };
 
+    let mut groups = HashMap::<(i64, i32), f64>::new();
     for row in 0..orderkeys.len() {
         if orderkeys.is_null(row)
             || partkeys.is_null(row)
@@ -4224,7 +4249,7 @@ fn q09_update_profit_decimal_batch(
             - supplycost * quantities.value(row);
         *groups.entry((nationkey, o_year)).or_insert(0.0) += amount;
     }
-    Ok(true)
+    Ok(Some(groups))
 }
 
 fn q09_output(rows: Vec<Q09Row>) -> Result<QueryOutput> {

@@ -612,6 +612,8 @@ Tried and rejected or neutral:
   - Parallelized Q10 returned lineitem revenue by customer with the same batch-local/final merge pattern. On SF=1 standalone CLI median, Q10 moved from about `0.260s` to about `0.211s`; latest full comparison moved to about `3.15s` Dodam vs `1.08s` DuckDB.
   - Added a Q02 minimum-cost supplier fast path by decorrelating the `min(ps_supplycost)` subquery into region/nation/supplier reduction, matching part selection, and a single partsupp grouped-min pass. On SF=1 standalone CLI median, Q02 moved from about `0.159s` to about `0.047s`.
   - Added a Q14 promotion-effect fast path by reducing `part` into `partkey -> promo` and parallelizing the date-filtered lineitem numerator/denominator sum. On SF=1 standalone CLI median, Q14 moved from about `0.152s` to about `0.071s`; latest full comparison moved to about `2.96s` Dodam vs `1.08s` DuckDB.
+  - Parallelized Q09 lineitem profit aggregation with the batch-local/final merge pattern. On SF=1 standalone CLI median, Q09 moved from about `0.407s` to about `0.263s`.
+  - Rejected filtering Q09 `partsupp` supply-cost map by supplier candidate set in addition to part set: standalone Q09 regressed slightly from about `0.263s` to about `0.267s`, so the extra lookup cost outweighed the smaller map.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.
