@@ -129,8 +129,9 @@ enum CatalogCommands {
     List,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    configure_default_rayon_threads();
     let cli = Cli::parse();
     let engine = DodamEngine::default();
 
@@ -276,6 +277,7 @@ async fn main() -> Result<()> {
         } => {
             let command_started = Instant::now();
             let profile_enabled = copy_profile_enabled();
+            let query_profile_enabled = query_profile_enabled();
             let copy_parse_started = Instant::now();
             let copy = parse_copy_to_select(&sql)?;
             let copy_parse_elapsed = copy_parse_started.elapsed();
@@ -329,18 +331,52 @@ async fn main() -> Result<()> {
             }
 
             let mut sink = StdoutQuerySink;
+            let direct_started = Instant::now();
             if try_execute_sql_to_sink(&engine, &sql, batch_size, &mut sink)
                 .await?
                 .is_some()
             {
+                print_query_profile(
+                    query_profile_enabled,
+                    command_started,
+                    copy_parse_elapsed,
+                    Some(direct_started.elapsed()),
+                    None,
+                    None,
+                    None,
+                );
                 return Ok(());
             }
+            let direct_elapsed = direct_started.elapsed();
+            let streaming_started = Instant::now();
             if let Some(stream) = try_execute_sql_streaming(&engine, &sql, batch_size).await? {
                 engine.write_batches_to_sink(stream, &mut sink)?;
+                print_query_profile(
+                    query_profile_enabled,
+                    command_started,
+                    copy_parse_elapsed,
+                    Some(direct_elapsed),
+                    Some(streaming_started.elapsed()),
+                    None,
+                    None,
+                );
                 return Ok(());
             }
+            let streaming_elapsed = streaming_started.elapsed();
+            let execute_started = Instant::now();
             let output = execute_sql(&engine, &sql, batch_size).await?;
+            let execute_elapsed = execute_started.elapsed();
+            let write_started = Instant::now();
             sink.write_output(output)?;
+            print_query_profile(
+                query_profile_enabled,
+                command_started,
+                copy_parse_elapsed,
+                Some(direct_elapsed),
+                Some(streaming_elapsed),
+                Some(execute_elapsed),
+                Some(write_started.elapsed()),
+            );
         }
     }
 
@@ -1120,6 +1156,52 @@ fn copy_profile_enabled() -> bool {
             "1" | "true" | "yes" | "on"
         )
     })
+}
+
+fn query_profile_enabled() -> bool {
+    std::env::var("DODAM_PROFILE_QUERY").is_ok_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn configure_default_rayon_threads() {
+    if std::env::var_os("RAYON_NUM_THREADS").is_some() {
+        return;
+    }
+    let threads = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(16)
+        .max(1);
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global();
+}
+
+fn print_query_profile(
+    enabled: bool,
+    command_started: Instant,
+    copy_parse: Duration,
+    direct_sink: Option<Duration>,
+    streaming: Option<Duration>,
+    execute: Option<Duration>,
+    write_output: Option<Duration>,
+) {
+    if !enabled {
+        return;
+    }
+    eprintln!(
+        "query_profile total={}us copy_parse={}us direct_sink={} streaming={} execute={} write_output={}",
+        micros(command_started.elapsed()),
+        micros(copy_parse),
+        optional_micros(direct_sink),
+        optional_micros(streaming),
+        optional_micros(execute),
+        optional_micros(write_output),
+    );
 }
 
 fn optional_micros(duration: Option<Duration>) -> String {
