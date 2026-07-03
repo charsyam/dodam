@@ -163,7 +163,32 @@ where
     }
 
     fn insert(&mut self, key: i64, value: V) {
-        self.update(key, || value, |slot| *slot = value);
+        match self {
+            Self::Dense {
+                values,
+                present,
+                len,
+            } => {
+                let Some(index) = adaptive_dense_index(key, DEFAULT_MAX_DENSE_I64_KEY) else {
+                    let mut hash = adaptive_i64_map_dense_to_hash(values, present);
+                    hash.insert(key, value);
+                    *self = Self::Hash(hash);
+                    return;
+                };
+                if index >= values.len() {
+                    values.resize(index + 1, V::default());
+                    present.resize(index + 1, false);
+                }
+                if !present[index] {
+                    present[index] = true;
+                    *len += 1;
+                }
+                values[index] = value;
+            }
+            Self::Hash(values) => {
+                values.insert(key, value);
+            }
+        }
     }
 
     fn update<Init, Update>(&mut self, key: i64, init: Init, update: Update)
@@ -9906,6 +9931,15 @@ type Q21FinalOrders = AdaptiveI64Set;
 fn q21_final_orders_batch_into(batch: &RecordBatch, keys: &mut Q21FinalOrders) -> Result<()> {
     let orderkeys = batch_column(batch, "o_orderkey")?;
     let statuses = batch_string_column(batch, "o_orderstatus")?;
+    if let Some(orderkeys) = orderkeys.as_any().downcast_ref::<Int64Array>() {
+        for row in 0..orderkeys.len() {
+            if orderkeys.is_null(row) || statuses.is_null(row) || statuses.value(row) != "F" {
+                continue;
+            }
+            keys.insert(orderkeys.value(row));
+        }
+        return Ok(());
+    }
     for row in 0..orderkeys.len() {
         if statuses.is_null(row) || statuses.value(row) != "F" {
             continue;
