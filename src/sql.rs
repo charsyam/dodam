@@ -31,7 +31,7 @@ use crate::execution::{
     DistinctExec, Expr, FilterExpr, GroupAggregateResult, GroupValue, HashJoinExec, JoinBuildSide,
     LiteralValue, MemoryExec, PhysicalPlan, Projection, RecordBatchSink, ScanPlanMetrics,
     SendableBatchStream, SortExpr, SortKey, collect_aggregates, collect_grouped_aggregates,
-    filter_batch,
+    evaluate_filter_mask, filter_batch,
 };
 use crate::optimizer::plan_join_inputs;
 
@@ -4826,13 +4826,21 @@ async fn collect_dense_right_counts(
             );
         }
     }
+    let direct_filter = join
+        .right_filter
+        .as_ref()
+        .filter(|filter| expr_is_like_only(filter.expr()));
     let mut right_stream = engine
         .scan_parquet_batches(
             join.right.path.clone(),
             batch_size,
             None,
             Projection::Columns(right_projection),
-            join.right_filter.clone(),
+            if direct_filter.is_some() {
+                None
+            } else {
+                join.right_filter.clone()
+            },
         )
         .await?;
     let mut dense_counts = Vec::<u64>::new();
@@ -4852,7 +4860,16 @@ async fn collect_dense_right_counts(
             return Ok(Vec::new());
         };
         let values = count_index.map(|index| batch.column(index));
+        let mask = direct_filter
+            .map(|filter| evaluate_filter_mask(&batch, filter))
+            .transpose()?;
         for row in 0..batch.num_rows() {
+            if mask
+                .as_ref()
+                .is_some_and(|mask| mask.is_null(row) || !mask.value(row))
+            {
+                continue;
+            }
             if keys.is_null(row) || values.is_some_and(|values| values.is_null(row)) {
                 continue;
             }
@@ -4868,6 +4885,21 @@ async fn collect_dense_right_counts(
         }
     }
     Ok(dense_counts)
+}
+
+fn expr_is_like_only(expr: &Expr) -> bool {
+    match expr {
+        Expr::Like { .. } => true,
+        Expr::Not(expr) => expr_is_like_only(expr),
+        Expr::And(left, right) | Expr::Or(left, right) => {
+            expr_is_like_only(left) && expr_is_like_only(right)
+        }
+        Expr::Boolean(_)
+        | Expr::Comparison(_)
+        | Expr::ColumnComparison { .. }
+        | Expr::InList { .. }
+        | Expr::IsNull { .. } => false,
+    }
 }
 
 fn parquet_column_is_non_nullable(path: &PathBuf, column: &str) -> Result<bool> {

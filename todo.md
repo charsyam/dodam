@@ -586,6 +586,7 @@ Tried and rejected or neutral:
     - Adding a general fast LIKE matcher for patterns without `_` or `ESCAPE` fixed the real Q13 bottleneck (`o_comment NOT LIKE '%special%requests%'`): Q13 standalone median moved to about `0.0086s` vs DuckDB about `0.0157s`.
     - Latest SF=0.01 7-run full comparison after fast LIKE: Dodam about `0.241s`, DuckDB about `0.368s`, total ratio about `0.65x`; no TPC-H query is above `1.1x`.
     - Refining fast LIKE into compiled exact/prefix/suffix/contains/ordered variants and using `memchr::memmem::Finder` for repeated substring search moved Q13 standalone median further to about `0.0058s`; latest full comparison remains about `0.240s` vs DuckDB about `0.368s`.
+    - Avoiding filtered `RecordBatch` materialization in the derived left-join count-distribution path when the right filter contains LIKE moved Q13 standalone median to about `0.0056s`; latest full comparison is about `0.239s` vs DuckDB about `0.369s`.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.

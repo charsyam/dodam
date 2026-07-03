@@ -8493,8 +8493,12 @@ pub fn scan_projection(projection: &Projection, filter: Option<&FilterExpr>) -> 
 }
 
 pub fn filter_batch(batch: RecordBatch, filter: &FilterExpr) -> Result<RecordBatch> {
-    let mask = evaluate_filter(&batch, filter.expr())?;
+    let mask = evaluate_filter_mask(&batch, filter)?;
     Ok(filter_record_batch(&batch, &mask)?)
+}
+
+pub fn evaluate_filter_mask(batch: &RecordBatch, filter: &FilterExpr) -> Result<BooleanArray> {
+    evaluate_filter(batch, filter.expr())
 }
 
 fn evaluate_filter(batch: &RecordBatch, expr: &Expr) -> Result<BooleanArray> {

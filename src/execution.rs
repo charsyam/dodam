@@ -15,5 +15,6 @@ pub use metrics::{
 pub use physical::{
     DistinctExec, FilterExec, HashJoinExec, IpcExec, JoinBuildSide, JoinType, LimitExec,
     MemoryExec, PartitionedHashJoinExec, PartitionedHashJoinOptions, ProjectionExec, ScanExec,
-    SortExec, SortMergeJoinExec, collect_metrics, filter_batch, scan_projection,
+    SortExec, SortMergeJoinExec, collect_metrics, evaluate_filter_mask, filter_batch,
+    scan_projection,
 };
