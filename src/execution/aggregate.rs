@@ -1,6 +1,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::mpsc;
 
 use arrow::array::{
     Array, ArrayRef, Date32Array, Date64Array, Decimal128Array, Float64Array, Int32Array,
@@ -68,21 +69,14 @@ pub fn collect_aggregates(
     fragments: usize,
     aggregates: &[AggregateExpr],
 ) -> Result<AggregateMetrics> {
-    let shared_sum_avg_columns = shared_sum_avg_columns(aggregates);
-    let mut shared_numeric_states = shared_sum_avg_columns
-        .iter()
-        .map(|column| (column.clone(), NumericState::default()))
-        .collect::<Vec<_>>();
-    let mut accumulators = aggregates
-        .iter()
-        .cloned()
-        .map(|aggregate| GlobalAggregateSlot::new(aggregate, &shared_sum_avg_columns))
-        .collect::<Vec<_>>();
+    let mut state = GlobalAggregateState::new(aggregates);
     let mut metrics = AggregateMetrics {
         fragments,
         ..AggregateMetrics::default()
     };
 
+    let (sender, receiver) = mpsc::channel();
+    let mut pending_batches = 0_usize;
     for batch in stream.by_ref() {
         let batch = batch?;
         if batch.num_rows() == 0 {
@@ -91,22 +85,82 @@ pub fn collect_aggregates(
 
         metrics.batches += 1;
         metrics.rows += batch.num_rows();
-        for (column, state) in &mut shared_numeric_states {
-            state.update(
+        let sender = sender.clone();
+        let aggregates = aggregates.to_vec();
+        pending_batches += 1;
+        rayon::spawn(move || {
+            let _ = sender.send(GlobalAggregateState::from_batch(batch, &aggregates));
+        });
+    }
+    drop(sender);
+    for _ in 0..pending_batches {
+        let partial = receiver
+            .recv()
+            .map_err(|_| DodamError::InvalidAggregate("aggregate worker stopped".to_string()))??;
+        state.merge(partial);
+    }
+
+    metrics.values = state.finish()?;
+    Ok(metrics)
+}
+
+struct GlobalAggregateState {
+    shared_numeric_states: Vec<(String, NumericState)>,
+    accumulators: Vec<GlobalAggregateSlot>,
+}
+
+impl GlobalAggregateState {
+    fn new(aggregates: &[AggregateExpr]) -> Self {
+        let shared_sum_avg_columns = shared_sum_avg_columns(aggregates);
+        let shared_numeric_states = shared_sum_avg_columns
+            .iter()
+            .map(|column| (column.clone(), NumericState::default()))
+            .collect::<Vec<_>>();
+        let accumulators = aggregates
+            .iter()
+            .cloned()
+            .map(|aggregate| GlobalAggregateSlot::new(aggregate, &shared_sum_avg_columns))
+            .collect::<Vec<_>>();
+        Self {
+            shared_numeric_states,
+            accumulators,
+        }
+    }
+
+    fn from_batch(batch: RecordBatch, aggregates: &[AggregateExpr]) -> Result<Self> {
+        let mut state = Self::new(aggregates);
+        for (column, numeric_state) in &mut state.shared_numeric_states {
+            numeric_state.update(
                 batch.column(column_index(&batch, column)?),
                 &AggregateExpr::Sum(column.clone()),
             )?;
         }
-        for accumulator in &mut accumulators {
+        for accumulator in &mut state.accumulators {
             accumulator.update(&batch)?;
+        }
+        Ok(state)
+    }
+
+    fn merge(&mut self, other: Self) {
+        for ((_, state), (_, other_state)) in self
+            .shared_numeric_states
+            .iter_mut()
+            .zip(other.shared_numeric_states)
+        {
+            state.merge(other_state);
+        }
+        for (accumulator, other_accumulator) in self.accumulators.iter_mut().zip(other.accumulators)
+        {
+            accumulator.merge(other_accumulator);
         }
     }
 
-    metrics.values = accumulators
-        .into_iter()
-        .map(|accumulator| accumulator.finish(&shared_numeric_states))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(metrics)
+    fn finish(self) -> Result<Vec<AggregateResult>> {
+        self.accumulators
+            .into_iter()
+            .map(|accumulator| accumulator.finish(&self.shared_numeric_states))
+            .collect::<Result<Vec<_>>>()
+    }
 }
 
 fn shared_sum_avg_columns(aggregates: &[AggregateExpr]) -> Vec<String> {
@@ -191,6 +245,14 @@ impl GlobalAggregateSlot {
                     .avg_value(),
             },
         })
+    }
+
+    fn merge(&mut self, other: Self) {
+        match (self, other) {
+            (Self::Accumulator(accumulator), Self::Accumulator(other)) => accumulator.merge(other),
+            (Self::SharedSum { .. } | Self::SharedAvg { .. }, _) => {}
+            _ => {}
+        }
     }
 }
 
@@ -2122,6 +2184,29 @@ impl AggregateAccumulator {
             },
         })
     }
+
+    fn merge(&mut self, other: Self) {
+        match (self, other) {
+            (Self::CountStar { count }, Self::CountStar { count: other }) => {
+                *count += other;
+            }
+            (Self::Count { count, .. }, Self::Count { count: other, .. }) => {
+                *count += other;
+            }
+            (Self::CountDistinct { values, .. }, Self::CountDistinct { values: other, .. }) => {
+                values.extend(other);
+            }
+            (Self::Sum { state, .. }, Self::Sum { state: other, .. })
+            | (Self::Avg { state, .. }, Self::Avg { state: other, .. }) => {
+                state.merge(other);
+            }
+            (Self::Min { expr, state }, Self::Min { state: other, .. })
+            | (Self::Max { expr, state }, Self::Max { state: other, .. }) => {
+                state.merge(other, expr);
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Default)]
@@ -2283,6 +2368,21 @@ impl NumericState {
             }
             _ => AggregateValue::Float64(None),
         }
+    }
+
+    fn merge(&mut self, other: Self) {
+        match other.output {
+            Some(NumericOutput::Int64) => {
+                self.output.get_or_insert(NumericOutput::Int64);
+                self.sum_i64 += other.sum_i64;
+            }
+            Some(NumericOutput::Float64) => {
+                self.output.get_or_insert(NumericOutput::Float64);
+                self.sum_f64 += other.sum_f64;
+            }
+            None => {}
+        }
+        self.count += other.count;
     }
 }
 
@@ -2648,6 +2748,12 @@ impl MinMaxState {
 
     fn value(self) -> AggregateValue {
         self.value.unwrap_or(AggregateValue::Int64(None))
+    }
+
+    fn merge(&mut self, other: Self, expr: &AggregateExpr) {
+        if let Some(candidate) = other.value {
+            update_min_max_value(expr, &mut self.value, candidate);
+        }
     }
 }
 
