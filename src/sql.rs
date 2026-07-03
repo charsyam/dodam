@@ -7935,10 +7935,23 @@ async fn q05_order_customer_nations(
         )
         .await?;
     let customer_nations = Arc::new(customer_nations.clone());
-    parallel_batch_fold(
+    parallel_batch_fold_chunks(
         &mut stream,
-        move |batch| {
-            q05_order_customer_nations_batch(batch, &customer_nations, start_days, end_days)
+        4,
+        move |batches| {
+            let mut orders = HashMap::<i64, i64>::new();
+            for batch in batches {
+                merge_maps(
+                    &mut orders,
+                    q05_order_customer_nations_batch(
+                        batch,
+                        &customer_nations,
+                        start_days,
+                        end_days,
+                    )?,
+                );
+            }
+            Ok(orders)
         },
         HashMap::<i64, i64>::new(),
         merge_maps,
@@ -9199,9 +9212,19 @@ async fn q08_order_years(
         )
         .await?;
     let customer_nations = Arc::new(customer_nations.clone());
-    parallel_batch_fold(
+    parallel_batch_fold_chunks(
         &mut stream,
-        move |batch| q08_order_years_batch(batch, &customer_nations, start_days, end_days),
+        4,
+        move |batches| {
+            let mut orders = HashMap::<i64, i32>::new();
+            for batch in batches {
+                merge_maps(
+                    &mut orders,
+                    q08_order_years_batch(batch, &customer_nations, start_days, end_days)?,
+                );
+            }
+            Ok(orders)
+        },
         HashMap::<i64, i32>::new(),
         merge_maps,
         "Q08 order years",
@@ -9343,9 +9366,19 @@ async fn q08_market_share_rows(
     let order_years = Arc::new(order_years.clone());
     let part_keys = Arc::new(part_keys.clone());
     let supplier_nations = Arc::new(supplier_nations.clone());
-    let groups = parallel_batch_fold(
+    let groups = parallel_batch_fold_chunks(
         &mut stream,
-        move |batch| q08_market_share_batch(batch, &order_years, &part_keys, &supplier_nations),
+        4,
+        move |batches| {
+            let mut groups = HashMap::<i32, (f64, f64)>::new();
+            for batch in batches {
+                q08_merge_market_share_groups(
+                    &mut groups,
+                    q08_market_share_batch(batch, &order_years, &part_keys, &supplier_nations)?,
+                );
+            }
+            Ok(groups)
+        },
         HashMap::<i32, (f64, f64)>::new(),
         q08_merge_market_share_groups,
         "Q08 market share aggregate",
