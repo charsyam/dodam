@@ -2307,10 +2307,8 @@ async fn try_execute_q17_small_quantity_order_revenue_fast(
     if part_keys.is_empty() {
         return Ok(Some(q17_output(output_name, None)?));
     }
-    let averages =
-        q17_lineitem_quantity_averages(engine, lineitem.path.clone(), batch_size).await?;
     let sum =
-        q17_filtered_extendedprice_sum(engine, lineitem.path, batch_size, &part_keys, &averages)
+        q17_lineitem_revenue_from_matching_parts(engine, lineitem.path, batch_size, &part_keys)
             .await?;
     Ok(Some(q17_output(output_name, sum.map(|value| value / 7.0))?))
 }
@@ -2413,49 +2411,11 @@ async fn q17_matching_part_keys(
     Ok(keys)
 }
 
-async fn q17_lineitem_quantity_averages(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-) -> Result<HashMap<i64, f64>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec!["l_partkey".to_string(), "l_quantity".to_string()]),
-            None,
-        )
-        .await?;
-    let mut states = HashMap::<i64, (f64, u64)>::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let partkey = batch_column(&batch, "l_partkey")?;
-        let quantity = batch_column(&batch, "l_quantity")?;
-        for row in 0..batch.num_rows() {
-            let (Some(partkey), Some(quantity)) = (
-                numeric_i64_value(partkey, row)?,
-                numeric_f64_value(quantity, row)?,
-            ) else {
-                continue;
-            };
-            let state = states.entry(partkey).or_insert((0.0, 0));
-            state.0 += quantity;
-            state.1 += 1;
-        }
-    }
-    Ok(states
-        .into_iter()
-        .filter_map(|(key, (sum, count))| (count > 0).then_some((key, sum / count as f64)))
-        .collect())
-}
-
-async fn q17_filtered_extendedprice_sum(
+async fn q17_lineitem_revenue_from_matching_parts(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
     part_keys: &HashSet<i64>,
-    averages: &HashMap<i64, f64>,
 ) -> Result<Option<f64>> {
     let mut stream = engine
         .scan_parquet_batches(
@@ -2470,8 +2430,8 @@ async fn q17_filtered_extendedprice_sum(
             None,
         )
         .await?;
-    let mut sum = 0.0;
-    let mut count = 0_usize;
+    let mut states = HashMap::<i64, (f64, u64)>::with_capacity(part_keys.len());
+    let mut candidate_rows = Vec::<(i64, f64, f64)>::new();
     while let Some(batch) = stream.next() {
         let batch = batch?;
         let partkey = batch_column(&batch, "l_partkey")?;
@@ -2484,16 +2444,24 @@ async fn q17_filtered_extendedprice_sum(
             if !part_keys.contains(&partkey) {
                 continue;
             }
-            let Some(average) = averages.get(&partkey) else {
-                continue;
-            };
             let (Some(quantity), Some(extendedprice)) = (
                 numeric_f64_value(quantity, row)?,
                 numeric_f64_value(extendedprice, row)?,
             ) else {
                 continue;
             };
-            if quantity < 0.2 * *average {
+            let state = states.entry(partkey).or_insert((0.0, 0));
+            state.0 += quantity;
+            state.1 += 1;
+            candidate_rows.push((partkey, quantity, extendedprice));
+        }
+    }
+    let mut sum = 0.0;
+    let mut count = 0_usize;
+    for (partkey, quantity, extendedprice) in candidate_rows {
+        if let Some((quantity_sum, quantity_count)) = states.get(&partkey) {
+            let average = quantity_sum / *quantity_count as f64;
+            if quantity < 0.2 * average {
                 sum += extendedprice;
                 count += 1;
             }
@@ -3233,22 +3201,16 @@ async fn try_execute_q21_suppliers_who_kept_orders_waiting_fast(
     }
     let order_states =
         q21_lineitem_order_states(engine, lineitem.path, batch_size, &final_orders).await?;
-    let mut counts = HashMap::<i64, u64>::new();
+    let mut counts = HashMap::<i64, u64>::with_capacity(suppliers.len());
     for state in order_states.into_values() {
-        if state.suppliers.len() <= 1 || state.late_suppliers.len() != 1 {
+        if !state.has_multiple_suppliers || !state.has_single_late_supplier() {
             continue;
         }
-        let suppkey = *state
-            .late_suppliers
-            .iter()
-            .next()
-            .expect("validated one late supplier");
+        let suppkey = state.late_supplier;
         if !suppliers.contains_key(&suppkey) {
             continue;
         }
-        if let Some(rows) = state.late_rows_by_supplier.get(&suppkey) {
-            *counts.entry(suppkey).or_insert(0) += *rows;
-        }
+        *counts.entry(suppkey).or_insert(0) += state.late_row_count;
     }
     let mut rows = counts
         .into_iter()
@@ -3385,9 +3347,40 @@ async fn q21_final_order_keys(
 
 #[derive(Default)]
 struct Q21OrderState {
-    suppliers: HashSet<i64>,
-    late_suppliers: HashSet<i64>,
-    late_rows_by_supplier: HashMap<i64, u64>,
+    first_supplier: i64,
+    has_supplier: bool,
+    has_multiple_suppliers: bool,
+    late_supplier: i64,
+    has_late_supplier: bool,
+    has_multiple_late_suppliers: bool,
+    late_row_count: u64,
+}
+
+impl Q21OrderState {
+    fn add_supplier(&mut self, suppkey: i64) {
+        if !self.has_supplier {
+            self.first_supplier = suppkey;
+            self.has_supplier = true;
+        } else if suppkey != self.first_supplier {
+            self.has_multiple_suppliers = true;
+        }
+    }
+
+    fn add_late_supplier(&mut self, suppkey: i64) {
+        if !self.has_late_supplier {
+            self.late_supplier = suppkey;
+            self.has_late_supplier = true;
+            self.late_row_count = 1;
+        } else if suppkey == self.late_supplier {
+            self.late_row_count += 1;
+        } else {
+            self.has_multiple_late_suppliers = true;
+        }
+    }
+
+    fn has_single_late_supplier(&self) -> bool {
+        self.has_late_supplier && !self.has_multiple_late_suppliers
+    }
 }
 
 async fn q21_lineitem_order_states(
@@ -3410,7 +3403,7 @@ async fn q21_lineitem_order_states(
             None,
         )
         .await?;
-    let mut states = HashMap::<i64, Q21OrderState>::new();
+    let mut states = HashMap::<i64, Q21OrderState>::with_capacity(final_orders.len());
     while let Some(batch) = stream.next() {
         let batch = batch?;
         let orderkeys = batch_column(&batch, "l_orderkey")?;
@@ -3428,15 +3421,14 @@ async fn q21_lineitem_order_states(
                 continue;
             }
             let state = states.entry(orderkey).or_default();
-            state.suppliers.insert(suppkey);
+            state.add_supplier(suppkey);
             let (Some(receipt), Some(commit)) =
                 (date32_value(receipt, row)?, date32_value(commit, row)?)
             else {
                 continue;
             };
             if receipt > commit {
-                state.late_suppliers.insert(suppkey);
-                *state.late_rows_by_supplier.entry(suppkey).or_insert(0) += 1;
+                state.add_late_supplier(suppkey);
             }
         }
     }
