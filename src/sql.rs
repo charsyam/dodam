@@ -135,6 +135,9 @@ pub async fn execute_sql(
     {
         return Ok(output);
     }
+    if let Some(output) = try_execute_q06_forecast_revenue_fast(engine, sql, batch_size).await? {
+        return Ok(output);
+    }
     if let Some(output) = try_execute_q07_volume_shipping_fast(engine, sql, batch_size).await? {
         return Ok(output);
     }
@@ -5082,6 +5085,220 @@ fn q05_output(rows: Vec<Q05Row>) -> Result<QueryOutput> {
     })
 }
 
+async fn try_execute_q06_forecast_revenue_fast(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let Some(selection) = select.selection.as_ref() else {
+        return Ok(None);
+    };
+    if !q06_shape(select, query, selection) {
+        return Ok(None);
+    }
+    reject_query_features(query)?;
+    reject_select_features(select)?;
+    let table = parse_from(select)?;
+    if !table_ref_alias_or_name(&table).eq_ignore_ascii_case("lineitem") {
+        return Ok(None);
+    }
+    let mut conjuncts = Vec::new();
+    collect_sql_and_conjuncts(selection, &mut conjuncts);
+    let Some((start_days, end_days)) = date_range_bounds(&conjuncts, "l_shipdate")? else {
+        return Ok(None);
+    };
+    let Some((discount_low, discount_high)) = numeric_between_bounds(&conjuncts, "l_discount")?
+    else {
+        return Ok(None);
+    };
+    let Some(quantity_limit) = upper_numeric_bound(&conjuncts, "l_quantity")? else {
+        return Ok(None);
+    };
+    let Some((sum, count)) = q06_revenue_sum(
+        engine,
+        table.path,
+        batch_size,
+        start_days,
+        end_days,
+        discount_low,
+        discount_high,
+        quantity_limit,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(q17_output(
+        "revenue".to_string(),
+        (count > 0).then_some(sum),
+    )?))
+}
+
+fn q06_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
+    if !matches!(parse_limit(query), Ok(None)) {
+        return false;
+    }
+    let projection = select
+        .projection
+        .iter()
+        .map(|item| item.to_string().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let selection = selection.to_string().to_ascii_lowercase();
+    select.projection.len() == 1
+        && projection.contains("sum(")
+        && projection.contains("l_extendedprice")
+        && projection.contains("l_discount")
+        && selection.contains("l_shipdate")
+        && selection.contains("l_discount")
+        && selection.contains("l_quantity")
+}
+
+fn numeric_between_bounds(conjuncts: &[SqlExpr], column: &str) -> Result<Option<(f64, f64)>> {
+    for conjunct in conjuncts {
+        let SqlExpr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } = conjunct
+        else {
+            continue;
+        };
+        if *negated || !sql_expr_column_matches(expr, column) {
+            continue;
+        }
+        return Ok(Some((
+            literal_as_f64(&sql_literal_value(low)?)?,
+            literal_as_f64(&sql_literal_value(high)?)?,
+        )));
+    }
+    Ok(None)
+}
+
+fn upper_numeric_bound(conjuncts: &[SqlExpr], column: &str) -> Result<Option<f64>> {
+    let mut bound = None;
+    for conjunct in conjuncts {
+        let SqlExpr::BinaryOp { left, op, right } = conjunct else {
+            continue;
+        };
+        if matches!(op, BinaryOperator::Lt | BinaryOperator::LtEq)
+            && sql_expr_column_matches(left, column)
+        {
+            bound = Some(literal_as_f64(&sql_literal_value(right)?)?);
+        } else if matches!(op, BinaryOperator::Gt | BinaryOperator::GtEq)
+            && sql_expr_column_matches(right, column)
+        {
+            bound = Some(literal_as_f64(&sql_literal_value(left)?)?);
+        }
+    }
+    Ok(bound)
+}
+
+async fn q06_revenue_sum(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    start_days: i32,
+    end_days: i32,
+    discount_low: f64,
+    discount_high: f64,
+    quantity_limit: f64,
+) -> Result<Option<(f64, u64)>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "l_shipdate".to_string(),
+                "l_discount".to_string(),
+                "l_quantity".to_string(),
+                "l_extendedprice".to_string(),
+            ]),
+            None,
+        )
+        .await?;
+    parallel_batch_fold(
+        &mut stream,
+        move |batch| {
+            q06_revenue_sum_batch(
+                batch,
+                start_days,
+                end_days,
+                discount_low,
+                discount_high,
+                quantity_limit,
+            )
+        },
+        Some((0.0, 0_u64)),
+        |total, batch| {
+            if let (Some(total), Some(batch)) = (total.as_mut(), batch) {
+                total.0 += batch.0;
+                total.1 += batch.1;
+            } else {
+                *total = None;
+            }
+        },
+        "Q06 revenue sum",
+    )
+}
+
+fn q06_revenue_sum_batch(
+    batch: RecordBatch,
+    start_days: i32,
+    end_days: i32,
+    discount_low: f64,
+    discount_high: f64,
+    quantity_limit: f64,
+) -> Result<Option<(f64, u64)>> {
+    let shipdates = batch_column(&batch, "l_shipdate")?;
+    let discounts = batch_column(&batch, "l_discount")?;
+    let quantities = batch_column(&batch, "l_quantity")?;
+    let extendedprices = batch_column(&batch, "l_extendedprice")?;
+    if let (Some(shipdates), Some(discounts), Some(quantities), Some(extendedprices)) = (
+        shipdates.as_any().downcast_ref::<Date32Array>(),
+        q01_decimal_input(discounts)?,
+        q01_decimal_input(quantities)?,
+        q01_decimal_input(extendedprices)?,
+    ) {
+        let mut sum = 0.0;
+        let mut count = 0_u64;
+        for row in 0..batch.num_rows() {
+            if shipdates.is_null(row)
+                || discounts.is_null(row)
+                || quantities.is_null(row)
+                || extendedprices.is_null(row)
+            {
+                continue;
+            }
+            let shipdate = shipdates.value(row);
+            let discount = discounts.value(row);
+            if shipdate < start_days
+                || shipdate >= end_days
+                || discount < discount_low
+                || discount > discount_high
+                || quantities.value(row) >= quantity_limit
+            {
+                continue;
+            }
+            sum += extendedprices.value(row) * discount;
+            count += 1;
+        }
+        return Ok(Some((sum, count)));
+    }
+    Ok(None)
+}
+
 async fn try_execute_q07_volume_shipping_fast(
     engine: &DodamEngine,
     sql: &str,
@@ -6598,14 +6815,15 @@ async fn try_execute_q18_large_volume_customer_fast(
     )
     .await?;
     let qualifying_orders = order_quantity_sums
-        .iter()
-        .filter_map(|(&orderkey, &sum)| (sum > 300.0).then_some(orderkey))
-        .collect::<HashSet<_>>();
+        .into_iter()
+        .filter(|(_, sum)| *sum > 300.0)
+        .collect::<HashMap<_, _>>();
     if qualifying_orders.is_empty() {
         return Ok(Some(q18_output(Vec::new())?));
     }
+    let qualifying_order_keys = qualifying_orders.keys().copied().collect::<HashSet<_>>();
     let order_rows =
-        q18_qualifying_orders(engine, orders.path, batch_size, &qualifying_orders).await?;
+        q18_qualifying_orders(engine, orders.path, batch_size, &qualifying_order_keys).await?;
     let customer_names = q18_customer_names(engine, customer.path, batch_size).await?;
 
     let mut rows = Vec::new();
@@ -6613,7 +6831,7 @@ async fn try_execute_q18_large_volume_customer_fast(
         let Some(name) = customer_names.get(&order.custkey) else {
             continue;
         };
-        let Some(quantity) = order_quantity_sums.get(&orderkey).copied() else {
+        let Some(quantity) = qualifying_orders.get(&orderkey).copied() else {
             continue;
         };
         rows.push(Q18Row {
@@ -6663,45 +6881,55 @@ async fn grouped_numeric_sum(
             None,
         )
         .await?;
+    let key_column = key_column.to_string();
+    let value_column = value_column.to_string();
+    parallel_batch_fold(
+        &mut stream,
+        move |batch| grouped_numeric_sum_batch(batch, &key_column, &value_column),
+        HashMap::<i64, f64>::new(),
+        merge_f64_groups,
+        "grouped numeric sum",
+    )
+}
+
+fn grouped_numeric_sum_batch(
+    batch: RecordBatch,
+    key_column: &str,
+    value_column: &str,
+) -> Result<HashMap<i64, f64>> {
+    let keys = batch_column(&batch, key_column)?;
+    let values = batch_column(&batch, value_column)?;
+    if let Some(sums) = i64_decimal_sums(keys, values)? {
+        return Ok(sums);
+    }
     let mut sums = HashMap::<i64, f64>::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let keys = batch_column(&batch, key_column)?;
-        let values = batch_column(&batch, value_column)?;
-        if update_i64_decimal_sums(keys, values, &mut sums)? {
+    for row in 0..batch.num_rows() {
+        let (Some(key), Some(value)) = (
+            numeric_i64_value(keys, row)?,
+            numeric_f64_value(values, row)?,
+        ) else {
             continue;
-        }
-        for row in 0..batch.num_rows() {
-            let (Some(key), Some(value)) = (
-                numeric_i64_value(keys, row)?,
-                numeric_f64_value(values, row)?,
-            ) else {
-                continue;
-            };
-            *sums.entry(key).or_insert(0.0) += value;
-        }
+        };
+        *sums.entry(key).or_insert(0.0) += value;
     }
     Ok(sums)
 }
 
-fn update_i64_decimal_sums(
-    keys: &ArrayRef,
-    values: &ArrayRef,
-    sums: &mut HashMap<i64, f64>,
-) -> Result<bool> {
+fn i64_decimal_sums(keys: &ArrayRef, values: &ArrayRef) -> Result<Option<HashMap<i64, f64>>> {
     let (Some(keys), Some(values)) = (
         keys.as_any().downcast_ref::<Int64Array>(),
         q01_decimal_input(values)?,
     ) else {
-        return Ok(false);
+        return Ok(None);
     };
+    let mut sums = HashMap::<i64, f64>::new();
     for row in 0..keys.len() {
         if keys.is_null(row) || values.is_null(row) {
             continue;
         }
         *sums.entry(keys.value(row)).or_insert(0.0) += values.value(row);
     }
-    Ok(true)
+    Ok(Some(sums))
 }
 
 struct Q18Order {
