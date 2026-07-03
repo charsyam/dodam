@@ -2503,24 +2503,13 @@ async fn q01_pricing_summary_rows(
             None,
         )
         .await?;
-    let mut groups = Vec::<Q01Row>::with_capacity(4);
-    let (sender, receiver) = mpsc::channel();
-    let mut pending_batches = 0_usize;
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let sender = sender.clone();
-        pending_batches += 1;
-        rayon::spawn(move || {
-            let _ = sender.send(q01_pricing_summary_batch(batch, cutoff_days));
-        });
-    }
-    drop(sender);
-    for _ in 0..pending_batches {
-        let rows = receiver.recv().map_err(|_| {
-            DodamError::UnsupportedSql("Q01 aggregate worker stopped".to_string())
-        })??;
-        q01_merge_rows(&mut groups, rows);
-    }
+    let groups = parallel_batch_fold(
+        &mut stream,
+        move |batch| q01_pricing_summary_batch(batch, cutoff_days),
+        Vec::<Q01Row>::with_capacity(4),
+        |groups, rows| q01_merge_rows(groups, rows),
+        "Q01 aggregate",
+    )?;
     let mut rows = groups;
     rows.sort_by(|left, right| {
         left.returnflag
@@ -2575,6 +2564,39 @@ fn q01_pricing_summary_batch(batch: RecordBatch, cutoff_days: i32) -> Result<Vec
         );
     }
     Ok(groups)
+}
+
+fn parallel_batch_fold<Partial, Output, Map, Merge>(
+    stream: &mut SendableBatchStream,
+    map: Map,
+    mut output: Output,
+    mut merge: Merge,
+    label: &str,
+) -> Result<Output>
+where
+    Partial: Send + 'static,
+    Map: Fn(RecordBatch) -> Result<Partial> + Send + Sync + Clone + 'static,
+    Merge: FnMut(&mut Output, Partial),
+{
+    let (sender, receiver) = mpsc::channel();
+    let mut pending_batches = 0_usize;
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        let sender = sender.clone();
+        let map = map.clone();
+        pending_batches += 1;
+        rayon::spawn(move || {
+            let _ = sender.send(map(batch));
+        });
+    }
+    drop(sender);
+    for _ in 0..pending_batches {
+        let partial = receiver
+            .recv()
+            .map_err(|_| DodamError::UnsupportedSql(format!("{label} worker stopped")))??;
+        merge(&mut output, partial);
+    }
+    Ok(output)
 }
 
 fn q01_merge_rows(groups: &mut Vec<Q01Row>, rows: Vec<Q01Row>) {
@@ -3832,46 +3854,71 @@ async fn q12_filtered_lineitem_counts(
             None,
         )
         .await?;
+    let shipmodes = Arc::new(shipmodes.clone());
+    parallel_batch_fold(
+        &mut stream,
+        move |batch| q12_filtered_lineitem_counts_batch(batch, &shipmodes, start_days, end_days),
+        HashMap::<i64, Q12PendingOrder>::new(),
+        q12_merge_pending_orders,
+        "Q12 lineitem aggregate",
+    )
+}
+
+fn q12_filtered_lineitem_counts_batch(
+    batch: RecordBatch,
+    shipmodes: &HashSet<String>,
+    start_days: i32,
+    end_days: i32,
+) -> Result<HashMap<i64, Q12PendingOrder>> {
+    let orderkeys = batch_column(&batch, "l_orderkey")?;
+    let modes = batch_string_column(&batch, "l_shipmode")?;
+    let commitdates = batch_column(&batch, "l_commitdate")?;
+    let receiptdates = batch_column(&batch, "l_receiptdate")?;
+    let shipdates = batch_column(&batch, "l_shipdate")?;
     let mut pending = HashMap::<i64, Q12PendingOrder>::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let orderkeys = batch_column(&batch, "l_orderkey")?;
-        let modes = batch_string_column(&batch, "l_shipmode")?;
-        let commitdates = batch_column(&batch, "l_commitdate")?;
-        let receiptdates = batch_column(&batch, "l_receiptdate")?;
-        let shipdates = batch_column(&batch, "l_shipdate")?;
-        for row in 0..batch.num_rows() {
-            if modes.is_null(row) {
-                continue;
-            }
-            let mode = modes.value(row);
-            if !shipmodes.contains(mode) {
-                continue;
-            }
-            let (Some(orderkey), Some(commitdate), Some(receiptdate), Some(shipdate)) = (
-                numeric_i64_value(orderkeys, row)?,
-                date32_value(commitdates, row)?,
-                date32_value(receiptdates, row)?,
-                date32_value(shipdates, row)?,
-            ) else {
-                continue;
-            };
-            if commitdate >= receiptdate
-                || shipdate >= commitdate
-                || receiptdate < start_days
-                || receiptdate >= end_days
-            {
-                continue;
-            }
-            *pending
-                .entry(orderkey)
-                .or_default()
-                .counts
-                .entry(mode.to_string())
-                .or_insert(0) += 1;
+    for row in 0..batch.num_rows() {
+        if modes.is_null(row) {
+            continue;
         }
+        let mode = modes.value(row);
+        if !shipmodes.contains(mode) {
+            continue;
+        }
+        let (Some(orderkey), Some(commitdate), Some(receiptdate), Some(shipdate)) = (
+            numeric_i64_value(orderkeys, row)?,
+            date32_value(commitdates, row)?,
+            date32_value(receiptdates, row)?,
+            date32_value(shipdates, row)?,
+        ) else {
+            continue;
+        };
+        if commitdate >= receiptdate
+            || shipdate >= commitdate
+            || receiptdate < start_days
+            || receiptdate >= end_days
+        {
+            continue;
+        }
+        *pending
+            .entry(orderkey)
+            .or_default()
+            .counts
+            .entry(mode.to_string())
+            .or_insert(0) += 1;
     }
     Ok(pending)
+}
+
+fn q12_merge_pending_orders(
+    pending: &mut HashMap<i64, Q12PendingOrder>,
+    batch_pending: HashMap<i64, Q12PendingOrder>,
+) {
+    for (orderkey, order) in batch_pending {
+        let target = pending.entry(orderkey).or_default();
+        for (mode, count) in order.counts {
+            *target.counts.entry(mode).or_insert(0) += count;
+        }
+    }
 }
 
 async fn q12_shipping_mode_counts_from_orders(

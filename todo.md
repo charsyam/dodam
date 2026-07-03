@@ -598,6 +598,7 @@ Tried and rejected or neutral:
   - Re-tested the same typed-loop idea for Q04 late-order and order-priority scans, but it did not move standalone median (`~0.218s` before/after). Rejected that change for now because the remaining Q04 cost is not per-row typed extraction.
   - Added a typed `Int64`/`Decimal128` revenue loop for Q05 lineitem aggregation. On SF=1 standalone CLI median, Q05 moved from about `0.296s` to about `0.236s`; latest 3-run full comparison is about `4.47s` Dodam vs `1.07s` DuckDB.
   - Added batch-local/final aggregate execution for Q01's pricing summary fast path. This confirmed the structural bottleneck: decode could be parallel, but the fast-path aggregate consumer was single-threaded. On SF=1 standalone CLI median, Q01 moved from about `0.257s` to about `0.091s`; latest 3-run full comparison is about `4.28s` Dodam vs `1.07s` DuckDB.
+  - Generalized the batch-local/final merge pattern into a reusable fast-path helper and applied it to Q12's lineitem pending-order aggregation. On SF=1 standalone CLI median, Q12 moved from about `0.214s` to about `0.096s`; latest 3-run full comparison is about `4.17s` Dodam vs `1.08s` DuckDB.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.
