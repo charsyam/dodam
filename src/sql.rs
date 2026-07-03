@@ -3844,24 +3844,34 @@ async fn try_execute_q02_minimum_cost_supplier_fast(
         return Ok(None);
     };
 
+    let stage = tpch_profile_start();
     let region_keys = q02_region_keys(engine, region.path, batch_size, &region_name).await?;
+    tpch_profile_elapsed("Q02 region keys", stage);
     if region_keys.is_empty() {
         return Ok(Some(q02_output(Vec::new())?));
     }
+    let stage = tpch_profile_start();
     let nation_names = q02_nation_names(engine, nation.path, batch_size, &region_keys).await?;
+    tpch_profile_elapsed("Q02 nation names", stage);
     if nation_names.is_empty() {
         return Ok(Some(q02_output(Vec::new())?));
     }
+    let stage = tpch_profile_start();
     let suppliers = q02_suppliers(engine, supplier.path, batch_size, &nation_names).await?;
+    tpch_profile_elapsed("Q02 suppliers", stage);
     if suppliers.is_empty() {
         return Ok(Some(q02_output(Vec::new())?));
     }
+    let stage = tpch_profile_start();
     let parts =
         q02_matching_parts(engine, part.path, batch_size, part_size, &part_type_suffix).await?;
+    tpch_profile_elapsed("Q02 parts", stage);
     if parts.is_empty() {
         return Ok(Some(q02_output(Vec::new())?));
     }
+    let stage = tpch_profile_start();
     let rows = q02_min_cost_rows(engine, partsupp.path, batch_size, &parts, &suppliers).await?;
+    tpch_profile_elapsed("Q02 partsupp min-cost rows", stage);
     Ok(Some(q02_output(rows)?))
 }
 
@@ -4176,31 +4186,16 @@ async fn q02_min_cost_rows(
             None,
         )
         .await?;
-    let mut min_costs = HashMap::<i64, f64>::new();
-    let mut candidates = Vec::<(i64, i64, f64)>::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let partkeys = batch_column(&batch, "ps_partkey")?;
-        let suppkeys = batch_column(&batch, "ps_suppkey")?;
-        let supplycosts = batch_column(&batch, "ps_supplycost")?;
-        for row in 0..batch.num_rows() {
-            let (Some(partkey), Some(suppkey), Some(supplycost)) = (
-                numeric_i64_value(partkeys, row)?,
-                numeric_i64_value(suppkeys, row)?,
-                numeric_f64_value(supplycosts, row)?,
-            ) else {
-                continue;
-            };
-            if !parts.contains_key(&partkey) || !suppliers.contains_key(&suppkey) {
-                continue;
-            }
-            candidates.push((partkey, suppkey, supplycost));
-            min_costs
-                .entry(partkey)
-                .and_modify(|min_cost| *min_cost = min_cost.min(supplycost))
-                .or_insert(supplycost);
-        }
-    }
+    let part_keys = Arc::new(parts.keys().copied().collect::<HashSet<_>>());
+    let supplier_keys = Arc::new(suppliers.keys().copied().collect::<HashSet<_>>());
+    let (min_costs, candidates) = parallel_batch_fold(
+        &mut stream,
+        move |batch| q02_partsupp_min_cost_batch(batch, &part_keys, &supplier_keys),
+        Q02PartsuppPartial::default(),
+        q02_merge_partsupp_min_cost,
+        "Q02 partsupp partials",
+    )?
+    .into_parts();
 
     let mut rows = Vec::new();
     for (partkey, suppkey, supplycost) in candidates {
@@ -4235,6 +4230,106 @@ async fn q02_min_cost_rows(
     });
     rows.truncate(100);
     Ok(rows)
+}
+
+#[derive(Default)]
+struct Q02PartsuppPartial {
+    min_costs: HashMap<i64, f64>,
+    candidates: Vec<(i64, i64, f64)>,
+}
+
+impl Q02PartsuppPartial {
+    fn into_parts(self) -> (HashMap<i64, f64>, Vec<(i64, i64, f64)>) {
+        (self.min_costs, self.candidates)
+    }
+}
+
+fn q02_partsupp_min_cost_batch(
+    batch: RecordBatch,
+    part_keys: &HashSet<i64>,
+    supplier_keys: &HashSet<i64>,
+) -> Result<Q02PartsuppPartial> {
+    let partkeys = batch_column(&batch, "ps_partkey")?;
+    let suppkeys = batch_column(&batch, "ps_suppkey")?;
+    let supplycosts = batch_column(&batch, "ps_supplycost")?;
+    if let Some(partial) = q02_partsupp_min_cost_batch_typed(
+        partkeys,
+        suppkeys,
+        supplycosts,
+        part_keys,
+        supplier_keys,
+    )? {
+        return Ok(partial);
+    }
+    let mut partial = Q02PartsuppPartial::default();
+    for row in 0..batch.num_rows() {
+        let (Some(partkey), Some(suppkey), Some(supplycost)) = (
+            numeric_i64_value(partkeys, row)?,
+            numeric_i64_value(suppkeys, row)?,
+            numeric_f64_value(supplycosts, row)?,
+        ) else {
+            continue;
+        };
+        if !part_keys.contains(&partkey) || !supplier_keys.contains(&suppkey) {
+            continue;
+        }
+        q02_push_partsupp_candidate(&mut partial, partkey, suppkey, supplycost);
+    }
+    Ok(partial)
+}
+
+fn q02_partsupp_min_cost_batch_typed(
+    partkeys: &ArrayRef,
+    suppkeys: &ArrayRef,
+    supplycosts: &ArrayRef,
+    part_keys: &HashSet<i64>,
+    supplier_keys: &HashSet<i64>,
+) -> Result<Option<Q02PartsuppPartial>> {
+    let (Some(partkeys), Some(suppkeys), Some(supplycosts)) = (
+        partkeys.as_any().downcast_ref::<Int64Array>(),
+        suppkeys.as_any().downcast_ref::<Int64Array>(),
+        q01_decimal_input(supplycosts)?,
+    ) else {
+        return Ok(None);
+    };
+    let mut partial = Q02PartsuppPartial::default();
+    for row in 0..partkeys.len() {
+        if partkeys.is_null(row) || suppkeys.is_null(row) || supplycosts.is_null(row) {
+            continue;
+        }
+        let partkey = partkeys.value(row);
+        let suppkey = suppkeys.value(row);
+        if !part_keys.contains(&partkey) || !supplier_keys.contains(&suppkey) {
+            continue;
+        }
+        q02_push_partsupp_candidate(&mut partial, partkey, suppkey, supplycosts.value(row));
+    }
+    Ok(Some(partial))
+}
+
+fn q02_push_partsupp_candidate(
+    partial: &mut Q02PartsuppPartial,
+    partkey: i64,
+    suppkey: i64,
+    supplycost: f64,
+) {
+    partial.candidates.push((partkey, suppkey, supplycost));
+    partial
+        .min_costs
+        .entry(partkey)
+        .and_modify(|min_cost| *min_cost = min_cost.min(supplycost))
+        .or_insert(supplycost);
+}
+
+fn q02_merge_partsupp_min_cost(output: &mut Q02PartsuppPartial, batch: Q02PartsuppPartial) {
+    for (partkey, min_cost) in batch.min_costs {
+        output
+            .min_costs
+            .entry(partkey)
+            .and_modify(|current| *current = current.min(min_cost))
+            .or_insert(min_cost);
+    }
+    output.candidates.extend(batch.candidates);
 }
 
 fn q02_output(rows: Vec<Q02Row>) -> Result<QueryOutput> {
