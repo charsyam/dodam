@@ -2491,7 +2491,7 @@ async fn q01_pricing_summary_rows(
             None,
         )
         .await?;
-    let mut groups = HashMap::<(String, String), Q01State>::new();
+    let mut groups = Vec::<Q01Row>::with_capacity(4);
     while let Some(batch) = stream.next() {
         let batch = batch?;
         let returnflags = batch_string_column(&batch, "l_returnflag")?;
@@ -2501,6 +2501,19 @@ async fn q01_pricing_summary_rows(
         let discounts = batch_column(&batch, "l_discount")?;
         let taxes = batch_column(&batch, "l_tax")?;
         let shipdates = batch_column(&batch, "l_shipdate")?;
+        if q01_update_decimal_batch(
+            returnflags,
+            linestatuses,
+            quantities,
+            extendedprices,
+            discounts,
+            taxes,
+            shipdates,
+            cutoff_days,
+            &mut groups,
+        )? {
+            continue;
+        }
         for row in 0..batch.num_rows() {
             let Some(shipdate) = date32_value(shipdates, row)? else {
                 continue;
@@ -2516,29 +2529,112 @@ async fn q01_pricing_summary_rows(
             ) else {
                 continue;
             };
-            groups
-                .entry((
-                    returnflags.value(row).to_string(),
-                    linestatuses.value(row).to_string(),
-                ))
-                .or_default()
-                .update(quantity, extendedprice, discount, tax);
+            q01_group_state(&mut groups, returnflags.value(row), linestatuses.value(row)).update(
+                quantity,
+                extendedprice,
+                discount,
+                tax,
+            );
         }
     }
-    let mut rows = groups
-        .into_iter()
-        .map(|((returnflag, linestatus), state)| Q01Row {
-            returnflag,
-            linestatus,
-            state,
-        })
-        .collect::<Vec<_>>();
+    let mut rows = groups;
     rows.sort_by(|left, right| {
         left.returnflag
             .cmp(&right.returnflag)
             .then_with(|| left.linestatus.cmp(&right.linestatus))
     });
     Ok(rows)
+}
+
+fn q01_update_decimal_batch(
+    returnflags: &StringArray,
+    linestatuses: &StringArray,
+    quantities: &ArrayRef,
+    extendedprices: &ArrayRef,
+    discounts: &ArrayRef,
+    taxes: &ArrayRef,
+    shipdates: &ArrayRef,
+    cutoff_days: i32,
+    groups: &mut Vec<Q01Row>,
+) -> Result<bool> {
+    let (Some(quantities), Some(extendedprices), Some(discounts), Some(taxes), Some(shipdates)) = (
+        q01_decimal_input(quantities)?,
+        q01_decimal_input(extendedprices)?,
+        q01_decimal_input(discounts)?,
+        q01_decimal_input(taxes)?,
+        shipdates.as_any().downcast_ref::<Date32Array>(),
+    ) else {
+        return Ok(false);
+    };
+    for row in 0..shipdates.len() {
+        if shipdates.is_null(row)
+            || shipdates.value(row) > cutoff_days
+            || returnflags.is_null(row)
+            || linestatuses.is_null(row)
+            || quantities.is_null(row)
+            || extendedprices.is_null(row)
+            || discounts.is_null(row)
+            || taxes.is_null(row)
+        {
+            continue;
+        }
+        let returnflag = returnflags.value(row);
+        let linestatus = linestatuses.value(row);
+        q01_group_state(groups, returnflag, linestatus).update(
+            quantities.value(row),
+            extendedprices.value(row),
+            discounts.value(row),
+            taxes.value(row),
+        );
+    }
+    Ok(true)
+}
+
+fn q01_group_state<'a>(
+    groups: &'a mut Vec<Q01Row>,
+    returnflag: &str,
+    linestatus: &str,
+) -> &'a mut Q01State {
+    if let Some(index) = groups
+        .iter()
+        .position(|row| row.returnflag == returnflag && row.linestatus == linestatus)
+    {
+        return &mut groups[index].state;
+    }
+    groups.push(Q01Row {
+        returnflag: returnflag.to_string(),
+        linestatus: linestatus.to_string(),
+        state: Q01State::default(),
+    });
+    &mut groups.last_mut().expect("inserted q01 group").state
+}
+
+struct Q01DecimalInput<'a> {
+    values: &'a Decimal128Array,
+    scale: f64,
+}
+
+impl Q01DecimalInput<'_> {
+    fn is_null(&self, row: usize) -> bool {
+        self.values.is_null(row)
+    }
+
+    fn value(&self, row: usize) -> f64 {
+        self.values.value(row) as f64 / self.scale
+    }
+}
+
+fn q01_decimal_input(column: &ArrayRef) -> Result<Option<Q01DecimalInput<'_>>> {
+    let DataType::Decimal128(_, scale) = column.data_type() else {
+        return Ok(None);
+    };
+    Ok(Some(Q01DecimalInput {
+        values: column
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("Decimal128 q01 input"),
+        scale: decimal_scale_factor(*scale),
+    }))
 }
 
 fn q01_output(rows: Vec<Q01Row>) -> Result<QueryOutput> {
@@ -5956,12 +6052,16 @@ fn date32_value(column: &ArrayRef, row: usize) -> Result<Option<i32>> {
 }
 
 fn q18_output(rows: Vec<Q18Row>) -> Result<QueryOutput> {
+    let orderdates = rows
+        .iter()
+        .map(|row| date32_to_ymd_string(row.o_orderdate))
+        .collect::<Result<Vec<_>>>()?;
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
             Field::new("c_name", DataType::Utf8, false),
             Field::new("c_custkey", DataType::Int64, false),
             Field::new("o_orderkey", DataType::Int64, false),
-            Field::new("o_orderdate", DataType::Date32, false),
+            Field::new("o_orderdate", DataType::Utf8, false),
             Field::new("o_totalprice", DataType::Float64, false),
             Field::new("sum(l_quantity)", DataType::Float64, false),
         ])),
@@ -5975,8 +6075,8 @@ fn q18_output(rows: Vec<Q18Row>) -> Result<QueryOutput> {
             Arc::new(Int64Array::from_iter_values(
                 rows.iter().map(|row| row.o_orderkey),
             )),
-            Arc::new(Date32Array::from_iter_values(
-                rows.iter().map(|row| row.o_orderdate),
+            Arc::new(StringArray::from_iter_values(
+                orderdates.iter().map(String::as_str),
             )),
             Arc::new(Float64Array::from_iter_values(
                 rows.iter().map(|row| row.o_totalprice),
