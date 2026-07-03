@@ -541,6 +541,11 @@ pub async fn execute_sql(
     if let Some(output) = try_execute_q14_promotion_effect_fast(engine, sql, batch_size).await? {
         return Ok(output);
     }
+    if let Some(output) =
+        try_execute_q16_parts_supplier_relationship_fast(engine, sql, batch_size).await?
+    {
+        return Ok(output);
+    }
     if let Some(output) = try_execute_q03_shipping_priority_fast(engine, sql, batch_size).await? {
         return Ok(output);
     }
@@ -5294,6 +5299,528 @@ fn q11_output(rows: Vec<Q11Row>) -> Result<QueryOutput> {
             )),
             Arc::new(Float64Array::from_iter_values(
                 rows.iter().map(|row| row.value),
+            )),
+        ],
+    )?;
+    Ok(QueryOutput::Aggregate {
+        metrics: AggregateMetrics::default(),
+        batches: vec![batch],
+    })
+}
+
+async fn try_execute_q16_parts_supplier_relationship_fast(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let Some(selection) = select.selection.as_ref() else {
+        return Ok(None);
+    };
+    if !q16_shape(select, query, selection) {
+        return Ok(None);
+    }
+    reject_query_features(query)?;
+    reject_select_features(select)?;
+    let Some(tables) = parse_comma_join_table_refs(select)? else {
+        return Ok(None);
+    };
+    if tables.len() != 2 {
+        return Ok(None);
+    }
+    let mut partsupp = None;
+    let mut part = None;
+    for table in tables {
+        let alias = table_ref_alias_or_name(&table);
+        if alias.eq_ignore_ascii_case("partsupp") {
+            partsupp = Some(table);
+        } else if alias.eq_ignore_ascii_case("part") {
+            part = Some(table);
+        }
+    }
+    let (Some(partsupp), Some(part)) = (partsupp, part) else {
+        return Ok(None);
+    };
+    let Some(supplier_path) = first_table_path_in_subqueries(selection, "supplier")? else {
+        return Ok(None);
+    };
+    let mut conjuncts = Vec::new();
+    collect_sql_and_conjuncts(selection, &mut conjuncts);
+    let Some(excluded_brand) = string_inequality_literal(&conjuncts, "p_brand")? else {
+        return Ok(None);
+    };
+    let Some(excluded_type_prefix) = not_like_prefix_literal(&conjuncts, "p_type")? else {
+        return Ok(None);
+    };
+    let Some(sizes) = numeric_in_i64_literals(&conjuncts, "p_size")? else {
+        return Ok(None);
+    };
+    let Some(comment_parts) = like_substrings_literal(selection, "s_comment")? else {
+        return Ok(None);
+    };
+
+    let stage = tpch_profile_start();
+    let bad_suppliers =
+        q16_bad_suppliers(engine, supplier_path, batch_size, &comment_parts).await?;
+    tpch_profile_elapsed("Q16 bad suppliers", stage);
+    let stage = tpch_profile_start();
+    let part_groups = q16_part_groups(
+        engine,
+        part.path,
+        batch_size,
+        &excluded_brand,
+        &excluded_type_prefix,
+        &sizes,
+    )
+    .await?;
+    tpch_profile_elapsed("Q16 part groups", stage);
+    if part_groups.part_to_group.is_empty() {
+        return Ok(Some(q16_output(Vec::new())?));
+    }
+    let stage = tpch_profile_start();
+    let rows = q16_supplier_counts(
+        engine,
+        partsupp.path,
+        batch_size,
+        part_groups,
+        bad_suppliers,
+    )
+    .await?;
+    tpch_profile_elapsed("Q16 supplier counts", stage);
+    Ok(Some(q16_output(rows)?))
+}
+
+fn q16_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
+    let projection = select
+        .projection
+        .iter()
+        .map(|item| item.to_string().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let group_by = select.group_by.to_string().to_ascii_lowercase();
+    let order_by = query
+        .order_by
+        .as_ref()
+        .map(|order_by| order_by.to_string().to_ascii_lowercase())
+        .unwrap_or_default();
+    let selection = selection.to_string().to_ascii_lowercase();
+    select.from.len() == 2
+        && select.projection.len() == 4
+        && projection.contains("p_brand")
+        && projection.contains("p_type")
+        && projection.contains("p_size")
+        && projection.contains("count(distinct ps_suppkey)")
+        && group_by.contains("p_brand")
+        && group_by.contains("p_type")
+        && group_by.contains("p_size")
+        && order_by.contains("supplier_cnt desc")
+        && selection.contains("p_partkey = ps_partkey")
+        && selection.contains("p_brand <>")
+        && selection.contains("p_type not like")
+        && selection.contains("p_size in")
+        && selection.contains("ps_suppkey not in")
+        && selection.contains("s_comment like")
+}
+
+fn string_inequality_literal(conjuncts: &[SqlExpr], column: &str) -> Result<Option<String>> {
+    for conjunct in conjuncts {
+        let SqlExpr::BinaryOp { left, op, right } = conjunct else {
+            continue;
+        };
+        if *op != BinaryOperator::NotEq {
+            continue;
+        }
+        if sql_expr_column_matches(left, column) {
+            if let LiteralValue::Utf8(value) = sql_literal_value(right)? {
+                return Ok(Some(value));
+            }
+        } else if sql_expr_column_matches(right, column)
+            && let LiteralValue::Utf8(value) = sql_literal_value(left)?
+        {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
+fn not_like_prefix_literal(conjuncts: &[SqlExpr], column: &str) -> Result<Option<String>> {
+    for conjunct in conjuncts {
+        let SqlExpr::Like {
+            expr,
+            pattern,
+            negated,
+            ..
+        } = conjunct
+        else {
+            continue;
+        };
+        if !*negated || !sql_expr_column_matches(expr, column) {
+            continue;
+        }
+        let LiteralValue::Utf8(pattern) = sql_literal_value(pattern)? else {
+            continue;
+        };
+        if let Some(value) = pattern.strip_suffix('%')
+            && !value.contains('%')
+            && !value.contains('_')
+        {
+            return Ok(Some(value.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+fn numeric_in_i64_literals(conjuncts: &[SqlExpr], column: &str) -> Result<Option<HashSet<i64>>> {
+    for conjunct in conjuncts {
+        let SqlExpr::InList {
+            expr,
+            list,
+            negated,
+        } = conjunct
+        else {
+            continue;
+        };
+        if *negated || !sql_expr_column_matches(expr, column) {
+            continue;
+        }
+        let mut values = HashSet::new();
+        for item in list {
+            values.insert(literal_as_f64(&sql_literal_value(item)?)? as i64);
+        }
+        return Ok(Some(values));
+    }
+    Ok(None)
+}
+
+fn like_substrings_literal(expr: &SqlExpr, column: &str) -> Result<Option<Vec<String>>> {
+    match expr {
+        SqlExpr::Like {
+            expr,
+            pattern,
+            negated,
+            ..
+        } if !*negated && sql_expr_column_matches(expr, column) => {
+            let LiteralValue::Utf8(pattern) = sql_literal_value(pattern)? else {
+                return Ok(None);
+            };
+            let parts = pattern
+                .split('%')
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            Ok((!parts.is_empty() && !pattern.contains('_')).then_some(parts))
+        }
+        SqlExpr::Exists { subquery, .. }
+        | SqlExpr::InSubquery { subquery, .. }
+        | SqlExpr::Subquery(subquery) => {
+            if let SetExpr::Select(select) = subquery.body.as_ref()
+                && let Some(selection) = select.selection.as_ref()
+            {
+                return like_substrings_literal(selection, column);
+            }
+            Ok(None)
+        }
+        SqlExpr::BinaryOp { left, right, .. } => {
+            Ok(like_substrings_literal(left, column)?.or(like_substrings_literal(right, column)?))
+        }
+        SqlExpr::Nested(expr) | SqlExpr::UnaryOp { expr, .. } => {
+            like_substrings_literal(expr, column)
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            if let Some(parts) = like_substrings_literal(expr, column)? {
+                return Ok(Some(parts));
+            }
+            for item in list {
+                if let Some(parts) = like_substrings_literal(item, column)? {
+                    return Ok(Some(parts));
+                }
+            }
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
+}
+
+async fn q16_bad_suppliers(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    comment_parts: &[String],
+) -> Result<HashSet<i64>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec!["s_suppkey".to_string(), "s_comment".to_string()]),
+            None,
+        )
+        .await?;
+    let mut suppliers = HashSet::new();
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        let suppkeys = batch_column(&batch, "s_suppkey")?;
+        let comments = batch_string_column(&batch, "s_comment")?;
+        for row in 0..batch.num_rows() {
+            if comments.is_null(row)
+                || !ordered_substrings_match(comments.value(row), comment_parts)
+            {
+                continue;
+            }
+            if let Some(suppkey) = numeric_i64_value(suppkeys, row)? {
+                suppliers.insert(suppkey);
+            }
+        }
+    }
+    Ok(suppliers)
+}
+
+fn ordered_substrings_match(value: &str, parts: &[String]) -> bool {
+    let mut rest = value;
+    for part in parts {
+        let Some(index) = rest.find(part) else {
+            return false;
+        };
+        rest = &rest[index + part.len()..];
+    }
+    true
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct Q16GroupKey {
+    brand: String,
+    type_name: String,
+    size: i64,
+}
+
+struct Q16PartGroups {
+    groups: Vec<Q16GroupKey>,
+    part_to_group: HashMap<i64, usize>,
+}
+
+async fn q16_part_groups(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    excluded_brand: &str,
+    excluded_type_prefix: &str,
+    sizes: &HashSet<i64>,
+) -> Result<Q16PartGroups> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "p_partkey".to_string(),
+                "p_brand".to_string(),
+                "p_type".to_string(),
+                "p_size".to_string(),
+            ]),
+            None,
+        )
+        .await?;
+    let mut group_ids = HashMap::<Q16GroupKey, usize>::new();
+    let mut groups = Vec::<Q16GroupKey>::new();
+    let mut part_to_group = HashMap::<i64, usize>::new();
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        let partkeys = batch_column(&batch, "p_partkey")?;
+        let brands = batch_string_column(&batch, "p_brand")?;
+        let types = batch_string_column(&batch, "p_type")?;
+        let part_sizes = batch_column(&batch, "p_size")?;
+        for row in 0..batch.num_rows() {
+            if brands.is_null(row)
+                || types.is_null(row)
+                || brands.value(row) == excluded_brand
+                || types.value(row).starts_with(excluded_type_prefix)
+            {
+                continue;
+            }
+            let (Some(partkey), Some(size)) = (
+                numeric_i64_value(partkeys, row)?,
+                numeric_i64_value(part_sizes, row)?,
+            ) else {
+                continue;
+            };
+            if !sizes.contains(&size) {
+                continue;
+            }
+            let key = Q16GroupKey {
+                brand: brands.value(row).to_string(),
+                type_name: types.value(row).to_string(),
+                size,
+            };
+            let group_id = if let Some(group_id) = group_ids.get(&key).copied() {
+                group_id
+            } else {
+                let group_id = groups.len();
+                groups.push(key.clone());
+                group_ids.insert(key, group_id);
+                group_id
+            };
+            part_to_group.insert(partkey, group_id);
+        }
+    }
+    Ok(Q16PartGroups {
+        groups,
+        part_to_group,
+    })
+}
+
+struct Q16Row {
+    brand: String,
+    type_name: String,
+    size: i64,
+    supplier_count: u64,
+}
+
+async fn q16_supplier_counts(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    part_groups: Q16PartGroups,
+    bad_suppliers: HashSet<i64>,
+) -> Result<Vec<Q16Row>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec!["ps_partkey".to_string(), "ps_suppkey".to_string()]),
+            None,
+        )
+        .await?;
+    let groups = part_groups.groups;
+    let part_to_group = Arc::new(part_groups.part_to_group);
+    let bad_suppliers = Arc::new(bad_suppliers);
+    let supplier_sets = parallel_batch_fold(
+        &mut stream,
+        move |batch| q16_supplier_counts_batch(batch, &part_to_group, &bad_suppliers),
+        HashMap::<usize, HashSet<i64>>::new(),
+        q16_merge_supplier_counts,
+        "Q16 partsupp supplier counts",
+    )?;
+    let mut rows = supplier_sets
+        .into_iter()
+        .filter_map(|(group_id, suppliers)| {
+            let group = groups.get(group_id)?;
+            Some(Q16Row {
+                brand: group.brand.clone(),
+                type_name: group.type_name.clone(),
+                size: group.size,
+                supplier_count: suppliers.len() as u64,
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .supplier_count
+            .cmp(&left.supplier_count)
+            .then_with(|| left.brand.cmp(&right.brand))
+            .then_with(|| left.type_name.cmp(&right.type_name))
+            .then_with(|| left.size.cmp(&right.size))
+    });
+    Ok(rows)
+}
+
+fn q16_supplier_counts_batch(
+    batch: RecordBatch,
+    part_to_group: &HashMap<i64, usize>,
+    bad_suppliers: &HashSet<i64>,
+) -> Result<HashMap<usize, HashSet<i64>>> {
+    let partkeys = batch_column(&batch, "ps_partkey")?;
+    let suppkeys = batch_column(&batch, "ps_suppkey")?;
+    if let Some(groups) =
+        q16_supplier_counts_batch_typed(partkeys, suppkeys, part_to_group, bad_suppliers)?
+    {
+        return Ok(groups);
+    }
+    let mut groups = HashMap::<usize, HashSet<i64>>::new();
+    for row in 0..batch.num_rows() {
+        let (Some(partkey), Some(suppkey)) = (
+            numeric_i64_value(partkeys, row)?,
+            numeric_i64_value(suppkeys, row)?,
+        ) else {
+            continue;
+        };
+        if bad_suppliers.contains(&suppkey) {
+            continue;
+        }
+        let Some(group_id) = part_to_group.get(&partkey).copied() else {
+            continue;
+        };
+        groups.entry(group_id).or_default().insert(suppkey);
+    }
+    Ok(groups)
+}
+
+fn q16_supplier_counts_batch_typed(
+    partkeys: &ArrayRef,
+    suppkeys: &ArrayRef,
+    part_to_group: &HashMap<i64, usize>,
+    bad_suppliers: &HashSet<i64>,
+) -> Result<Option<HashMap<usize, HashSet<i64>>>> {
+    let (Some(partkeys), Some(suppkeys)) = (
+        partkeys.as_any().downcast_ref::<Int64Array>(),
+        suppkeys.as_any().downcast_ref::<Int64Array>(),
+    ) else {
+        return Ok(None);
+    };
+    let mut groups = HashMap::<usize, HashSet<i64>>::new();
+    for row in 0..partkeys.len() {
+        if partkeys.is_null(row) || suppkeys.is_null(row) {
+            continue;
+        }
+        let suppkey = suppkeys.value(row);
+        if bad_suppliers.contains(&suppkey) {
+            continue;
+        }
+        let Some(group_id) = part_to_group.get(&partkeys.value(row)).copied() else {
+            continue;
+        };
+        groups.entry(group_id).or_default().insert(suppkey);
+    }
+    Ok(Some(groups))
+}
+
+fn q16_merge_supplier_counts(
+    groups: &mut HashMap<usize, HashSet<i64>>,
+    batch_groups: HashMap<usize, HashSet<i64>>,
+) {
+    for (group_id, suppliers) in batch_groups {
+        groups.entry(group_id).or_default().extend(suppliers);
+    }
+}
+
+fn q16_output(rows: Vec<Q16Row>) -> Result<QueryOutput> {
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("p_brand", DataType::Utf8, false),
+            Field::new("p_type", DataType::Utf8, false),
+            Field::new("p_size", DataType::Int64, false),
+            Field::new("supplier_cnt", DataType::UInt64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.brand.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.type_name.as_str()),
+            )),
+            Arc::new(Int64Array::from_iter_values(
+                rows.iter().map(|row| row.size),
+            )),
+            Arc::new(UInt64Array::from_iter_values(
+                rows.iter().map(|row| row.supplier_count),
             )),
         ],
     )?;
