@@ -84,6 +84,7 @@ def main() -> int:
     parser.add_argument("--data-dir", default="/tmp/dodam-tpchgen-sf0_01")
     parser.add_argument("--dodam", default="target/debug/dodam")
     parser.add_argument("--queries", default="tests/tpch_coverage.rs")
+    parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--show-sql", action="store_true")
     args = parser.parse_args()
@@ -101,7 +102,8 @@ def main() -> int:
         started = time.time()
         try:
             completed = subprocess.run(
-                [args.dodam, "query", rewritten],
+                [args.dodam, "query", rewritten]
+                + ([] if args.batch_size is None else ["--batch-size", str(args.batch_size)]),
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

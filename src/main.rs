@@ -25,6 +25,8 @@ use sqlparser::ast::{CopyOption, CopySource, CopyTarget, Ident, Statement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser as SqlParser;
 
+const DEFAULT_BATCH_SIZE: usize = 32 * 1024;
+
 #[derive(Debug, Parser)]
 #[command(name = "dodam")]
 #[command(about = "A vectorized OLAP engine built around Iceberg-style planning and Parquet scans")]
@@ -47,7 +49,7 @@ enum Commands {
         path: PathBuf,
 
         /// Number of rows per Arrow RecordBatch.
-        #[arg(long, default_value_t = 8192)]
+        #[arg(long, default_value_t = DEFAULT_BATCH_SIZE)]
         batch_size: usize,
 
         /// Optional row limit for quick inspection.
@@ -77,7 +79,7 @@ enum Commands {
         path: PathBuf,
 
         /// Number of rows per Arrow RecordBatch.
-        #[arg(long, default_value_t = 8192)]
+        #[arg(long, default_value_t = DEFAULT_BATCH_SIZE)]
         batch_size: usize,
 
         /// Aggregate expression, such as count(*), count(id), sum(id), avg(id), min(id), or max(id).
@@ -99,7 +101,7 @@ enum Commands {
         sql: String,
 
         /// Number of rows per Arrow RecordBatch.
-        #[arg(long, default_value_t = 8192)]
+        #[arg(long, default_value_t = DEFAULT_BATCH_SIZE)]
         batch_size: usize,
 
         /// COPY TO output buffer size in bytes.

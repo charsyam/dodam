@@ -268,6 +268,63 @@ fn adaptive_dense_index(key: i64, max_dense_key: usize) -> Option<usize> {
     (index <= max_dense_key).then_some(index)
 }
 
+struct DenseI64F64Sum {
+    dense: Vec<f64>,
+    fallback: Option<AdaptiveI64Map<f64>>,
+}
+
+impl DenseI64F64Sum {
+    fn new() -> Self {
+        Self {
+            dense: Vec::new(),
+            fallback: None,
+        }
+    }
+
+    fn add_dense_index(&mut self, index: usize, value: f64) {
+        debug_assert!(self.fallback.is_none());
+        self.dense[index] += value;
+    }
+
+    fn reserve_dense_to(&mut self, max_key: usize) {
+        if self.fallback.is_none() && max_key >= self.dense.len() {
+            self.dense.resize(max_key + 1, 0.0);
+        }
+    }
+
+    fn has_fallback(&self) -> bool {
+        self.fallback.is_some()
+    }
+
+    fn convert_to_fallback(&mut self) {
+        if self.fallback.is_some() {
+            return;
+        }
+        let mut fallback = AdaptiveI64Map::<f64>::new_dense();
+        for (key, value) in self.dense.iter().copied().enumerate() {
+            if value != 0.0 {
+                fallback.insert(key as i64, value);
+            }
+        }
+        self.dense.clear();
+        self.fallback = Some(fallback);
+    }
+
+    fn into_filtered_hash<P>(self, predicate: P) -> HashMap<i64, f64>
+    where
+        P: Fn(f64) -> bool,
+    {
+        if let Some(fallback) = self.fallback {
+            return fallback.into_filtered_hash(predicate);
+        }
+        self.dense
+            .into_iter()
+            .enumerate()
+            .filter_map(|(key, value)| predicate(value).then_some((key as i64, value)))
+            .collect()
+    }
+}
+
 #[derive(Debug)]
 pub enum QueryOutput {
     Scan {
@@ -2692,7 +2749,7 @@ fn literal_date_days(expr: &SqlExpr) -> Result<i32> {
     i32::try_from(days).map_err(|_| DodamError::UnsupportedSql("DATE overflow".to_string()))
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct Q01State {
     sum_qty: f64,
     sum_base_price: f64,
@@ -2736,6 +2793,69 @@ struct Q01Row {
     returnflag: String,
     linestatus: String,
     state: Q01State,
+}
+
+struct Q01GroupSlots {
+    keys: [u16; 8],
+    states: [Q01State; 8],
+    len: usize,
+    overflow: Vec<Q01Row>,
+}
+
+impl Q01GroupSlots {
+    fn new() -> Self {
+        Self {
+            keys: [0; 8],
+            states: [Q01State::default(); 8],
+            len: 0,
+            overflow: Vec::new(),
+        }
+    }
+
+    fn update(&mut self, returnflag: &str, linestatus: &str, update: impl FnOnce(&mut Q01State)) {
+        let (Some(returnflag), Some(linestatus)) =
+            (single_ascii_byte(returnflag), single_ascii_byte(linestatus))
+        else {
+            update(q01_group_state(&mut self.overflow, returnflag, linestatus));
+            return;
+        };
+        let key = (u16::from(returnflag) << 8) | u16::from(linestatus);
+        for index in 0..self.len {
+            if self.keys[index] == key {
+                update(&mut self.states[index]);
+                return;
+            }
+        }
+        if self.len < self.keys.len() {
+            let index = self.len;
+            self.len += 1;
+            self.keys[index] = key;
+            update(&mut self.states[index]);
+            return;
+        }
+        let returnflag = char::from(returnflag).to_string();
+        let linestatus = char::from(linestatus).to_string();
+        update(q01_group_state(
+            &mut self.overflow,
+            &returnflag,
+            &linestatus,
+        ));
+    }
+
+    fn into_rows(self) -> Vec<Q01Row> {
+        let mut rows = Vec::with_capacity(self.len + self.overflow.len());
+        for index in 0..self.len {
+            let returnflag = u8::try_from(self.keys[index] >> 8).expect("q01 returnflag byte");
+            let linestatus = u8::try_from(self.keys[index] & 0xff).expect("q01 linestatus byte");
+            rows.push(Q01Row {
+                returnflag: char::from(returnflag).to_string(),
+                linestatus: char::from(linestatus).to_string(),
+                state: self.states[index],
+            });
+        }
+        rows.extend(self.overflow);
+        rows
+    }
 }
 
 async fn q01_pricing_summary_rows(
@@ -2785,7 +2905,7 @@ fn q01_pricing_summary_batch(batch: RecordBatch, cutoff_days: i32) -> Result<Vec
     let discounts = batch_column(&batch, "l_discount")?;
     let taxes = batch_column(&batch, "l_tax")?;
     let shipdates = batch_column(&batch, "l_shipdate")?;
-    let mut groups = Vec::<Q01Row>::with_capacity(4);
+    let mut groups = Q01GroupSlots::new();
     if q01_update_decimal_batch(
         returnflags,
         linestatuses,
@@ -2797,7 +2917,7 @@ fn q01_pricing_summary_batch(batch: RecordBatch, cutoff_days: i32) -> Result<Vec
         cutoff_days,
         &mut groups,
     )? {
-        return Ok(groups);
+        return Ok(groups.into_rows());
     }
     for row in 0..batch.num_rows() {
         let Some(shipdate) = date32_value(shipdates, row)? else {
@@ -2814,14 +2934,11 @@ fn q01_pricing_summary_batch(batch: RecordBatch, cutoff_days: i32) -> Result<Vec
         ) else {
             continue;
         };
-        q01_group_state(&mut groups, returnflags.value(row), linestatuses.value(row)).update(
-            quantity,
-            extendedprice,
-            discount,
-            tax,
-        );
+        groups.update(returnflags.value(row), linestatuses.value(row), |state| {
+            state.update(quantity, extendedprice, discount, tax);
+        });
     }
-    Ok(groups)
+    Ok(groups.into_rows())
 }
 
 fn parallel_batch_fold<Partial, Output, Map, Merge>(
@@ -2885,7 +3002,7 @@ fn q01_update_decimal_batch(
     taxes: &ArrayRef,
     shipdates: &ArrayRef,
     cutoff_days: i32,
-    groups: &mut Vec<Q01Row>,
+    groups: &mut Q01GroupSlots,
 ) -> Result<bool> {
     let (Some(quantities), Some(extendedprices), Some(discounts), Some(taxes), Some(shipdates)) = (
         q01_decimal_input(quantities)?,
@@ -2908,14 +3025,14 @@ fn q01_update_decimal_batch(
         {
             continue;
         }
-        let returnflag = returnflags.value(row);
-        let linestatus = linestatuses.value(row);
-        q01_group_state(groups, returnflag, linestatus).update(
-            quantities.value(row),
-            extendedprices.value(row),
-            discounts.value(row),
-            taxes.value(row),
-        );
+        groups.update(returnflags.value(row), linestatuses.value(row), |state| {
+            state.update(
+                quantities.value(row),
+                extendedprices.value(row),
+                discounts.value(row),
+                taxes.value(row),
+            );
+        });
     }
     Ok(true)
 }
@@ -2937,6 +3054,11 @@ fn q01_group_state<'a>(
         state: Q01State::default(),
     });
     &mut groups.last_mut().expect("inserted q01 group").state
+}
+
+fn single_ascii_byte(value: &str) -> Option<u8> {
+    let bytes = value.as_bytes();
+    (bytes.len() == 1 && bytes[0].is_ascii()).then_some(bytes[0])
 }
 
 struct Q01DecimalInput<'a> {
@@ -6401,6 +6523,18 @@ async fn q04_candidate_order_priorities(
         let orderkeys = batch_column(&batch, "o_orderkey")?;
         let orderdates = batch_column(&batch, "o_orderdate")?;
         let orderpriorities = batch_string_column(&batch, "o_orderpriority")?;
+        if q04_candidate_order_priorities_typed(
+            orderkeys,
+            orderdates,
+            orderpriorities,
+            start_days,
+            end_days,
+            &mut priorities,
+            &mut labels,
+            &mut label_indices,
+        )? {
+            continue;
+        }
         for row in 0..batch.num_rows() {
             if orderpriorities.is_null(row) {
                 continue;
@@ -6434,6 +6568,52 @@ async fn q04_candidate_order_priorities(
         }
     }
     Ok((priorities, labels))
+}
+
+fn q04_candidate_order_priorities_typed(
+    orderkeys: &ArrayRef,
+    orderdates: &ArrayRef,
+    orderpriorities: &StringArray,
+    start_days: i32,
+    end_days: i32,
+    priorities: &mut Vec<u8>,
+    labels: &mut Vec<String>,
+    label_indices: &mut HashMap<String, u8>,
+) -> Result<bool> {
+    let (Some(orderkeys), Some(orderdates)) = (
+        orderkeys.as_any().downcast_ref::<Int64Array>(),
+        orderdates.as_any().downcast_ref::<Date32Array>(),
+    ) else {
+        return Ok(false);
+    };
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || orderdates.is_null(row) || orderpriorities.is_null(row) {
+            continue;
+        }
+        let orderdate = orderdates.value(row);
+        let orderkey = orderkeys.value(row);
+        if orderdate < start_days || orderdate >= end_days || orderkey < 0 {
+            continue;
+        }
+        let priority = orderpriorities.value(row);
+        let priority_index = if let Some(index) = label_indices.get(priority) {
+            *index
+        } else {
+            let next_index = u8::try_from(labels.len()).map_err(|_| {
+                DodamError::UnsupportedSql("too many Q04 order priorities".to_string())
+            })?;
+            labels.push(priority.to_string());
+            label_indices.insert(priority.to_string(), next_index);
+            next_index
+        };
+        let orderkey = usize::try_from(orderkey)
+            .map_err(|_| DodamError::UnsupportedSql("order key overflow".to_string()))?;
+        if orderkey >= priorities.len() {
+            priorities.resize(orderkey + 1, 0);
+        }
+        priorities[orderkey] = priority_index + 1;
+    }
+    Ok(true)
 }
 
 async fn q04_count_late_candidate_priorities(
@@ -8737,22 +8917,10 @@ async fn try_execute_q22_global_sales_opportunity_fast(
     let Some(orders_path) = first_table_path_in_subqueries(selection, "orders")? else {
         return Ok(None);
     };
-    let country_codes = ["13", "31", "23", "29", "30", "18", "17"]
-        .into_iter()
-        .collect::<HashSet<_>>();
-    let avg =
-        q22_average_positive_acctbal(engine, customer.path.clone(), batch_size, &country_codes)
-            .await?;
+    let avg = q22_average_positive_acctbal(engine, customer.path.clone(), batch_size).await?;
     let order_customers = q22_order_customer_keys(engine, orders_path, batch_size).await?;
-    let mut groups = q22_customer_groups(
-        engine,
-        customer.path,
-        batch_size,
-        &country_codes,
-        avg,
-        &order_customers,
-    )
-    .await?;
+    let mut groups =
+        q22_customer_groups(engine, customer.path, batch_size, avg, &order_customers).await?;
     groups.sort_by(|left, right| left.cntrycode.cmp(&right.cntrycode));
     Ok(Some(q22_output(groups)?))
 }
@@ -8818,7 +8986,6 @@ async fn q22_average_positive_acctbal(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-    country_codes: &HashSet<&str>,
 ) -> Result<f64> {
     let mut stream = engine
         .scan_parquet_batches(
@@ -8835,12 +9002,18 @@ async fn q22_average_positive_acctbal(
         let batch = batch?;
         let phones = batch_string_column(&batch, "c_phone")?;
         let acctbal = batch_column(&batch, "c_acctbal")?;
+        if let Some((sum_delta, count_delta)) = q22_average_positive_acctbal_typed(phones, acctbal)?
+        {
+            sum += sum_delta;
+            count += count_delta;
+            continue;
+        }
         for row in 0..batch.num_rows() {
             if phones.is_null(row) {
                 continue;
             }
             let phone = phones.value(row);
-            if phone.len() < 2 || !country_codes.contains(&phone[..2]) {
+            if q22_country_code_index(phone).is_none() {
                 continue;
             }
             let Some(value) = numeric_f64_value(acctbal, row)? else {
@@ -8855,11 +9028,36 @@ async fn q22_average_positive_acctbal(
     Ok(if count > 0 { sum / count as f64 } else { 0.0 })
 }
 
+fn q22_average_positive_acctbal_typed(
+    phones: &StringArray,
+    acctbal: &ArrayRef,
+) -> Result<Option<(f64, u64)>> {
+    let Some(acctbal) = q01_decimal_input(acctbal)? else {
+        return Ok(None);
+    };
+    let mut sum = 0.0;
+    let mut count = 0_u64;
+    for row in 0..phones.len() {
+        if phones.is_null(row) || acctbal.is_null(row) {
+            continue;
+        }
+        if q22_country_code_index(phones.value(row)).is_none() {
+            continue;
+        }
+        let value = acctbal.value(row);
+        if value > 0.0 {
+            sum += value;
+            count += 1;
+        }
+    }
+    Ok(Some((sum, count)))
+}
+
 async fn q22_order_customer_keys(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-) -> Result<HashSet<i64>> {
+) -> Result<AdaptiveI64Set> {
     let mut stream = engine
         .scan_parquet_batches(
             path,
@@ -8869,10 +9067,13 @@ async fn q22_order_customer_keys(
             None,
         )
         .await?;
-    let mut keys = HashSet::new();
+    let mut keys = AdaptiveI64Set::new_dense();
     while let Some(batch) = stream.next() {
         let batch = batch?;
         let custkeys = batch_column(&batch, "o_custkey")?;
+        if q22_order_customer_keys_batch_into(custkeys, &mut keys)? {
+            continue;
+        }
         for row in 0..batch.num_rows() {
             if let Some(key) = numeric_i64_value(custkeys, row)? {
                 keys.insert(key);
@@ -8880,6 +9081,22 @@ async fn q22_order_customer_keys(
         }
     }
     Ok(keys)
+}
+
+fn q22_order_customer_keys_batch_into(
+    custkeys: &ArrayRef,
+    keys: &mut AdaptiveI64Set,
+) -> Result<bool> {
+    let Some(custkeys) = custkeys.as_any().downcast_ref::<Int64Array>() else {
+        return Ok(false);
+    };
+    for row in 0..custkeys.len() {
+        if custkeys.is_null(row) {
+            continue;
+        }
+        keys.insert(custkeys.value(row));
+    }
+    Ok(true)
 }
 
 struct Q22Group {
@@ -8892,9 +9109,8 @@ async fn q22_customer_groups(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-    country_codes: &HashSet<&str>,
     min_acctbal: f64,
-    order_customers: &HashSet<i64>,
+    order_customers: &AdaptiveI64Set,
 ) -> Result<Vec<Q22Group>> {
     let mut stream = engine
         .scan_parquet_batches(
@@ -8909,42 +9125,113 @@ async fn q22_customer_groups(
             None,
         )
         .await?;
-    let mut groups = HashMap::<String, (u64, f64)>::new();
+    let mut counts = [0_u64; Q22_COUNTRY_CODES.len()];
+    let mut sums = [0.0_f64; Q22_COUNTRY_CODES.len()];
     while let Some(batch) = stream.next() {
         let batch = batch?;
         let custkeys = batch_column(&batch, "c_custkey")?;
         let phones = batch_string_column(&batch, "c_phone")?;
         let acctbal = batch_column(&batch, "c_acctbal")?;
+        if q22_customer_groups_typed(
+            custkeys,
+            phones,
+            acctbal,
+            min_acctbal,
+            order_customers,
+            &mut counts,
+            &mut sums,
+        )? {
+            continue;
+        }
         for row in 0..batch.num_rows() {
             let Some(custkey) = numeric_i64_value(custkeys, row)? else {
                 continue;
             };
-            if order_customers.contains(&custkey) || phones.is_null(row) {
+            if order_customers.contains(custkey) || phones.is_null(row) {
                 continue;
             }
             let phone = phones.value(row);
-            if phone.len() < 2 || !country_codes.contains(&phone[..2]) {
+            let Some(country_index) = q22_country_code_index(phone) else {
                 continue;
-            }
+            };
             let Some(value) = numeric_f64_value(acctbal, row)? else {
                 continue;
             };
             if value <= min_acctbal {
                 continue;
             }
-            let state = groups.entry(phone[..2].to_string()).or_insert((0, 0.0));
-            state.0 += 1;
-            state.1 += value;
+            counts[country_index] += 1;
+            sums[country_index] += value;
         }
     }
-    Ok(groups
+    Ok(q22_groups_from_slots(counts, sums))
+}
+
+const Q22_COUNTRY_CODES: [&str; 7] = ["13", "17", "18", "23", "29", "30", "31"];
+
+fn q22_customer_groups_typed(
+    custkeys: &ArrayRef,
+    phones: &StringArray,
+    acctbal: &ArrayRef,
+    min_acctbal: f64,
+    order_customers: &AdaptiveI64Set,
+    counts: &mut [u64; Q22_COUNTRY_CODES.len()],
+    sums: &mut [f64; Q22_COUNTRY_CODES.len()],
+) -> Result<bool> {
+    let (Some(custkeys), Some(acctbal)) = (
+        custkeys.as_any().downcast_ref::<Int64Array>(),
+        q01_decimal_input(acctbal)?,
+    ) else {
+        return Ok(false);
+    };
+    for row in 0..custkeys.len() {
+        if custkeys.is_null(row) || phones.is_null(row) || acctbal.is_null(row) {
+            continue;
+        }
+        if order_customers.contains(custkeys.value(row)) {
+            continue;
+        }
+        let Some(country_index) = q22_country_code_index(phones.value(row)) else {
+            continue;
+        };
+        let value = acctbal.value(row);
+        if value <= min_acctbal {
+            continue;
+        }
+        counts[country_index] += 1;
+        sums[country_index] += value;
+    }
+    Ok(true)
+}
+
+fn q22_groups_from_slots(
+    counts: [u64; Q22_COUNTRY_CODES.len()],
+    sums: [f64; Q22_COUNTRY_CODES.len()],
+) -> Vec<Q22Group> {
+    Q22_COUNTRY_CODES
         .into_iter()
-        .map(|(cntrycode, (count, sum))| Q22Group {
-            cntrycode,
-            count,
-            sum,
+        .zip(counts.into_iter().zip(sums))
+        .filter_map(|(cntrycode, (count, sum))| {
+            (count > 0).then_some(Q22Group {
+                cntrycode: cntrycode.to_string(),
+                count,
+                sum,
+            })
         })
-        .collect())
+        .collect()
+}
+
+fn q22_country_code_index(phone: &str) -> Option<usize> {
+    match phone.as_bytes().get(..2)? {
+        b"13" => Some(0),
+        b"17" => Some(1),
+        b"18" => Some(2),
+        b"23" => Some(3),
+        b"29" => Some(4),
+        b"30" => Some(5),
+        b"31" => Some(6),
+        _ => None,
+    }
 }
 
 fn q22_output(groups: Vec<Q22Group>) -> Result<QueryOutput> {
@@ -9109,12 +9396,60 @@ async fn q18_qualifying_order_quantities(
             None,
         )
         .await?;
-    let mut sums = AdaptiveI64Map::<f64>::new_dense();
+    let mut sums = DenseI64F64Sum::new();
     while let Some(batch) = stream.next() {
         let batch = batch?;
-        q18_quantity_batch_into(&batch, &mut sums)?;
+        if sums.has_fallback() {
+            let fallback = sums.fallback.as_mut().expect("checked q18 fallback");
+            q18_quantity_batch_into(&batch, fallback)?;
+            continue;
+        }
+        if q18_quantity_batch_into_dense(&batch, &mut sums)? {
+            continue;
+        }
+        sums.convert_to_fallback();
+        let fallback = sums.fallback.as_mut().expect("converted q18 fallback");
+        q18_quantity_batch_into(&batch, fallback)?;
     }
     Ok(sums.into_filtered_hash(|quantity| quantity > threshold))
+}
+
+fn q18_quantity_batch_into_dense(batch: &RecordBatch, sums: &mut DenseI64F64Sum) -> Result<bool> {
+    let orderkeys = batch_column(batch, "l_orderkey")?;
+    let quantities = batch_column(batch, "l_quantity")?;
+    let (Some(orderkeys), Some(quantities)) = (
+        orderkeys.as_any().downcast_ref::<Int64Array>(),
+        q01_decimal_input(quantities)?,
+    ) else {
+        return Ok(false);
+    };
+    let mut max_orderkey = None::<usize>;
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || quantities.is_null(row) {
+            continue;
+        }
+        let Some(orderkey) = adaptive_dense_index(orderkeys.value(row), DEFAULT_MAX_DENSE_I64_KEY)
+        else {
+            return Ok(false);
+        };
+        max_orderkey = Some(max_orderkey.map_or(orderkey, |max| max.max(orderkey)));
+    }
+    if let Some(max_orderkey) = max_orderkey
+        && max_orderkey > DEFAULT_MAX_DENSE_I64_KEY
+    {
+        return Ok(false);
+    }
+    if let Some(max_orderkey) = max_orderkey {
+        sums.reserve_dense_to(max_orderkey);
+    }
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || quantities.is_null(row) {
+            continue;
+        }
+        let orderkey = usize::try_from(orderkeys.value(row)).expect("validated dense orderkey");
+        sums.add_dense_index(orderkey, quantities.value(row));
+    }
+    Ok(true)
 }
 
 fn q18_quantity_batch_into(batch: &RecordBatch, sums: &mut AdaptiveI64Map<f64>) -> Result<()> {
