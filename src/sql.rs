@@ -4946,49 +4946,15 @@ async fn q05_revenue_by_nation(
             None,
         )
         .await?;
-    let mut groups = HashMap::<i64, f64>::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let orderkeys = batch_column(&batch, "l_orderkey")?;
-        let suppkeys = batch_column(&batch, "l_suppkey")?;
-        let extendedprices = batch_column(&batch, "l_extendedprice")?;
-        let discounts = batch_column(&batch, "l_discount")?;
-        if q05_update_revenue_decimal_batch(
-            orderkeys,
-            suppkeys,
-            extendedprices,
-            discounts,
-            order_customer_nations,
-            supplier_nations,
-            &mut groups,
-        )? {
-            continue;
-        }
-        for row in 0..batch.num_rows() {
-            let (Some(orderkey), Some(suppkey)) = (
-                numeric_i64_value(orderkeys, row)?,
-                numeric_i64_value(suppkeys, row)?,
-            ) else {
-                continue;
-            };
-            let (Some(customer_nation), Some(supplier_nation)) = (
-                order_customer_nations.get(&orderkey).copied(),
-                supplier_nations.get(&suppkey).copied(),
-            ) else {
-                continue;
-            };
-            if customer_nation != supplier_nation {
-                continue;
-            }
-            let (Some(extendedprice), Some(discount)) = (
-                numeric_f64_value(extendedprices, row)?,
-                numeric_f64_value(discounts, row)?,
-            ) else {
-                continue;
-            };
-            *groups.entry(customer_nation).or_insert(0.0) += extendedprice * (1.0 - discount);
-        }
-    }
+    let order_customer_nations = Arc::new(order_customer_nations.clone());
+    let supplier_nations = Arc::new(supplier_nations.clone());
+    let groups = parallel_batch_fold(
+        &mut stream,
+        move |batch| q05_revenue_by_nation_batch(batch, &order_customer_nations, &supplier_nations),
+        HashMap::<i64, f64>::new(),
+        merge_f64_groups,
+        "Q05 revenue aggregate",
+    )?;
     let mut rows = groups
         .into_iter()
         .filter_map(|(nationkey, revenue)| {
@@ -5007,23 +4973,70 @@ async fn q05_revenue_by_nation(
     Ok(rows)
 }
 
-fn q05_update_revenue_decimal_batch(
+fn q05_revenue_by_nation_batch(
+    batch: RecordBatch,
+    order_customer_nations: &HashMap<i64, i64>,
+    supplier_nations: &HashMap<i64, i64>,
+) -> Result<HashMap<i64, f64>> {
+    let orderkeys = batch_column(&batch, "l_orderkey")?;
+    let suppkeys = batch_column(&batch, "l_suppkey")?;
+    let extendedprices = batch_column(&batch, "l_extendedprice")?;
+    let discounts = batch_column(&batch, "l_discount")?;
+    if let Some(groups) = q05_revenue_by_nation_typed(
+        orderkeys,
+        suppkeys,
+        extendedprices,
+        discounts,
+        order_customer_nations,
+        supplier_nations,
+    )? {
+        return Ok(groups);
+    }
+    let mut groups = HashMap::<i64, f64>::new();
+    for row in 0..batch.num_rows() {
+        let (Some(orderkey), Some(suppkey)) = (
+            numeric_i64_value(orderkeys, row)?,
+            numeric_i64_value(suppkeys, row)?,
+        ) else {
+            continue;
+        };
+        let (Some(customer_nation), Some(supplier_nation)) = (
+            order_customer_nations.get(&orderkey).copied(),
+            supplier_nations.get(&suppkey).copied(),
+        ) else {
+            continue;
+        };
+        if customer_nation != supplier_nation {
+            continue;
+        }
+        let (Some(extendedprice), Some(discount)) = (
+            numeric_f64_value(extendedprices, row)?,
+            numeric_f64_value(discounts, row)?,
+        ) else {
+            continue;
+        };
+        *groups.entry(customer_nation).or_insert(0.0) += extendedprice * (1.0 - discount);
+    }
+    Ok(groups)
+}
+
+fn q05_revenue_by_nation_typed(
     orderkeys: &ArrayRef,
     suppkeys: &ArrayRef,
     extendedprices: &ArrayRef,
     discounts: &ArrayRef,
     order_customer_nations: &HashMap<i64, i64>,
     supplier_nations: &HashMap<i64, i64>,
-    groups: &mut HashMap<i64, f64>,
-) -> Result<bool> {
+) -> Result<Option<HashMap<i64, f64>>> {
     let (Some(orderkeys), Some(suppkeys), Some(extendedprices), Some(discounts)) = (
         orderkeys.as_any().downcast_ref::<Int64Array>(),
         suppkeys.as_any().downcast_ref::<Int64Array>(),
         q01_decimal_input(extendedprices)?,
         q01_decimal_input(discounts)?,
     ) else {
-        return Ok(false);
+        return Ok(None);
     };
+    let mut groups = HashMap::<i64, f64>::new();
     for row in 0..orderkeys.len() {
         if orderkeys.is_null(row)
             || suppkeys.is_null(row)
@@ -5045,7 +5058,7 @@ fn q05_update_revenue_decimal_batch(
                 extendedprices.value(row) * (1.0 - discounts.value(row));
         }
     }
-    Ok(true)
+    Ok(Some(groups))
 }
 
 fn q05_output(rows: Vec<Q05Row>) -> Result<QueryOutput> {
