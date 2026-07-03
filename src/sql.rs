@@ -5257,6 +5257,11 @@ async fn try_execute_q12_shipping_modes_fast(
     let Some(shipmodes) = string_in_literals(&conjuncts, "l_shipmode")? else {
         return Ok(None);
     };
+    if shipmodes.len() != 2 {
+        return Ok(None);
+    }
+    let mut shipmodes = shipmodes.into_iter().collect::<Vec<_>>();
+    shipmodes.sort();
     if !orders.path.exists() {
         return Err(DodamError::MissingPath(orders.path));
     }
@@ -5270,7 +5275,8 @@ async fn try_execute_q12_shipping_modes_fast(
     )
     .await?;
     let rows =
-        q12_shipping_mode_counts_from_orders(engine, orders.path, batch_size, &pending).await?;
+        q12_shipping_mode_counts_from_orders(engine, orders.path, batch_size, &shipmodes, &pending)
+            .await?;
     Ok(Some(q12_output(rows)?))
 }
 
@@ -5329,7 +5335,7 @@ fn string_in_literals(conjuncts: &[SqlExpr], column: &str) -> Result<Option<Hash
     Ok(None)
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct Q12State {
     high_line_count: u64,
     low_line_count: u64,
@@ -5343,14 +5349,14 @@ struct Q12Row {
 
 #[derive(Clone, Default)]
 struct Q12PendingOrder {
-    counts: HashMap<String, u64>,
+    counts: [u64; 2],
 }
 
 async fn q12_filtered_lineitem_counts(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-    shipmodes: &HashSet<String>,
+    shipmodes: &[String],
     start_days: i32,
     end_days: i32,
 ) -> Result<HashMap<i64, Q12PendingOrder>> {
@@ -5369,7 +5375,7 @@ async fn q12_filtered_lineitem_counts(
             None,
         )
         .await?;
-    let shipmodes = Arc::new(shipmodes.clone());
+    let shipmodes = Arc::new(shipmodes.to_vec());
     parallel_batch_fold(
         &mut stream,
         move |batch| q12_filtered_lineitem_counts_batch(batch, &shipmodes, start_days, end_days),
@@ -5381,7 +5387,7 @@ async fn q12_filtered_lineitem_counts(
 
 fn q12_filtered_lineitem_counts_batch(
     batch: RecordBatch,
-    shipmodes: &HashSet<String>,
+    shipmodes: &[String],
     start_days: i32,
     end_days: i32,
 ) -> Result<HashMap<i64, Q12PendingOrder>> {
@@ -5396,9 +5402,9 @@ fn q12_filtered_lineitem_counts_batch(
             continue;
         }
         let mode = modes.value(row);
-        if !shipmodes.contains(mode) {
+        let Some(mode_index) = q12_shipmode_index(shipmodes, mode) else {
             continue;
-        }
+        };
         let (Some(orderkey), Some(commitdate), Some(receiptdate), Some(shipdate)) = (
             numeric_i64_value(orderkeys, row)?,
             date32_value(commitdates, row)?,
@@ -5414,14 +5420,17 @@ fn q12_filtered_lineitem_counts_batch(
         {
             continue;
         }
-        *pending
-            .entry(orderkey)
-            .or_default()
-            .counts
-            .entry(mode.to_string())
-            .or_insert(0) += 1;
+        pending.entry(orderkey).or_default().counts[mode_index] += 1;
     }
     Ok(pending)
+}
+
+fn q12_shipmode_index(shipmodes: &[String], mode: &str) -> Option<usize> {
+    match shipmodes {
+        [left, _] if mode == left => Some(0),
+        [_, right] if mode == right => Some(1),
+        _ => None,
+    }
 }
 
 fn q12_merge_pending_orders(
@@ -5430,8 +5439,8 @@ fn q12_merge_pending_orders(
 ) {
     for (orderkey, order) in batch_pending {
         let target = pending.entry(orderkey).or_default();
-        for (mode, count) in order.counts {
-            *target.counts.entry(mode).or_insert(0) += count;
+        for index in 0..target.counts.len() {
+            target.counts[index] += order.counts[index];
         }
     }
 }
@@ -5440,6 +5449,7 @@ async fn q12_shipping_mode_counts_from_orders(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
+    shipmodes: &[String],
     pending: &HashMap<i64, Q12PendingOrder>,
 ) -> Result<Vec<Q12Row>> {
     let mut stream = engine
@@ -5458,29 +5468,29 @@ async fn q12_shipping_mode_counts_from_orders(
     let groups = parallel_batch_fold(
         &mut stream,
         move |batch| q12_shipping_mode_counts_batch(batch, &pending),
-        HashMap::<String, Q12State>::new(),
+        [Q12State::default(); 2],
         q12_merge_shipping_mode_counts,
         "Q12 orders aggregate",
     )?;
-    let mut rows = groups
+    let rows = groups
         .into_iter()
-        .map(|(shipmode, state)| Q12Row {
-            shipmode,
+        .enumerate()
+        .map(|(index, state)| Q12Row {
+            shipmode: shipmodes[index].clone(),
             high_line_count: state.high_line_count,
             low_line_count: state.low_line_count,
         })
         .collect::<Vec<_>>();
-    rows.sort_by(|left, right| left.shipmode.cmp(&right.shipmode));
     Ok(rows)
 }
 
 fn q12_shipping_mode_counts_batch(
     batch: RecordBatch,
     pending: &HashMap<i64, Q12PendingOrder>,
-) -> Result<HashMap<String, Q12State>> {
+) -> Result<[Q12State; 2]> {
     let orderkeys = batch_column(&batch, "o_orderkey")?;
     let orderpriorities = batch_string_column(&batch, "o_orderpriority")?;
-    let mut groups = HashMap::<String, Q12State>::new();
+    let mut groups = [Q12State::default(); 2];
     for row in 0..batch.num_rows() {
         if orderpriorities.is_null(row) {
             continue;
@@ -5492,26 +5502,25 @@ fn q12_shipping_mode_counts_batch(
             continue;
         };
         let is_high_priority = matches!(orderpriorities.value(row), "1-URGENT" | "2-HIGH");
-        for (mode, count) in &order.counts {
-            let group = groups.entry(mode.clone()).or_default();
+        for (index, count) in order.counts.iter().copied().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            let group = &mut groups[index];
             if is_high_priority {
-                group.high_line_count += *count;
+                group.high_line_count += count;
             } else {
-                group.low_line_count += *count;
+                group.low_line_count += count;
             }
         }
     }
     Ok(groups)
 }
 
-fn q12_merge_shipping_mode_counts(
-    groups: &mut HashMap<String, Q12State>,
-    batch_groups: HashMap<String, Q12State>,
-) {
-    for (shipmode, state) in batch_groups {
-        let group = groups.entry(shipmode).or_default();
-        group.high_line_count += state.high_line_count;
-        group.low_line_count += state.low_line_count;
+fn q12_merge_shipping_mode_counts(groups: &mut [Q12State; 2], batch_groups: [Q12State; 2]) {
+    for index in 0..groups.len() {
+        groups[index].high_line_count += batch_groups[index].high_line_count;
+        groups[index].low_line_count += batch_groups[index].low_line_count;
     }
 }
 
@@ -8032,7 +8041,6 @@ async fn q07_volume_rows(
         .await?;
     let supplier_nations = Arc::new(supplier_nations.clone());
     let order_customer_nations = Arc::new(order_customer_nations.clone());
-    let nation_names = Arc::new(nation_names.clone());
     let groups = parallel_batch_fold(
         &mut stream,
         move |batch| {
@@ -8040,22 +8048,23 @@ async fn q07_volume_rows(
                 batch,
                 &supplier_nations,
                 &order_customer_nations,
-                &nation_names,
                 start_days,
                 end_days,
             )
         },
-        HashMap::<(String, String, i32), f64>::new(),
+        HashMap::<(i64, i64, i32), f64>::new(),
         merge_f64_groups,
         "Q07 volume aggregate",
     )?;
     let mut rows = groups
         .into_iter()
-        .map(|((supp_nation, cust_nation, l_year), revenue)| Q07Row {
-            supp_nation,
-            cust_nation,
-            l_year,
-            revenue,
+        .filter_map(|((supp_nation_key, cust_nation_key, l_year), revenue)| {
+            Some(Q07Row {
+                supp_nation: nation_names.get(&supp_nation_key)?.clone(),
+                cust_nation: nation_names.get(&cust_nation_key)?.clone(),
+                l_year,
+                revenue,
+            })
         })
         .collect::<Vec<_>>();
     rows.sort_by(|left, right| {
@@ -8071,16 +8080,15 @@ fn q07_volume_batch(
     batch: RecordBatch,
     supplier_nations: &HashMap<i64, i64>,
     order_customer_nations: &HashMap<i64, i64>,
-    nation_names: &HashMap<i64, String>,
     start_days: i32,
     end_days: i32,
-) -> Result<HashMap<(String, String, i32), f64>> {
+) -> Result<HashMap<(i64, i64, i32), f64>> {
     let orderkeys = batch_column(&batch, "l_orderkey")?;
     let suppkeys = batch_column(&batch, "l_suppkey")?;
     let shipdates = batch_column(&batch, "l_shipdate")?;
     let extendedprices = batch_column(&batch, "l_extendedprice")?;
     let discounts = batch_column(&batch, "l_discount")?;
-    let mut groups = HashMap::<(String, String, i32), f64>::new();
+    let mut groups = HashMap::<(i64, i64, i32), f64>::new();
     for row in 0..batch.num_rows() {
         let (Some(orderkey), Some(suppkey), Some(shipdate)) = (
             numeric_i64_value(orderkeys, row)?,
@@ -8098,15 +8106,7 @@ fn q07_volume_batch(
         ) else {
             continue;
         };
-        let (Some(supp_nation), Some(cust_nation)) = (
-            nation_names.get(&supp_nation_key),
-            nation_names.get(&cust_nation_key),
-        ) else {
-            continue;
-        };
-        if !((supp_nation == "FRANCE" && cust_nation == "GERMANY")
-            || (supp_nation == "GERMANY" && cust_nation == "FRANCE"))
-        {
+        if supp_nation_key == cust_nation_key {
             continue;
         }
         let (Some(extendedprice), Some(discount)) = (
@@ -8117,8 +8117,8 @@ fn q07_volume_batch(
         };
         *groups
             .entry((
-                supp_nation.clone(),
-                cust_nation.clone(),
+                supp_nation_key,
+                cust_nation_key,
                 year_from_days(i64::from(shipdate))?,
             ))
             .or_insert(0.0) += extendedprice * (1.0 - discount);
