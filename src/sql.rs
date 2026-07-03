@@ -4255,32 +4255,14 @@ async fn q03_revenue_rows(
             None,
         )
         .await?;
-    let mut revenues = HashMap::<i64, f64>::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let orderkeys = batch_column(&batch, "l_orderkey")?;
-        let shipdates = batch_column(&batch, "l_shipdate")?;
-        let extendedprices = batch_column(&batch, "l_extendedprice")?;
-        let discounts = batch_column(&batch, "l_discount")?;
-        for row in 0..batch.num_rows() {
-            let (Some(orderkey), Some(shipdate)) = (
-                numeric_i64_value(orderkeys, row)?,
-                date32_value(shipdates, row)?,
-            ) else {
-                continue;
-            };
-            if shipdate <= ship_cutoff || !orders.contains_key(&orderkey) {
-                continue;
-            }
-            let (Some(extendedprice), Some(discount)) = (
-                numeric_f64_value(extendedprices, row)?,
-                numeric_f64_value(discounts, row)?,
-            ) else {
-                continue;
-            };
-            *revenues.entry(orderkey).or_insert(0.0) += extendedprice * (1.0 - discount);
-        }
-    }
+    let orders_for_scan = Arc::new(orders.clone());
+    let revenues = parallel_batch_fold(
+        &mut stream,
+        move |batch| q03_revenue_batch(batch, &orders_for_scan, ship_cutoff),
+        HashMap::<i64, f64>::new(),
+        merge_f64_groups,
+        "Q03 revenue aggregate",
+    )?;
     let mut rows = revenues
         .into_iter()
         .filter_map(|(orderkey, revenue)| {
@@ -4301,6 +4283,43 @@ async fn q03_revenue_rows(
     });
     rows.truncate(10);
     Ok(rows)
+}
+
+fn q03_revenue_batch(
+    batch: RecordBatch,
+    orders: &HashMap<i64, Q03Order>,
+    ship_cutoff: i32,
+) -> Result<HashMap<i64, f64>> {
+    let orderkeys = batch_column(&batch, "l_orderkey")?;
+    let shipdates = batch_column(&batch, "l_shipdate")?;
+    let extendedprices = batch_column(&batch, "l_extendedprice")?;
+    let discounts = batch_column(&batch, "l_discount")?;
+    let mut revenues = HashMap::<i64, f64>::new();
+    for row in 0..batch.num_rows() {
+        let (Some(orderkey), Some(shipdate)) = (
+            numeric_i64_value(orderkeys, row)?,
+            date32_value(shipdates, row)?,
+        ) else {
+            continue;
+        };
+        if shipdate <= ship_cutoff || !orders.contains_key(&orderkey) {
+            continue;
+        }
+        let (Some(extendedprice), Some(discount)) = (
+            numeric_f64_value(extendedprices, row)?,
+            numeric_f64_value(discounts, row)?,
+        ) else {
+            continue;
+        };
+        *revenues.entry(orderkey).or_insert(0.0) += extendedprice * (1.0 - discount);
+    }
+    Ok(revenues)
+}
+
+fn merge_f64_groups<K: Eq + std::hash::Hash>(groups: &mut HashMap<K, f64>, batch: HashMap<K, f64>) {
+    for (key, value) in batch {
+        *groups.entry(key).or_insert(0.0) += value;
+    }
 }
 
 fn q03_output(rows: Vec<Q03Row>) -> Result<QueryOutput> {
@@ -5377,54 +5396,25 @@ async fn q07_volume_rows(
             None,
         )
         .await?;
-    let mut groups = HashMap::<(String, String, i32), f64>::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let orderkeys = batch_column(&batch, "l_orderkey")?;
-        let suppkeys = batch_column(&batch, "l_suppkey")?;
-        let shipdates = batch_column(&batch, "l_shipdate")?;
-        let extendedprices = batch_column(&batch, "l_extendedprice")?;
-        let discounts = batch_column(&batch, "l_discount")?;
-        for row in 0..batch.num_rows() {
-            let (Some(orderkey), Some(suppkey), Some(shipdate)) = (
-                numeric_i64_value(orderkeys, row)?,
-                numeric_i64_value(suppkeys, row)?,
-                date32_value(shipdates, row)?,
-            ) else {
-                continue;
-            };
-            if shipdate < start_days || shipdate > end_days {
-                continue;
-            }
-            let (Some(supp_nation_key), Some(cust_nation_key)) = (
-                supplier_nations.get(&suppkey).copied(),
-                order_customer_nations.get(&orderkey).copied(),
-            ) else {
-                continue;
-            };
-            let (Some(supp_nation), Some(cust_nation)) = (
-                nation_names.get(&supp_nation_key),
-                nation_names.get(&cust_nation_key),
-            ) else {
-                continue;
-            };
-            if !((supp_nation == "FRANCE" && cust_nation == "GERMANY")
-                || (supp_nation == "GERMANY" && cust_nation == "FRANCE"))
-            {
-                continue;
-            }
-            let (Some(extendedprice), Some(discount)) = (
-                numeric_f64_value(extendedprices, row)?,
-                numeric_f64_value(discounts, row)?,
-            ) else {
-                continue;
-            };
-            let (year, _, _) = civil_from_days(i64::from(shipdate))?;
-            *groups
-                .entry((supp_nation.clone(), cust_nation.clone(), year))
-                .or_insert(0.0) += extendedprice * (1.0 - discount);
-        }
-    }
+    let supplier_nations = Arc::new(supplier_nations.clone());
+    let order_customer_nations = Arc::new(order_customer_nations.clone());
+    let nation_names = Arc::new(nation_names.clone());
+    let groups = parallel_batch_fold(
+        &mut stream,
+        move |batch| {
+            q07_volume_batch(
+                batch,
+                &supplier_nations,
+                &order_customer_nations,
+                &nation_names,
+                start_days,
+                end_days,
+            )
+        },
+        HashMap::<(String, String, i32), f64>::new(),
+        merge_f64_groups,
+        "Q07 volume aggregate",
+    )?;
     let mut rows = groups
         .into_iter()
         .map(|((supp_nation, cust_nation, l_year), revenue)| Q07Row {
@@ -5441,6 +5431,62 @@ async fn q07_volume_rows(
             .then_with(|| left.l_year.cmp(&right.l_year))
     });
     Ok(rows)
+}
+
+fn q07_volume_batch(
+    batch: RecordBatch,
+    supplier_nations: &HashMap<i64, i64>,
+    order_customer_nations: &HashMap<i64, i64>,
+    nation_names: &HashMap<i64, String>,
+    start_days: i32,
+    end_days: i32,
+) -> Result<HashMap<(String, String, i32), f64>> {
+    let orderkeys = batch_column(&batch, "l_orderkey")?;
+    let suppkeys = batch_column(&batch, "l_suppkey")?;
+    let shipdates = batch_column(&batch, "l_shipdate")?;
+    let extendedprices = batch_column(&batch, "l_extendedprice")?;
+    let discounts = batch_column(&batch, "l_discount")?;
+    let mut groups = HashMap::<(String, String, i32), f64>::new();
+    for row in 0..batch.num_rows() {
+        let (Some(orderkey), Some(suppkey), Some(shipdate)) = (
+            numeric_i64_value(orderkeys, row)?,
+            numeric_i64_value(suppkeys, row)?,
+            date32_value(shipdates, row)?,
+        ) else {
+            continue;
+        };
+        if shipdate < start_days || shipdate > end_days {
+            continue;
+        }
+        let (Some(supp_nation_key), Some(cust_nation_key)) = (
+            supplier_nations.get(&suppkey).copied(),
+            order_customer_nations.get(&orderkey).copied(),
+        ) else {
+            continue;
+        };
+        let (Some(supp_nation), Some(cust_nation)) = (
+            nation_names.get(&supp_nation_key),
+            nation_names.get(&cust_nation_key),
+        ) else {
+            continue;
+        };
+        if !((supp_nation == "FRANCE" && cust_nation == "GERMANY")
+            || (supp_nation == "GERMANY" && cust_nation == "FRANCE"))
+        {
+            continue;
+        }
+        let (Some(extendedprice), Some(discount)) = (
+            numeric_f64_value(extendedprices, row)?,
+            numeric_f64_value(discounts, row)?,
+        ) else {
+            continue;
+        };
+        let (year, _, _) = civil_from_days(i64::from(shipdate))?;
+        *groups
+            .entry((supp_nation.clone(), cust_nation.clone(), year))
+            .or_insert(0.0) += extendedprice * (1.0 - discount);
+    }
+    Ok(groups)
 }
 
 fn q07_output(rows: Vec<Q07Row>) -> Result<QueryOutput> {
