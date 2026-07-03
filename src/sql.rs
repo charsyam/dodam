@@ -235,11 +235,7 @@ pub async fn execute_sql(
             let stream: SendableBatchStream = if query.aggregate_expressions.is_empty() {
                 stream
             } else {
-                let batches = append_aggregate_expression_columns(
-                    collect_batches(stream)?,
-                    &query.aggregate_expressions,
-                )?;
-                Box::new(MemoryExec::new(batches)).execute()?
+                append_aggregate_expression_stream(stream, query.aggregate_expressions.clone())
             };
             let metrics = if group_by.is_empty() {
                 collect_aggregates(stream, 2, &aggregates)?
@@ -290,11 +286,7 @@ pub async fn execute_sql(
                     query.filter,
                 )
                 .await?;
-            let batches = append_aggregate_expression_columns(
-                collect_batches(stream)?,
-                &query.aggregate_expressions,
-            )?;
-            let stream = Box::new(MemoryExec::new(batches)).execute()?;
+            let stream = append_aggregate_expression_stream(stream, query.aggregate_expressions);
             if query.group_by.is_empty() {
                 collect_aggregates(stream, 1, &aggregates)?
             } else {
@@ -11348,24 +11340,46 @@ fn append_aggregate_expression_columns(
     }
     batches
         .into_iter()
-        .map(|batch| {
-            let mut fields = batch.schema().fields().to_vec();
-            let mut columns = batch.columns().to_vec();
-            for expression in expressions {
-                let value = evaluate_scalar_expression(&batch, &expression.expr)?;
-                fields.push(Arc::new(Field::new(
-                    expression.output_name.clone(),
-                    value.data_type(),
-                    value.is_nullable(),
-                )));
-                columns.push(value.into_array(batch.num_rows()));
-            }
-            Ok(RecordBatch::try_new(
-                Arc::new(Schema::new(fields)),
-                columns,
-            )?)
-        })
+        .map(|batch| append_aggregate_expression_batch(batch, expressions))
         .collect()
+}
+
+fn append_aggregate_expression_stream(
+    stream: SendableBatchStream,
+    expressions: Vec<ProjectionExpression>,
+) -> SendableBatchStream {
+    if expressions.is_empty() {
+        return stream;
+    }
+    let (inner, metrics) = stream.into_parts();
+    SendableBatchStream::new(
+        Box::new(inner.map(move |batch| append_aggregate_expression_batch(batch?, &expressions))),
+        metrics,
+    )
+}
+
+fn append_aggregate_expression_batch(
+    batch: RecordBatch,
+    expressions: &[ProjectionExpression],
+) -> Result<RecordBatch> {
+    if expressions.is_empty() {
+        return Ok(batch);
+    }
+    let mut fields = batch.schema().fields().to_vec();
+    let mut columns = batch.columns().to_vec();
+    for expression in expressions {
+        let value = evaluate_scalar_expression(&batch, &expression.expr)?;
+        fields.push(Arc::new(Field::new(
+            expression.output_name.clone(),
+            value.data_type(),
+            value.is_nullable(),
+        )));
+        columns.push(value.into_array(batch.num_rows()));
+    }
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns,
+    )?)
 }
 
 #[derive(Clone)]
