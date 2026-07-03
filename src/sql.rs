@@ -2657,66 +2657,6 @@ where
     Ok(output)
 }
 
-fn parallel_batch_fold_chunked<Partial, Output, Map, Merge>(
-    stream: &mut SendableBatchStream,
-    chunk_size: usize,
-    map: Map,
-    mut output: Output,
-    mut merge: Merge,
-    label: &str,
-) -> Result<Output>
-where
-    Partial: Send + 'static,
-    Map: Fn(Vec<RecordBatch>) -> Result<Partial> + Send + Sync + Clone + 'static,
-    Merge: FnMut(&mut Output, Partial),
-{
-    let profile = tpch_profile_enabled();
-    let started = profile.then(Instant::now);
-    let (sender, receiver) = mpsc::channel();
-    let mut pending_chunks = 0_usize;
-    let mut chunk = Vec::with_capacity(chunk_size);
-    while let Some(batch) = stream.next() {
-        chunk.push(batch?);
-        if chunk.len() < chunk_size {
-            continue;
-        }
-        let sender = sender.clone();
-        let map = map.clone();
-        let batches = std::mem::take(&mut chunk);
-        pending_chunks += 1;
-        rayon::spawn(move || {
-            let _ = sender.send(map(batches));
-        });
-    }
-    if !chunk.is_empty() {
-        let sender = sender.clone();
-        let map = map.clone();
-        pending_chunks += 1;
-        rayon::spawn(move || {
-            let _ = sender.send(map(chunk));
-        });
-    }
-    drop(sender);
-    let merge_started = profile.then(Instant::now);
-    for _ in 0..pending_chunks {
-        let partial = receiver
-            .recv()
-            .map_err(|_| DodamError::UnsupportedSql(format!("{label} worker stopped")))??;
-        merge(&mut output, partial);
-    }
-    if let Some(started) = started {
-        let merge_ms = merge_started
-            .map(|started| started.elapsed().as_secs_f64() * 1000.0)
-            .unwrap_or_default();
-        eprintln!(
-            "[dodam:tpch-profile] {label}: total={:.3} ms worker_wait_merge={:.3} ms chunks={pending_chunks}",
-            started.elapsed().as_secs_f64() * 1000.0,
-            merge_ms
-        );
-    }
-    Ok(output)
-}
-
 fn q01_merge_rows(groups: &mut Vec<Q01Row>, rows: Vec<Q01Row>) {
     for row in rows {
         q01_group_state(groups, &row.returnflag, &row.linestatus).merge(row.state);
@@ -4008,7 +3948,7 @@ async fn try_execute_q09_product_type_profit_fast(
         &part_keys,
         &supplier_nations,
         &nation_names,
-        &order_years,
+        order_years,
         &supply_costs,
     )
     .await?;
@@ -4168,7 +4108,7 @@ async fn q09_order_years(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-) -> Result<HashMap<i64, i32>> {
+) -> Result<Q09OrderYears> {
     let mut stream = engine
         .scan_parquet_batches(
             path,
@@ -4178,23 +4118,125 @@ async fn q09_order_years(
             None,
         )
         .await?;
-    parallel_batch_fold(
-        &mut stream,
-        q09_order_years_batch,
-        HashMap::<i64, i32>::new(),
-        merge_maps,
-        "Q09 order years",
-    )
+    let mut years = Q09OrderYearsBuilder::Dense(Vec::new());
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        years.add_batch(&batch)?;
+    }
+    Ok(years.finish())
 }
 
-fn q09_order_years_batch(batch: RecordBatch) -> Result<HashMap<i64, i32>> {
-    let orderkeys = batch_column(&batch, "o_orderkey")?;
-    let orderdates = batch_column(&batch, "o_orderdate")?;
-    if let Some(orders) = q09_order_years_batch_typed(orderkeys, orderdates)? {
-        return Ok(orders);
+const Q09_MAX_DENSE_ORDERKEY: usize = 20_000_000;
+
+enum Q09OrderYears {
+    Dense(Vec<i16>),
+    Hash(HashMap<i64, i32>),
+}
+
+impl Q09OrderYears {
+    fn get(&self, orderkey: i64) -> Option<i32> {
+        match self {
+            Self::Dense(years) => {
+                let index = usize::try_from(orderkey).ok()?;
+                years
+                    .get(index)
+                    .copied()
+                    .filter(|year| *year != 0)
+                    .map(i32::from)
+            }
+            Self::Hash(years) => years.get(&orderkey).copied(),
+        }
     }
-    let mut orders = HashMap::new();
-    for row in 0..batch.num_rows() {
+}
+
+enum Q09OrderYearsBuilder {
+    Dense(Vec<i16>),
+    Hash(HashMap<i64, i32>),
+}
+
+impl Q09OrderYearsBuilder {
+    fn add_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        let orderkeys = batch_column(batch, "o_orderkey")?;
+        let orderdates = batch_column(batch, "o_orderdate")?;
+        match self {
+            Self::Dense(years) => {
+                if q09_order_years_batch_dense(orderkeys, orderdates, years)? {
+                    Ok(())
+                } else {
+                    let mut hash = q09_dense_order_years_to_hash(years);
+                    q09_order_years_batch_hash(orderkeys, orderdates, &mut hash)?;
+                    *self = Self::Hash(hash);
+                    Ok(())
+                }
+            }
+            Self::Hash(years) => q09_order_years_batch_hash(orderkeys, orderdates, years),
+        }
+    }
+
+    fn finish(self) -> Q09OrderYears {
+        match self {
+            Self::Dense(years) => Q09OrderYears::Dense(years),
+            Self::Hash(years) => Q09OrderYears::Hash(years),
+        }
+    }
+}
+
+fn q09_order_years_batch_dense(
+    orderkeys: &ArrayRef,
+    orderdates: &ArrayRef,
+    years: &mut Vec<i16>,
+) -> Result<bool> {
+    let (Some(orderkeys), Some(orderdates)) = (
+        orderkeys.as_any().downcast_ref::<Int64Array>(),
+        orderdates.as_any().downcast_ref::<Date32Array>(),
+    ) else {
+        return Ok(false);
+    };
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || orderdates.is_null(row) {
+            continue;
+        }
+        let orderkey = orderkeys.value(row);
+        if orderkey < 0 {
+            return Ok(false);
+        }
+        let Ok(index) = usize::try_from(orderkey) else {
+            return Ok(false);
+        };
+        if index > Q09_MAX_DENSE_ORDERKEY {
+            return Ok(false);
+        }
+        if index >= years.len() {
+            years.resize(index + 1, 0);
+        }
+        let (year, _, _) = civil_from_days(i64::from(orderdates.value(row)))?;
+        let Ok(year) = i16::try_from(year) else {
+            return Ok(false);
+        };
+        years[index] = year;
+    }
+    Ok(true)
+}
+
+fn q09_order_years_batch_hash(
+    orderkeys: &ArrayRef,
+    orderdates: &ArrayRef,
+    years: &mut HashMap<i64, i32>,
+) -> Result<()> {
+    if let (Some(orderkeys), Some(orderdates)) = (
+        orderkeys.as_any().downcast_ref::<Int64Array>(),
+        orderdates.as_any().downcast_ref::<Date32Array>(),
+    ) {
+        for row in 0..orderkeys.len() {
+            if orderkeys.is_null(row) || orderdates.is_null(row) {
+                continue;
+            }
+            let (year, _, _) = civil_from_days(i64::from(orderdates.value(row)))?;
+            years.insert(orderkeys.value(row), year);
+        }
+        return Ok(());
+    }
+    for row in 0..orderkeys.len() {
         let (Some(orderkey), Some(orderdate)) = (
             numeric_i64_value(orderkeys, row)?,
             date32_value(orderdates, row)?,
@@ -4202,30 +4244,18 @@ fn q09_order_years_batch(batch: RecordBatch) -> Result<HashMap<i64, i32>> {
             continue;
         };
         let (year, _, _) = civil_from_days(i64::from(orderdate))?;
-        orders.insert(orderkey, year);
+        years.insert(orderkey, year);
     }
-    Ok(orders)
+    Ok(())
 }
 
-fn q09_order_years_batch_typed(
-    orderkeys: &ArrayRef,
-    orderdates: &ArrayRef,
-) -> Result<Option<HashMap<i64, i32>>> {
-    let (Some(orderkeys), Some(orderdates)) = (
-        orderkeys.as_any().downcast_ref::<Int64Array>(),
-        orderdates.as_any().downcast_ref::<Date32Array>(),
-    ) else {
-        return Ok(None);
-    };
-    let mut orders = HashMap::new();
-    for row in 0..orderkeys.len() {
-        if orderkeys.is_null(row) || orderdates.is_null(row) {
-            continue;
-        }
-        let (year, _, _) = civil_from_days(i64::from(orderdates.value(row)))?;
-        orders.insert(orderkeys.value(row), year);
-    }
-    Ok(Some(orders))
+fn q09_dense_order_years_to_hash(years: &[i16]) -> HashMap<i64, i32> {
+    years
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(orderkey, year)| (year != 0).then_some((orderkey as i64, i32::from(year))))
+        .collect()
 }
 
 async fn q09_supply_costs(
@@ -4322,7 +4352,7 @@ async fn q09_profit_rows(
     part_keys: &HashSet<i64>,
     supplier_nations: &HashMap<i64, i64>,
     nation_names: &HashMap<i64, String>,
-    order_years: &HashMap<i64, i32>,
+    order_years: Q09OrderYears,
     supply_costs: &HashMap<(i64, i64), f64>,
 ) -> Result<Vec<Q09Row>> {
     let mut stream = engine
@@ -4343,7 +4373,7 @@ async fn q09_profit_rows(
         .await?;
     let part_keys = Arc::new(part_keys.clone());
     let supplier_nations = Arc::new(supplier_nations.clone());
-    let order_years = Arc::new(order_years.clone());
+    let order_years = Arc::new(order_years);
     let supply_costs = Arc::new(supply_costs.clone());
     let groups = parallel_batch_fold(
         &mut stream,
@@ -4382,7 +4412,7 @@ fn q09_profit_batch(
     batch: RecordBatch,
     part_keys: &HashSet<i64>,
     supplier_nations: &HashMap<i64, i64>,
-    order_years: &HashMap<i64, i32>,
+    order_years: &Q09OrderYears,
     supply_costs: &HashMap<(i64, i64), f64>,
 ) -> Result<HashMap<(i64, i32), f64>> {
     let orderkeys = batch_column(&batch, "l_orderkey")?;
@@ -4418,7 +4448,7 @@ fn q09_profit_batch(
             continue;
         }
         let (Some(o_year), Some(nationkey), Some(supplycost)) = (
-            order_years.get(&orderkey).copied(),
+            order_years.get(orderkey),
             supplier_nations.get(&suppkey).copied(),
             supply_costs.get(&(partkey, suppkey)).copied(),
         ) else {
@@ -4446,7 +4476,7 @@ fn q09_profit_decimal_batch(
     discounts: &ArrayRef,
     part_keys: &HashSet<i64>,
     supplier_nations: &HashMap<i64, i64>,
-    order_years: &HashMap<i64, i32>,
+    order_years: &Q09OrderYears,
     supply_costs: &HashMap<(i64, i64), f64>,
 ) -> Result<Option<HashMap<(i64, i32), f64>>> {
     let (
@@ -4486,7 +4516,7 @@ fn q09_profit_decimal_batch(
         let orderkey = orderkeys.value(row);
         let suppkey = suppkeys.value(row);
         let (Some(o_year), Some(nationkey), Some(supplycost)) = (
-            order_years.get(&orderkey).copied(),
+            order_years.get(orderkey),
             supplier_nations.get(&suppkey).copied(),
             supply_costs.get(&(partkey, suppkey)).copied(),
         ) else {
@@ -8874,25 +8904,13 @@ async fn try_execute_q18_large_volume_customer_fast(
     };
 
     let stage = tpch_profile_start();
-    let order_quantity_sums = grouped_numeric_sum(
-        engine,
-        lineitem.path.clone(),
-        batch_size,
-        "l_orderkey",
-        "l_quantity",
-    )
-    .await?;
+    let order_quantity_sums =
+        q18_qualifying_order_quantities(engine, lineitem.path.clone(), batch_size, 300.0).await?;
     tpch_profile_elapsed("Q18 lineitem quantity sums", stage);
-    let stage = tpch_profile_start();
-    let qualifying_orders = order_quantity_sums
-        .into_iter()
-        .filter(|(_, sum)| *sum > 300.0)
-        .collect::<HashMap<_, _>>();
-    tpch_profile_elapsed("Q18 qualifying filter", stage);
-    if qualifying_orders.is_empty() {
+    if order_quantity_sums.is_empty() {
         return Ok(Some(q18_output(Vec::new())?));
     }
-    let qualifying_order_keys = qualifying_orders.keys().copied().collect::<HashSet<_>>();
+    let qualifying_order_keys = order_quantity_sums.keys().copied().collect::<HashSet<_>>();
     let stage = tpch_profile_start();
     let order_rows =
         q18_qualifying_orders(engine, orders.path, batch_size, &qualifying_order_keys).await?;
@@ -8907,7 +8925,7 @@ async fn try_execute_q18_large_volume_customer_fast(
         let Some(name) = customer_names.get(&order.custkey) else {
             continue;
         };
-        let Some(quantity) = qualifying_orders.get(&orderkey).copied() else {
+        let Some(quantity) = order_quantity_sums.get(&orderkey).copied() else {
             continue;
         };
         rows.push(Q18Row {
@@ -8942,89 +8960,6 @@ fn q18_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
         && text.contains("o_orderkey = l_orderkey")
 }
 
-async fn grouped_numeric_sum(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-    key_column: &str,
-    value_column: &str,
-) -> Result<HashMap<i64, f64>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec![key_column.to_string(), value_column.to_string()]),
-            None,
-        )
-        .await?;
-    let key_column = key_column.to_string();
-    let value_column = value_column.to_string();
-    parallel_batch_fold_chunked(
-        &mut stream,
-        16,
-        move |batches| grouped_numeric_sum_batches(batches, &key_column, &value_column),
-        HashMap::<i64, f64>::new(),
-        merge_f64_groups,
-        "grouped numeric sum",
-    )
-}
-
-fn grouped_numeric_sum_batches(
-    batches: Vec<RecordBatch>,
-    key_column: &str,
-    value_column: &str,
-) -> Result<HashMap<i64, f64>> {
-    let mut sums = HashMap::<i64, f64>::new();
-    for batch in batches {
-        grouped_numeric_sum_batch_into(&batch, key_column, value_column, &mut sums)?;
-    }
-    Ok(sums)
-}
-
-fn grouped_numeric_sum_batch_into(
-    batch: &RecordBatch,
-    key_column: &str,
-    value_column: &str,
-    sums: &mut HashMap<i64, f64>,
-) -> Result<()> {
-    let keys = batch_column(&batch, key_column)?;
-    let values = batch_column(&batch, value_column)?;
-    if i64_decimal_sums_into(keys, values, sums)? {
-        return Ok(());
-    }
-    for row in 0..batch.num_rows() {
-        let (Some(key), Some(value)) = (
-            numeric_i64_value(keys, row)?,
-            numeric_f64_value(values, row)?,
-        ) else {
-            continue;
-        };
-        *sums.entry(key).or_insert(0.0) += value;
-    }
-    Ok(())
-}
-
-fn i64_decimal_sums_into(
-    keys: &ArrayRef,
-    values: &ArrayRef,
-    sums: &mut HashMap<i64, f64>,
-) -> Result<bool> {
-    let (Some(keys), Some(values)) = (
-        keys.as_any().downcast_ref::<Int64Array>(),
-        q01_decimal_input(values)?,
-    ) else {
-        return Ok(false);
-    };
-    for row in 0..keys.len() {
-        if keys.is_null(row) || values.is_null(row) {
-            continue;
-        }
-        *sums.entry(keys.value(row)).or_insert(0.0) += values.value(row);
-    }
-    Ok(true)
-}
-
 struct Q18Order {
     custkey: i64,
     orderdate: i32,
@@ -9038,6 +8973,142 @@ struct Q18Row {
     o_orderdate: i32,
     o_totalprice: f64,
     quantity: f64,
+}
+
+const Q18_MAX_DENSE_ORDERKEY: usize = 20_000_000;
+
+async fn q18_qualifying_order_quantities(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    threshold: f64,
+) -> Result<HashMap<i64, f64>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec!["l_orderkey".to_string(), "l_quantity".to_string()]),
+            None,
+        )
+        .await?;
+    let mut accumulator = Q18QuantityAccumulator::Dense(Vec::new());
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        accumulator.add_batch(&batch)?;
+    }
+    Ok(accumulator.into_qualifying(threshold))
+}
+
+enum Q18QuantityAccumulator {
+    Dense(Vec<f64>),
+    Hash(HashMap<i64, f64>),
+}
+
+impl Q18QuantityAccumulator {
+    fn add_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        let orderkeys = batch_column(batch, "l_orderkey")?;
+        let quantities = batch_column(batch, "l_quantity")?;
+        match self {
+            Self::Dense(sums) => {
+                if q18_quantity_batch_dense(orderkeys, quantities, sums)? {
+                    Ok(())
+                } else {
+                    let mut hash = q18_dense_quantities_to_hash(sums);
+                    q18_quantity_batch_hash(orderkeys, quantities, &mut hash)?;
+                    *self = Self::Hash(hash);
+                    Ok(())
+                }
+            }
+            Self::Hash(sums) => q18_quantity_batch_hash(orderkeys, quantities, sums),
+        }
+    }
+
+    fn into_qualifying(self, threshold: f64) -> HashMap<i64, f64> {
+        match self {
+            Self::Dense(sums) => sums
+                .into_iter()
+                .enumerate()
+                .filter_map(|(orderkey, quantity)| {
+                    (quantity > threshold).then_some((orderkey as i64, quantity))
+                })
+                .collect(),
+            Self::Hash(sums) => sums
+                .into_iter()
+                .filter(|(_, quantity)| *quantity > threshold)
+                .collect(),
+        }
+    }
+}
+
+fn q18_quantity_batch_dense(
+    orderkeys: &ArrayRef,
+    quantities: &ArrayRef,
+    sums: &mut Vec<f64>,
+) -> Result<bool> {
+    let (Some(orderkeys), Some(quantities)) = (
+        orderkeys.as_any().downcast_ref::<Int64Array>(),
+        q01_decimal_input(quantities)?,
+    ) else {
+        return Ok(false);
+    };
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || quantities.is_null(row) {
+            continue;
+        }
+        let orderkey = orderkeys.value(row);
+        if orderkey < 0 {
+            return Ok(false);
+        }
+        let Ok(index) = usize::try_from(orderkey) else {
+            return Ok(false);
+        };
+        if index > Q18_MAX_DENSE_ORDERKEY {
+            return Ok(false);
+        }
+        if index >= sums.len() {
+            sums.resize(index + 1, 0.0);
+        }
+        sums[index] += quantities.value(row);
+    }
+    Ok(true)
+}
+
+fn q18_quantity_batch_hash(
+    orderkeys: &ArrayRef,
+    quantities: &ArrayRef,
+    sums: &mut HashMap<i64, f64>,
+) -> Result<()> {
+    if let (Some(orderkeys), Some(quantities)) = (
+        orderkeys.as_any().downcast_ref::<Int64Array>(),
+        q01_decimal_input(quantities)?,
+    ) {
+        for row in 0..orderkeys.len() {
+            if orderkeys.is_null(row) || quantities.is_null(row) {
+                continue;
+            }
+            *sums.entry(orderkeys.value(row)).or_insert(0.0) += quantities.value(row);
+        }
+        return Ok(());
+    }
+    for row in 0..orderkeys.len() {
+        let (Some(orderkey), Some(quantity)) = (
+            numeric_i64_value(orderkeys, row)?,
+            numeric_f64_value(quantities, row)?,
+        ) else {
+            continue;
+        };
+        *sums.entry(orderkey).or_insert(0.0) += quantity;
+    }
+    Ok(())
+}
+
+fn q18_dense_quantities_to_hash(sums: &[f64]) -> HashMap<i64, f64> {
+    sums.iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(orderkey, quantity)| (quantity != 0.0).then_some((orderkey as i64, quantity)))
+        .collect()
 }
 
 async fn q18_qualifying_orders(
