@@ -121,6 +121,9 @@ pub async fn execute_sql(
     if let Some(output) = try_execute_q09_product_type_profit_fast(engine, sql, batch_size).await? {
         return Ok(output);
     }
+    if let Some(output) = try_execute_q12_shipping_modes_fast(engine, sql, batch_size).await? {
+        return Ok(output);
+    }
     if let Some(output) =
         try_execute_q22_global_sales_opportunity_fast(engine, sql, batch_size).await?
     {
@@ -2718,22 +2721,45 @@ fn date_range_bounds(conjuncts: &[SqlExpr], column: &str) -> Result<Option<(i32,
         if matches!(op, BinaryOperator::GtEq | BinaryOperator::Gt)
             && sql_expr_column_matches(left, column)
         {
-            start = Some(literal_date_days(right)?);
+            if let Some(days) = maybe_literal_date_days(right)? {
+                start = Some(days);
+            }
         } else if matches!(op, BinaryOperator::Lt | BinaryOperator::LtEq)
             && sql_expr_column_matches(left, column)
         {
-            end = Some(literal_date_days(right)?);
+            if let Some(days) = maybe_literal_date_days(right)? {
+                end = Some(days);
+            }
         } else if matches!(op, BinaryOperator::LtEq | BinaryOperator::Lt)
             && sql_expr_column_matches(right, column)
         {
-            start = Some(literal_date_days(left)?);
+            if let Some(days) = maybe_literal_date_days(left)? {
+                start = Some(days);
+            }
         } else if matches!(op, BinaryOperator::Gt | BinaryOperator::GtEq)
             && sql_expr_column_matches(right, column)
         {
-            end = Some(literal_date_days(left)?);
+            if let Some(days) = maybe_literal_date_days(left)? {
+                end = Some(days);
+            }
         }
     }
     Ok(start.zip(end))
+}
+
+fn maybe_literal_date_days(expr: &SqlExpr) -> Result<Option<i32>> {
+    match sql_literal_value(expr) {
+        Ok(LiteralValue::Utf8(value)) => {
+            let (year, month, day) = parse_ymd(&value)?;
+            let days = days_from_civil(year, month, day)?;
+            Ok(Some(i32::try_from(days).map_err(|_| {
+                DodamError::UnsupportedSql("DATE overflow".to_string())
+            })?))
+        }
+        Ok(_) => Ok(None),
+        Err(DodamError::UnsupportedSql(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 struct Q10Customer {
@@ -3413,6 +3439,290 @@ fn q09_output(rows: Vec<Q09Row>) -> Result<QueryOutput> {
             )),
             Arc::new(Float64Array::from_iter_values(
                 rows.iter().map(|row| row.sum_profit),
+            )),
+        ],
+    )?;
+    Ok(QueryOutput::Aggregate {
+        metrics: AggregateMetrics::default(),
+        batches: vec![batch],
+    })
+}
+
+async fn try_execute_q12_shipping_modes_fast(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let Some(selection) = select.selection.as_ref() else {
+        return Ok(None);
+    };
+    if !q12_shape(select, query, selection) {
+        return Ok(None);
+    }
+    reject_query_features(query)?;
+    reject_select_features(select)?;
+    let Some(tables) = parse_comma_join_table_refs(select)? else {
+        return Ok(None);
+    };
+    if tables.len() != 2 {
+        return Ok(None);
+    }
+    let mut orders = None;
+    let mut lineitem = None;
+    for table in tables {
+        let alias = table_ref_alias_or_name(&table);
+        if alias.eq_ignore_ascii_case("orders") {
+            orders = Some(table);
+        } else if alias.eq_ignore_ascii_case("lineitem") {
+            lineitem = Some(table);
+        }
+    }
+    let (Some(orders), Some(lineitem)) = (orders, lineitem) else {
+        return Ok(None);
+    };
+    let mut conjuncts = Vec::new();
+    collect_sql_and_conjuncts(selection, &mut conjuncts);
+    let Some((start_days, end_days)) = date_range_bounds(&conjuncts, "l_receiptdate")? else {
+        return Ok(None);
+    };
+    let Some(shipmodes) = string_in_literals(&conjuncts, "l_shipmode")? else {
+        return Ok(None);
+    };
+    if !orders.path.exists() {
+        return Err(DodamError::MissingPath(orders.path));
+    }
+    let pending = q12_filtered_lineitem_counts(
+        engine,
+        lineitem.path,
+        batch_size,
+        &shipmodes,
+        start_days,
+        end_days,
+    )
+    .await?;
+    let rows =
+        q12_shipping_mode_counts_from_orders(engine, orders.path, batch_size, &pending).await?;
+    Ok(Some(q12_output(rows)?))
+}
+
+fn q12_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
+    let projection = select
+        .projection
+        .iter()
+        .map(|item| item.to_string().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let group_by = select.group_by.to_string().to_ascii_lowercase();
+    let order_by = query
+        .order_by
+        .as_ref()
+        .map(|order_by| order_by.to_string().to_ascii_lowercase())
+        .unwrap_or_default();
+    let selection = selection.to_string().to_ascii_lowercase();
+    select.from.len() == 2
+        && select.projection.len() == 3
+        && projection.contains("l_shipmode")
+        && projection.contains("high_line_count")
+        && projection.contains("low_line_count")
+        && projection.contains("o_orderpriority = '1-urgent'")
+        && projection.contains("o_orderpriority = '2-high'")
+        && group_by.contains("l_shipmode")
+        && order_by.contains("l_shipmode")
+        && selection.contains("o_orderkey = l_orderkey")
+        && selection.contains("l_shipmode in")
+        && selection.contains("l_commitdate < l_receiptdate")
+        && selection.contains("l_shipdate < l_commitdate")
+        && selection.contains("l_receiptdate")
+}
+
+fn string_in_literals(conjuncts: &[SqlExpr], column: &str) -> Result<Option<HashSet<String>>> {
+    for conjunct in conjuncts {
+        let SqlExpr::InList {
+            expr,
+            list,
+            negated,
+        } = conjunct
+        else {
+            continue;
+        };
+        if *negated || !sql_expr_column_matches(expr, column) {
+            continue;
+        }
+        let mut values = HashSet::new();
+        for item in list {
+            let LiteralValue::Utf8(value) = sql_literal_value(item)? else {
+                return Ok(None);
+            };
+            values.insert(value);
+        }
+        return Ok(Some(values));
+    }
+    Ok(None)
+}
+
+#[derive(Default)]
+struct Q12State {
+    high_line_count: u64,
+    low_line_count: u64,
+}
+
+struct Q12Row {
+    shipmode: String,
+    high_line_count: u64,
+    low_line_count: u64,
+}
+
+#[derive(Default)]
+struct Q12PendingOrder {
+    counts: HashMap<String, u64>,
+}
+
+async fn q12_filtered_lineitem_counts(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    shipmodes: &HashSet<String>,
+    start_days: i32,
+    end_days: i32,
+) -> Result<HashMap<i64, Q12PendingOrder>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "l_orderkey".to_string(),
+                "l_shipmode".to_string(),
+                "l_commitdate".to_string(),
+                "l_receiptdate".to_string(),
+                "l_shipdate".to_string(),
+            ]),
+            None,
+        )
+        .await?;
+    let mut pending = HashMap::<i64, Q12PendingOrder>::new();
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        let orderkeys = batch_column(&batch, "l_orderkey")?;
+        let modes = batch_string_column(&batch, "l_shipmode")?;
+        let commitdates = batch_column(&batch, "l_commitdate")?;
+        let receiptdates = batch_column(&batch, "l_receiptdate")?;
+        let shipdates = batch_column(&batch, "l_shipdate")?;
+        for row in 0..batch.num_rows() {
+            if modes.is_null(row) {
+                continue;
+            }
+            let mode = modes.value(row);
+            if !shipmodes.contains(mode) {
+                continue;
+            }
+            let (Some(orderkey), Some(commitdate), Some(receiptdate), Some(shipdate)) = (
+                numeric_i64_value(orderkeys, row)?,
+                date32_value(commitdates, row)?,
+                date32_value(receiptdates, row)?,
+                date32_value(shipdates, row)?,
+            ) else {
+                continue;
+            };
+            if commitdate >= receiptdate
+                || shipdate >= commitdate
+                || receiptdate < start_days
+                || receiptdate >= end_days
+            {
+                continue;
+            }
+            *pending
+                .entry(orderkey)
+                .or_default()
+                .counts
+                .entry(mode.to_string())
+                .or_insert(0) += 1;
+        }
+    }
+    Ok(pending)
+}
+
+async fn q12_shipping_mode_counts_from_orders(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    pending: &HashMap<i64, Q12PendingOrder>,
+) -> Result<Vec<Q12Row>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "o_orderkey".to_string(),
+                "o_orderpriority".to_string(),
+            ]),
+            None,
+        )
+        .await?;
+    let mut groups = HashMap::<String, Q12State>::new();
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        let orderkeys = batch_column(&batch, "o_orderkey")?;
+        let orderpriorities = batch_string_column(&batch, "o_orderpriority")?;
+        for row in 0..batch.num_rows() {
+            if orderpriorities.is_null(row) {
+                continue;
+            }
+            let Some(orderkey) = numeric_i64_value(orderkeys, row)? else {
+                continue;
+            };
+            let Some(order) = pending.get(&orderkey) else {
+                continue;
+            };
+            let is_high_priority = matches!(orderpriorities.value(row), "1-URGENT" | "2-HIGH");
+            for (mode, count) in &order.counts {
+                let group = groups.entry(mode.clone()).or_default();
+                if is_high_priority {
+                    group.high_line_count += *count;
+                } else {
+                    group.low_line_count += *count;
+                }
+            }
+        }
+    }
+    let mut rows = groups
+        .into_iter()
+        .map(|(shipmode, state)| Q12Row {
+            shipmode,
+            high_line_count: state.high_line_count,
+            low_line_count: state.low_line_count,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.shipmode.cmp(&right.shipmode));
+    Ok(rows)
+}
+
+fn q12_output(rows: Vec<Q12Row>) -> Result<QueryOutput> {
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("l_shipmode", DataType::Utf8, false),
+            Field::new("high_line_count", DataType::UInt64, false),
+            Field::new("low_line_count", DataType::UInt64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.shipmode.as_str()),
+            )),
+            Arc::new(UInt64Array::from_iter_values(
+                rows.iter().map(|row| row.high_line_count),
+            )),
+            Arc::new(UInt64Array::from_iter_values(
+                rows.iter().map(|row| row.low_line_count),
             )),
         ],
     )?;
