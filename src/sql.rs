@@ -6460,6 +6460,16 @@ async fn q21_lineitem_order_states(
         let suppkeys = batch_column(&batch, "l_suppkey")?;
         let receipt = batch_column(&batch, "l_receiptdate")?;
         let commit = batch_column(&batch, "l_commitdate")?;
+        if q21_update_lineitem_states_typed(
+            orderkeys,
+            suppkeys,
+            receipt,
+            commit,
+            final_orders,
+            &mut states,
+        ) {
+            continue;
+        }
         for row in 0..batch.num_rows() {
             let (Some(orderkey), Some(suppkey)) = (
                 numeric_i64_value(orderkeys, row)?,
@@ -6483,6 +6493,43 @@ async fn q21_lineitem_order_states(
         }
     }
     Ok(states)
+}
+
+fn q21_update_lineitem_states_typed(
+    orderkeys: &ArrayRef,
+    suppkeys: &ArrayRef,
+    receipt: &ArrayRef,
+    commit: &ArrayRef,
+    final_orders: &HashSet<i64>,
+    states: &mut HashMap<i64, Q21OrderState>,
+) -> bool {
+    let (Some(orderkeys), Some(suppkeys), Some(receipt), Some(commit)) = (
+        orderkeys.as_any().downcast_ref::<Int64Array>(),
+        suppkeys.as_any().downcast_ref::<Int64Array>(),
+        receipt.as_any().downcast_ref::<Date32Array>(),
+        commit.as_any().downcast_ref::<Date32Array>(),
+    ) else {
+        return false;
+    };
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || suppkeys.is_null(row) {
+            continue;
+        }
+        let orderkey = orderkeys.value(row);
+        if !final_orders.contains(&orderkey) {
+            continue;
+        }
+        let suppkey = suppkeys.value(row);
+        let state = states.entry(orderkey).or_default();
+        state.add_supplier(suppkey);
+        if receipt.is_null(row) || commit.is_null(row) {
+            continue;
+        }
+        if receipt.value(row) > commit.value(row) {
+            state.add_late_supplier(suppkey);
+        }
+    }
+    true
 }
 
 struct Q21Row {
