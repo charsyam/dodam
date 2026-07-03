@@ -754,7 +754,7 @@ async fn collect_semijoin_key_set(
     key_column: &str,
     filter: Option<FilterExpr>,
     batch_size: usize,
-) -> Result<HashSet<String>> {
+) -> Result<SemijoinKeySet> {
     let mut projection = vec![key_column.to_string()];
     if let Some(filter) = &filter {
         for column in filter.referenced_columns() {
@@ -771,17 +771,22 @@ async fn collect_semijoin_key_set(
         )
         .await?;
     let batches = collect_batches(stream)?;
-    let mut keys = HashSet::new();
-    for batch in batches {
+    let Some(first_batch) = batches.first() else {
+        return Ok(SemijoinKeySet::Empty);
+    };
+    let column_index = first_batch
+        .schema()
+        .index_of(key_column)
+        .map_err(|_| DodamError::UnknownColumn(key_column.to_string()))?;
+    let mut keys = SemijoinKeySet::for_data_type(first_batch.column(column_index).data_type());
+    for batch in &batches {
         let column_index = batch
             .schema()
             .index_of(key_column)
             .map_err(|_| DodamError::UnknownColumn(key_column.to_string()))?;
         let column = batch.column(column_index);
         for row in 0..batch.num_rows() {
-            if let Some(key) = semijoin_key_at(column, row)? {
-                keys.insert(key);
-            }
+            keys.insert_from_column(column, row)?;
         }
     }
     Ok(keys)
@@ -790,7 +795,7 @@ async fn collect_semijoin_key_set(
 fn semijoin_membership_mask(
     batch: &RecordBatch,
     key_column: &str,
-    keys: &HashSet<String>,
+    keys: &SemijoinKeySet,
 ) -> Result<BooleanArray> {
     let column_index = batch
         .schema()
@@ -798,9 +803,7 @@ fn semijoin_membership_mask(
         .map_err(|_| DodamError::UnknownColumn(key_column.to_string()))?;
     let column = batch.column(column_index);
     let values = (0..batch.num_rows())
-        .map(|row| {
-            semijoin_key_at(column, row).map(|key| key.is_some_and(|key| keys.contains(&key)))
-        })
+        .map(|row| keys.contains_column_value(column, row))
         .collect::<Result<Vec<_>>>()?;
     Ok(BooleanArray::from(values))
 }
@@ -857,6 +860,114 @@ fn semijoin_key_at(column: &ArrayRef, row: usize) -> Result<Option<String>> {
         return Ok(None);
     }
     Ok(Some(sql_literal(&literal_value_from_array(column, row)?)))
+}
+
+enum SemijoinKeySet {
+    Empty,
+    Int64(HashSet<i64>),
+    Utf8(HashSet<String>),
+    Literal(HashSet<String>),
+}
+
+impl SemijoinKeySet {
+    fn for_data_type(data_type: &DataType) -> Self {
+        match data_type {
+            DataType::Int32 | DataType::Int64 | DataType::Date32 | DataType::Date64 => {
+                Self::Int64(HashSet::new())
+            }
+            DataType::Utf8 => Self::Utf8(HashSet::new()),
+            _ => Self::Literal(HashSet::new()),
+        }
+    }
+
+    fn insert_from_column(&mut self, column: &ArrayRef, row: usize) -> Result<()> {
+        match self {
+            Self::Empty => {}
+            Self::Int64(values) => {
+                if let Some(value) = semijoin_i64_key_at(column, row)? {
+                    values.insert(value);
+                }
+            }
+            Self::Utf8(values) => {
+                if column.is_valid(row) {
+                    if let Some(strings) = column.as_any().downcast_ref::<StringArray>() {
+                        values.insert(strings.value(row).to_string());
+                    } else if let Some(value) = semijoin_key_at(column, row)? {
+                        values.insert(value);
+                    }
+                }
+            }
+            Self::Literal(values) => {
+                if let Some(value) = semijoin_key_at(column, row)? {
+                    values.insert(value);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn contains_column_value(&self, column: &ArrayRef, row: usize) -> Result<Option<bool>> {
+        if column.is_null(row) {
+            return Ok(Some(false));
+        }
+        match self {
+            Self::Empty => Ok(Some(false)),
+            Self::Int64(values) => Ok(Some(
+                semijoin_i64_key_at(column, row)?.is_some_and(|value| values.contains(&value)),
+            )),
+            Self::Utf8(values) => {
+                if let Some(strings) = column.as_any().downcast_ref::<StringArray>() {
+                    Ok(Some(values.contains(strings.value(row))))
+                } else {
+                    Ok(Some(
+                        semijoin_key_at(column, row)?.is_some_and(|value| values.contains(&value)),
+                    ))
+                }
+            }
+            Self::Literal(values) => Ok(Some(
+                semijoin_key_at(column, row)?.is_some_and(|value| values.contains(&value)),
+            )),
+        }
+    }
+}
+
+fn semijoin_i64_key_at(column: &ArrayRef, row: usize) -> Result<Option<i64>> {
+    if column.is_null(row) {
+        return Ok(None);
+    }
+    match column.data_type() {
+        DataType::Int32 => Ok(Some(i64::from(
+            column
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("Int32 semijoin key")
+                .value(row),
+        ))),
+        DataType::Int64 => Ok(Some(
+            column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 semijoin key")
+                .value(row),
+        )),
+        DataType::Date32 => Ok(Some(i64::from(
+            column
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .expect("Date32 semijoin key")
+                .value(row),
+        ))),
+        DataType::Date64 => Ok(Some(
+            column
+                .as_any()
+                .downcast_ref::<Date64Array>()
+                .expect("Date64 semijoin key")
+                .value(row),
+        )),
+        data_type => Err(DodamError::UnsupportedSql(format!(
+            "cannot use {data_type} as integer semijoin key"
+        ))),
+    }
 }
 
 async fn try_execute_correlated_subquery_filter_sql(
