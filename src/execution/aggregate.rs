@@ -999,6 +999,8 @@ fn collect_grouped_aggregates_generic(
         ..AggregateMetrics::default()
     });
     let mut pending = first_batch;
+    let (sender, receiver) = mpsc::channel();
+    let mut pending_batches = 0_usize;
 
     loop {
         let batch = if let Some(batch) = pending.take() {
@@ -1015,49 +1017,24 @@ fn collect_grouped_aggregates_generic(
 
         metrics.batches += 1;
         metrics.rows += batch.num_rows();
-        let group_columns = group_by
-            .iter()
-            .map(|column| Ok((column.as_str(), batch.column(column_index(&batch, column)?))))
-            .collect::<Result<Vec<_>>>()?;
-
-        let group_arrays = group_columns
-            .iter()
-            .map(|(_, column)| (*column).clone())
-            .collect::<Vec<_>>();
-        let converter = RowConverter::new(
-            group_arrays
-                .iter()
-                .map(|column| SortField::new(column.data_type().clone()))
-                .collect(),
-        )?;
-        let encoded_rows = converter.convert_columns(&group_arrays)?;
-        let aggregate_columns = aggregates
-            .iter()
-            .map(|aggregate| {
-                aggregate
-                    .referenced_column()
-                    .map(|column| Ok(batch.column(column_index(&batch, column)?).clone()))
-                    .transpose()
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        for (row, encoded_row) in encoded_rows.iter().enumerate() {
-            let key = encoded_row.owned();
-            let group = match groups.entry(key) {
-                Entry::Vacant(entry) => entry.insert(GroupState {
-                    keys: group_key(&group_columns, row)?,
-                    accumulators: aggregates
-                        .iter()
-                        .cloned()
-                        .map(AggregateAccumulator::new)
-                        .collect(),
-                }),
-                Entry::Occupied(entry) => entry.into_mut(),
-            };
-            for (accumulator, column) in group.accumulators.iter_mut().zip(&aggregate_columns) {
-                accumulator.update_row(column.as_ref(), row)?;
-            }
-        }
+        let sender = sender.clone();
+        let group_by = group_by.to_vec();
+        let aggregates = aggregates.to_vec();
+        pending_batches += 1;
+        rayon::spawn(move || {
+            let _ = sender.send(collect_grouped_aggregates_batch(
+                batch,
+                &group_by,
+                &aggregates,
+            ));
+        });
+    }
+    drop(sender);
+    for _ in 0..pending_batches {
+        let partial = receiver.recv().map_err(|_| {
+            DodamError::InvalidAggregate("grouped aggregate worker stopped".to_string())
+        })??;
+        merge_group_maps(&mut groups, partial);
     }
 
     let mut group_results = groups
@@ -1076,6 +1053,81 @@ fn collect_grouped_aggregates_generic(
     group_results.sort_by(|left, right| compare_group_keys(&left.keys, &right.keys));
     metrics.groups = group_results;
     Ok(metrics)
+}
+
+fn collect_grouped_aggregates_batch(
+    batch: RecordBatch,
+    group_by: &[String],
+    aggregates: &[AggregateExpr],
+) -> Result<AggregateHashMap<OwnedRow, GroupState>> {
+    let mut groups: AggregateHashMap<OwnedRow, GroupState> = AggregateHashMap::default();
+    let group_columns = group_by
+        .iter()
+        .map(|column| Ok((column.as_str(), batch.column(column_index(&batch, column)?))))
+        .collect::<Result<Vec<_>>>()?;
+
+    let group_arrays = group_columns
+        .iter()
+        .map(|(_, column)| (*column).clone())
+        .collect::<Vec<_>>();
+    let converter = RowConverter::new(
+        group_arrays
+            .iter()
+            .map(|column| SortField::new(column.data_type().clone()))
+            .collect(),
+    )?;
+    let encoded_rows = converter.convert_columns(&group_arrays)?;
+    let aggregate_columns = aggregates
+        .iter()
+        .map(|aggregate| {
+            aggregate
+                .referenced_column()
+                .map(|column| Ok(batch.column(column_index(&batch, column)?).clone()))
+                .transpose()
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    for (row, encoded_row) in encoded_rows.iter().enumerate() {
+        let key = encoded_row.owned();
+        let group = match groups.entry(key) {
+            Entry::Vacant(entry) => entry.insert(GroupState {
+                keys: group_key(&group_columns, row)?,
+                accumulators: aggregates
+                    .iter()
+                    .cloned()
+                    .map(AggregateAccumulator::new)
+                    .collect(),
+            }),
+            Entry::Occupied(entry) => entry.into_mut(),
+        };
+        for (accumulator, column) in group.accumulators.iter_mut().zip(&aggregate_columns) {
+            accumulator.update_row(column.as_ref(), row)?;
+        }
+    }
+    Ok(groups)
+}
+
+fn merge_group_maps(
+    groups: &mut AggregateHashMap<OwnedRow, GroupState>,
+    partial: AggregateHashMap<OwnedRow, GroupState>,
+) {
+    for (key, partial_group) in partial {
+        match groups.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(partial_group);
+            }
+            Entry::Occupied(mut entry) => {
+                let group = entry.get_mut();
+                for (accumulator, partial_accumulator) in group
+                    .accumulators
+                    .iter_mut()
+                    .zip(partial_group.accumulators)
+                {
+                    accumulator.merge(partial_accumulator);
+                }
+            }
+        }
+    }
 }
 
 fn can_use_single_key_fast_path(group_by: &[String], aggregates: &[AggregateExpr]) -> bool {
