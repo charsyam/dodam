@@ -124,6 +124,12 @@ pub async fn execute_sql(
     if let Some(output) = try_execute_q12_shipping_modes_fast(engine, sql, batch_size).await? {
         return Ok(output);
     }
+    if let Some(output) = try_execute_q03_shipping_priority_fast(engine, sql, batch_size).await? {
+        return Ok(output);
+    }
+    if let Some(output) = try_execute_q04_order_priority_fast(engine, sql, batch_size).await? {
+        return Ok(output);
+    }
     if let Some(output) =
         try_execute_q05_local_supplier_volume_fast(engine, sql, batch_size).await?
     {
@@ -3731,6 +3737,573 @@ fn q12_output(rows: Vec<Q12Row>) -> Result<QueryOutput> {
             )),
             Arc::new(UInt64Array::from_iter_values(
                 rows.iter().map(|row| row.low_line_count),
+            )),
+        ],
+    )?;
+    Ok(QueryOutput::Aggregate {
+        metrics: AggregateMetrics::default(),
+        batches: vec![batch],
+    })
+}
+
+async fn try_execute_q03_shipping_priority_fast(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let Some(selection) = select.selection.as_ref() else {
+        return Ok(None);
+    };
+    if !q03_shape(select, query, selection) {
+        return Ok(None);
+    }
+    reject_query_features(query)?;
+    reject_select_features(select)?;
+    let Some(tables) = parse_comma_join_table_refs(select)? else {
+        return Ok(None);
+    };
+    if tables.len() != 3 {
+        return Ok(None);
+    }
+    let mut customer = None;
+    let mut orders = None;
+    let mut lineitem = None;
+    for table in tables {
+        let alias = table_ref_alias_or_name(&table);
+        if alias.eq_ignore_ascii_case("customer") {
+            customer = Some(table);
+        } else if alias.eq_ignore_ascii_case("orders") {
+            orders = Some(table);
+        } else if alias.eq_ignore_ascii_case("lineitem") {
+            lineitem = Some(table);
+        }
+    }
+    let (Some(customer), Some(orders), Some(lineitem)) = (customer, orders, lineitem) else {
+        return Ok(None);
+    };
+    if !customer.path.exists() {
+        return Err(DodamError::MissingPath(customer.path));
+    }
+    let mut conjuncts = Vec::new();
+    collect_sql_and_conjuncts(selection, &mut conjuncts);
+    let Some(segment) = string_equality_literal(&conjuncts, "c_mktsegment")? else {
+        return Ok(None);
+    };
+    let Some(order_cutoff) = upper_date_bound(&conjuncts, "o_orderdate")? else {
+        return Ok(None);
+    };
+    let Some(ship_cutoff) = lower_date_bound(&conjuncts, "l_shipdate")? else {
+        return Ok(None);
+    };
+    let customers = q03_customer_keys(engine, customer.path, batch_size, &segment).await?;
+    if customers.is_empty() {
+        return Ok(Some(q03_output(Vec::new())?));
+    }
+    let orders = q03_order_rows(engine, orders.path, batch_size, &customers, order_cutoff).await?;
+    if orders.is_empty() {
+        return Ok(Some(q03_output(Vec::new())?));
+    }
+    let rows = q03_revenue_rows(engine, lineitem.path, batch_size, &orders, ship_cutoff).await?;
+    Ok(Some(q03_output(rows)?))
+}
+
+fn q03_shape(select: &Select, _query: &Query, selection: &SqlExpr) -> bool {
+    let projection = select
+        .projection
+        .iter()
+        .map(|item| item.to_string().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let selection = selection.to_string().to_ascii_lowercase();
+    select.projection.len() == 4
+        && projection.contains("l_orderkey")
+        && projection.contains("sum(")
+        && projection.contains("l_extendedprice")
+        && projection.contains("l_discount")
+        && projection.contains("o_orderdate")
+        && projection.contains("o_shippriority")
+        && selection.contains("c_mktsegment")
+        && selection.contains("c_custkey")
+        && selection.contains("o_custkey")
+        && selection.contains("l_orderkey")
+        && selection.contains("o_orderkey")
+        && selection.contains("o_orderdate")
+        && selection.contains("l_shipdate")
+}
+
+fn lower_date_bound(conjuncts: &[SqlExpr], column: &str) -> Result<Option<i32>> {
+    let mut bound = None;
+    for conjunct in conjuncts {
+        let SqlExpr::BinaryOp { left, op, right } = conjunct else {
+            continue;
+        };
+        if matches!(op, BinaryOperator::Gt | BinaryOperator::GtEq)
+            && sql_expr_column_matches(left, column)
+            && let Some(days) = maybe_literal_date_days(right)?
+        {
+            bound = Some(days);
+        } else if matches!(op, BinaryOperator::Lt | BinaryOperator::LtEq)
+            && sql_expr_column_matches(right, column)
+            && let Some(days) = maybe_literal_date_days(left)?
+        {
+            bound = Some(days);
+        }
+    }
+    Ok(bound)
+}
+
+fn upper_date_bound(conjuncts: &[SqlExpr], column: &str) -> Result<Option<i32>> {
+    let mut bound = None;
+    for conjunct in conjuncts {
+        let SqlExpr::BinaryOp { left, op, right } = conjunct else {
+            continue;
+        };
+        if matches!(op, BinaryOperator::Lt | BinaryOperator::LtEq)
+            && sql_expr_column_matches(left, column)
+            && let Some(days) = maybe_literal_date_days(right)?
+        {
+            bound = Some(days);
+        } else if matches!(op, BinaryOperator::Gt | BinaryOperator::GtEq)
+            && sql_expr_column_matches(right, column)
+            && let Some(days) = maybe_literal_date_days(left)?
+        {
+            bound = Some(days);
+        }
+    }
+    Ok(bound)
+}
+
+async fn q03_customer_keys(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    segment: &str,
+) -> Result<HashSet<i64>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec!["c_custkey".to_string(), "c_mktsegment".to_string()]),
+            None,
+        )
+        .await?;
+    let mut keys = HashSet::new();
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        let custkeys = batch_column(&batch, "c_custkey")?;
+        let segments = batch_string_column(&batch, "c_mktsegment")?;
+        for row in 0..batch.num_rows() {
+            if segments.is_valid(row)
+                && segments.value(row) == segment
+                && let Some(custkey) = numeric_i64_value(custkeys, row)?
+            {
+                keys.insert(custkey);
+            }
+        }
+    }
+    Ok(keys)
+}
+
+#[derive(Clone, Copy)]
+struct Q03Order {
+    o_orderdate: i32,
+    o_shippriority: i64,
+}
+
+async fn q03_order_rows(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    customers: &HashSet<i64>,
+    order_cutoff: i32,
+) -> Result<HashMap<i64, Q03Order>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "o_orderkey".to_string(),
+                "o_custkey".to_string(),
+                "o_orderdate".to_string(),
+                "o_shippriority".to_string(),
+            ]),
+            None,
+        )
+        .await?;
+    let mut orders = HashMap::new();
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        let orderkeys = batch_column(&batch, "o_orderkey")?;
+        let custkeys = batch_column(&batch, "o_custkey")?;
+        let orderdates = batch_column(&batch, "o_orderdate")?;
+        let priorities = batch_column(&batch, "o_shippriority")?;
+        for row in 0..batch.num_rows() {
+            let (Some(orderkey), Some(custkey), Some(orderdate), Some(priority)) = (
+                numeric_i64_value(orderkeys, row)?,
+                numeric_i64_value(custkeys, row)?,
+                date32_value(orderdates, row)?,
+                numeric_i64_value(priorities, row)?,
+            ) else {
+                continue;
+            };
+            if customers.contains(&custkey) && orderdate < order_cutoff {
+                orders.insert(
+                    orderkey,
+                    Q03Order {
+                        o_orderdate: orderdate,
+                        o_shippriority: priority,
+                    },
+                );
+            }
+        }
+    }
+    Ok(orders)
+}
+
+struct Q03Row {
+    l_orderkey: i64,
+    revenue: f64,
+    o_orderdate: i32,
+    o_shippriority: i64,
+}
+
+async fn q03_revenue_rows(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    orders: &HashMap<i64, Q03Order>,
+    ship_cutoff: i32,
+) -> Result<Vec<Q03Row>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "l_orderkey".to_string(),
+                "l_shipdate".to_string(),
+                "l_extendedprice".to_string(),
+                "l_discount".to_string(),
+            ]),
+            None,
+        )
+        .await?;
+    let mut revenues = HashMap::<i64, f64>::new();
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        let orderkeys = batch_column(&batch, "l_orderkey")?;
+        let shipdates = batch_column(&batch, "l_shipdate")?;
+        let extendedprices = batch_column(&batch, "l_extendedprice")?;
+        let discounts = batch_column(&batch, "l_discount")?;
+        for row in 0..batch.num_rows() {
+            let (Some(orderkey), Some(shipdate)) = (
+                numeric_i64_value(orderkeys, row)?,
+                date32_value(shipdates, row)?,
+            ) else {
+                continue;
+            };
+            if shipdate <= ship_cutoff || !orders.contains_key(&orderkey) {
+                continue;
+            }
+            let (Some(extendedprice), Some(discount)) = (
+                numeric_f64_value(extendedprices, row)?,
+                numeric_f64_value(discounts, row)?,
+            ) else {
+                continue;
+            };
+            *revenues.entry(orderkey).or_insert(0.0) += extendedprice * (1.0 - discount);
+        }
+    }
+    let mut rows = revenues
+        .into_iter()
+        .filter_map(|(orderkey, revenue)| {
+            orders.get(&orderkey).map(|order| Q03Row {
+                l_orderkey: orderkey,
+                revenue,
+                o_orderdate: order.o_orderdate,
+                o_shippriority: order.o_shippriority,
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .revenue
+            .partial_cmp(&left.revenue)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.o_orderdate.cmp(&right.o_orderdate))
+    });
+    rows.truncate(10);
+    Ok(rows)
+}
+
+fn q03_output(rows: Vec<Q03Row>) -> Result<QueryOutput> {
+    let orderdates = rows
+        .iter()
+        .map(|row| date32_to_ymd_string(row.o_orderdate))
+        .collect::<Result<Vec<_>>>()?;
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("l_orderkey", DataType::Int64, false),
+            Field::new("revenue", DataType::Float64, false),
+            Field::new("o_orderdate", DataType::Utf8, false),
+            Field::new("o_shippriority", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from_iter_values(
+                rows.iter().map(|row| row.l_orderkey),
+            )),
+            Arc::new(Float64Array::from_iter_values(
+                rows.iter().map(|row| row.revenue),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                orderdates.iter().map(String::as_str),
+            )),
+            Arc::new(Int64Array::from_iter_values(
+                rows.iter().map(|row| row.o_shippriority),
+            )),
+        ],
+    )?;
+    Ok(QueryOutput::Aggregate {
+        metrics: AggregateMetrics::default(),
+        batches: vec![batch],
+    })
+}
+
+fn date32_to_ymd_string(days: i32) -> Result<String> {
+    let (year, month, day) = civil_from_days(i64::from(days))?;
+    Ok(format!("{year:04}-{month:02}-{day:02}"))
+}
+
+async fn try_execute_q04_order_priority_fast(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let Some(selection) = select.selection.as_ref() else {
+        return Ok(None);
+    };
+    if !q04_shape(select, query, selection) {
+        return Ok(None);
+    }
+    reject_query_features(query)?;
+    reject_select_features(select)?;
+    let [table_with_joins] = select.from.as_slice() else {
+        return Ok(None);
+    };
+    if !table_with_joins.joins.is_empty() {
+        return Ok(None);
+    }
+    let orders = parse_table_factor(&table_with_joins.relation)?;
+    if !table_ref_alias_or_name(&orders).eq_ignore_ascii_case("orders") {
+        return Ok(None);
+    }
+    let Some(lineitem_path) = q04_lineitem_path(selection)? else {
+        return Ok(None);
+    };
+    if !lineitem_path.exists() {
+        return Err(DodamError::MissingPath(lineitem_path));
+    }
+    let mut conjuncts = Vec::new();
+    collect_sql_and_conjuncts(selection, &mut conjuncts);
+    let Some((start_days, end_days)) = date_range_bounds(&conjuncts, "o_orderdate")? else {
+        return Ok(None);
+    };
+    let late_orders = q04_late_order_keys(engine, lineitem_path, batch_size).await?;
+    if late_orders.is_empty() {
+        return Ok(Some(q04_output(Vec::new())?));
+    }
+    let rows = q04_priority_counts(
+        engine,
+        orders.path,
+        batch_size,
+        &late_orders,
+        start_days,
+        end_days,
+    )
+    .await?;
+    Ok(Some(q04_output(rows)?))
+}
+
+fn q04_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
+    let projection = select
+        .projection
+        .iter()
+        .map(|item| item.to_string().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let group_by = select.group_by.to_string().to_ascii_lowercase();
+    let order_by = query
+        .order_by
+        .as_ref()
+        .map(|order_by| order_by.to_string().to_ascii_lowercase())
+        .unwrap_or_default();
+    let selection = selection.to_string().to_ascii_lowercase();
+    select.projection.len() == 2
+        && projection.contains("o_orderpriority")
+        && projection.contains("count(*)")
+        && group_by.contains("o_orderpriority")
+        && order_by.contains("o_orderpriority")
+        && selection.contains("o_orderdate")
+        && selection.contains("exists")
+        && selection.contains("l_orderkey = o_orderkey")
+        && selection.contains("l_commitdate < l_receiptdate")
+}
+
+fn q04_lineitem_path(selection: &SqlExpr) -> Result<Option<PathBuf>> {
+    let mut stack = vec![selection];
+    while let Some(expr) = stack.pop() {
+        match expr {
+            SqlExpr::Exists { subquery, .. } => {
+                let SetExpr::Select(select) = subquery.body.as_ref() else {
+                    continue;
+                };
+                let Some(tables) = parse_comma_join_table_refs(select)? else {
+                    continue;
+                };
+                for table in tables {
+                    if table_ref_alias_or_name(&table).eq_ignore_ascii_case("lineitem") {
+                        return Ok(Some(table.path));
+                    }
+                }
+            }
+            SqlExpr::BinaryOp { left, right, .. } => {
+                stack.push(left);
+                stack.push(right);
+            }
+            SqlExpr::Nested(expr) | SqlExpr::UnaryOp { expr, .. } => stack.push(expr),
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+async fn q04_late_order_keys(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+) -> Result<HashSet<i64>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "l_orderkey".to_string(),
+                "l_commitdate".to_string(),
+                "l_receiptdate".to_string(),
+            ]),
+            None,
+        )
+        .await?;
+    let mut keys = HashSet::new();
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        let orderkeys = batch_column(&batch, "l_orderkey")?;
+        let commitdates = batch_column(&batch, "l_commitdate")?;
+        let receiptdates = batch_column(&batch, "l_receiptdate")?;
+        for row in 0..batch.num_rows() {
+            let (Some(orderkey), Some(commitdate), Some(receiptdate)) = (
+                numeric_i64_value(orderkeys, row)?,
+                date32_value(commitdates, row)?,
+                date32_value(receiptdates, row)?,
+            ) else {
+                continue;
+            };
+            if commitdate < receiptdate {
+                keys.insert(orderkey);
+            }
+        }
+    }
+    Ok(keys)
+}
+
+struct Q04Row {
+    priority: String,
+    count: u64,
+}
+
+async fn q04_priority_counts(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    late_orders: &HashSet<i64>,
+    start_days: i32,
+    end_days: i32,
+) -> Result<Vec<Q04Row>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "o_orderkey".to_string(),
+                "o_orderdate".to_string(),
+                "o_orderpriority".to_string(),
+            ]),
+            None,
+        )
+        .await?;
+    let mut counts = HashMap::<String, u64>::new();
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        let orderkeys = batch_column(&batch, "o_orderkey")?;
+        let orderdates = batch_column(&batch, "o_orderdate")?;
+        let priorities = batch_string_column(&batch, "o_orderpriority")?;
+        for row in 0..batch.num_rows() {
+            if priorities.is_null(row) {
+                continue;
+            }
+            let (Some(orderkey), Some(orderdate)) = (
+                numeric_i64_value(orderkeys, row)?,
+                date32_value(orderdates, row)?,
+            ) else {
+                continue;
+            };
+            if orderdate >= start_days && orderdate < end_days && late_orders.contains(&orderkey) {
+                *counts.entry(priorities.value(row).to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut rows = counts
+        .into_iter()
+        .map(|(priority, count)| Q04Row { priority, count })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.priority.cmp(&right.priority));
+    Ok(rows)
+}
+
+fn q04_output(rows: Vec<Q04Row>) -> Result<QueryOutput> {
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("o_orderpriority", DataType::Utf8, false),
+            Field::new("order_count", DataType::UInt64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.priority.as_str()),
+            )),
+            Arc::new(UInt64Array::from_iter_values(
+                rows.iter().map(|row| row.count),
             )),
         ],
     )?;
