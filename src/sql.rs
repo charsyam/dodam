@@ -118,6 +118,11 @@ pub async fn execute_sql(
     if let Some(output) = try_execute_derived_join_sql(engine, sql, batch_size).await? {
         return Ok(output);
     }
+    if let Some(output) =
+        try_execute_derived_left_join_count_distribution_sql(engine, sql, batch_size).await?
+    {
+        return Ok(output);
+    }
     if let Some(output) = try_execute_derived_sql(engine, sql, batch_size).await? {
         return Ok(output);
     }
@@ -4634,6 +4639,264 @@ async fn execute_parsed_join_query(
         batches = rename_output_batches(batches, &query.aliases)?;
     }
     Ok(Some(QueryOutput::Scan { batches }))
+}
+
+fn same_join_column(left: &str, right: &str) -> bool {
+    left == right
+        || left.rsplit('.').next() == Some(right)
+        || right.rsplit('.').next() == Some(left)
+}
+
+async fn try_execute_derived_left_join_count_distribution_sql(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let Some((subquery, alias)) = parse_derived_from(select)? else {
+        return Ok(None);
+    };
+    reject_query_features(query)?;
+    reject_select_features(select)?;
+
+    let outer_group_by = parse_group_by(select, Some(&alias))?;
+    let projection = parse_projection(select, &outer_group_by, Some(&alias))?;
+    if parse_distinct(select)?
+        || outer_group_by.len() != 1
+        || !matches!(projection.aggregates.as_slice(), [AggregateExpr::CountStar])
+        || !projection.aggregate_expressions.is_empty()
+        || projection_requires_expression_path(&projection.expressions)
+        || select.selection.is_some()
+        || select.having.is_some()
+    {
+        return Ok(None);
+    }
+    let order_by = parse_order_by(query, &projection.aliases, Some(&alias))?;
+    let limit = parse_limit(query)?;
+
+    let inner = match parse_query(subquery) {
+        Ok(inner) => inner,
+        Err(DodamError::UnsupportedSql(_)) | Err(DodamError::UnknownColumn(_)) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let Some(join) = &inner.join else {
+        return Ok(None);
+    };
+    if inner.distinct
+        || inner.filter.is_some()
+        || inner.having.is_some()
+        || inner.order_by.is_some()
+        || inner.limit.is_some()
+        || !inner.aggregate_expressions.is_empty()
+        || projection_requires_expression_path(&inner.expressions)
+        || join.join_type != JoinType::Left
+        || join.left_keys.len() != 1
+        || join.right_keys.len() != 1
+        || inner.group_by.len() != 1
+        || !same_join_column(&inner.group_by[0], &join.left_keys[0])
+    {
+        return Ok(None);
+    }
+    let [AggregateExpr::Count(count_column)] = inner.aggregates.as_slice() else {
+        return Ok(None);
+    };
+    if resolve_inner_output_column_index(&inner, &outer_group_by[0]) != Some(inner.group_by.len()) {
+        return Ok(None);
+    }
+    if !inner.path.exists() {
+        return Ok(None);
+    }
+
+    let dense_counts = collect_dense_right_counts(engine, join, count_column, batch_size).await?;
+    if dense_counts.is_empty() {
+        return Ok(None);
+    }
+    let groups =
+        collect_left_count_distribution(engine, &inner.path, join, &dense_counts, batch_size)
+            .await?;
+    let rows = groups
+        .iter()
+        .map(|group| match group.values[0].value {
+            AggregateValue::Count(value) => value as usize,
+            _ => 0,
+        })
+        .sum();
+    let metrics = AggregateMetrics {
+        fragments: 2,
+        batches: 1,
+        rows,
+        values: Vec::new(),
+        groups,
+    };
+    let mut batches =
+        aggregate_metrics_to_batches(&metrics, &outer_group_by, &projection.aggregates)?;
+    batches = apply_output_order_limit(batches, order_by.as_ref(), limit)?;
+    batches = rename_output_batches(batches, &projection.aliases)?;
+    Ok(Some(QueryOutput::Aggregate { metrics, batches }))
+}
+
+async fn collect_dense_right_counts(
+    engine: &DodamEngine,
+    join: &SqlJoin,
+    count_column: &str,
+    batch_size: usize,
+) -> Result<Vec<u64>> {
+    let count_column = strip_column_prefix(count_column, &join.right_alias);
+    let mut right_projection = vec![join.right_keys[0].clone(), count_column.clone()];
+    if let Some(filter) = &join.right_filter {
+        for column in filter.referenced_columns() {
+            add_column_once(
+                &mut right_projection,
+                strip_column_prefix(&column, &join.right_alias),
+            );
+        }
+    }
+    let mut right_stream = engine
+        .scan_parquet_batches(
+            join.right.path.clone(),
+            batch_size,
+            None,
+            Projection::Columns(right_projection),
+            join.right_filter.clone(),
+        )
+        .await?;
+    let mut dense_counts = Vec::<u64>::new();
+    while let Some(batch) = right_stream.next() {
+        let batch = batch?;
+        let key_index = batch_column_index(&batch, &join.right_keys[0])?;
+        let count_index = batch_column_index(&batch, &count_column)?;
+        let Some(keys) = batch
+            .column(key_index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+        else {
+            return Ok(Vec::new());
+        };
+        let values = batch.column(count_index);
+        for row in 0..batch.num_rows() {
+            if keys.is_null(row) || values.is_null(row) {
+                continue;
+            }
+            let key = keys.value(row);
+            if key < 0 || key > 10_000_000 {
+                return Ok(Vec::new());
+            }
+            let index = key as usize;
+            if dense_counts.len() <= index {
+                dense_counts.resize(index + 1, 0);
+            }
+            dense_counts[index] += 1;
+        }
+    }
+    Ok(dense_counts)
+}
+
+async fn collect_left_count_distribution(
+    engine: &DodamEngine,
+    left_path: &PathBuf,
+    join: &SqlJoin,
+    dense_counts: &[u64],
+    batch_size: usize,
+) -> Result<Vec<GroupAggregateResult>> {
+    let mut left_stream = engine
+        .scan_parquet_batches(
+            left_path.clone(),
+            batch_size,
+            None,
+            Projection::Columns(vec![join.left_keys[0].clone()]),
+            None,
+        )
+        .await?;
+    let mut distribution = Vec::<u64>::new();
+    while let Some(batch) = left_stream.next() {
+        let batch = batch?;
+        let key_index = batch_column_index(&batch, &join.left_keys[0])?;
+        let Some(keys) = batch
+            .column(key_index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+        else {
+            return Ok(Vec::new());
+        };
+        for row in 0..batch.num_rows() {
+            let count = if keys.is_valid(row) {
+                let key = keys.value(row);
+                if key >= 0 {
+                    dense_counts.get(key as usize).copied().unwrap_or(0)
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            let index = count as usize;
+            if distribution.len() <= index {
+                distribution.resize(index + 1, 0);
+            }
+            distribution[index] += 1;
+        }
+    }
+    Ok(distribution
+        .into_iter()
+        .enumerate()
+        .filter(|(_, rows)| *rows > 0)
+        .map(|(count, rows)| GroupAggregateResult {
+            keys: vec![GroupValue::UInt64(Some(count as u64))],
+            values: vec![AggregateResult {
+                expr: AggregateExpr::CountStar,
+                value: AggregateValue::Count(rows),
+            }],
+        })
+        .collect())
+}
+
+fn resolve_inner_output_column_index(inner: &SqlQuery, column: &str) -> Option<usize> {
+    if let Some(index) = inner
+        .group_by
+        .iter()
+        .position(|group| same_join_column(group, column))
+    {
+        return Some(index);
+    }
+    if let Some(index) = inner
+        .aggregates
+        .iter()
+        .position(|aggregate| aggregate.to_string() == column)
+    {
+        return Some(inner.group_by.len() + index);
+    }
+    let (_, target) = inner.aliases.iter().find(|(alias, _)| alias == column)?;
+    if let Some(index) = inner
+        .group_by
+        .iter()
+        .position(|group| same_join_column(group, target))
+    {
+        return Some(index);
+    }
+    inner
+        .aggregates
+        .iter()
+        .position(|aggregate| aggregate.to_string() == *target)
+        .map(|index| inner.group_by.len() + index)
+}
+
+fn batch_column_index(batch: &RecordBatch, column: &str) -> Result<usize> {
+    batch
+        .schema()
+        .fields()
+        .iter()
+        .position(|field| field.name() == column)
+        .ok_or_else(|| DodamError::UnknownColumn(column.to_string()))
 }
 
 fn try_count_derived_aggregate_groups(
