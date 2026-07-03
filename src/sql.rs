@@ -325,6 +325,63 @@ impl DenseI64F64Sum {
     }
 }
 
+fn try_for_each_i64_date32_str<Visit>(
+    int_values: &ArrayRef,
+    date_values: &ArrayRef,
+    string_values: &StringArray,
+    mut visit: Visit,
+) -> Result<bool>
+where
+    Visit: FnMut(i64, i32, &str) -> Result<()>,
+{
+    let (Some(int_values), Some(date_values)) = (
+        int_values.as_any().downcast_ref::<Int64Array>(),
+        date_values.as_any().downcast_ref::<Date32Array>(),
+    ) else {
+        return Ok(false);
+    };
+    for row in 0..int_values.len() {
+        if int_values.is_null(row) || date_values.is_null(row) || string_values.is_null(row) {
+            continue;
+        }
+        visit(
+            int_values.value(row),
+            date_values.value(row),
+            string_values.value(row),
+        )?;
+    }
+    Ok(true)
+}
+
+fn try_for_each_i64_i64_date32<Visit>(
+    left_values: &ArrayRef,
+    right_values: &ArrayRef,
+    date_values: &ArrayRef,
+    mut visit: Visit,
+) -> Result<bool>
+where
+    Visit: FnMut(i64, i64, i32) -> Result<()>,
+{
+    let (Some(left_values), Some(right_values), Some(date_values)) = (
+        left_values.as_any().downcast_ref::<Int64Array>(),
+        right_values.as_any().downcast_ref::<Int64Array>(),
+        date_values.as_any().downcast_ref::<Date32Array>(),
+    ) else {
+        return Ok(false);
+    };
+    for row in 0..left_values.len() {
+        if left_values.is_null(row) || right_values.is_null(row) || date_values.is_null(row) {
+            continue;
+        }
+        visit(
+            left_values.value(row),
+            right_values.value(row),
+            date_values.value(row),
+        )?;
+    }
+    Ok(true)
+}
+
 #[derive(Debug)]
 pub enum QueryOutput {
     Scan {
@@ -3487,7 +3544,7 @@ fn q10_order_customers_batch(
     let custkeys = batch_column(&batch, "o_custkey")?;
     let orderdates = batch_column(&batch, "o_orderdate")?;
     if let Some(orders) =
-        q10_order_customers_batch_typed(orderkeys, custkeys, orderdates, start_days, end_days)
+        q10_order_customers_batch_typed(orderkeys, custkeys, orderdates, start_days, end_days)?
     {
         return Ok(orders);
     }
@@ -3516,25 +3573,22 @@ fn q10_order_customers_batch_typed(
     orderdates: &ArrayRef,
     start_days: i32,
     end_days: i32,
-) -> Option<HashMap<i64, i64>> {
-    let (Some(orderkeys), Some(custkeys), Some(orderdates)) = (
-        orderkeys.as_any().downcast_ref::<Int64Array>(),
-        custkeys.as_any().downcast_ref::<Int64Array>(),
-        orderdates.as_any().downcast_ref::<Date32Array>(),
-    ) else {
-        return None;
-    };
+) -> Result<Option<HashMap<i64, i64>>> {
     let mut orders = HashMap::new();
-    for row in 0..orderkeys.len() {
-        if orderkeys.is_null(row) || custkeys.is_null(row) || orderdates.is_null(row) {
-            continue;
-        }
-        let orderdate = orderdates.value(row);
-        if orderdate >= start_days && orderdate < end_days {
-            orders.insert(orderkeys.value(row), custkeys.value(row));
-        }
-    }
-    Some(orders)
+    if !try_for_each_i64_i64_date32(
+        orderkeys,
+        custkeys,
+        orderdates,
+        |orderkey, custkey, orderdate| {
+            if orderdate >= start_days && orderdate < end_days {
+                orders.insert(orderkey, custkey);
+            }
+            Ok(())
+        },
+    )? {
+        return Ok(None);
+    };
+    Ok(Some(orders))
 }
 
 async fn q10_returned_revenue_by_customer(
@@ -6580,40 +6634,33 @@ fn q04_candidate_order_priorities_typed(
     labels: &mut Vec<String>,
     label_indices: &mut HashMap<String, u8>,
 ) -> Result<bool> {
-    let (Some(orderkeys), Some(orderdates)) = (
-        orderkeys.as_any().downcast_ref::<Int64Array>(),
-        orderdates.as_any().downcast_ref::<Date32Array>(),
-    ) else {
-        return Ok(false);
-    };
-    for row in 0..orderkeys.len() {
-        if orderkeys.is_null(row) || orderdates.is_null(row) || orderpriorities.is_null(row) {
-            continue;
-        }
-        let orderdate = orderdates.value(row);
-        let orderkey = orderkeys.value(row);
-        if orderdate < start_days || orderdate >= end_days || orderkey < 0 {
-            continue;
-        }
-        let priority = orderpriorities.value(row);
-        let priority_index = if let Some(index) = label_indices.get(priority) {
-            *index
-        } else {
-            let next_index = u8::try_from(labels.len()).map_err(|_| {
-                DodamError::UnsupportedSql("too many Q04 order priorities".to_string())
-            })?;
-            labels.push(priority.to_string());
-            label_indices.insert(priority.to_string(), next_index);
-            next_index
-        };
-        let orderkey = usize::try_from(orderkey)
-            .map_err(|_| DodamError::UnsupportedSql("order key overflow".to_string()))?;
-        if orderkey >= priorities.len() {
-            priorities.resize(orderkey + 1, 0);
-        }
-        priorities[orderkey] = priority_index + 1;
-    }
-    Ok(true)
+    try_for_each_i64_date32_str(
+        orderkeys,
+        orderdates,
+        orderpriorities,
+        |orderkey, orderdate, priority| {
+            if orderdate < start_days || orderdate >= end_days || orderkey < 0 {
+                return Ok(());
+            }
+            let priority_index = if let Some(index) = label_indices.get(priority) {
+                *index
+            } else {
+                let next_index = u8::try_from(labels.len()).map_err(|_| {
+                    DodamError::UnsupportedSql("too many Q04 order priorities".to_string())
+                })?;
+                labels.push(priority.to_string());
+                label_indices.insert(priority.to_string(), next_index);
+                next_index
+            };
+            let orderkey = usize::try_from(orderkey)
+                .map_err(|_| DodamError::UnsupportedSql("order key overflow".to_string()))?;
+            if orderkey >= priorities.len() {
+                priorities.resize(orderkey + 1, 0);
+            }
+            priorities[orderkey] = priority_index + 1;
+            Ok(())
+        },
+    )
 }
 
 async fn q04_count_late_candidate_priorities(
