@@ -206,8 +206,198 @@ pub fn collect_grouped_aggregates(
     if can_use_single_key_fast_path(group_by, aggregates) {
         return collect_single_key_groups(stream, fragments, group_by, aggregates);
     }
+    if can_use_two_key_sum_path(group_by, aggregates) {
+        return collect_two_key_sum_groups(stream, fragments, group_by, aggregates);
+    }
 
     collect_grouped_aggregates_generic(stream, fragments, group_by, aggregates, None, None)
+}
+
+fn can_use_two_key_sum_path(group_by: &[String], aggregates: &[AggregateExpr]) -> bool {
+    group_by.len() == 2 && matches!(aggregates, [AggregateExpr::Sum(_)])
+}
+
+fn collect_two_key_sum_groups(
+    mut stream: SendableBatchStream,
+    fragments: usize,
+    group_by: &[String],
+    aggregates: &[AggregateExpr],
+) -> Result<AggregateMetrics> {
+    let AggregateExpr::Sum(sum_column) = &aggregates[0] else {
+        unreachable!("two-key sum fast path precondition");
+    };
+    let sum_expr = aggregates[0].clone();
+    let mut groups: AggregateHashMap<(Option<String>, Option<i64>), NumericState> =
+        AggregateHashMap::default();
+    let mut metrics = AggregateMetrics {
+        fragments,
+        ..AggregateMetrics::default()
+    };
+
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        metrics.batches += 1;
+        metrics.rows += batch.num_rows();
+
+        let first_key = batch.column(column_index(&batch, &group_by[0])?);
+        let second_key = batch.column(column_index(&batch, &group_by[1])?);
+        let sum_values = batch.column(column_index(&batch, sum_column)?);
+        let Some(first_key) = first_key.as_any().downcast_ref::<StringArray>() else {
+            return collect_grouped_aggregates_generic(
+                stream,
+                fragments,
+                group_by,
+                aggregates,
+                Some(batch),
+                Some(metrics),
+            );
+        };
+        if !matches!(second_key.data_type(), DataType::Int32 | DataType::Int64) {
+            return collect_grouped_aggregates_generic(
+                stream,
+                fragments,
+                group_by,
+                aggregates,
+                Some(batch),
+                Some(metrics),
+            );
+        }
+        let second_key = two_key_sum_key_column(second_key);
+        let Some(sum_values) = two_key_sum_column(sum_values) else {
+            return collect_grouped_aggregates_generic(
+                stream,
+                fragments,
+                group_by,
+                aggregates,
+                Some(batch),
+                Some(metrics),
+            );
+        };
+
+        for row in 0..batch.num_rows() {
+            let key = (
+                first_key
+                    .is_valid(row)
+                    .then(|| first_key.value(row).to_string()),
+                second_key.value(row),
+            );
+            sum_values.update_state(groups.entry(key).or_default(), row);
+        }
+    }
+
+    let mut group_results = groups
+        .into_iter()
+        .map(|((first, second), state)| GroupAggregateResult {
+            keys: vec![GroupValue::Utf8(first), GroupValue::Int64(second)],
+            values: vec![AggregateResult {
+                expr: sum_expr.clone(),
+                value: state.sum_value(),
+            }],
+        })
+        .collect::<Vec<_>>();
+    group_results.sort_by(|left, right| compare_group_keys(&left.keys, &right.keys));
+    metrics.groups = group_results;
+    Ok(metrics)
+}
+
+enum TwoKeySumKeyColumn<'a> {
+    Int32(&'a Int32Array),
+    Int64(&'a Int64Array),
+}
+
+impl TwoKeySumKeyColumn<'_> {
+    fn value(&self, row: usize) -> Option<i64> {
+        match self {
+            Self::Int32(values) => values.is_valid(row).then(|| i64::from(values.value(row))),
+            Self::Int64(values) => values.is_valid(row).then(|| values.value(row)),
+        }
+    }
+}
+
+fn two_key_sum_key_column(column: &ArrayRef) -> TwoKeySumKeyColumn<'_> {
+    match column.data_type() {
+        DataType::Int32 => TwoKeySumKeyColumn::Int32(
+            column
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("Int32 data type"),
+        ),
+        DataType::Int64 => TwoKeySumKeyColumn::Int64(
+            column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 data type"),
+        ),
+        _ => unreachable!("validated two-key sum key type"),
+    }
+}
+
+enum TwoKeySumColumn<'a> {
+    Int32(&'a Int32Array),
+    Int64(&'a Int64Array),
+    Float64(&'a Float64Array),
+    Decimal128(&'a Decimal128Array, f64),
+}
+
+impl TwoKeySumColumn<'_> {
+    fn update_state(&self, state: &mut NumericState, row: usize) {
+        match self {
+            Self::Int32(values) => {
+                if values.is_valid(row) {
+                    state.add_i64(i64::from(values.value(row)));
+                }
+            }
+            Self::Int64(values) => {
+                if values.is_valid(row) {
+                    state.add_i64(values.value(row));
+                }
+            }
+            Self::Float64(values) => {
+                if values.is_valid(row) {
+                    state.add_f64(values.value(row));
+                }
+            }
+            Self::Decimal128(values, scale) => {
+                if values.is_valid(row) {
+                    state.add_f64(values.value(row) as f64 / scale);
+                }
+            }
+        }
+    }
+}
+
+fn two_key_sum_column(column: &ArrayRef) -> Option<TwoKeySumColumn<'_>> {
+    match column.data_type() {
+        DataType::Int32 => Some(TwoKeySumColumn::Int32(
+            column
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("Int32 data type"),
+        )),
+        DataType::Int64 => Some(TwoKeySumColumn::Int64(
+            column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 data type"),
+        )),
+        DataType::Float64 => Some(TwoKeySumColumn::Float64(
+            column
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("Float64 data type"),
+        )),
+        DataType::Decimal128(_, scale) => Some(TwoKeySumColumn::Decimal128(
+            column
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("Decimal128 data type"),
+            decimal_scale_factor(*scale),
+        )),
+        _ => None,
+    }
 }
 
 fn can_use_single_key_count_sum_path(group_by: &[String], aggregates: &[AggregateExpr]) -> bool {
@@ -1746,6 +1936,18 @@ enum NumericOutput {
 }
 
 impl NumericState {
+    fn add_i64(&mut self, value: i64) {
+        self.output.get_or_insert(NumericOutput::Int64);
+        self.sum_i64 += value;
+        self.count += 1;
+    }
+
+    fn add_f64(&mut self, value: f64) {
+        self.output.get_or_insert(NumericOutput::Float64);
+        self.sum_f64 += value;
+        self.count += 1;
+    }
+
     fn update(&mut self, column: &ArrayRef, expr: &AggregateExpr) -> Result<()> {
         match column.data_type() {
             DataType::Int32 => {

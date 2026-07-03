@@ -5272,6 +5272,13 @@ async fn try_execute_multi_comma_join_sql(
         having.as_ref(),
         order_by.as_ref(),
     )?;
+    let final_columns = comma_join_final_columns(
+        &alias_refs,
+        &group_by,
+        &projection,
+        having.as_ref(),
+        order_by.as_ref(),
+    )?;
     let mut scanned = Vec::with_capacity(tables.len());
     let mut row_counts = Vec::with_capacity(tables.len());
     for index in 0..tables.len() {
@@ -5403,6 +5410,14 @@ async fn try_execute_multi_comma_join_sql(
             current = strip_batch_field_prefix(current, "__dodam_join.")?;
         }
         joined_aliases.push(alias.clone());
+        current = prune_comma_join_current_columns(
+            current,
+            &joined_aliases,
+            &alias_refs,
+            &conjuncts,
+            &used_conjuncts,
+            &final_columns,
+        )?;
     }
 
     let residual = conjuncts
@@ -5628,6 +5643,108 @@ fn comma_join_scan_projections(
             }
         })
         .collect())
+}
+
+fn comma_join_final_columns(
+    alias_refs: &[&str],
+    group_by: &[String],
+    projection: &ParsedProjection,
+    having: Option<&FilterExpr>,
+    order_by: Option<&SortKey>,
+) -> Result<HashSet<String>> {
+    let mut columns = HashSet::new();
+    for column in group_by {
+        columns.insert(column.clone());
+    }
+    if let Projection::Columns(projected) = &projection.projection {
+        columns.extend(projected.iter().cloned());
+    }
+    for aggregate in &projection.aggregates {
+        if let Some(column) = aggregate.referenced_column() {
+            columns.insert(column.to_string());
+        }
+    }
+    for expression in &projection.aggregate_expressions {
+        columns.extend(join_scalar_expression_columns(
+            &expression.expr,
+            alias_refs,
+        )?);
+    }
+    for expression in &projection.expressions {
+        columns.extend(join_scalar_expression_columns(
+            &expression.expr,
+            alias_refs,
+        )?);
+    }
+    if let Some(having) = having {
+        columns.extend(having.referenced_columns());
+    }
+    if let Some(order_by) = order_by {
+        columns.extend(order_by.expressions.iter().map(|sort| sort.column.clone()));
+    }
+    Ok(columns)
+}
+
+fn prune_comma_join_current_columns(
+    batches: Vec<RecordBatch>,
+    joined_aliases: &[String],
+    alias_refs: &[&str],
+    conjuncts: &[SqlExpr],
+    used_conjuncts: &[bool],
+    final_columns: &HashSet<String>,
+) -> Result<Vec<RecordBatch>> {
+    if batches.is_empty() {
+        return Ok(batches);
+    }
+    let mut needed = final_columns.clone();
+    for (conjunct, used) in conjuncts.iter().zip(used_conjuncts) {
+        if *used {
+            continue;
+        }
+        let mut columns = Vec::new();
+        collect_join_column_candidates(conjunct, alias_refs, &mut columns)?;
+        needed.extend(columns);
+    }
+    let schema = batches[0].schema();
+    let keep = schema
+        .fields()
+        .iter()
+        .filter_map(|field| {
+            let name = field.name();
+            if comma_join_field_needed(name, joined_aliases, &needed) {
+                Some(name.clone())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    if keep.len() == schema.fields().len() {
+        return Ok(batches);
+    }
+    if keep.is_empty() {
+        return Ok(batches);
+    }
+    apply_output_projection(batches, &Projection::Columns(keep))
+}
+
+fn comma_join_field_needed(
+    field_name: &str,
+    joined_aliases: &[String],
+    needed: &HashSet<String>,
+) -> bool {
+    if needed.contains(field_name) {
+        return true;
+    }
+    let Some((alias, column)) = field_name.split_once('.') else {
+        return true;
+    };
+    if !joined_aliases
+        .iter()
+        .any(|joined| joined.eq_ignore_ascii_case(alias))
+    {
+        return true;
+    }
+    needed.contains(&format!("{alias}.{column}"))
 }
 
 fn add_comma_join_expr_columns(
