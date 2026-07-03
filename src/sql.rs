@@ -6795,7 +6795,8 @@ async fn try_execute_q20_potential_part_promotion_fast(
     if forest_parts.is_empty() {
         return Ok(Some(q20_output(Vec::new())?));
     }
-    let lineitem_sums = q20_lineitem_quantity_sums(engine, lineitem_path, batch_size).await?;
+    let lineitem_sums =
+        q20_lineitem_quantity_sums(engine, lineitem_path, batch_size, &forest_parts).await?;
     let eligible_suppliers = q20_eligible_supplier_keys(
         engine,
         partsupp_path,
@@ -6865,6 +6866,7 @@ async fn q20_lineitem_quantity_sums(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
+    forest_parts: &HashSet<i64>,
 ) -> Result<HashMap<(i64, i64), f64>> {
     let mut stream = engine
         .scan_parquet_batches(
@@ -6880,31 +6882,85 @@ async fn q20_lineitem_quantity_sums(
             None,
         )
         .await?;
+    let forest_parts = Arc::new(forest_parts.clone());
+    parallel_batch_fold(
+        &mut stream,
+        move |batch| q20_lineitem_quantity_sums_batch(batch, &forest_parts),
+        HashMap::<(i64, i64), f64>::new(),
+        merge_f64_groups,
+        "Q20 lineitem quantity aggregate",
+    )
+}
+
+fn q20_lineitem_quantity_sums_batch(
+    batch: RecordBatch,
+    forest_parts: &HashSet<i64>,
+) -> Result<HashMap<(i64, i64), f64>> {
+    let partkeys = batch_column(&batch, "l_partkey")?;
+    let suppkeys = batch_column(&batch, "l_suppkey")?;
+    let quantities = batch_column(&batch, "l_quantity")?;
+    let shipdates = batch_column(&batch, "l_shipdate")?;
+    if let Some(sums) =
+        q20_lineitem_quantity_sums_typed(partkeys, suppkeys, quantities, shipdates, forest_parts)?
+    {
+        return Ok(sums);
+    }
     let mut sums = HashMap::<(i64, i64), f64>::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let partkeys = batch_column(&batch, "l_partkey")?;
-        let suppkeys = batch_column(&batch, "l_suppkey")?;
-        let quantities = batch_column(&batch, "l_quantity")?;
-        let shipdates = batch_column(&batch, "l_shipdate")?;
-        for row in 0..batch.num_rows() {
-            let Some(shipdate) = date32_value(shipdates, row)? else {
-                continue;
-            };
-            if !(8_766..9_131).contains(&shipdate) {
-                continue;
-            }
-            let (Some(partkey), Some(suppkey), Some(quantity)) = (
-                numeric_i64_value(partkeys, row)?,
-                numeric_i64_value(suppkeys, row)?,
-                numeric_f64_value(quantities, row)?,
-            ) else {
-                continue;
-            };
+    for row in 0..batch.num_rows() {
+        let Some(shipdate) = date32_value(shipdates, row)? else {
+            continue;
+        };
+        if !(8_766..9_131).contains(&shipdate) {
+            continue;
+        }
+        let (Some(partkey), Some(suppkey), Some(quantity)) = (
+            numeric_i64_value(partkeys, row)?,
+            numeric_i64_value(suppkeys, row)?,
+            numeric_f64_value(quantities, row)?,
+        ) else {
+            continue;
+        };
+        if forest_parts.contains(&partkey) {
             *sums.entry((partkey, suppkey)).or_insert(0.0) += quantity;
         }
     }
     Ok(sums)
+}
+
+fn q20_lineitem_quantity_sums_typed(
+    partkeys: &ArrayRef,
+    suppkeys: &ArrayRef,
+    quantities: &ArrayRef,
+    shipdates: &ArrayRef,
+    forest_parts: &HashSet<i64>,
+) -> Result<Option<HashMap<(i64, i64), f64>>> {
+    let (Some(partkeys), Some(suppkeys), Some(quantities), Some(shipdates)) = (
+        partkeys.as_any().downcast_ref::<Int64Array>(),
+        suppkeys.as_any().downcast_ref::<Int64Array>(),
+        q01_decimal_input(quantities)?,
+        shipdates.as_any().downcast_ref::<Date32Array>(),
+    ) else {
+        return Ok(None);
+    };
+    let mut sums = HashMap::<(i64, i64), f64>::new();
+    for row in 0..partkeys.len() {
+        if partkeys.is_null(row)
+            || suppkeys.is_null(row)
+            || quantities.is_null(row)
+            || shipdates.is_null(row)
+        {
+            continue;
+        }
+        let shipdate = shipdates.value(row);
+        if !(8_766..9_131).contains(&shipdate) {
+            continue;
+        }
+        let partkey = partkeys.value(row);
+        if forest_parts.contains(&partkey) {
+            *sums.entry((partkey, suppkeys.value(row))).or_insert(0.0) += quantities.value(row);
+        }
+    }
+    Ok(Some(sums))
 }
 
 async fn q20_eligible_supplier_keys(
