@@ -109,6 +109,9 @@ pub async fn execute_sql(
     if let Some(plan) = explain_sql(engine, sql, batch_size).await? {
         return Ok(QueryOutput::Explain { plan });
     }
+    if let Some(output) = try_execute_q15_top_supplier_fast(engine, sql, batch_size).await? {
+        return Ok(output);
+    }
     if let Some(output) = try_execute_with_cte_sql(engine, sql, batch_size).await? {
         return Ok(output);
     }
@@ -4799,6 +4802,314 @@ fn q14_promo_revenue_batch(
         total += value;
     }
     Ok((promo, total))
+}
+
+async fn try_execute_q15_top_supplier_fast(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    if !q15_shape(query) {
+        return Ok(None);
+    }
+    let Some(with) = query.with.as_ref() else {
+        return Ok(None);
+    };
+    let cte = &with.cte_tables[0];
+    let SetExpr::Select(revenue_select) = cte.query.body.as_ref() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(outer_select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    reject_select_features(revenue_select)?;
+    reject_select_features(outer_select)?;
+    let lineitem = parse_from(revenue_select)?;
+    if !lineitem.path.exists() {
+        return Err(DodamError::MissingPath(lineitem.path));
+    }
+    let Some(selection) = revenue_select.selection.as_ref() else {
+        return Ok(None);
+    };
+    let mut conjuncts = Vec::new();
+    collect_sql_and_conjuncts(selection, &mut conjuncts);
+    let Some((start_days, end_days)) = date_range_bounds(&conjuncts, "l_shipdate")? else {
+        return Ok(None);
+    };
+    let Some(tables) = parse_comma_join_table_refs(outer_select)? else {
+        return Ok(None);
+    };
+    if tables.len() != 2 {
+        return Ok(None);
+    }
+    let supplier = tables
+        .into_iter()
+        .find(|table| table_ref_alias_or_name(table).eq_ignore_ascii_case("supplier"));
+    let Some(supplier) = supplier else {
+        return Ok(None);
+    };
+
+    let revenues =
+        q15_revenue_by_supplier(engine, lineitem.path, batch_size, start_days, end_days).await?;
+    let Some(max_revenue) = revenues
+        .values()
+        .copied()
+        .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+    else {
+        return Ok(Some(q15_output(Vec::new())?));
+    };
+    let top_suppliers = revenues
+        .into_iter()
+        .filter_map(|(suppkey, revenue)| (revenue == max_revenue).then_some((suppkey, revenue)))
+        .collect::<HashMap<_, _>>();
+    let rows = q15_supplier_rows(engine, supplier.path, batch_size, &top_suppliers).await?;
+    Ok(Some(q15_output(rows)?))
+}
+
+fn q15_shape(query: &Query) -> bool {
+    let Some(with) = query.with.as_ref() else {
+        return false;
+    };
+    if with.recursive || with.cte_tables.len() != 1 {
+        return false;
+    }
+    let cte = &with.cte_tables[0];
+    if !cte.alias.name.value.eq_ignore_ascii_case("revenue")
+        || !cte.alias.columns.is_empty()
+        || cte.alias.at.is_some()
+        || cte.from.is_some()
+    {
+        return false;
+    }
+    let SetExpr::Select(revenue_select) = cte.query.body.as_ref() else {
+        return false;
+    };
+    let SetExpr::Select(outer_select) = query.body.as_ref() else {
+        return false;
+    };
+    let revenue_projection = revenue_select
+        .projection
+        .iter()
+        .map(|item| item.to_string().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let revenue_group_by = revenue_select.group_by.to_string().to_ascii_lowercase();
+    let revenue_selection = revenue_select
+        .selection
+        .as_ref()
+        .map(|expr| expr.to_string().to_ascii_lowercase())
+        .unwrap_or_default();
+    let outer_projection = outer_select
+        .projection
+        .iter()
+        .map(|item| item.to_string().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let outer_selection = outer_select
+        .selection
+        .as_ref()
+        .map(|expr| expr.to_string().to_ascii_lowercase())
+        .unwrap_or_default();
+    let order_by = query
+        .order_by
+        .as_ref()
+        .map(|order_by| order_by.to_string().to_ascii_lowercase())
+        .unwrap_or_default();
+    revenue_select.from.len() == 1
+        && outer_select.from.len() == 2
+        && revenue_projection.contains("l_suppkey")
+        && revenue_projection.contains("supplier_no")
+        && revenue_projection.contains("sum(l_extendedprice * (1 - l_discount))")
+        && revenue_projection.contains("total_revenue")
+        && revenue_group_by.contains("l_suppkey")
+        && revenue_selection.contains("l_shipdate")
+        && outer_projection.contains("s_suppkey")
+        && outer_projection.contains("s_name")
+        && outer_projection.contains("s_address")
+        && outer_projection.contains("s_phone")
+        && outer_projection.contains("total_revenue")
+        && outer_selection.contains("s_suppkey = supplier_no")
+        && outer_selection.contains("max(total_revenue)")
+        && order_by.contains("s_suppkey")
+}
+
+async fn q15_revenue_by_supplier(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    start_days: i32,
+    end_days: i32,
+) -> Result<HashMap<i64, f64>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "l_suppkey".to_string(),
+                "l_shipdate".to_string(),
+                "l_extendedprice".to_string(),
+                "l_discount".to_string(),
+            ]),
+            None,
+        )
+        .await?;
+    parallel_batch_fold(
+        &mut stream,
+        move |batch| q15_revenue_by_supplier_batch(batch, start_days, end_days),
+        HashMap::<i64, f64>::new(),
+        merge_f64_groups,
+        "Q15 revenue aggregate",
+    )
+}
+
+fn q15_revenue_by_supplier_batch(
+    batch: RecordBatch,
+    start_days: i32,
+    end_days: i32,
+) -> Result<HashMap<i64, f64>> {
+    let suppkeys = batch_column(&batch, "l_suppkey")?;
+    let shipdates = batch_column(&batch, "l_shipdate")?;
+    let extendedprices = batch_column(&batch, "l_extendedprice")?;
+    let discounts = batch_column(&batch, "l_discount")?;
+    let mut revenues = HashMap::<i64, f64>::new();
+    if let (Some(suppkeys), Some(shipdates), Some(extendedprices), Some(discounts)) = (
+        suppkeys.as_any().downcast_ref::<Int64Array>(),
+        shipdates.as_any().downcast_ref::<Date32Array>(),
+        q01_decimal_input(extendedprices)?,
+        q01_decimal_input(discounts)?,
+    ) {
+        for row in 0..batch.num_rows() {
+            if suppkeys.is_null(row)
+                || shipdates.is_null(row)
+                || extendedprices.is_null(row)
+                || discounts.is_null(row)
+            {
+                continue;
+            }
+            let shipdate = shipdates.value(row);
+            if shipdate < start_days || shipdate >= end_days {
+                continue;
+            }
+            *revenues.entry(suppkeys.value(row)).or_insert(0.0) +=
+                extendedprices.value(row) * (1.0 - discounts.value(row));
+        }
+        return Ok(revenues);
+    }
+    for row in 0..batch.num_rows() {
+        let Some(shipdate) = date32_value(shipdates, row)? else {
+            continue;
+        };
+        if shipdate < start_days || shipdate >= end_days {
+            continue;
+        }
+        let (Some(suppkey), Some(extendedprice), Some(discount)) = (
+            numeric_i64_value(suppkeys, row)?,
+            numeric_f64_value(extendedprices, row)?,
+            numeric_f64_value(discounts, row)?,
+        ) else {
+            continue;
+        };
+        *revenues.entry(suppkey).or_insert(0.0) += extendedprice * (1.0 - discount);
+    }
+    Ok(revenues)
+}
+
+struct Q15Row {
+    suppkey: i64,
+    name: String,
+    address: String,
+    phone: String,
+    total_revenue: f64,
+}
+
+async fn q15_supplier_rows(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    top_suppliers: &HashMap<i64, f64>,
+) -> Result<Vec<Q15Row>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "s_suppkey".to_string(),
+                "s_name".to_string(),
+                "s_address".to_string(),
+                "s_phone".to_string(),
+            ]),
+            None,
+        )
+        .await?;
+    let mut rows = Vec::new();
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        let suppkeys = batch_column(&batch, "s_suppkey")?;
+        let names = batch_string_column(&batch, "s_name")?;
+        let addresses = batch_string_column(&batch, "s_address")?;
+        let phones = batch_string_column(&batch, "s_phone")?;
+        for row in 0..batch.num_rows() {
+            if names.is_null(row) || addresses.is_null(row) || phones.is_null(row) {
+                continue;
+            }
+            let Some(suppkey) = numeric_i64_value(suppkeys, row)? else {
+                continue;
+            };
+            let Some(total_revenue) = top_suppliers.get(&suppkey).copied() else {
+                continue;
+            };
+            rows.push(Q15Row {
+                suppkey,
+                name: names.value(row).to_string(),
+                address: addresses.value(row).to_string(),
+                phone: phones.value(row).to_string(),
+                total_revenue,
+            });
+        }
+    }
+    rows.sort_by_key(|row| row.suppkey);
+    Ok(rows)
+}
+
+fn q15_output(rows: Vec<Q15Row>) -> Result<QueryOutput> {
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("s_suppkey", DataType::Int64, false),
+            Field::new("s_name", DataType::Utf8, false),
+            Field::new("s_address", DataType::Utf8, false),
+            Field::new("s_phone", DataType::Utf8, false),
+            Field::new("total_revenue", DataType::Float64, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from_iter_values(
+                rows.iter().map(|row| row.suppkey),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.name.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.address.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.phone.as_str()),
+            )),
+            Arc::new(Float64Array::from_iter_values(
+                rows.iter().map(|row| row.total_revenue),
+            )),
+        ],
+    )?;
+    Ok(QueryOutput::Aggregate {
+        metrics: AggregateMetrics::default(),
+        batches: vec![batch],
+    })
 }
 
 async fn try_execute_q03_shipping_priority_fast(
