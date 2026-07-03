@@ -602,12 +602,19 @@ async fn try_execute_correlated_exists_semijoin_sql(
         order_by.as_ref(),
     )?;
 
+    let outer_projection = semijoin_outer_projection(
+        &parsed_projection,
+        &group_by,
+        order_by.as_ref(),
+        &outer_key,
+        outer_filter.as_ref(),
+    );
     let stream = engine
         .scan_parquet_batches(
             outer_path.path,
             batch_size,
             None,
-            Projection::All,
+            outer_projection,
             outer_filter,
         )
         .await?;
@@ -762,8 +769,20 @@ async fn collect_semijoin_key_set(
     filter: Option<FilterExpr>,
     batch_size: usize,
 ) -> Result<HashSet<String>> {
+    let mut projection = vec![key_column.to_string()];
+    if let Some(filter) = &filter {
+        for column in filter.referenced_columns() {
+            add_column_once(&mut projection, column);
+        }
+    }
     let stream = engine
-        .scan_parquet_batches(path, batch_size, None, Projection::All, filter)
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(projection),
+            filter,
+        )
         .await?;
     let batches = collect_batches(stream)?;
     let mut keys = HashSet::new();
@@ -798,6 +817,53 @@ fn semijoin_membership_mask(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(BooleanArray::from(values))
+}
+
+fn semijoin_outer_projection(
+    projection: &ParsedProjection,
+    group_by: &[String],
+    order_by: Option<&SortKey>,
+    key_column: &str,
+    filter: Option<&FilterExpr>,
+) -> Projection {
+    let mut columns = vec![key_column.to_string()];
+    for column in group_by {
+        add_column_once(&mut columns, column.clone());
+    }
+    match &projection.projection {
+        Projection::All => return Projection::All,
+        Projection::Columns(projected) => {
+            for column in projected {
+                add_column_once(&mut columns, column.clone());
+            }
+        }
+    }
+    for aggregate in &projection.aggregates {
+        if let Some(column) = aggregate.referenced_column() {
+            add_column_once(&mut columns, column.to_string());
+        }
+    }
+    for expression in &projection.aggregate_expressions {
+        for column in scalar_expression_columns(&expression.expr) {
+            add_column_once(&mut columns, column);
+        }
+    }
+    for expression in &projection.expressions {
+        for column in scalar_expression_columns(&expression.expr) {
+            add_column_once(&mut columns, column);
+        }
+    }
+    if let Some(order_by) = order_by {
+        for sort in &order_by.expressions {
+            add_column_once(&mut columns, sort.column.clone());
+        }
+    }
+    if let Some(filter) = filter {
+        for column in filter.referenced_columns() {
+            add_column_once(&mut columns, column);
+        }
+    }
+    Projection::Columns(columns)
 }
 
 fn semijoin_key_at(column: &ArrayRef, row: usize) -> Result<Option<String>> {
