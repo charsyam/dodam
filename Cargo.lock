@@ -638,6 +638,7 @@ dependencies = [
  "clap",
  "criterion",
  "itoa",
+ "memchr",
  "parquet",
  "rayon",
  "ryu",

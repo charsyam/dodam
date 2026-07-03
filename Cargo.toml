@@ -10,6 +10,7 @@ arrow-row = "59.0.0"
 arrow-select = "59.0.0"
 clap = { version = "4.6.1", features = ["derive"] }
 itoa = "1.0.15"
+memchr = "2.8.2"
 parquet = "59.0.0"
 rayon = "1.12.0"
 ryu = "1.0.20"

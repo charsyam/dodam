@@ -26,6 +26,7 @@ use arrow_ord::sort::{SortColumn, SortOptions, lexsort_to_indices};
 use arrow_row::{OwnedRow, RowConverter, SortField};
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take_record_batch;
+use memchr::memmem::Finder;
 
 use crate::catalog::{FileFragment, StorageFormat};
 use crate::error::{DodamError, Result};
@@ -8888,70 +8889,99 @@ fn evaluate_like(
             column: column.to_string(),
             data_type: column_array.data_type().clone(),
         })?;
-    let tokens = like_pattern_tokens(pattern, escape)?;
     let fast_pattern = fast_like_pattern(pattern, escape);
     let mut builder = BooleanBuilder::with_capacity(values.len());
-    for row in 0..values.len() {
-        if values.is_null(row) {
-            builder.append_null();
-            continue;
+    if let Some(fast_pattern) = fast_pattern {
+        for row in 0..values.len() {
+            if values.is_null(row) {
+                builder.append_null();
+                continue;
+            }
+            let matched = fast_pattern.matches(values.value(row));
+            builder.append_value(if negated { !matched } else { matched });
         }
-        let matched = fast_pattern
-            .as_ref()
-            .map(|pattern| pattern.matches(values.value(row)))
-            .unwrap_or_else(|| like_matches(values.value(row), &tokens));
-        builder.append_value(if negated { !matched } else { matched });
+    } else {
+        let tokens = like_pattern_tokens(pattern, escape)?;
+        for row in 0..values.len() {
+            if values.is_null(row) {
+                builder.append_null();
+                continue;
+            }
+            let matched = like_matches(values.value(row), &tokens);
+            builder.append_value(if negated { !matched } else { matched });
+        }
     }
     Ok(builder.finish())
 }
 
-#[derive(Debug, Clone)]
-struct FastLikePattern<'a> {
-    starts_with_any: bool,
-    ends_with_any: bool,
-    segments: Vec<&'a str>,
+enum FastLikePattern<'a> {
+    All,
+    Exact(&'a str),
+    Prefix(&'a str),
+    Suffix(&'a str),
+    Contains(FastLikeSegment<'a>),
+    Ordered {
+        starts_with_any: bool,
+        ends_with_any: bool,
+        segments: Vec<FastLikeSegment<'a>>,
+    },
+}
+
+struct FastLikeSegment<'a> {
+    text: &'a str,
+    finder: Finder<'a>,
+}
+
+impl<'a> FastLikeSegment<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            finder: Finder::new(text.as_bytes()),
+        }
+    }
 }
 
 impl FastLikePattern<'_> {
     fn matches(&self, value: &str) -> bool {
-        if self.segments.is_empty() {
-            return true;
-        }
-        if !self.starts_with_any && !self.ends_with_any && self.segments.len() == 1 {
-            return value == self.segments[0];
-        }
-        if !self.starts_with_any && !value.starts_with(self.segments[0]) {
-            return false;
-        }
-        if !self.ends_with_any
-            && !value.ends_with(self.segments[self.segments.len().saturating_sub(1)])
-        {
-            return false;
-        }
-
-        let mut offset = 0;
-        for (index, segment) in self.segments.iter().enumerate() {
-            if segment.is_empty() {
-                continue;
-            }
-            if index == 0 && !self.starts_with_any {
-                offset = segment.len();
-                continue;
-            }
-            if index + 1 == self.segments.len() && !self.ends_with_any {
-                let suffix_start = value.len().saturating_sub(segment.len());
-                if suffix_start < offset {
+        match self {
+            Self::All => true,
+            Self::Exact(segment) => value == *segment,
+            Self::Prefix(segment) => value.starts_with(segment),
+            Self::Suffix(segment) => value.ends_with(segment),
+            Self::Contains(segment) => segment.finder.find(value.as_bytes()).is_some(),
+            Self::Ordered {
+                starts_with_any,
+                ends_with_any,
+                segments,
+            } => {
+                if !starts_with_any && !value.starts_with(segments[0].text) {
                     return false;
                 }
-                offset = suffix_start + segment.len();
-                continue;
+                if !ends_with_any && !value.ends_with(segments[segments.len() - 1].text) {
+                    return false;
+                }
+
+                let mut offset = 0;
+                for (index, segment) in segments.iter().enumerate() {
+                    if index == 0 && !starts_with_any {
+                        offset = segment.text.len();
+                        continue;
+                    }
+                    if index + 1 == segments.len() && !ends_with_any {
+                        let suffix_start = value.len().saturating_sub(segment.text.len());
+                        if suffix_start < offset {
+                            return false;
+                        }
+                        continue;
+                    }
+                    let Some(relative) = segment.finder.find(&value.as_bytes()[offset..]) else {
+                        return false;
+                    };
+                    offset += relative + segment.text.len();
+                }
+                true
             }
-            let Some(relative) = value[offset..].find(segment) else {
-                return false;
-            };
-            offset += relative + segment.len();
         }
-        true
     }
 }
 
@@ -8959,21 +8989,24 @@ fn fast_like_pattern(pattern: &str, escape: Option<char>) -> Option<FastLikePatt
     if escape.is_some() || pattern.contains('_') {
         return None;
     }
-    if !pattern.contains('%') {
-        return Some(FastLikePattern {
-            starts_with_any: false,
-            ends_with_any: false,
-            segments: vec![pattern],
-        });
+    let starts_with_any = pattern.starts_with('%');
+    let ends_with_any = pattern.ends_with('%');
+    let segments = pattern
+        .split('%')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    match segments.as_slice() {
+        [] => Some(FastLikePattern::All),
+        [segment] if !starts_with_any && !ends_with_any => Some(FastLikePattern::Exact(segment)),
+        [segment] if !starts_with_any && ends_with_any => Some(FastLikePattern::Prefix(segment)),
+        [segment] if starts_with_any && !ends_with_any => Some(FastLikePattern::Suffix(segment)),
+        [segment] => Some(FastLikePattern::Contains(FastLikeSegment::new(segment))),
+        _ => Some(FastLikePattern::Ordered {
+            starts_with_any,
+            ends_with_any,
+            segments: segments.into_iter().map(FastLikeSegment::new).collect(),
+        }),
     }
-    Some(FastLikePattern {
-        starts_with_any: pattern.starts_with('%'),
-        ends_with_any: pattern.ends_with('%'),
-        segments: pattern
-            .split('%')
-            .filter(|segment| !segment.is_empty())
-            .collect(),
-    })
 }
 
 #[derive(Debug, Clone, Copy)]
