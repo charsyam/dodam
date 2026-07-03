@@ -206,11 +206,196 @@ pub fn collect_grouped_aggregates(
     if can_use_single_key_fast_path(group_by, aggregates) {
         return collect_single_key_groups(stream, fragments, group_by, aggregates);
     }
+    if can_use_two_utf8_key_fast_path(group_by, aggregates) {
+        return collect_two_utf8_key_groups(stream, fragments, group_by, aggregates);
+    }
     if can_use_two_key_sum_path(group_by, aggregates) {
         return collect_two_key_sum_groups(stream, fragments, group_by, aggregates);
     }
 
     collect_grouped_aggregates_generic(stream, fragments, group_by, aggregates, None, None)
+}
+
+fn can_use_two_utf8_key_fast_path(group_by: &[String], aggregates: &[AggregateExpr]) -> bool {
+    group_by.len() == 2
+        && !aggregates.is_empty()
+        && aggregates.iter().all(|aggregate| {
+            matches!(
+                aggregate,
+                AggregateExpr::CountStar
+                    | AggregateExpr::Count(_)
+                    | AggregateExpr::Sum(_)
+                    | AggregateExpr::Avg(_)
+                    | AggregateExpr::Min(_)
+                    | AggregateExpr::Max(_)
+            )
+        })
+}
+
+fn collect_two_utf8_key_groups(
+    mut stream: SendableBatchStream,
+    fragments: usize,
+    group_by: &[String],
+    aggregates: &[AggregateExpr],
+) -> Result<AggregateMetrics> {
+    let mut group_index = TwoUtf8KeyGroupIndex::default();
+    let mut groups = Vec::<TwoKeyGroup>::new();
+    let mut metrics = AggregateMetrics {
+        fragments,
+        ..AggregateMetrics::default()
+    };
+
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        metrics.batches += 1;
+        metrics.rows += batch.num_rows();
+
+        let first_key = batch.column(column_index(&batch, &group_by[0])?);
+        let second_key = batch.column(column_index(&batch, &group_by[1])?);
+        let (Some(first_key), Some(second_key)) = (
+            first_key.as_any().downcast_ref::<StringArray>(),
+            second_key.as_any().downcast_ref::<StringArray>(),
+        ) else {
+            return collect_grouped_aggregates_generic(
+                stream,
+                fragments,
+                group_by,
+                aggregates,
+                Some(batch),
+                Some(metrics),
+            );
+        };
+        let aggregate_inputs = typed_fast_inputs(&batch, aggregates)?;
+
+        for row in 0..batch.num_rows() {
+            let first = first_key.is_valid(row).then(|| first_key.value(row));
+            let second = second_key.is_valid(row).then(|| second_key.value(row));
+            let group_id = group_index.group_id(first, second, &mut groups, &aggregate_inputs);
+            let group = &mut groups[group_id];
+            for (state, input) in group.states.iter_mut().zip(&aggregate_inputs) {
+                state.update(input, row);
+            }
+        }
+    }
+
+    let mut group_results = groups
+        .into_iter()
+        .map(TwoKeyGroup::finish)
+        .collect::<Vec<_>>();
+    group_results.sort_by(|left, right| compare_group_keys(&left.keys, &right.keys));
+    metrics.groups = group_results;
+    Ok(metrics)
+}
+
+#[derive(Default)]
+struct TwoUtf8KeyGroupIndex {
+    groups: AggregateHashMap<String, AggregateHashMap<String, usize>>,
+    null_first: AggregateHashMap<String, usize>,
+    null_second: AggregateHashMap<String, usize>,
+    null_both: Option<usize>,
+}
+
+impl TwoUtf8KeyGroupIndex {
+    fn group_id(
+        &mut self,
+        first: Option<&str>,
+        second: Option<&str>,
+        groups_out: &mut Vec<TwoKeyGroup>,
+        inputs: &[FastAggregateInput<'_>],
+    ) -> usize {
+        match (first, second) {
+            (Some(first), Some(second)) => {
+                if let Some(second_groups) = self.groups.get(first)
+                    && let Some(group_id) = second_groups.get(second)
+                {
+                    return *group_id;
+                }
+                let group_id = groups_out.len();
+                self.groups
+                    .entry(first.to_string())
+                    .or_default()
+                    .insert(second.to_string(), group_id);
+                groups_out.push(TwoKeyGroup::new(
+                    vec![
+                        GroupValue::Utf8(Some(first.to_string())),
+                        GroupValue::Utf8(Some(second.to_string())),
+                    ],
+                    inputs,
+                ));
+                group_id
+            }
+            (None, Some(second)) => {
+                if let Some(group_id) = self.null_first.get(second) {
+                    return *group_id;
+                }
+                let group_id = groups_out.len();
+                self.null_first.insert(second.to_string(), group_id);
+                groups_out.push(TwoKeyGroup::new(
+                    vec![
+                        GroupValue::Utf8(None),
+                        GroupValue::Utf8(Some(second.to_string())),
+                    ],
+                    inputs,
+                ));
+                group_id
+            }
+            (Some(first), None) => {
+                if let Some(group_id) = self.null_second.get(first) {
+                    return *group_id;
+                }
+                let group_id = groups_out.len();
+                self.null_second.insert(first.to_string(), group_id);
+                groups_out.push(TwoKeyGroup::new(
+                    vec![
+                        GroupValue::Utf8(Some(first.to_string())),
+                        GroupValue::Utf8(None),
+                    ],
+                    inputs,
+                ));
+                group_id
+            }
+            (None, None) => {
+                if let Some(group_id) = self.null_both {
+                    return group_id;
+                }
+                let group_id = groups_out.len();
+                self.null_both = Some(group_id);
+                groups_out.push(TwoKeyGroup::new(
+                    vec![GroupValue::Utf8(None), GroupValue::Utf8(None)],
+                    inputs,
+                ));
+                group_id
+            }
+        }
+    }
+}
+
+struct TwoKeyGroup {
+    keys: Vec<GroupValue>,
+    states: Vec<FastAggregateState>,
+}
+
+impl TwoKeyGroup {
+    fn new(keys: Vec<GroupValue>, inputs: &[FastAggregateInput<'_>]) -> Self {
+        Self {
+            keys,
+            states: inputs.iter().map(FastAggregateState::new).collect(),
+        }
+    }
+
+    fn finish(self) -> GroupAggregateResult {
+        GroupAggregateResult {
+            keys: self.keys,
+            values: self
+                .states
+                .into_iter()
+                .map(FastAggregateState::finish)
+                .collect::<Vec<_>>(),
+        }
+    }
 }
 
 fn can_use_two_key_sum_path(group_by: &[String], aggregates: &[AggregateExpr]) -> bool {
@@ -1182,6 +1367,15 @@ fn typed_fast_inputs<'a>(
                             .downcast_ref::<Float64Array>()
                             .expect("Float64 numeric input"),
                     }),
+                    DataType::Decimal128(precision, scale) => Ok(FastAggregateInput::Decimal128 {
+                        expr,
+                        values: values
+                            .as_any()
+                            .downcast_ref::<Decimal128Array>()
+                            .expect("Decimal128 numeric input"),
+                        precision: *precision,
+                        scale: *scale,
+                    }),
                     _ => Err(DodamError::UnsupportedAggregateType {
                         function: aggregate_function_name(aggregate).to_string(),
                         column: column.clone(),
@@ -1311,6 +1505,11 @@ impl FastAggregateState {
             FastAggregateInput::NumericInt32 { expr, .. }
             | FastAggregateInput::NumericInt64 { expr, .. } => numeric_fast_state(expr, false),
             FastAggregateInput::NumericFloat64 { expr, .. } => numeric_fast_state(expr, true),
+            FastAggregateInput::Decimal128 { expr, .. }
+                if matches!(expr, AggregateExpr::Sum(_) | AggregateExpr::Avg(_)) =>
+            {
+                numeric_fast_state(expr, true)
+            }
             FastAggregateInput::Date32 { expr, .. } => {
                 min_max_fast_state(expr, AggregateValue::Date32(None))
             }
@@ -1438,18 +1637,22 @@ impl FastAggregateState {
                 precision,
                 scale,
                 ..
-            } if values.is_valid(row) => {
-                if let Self::MinMax {
+            } if values.is_valid(row) => match self {
+                Self::SumFloat { sum, count, .. } | Self::AvgFloat { sum, count, .. } => {
+                    *sum += values.value(row) as f64 / decimal_scale_factor(*scale);
+                    *count += 1;
+                }
+                Self::MinMax {
                     expr, value: state, ..
-                } = self
-                {
+                } => {
                     update_min_max_value(
                         expr,
                         state,
                         AggregateValue::Decimal128(Some(values.value(row)), *precision, *scale),
                     );
                 }
-            }
+                _ => {}
+            },
             FastAggregateInput::Utf8 { values, .. } if values.is_valid(row) => {
                 if let Self::MinMax {
                     expr, value: state, ..
