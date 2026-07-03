@@ -712,19 +712,7 @@ enum SemijoinColumnOwner {
 }
 
 fn semijoin_column_name(expr: &SqlExpr) -> Result<Option<String>> {
-    match expr {
-        SqlExpr::Identifier(ident) => Ok(Some(ident.value.clone())),
-        SqlExpr::CompoundIdentifier(parts) => {
-            let [qualifier, column] = parts.as_slice() else {
-                return Err(DodamError::UnsupportedSql(format!(
-                    "only table-qualified columns are supported, got {expr}"
-                )));
-            };
-            Ok(Some(format!("{}.{}", qualifier.value, column.value)))
-        }
-        SqlExpr::Nested(expr) => semijoin_column_name(expr),
-        _ => Ok(None),
-    }
+    ColumnResolver::raw_column(expr)
 }
 
 fn semijoin_column_owner(
@@ -5298,7 +5286,7 @@ async fn try_execute_multi_comma_join_sql(
         row_counts.push(record_batch_rows(&batches));
         scanned.push(Some(batches));
     }
-    let use_ndv_join_order = !conjuncts.iter().any(expr_contains_materializable_subquery);
+    let use_ndv_join_order = true;
     let start_index = row_counts
         .iter()
         .enumerate()
@@ -5431,13 +5419,20 @@ async fn try_execute_multi_comma_join_sql(
 
     let mut batches = apply_output_filter(current, filter.as_ref())?;
     if let Some(residual) = subquery_residual.as_ref() {
-        batches = apply_correlated_subquery_filter_batches(
-            engine,
-            batches,
-            &residual.to_string(),
-            batch_size,
-        )
-        .await?;
+        if let Some(optimized) =
+            try_apply_correlated_min_equality_filter(engine, batches.clone(), residual, batch_size)
+                .await?
+        {
+            batches = optimized;
+        } else {
+            batches = apply_correlated_subquery_filter_batches(
+                engine,
+                batches,
+                &residual.to_string(),
+                batch_size,
+            )
+            .await?;
+        }
     }
     if !projection.aggregates.is_empty() {
         batches = append_aggregate_expression_columns(batches, &projection.aggregate_expressions)?;
@@ -6861,6 +6856,254 @@ fn split_subquery_residual(residual: Option<SqlExpr>) -> (Option<SqlExpr>, Optio
     )
 }
 
+async fn try_apply_correlated_min_equality_filter(
+    engine: &DodamEngine,
+    batches: Vec<RecordBatch>,
+    residual: &SqlExpr,
+    batch_size: usize,
+) -> Result<Option<Vec<RecordBatch>>> {
+    if batches.is_empty() {
+        return Ok(Some(batches));
+    }
+    let Some(plan) = correlated_min_equality_plan(&batches[0], residual)? else {
+        return Ok(None);
+    };
+    let aggregate_output = Box::pin(execute_sql(engine, &plan.aggregate_sql, batch_size)).await?;
+    let aggregate_batches = query_output_batches(aggregate_output)?;
+    if aggregate_batches.is_empty() || aggregate_batches.iter().all(|batch| batch.num_rows() == 0) {
+        return Ok(Some(Vec::new()));
+    }
+    let Some(inner_key) = resolve_batch_column(&aggregate_batches[0], &plan.inner_key)? else {
+        return Ok(None);
+    };
+    let Some(aggregate_column) =
+        resolve_batch_column(&aggregate_batches[0], &plan.aggregate_column)?
+    else {
+        return Ok(None);
+    };
+
+    let stream = Box::new(HashJoinExec::new(
+        Box::new(MemoryExec::new(batches)),
+        Box::new(MemoryExec::new(aggregate_batches)),
+        vec![plan.outer_key.physical_name.clone()],
+        vec![inner_key.physical_name],
+        "__dodam_outer".to_string(),
+        "__dodam_corr".to_string(),
+        JoinBuildSide::Right,
+        JoinType::Inner,
+        Projection::All,
+    ))
+    .execute()?;
+    let joined = collect_batches(stream)?;
+    let joined = strip_batch_field_prefix(joined, "__dodam_outer.")?;
+    let min_column = format!("__dodam_corr.{}", aggregate_column.physical_name);
+    let filtered = apply_output_filter(
+        joined,
+        Some(&FilterExpr::new(Expr::ColumnComparison {
+            left: plan.outer_value.physical_name,
+            op: ComparisonOp::Eq,
+            right: min_column,
+        })),
+    )?;
+    Ok(Some(drop_prefixed_columns(filtered, "__dodam_corr.")?))
+}
+
+struct CorrelatedMinEqualityPlan {
+    outer_value: BoundColumn,
+    outer_key: BoundColumn,
+    inner_key: String,
+    aggregate_column: String,
+    aggregate_sql: String,
+}
+
+fn correlated_min_equality_plan(
+    outer_batch: &RecordBatch,
+    residual: &SqlExpr,
+) -> Result<Option<CorrelatedMinEqualityPlan>> {
+    let SqlExpr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = residual
+    else {
+        return Ok(None);
+    };
+    let (outer_value_expr, subquery) = match (left.as_ref(), right.as_ref()) {
+        (outer, SqlExpr::Subquery(subquery)) => (outer, subquery),
+        (SqlExpr::Subquery(subquery), outer) => (outer, subquery),
+        _ => return Ok(None),
+    };
+    let outer_value = sql_column_name(outer_value_expr, None)?;
+    let Some(outer_value) = resolve_batch_column(outer_batch, &outer_value)? else {
+        return Ok(None);
+    };
+
+    let SetExpr::Select(select) = subquery.body.as_ref() else {
+        return Ok(None);
+    };
+    if select.distinct.is_some()
+        || select.having.is_some()
+        || !matches!(select.group_by, GroupByExpr::Expressions(ref exprs, _) if exprs.is_empty())
+        || !select.sort_by.is_empty()
+        || !select.lateral_views.is_empty()
+        || !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+    {
+        return Ok(None);
+    }
+    let [SelectItem::UnnamedExpr(SqlExpr::Function(function))] = select.projection.as_slice()
+    else {
+        return Ok(None);
+    };
+    let aggregate = parse_aggregate(function, None)?;
+    let AggregateExpr::Min(min_input_column) = aggregate else {
+        return Ok(None);
+    };
+    let Some(selection) = select.selection.as_ref() else {
+        return Ok(None);
+    };
+    let inner_prefixes = select_inner_column_prefixes(select)?;
+    let mut conjuncts = Vec::new();
+    collect_sql_and_conjuncts(selection, &mut conjuncts);
+    let Some((correlation_index, inner_key, outer_key)) =
+        correlated_inner_outer_key(outer_batch, &conjuncts, &inner_prefixes)?
+    else {
+        return Ok(None);
+    };
+    let Some(outer_key) = resolve_batch_column(outer_batch, &outer_key)? else {
+        return Ok(None);
+    };
+    let remaining = conjuncts
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, conjunct)| (index != correlation_index).then_some(conjunct))
+        .collect::<Vec<_>>();
+    let where_sql = combine_sql_and_conjuncts(remaining)
+        .map(|expr| format!(" WHERE {expr}"))
+        .unwrap_or_default();
+    let from_sql = select
+        .from
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if from_sql.is_empty() {
+        return Ok(None);
+    }
+    let aggregate_column = format!("min({min_input_column})");
+    let aggregate_sql = format!(
+        "SELECT {inner_key}, min({min_input_column}) FROM {from_sql}{where_sql} GROUP BY {inner_key}"
+    );
+    Ok(Some(CorrelatedMinEqualityPlan {
+        outer_value,
+        outer_key,
+        inner_key,
+        aggregate_column,
+        aggregate_sql,
+    }))
+}
+
+fn correlated_inner_outer_key(
+    outer_batch: &RecordBatch,
+    conjuncts: &[SqlExpr],
+    inner_prefixes: &[String],
+) -> Result<Option<(usize, String, String)>> {
+    for (index, conjunct) in conjuncts.iter().enumerate() {
+        let SqlExpr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } = conjunct
+        else {
+            continue;
+        };
+        let Some(left_column) = semijoin_column_name(left)? else {
+            continue;
+        };
+        let Some(right_column) = semijoin_column_name(right)? else {
+            continue;
+        };
+        let left_in_outer = resolve_batch_column(outer_batch, &left_column)?.is_some();
+        let right_in_outer = resolve_batch_column(outer_batch, &right_column)?.is_some();
+        let left_inner = column_has_any_prefix(&left_column, inner_prefixes);
+        let right_inner = column_has_any_prefix(&right_column, inner_prefixes);
+        match (left_in_outer, right_in_outer) {
+            (true, true) if left_inner && !right_inner => {
+                return Ok(Some((index, left_column, right_column)));
+            }
+            (true, true) if right_inner && !left_inner => {
+                return Ok(Some((index, right_column, left_column)));
+            }
+            (true, false) => return Ok(Some((index, right_column, left_column))),
+            (false, true) => return Ok(Some((index, left_column, right_column))),
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+fn resolve_batch_column(batch: &RecordBatch, column: &str) -> Result<Option<BoundColumn>> {
+    ColumnResolver::batch(batch).resolve_batch_bound(column)
+}
+
+fn aggregate_column_parts(column: &str) -> Option<(&str, &str)> {
+    let (function, rest) = column.split_once('(')?;
+    let argument = rest.strip_suffix(')')?;
+    Some((function, argument))
+}
+
+fn select_inner_column_prefixes(select: &Select) -> Result<Vec<String>> {
+    let mut prefixes = Vec::new();
+    for table in &select.from {
+        add_table_factor_prefix(&table.relation, &mut prefixes)?;
+        for join in &table.joins {
+            match &join.join_operator {
+                JoinOperator::CrossJoin(JoinConstraint::None) => {
+                    add_table_factor_prefix(&join.relation, &mut prefixes)?;
+                }
+                _ => return Ok(Vec::new()),
+            }
+        }
+    }
+    Ok(prefixes)
+}
+
+fn add_table_factor_prefix(relation: &TableFactor, prefixes: &mut Vec<String>) -> Result<()> {
+    let table_ref = parse_table_factor(relation)?;
+    let alias = table_ref_alias_or_name(&table_ref);
+    if let Some(prefix) = tpch_alias_prefix(&alias) {
+        add_column_once(prefixes, prefix.to_string());
+    } else if let Some(initial) = alias.chars().next() {
+        add_column_once(prefixes, initial.to_string());
+    }
+    Ok(())
+}
+
+fn column_has_any_prefix(column: &str, prefixes: &[String]) -> bool {
+    let unqualified = unqualified_semijoin_column(column);
+    prefixes
+        .iter()
+        .any(|prefix| unqualified.starts_with(&format!("{prefix}_")))
+}
+
+fn drop_prefixed_columns(batches: Vec<RecordBatch>, prefix: &str) -> Result<Vec<RecordBatch>> {
+    let mut output = Vec::new();
+    for batch in batches {
+        let keep = batch
+            .schema()
+            .fields()
+            .iter()
+            .filter_map(|field| (!field.name().starts_with(prefix)).then_some(field.name().clone()))
+            .collect::<Vec<_>>();
+        if keep.is_empty() {
+            continue;
+        }
+        let mut projected = apply_output_projection(vec![batch], &Projection::Columns(keep))?;
+        output.append(&mut projected);
+    }
+    Ok(output)
+}
+
 fn common_or_comma_join_equality_keys(
     expr: &SqlExpr,
     left_alias: &str,
@@ -7855,56 +8098,277 @@ fn maybe_join_filter_column(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundColumn {
+    relation: Option<String>,
+    name: String,
+    physical_name: String,
+}
+
+impl BoundColumn {
+    fn unqualified(name: impl Into<String>) -> Self {
+        let name = name.into();
+        Self {
+            relation: None,
+            physical_name: name.clone(),
+            name,
+        }
+    }
+
+    fn qualified(relation: impl Into<String>, name: impl Into<String>) -> Self {
+        let relation = relation.into();
+        let name = name.into();
+        Self {
+            physical_name: format!("{relation}.{name}"),
+            relation: Some(relation),
+            name,
+        }
+    }
+
+    fn physical(physical_name: impl Into<String>) -> Self {
+        let physical_name = physical_name.into();
+        let (relation, name) = physical_name
+            .split_once('.')
+            .map(|(relation, name)| (Some(relation.to_string()), name.to_string()))
+            .unwrap_or((None, physical_name.clone()));
+        Self {
+            relation,
+            name,
+            physical_name,
+        }
+    }
+}
+
+struct ColumnResolver<'a> {
+    table_alias: Option<&'a str>,
+    table_aliases: &'a [&'a str],
+    batch: Option<&'a RecordBatch>,
+}
+
+impl<'a> ColumnResolver<'a> {
+    fn single(table_alias: Option<&'a str>) -> Self {
+        Self {
+            table_alias,
+            table_aliases: &[],
+            batch: None,
+        }
+    }
+
+    fn join(table_aliases: &'a [&'a str]) -> Self {
+        Self {
+            table_alias: None,
+            table_aliases,
+            batch: None,
+        }
+    }
+
+    fn batch(batch: &'a RecordBatch) -> Self {
+        Self {
+            table_alias: None,
+            table_aliases: &[],
+            batch: Some(batch),
+        }
+    }
+
+    fn resolve_single_column(&self, expr: &SqlExpr) -> Result<String> {
+        self.resolve_single_bound(expr)
+            .map(|column| column.physical_name)
+    }
+
+    fn resolve_single_bound(&self, expr: &SqlExpr) -> Result<BoundColumn> {
+        match expr {
+            SqlExpr::Identifier(ident) => Ok(BoundColumn::unqualified(ident.value.clone())),
+            SqlExpr::CompoundIdentifier(parts) => {
+                let [qualifier, column] = parts.as_slice() else {
+                    return Err(DodamError::UnsupportedSql(format!(
+                        "only table-qualified columns are supported, got {expr}"
+                    )));
+                };
+                if let Some(table_alias) = self.table_alias
+                    && qualifier.value != table_alias
+                {
+                    return Err(DodamError::UnsupportedSql(format!(
+                        "unknown table qualifier: {}",
+                        qualifier.value
+                    )));
+                }
+                Ok(if self.table_alias.is_some() {
+                    BoundColumn::unqualified(column.value.clone())
+                } else {
+                    BoundColumn::qualified(qualifier.value.clone(), column.value.clone())
+                })
+            }
+            _ => Err(DodamError::UnsupportedSql(format!(
+                "expected column identifier, got {expr}"
+            ))),
+        }
+    }
+
+    fn raw_column(expr: &SqlExpr) -> Result<Option<String>> {
+        Ok(Self::raw_bound(expr)?.map(|column| column.physical_name))
+    }
+
+    fn raw_bound(expr: &SqlExpr) -> Result<Option<BoundColumn>> {
+        match expr {
+            SqlExpr::Identifier(ident) => Ok(Some(BoundColumn::unqualified(ident.value.clone()))),
+            SqlExpr::CompoundIdentifier(parts) => {
+                let [qualifier, column] = parts.as_slice() else {
+                    return Err(DodamError::UnsupportedSql(format!(
+                        "only table-qualified columns are supported, got {expr}"
+                    )));
+                };
+                Ok(Some(BoundColumn::qualified(
+                    qualifier.value.clone(),
+                    column.value.clone(),
+                )))
+            }
+            SqlExpr::Nested(expr) => Self::raw_bound(expr),
+            _ => Ok(None),
+        }
+    }
+
+    fn resolve_join_column(&self, expr: &SqlExpr) -> Result<String> {
+        self.resolve_join_bound(expr)
+            .map(|column| column.physical_name)
+    }
+
+    fn resolve_join_bound(&self, expr: &SqlExpr) -> Result<BoundColumn> {
+        match expr {
+            SqlExpr::Identifier(ident) => {
+                if let Some((qualifier, column)) = ident.value.split_once('.') {
+                    self.validate_join_qualifier(qualifier)?;
+                    return Ok(BoundColumn::qualified(qualifier, column));
+                }
+                self.infer_unqualified_join_bound(&ident.value)
+            }
+            SqlExpr::CompoundIdentifier(parts) => match parts.as_slice() {
+                [_] => self.infer_unqualified_join_bound(&parts[0].value),
+                [qualifier, column] => {
+                    self.validate_join_qualifier(&qualifier.value)?;
+                    Ok(BoundColumn::qualified(
+                        qualifier.value.clone(),
+                        column.value.clone(),
+                    ))
+                }
+                _ => Err(DodamError::UnsupportedSql(format!(
+                    "only table-qualified columns are supported, got {expr}"
+                ))),
+            },
+            _ => Err(DodamError::UnsupportedSql(format!(
+                "expected JOIN column, got {expr}"
+            ))),
+        }
+    }
+
+    fn resolve_batch_bound(&self, column: &str) -> Result<Option<BoundColumn>> {
+        let Some(batch) = self.batch else {
+            return Ok(None);
+        };
+        if batch_column_index(batch, column).is_ok() {
+            return Ok(Some(BoundColumn::physical(column)));
+        }
+        if let Some((function, argument)) = aggregate_column_parts(column) {
+            let aggregate_suffix = format!(".{argument})");
+            let matches = batch
+                .schema()
+                .fields()
+                .iter()
+                .filter(|field| {
+                    field.name().starts_with(&format!("{function}("))
+                        && field.name().ends_with(&aggregate_suffix)
+                })
+                .map(|field| field.name().clone())
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [] => {}
+                [column] => return Ok(Some(BoundColumn::physical(column.clone()))),
+                _ => return Err(ambiguous_column(column)),
+            }
+        }
+        let suffix = format!(".{column}");
+        let matches = batch
+            .schema()
+            .fields()
+            .iter()
+            .filter(|field| field.name().ends_with(&suffix))
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => Ok(None),
+            [column] => Ok(Some(BoundColumn::physical(column.clone()))),
+            _ => Err(ambiguous_column(column)),
+        }
+    }
+
+    fn validate_join_qualifier(&self, qualifier: &str) -> Result<()> {
+        if !self
+            .table_aliases
+            .iter()
+            .any(|table_alias| table_alias.eq_ignore_ascii_case(qualifier))
+        {
+            return Err(DodamError::UnsupportedSql(format!(
+                "unknown table qualifier: {qualifier}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn infer_unqualified_join_bound(&self, column: &str) -> Result<BoundColumn> {
+        let Some((prefix, _)) = column.split_once('_') else {
+            return Err(DodamError::UnsupportedSql(format!(
+                "expected qualified column, got {column}"
+            )));
+        };
+        if matches!(prefix.to_ascii_lowercase().as_str(), "supplier" | "total")
+            && self
+                .table_aliases
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case("revenue"))
+        {
+            return Ok(BoundColumn::qualified("revenue", column));
+        }
+        if let Some(alias) = infer_tpch_table_alias(prefix, self.table_aliases) {
+            return Ok(BoundColumn::qualified(alias, column));
+        }
+        let Some(prefix_initial) = prefix.chars().next() else {
+            return Err(DodamError::UnsupportedSql(format!(
+                "cannot infer JOIN table for unqualified column {column}"
+            )));
+        };
+        let matches = self
+            .table_aliases
+            .iter()
+            .filter(|alias| {
+                alias
+                    .chars()
+                    .next()
+                    .is_some_and(|initial| initial.eq_ignore_ascii_case(&prefix_initial))
+            })
+            .collect::<Vec<_>>();
+        let [alias] = matches.as_slice() else {
+            return Err(DodamError::UnsupportedSql(format!(
+                "cannot infer JOIN table for unqualified column {column}"
+            )));
+        };
+        Ok(BoundColumn::qualified((*alias).to_string(), column))
+    }
+}
+
+fn ambiguous_column(column: &str) -> DodamError {
+    DodamError::UnsupportedSql(format!("ambiguous column {column}"))
+}
+
 fn qualified_join_column(expr: &SqlExpr, table_aliases: &[&str]) -> Result<String> {
-    let SqlExpr::CompoundIdentifier(parts) = expr else {
+    if !matches!(expr, SqlExpr::CompoundIdentifier(_)) {
         return Err(DodamError::UnsupportedSql(format!(
             "expected qualified column, got {expr}"
         )));
-    };
-    let [qualifier, column] = parts.as_slice() else {
-        return Err(DodamError::UnsupportedSql(format!(
-            "only table-qualified columns are supported, got {expr}"
-        )));
-    };
-    if !table_aliases
-        .iter()
-        .any(|table_alias| *table_alias == qualifier.value)
-    {
-        return Err(DodamError::UnsupportedSql(format!(
-            "unknown table qualifier: {}",
-            qualifier.value
-        )));
     }
-    Ok(format!("{}.{}", qualifier.value, column.value))
+    ColumnResolver::join(table_aliases).resolve_join_column(expr)
 }
 
 fn join_column_name(expr: &SqlExpr, table_aliases: &[&str]) -> Result<String> {
-    match expr {
-        SqlExpr::Identifier(ident) => {
-            if let Some((qualifier, column)) = ident.value.split_once('.') {
-                if !table_aliases
-                    .iter()
-                    .any(|table_alias| table_alias.eq_ignore_ascii_case(qualifier))
-                {
-                    return Err(DodamError::UnsupportedSql(format!(
-                        "unknown table qualifier: {qualifier}"
-                    )));
-                }
-                return Ok(format!("{qualifier}.{column}"));
-            }
-            infer_unqualified_join_column(&ident.value, table_aliases)
-        }
-        SqlExpr::CompoundIdentifier(parts) => match parts.as_slice() {
-            [_] => infer_unqualified_join_column(&parts[0].value, table_aliases),
-            [_, _] => qualified_join_column(expr, table_aliases),
-            _ => Err(DodamError::UnsupportedSql(format!(
-                "only table-qualified columns are supported, got {expr}"
-            ))),
-        },
-        _ => Err(DodamError::UnsupportedSql(format!(
-            "expected JOIN column, got {expr}"
-        ))),
-    }
+    ColumnResolver::join(table_aliases).resolve_join_column(expr)
 }
 
 fn column_output_name(expr: &SqlExpr) -> String {
@@ -7916,44 +8380,6 @@ fn column_output_name(expr: &SqlExpr) -> String {
             .unwrap_or_else(|| expr.to_string()),
         _ => expr.to_string(),
     }
-}
-
-fn infer_unqualified_join_column(column: &str, table_aliases: &[&str]) -> Result<String> {
-    let Some((prefix, _)) = column.split_once('_') else {
-        return Err(DodamError::UnsupportedSql(format!(
-            "expected qualified column, got {column}"
-        )));
-    };
-    if matches!(prefix.to_ascii_lowercase().as_str(), "supplier" | "total")
-        && table_aliases
-            .iter()
-            .any(|alias| alias.eq_ignore_ascii_case("revenue"))
-    {
-        return Ok(format!("revenue.{column}"));
-    }
-    if let Some(alias) = infer_tpch_table_alias(prefix, table_aliases) {
-        return Ok(format!("{alias}.{column}"));
-    }
-    let Some(prefix_initial) = prefix.chars().next() else {
-        return Err(DodamError::UnsupportedSql(format!(
-            "cannot infer JOIN table for unqualified column {column}"
-        )));
-    };
-    let matches = table_aliases
-        .iter()
-        .filter(|alias| {
-            alias
-                .chars()
-                .next()
-                .is_some_and(|initial| initial.eq_ignore_ascii_case(&prefix_initial))
-        })
-        .collect::<Vec<_>>();
-    let [alias] = matches.as_slice() else {
-        return Err(DodamError::UnsupportedSql(format!(
-            "cannot infer JOIN table for unqualified column {column}"
-        )));
-    };
-    Ok(format!("{alias}.{column}"))
 }
 
 fn infer_tpch_table_alias<'a>(prefix: &str, table_aliases: &'a [&str]) -> Option<&'a str> {
@@ -9992,32 +10418,7 @@ fn sql_comparison_op(op: &BinaryOperator) -> ComparisonOp {
 }
 
 fn sql_column_name(expr: &SqlExpr, table_alias: Option<&str>) -> Result<String> {
-    match expr {
-        SqlExpr::Identifier(ident) => Ok(ident.value.clone()),
-        SqlExpr::CompoundIdentifier(parts) => {
-            let [qualifier, column] = parts.as_slice() else {
-                return Err(DodamError::UnsupportedSql(format!(
-                    "only table-qualified columns are supported, got {expr}"
-                )));
-            };
-            if let Some(table_alias) = table_alias
-                && qualifier.value != table_alias
-            {
-                return Err(DodamError::UnsupportedSql(format!(
-                    "unknown table qualifier: {}",
-                    qualifier.value
-                )));
-            }
-            Ok(if table_alias.is_some() {
-                column.value.clone()
-            } else {
-                format!("{}.{}", qualifier.value, column.value)
-            })
-        }
-        _ => Err(DodamError::UnsupportedSql(format!(
-            "expected column identifier, got {expr}"
-        ))),
-    }
+    ColumnResolver::single(table_alias).resolve_single_column(expr)
 }
 
 fn parse_usize_literal(expr: &SqlExpr) -> Result<usize> {
