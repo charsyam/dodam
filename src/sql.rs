@@ -4650,6 +4650,7 @@ async fn try_execute_q09_product_type_profit_fast(
     if part_keys.is_empty() {
         return Ok(Some(q09_output(Vec::new())?));
     }
+    let part_keys = adaptive_i64_set_from_hash(part_keys);
     let stage = tpch_profile_start();
     let nation_names = q10_nation_names(engine, nation.path, batch_size).await?;
     tpch_profile_elapsed("Q09 nation names", stage);
@@ -4913,7 +4914,7 @@ async fn q09_supply_costs(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-    part_keys: &HashSet<i64>,
+    part_keys: &AdaptiveI64Set,
 ) -> Result<HashMap<(i64, i64), f64>> {
     let mut stream = engine
         .scan_parquet_batches(
@@ -4940,7 +4941,7 @@ async fn q09_supply_costs(
 
 fn q09_supply_costs_batch(
     batch: RecordBatch,
-    part_keys: &HashSet<i64>,
+    part_keys: &AdaptiveI64Set,
 ) -> Result<HashMap<(i64, i64), f64>> {
     let partkeys = batch_column(&batch, "ps_partkey")?;
     let suppkeys = batch_column(&batch, "ps_suppkey")?;
@@ -4957,7 +4958,7 @@ fn q09_supply_costs_batch(
         ) else {
             continue;
         };
-        if part_keys.contains(&partkey) {
+        if part_keys.contains(partkey) {
             costs.insert((partkey, suppkey), supplycost);
         }
     }
@@ -4968,7 +4969,7 @@ fn q09_supply_costs_batch_typed(
     partkeys: &ArrayRef,
     suppkeys: &ArrayRef,
     supplycosts: &ArrayRef,
-    part_keys: &HashSet<i64>,
+    part_keys: &AdaptiveI64Set,
 ) -> Result<Option<HashMap<(i64, i64), f64>>> {
     let (Some(partkeys), Some(suppkeys), Some(supplycosts)) = (
         partkeys.as_any().downcast_ref::<Int64Array>(),
@@ -4983,7 +4984,7 @@ fn q09_supply_costs_batch_typed(
             continue;
         }
         let partkey = partkeys.value(row);
-        if part_keys.contains(&partkey) {
+        if part_keys.contains(partkey) {
             costs.insert((partkey, suppkeys.value(row)), supplycosts.value(row));
         }
     }
@@ -5000,7 +5001,7 @@ async fn q09_profit_rows(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-    part_keys: &HashSet<i64>,
+    part_keys: &AdaptiveI64Set,
     supplier_nations: &HashMap<i64, i64>,
     nation_names: &HashMap<i64, String>,
     order_years: Q09OrderYears,
@@ -5061,7 +5062,7 @@ async fn q09_profit_rows(
 
 fn q09_profit_batch(
     batch: RecordBatch,
-    part_keys: &HashSet<i64>,
+    part_keys: &AdaptiveI64Set,
     supplier_nations: &HashMap<i64, i64>,
     order_years: &Q09OrderYears,
     supply_costs: &HashMap<(i64, i64), f64>,
@@ -5095,7 +5096,7 @@ fn q09_profit_batch(
         ) else {
             continue;
         };
-        if !part_keys.contains(&partkey) {
+        if !part_keys.contains(partkey) {
             continue;
         }
         let (Some(o_year), Some(nationkey), Some(supplycost)) = (
@@ -5125,7 +5126,7 @@ fn q09_profit_decimal_batch(
     quantities: &ArrayRef,
     extendedprices: &ArrayRef,
     discounts: &ArrayRef,
-    part_keys: &HashSet<i64>,
+    part_keys: &AdaptiveI64Set,
     supplier_nations: &HashMap<i64, i64>,
     order_years: &Q09OrderYears,
     supply_costs: &HashMap<(i64, i64), f64>,
@@ -5161,7 +5162,7 @@ fn q09_profit_decimal_batch(
             continue;
         }
         let partkey = partkeys.value(row);
-        if !part_keys.contains(&partkey) {
+        if !part_keys.contains(partkey) {
             continue;
         }
         let orderkey = orderkeys.value(row);
@@ -9713,7 +9714,7 @@ async fn q08_market_share_rows(
         )
         .await?;
     let order_years = Arc::new(order_years.clone());
-    let part_keys = Arc::new(part_keys.clone());
+    let part_keys = Arc::new(adaptive_i64_set_from_hash(part_keys.clone()));
     let supplier_nations = Arc::new(supplier_nations.clone());
     let groups = parallel_batch_fold_chunks(
         &mut stream,
@@ -9746,7 +9747,7 @@ async fn q08_market_share_rows(
 fn q08_market_share_batch(
     batch: RecordBatch,
     order_years: &HashMap<i64, i32>,
-    part_keys: &HashSet<i64>,
+    part_keys: &AdaptiveI64Set,
     supplier_nations: &HashMap<i64, String>,
 ) -> Result<HashMap<i32, (f64, f64)>> {
     let orderkeys = batch_column(&batch, "l_orderkey")?;
@@ -9778,7 +9779,7 @@ fn q08_market_share_batch(
         let Some(o_year) = order_years.get(&orderkey).copied() else {
             continue;
         };
-        if !part_keys.contains(&partkey) {
+        if !part_keys.contains(partkey) {
             continue;
         }
         let Some(nation) = supplier_nations.get(&suppkey) else {
@@ -9807,7 +9808,7 @@ fn q08_market_share_batch_typed(
     extendedprices: &ArrayRef,
     discounts: &ArrayRef,
     order_years: &HashMap<i64, i32>,
-    part_keys: &HashSet<i64>,
+    part_keys: &AdaptiveI64Set,
     supplier_nations: &HashMap<i64, String>,
 ) -> Result<Option<HashMap<i32, (f64, f64)>>> {
     let (Some(orderkeys), Some(partkeys), Some(suppkeys), Some(extendedprices), Some(discounts)) = (
@@ -9830,7 +9831,7 @@ fn q08_market_share_batch_typed(
             let Some(o_year) = order_years.get(&orderkeys.value(row)).copied() else {
                 continue;
             };
-            if !part_keys.contains(&partkeys.value(row)) {
+            if !part_keys.contains(partkeys.value(row)) {
                 continue;
             }
             let Some(nation) = supplier_nations.get(&suppkeys.value(row)) else {
@@ -9857,7 +9858,7 @@ fn q08_market_share_batch_typed(
         let Some(o_year) = order_years.get(&orderkeys.value(row)).copied() else {
             continue;
         };
-        if !part_keys.contains(&partkeys.value(row)) {
+        if !part_keys.contains(partkeys.value(row)) {
             continue;
         }
         let Some(nation) = supplier_nations.get(&suppkeys.value(row)) else {
@@ -10023,7 +10024,7 @@ async fn q17_lineitem_revenue_from_matching_parts(
         )
         .await?;
     let part_key_count = part_keys.len();
-    let part_keys = Arc::new(part_keys.clone());
+    let part_keys = Arc::new(adaptive_i64_set_from_hash(part_keys.clone()));
     let (states, candidate_rows) = parallel_batch_fold(
         &mut stream,
         move |batch| q17_lineitem_revenue_batch(batch, &part_keys),
@@ -10055,7 +10056,7 @@ type Q17LineitemPartial = (HashMap<i64, (f64, u64)>, Vec<(i64, f64, f64)>);
 
 fn q17_lineitem_revenue_batch(
     batch: RecordBatch,
-    part_keys: &HashSet<i64>,
+    part_keys: &AdaptiveI64Set,
 ) -> Result<Q17LineitemPartial> {
     let partkeys = batch_column(&batch, "l_partkey")?;
     let quantities = batch_column(&batch, "l_quantity")?;
@@ -10071,7 +10072,7 @@ fn q17_lineitem_revenue_batch(
         let Some(partkey) = numeric_i64_value(partkeys, row)? else {
             continue;
         };
-        if !part_keys.contains(&partkey) {
+        if !part_keys.contains(partkey) {
             continue;
         }
         let (Some(quantity), Some(extendedprice)) = (
@@ -10092,7 +10093,7 @@ fn q17_lineitem_revenue_batch_typed(
     partkeys: &ArrayRef,
     quantities: &ArrayRef,
     extendedprices: &ArrayRef,
-    part_keys: &HashSet<i64>,
+    part_keys: &AdaptiveI64Set,
 ) -> Result<Option<Q17LineitemPartial>> {
     let (Some(partkeys), Some(quantities), Some(extendedprices)) = (
         partkeys.as_any().downcast_ref::<Int64Array>(),
@@ -10108,7 +10109,7 @@ fn q17_lineitem_revenue_batch_typed(
             continue;
         }
         let partkey = partkeys.value(row);
-        if !part_keys.contains(&partkey) {
+        if !part_keys.contains(partkey) {
             continue;
         }
         let quantity = quantities.value(row);
