@@ -323,6 +323,11 @@ Effective or retained:
   - Changed Q18 order/customer membership checks from `HashSet<i64>` probes to `AdaptiveI64Set`, so dense key fixtures use vector membership during scan.
   - Added a typed `Int64` customer-key loop in Q18 customer-name lookup to avoid generic numeric conversion per row.
   - Q18 focused median improved from about `0.102s` after scan chunking to about `0.096s`; full SF=1 TPC-H Parquet COPY sum-of-medians improved slightly to about `1.221s` Dodam / `1.087s` DuckDB (`1.12x`).
+- Q01 raw decimal read cleanup:
+  - Changed Q01's non-null typed loop to read `Decimal128` raw value slices once per batch and multiply by reciprocal scale, instead of calling the decimal accessor for each aggregate input per row.
+  - This is different from the earlier rejected raw-product experiment: it keeps the same f64 arithmetic path and only removes repeated Arrow accessor/scale work.
+  - Q01 focused aggregate profile improved from about `58ms` to about `51ms`, and standalone Parquet COPY median improved from about `0.074s` to about `0.063s`.
+  - Full SF=1 TPC-H Parquet COPY sum-of-medians improved to about `1.211s` Dodam / `1.088s` DuckDB (`1.11x`).
 
 Tried and rejected or neutral:
 
@@ -526,10 +531,10 @@ Tried and rejected or neutral:
 
 ### 5. TPC-H Remaining Performance Gaps
 
-- Current SF=1 Parquet COPY 22-query comparison is about `1.12x` Dodam/DuckDB by sum of medians.
+- Current SF=1 Parquet COPY 22-query comparison is about `1.11x` Dodam/DuckDB by sum of medians.
 - Biggest remaining slow queries after row-group chunking:
   - Q18: about `1.54x`; still dominated by the lineitem order-quantity aggregate step rather than output write.
-  - Q01: about `1.44x`; scan + two-key grouped aggregate still slower than DuckDB.
+  - Q01: about `1.43x`; scan + two-key grouped aggregate still slower than DuckDB.
   - Q06: about `1.37x`; narrow scan/filter/expression aggregate still has engine overhead after chunking.
   - Q16/Q10/Q21 remain around `1.17x-1.25x`.
 - Several queries are now faster than DuckDB on this fixture, including Q02, Q11, Q13, Q14, Q17, Q19, and Q20.

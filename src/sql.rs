@@ -3275,30 +3275,32 @@ fn q01_update_decimal_batch(
         let returnflag_data = returnflags.value_data();
         let linestatus_offsets = linestatuses.value_offsets();
         let linestatus_data = linestatuses.value_data();
+        let quantity_values = quantities.raw_values();
+        let extendedprice_values = extendedprices.raw_values();
+        let discount_values = discounts.raw_values();
+        let tax_values = taxes.raw_values();
+        let quantity_scale = 1.0 / quantities.scale;
+        let extendedprice_scale = 1.0 / extendedprices.scale;
+        let discount_scale = 1.0 / discounts.scale;
+        let tax_scale = 1.0 / taxes.scale;
         for row in 0..shipdates.len() {
             if shipdates.value(row) > cutoff_days {
                 continue;
             }
+            let quantity = quantity_values[row] as f64 * quantity_scale;
+            let extendedprice = extendedprice_values[row] as f64 * extendedprice_scale;
+            let discount = discount_values[row] as f64 * discount_scale;
+            let tax = tax_values[row] as f64 * tax_scale;
             if let (Some(returnflag), Some(linestatus)) = (
                 single_byte_string_parts(returnflag_offsets, returnflag_data, row),
                 single_byte_string_parts(linestatus_offsets, linestatus_data, row),
             ) {
                 groups.update_key(returnflag, linestatus, |state| {
-                    state.update(
-                        quantities.value(row),
-                        extendedprices.value(row),
-                        discounts.value(row),
-                        taxes.value(row),
-                    );
+                    state.update(quantity, extendedprice, discount, tax);
                 });
             } else {
                 groups.update(returnflags.value(row), linestatuses.value(row), |state| {
-                    state.update(
-                        quantities.value(row),
-                        extendedprices.value(row),
-                        discounts.value(row),
-                        taxes.value(row),
-                    );
+                    state.update(quantity, extendedprice, discount, tax);
                 });
             }
         }
