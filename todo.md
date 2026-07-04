@@ -335,6 +335,10 @@ Effective or retained:
     - partsupp supplier counts about `28.8ms` to `15.1ms`
     - standalone Parquet COPY median about `0.061s` to `0.045s`
   - Full SF=1 TPC-H sampled Q16 improved from about `0.0485s` to about `0.0463s`, while total 22-query sum stayed noise-sensitive around `1.11-1.12x`.
+- Generalized adaptive dense integer probes:
+  - Moved `AdaptiveI64Set` and `AdaptiveI64Map` out of `sql.rs` into a shared `dense` module.
+  - The common rule is now reusable by future operators and fast paths: use vector-backed lookup for non-negative dense `i64` domains up to the configured bound, and fall back to `HashSet`/`HashMap` for sparse or negative keys.
+  - Q16 focused median stayed around `0.047s` after extraction, so this was a structural cleanup rather than a performance regression.
 
 Tried and rejected or neutral:
 

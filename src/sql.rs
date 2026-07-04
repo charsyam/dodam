@@ -25,6 +25,7 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
+use crate::dense::{AdaptiveI64Map, AdaptiveI64Set, adaptive_dense_index};
 use crate::engine::{DodamEngine, JoinAlgorithm, JoinParquetRequest};
 use crate::error::{DodamError, Result};
 use crate::execution::JoinType;
@@ -56,248 +57,6 @@ fn tpch_profile_elapsed(label: &str, started: Option<Instant>) {
 }
 
 const DEFAULT_MAX_DENSE_I64_KEY: usize = 20_000_000;
-
-#[derive(Clone)]
-enum AdaptiveI64Set {
-    Dense { contains: Vec<bool>, len: usize },
-    Hash(HashSet<i64>),
-}
-
-impl AdaptiveI64Set {
-    fn new_dense() -> Self {
-        Self::Dense {
-            contains: Vec::new(),
-            len: 0,
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    fn len(&self) -> usize {
-        match self {
-            Self::Dense { len, .. } => *len,
-            Self::Hash(keys) => keys.len(),
-        }
-    }
-
-    fn contains(&self, key: i64) -> bool {
-        match self {
-            Self::Dense { contains, .. } => usize::try_from(key)
-                .ok()
-                .and_then(|index| contains.get(index))
-                .copied()
-                .unwrap_or(false),
-            Self::Hash(keys) => keys.contains(&key),
-        }
-    }
-
-    fn insert(&mut self, key: i64) {
-        match self {
-            Self::Dense { contains, len } => {
-                let Some(index) = adaptive_dense_index(key, DEFAULT_MAX_DENSE_I64_KEY) else {
-                    let mut keys = adaptive_i64_set_dense_to_hash(contains);
-                    keys.insert(key);
-                    *self = Self::Hash(keys);
-                    return;
-                };
-                if index >= contains.len() {
-                    contains.resize(index + 1, false);
-                }
-                if !contains[index] {
-                    contains[index] = true;
-                    *len += 1;
-                }
-            }
-            Self::Hash(keys) => {
-                keys.insert(key);
-            }
-        }
-    }
-}
-
-fn adaptive_i64_set_dense_to_hash(contains: &[bool]) -> HashSet<i64> {
-    contains
-        .iter()
-        .copied()
-        .enumerate()
-        .filter_map(|(key, contains)| contains.then_some(key as i64))
-        .collect()
-}
-
-fn adaptive_i64_set_from_hash(values: HashSet<i64>) -> AdaptiveI64Set {
-    if values.is_empty() {
-        return AdaptiveI64Set::new_dense();
-    }
-    let mut max_key = 0_usize;
-    for key in values.iter().copied() {
-        let Some(index) = adaptive_dense_index(key, DEFAULT_MAX_DENSE_I64_KEY) else {
-            return AdaptiveI64Set::Hash(values);
-        };
-        max_key = max_key.max(index);
-    }
-    let mut contains = vec![false; max_key + 1];
-    let mut len = 0_usize;
-    for key in values {
-        let index = usize::try_from(key).expect("validated dense key");
-        if !contains[index] {
-            contains[index] = true;
-            len += 1;
-        }
-    }
-    AdaptiveI64Set::Dense { contains, len }
-}
-
-enum AdaptiveI64Map<V> {
-    Dense {
-        values: Vec<V>,
-        present: Vec<bool>,
-        len: usize,
-    },
-    Hash(HashMap<i64, V>),
-}
-
-impl<V> AdaptiveI64Map<V>
-where
-    V: Copy + Default,
-{
-    fn new_dense() -> Self {
-        Self::Dense {
-            values: Vec::new(),
-            present: Vec::new(),
-            len: 0,
-        }
-    }
-
-    fn get(&self, key: i64) -> Option<V> {
-        match self {
-            Self::Dense {
-                values, present, ..
-            } => {
-                let index = usize::try_from(key).ok()?;
-                present
-                    .get(index)
-                    .copied()
-                    .filter(|present| *present)
-                    .map(|_| values[index])
-            }
-            Self::Hash(values) => values.get(&key).copied(),
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        match self {
-            Self::Dense { len, .. } => *len == 0,
-            Self::Hash(values) => values.is_empty(),
-        }
-    }
-
-    fn insert(&mut self, key: i64, value: V) {
-        match self {
-            Self::Dense {
-                values,
-                present,
-                len,
-            } => {
-                let Some(index) = adaptive_dense_index(key, DEFAULT_MAX_DENSE_I64_KEY) else {
-                    let mut hash = adaptive_i64_map_dense_to_hash(values, present);
-                    hash.insert(key, value);
-                    *self = Self::Hash(hash);
-                    return;
-                };
-                if index >= values.len() {
-                    values.resize(index + 1, V::default());
-                    present.resize(index + 1, false);
-                }
-                if !present[index] {
-                    present[index] = true;
-                    *len += 1;
-                }
-                values[index] = value;
-            }
-            Self::Hash(values) => {
-                values.insert(key, value);
-            }
-        }
-    }
-
-    fn update<Init, Update>(&mut self, key: i64, init: Init, update: Update)
-    where
-        Init: FnOnce() -> V,
-        Update: FnOnce(&mut V),
-    {
-        match self {
-            Self::Dense {
-                values,
-                present,
-                len,
-            } => {
-                let Some(index) = adaptive_dense_index(key, DEFAULT_MAX_DENSE_I64_KEY) else {
-                    let mut hash = adaptive_i64_map_dense_to_hash(values, present);
-                    let entry = hash.entry(key).or_insert_with(init);
-                    update(entry);
-                    *self = Self::Hash(hash);
-                    return;
-                };
-                if index >= values.len() {
-                    values.resize(index + 1, V::default());
-                    present.resize(index + 1, false);
-                }
-                if !present[index] {
-                    values[index] = init();
-                    present[index] = true;
-                    *len += 1;
-                }
-                update(&mut values[index]);
-            }
-            Self::Hash(values) => {
-                let entry = values.entry(key).or_insert_with(init);
-                update(entry);
-            }
-        }
-    }
-
-    fn into_filtered_hash<P>(self, predicate: P) -> HashMap<i64, V>
-    where
-        P: Fn(V) -> bool,
-    {
-        match self {
-            Self::Dense {
-                values, present, ..
-            } => values
-                .into_iter()
-                .zip(present)
-                .enumerate()
-                .filter_map(|(key, (value, present))| {
-                    (present && predicate(value)).then_some((key as i64, value))
-                })
-                .collect(),
-            Self::Hash(values) => values
-                .into_iter()
-                .filter(|(_, value)| predicate(*value))
-                .collect(),
-        }
-    }
-}
-
-fn adaptive_i64_map_dense_to_hash<V>(values: &[V], present: &[bool]) -> HashMap<i64, V>
-where
-    V: Copy,
-{
-    values
-        .iter()
-        .copied()
-        .zip(present.iter().copied())
-        .enumerate()
-        .filter_map(|(key, (value, present))| present.then_some((key as i64, value)))
-        .collect()
-}
-
-fn adaptive_dense_index(key: i64, max_dense_key: usize) -> Option<usize> {
-    let index = usize::try_from(key).ok()?;
-    (index <= max_dense_key).then_some(index)
-}
 
 struct DenseI64F64Sum {
     dense: Vec<f64>,
@@ -4662,7 +4421,7 @@ async fn try_execute_q09_product_type_profit_fast(
     if part_keys.is_empty() {
         return Ok(Some(q09_output(Vec::new())?));
     }
-    let part_keys = adaptive_i64_set_from_hash(part_keys);
+    let part_keys = AdaptiveI64Set::from_hash(part_keys);
     let stage = tpch_profile_start();
     let nation_names = q10_nation_names(engine, nation.path, batch_size).await?;
     tpch_profile_elapsed("Q09 nation names", stage);
@@ -5553,7 +5312,7 @@ async fn try_execute_q16_parts_supplier_relationship_fast(
     let Some(sizes) = numeric_in_i64_literals(&conjuncts, "p_size")? else {
         return Ok(None);
     };
-    let sizes = adaptive_i64_set_from_hash(sizes);
+    let sizes = AdaptiveI64Set::from_hash(sizes);
     let Some(comment_parts) = like_substrings_literal(selection, "s_comment")? else {
         return Ok(None);
     };
@@ -5863,7 +5622,7 @@ async fn q16_part_groups(
     }
     Ok(Q16PartGroups {
         groups,
-        part_to_group: adaptive_i64_map_from_hash(part_to_group),
+        part_to_group: AdaptiveI64Map::from_hash(part_to_group),
     })
 }
 
@@ -5892,7 +5651,7 @@ async fn q16_supplier_counts(
         .await?;
     let groups = part_groups.groups;
     let part_to_group = Arc::new(part_groups.part_to_group);
-    let bad_suppliers = Arc::new(adaptive_i64_set_from_hash(bad_suppliers));
+    let bad_suppliers = Arc::new(AdaptiveI64Set::from_hash(bad_suppliers));
     let supplier_sets = parallel_batch_fold(
         &mut stream,
         move |batch| q16_supplier_counts_batch(batch, &part_to_group, &bad_suppliers),
@@ -7096,7 +6855,7 @@ async fn q03_order_rows(
             None,
         )
         .await?;
-    let customers = Arc::new(adaptive_i64_set_from_hash(customers.clone()));
+    let customers = Arc::new(AdaptiveI64Set::from_hash(customers.clone()));
     parallel_batch_fold_chunks(
         &mut stream,
         1,
@@ -7386,38 +7145,6 @@ fn merge_f64_groups<K: Eq + std::hash::Hash>(groups: &mut HashMap<K, f64>, batch
 
 fn merge_maps<K: Eq + std::hash::Hash, V>(output: &mut HashMap<K, V>, batch: HashMap<K, V>) {
     output.extend(batch);
-}
-
-fn adaptive_i64_map_from_hash<V>(values: HashMap<i64, V>) -> AdaptiveI64Map<V>
-where
-    V: Copy + Default,
-{
-    if values.is_empty() {
-        return AdaptiveI64Map::new_dense();
-    }
-    let mut max_key = 0_usize;
-    for key in values.keys().copied() {
-        let Some(index) = adaptive_dense_index(key, DEFAULT_MAX_DENSE_I64_KEY) else {
-            return AdaptiveI64Map::Hash(values);
-        };
-        max_key = max_key.max(index);
-    }
-    let mut dense_values = vec![V::default(); max_key + 1];
-    let mut present = vec![false; max_key + 1];
-    let mut len = 0_usize;
-    for (key, value) in values {
-        let index = usize::try_from(key).expect("validated dense key");
-        if !present[index] {
-            present[index] = true;
-            len += 1;
-        }
-        dense_values[index] = value;
-    }
-    AdaptiveI64Map::Dense {
-        values: dense_values,
-        present,
-        len,
-    }
 }
 
 fn merge_sets<K: Eq + std::hash::Hash>(output: &mut HashSet<K>, batch: HashSet<K>) {
@@ -8149,7 +7876,7 @@ async fn q05_order_customer_nations(
             None,
         )
         .await?;
-    let customer_nations = Arc::new(adaptive_i64_map_from_hash(customer_nations.clone()));
+    let customer_nations = Arc::new(AdaptiveI64Map::from_hash(customer_nations.clone()));
     parallel_batch_fold_chunks(
         &mut stream,
         4,
@@ -8285,7 +8012,7 @@ async fn q05_revenue_by_nation(
         )
         .await?;
     let order_customer_nations = Arc::new(order_customer_nations.clone());
-    let supplier_nations = Arc::new(adaptive_i64_map_from_hash(supplier_nations.clone()));
+    let supplier_nations = Arc::new(AdaptiveI64Map::from_hash(supplier_nations.clone()));
     let groups = parallel_batch_fold_chunks(
         &mut stream,
         2,
@@ -9004,7 +8731,7 @@ async fn q07_order_customers(
             None,
         )
         .await?;
-    let customer_nations = Arc::new(adaptive_i64_map_from_hash(customer_nations.clone()));
+    let customer_nations = Arc::new(AdaptiveI64Map::from_hash(customer_nations.clone()));
     parallel_batch_fold_chunks(
         &mut stream,
         4,
@@ -9111,7 +8838,7 @@ async fn q07_volume_rows(
             None,
         )
         .await?;
-    let supplier_nations = Arc::new(adaptive_i64_map_from_hash(supplier_nations.clone()));
+    let supplier_nations = Arc::new(AdaptiveI64Map::from_hash(supplier_nations.clone()));
     let order_customer_nations = Arc::new(order_customer_nations.clone());
     let groups = parallel_batch_fold_chunks(
         &mut stream,
@@ -9572,7 +9299,7 @@ async fn q08_order_years(
             None,
         )
         .await?;
-    let customer_nations = Arc::new(adaptive_i64_map_from_hash(customer_nations.clone()));
+    let customer_nations = Arc::new(AdaptiveI64Map::from_hash(customer_nations.clone()));
     parallel_batch_fold_chunks(
         &mut stream,
         4,
@@ -9737,7 +9464,7 @@ async fn q08_market_share_rows(
         )
         .await?;
     let order_years = Arc::new(order_years.clone());
-    let part_keys = Arc::new(adaptive_i64_set_from_hash(part_keys.clone()));
+    let part_keys = Arc::new(AdaptiveI64Set::from_hash(part_keys.clone()));
     let supplier_nations = Arc::new(supplier_nations.clone());
     let groups = parallel_batch_fold_chunks(
         &mut stream,
@@ -10047,7 +9774,7 @@ async fn q17_lineitem_revenue_from_matching_parts(
         )
         .await?;
     let part_key_count = part_keys.len();
-    let part_keys = Arc::new(adaptive_i64_set_from_hash(part_keys.clone()));
+    let part_keys = Arc::new(AdaptiveI64Set::from_hash(part_keys.clone()));
     let (states, candidate_rows) = parallel_batch_fold(
         &mut stream,
         move |batch| q17_lineitem_revenue_batch(batch, &part_keys),
@@ -10678,7 +10405,7 @@ async fn try_execute_q18_large_volume_customer_fast(
         return Ok(Some(q18_output(Vec::new())?));
     }
     let qualifying_order_keys =
-        adaptive_i64_set_from_hash(order_quantity_sums.keys().copied().collect::<HashSet<_>>());
+        AdaptiveI64Set::from_hash(order_quantity_sums.keys().copied().collect::<HashSet<_>>());
     let stage = tpch_profile_start();
     let order_rows =
         q18_qualifying_orders(engine, orders.path, batch_size, &qualifying_order_keys).await?;
@@ -10687,7 +10414,7 @@ async fn try_execute_q18_large_volume_customer_fast(
         .values()
         .map(|order| order.custkey)
         .collect::<HashSet<_>>();
-    let customer_keys = adaptive_i64_set_from_hash(customer_keys);
+    let customer_keys = AdaptiveI64Set::from_hash(customer_keys);
     let stage = tpch_profile_start();
     let customer_names =
         q18_customer_names(engine, customer.path, batch_size, &customer_keys).await?;
@@ -12249,7 +11976,7 @@ async fn try_execute_q20_potential_part_promotion_fast(
     if forest_parts.is_empty() {
         return Ok(Some(q20_output(Vec::new())?));
     }
-    let forest_parts = adaptive_i64_set_from_hash(forest_parts);
+    let forest_parts = AdaptiveI64Set::from_hash(forest_parts);
     let stage = tpch_profile_start();
     let lineitem_sums =
         q20_lineitem_quantity_sums(engine, lineitem_path, batch_size, &forest_parts).await?;
