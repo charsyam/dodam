@@ -2664,9 +2664,6 @@ struct Q01State {
     sum_disc_price: f64,
     sum_charge: f64,
     sum_discount: f64,
-    qty_count: u64,
-    price_count: u64,
-    discount_count: u64,
     count_order: u64,
 }
 
@@ -2678,9 +2675,6 @@ impl Q01State {
         self.sum_disc_price += discounted;
         self.sum_charge += discounted * (1.0 + tax);
         self.sum_discount += discount;
-        self.qty_count += 1;
-        self.price_count += 1;
-        self.discount_count += 1;
         self.count_order += 1;
     }
 
@@ -2690,9 +2684,6 @@ impl Q01State {
         self.sum_disc_price += other.sum_disc_price;
         self.sum_charge += other.sum_charge;
         self.sum_discount += other.sum_discount;
-        self.qty_count += other.qty_count;
-        self.price_count += other.price_count;
-        self.discount_count += other.discount_count;
         self.count_order += other.count_order;
     }
 }
@@ -3211,13 +3202,13 @@ fn q01_output(rows: Vec<Q01Row>) -> Result<QueryOutput> {
             )),
             Arc::new(Float64Array::from_iter_values(
                 rows.iter()
-                    .map(|row| row.state.sum_qty / row.state.qty_count as f64),
+                    .map(|row| row.state.sum_qty / row.state.count_order as f64),
             )),
             Arc::new(Float64Array::from_iter_values(rows.iter().map(|row| {
-                row.state.sum_base_price / row.state.price_count as f64
+                row.state.sum_base_price / row.state.count_order as f64
             }))),
             Arc::new(Float64Array::from_iter_values(rows.iter().map(|row| {
-                row.state.sum_discount / row.state.discount_count as f64
+                row.state.sum_discount / row.state.count_order as f64
             }))),
             Arc::new(UInt64Array::from_iter_values(
                 rows.iter().map(|row| row.state.count_order),
