@@ -635,6 +635,7 @@ dependencies = [
  "arrow-ord",
  "arrow-row",
  "arrow-select",
+ "bytes",
  "clap",
  "criterion",
  "itoa",

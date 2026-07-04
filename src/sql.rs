@@ -61,6 +61,9 @@ const DEFAULT_MAX_DENSE_I64_KEY: usize = 20_000_000;
 struct DenseI64F64Sum {
     dense: Vec<f64>,
     fallback: Option<AdaptiveI64Map<f64>>,
+    threshold: Option<f64>,
+    threshold_candidates: Vec<i64>,
+    all_non_negative: bool,
 }
 
 impl DenseI64F64Sum {
@@ -68,12 +71,32 @@ impl DenseI64F64Sum {
         Self {
             dense: Vec::new(),
             fallback: None,
+            threshold: None,
+            threshold_candidates: Vec::new(),
+            all_non_negative: true,
+        }
+    }
+
+    fn new_tracking_threshold(threshold: f64) -> Self {
+        Self {
+            threshold: Some(threshold),
+            ..Self::new()
         }
     }
 
     fn add_dense_index(&mut self, index: usize, value: f64) {
         debug_assert!(self.fallback.is_none());
+        if value < 0.0 {
+            self.all_non_negative = false;
+        }
+        let previous = self.dense[index];
         self.dense[index] += value;
+        if let Some(threshold) = self.threshold
+            && previous <= threshold
+            && self.dense[index] > threshold
+        {
+            self.threshold_candidates.push(index as i64);
+        }
     }
 
     fn reserve_dense_to(&mut self, max_key: usize) {
@@ -98,6 +121,7 @@ impl DenseI64F64Sum {
         }
         self.dense.clear();
         self.fallback = Some(fallback);
+        self.threshold_candidates.clear();
     }
 
     fn into_filtered_hash<P>(self, predicate: P) -> HashMap<i64, f64>
@@ -106,6 +130,17 @@ impl DenseI64F64Sum {
     {
         if let Some(fallback) = self.fallback {
             return fallback.into_filtered_hash(predicate);
+        }
+        if self.threshold.is_some() && self.all_non_negative {
+            return self
+                .threshold_candidates
+                .iter()
+                .copied()
+                .filter_map(|key| {
+                    let value = self.dense.get(usize::try_from(key).ok()?).copied()?;
+                    predicate(value).then_some((key, value))
+                })
+                .collect();
         }
         self.dense
             .into_iter()
@@ -3133,6 +3168,7 @@ fn contiguous_single_byte_utf8_data(values: &StringArray) -> Option<&[u8]> {
 
 struct Q01DecimalInput<'a> {
     values: &'a Decimal128Array,
+    precision: u8,
     scale: f64,
 }
 
@@ -3155,7 +3191,7 @@ impl Q01DecimalInput<'_> {
 }
 
 fn q01_decimal_input(column: &ArrayRef) -> Result<Option<Q01DecimalInput<'_>>> {
-    let DataType::Decimal128(_, scale) = column.data_type() else {
+    let DataType::Decimal128(precision, scale) = column.data_type() else {
         return Ok(None);
     };
     Ok(Some(Q01DecimalInput {
@@ -3163,6 +3199,7 @@ fn q01_decimal_input(column: &ArrayRef) -> Result<Option<Q01DecimalInput<'_>>> {
             .as_any()
             .downcast_ref::<Decimal128Array>()
             .expect("Decimal128 q01 input"),
+        precision: *precision,
         scale: decimal_scale_factor(*scale),
     }))
 }
@@ -4502,7 +4539,7 @@ async fn try_execute_q09_product_type_profit_fast(
         &supplier_nations,
         &nation_names,
         order_years,
-        &supply_costs,
+        supply_costs,
     )
     .await?;
     tpch_profile_elapsed("Q09 lineitem profit rows", stage);
@@ -4672,18 +4709,23 @@ async fn q09_order_years(
         )
         .await?;
     let mut years = Q09OrderYears::new(0);
+    let mut year_cache = Date32YearCache::default();
     while let Some(batch) = stream.next() {
         let batch = batch?;
-        q09_order_years_batch_into(&batch, &mut years)?;
+        q09_order_years_batch_into(&batch, &mut years, &mut year_cache)?;
     }
     Ok(years)
 }
 
 type Q09OrderYears = DenseI64I32Map;
 
-fn q09_order_years_batch_into(batch: &RecordBatch, years: &mut Q09OrderYears) -> Result<()> {
+fn q09_order_years_batch_into(
+    batch: &RecordBatch,
+    years: &mut Q09OrderYears,
+    year_cache: &mut Date32YearCache,
+) -> Result<()> {
     if let Some(fallback) = years.fallback_mut() {
-        return q09_order_years_batch_into_fallback(batch, fallback);
+        return q09_order_years_batch_into_fallback(batch, fallback, year_cache);
     }
     let orderkeys = batch_column(batch, "o_orderkey")?;
     let orderdates = batch_column(batch, "o_orderdate")?;
@@ -4691,6 +4733,25 @@ fn q09_order_years_batch_into(batch: &RecordBatch, years: &mut Q09OrderYears) ->
         orderkeys.as_any().downcast_ref::<Int64Array>(),
         orderdates.as_any().downcast_ref::<Date32Array>(),
     ) {
+        if orderkeys.null_count() == 0 && orderdates.null_count() == 0 {
+            let orderkey_values = orderkeys.values().as_ref();
+            let orderdate_values = orderdates.values().as_ref();
+            let mut max_orderkey = 0_usize;
+            for &orderkey in orderkey_values {
+                let Some(index) = adaptive_dense_index(orderkey, DEFAULT_MAX_DENSE_I64_KEY) else {
+                    years.convert_to_fallback();
+                    let fallback = years.fallback_mut().expect("converted q09 fallback");
+                    return q09_order_years_batch_into_fallback(batch, fallback, year_cache);
+                };
+                max_orderkey = max_orderkey.max(index);
+            }
+            years.reserve_dense_to(max_orderkey);
+            for (&orderkey, &orderdate) in orderkey_values.iter().zip(orderdate_values) {
+                let index = usize::try_from(orderkey).expect("validated q09 orderkey");
+                years.insert_dense_index(index, year_cache.year(orderdate)?);
+            }
+            return Ok(());
+        }
         let mut max_orderkey = None::<usize>;
         for row in 0..orderkeys.len() {
             if orderkeys.is_null(row) || orderdates.is_null(row) {
@@ -4701,7 +4762,7 @@ fn q09_order_years_batch_into(batch: &RecordBatch, years: &mut Q09OrderYears) ->
             else {
                 years.convert_to_fallback();
                 let fallback = years.fallback_mut().expect("converted q09 fallback");
-                return q09_order_years_batch_into_fallback(batch, fallback);
+                return q09_order_years_batch_into_fallback(batch, fallback, year_cache);
             };
             max_orderkey = Some(max_orderkey.map_or(orderkey, |max| max.max(orderkey)));
         }
@@ -4713,18 +4774,19 @@ fn q09_order_years_batch_into(batch: &RecordBatch, years: &mut Q09OrderYears) ->
                 continue;
             }
             let orderkey = usize::try_from(orderkeys.value(row)).expect("validated q09 orderkey");
-            years.insert_dense_index(orderkey, year_from_days(i64::from(orderdates.value(row)))?);
+            years.insert_dense_index(orderkey, year_cache.year(orderdates.value(row))?);
         }
         return Ok(());
     }
     years.convert_to_fallback();
     let fallback = years.fallback_mut().expect("converted q09 fallback");
-    q09_order_years_batch_into_fallback(batch, fallback)
+    q09_order_years_batch_into_fallback(batch, fallback, year_cache)
 }
 
 fn q09_order_years_batch_into_fallback(
     batch: &RecordBatch,
     years: &mut AdaptiveI64Map<i32>,
+    year_cache: &mut Date32YearCache,
 ) -> Result<()> {
     let orderkeys = batch_column(batch, "o_orderkey")?;
     let orderdates = batch_column(batch, "o_orderdate")?;
@@ -4735,7 +4797,7 @@ fn q09_order_years_batch_into_fallback(
         ) else {
             continue;
         };
-        years.insert(orderkey, year_from_days(i64::from(orderdate))?);
+        years.insert(orderkey, year_cache.year(orderdate)?);
     }
     Ok(())
 }
@@ -4835,7 +4897,7 @@ async fn q09_profit_rows(
     supplier_nations: &HashMap<i64, i64>,
     nation_names: &HashMap<i64, String>,
     order_years: Q09OrderYears,
-    supply_costs: &HashMap<(i64, i64), f64>,
+    supply_costs: HashMap<(i64, i64), f64>,
 ) -> Result<Vec<Q09Row>> {
     let mut stream = engine
         .scan_parquet_batches(
@@ -4856,7 +4918,7 @@ async fn q09_profit_rows(
     let part_keys = Arc::new(part_keys.clone());
     let supplier_nations = Arc::new(supplier_nations.clone());
     let order_years = Arc::new(order_years);
-    let supply_costs = Arc::new(supply_costs.clone());
+    let supply_costs = Arc::new(supply_costs);
     let groups = parallel_batch_fold(
         &mut stream,
         move |batch| {
@@ -7578,6 +7640,36 @@ fn q04_count_late_candidate_priorities_typed(
     ) else {
         return Ok(false);
     };
+    if orderkeys.null_count() == 0
+        && commitdates.null_count() == 0
+        && receiptdates.null_count() == 0
+    {
+        let orderkeys = orderkeys.values().as_ref();
+        let commitdates = commitdates.values().as_ref();
+        let receiptdates = receiptdates.values().as_ref();
+        for row in 0..orderkeys.len() {
+            if commitdates[row] >= receiptdates[row] {
+                continue;
+            }
+            let orderkey = orderkeys[row];
+            if orderkey < 0 {
+                continue;
+            }
+            let Ok(orderkey) = usize::try_from(orderkey) else {
+                continue;
+            };
+            let Some(priority_marker) = candidate_priorities.get_mut(orderkey) else {
+                continue;
+            };
+            if *priority_marker == 0 {
+                continue;
+            }
+            let priority_index = usize::from(*priority_marker - 1);
+            counts[priority_index] += 1;
+            *priority_marker = 0;
+        }
+        return Ok(true);
+    }
     for row in 0..orderkeys.len() {
         if orderkeys.is_null(row) || commitdates.is_null(row) || receiptdates.is_null(row) {
             continue;
@@ -8401,7 +8493,7 @@ async fn q06_revenue_sum(
         .await?;
     parallel_batch_fold_chunks(
         &mut stream,
-        8,
+        q06_revenue_chunk_size(),
         move |batches| {
             let mut sum = 0.0;
             let mut count = 0_u64;
@@ -8433,6 +8525,14 @@ async fn q06_revenue_sum(
         },
         "Q06 revenue sum",
     )
+}
+
+fn q06_revenue_chunk_size() -> usize {
+    std::env::var("DODAM_Q06_CHUNK_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4)
 }
 
 fn q06_revenue_sum_batch(
@@ -8468,6 +8568,29 @@ fn q06_revenue_sum_batch(
             let discount_values = discounts.raw_values();
             let quantity_values = quantities.raw_values();
             let extendedprice_values = extendedprices.raw_values();
+            if discounts.precision <= 18
+                && quantities.precision <= 18
+                && extendedprices.precision <= 18
+            {
+                let discount_low_raw = discount_low_raw as i64;
+                let discount_high_raw = discount_high_raw as i64;
+                let quantity_limit_raw = quantity_limit_raw as i64;
+                for row in 0..shipdate_values.len() {
+                    let shipdate = shipdate_values[row];
+                    let discount = discount_values[row] as i64;
+                    if shipdate < start_days
+                        || shipdate >= end_days
+                        || discount < discount_low_raw
+                        || discount > discount_high_raw
+                        || (quantity_values[row] as i64) >= quantity_limit_raw
+                    {
+                        continue;
+                    }
+                    sum += ((extendedprice_values[row] as i64) * discount) as f64 * revenue_scale;
+                    count += 1;
+                }
+                return Ok(Some((sum, count)));
+            }
             for row in 0..shipdate_values.len() {
                 let shipdate = shipdate_values[row];
                 let discount = discount_values[row];
@@ -8972,6 +9095,7 @@ fn q07_volume_batch(
         return Ok(groups);
     }
     let mut groups = HashMap::<(i64, i64, i32), f64>::new();
+    let mut year_cache = Date32YearCache::default();
     for row in 0..batch.num_rows() {
         let (Some(orderkey), Some(suppkey), Some(shipdate)) = (
             numeric_i64_value(orderkeys, row)?,
@@ -8999,11 +9123,7 @@ fn q07_volume_batch(
             continue;
         };
         *groups
-            .entry((
-                supp_nation_key,
-                cust_nation_key,
-                year_from_days(i64::from(shipdate))?,
-            ))
+            .entry((supp_nation_key, cust_nation_key, year_cache.year(shipdate)?))
             .or_insert(0.0) += extendedprice * (1.0 - discount);
     }
     Ok(groups)
@@ -9030,6 +9150,7 @@ fn q07_volume_batch_typed(
         return Ok(None);
     };
     let mut groups = HashMap::<(i64, i64, i32), f64>::new();
+    let mut year_cache = Date32YearCache::default();
     if orderkeys.null_count() == 0
         && suppkeys.null_count() == 0
         && shipdates.null_count() == 0
@@ -9051,11 +9172,7 @@ fn q07_volume_batch_typed(
                 continue;
             }
             *groups
-                .entry((
-                    supp_nation_key,
-                    cust_nation_key,
-                    year_from_days(i64::from(shipdate))?,
-                ))
+                .entry((supp_nation_key, cust_nation_key, year_cache.year(shipdate)?))
                 .or_insert(0.0) += extendedprices.value(row) * (1.0 - discounts.value(row));
         }
         return Ok(Some(groups));
@@ -9083,11 +9200,7 @@ fn q07_volume_batch_typed(
             continue;
         }
         *groups
-            .entry((
-                supp_nation_key,
-                cust_nation_key,
-                year_from_days(i64::from(shipdate))?,
-            ))
+            .entry((supp_nation_key, cust_nation_key, year_cache.year(shipdate)?))
             .or_insert(0.0) += extendedprices.value(row) * (1.0 - discounts.value(row));
     }
     Ok(Some(groups))
@@ -9402,6 +9515,7 @@ fn q08_order_years_batch(
         return Ok(orders);
     }
     let mut orders = HashMap::new();
+    let mut year_cache = Date32YearCache::default();
     for row in 0..batch.num_rows() {
         let (Some(orderkey), Some(custkey), Some(orderdate)) = (
             numeric_i64_value(orderkeys, row)?,
@@ -9414,7 +9528,7 @@ fn q08_order_years_batch(
             && orderdate <= end_days
             && customer_nations.get(custkey).is_some()
         {
-            orders.insert(orderkey, year_from_days(i64::from(orderdate))?);
+            orders.insert(orderkey, year_cache.year(orderdate)?);
         }
     }
     Ok(orders)
@@ -9436,6 +9550,7 @@ fn q08_order_years_batch_typed(
         return Ok(None);
     };
     let mut orders = HashMap::new();
+    let mut year_cache = Date32YearCache::default();
     if orderkeys.null_count() == 0 && custkeys.null_count() == 0 && orderdates.null_count() == 0 {
         for row in 0..orderkeys.len() {
             let orderdate = orderdates.value(row);
@@ -9443,7 +9558,7 @@ fn q08_order_years_batch_typed(
                 && orderdate <= end_days
                 && customer_nations.get(custkeys.value(row)).is_some()
             {
-                orders.insert(orderkeys.value(row), year_from_days(i64::from(orderdate))?);
+                orders.insert(orderkeys.value(row), year_cache.year(orderdate)?);
             }
         }
         return Ok(Some(orders));
@@ -9457,7 +9572,7 @@ fn q08_order_years_batch_typed(
             && orderdate <= end_days
             && customer_nations.get(custkeys.value(row)).is_some()
         {
-            orders.insert(orderkeys.value(row), year_from_days(i64::from(orderdate))?);
+            orders.insert(orderkeys.value(row), year_cache.year(orderdate)?);
         }
     }
     Ok(Some(orders))
@@ -10560,7 +10675,7 @@ async fn q18_qualifying_order_quantities(
             None,
         )
         .await?;
-    let mut sums = DenseI64F64Sum::new();
+    let mut sums = DenseI64F64Sum::new_tracking_threshold(threshold);
     while let Some(batch) = stream.next() {
         let batch = batch?;
         if sums.has_fallback() {
@@ -10589,17 +10704,19 @@ fn q18_quantity_batch_into_dense(batch: &RecordBatch, sums: &mut DenseI64F64Sum)
     };
     if orderkeys.null_count() == 0 && quantities.null_count() == 0 {
         let mut max_index = 0_usize;
-        for row in 0..orderkeys.len() {
-            let Some(index) = adaptive_dense_index(orderkeys.value(row), DEFAULT_MAX_DENSE_I64_KEY)
-            else {
+        let orderkey_values = orderkeys.values().as_ref();
+        let quantity_values = quantities.raw_values();
+        let quantity_scale = 1.0 / quantities.scale;
+        for &orderkey in orderkey_values {
+            let Some(index) = adaptive_dense_index(orderkey, DEFAULT_MAX_DENSE_I64_KEY) else {
                 return Ok(false);
             };
             max_index = max_index.max(index);
         }
         sums.reserve_dense_to(max_index);
-        for row in 0..orderkeys.len() {
-            let index = usize::try_from(orderkeys.value(row)).expect("validated dense index");
-            sums.add_dense_index(index, quantities.value(row));
+        for (&orderkey, &quantity) in orderkey_values.iter().zip(quantity_values) {
+            let index = usize::try_from(orderkey).expect("validated dense index");
+            sums.add_dense_index(index, quantity as f64 * quantity_scale);
         }
         return Ok(true);
     }
@@ -19727,6 +19844,61 @@ fn year_from_days(days: i64) -> Result<i32> {
     let month = mp + if mp < 10 { 3 } else { -9 };
     i32::try_from(year + i64::from(month <= 2))
         .map_err(|_| DodamError::UnsupportedSql("DATE arithmetic overflow".to_string()))
+}
+
+#[derive(Default)]
+struct Date32YearCache {
+    base_day: i32,
+    years: Vec<i32>,
+    disabled: bool,
+}
+
+impl Date32YearCache {
+    const MAX_SPAN_DAYS: usize = 20_000;
+
+    fn year(&mut self, day: i32) -> Result<i32> {
+        if self.disabled {
+            return year_from_days(i64::from(day));
+        }
+        if self.years.is_empty() {
+            self.base_day = day;
+            self.years.push(year_from_days(i64::from(day))?);
+            return Ok(self.years[0]);
+        }
+        if day < self.base_day {
+            let prepend = usize::try_from(self.base_day - day)
+                .map_err(|_| DodamError::UnsupportedSql("DATE arithmetic overflow".to_string()))?;
+            if prepend + self.years.len() > Self::MAX_SPAN_DAYS {
+                self.disabled = true;
+                self.years.clear();
+                return year_from_days(i64::from(day));
+            }
+            let mut years = Vec::with_capacity(prepend + self.years.len());
+            for offset in 0..prepend {
+                years.push(year_from_days(i64::from(day) + offset as i64)?);
+            }
+            years.extend_from_slice(&self.years);
+            self.base_day = day;
+            self.years = years;
+            return Ok(self.years[0]);
+        }
+        let index = usize::try_from(day - self.base_day)
+            .map_err(|_| DodamError::UnsupportedSql("DATE arithmetic overflow".to_string()))?;
+        if index >= self.years.len() {
+            if index + 1 > Self::MAX_SPAN_DAYS {
+                self.disabled = true;
+                self.years.clear();
+                return year_from_days(i64::from(day));
+            }
+            let start = self.years.len();
+            self.years.reserve(index + 1 - start);
+            for offset in start..=index {
+                self.years
+                    .push(year_from_days(i64::from(self.base_day) + offset as i64)?);
+            }
+        }
+        Ok(self.years[index])
+    }
 }
 
 fn sql_comparison_op(op: &BinaryOperator) -> ComparisonOp {

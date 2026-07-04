@@ -31,8 +31,8 @@ use crate::plan::{
     PhysicalJoinStrategy, PhysicalOperator, PhysicalPlanNode, PlanTableSource, TaskInput, TaskPlan,
 };
 use crate::storage::{
-    LocalFileSystemObjectStore, ObjectStore, ParquetMetadataCache, plan_parquet_scan_tasks,
-    read_parquet_file_statistics,
+    LocalFileSystemObjectStore, ObjectStore, ParquetFileCache, ParquetFileCacheStats,
+    ParquetMetadataCache, plan_parquet_scan_tasks, read_parquet_file_statistics,
 };
 
 const LOCAL_SHUFFLE_FILE_TARGET_BYTES: u64 = 64 * 1024 * 1024;
@@ -40,6 +40,7 @@ const LOCAL_SHUFFLE_FILE_TARGET_BYTES: u64 = 64 * 1024 * 1024;
 #[derive(Clone)]
 pub struct DodamEngine {
     metadata_cache: Arc<ParquetMetadataCache>,
+    file_cache: Arc<ParquetFileCache>,
     object_store: Arc<dyn ObjectStore>,
     catalog_root: PathBuf,
 }
@@ -468,6 +469,7 @@ impl Default for DodamEngine {
     fn default() -> Self {
         Self {
             metadata_cache: Arc::new(ParquetMetadataCache::default()),
+            file_cache: Arc::new(ParquetFileCache::default()),
             object_store: Arc::new(LocalFileSystemObjectStore),
             catalog_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
@@ -482,6 +484,18 @@ impl DodamEngine {
 
     pub fn metadata_cache_len(&self) -> usize {
         self.metadata_cache.len()
+    }
+
+    pub fn file_cache_len(&self) -> usize {
+        self.file_cache.len()
+    }
+
+    pub fn file_cache_bytes(&self) -> usize {
+        self.file_cache.bytes()
+    }
+
+    pub fn file_cache_stats(&self) -> ParquetFileCacheStats {
+        self.file_cache.stats()
     }
 
     pub async fn scan_parquet(
@@ -1110,6 +1124,7 @@ impl DodamEngine {
                 projection,
                 pushdown_predicates,
                 self.metadata_cache.clone(),
+                self.file_cache.clone(),
                 self.object_store.clone(),
             ))),
             (PhysicalOperator::Memory, Some(PhysicalExecutionConfig::Memory { batches })) => {
@@ -1612,6 +1627,7 @@ impl DodamEngine {
             plan.scan_projection,
             plan.pushdown_predicates,
             self.metadata_cache.clone(),
+            self.file_cache.clone(),
             self.object_store.clone(),
         );
         let mut physical: Box<dyn PhysicalPlan> = Box::new(scan);

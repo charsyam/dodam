@@ -1,17 +1,23 @@
 use std::fs::File;
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use std::time::SystemTime;
 
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use bytes::Bytes;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use parquet::data_type::{ByteArray, FixedLenByteArray};
+use parquet::errors::{ParquetError, Result as ParquetResult};
+use parquet::file::reader::{ChunkReader, Length};
 use parquet::file::statistics::Statistics;
 use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
 
 use crate::error::{DodamError, Result};
 use crate::execution::{ComparisonExpr, ComparisonOp, Expr, Projection};
@@ -104,6 +110,391 @@ impl ParquetMetadataCache {
     }
 }
 
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct CachedFileChunkKey {
+    path: PathBuf,
+    len: u64,
+    modified: Option<SystemTime>,
+    chunk_start: u64,
+}
+
+#[derive(Debug, Default)]
+struct ParquetFileCacheShard {
+    entries: RwLock<HashMap<CachedFileChunkKey, Arc<CachedFileChunkEntry>>>,
+    admissions: Mutex<HashMap<CachedFileChunkKey, u64>>,
+}
+
+#[derive(Debug)]
+struct CachedFileChunkEntry {
+    bytes: Bytes,
+    last_access_epoch: AtomicU64,
+}
+
+#[derive(Debug)]
+pub struct ParquetFileCache {
+    max_bytes: usize,
+    chunk_bytes: usize,
+    shards: Vec<ParquetFileCacheShard>,
+    bytes: AtomicU64,
+    access_epoch: AtomicU64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    evictions: AtomicU64,
+    read_bytes: AtomicU64,
+    deferred_admissions: AtomicU64,
+}
+
+const PARQUET_FILE_CACHE_SHARDS: usize = 64;
+
+impl Default for ParquetFileCache {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
+impl ParquetFileCache {
+    pub fn from_env() -> Self {
+        let max_bytes = std::env::var("DODAM_FILE_CACHE_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let chunk_bytes = std::env::var("DODAM_FILE_CACHE_CHUNK_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(512 * 1024);
+        Self {
+            max_bytes,
+            chunk_bytes,
+            shards: (0..PARQUET_FILE_CACHE_SHARDS)
+                .map(|_| ParquetFileCacheShard::default())
+                .collect(),
+            bytes: AtomicU64::new(0),
+            access_epoch: AtomicU64::new(1),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+            read_bytes: AtomicU64::new(0),
+            deferred_admissions: AtomicU64::new(0),
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.max_bytes > 0
+    }
+
+    fn chunk_bytes(&self) -> usize {
+        self.chunk_bytes
+    }
+
+    fn get_or_read_chunk(
+        &self,
+        path: impl AsRef<Path>,
+        len: u64,
+        modified: Option<SystemTime>,
+        file: &File,
+        chunk_start: u64,
+    ) -> ParquetResult<Bytes> {
+        if self.max_bytes == 0 {
+            return read_file_range(file, chunk_start, self.chunk_len(len, chunk_start));
+        }
+        let chunk_len = self.chunk_len(len, chunk_start);
+        let key = CachedFileChunkKey {
+            path: path.as_ref().to_path_buf(),
+            len,
+            modified,
+            chunk_start,
+        };
+        let shard_index = self.shard_index(&key);
+        let epoch = self.next_epoch();
+
+        {
+            let entries = self.shards[shard_index]
+                .entries
+                .read()
+                .expect("file cache shard read lock");
+            if let Some(entry) = entries.get(&key) {
+                entry.last_access_epoch.store(epoch, Ordering::Relaxed);
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(entry.bytes.clone());
+            }
+        }
+
+        if chunk_len > self.max_bytes {
+            return read_file_range(file, chunk_start, chunk_len);
+        }
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        let bytes = read_file_range(file, chunk_start, chunk_len)?;
+        self.read_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+
+        let mut entries = self.shards[shard_index]
+            .entries
+            .write()
+            .expect("file cache shard write lock");
+        if let Some(entry) = entries.get(&key) {
+            entry.last_access_epoch.store(epoch, Ordering::Relaxed);
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(entry.bytes.clone());
+        }
+
+        let entry_size = bytes.len() as u64;
+        if !self.should_admit(&key, shard_index, epoch, entry_size) {
+            return Ok(bytes);
+        }
+        self.evict_until_has_space(entry_size, shard_index, &mut entries);
+        entries.insert(
+            key,
+            Arc::new(CachedFileChunkEntry {
+                bytes: bytes.clone(),
+                last_access_epoch: AtomicU64::new(epoch),
+            }),
+        );
+        self.bytes.fetch_add(entry_size, Ordering::Relaxed);
+        Ok(bytes)
+    }
+
+    fn should_admit(
+        &self,
+        key: &CachedFileChunkKey,
+        shard_index: usize,
+        epoch: u64,
+        entry_size: u64,
+    ) -> bool {
+        if !self.cache_pressure(entry_size) {
+            return true;
+        }
+
+        let mut admissions = self.shards[shard_index]
+            .admissions
+            .lock()
+            .expect("file cache admission lock");
+        let previous = admissions.remove(key);
+        if previous.is_some() {
+            return true;
+        }
+        if admissions.len() >= 4096
+            && let Some(oldest_key) = admissions
+                .iter()
+                .min_by_key(|(_, seen_epoch)| **seen_epoch)
+                .map(|(key, _)| key.clone())
+        {
+            admissions.remove(&oldest_key);
+        }
+        admissions.insert(key.clone(), epoch);
+        self.deferred_admissions.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+
+    fn cache_pressure(&self, incoming_bytes: u64) -> bool {
+        self.bytes
+            .load(Ordering::Relaxed)
+            .saturating_add(incoming_bytes)
+            .saturating_mul(4)
+            >= (self.max_bytes as u64).saturating_mul(3)
+    }
+
+    fn evict_until_has_space(
+        &self,
+        incoming_bytes: u64,
+        locked_shard_index: usize,
+        locked_entries: &mut HashMap<CachedFileChunkKey, Arc<CachedFileChunkEntry>>,
+    ) {
+        let max_bytes = self.max_bytes as u64;
+        let start = self.access_epoch.load(Ordering::Relaxed) as usize;
+        let mut attempts = 0usize;
+        while self
+            .bytes
+            .load(Ordering::Relaxed)
+            .saturating_add(incoming_bytes)
+            > max_bytes
+            && attempts < PARQUET_FILE_CACHE_SHARDS * 4
+        {
+            let shard_index = (start + attempts) % PARQUET_FILE_CACHE_SHARDS;
+            if shard_index == locked_shard_index {
+                let _ = self.evict_one_from_entries(locked_entries);
+            } else if let Ok(mut entries) = self.shards[shard_index].entries.try_write() {
+                let _ = self.evict_one_from_entries(&mut entries);
+            }
+            attempts += 1;
+        }
+    }
+
+    fn evict_one_from_entries(
+        &self,
+        entries: &mut HashMap<CachedFileChunkKey, Arc<CachedFileChunkEntry>>,
+    ) -> bool {
+        let Some(victim_key) = entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_access_epoch.load(Ordering::Relaxed))
+            .map(|(key, _)| key.clone())
+        else {
+            return false;
+        };
+        if let Some(victim) = entries.remove(&victim_key) {
+            self.bytes
+                .fetch_sub(victim.bytes.len() as u64, Ordering::Relaxed);
+            self.evictions.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
+    fn shard_index(&self, key: &CachedFileChunkKey) -> usize {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) % self.shards.len()
+    }
+
+    fn next_epoch(&self) -> u64 {
+        self.access_epoch.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn chunk_len(&self, file_len: u64, chunk_start: u64) -> usize {
+        file_len
+            .saturating_sub(chunk_start)
+            .min(self.chunk_bytes as u64) as usize
+    }
+
+    pub fn len(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .entries
+                    .read()
+                    .expect("file cache shard read lock")
+                    .len()
+            })
+            .sum()
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes.load(Ordering::Relaxed) as usize
+    }
+
+    pub fn stats(&self) -> ParquetFileCacheStats {
+        ParquetFileCacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+            read_bytes: self.read_bytes.load(Ordering::Relaxed),
+            deferred_admissions: self.deferred_admissions.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ParquetFileCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub read_bytes: u64,
+    pub deferred_admissions: u64,
+}
+
+struct CachedParquetChunkReader {
+    path: PathBuf,
+    len: u64,
+    modified: Option<SystemTime>,
+    file: File,
+    cache: Arc<ParquetFileCache>,
+}
+
+impl CachedParquetChunkReader {
+    fn new(
+        path: impl AsRef<Path>,
+        store: &dyn ObjectStore,
+        cache: Arc<ParquetFileCache>,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let metadata = store.metadata(path)?;
+        let file = store.open(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            len: metadata.len,
+            modified: metadata.modified,
+            file,
+            cache,
+        })
+    }
+}
+
+impl Length for CachedParquetChunkReader {
+    fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+impl ChunkReader for CachedParquetChunkReader {
+    type T = BufReader<File>;
+
+    fn get_read(&self, start: u64) -> ParquetResult<Self::T> {
+        let mut reader = self.file.try_clone()?;
+        reader.seek(SeekFrom::Start(start))?;
+        Ok(BufReader::new(reader))
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> ParquetResult<Bytes> {
+        if start > self.len || start.saturating_add(length as u64) > self.len {
+            return Err(ParquetError::EOF(format!(
+                "Expected to read {length} bytes at offset {start}, while file has length {}",
+                self.len
+            )));
+        }
+        if length == 0 {
+            return Ok(Bytes::new());
+        }
+
+        let chunk_bytes = self.cache.chunk_bytes() as u64;
+        let request_end = start + length as u64;
+        let mut chunk_start = (start / chunk_bytes) * chunk_bytes;
+        if request_end <= chunk_start.saturating_add(chunk_bytes) {
+            let chunk = self.cache.get_or_read_chunk(
+                &self.path,
+                self.len,
+                self.modified,
+                &self.file,
+                chunk_start,
+            )?;
+            let local_start = (start - chunk_start) as usize;
+            return Ok(chunk.slice(local_start..local_start + length));
+        }
+
+        let mut output = Vec::with_capacity(length);
+        while chunk_start < request_end {
+            let chunk = self.cache.get_or_read_chunk(
+                &self.path,
+                self.len,
+                self.modified,
+                &self.file,
+                chunk_start,
+            )?;
+            let chunk_end = chunk_start + chunk.len() as u64;
+            let copy_start = start.max(chunk_start);
+            let copy_end = request_end.min(chunk_end);
+            let local_start = (copy_start - chunk_start) as usize;
+            let local_end = (copy_end - chunk_start) as usize;
+            output.extend_from_slice(&chunk[local_start..local_end]);
+            chunk_start = chunk_start.saturating_add(chunk_bytes);
+        }
+        Ok(Bytes::from(output))
+    }
+}
+
+fn read_file_range(file: &File, start: u64, length: usize) -> ParquetResult<Bytes> {
+    let mut buffer = Vec::with_capacity(length);
+    let mut reader = file.try_clone()?;
+    reader.seek(SeekFrom::Start(start))?;
+    let read = reader.take(length as u64).read_to_end(&mut buffer)?;
+    if read != length {
+        return Err(ParquetError::EOF(format!(
+            "Expected to read {length} bytes at offset {start}, read only {read}"
+        )));
+    }
+    Ok(Bytes::from(buffer))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParquetScanTask {
     pub path: PathBuf,
@@ -150,20 +541,94 @@ impl ParquetBatchReader {
         projection: &Projection,
         pruning_predicates: &[Expr],
         metadata_cache: &ParquetMetadataCache,
+        file_cache: Arc<ParquetFileCache>,
         store: &dyn ObjectStore,
     ) -> Result<Self> {
         let path = path.as_ref();
-        let file = store.open(path)?;
         let metadata_start = Instant::now();
         let metadata = metadata_cache.get_with_store(path, store)?;
         let metadata_nanos = elapsed_nanos(metadata_start);
+        if file_cache.enabled() {
+            let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
+            Self::build(
+                reader,
+                metadata,
+                metadata_nanos,
+                batch_size,
+                projection,
+                pruning_predicates,
+                None,
+            )
+        } else {
+            let file = store.open(path)?;
+            Self::build(
+                file,
+                metadata,
+                metadata_nanos,
+                batch_size,
+                projection,
+                pruning_predicates,
+                None,
+            )
+        }
+    }
+
+    pub fn try_new_with_row_groups(
+        path: impl AsRef<Path>,
+        batch_size: usize,
+        projection: &Projection,
+        row_groups: Vec<usize>,
+        metadata_cache: &ParquetMetadataCache,
+        file_cache: Arc<ParquetFileCache>,
+        store: &dyn ObjectStore,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let metadata_start = Instant::now();
+        let metadata = metadata_cache.get_with_store(path, store)?;
+        let metadata_nanos = elapsed_nanos(metadata_start);
+        if file_cache.enabled() {
+            let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
+            Self::build(
+                reader,
+                metadata,
+                metadata_nanos,
+                batch_size,
+                projection,
+                &[],
+                Some(row_groups),
+            )
+        } else {
+            let file = store.open(path)?;
+            Self::build(
+                file,
+                metadata,
+                metadata_nanos,
+                batch_size,
+                projection,
+                &[],
+                Some(row_groups),
+            )
+        }
+    }
+
+    fn build<T: ChunkReader + 'static>(
+        input: T,
+        metadata: ArrowReaderMetadata,
+        metadata_nanos: u64,
+        batch_size: usize,
+        projection: &Projection,
+        pruning_predicates: &[Expr],
+        requested_row_groups: Option<Vec<usize>>,
+    ) -> Result<Self> {
         let planning_start = Instant::now();
-        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata)
+        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(input, metadata)
             .with_batch_size(batch_size);
         let projected_columns = projected_column_count(builder.schema(), projection);
         let row_groups_total = builder.metadata().num_row_groups();
         let column_indices = projection_indices_for_schema(builder.schema(), projection)?;
-        let row_groups = if pruning_predicates.is_empty() {
+        let row_groups = if let Some(row_groups) = requested_row_groups {
+            Some(row_groups)
+        } else if pruning_predicates.is_empty() {
             None
         } else {
             Some(prune_row_groups(&builder, pruning_predicates)?)
@@ -185,47 +650,6 @@ impl ParquetBatchReader {
         } else {
             builder
         };
-        let planning_nanos = elapsed_nanos(planning_start);
-        let inner = builder.build()?;
-
-        Ok(Self {
-            inner,
-            projected_columns,
-            row_groups_total,
-            row_groups_scanned,
-            compressed_bytes_total,
-            compressed_bytes_scanned,
-            metadata_nanos,
-            planning_nanos,
-        })
-    }
-
-    pub fn try_new_with_row_groups(
-        path: impl AsRef<Path>,
-        batch_size: usize,
-        projection: &Projection,
-        row_groups: Vec<usize>,
-        metadata_cache: &ParquetMetadataCache,
-        store: &dyn ObjectStore,
-    ) -> Result<Self> {
-        let path = path.as_ref();
-        let file = store.open(path)?;
-        let metadata_start = Instant::now();
-        let metadata = metadata_cache.get_with_store(path, store)?;
-        let metadata_nanos = elapsed_nanos(metadata_start);
-        let planning_start = Instant::now();
-        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata)
-            .with_batch_size(batch_size);
-        let projected_columns = projected_column_count(builder.schema(), projection);
-        let row_groups_total = builder.metadata().num_row_groups();
-        let column_indices = projection_indices_for_schema(builder.schema(), projection)?;
-        let row_groups_scanned = row_groups.len();
-        let all_row_groups = (0..row_groups_total).collect::<Vec<_>>();
-        let compressed_bytes_total =
-            compressed_bytes_for_row_groups(&builder, &column_indices, &all_row_groups);
-        let compressed_bytes_scanned =
-            compressed_bytes_for_row_groups(&builder, &column_indices, &row_groups);
-        let builder = apply_projection(builder, projection)?.with_row_groups(row_groups);
         let planning_nanos = elapsed_nanos(planning_start);
         let inner = builder.build()?;
 
@@ -389,10 +813,10 @@ impl Iterator for ParquetBatchReader {
     }
 }
 
-fn apply_projection(
-    builder: ParquetRecordBatchReaderBuilder<File>,
+fn apply_projection<T: ChunkReader + 'static>(
+    builder: ParquetRecordBatchReaderBuilder<T>,
     projection: &Projection,
-) -> Result<ParquetRecordBatchReaderBuilder<File>> {
+) -> Result<ParquetRecordBatchReaderBuilder<T>> {
     let Projection::Columns(columns) = projection else {
         return Ok(builder);
     };
@@ -439,8 +863,8 @@ fn projection_indices_for_schema(
     }
 }
 
-fn compressed_bytes_for_row_groups(
-    builder: &ParquetRecordBatchReaderBuilder<File>,
+fn compressed_bytes_for_row_groups<T: ChunkReader + 'static>(
+    builder: &ParquetRecordBatchReaderBuilder<T>,
     column_indices: &[usize],
     row_groups: &[usize],
 ) -> u64 {
@@ -456,8 +880,8 @@ fn compressed_bytes_for_row_groups(
         .sum()
 }
 
-fn prune_row_groups(
-    builder: &ParquetRecordBatchReaderBuilder<File>,
+fn prune_row_groups<T: ChunkReader + 'static>(
+    builder: &ParquetRecordBatchReaderBuilder<T>,
     pruning_predicates: &[Expr],
 ) -> Result<Vec<usize>> {
     let mut row_groups = Vec::new();
@@ -476,8 +900,8 @@ fn prune_row_groups(
     Ok(row_groups)
 }
 
-fn row_group_may_match(
-    builder: &ParquetRecordBatchReaderBuilder<File>,
+fn row_group_may_match<T: ChunkReader + 'static>(
+    builder: &ParquetRecordBatchReaderBuilder<T>,
     row_group_index: usize,
     expr: &Expr,
 ) -> Result<bool> {
@@ -501,8 +925,8 @@ fn row_group_may_match(
     }
 }
 
-fn row_group_may_match_comparison(
-    builder: &ParquetRecordBatchReaderBuilder<File>,
+fn row_group_may_match_comparison<T: ChunkReader + 'static>(
+    builder: &ParquetRecordBatchReaderBuilder<T>,
     row_group_index: usize,
     comparison: &ComparisonExpr,
 ) -> Result<bool> {

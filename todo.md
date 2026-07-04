@@ -751,7 +751,53 @@ Tried and rejected or neutral:
   - Tightened Q06's non-null decimal loop by reading `Date32`/`Decimal128` raw slices directly and retuned its chunk size from `16` to `8` after the loop got cheaper. Focused Q06 moved from about `~0.040s` to about `~0.0365s`, and the revenue stage moved to about `~29ms`; chunk `4` was tested and rejected as slightly worse. Added a Q01 contiguous single-byte UTF-8 key path, but it was mostly neutral in focused Parquet COPY runs.
   - Latest SF=1 3-run Parquet COPY comparison after the Q06 raw-slice/chunk retune sampled Dodam `~1.214s` vs DuckDB `~1.092s` (`~1.11x`). Q06 improved to about `~0.037s`, while the largest remaining gaps are Q18 (`~1.54x`), Q01 (`~1.38x`), Q03/Q07/Q08 (`~1.26-1.28x`), and Q10 (`~1.23x` in this noisy sample).
   - Rejected another order-side map preallocation/chunk retune pass for Q03/Q05/Q07/Q08/Q10. Some stage timers improved, but full SF=1 Parquet COPY did not improve (`~1.22s` sampled), so the code changes were reverted. Also rejected Q18 ordered raw-decimal streaming aggregation: it avoided dense-vector final scanning in theory, but focused Q18 regressed to about `~0.099s` vs the retained dense f64 path around `~0.096s`.
-  - Reduced Q01's fast-path aggregate state by removing the redundant per-aggregate count fields. In this fast path the quantity, price, discount, and `count(*)` counts advance together, so `count_order` is enough for the three averages. Focused Q01 aggregate profile moved to about `~50ms`, and the latest SF=1 3-run Parquet COPY comparison sampled Dodam `~1.216s` vs DuckDB `~1.103s` (`~1.10x`).
+- Reduced Q01's fast-path aggregate state by removing the redundant per-aggregate count fields. In this fast path the quantity, price, discount, and `count(*)` counts advance together, so `count_order` is enough for the three averages. Focused Q01 aggregate profile moved to about `~50ms`, and the latest SF=1 3-run Parquet COPY comparison sampled Dodam `~1.216s` vs DuckDB `~1.103s` (`~1.10x`).
+- Added an in-process TPC-H runner and an opt-in Parquet range/chunk buffer cache:
+  - runner: `target/release/tpch_real_inprocess --data-dir /tmp/dodam-tpchgen-sf1 --output-dir /tmp/dodam-tpch-inprocess-sf1`
+  - file cache env: `DODAM_FILE_CACHE_BYTES=<bytes>`
+  - chunk size env: `DODAM_FILE_CACHE_CHUNK_BYTES=<bytes>`, default `512KiB`
+  - Same-session one-pass SF=1 Parquet output comparison sampled DuckDB around `0.60-0.70s` and Dodam around `0.87-0.89s`; this removes per-query process startup from both sides and shows Dodam is still about `~1.4x` slower in this shape.
+  - Rejected full-file caching because it defeats projection pushdown by reading unused columns; it improved warm second-pass timing but regressed first-pass and total repeat timing.
+  - Replaced it with a `ChunkReader::get_bytes` range cache that stores fixed-size file chunks. This keeps projection pushdown intact and reuses only byte ranges actually requested by the Parquet reader.
+  - On SF=1 one-pass in-process TPC-H with `512MiB` cache, default `512KiB` chunks sampled about `0.875s` Dodam vs `0.986s` cache-off in the same run shape. Chunk sweep showed `512KiB` better than `256KiB`, `1MiB`, and `2MiB` for this workload.
+  - Improved cache accounting and hit behavior:
+    - added hit/miss/eviction/read-byte counters to the in-process runner output
+    - added single-chunk zero-copy `Bytes::slice` return to avoid copying common reads
+    - changed LRU touch to happen only under cache pressure, avoiding per-hit `VecDeque` scans when the cache has enough headroom
+    - changed the range cache from one global lock to 64 sharded maps with approximate LRU state:
+      - cache counters and per-entry access epoch are atomics
+      - hit path takes only the shard read lock and updates the entry epoch
+      - miss/insert/eviction takes only the target shard write lock and opportunistically samples shards for old entries
+      - pure atomics are used where they fit, but `HashMap` insertion/removal still needs synchronization
+  - Cache-size sweep showed that undersized cache is harmful: `64MiB` and `128MiB` caused thousands of evictions and re-read gigabytes of chunks. The sharded approximate eviction reduced read amplification versus the first sharded attempt (`64MiB` about `10GB -> 3GB` read bytes), but small caches are still slower than cache-off on local warm files. `256MiB` is close, while `512MiB` avoided evictions on the current SF=1 dataset. Keep the cache opt-in until there is a better admission policy.
+  - Added pressure-gated second-touch admission:
+    - while cache usage is below about 75% of budget, first-touch chunks are admitted normally
+    - under pressure, a chunk is cached only after a second request, reducing churn from one-time sequential reads
+    - the `64MiB` cache remained slower than cache-off but improved in sampled total time versus the sharded no-admission run; `256MiB` also improved, while `512MiB` is unaffected because it does not enter pressure on the current SF=1 data
+  - Tightened Q06 after the cache work:
+    - Decimal128 inputs with precision `<= 18` now use an i64 raw-value multiply path in the no-null Q06 loop, avoiding i128 multiplication for common TPC-H-style decimal columns while keeping the generic i128 path for wider decimals.
+    - Retuned Q06's chunked fold default from `8` to `4` after the cheaper loop made finer-grained work distribution better again.
+    - Focused Q06 stage samples moved to roughly `~28-29ms` median with `47` chunks, and 5-run in-process full TPC-H remained around `~0.85s` median after the change.
+  - Added a small `Date32 -> year` cache for repeated year extraction in Q07/Q08/Q09 hot paths:
+    - Q09 `orders` year-map build also gained a no-null raw-slice path for `Int64` order keys and `Date32` order dates.
+    - In-process SF=1 profile moved Q09 `order years` from roughly `~25ms` to `~15ms`; full 5-run in-process TPC-H sampled around `~0.84-0.85s` total.
+    - Q07/Q08 reuse the same cache inside their per-batch year extraction loops; the effect is smaller but neutral-to-positive.
+  - Rejected two dense/parallel state attempts after measurement:
+    - A single dense `orderkey -> Q21OrderState` accumulator removed partial HashMap merging in theory but regressed Q21 lineitem state to about `~171ms` and full in-process total to about `~0.94-0.96s`.
+    - Batch-local/final parallelization of Q09 `order years` created large dense vectors per partial and regressed the stage to about `~124ms`; the retained path keeps one incremental dense map plus the Date32 year cache.
+  - Re-tested Q21 sorted-input streaming:
+    - `lineitem` is physically ordered by `l_orderkey`, but the normal parallel reader returns batches out of order.
+    - Forcing a sequential reader allowed streaming order-state flushing, but Q21 regressed to about `~99ms` because lost parallel Parquet decode outweighed avoiding HashMap partial merges.
+    - Rejected this path; Q21 keeps the parallel state-merge path.
+  - Added threshold-crossing tracking to the dense `i64 -> f64` sum helper used by Q18:
+    - For non-negative inputs, keys are recorded when their running sum first crosses the `HAVING sum(...) > threshold` value, avoiding a full dense-vector scan at finalization.
+    - If a negative value appears or the helper falls back to the generic map path, finalization uses the existing full predicate check for correctness.
+    - Focused Q18 profile sampled `lineitem quantity sums` around `~55-56ms` versus prior `~58ms`; full in-process 5-run TPC-H stayed in the same `~0.84-0.85s` band.
+  - Revisited Q09 composite supply-cost lookup:
+    - Tried replacing `(partkey, suppkey)` tuple keys with packed `u64` keys plus tuple fallback for out-of-range integer keys.
+    - Rejected it because Q09 profit stage stayed neutral-to-worse (`~44-46ms` samples); packing/probe overhead did not beat the existing tuple HashMap path.
+    - Also rejected a Q09 raw `Decimal128` no-null profit loop; it regressed the focused profit stage versus the existing `value()` path.
+    - Retained a small ownership cleanup: `q09_profit_rows` now takes the supply-cost map by value and moves it into `Arc`, avoiding a full HashMap clone before the lineitem stage.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.

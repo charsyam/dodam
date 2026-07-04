@@ -37,7 +37,8 @@ use crate::execution::metrics::{
     RecordBatchSink, ScanMetrics, ScanPlanMetrics, ScanPlanMetricsCounter, SendableBatchStream,
 };
 use crate::storage::{
-    ObjectStore, ParquetBatchReader, ParquetMetadataCache, ParquetScanTask, plan_parquet_scan_tasks,
+    ObjectStore, ParquetBatchReader, ParquetFileCache, ParquetMetadataCache, ParquetScanTask,
+    plan_parquet_scan_tasks,
 };
 
 type JoinKeyHashMap<K, V> = HashMap<K, V, BuildHasherDefault<JoinKeyHasher>>;
@@ -95,6 +96,7 @@ pub struct ScanExec {
     projection: Projection,
     pruning_predicates: Vec<Expr>,
     metadata_cache: Arc<ParquetMetadataCache>,
+    file_cache: Arc<ParquetFileCache>,
     object_store: Arc<dyn ObjectStore>,
 }
 
@@ -154,6 +156,7 @@ impl ScanExec {
         projection: Projection,
         pruning_predicates: Vec<Expr>,
         metadata_cache: Arc<ParquetMetadataCache>,
+        file_cache: Arc<ParquetFileCache>,
         object_store: Arc<dyn ObjectStore>,
     ) -> Self {
         Self {
@@ -162,6 +165,7 @@ impl ScanExec {
             projection,
             pruning_predicates,
             metadata_cache,
+            file_cache,
             object_store,
         }
     }
@@ -181,6 +185,7 @@ impl PhysicalPlan for ScanExec {
                 self.projection,
                 self.pruning_predicates,
                 self.metadata_cache,
+                self.file_cache,
                 self.object_store,
             ))
             .execute(),
@@ -210,6 +215,7 @@ struct ParquetScanExec {
     projection: Projection,
     pruning_predicates: Vec<Expr>,
     metadata_cache: Arc<ParquetMetadataCache>,
+    file_cache: Arc<ParquetFileCache>,
     object_store: Arc<dyn ObjectStore>,
 }
 
@@ -220,6 +226,7 @@ impl ParquetScanExec {
         projection: Projection,
         pruning_predicates: Vec<Expr>,
         metadata_cache: Arc<ParquetMetadataCache>,
+        file_cache: Arc<ParquetFileCache>,
         object_store: Arc<dyn ObjectStore>,
     ) -> Self {
         Self {
@@ -228,6 +235,7 @@ impl ParquetScanExec {
             projection,
             pruning_predicates,
             metadata_cache,
+            file_cache,
             object_store,
         }
     }
@@ -249,6 +257,7 @@ impl PhysicalPlan for ParquetScanExec {
                     decode_nanos: 0,
                     metrics: metrics.clone(),
                     metadata_cache: self.metadata_cache,
+                    file_cache: self.file_cache,
                     object_store: self.object_store,
                 }),
                 metrics,
@@ -316,6 +325,7 @@ impl PhysicalPlan for ParquetScanExec {
                     decode_nanos: 0,
                     metrics: metrics.clone(),
                     metadata_cache: self.metadata_cache,
+                    file_cache: self.file_cache,
                     object_store: self.object_store,
                 }),
                 metrics,
@@ -334,6 +344,7 @@ impl PhysicalPlan for ParquetScanExec {
                 self.batch_size,
                 self.projection,
                 self.metadata_cache,
+                self.file_cache,
                 self.object_store,
                 metrics.clone(),
             )),
@@ -358,6 +369,7 @@ struct SequentialFragmentScanStream {
     decode_nanos: u64,
     metrics: Arc<ScanPlanMetricsCounter>,
     metadata_cache: Arc<ParquetMetadataCache>,
+    file_cache: Arc<ParquetFileCache>,
     object_store: Arc<dyn ObjectStore>,
 }
 
@@ -395,6 +407,7 @@ impl Iterator for SequentialFragmentScanStream {
                 &parquet_projection,
                 &self.pruning_predicates,
                 &self.metadata_cache,
+                self.file_cache.clone(),
                 self.object_store.as_ref(),
             ) {
                 Ok(reader) => {
@@ -453,6 +466,7 @@ impl ParallelParquetScanStream {
         batch_size: usize,
         projection: Projection,
         metadata_cache: Arc<ParquetMetadataCache>,
+        file_cache: Arc<ParquetFileCache>,
         object_store: Arc<dyn ObjectStore>,
         metrics: Arc<ScanPlanMetricsCounter>,
     ) -> Self {
@@ -464,6 +478,7 @@ impl ParallelParquetScanStream {
                 projection_without_partition_columns(&projection, &task.partition_values);
             let partition_values = task.partition_values.clone();
             let metadata_cache = metadata_cache.clone();
+            let file_cache = file_cache.clone();
             let object_store = object_store.clone();
             let metrics = metrics.clone();
             rayon::spawn(move || {
@@ -473,6 +488,7 @@ impl ParallelParquetScanStream {
                     &parquet_projection,
                     task.row_groups,
                     &metadata_cache,
+                    file_cache.clone(),
                     object_store.as_ref(),
                 ) {
                     Ok(reader) => reader,
