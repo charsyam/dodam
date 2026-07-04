@@ -76,16 +76,6 @@ impl DenseI64F64Sum {
         self.dense[index] += value;
     }
 
-    fn add_dense_key(&mut self, key: i64, value: f64) -> bool {
-        debug_assert!(self.fallback.is_none());
-        let Some(index) = adaptive_dense_index(key, DEFAULT_MAX_DENSE_I64_KEY) else {
-            return false;
-        };
-        self.reserve_dense_to(index);
-        self.add_dense_index(index, value);
-        true
-    }
-
     fn reserve_dense_to(&mut self, max_key: usize) {
         if self.fallback.is_none() && max_key >= self.dense.len() {
             self.dense.resize(max_key + 1, 0.0);
@@ -3042,8 +3032,27 @@ fn q01_update_decimal_batch(
         let extendedprice_scale = 1.0 / extendedprices.scale;
         let discount_scale = 1.0 / discounts.scale;
         let tax_scale = 1.0 / taxes.scale;
-        for row in 0..shipdates.len() {
-            if shipdates.value(row) > cutoff_days {
+        let shipdate_values = shipdates.values().as_ref();
+        if let (Some(returnflag_bytes), Some(linestatus_bytes)) = (
+            contiguous_single_byte_utf8_data(returnflags),
+            contiguous_single_byte_utf8_data(linestatuses),
+        ) {
+            for row in 0..shipdate_values.len() {
+                if shipdate_values[row] > cutoff_days {
+                    continue;
+                }
+                let quantity = quantity_values[row] as f64 * quantity_scale;
+                let extendedprice = extendedprice_values[row] as f64 * extendedprice_scale;
+                let discount = discount_values[row] as f64 * discount_scale;
+                let tax = tax_values[row] as f64 * tax_scale;
+                groups.update_key(returnflag_bytes[row], linestatus_bytes[row], |state| {
+                    state.update(quantity, extendedprice, discount, tax);
+                });
+            }
+            return Ok(true);
+        }
+        for row in 0..shipdate_values.len() {
+            if shipdate_values[row] > cutoff_days {
                 continue;
             }
             let quantity = quantity_values[row] as f64 * quantity_scale;
@@ -3057,11 +3066,11 @@ fn q01_update_decimal_batch(
                 groups.update_key(returnflag, linestatus, |state| {
                     state.update(quantity, extendedprice, discount, tax);
                 });
-            } else {
-                groups.update(returnflags.value(row), linestatuses.value(row), |state| {
-                    state.update(quantity, extendedprice, discount, tax);
-                });
+                continue;
             }
+            groups.update(returnflags.value(row), linestatuses.value(row), |state| {
+                state.update(quantity, extendedprice, discount, tax);
+            });
         }
         return Ok(true);
     }
@@ -3117,6 +3126,18 @@ fn single_byte_string_parts(offsets: &[i32], data: &[u8], row: usize) -> Option<
     let start = offsets[row] as usize;
     let end = offsets[row + 1] as usize;
     (end == start + 1).then_some(data[start])
+}
+
+fn contiguous_single_byte_utf8_data(values: &StringArray) -> Option<&[u8]> {
+    if values.null_count() != 0 || values.value_data().len() != values.len() {
+        return None;
+    }
+    for (index, offset) in values.value_offsets().iter().copied().enumerate() {
+        if usize::try_from(offset).ok()? != index {
+            return None;
+        }
+    }
+    Some(values.value_data())
 }
 
 struct Q01DecimalInput<'a> {
@@ -3287,6 +3308,7 @@ async fn try_execute_q10_returned_item_fast(
         .iter()
         .map(|(custkey, _)| *custkey)
         .collect::<HashSet<_>>();
+    let top_customer_keys = AdaptiveI64Set::from_hash(top_customer_keys);
     let customers =
         q10_customer_rows(engine, customer.path, batch_size, &top_customer_keys).await?;
     let rows = top_revenues
@@ -3450,7 +3472,7 @@ async fn q10_customer_rows(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-    customer_keys: &HashSet<i64>,
+    customer_keys: &AdaptiveI64Set,
 ) -> Result<HashMap<i64, Q10Customer>> {
     let mut stream = engine
         .scan_parquet_batches(
@@ -3479,11 +3501,48 @@ async fn q10_customer_rows(
         let addresses = batch_string_column(&batch, "c_address")?;
         let phones = batch_string_column(&batch, "c_phone")?;
         let comments = batch_string_column(&batch, "c_comment")?;
+        if let (Some(custkeys), Some(acctbals), Some(nationkeys)) = (
+            custkeys.as_any().downcast_ref::<Int64Array>(),
+            q01_decimal_input(acctbals)?,
+            nationkeys.as_any().downcast_ref::<Int64Array>(),
+        ) {
+            for row in 0..batch.num_rows() {
+                if custkeys.is_null(row)
+                    || acctbals.is_null(row)
+                    || nationkeys.is_null(row)
+                    || names.is_null(row)
+                    || addresses.is_null(row)
+                    || phones.is_null(row)
+                    || comments.is_null(row)
+                {
+                    continue;
+                }
+                let custkey = custkeys.value(row);
+                if !customer_keys.contains(custkey) {
+                    continue;
+                }
+                customers.insert(
+                    custkey,
+                    Q10Customer {
+                        c_name: names.value(row).to_string(),
+                        c_acctbal: acctbals.value(row),
+                        c_nationkey: nationkeys.value(row),
+                        c_address: addresses.value(row).to_string(),
+                        c_phone: phones.value(row).to_string(),
+                        c_comment: comments.value(row).to_string(),
+                    },
+                );
+            }
+            if customers.len() == customer_keys.len() {
+                break;
+            }
+            continue;
+        }
         for row in 0..batch.num_rows() {
             let Some(custkey) = numeric_i64_value(custkeys, row)? else {
                 continue;
             };
-            if !customer_keys.contains(&custkey) {
+            if !customer_keys.contains(custkey) {
                 continue;
             }
             let (Some(acctbal), Some(nationkey)) = (
@@ -3510,6 +3569,9 @@ async fn q10_customer_rows(
                     c_comment: comments.value(row).to_string(),
                 },
             );
+        }
+        if customers.len() == customer_keys.len() {
+            break;
         }
     }
     Ok(customers)
@@ -3644,9 +3706,11 @@ fn q10_returned_revenue_batch(
         q01_decimal_input(extendedprices)?,
         q01_decimal_input(discounts)?,
     ) {
+        let returnflag_offsets = returnflags.value_offsets();
+        let returnflag_data = returnflags.value_data();
         for row in 0..batch.num_rows() {
             if returnflags.is_null(row)
-                || returnflags.value(row) != "R"
+                || !utf8_value_is_one_byte(returnflag_offsets, returnflag_data, row, b'R')
                 || orderkeys.is_null(row)
                 || extendedprices.is_null(row)
                 || discounts.is_null(row)
@@ -3661,8 +3725,12 @@ fn q10_returned_revenue_batch(
         }
         return Ok(revenues);
     }
+    let returnflag_offsets = returnflags.value_offsets();
+    let returnflag_data = returnflags.value_data();
     for row in 0..batch.num_rows() {
-        if returnflags.is_null(row) || returnflags.value(row) != "R" {
+        if returnflags.is_null(row)
+            || !utf8_value_is_one_byte(returnflag_offsets, returnflag_data, row, b'R')
+        {
             continue;
         }
         let Some(orderkey) = numeric_i64_value(orderkeys, row)? else {
@@ -8342,7 +8410,7 @@ async fn q06_revenue_sum(
         .await?;
     parallel_batch_fold_chunks(
         &mut stream,
-        16,
+        8,
         move |batches| {
             let mut sum = 0.0;
             let mut count = 0_u64;
@@ -8405,18 +8473,22 @@ fn q06_revenue_sum_batch(
             let discount_high_raw = scaled_f64_to_i128(discount_high, discounts.scale);
             let quantity_limit_raw = scaled_f64_to_i128(quantity_limit, quantities.scale);
             let revenue_scale = 1.0 / (extendedprices.scale * discounts.scale);
-            for row in 0..batch.num_rows() {
-                let shipdate = shipdates.value(row);
-                let discount = discounts.values.value(row);
+            let shipdate_values = shipdates.values().as_ref();
+            let discount_values = discounts.raw_values();
+            let quantity_values = quantities.raw_values();
+            let extendedprice_values = extendedprices.raw_values();
+            for row in 0..shipdate_values.len() {
+                let shipdate = shipdate_values[row];
+                let discount = discount_values[row];
                 if shipdate < start_days
                     || shipdate >= end_days
                     || discount < discount_low_raw
                     || discount > discount_high_raw
-                    || quantities.values.value(row) >= quantity_limit_raw
+                    || quantity_values[row] >= quantity_limit_raw
                 {
                     continue;
                 }
-                sum += (extendedprices.values.value(row) * discount) as f64 * revenue_scale;
+                sum += (extendedprice_values[row] * discount) as f64 * revenue_scale;
                 count += 1;
             }
             return Ok(Some((sum, count)));
@@ -9909,6 +9981,12 @@ fn batch_string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Str
         .ok_or_else(|| DodamError::UnsupportedSql(format!("{name} must be Utf8")))
 }
 
+fn utf8_value_is_one_byte(offsets: &[i32], data: &[u8], row: usize, byte: u8) -> bool {
+    let start = offsets[row] as usize;
+    let end = offsets[row + 1] as usize;
+    end == start + 1 && data[start] == byte
+}
+
 fn numeric_i64_value(column: &ArrayRef, row: usize) -> Result<Option<i64>> {
     if column.is_null(row) {
         return Ok(None);
@@ -10519,47 +10597,41 @@ fn q18_quantity_batch_into_dense(batch: &RecordBatch, sums: &mut DenseI64F64Sum)
         return Ok(false);
     };
     if orderkeys.null_count() == 0 && quantities.null_count() == 0 {
+        let mut max_index = 0_usize;
         for row in 0..orderkeys.len() {
-            if !sums.add_dense_key(orderkeys.value(row), quantities.value(row)) {
-                q18_quantity_batch_remaining_into_fallback(row, orderkeys, &quantities, sums);
-                break;
-            }
+            let Some(index) = adaptive_dense_index(orderkeys.value(row), DEFAULT_MAX_DENSE_I64_KEY)
+            else {
+                return Ok(false);
+            };
+            max_index = max_index.max(index);
+        }
+        sums.reserve_dense_to(max_index);
+        for row in 0..orderkeys.len() {
+            let index = usize::try_from(orderkeys.value(row)).expect("validated dense index");
+            sums.add_dense_index(index, quantities.value(row));
         }
         return Ok(true);
     }
+    let mut max_index = 0_usize;
     for row in 0..orderkeys.len() {
         if orderkeys.is_null(row) || quantities.is_null(row) {
             continue;
         }
-        if !sums.add_dense_key(orderkeys.value(row), quantities.value(row)) {
-            q18_quantity_batch_remaining_into_fallback(row, orderkeys, &quantities, sums);
-            break;
-        }
+        let Some(index) = adaptive_dense_index(orderkeys.value(row), DEFAULT_MAX_DENSE_I64_KEY)
+        else {
+            return Ok(false);
+        };
+        max_index = max_index.max(index);
     }
-    Ok(true)
-}
-
-fn q18_quantity_batch_remaining_into_fallback(
-    start_row: usize,
-    orderkeys: &Int64Array,
-    quantities: &Q01DecimalInput<'_>,
-    sums: &mut DenseI64F64Sum,
-) {
-    sums.convert_to_fallback();
-    let fallback = sums
-        .fallback
-        .as_mut()
-        .expect("converted Q18 quantity fallback");
-    for row in start_row..orderkeys.len() {
+    sums.reserve_dense_to(max_index);
+    for row in 0..orderkeys.len() {
         if orderkeys.is_null(row) || quantities.is_null(row) {
             continue;
         }
-        fallback.update(
-            orderkeys.value(row),
-            || 0.0,
-            |sum| *sum += quantities.value(row),
-        );
+        let index = usize::try_from(orderkeys.value(row)).expect("validated dense index");
+        sums.add_dense_index(index, quantities.value(row));
     }
+    Ok(true)
 }
 
 fn q18_quantity_batch_into(batch: &RecordBatch, sums: &mut AdaptiveI64Map<f64>) -> Result<()> {
