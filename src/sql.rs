@@ -57,6 +57,7 @@ fn tpch_profile_elapsed(label: &str, started: Option<Instant>) {
 
 const DEFAULT_MAX_DENSE_I64_KEY: usize = 20_000_000;
 
+#[derive(Clone)]
 enum AdaptiveI64Set {
     Dense { contains: Vec<bool>, len: usize },
     Hash(HashSet<i64>),
@@ -8590,7 +8591,7 @@ async fn q06_revenue_sum(
         .await?;
     parallel_batch_fold_chunks(
         &mut stream,
-        8,
+        16,
         move |batches| {
             let mut sum = 0.0;
             let mut count = 0_u64;
@@ -11331,6 +11332,7 @@ fn q19_lineitem_revenue_batch(
         q01_decimal_input(extendedprices)?,
         q01_decimal_input(discounts)?,
     ) {
+        let raw_rules = q19_raw_line_rules(rules, quantities.scale);
         if partkeys.null_count() == 0
             && quantities.null_count() == 0
             && extendedprices.null_count() == 0
@@ -11338,17 +11340,20 @@ fn q19_lineitem_revenue_batch(
             && shipmodes.null_count() == 0
             && shipinstructs.null_count() == 0
         {
+            let shipmode_offsets = shipmodes.value_offsets();
+            let shipmode_data = shipmodes.value_data();
+            let shipinstruct_offsets = shipinstructs.value_offsets();
+            let shipinstruct_data = shipinstructs.value_data();
             for row in 0..batch.num_rows() {
                 let Some(mask) = part_masks.get(partkeys.value(row)) else {
                     continue;
                 };
-                let quantity = quantities.value(row);
-                if !q19_rule_matches_lineitem(
-                    rules,
+                if !q19_rule_matches_lineitem_raw(
+                    &raw_rules,
                     mask,
-                    quantity,
-                    shipmodes.value(row),
-                    shipinstructs.value(row),
+                    quantities.raw_value(row),
+                    bytes_string_parts(shipmode_offsets, shipmode_data, row),
+                    bytes_string_parts(shipinstruct_offsets, shipinstruct_data, row),
                 ) {
                     continue;
                 }
@@ -11412,6 +11417,60 @@ fn q19_lineitem_revenue_batch(
         }
     }
     Ok((sum, count))
+}
+
+struct Q19RawLineRule {
+    quantity_low: i128,
+    quantity_high: i128,
+    shipmodes: Vec<Vec<u8>>,
+    shipinstruct: Vec<u8>,
+}
+
+fn q19_raw_line_rules(rules: &[Q19Rule], quantity_scale: f64) -> Vec<Q19RawLineRule> {
+    rules
+        .iter()
+        .map(|rule| Q19RawLineRule {
+            quantity_low: scaled_f64_to_i128(rule.quantity_low, quantity_scale),
+            quantity_high: scaled_f64_to_i128(rule.quantity_high, quantity_scale),
+            shipmodes: rule
+                .shipmodes
+                .iter()
+                .map(|shipmode| shipmode.as_bytes().to_vec())
+                .collect(),
+            shipinstruct: rule.shipinstruct.as_bytes().to_vec(),
+        })
+        .collect()
+}
+
+fn bytes_string_parts<'a>(offsets: &[i32], data: &'a [u8], row: usize) -> &'a [u8] {
+    let start = offsets[row] as usize;
+    let end = offsets[row + 1] as usize;
+    &data[start..end]
+}
+
+fn q19_rule_matches_lineitem_raw(
+    rules: &[Q19RawLineRule],
+    mask: u8,
+    quantity: i128,
+    shipmode: &[u8],
+    shipinstruct: &[u8],
+) -> bool {
+    for (index, rule) in rules.iter().enumerate() {
+        if mask & (1 << index) == 0 {
+            continue;
+        }
+        if quantity >= rule.quantity_low
+            && quantity <= rule.quantity_high
+            && rule.shipinstruct == shipinstruct
+            && rule
+                .shipmodes
+                .iter()
+                .any(|candidate| candidate.as_slice() == shipmode)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn q19_rule_matches_lineitem(
@@ -11943,12 +12002,18 @@ async fn try_execute_q20_potential_part_promotion_fast(
         return Ok(None);
     };
 
+    let stage = tpch_profile_start();
     let forest_parts = q20_forest_part_keys(engine, part_path, batch_size).await?;
+    tpch_profile_elapsed("Q20 forest part keys", stage);
     if forest_parts.is_empty() {
         return Ok(Some(q20_output(Vec::new())?));
     }
+    let forest_parts = adaptive_i64_set_from_hash(forest_parts);
+    let stage = tpch_profile_start();
     let lineitem_sums =
         q20_lineitem_quantity_sums(engine, lineitem_path, batch_size, &forest_parts).await?;
+    tpch_profile_elapsed("Q20 lineitem quantity sums", stage);
+    let stage = tpch_profile_start();
     let eligible_suppliers = q20_eligible_supplier_keys(
         engine,
         partsupp_path,
@@ -11957,10 +12022,14 @@ async fn try_execute_q20_potential_part_promotion_fast(
         &lineitem_sums,
     )
     .await?;
+    tpch_profile_elapsed("Q20 eligible suppliers", stage);
     if eligible_suppliers.is_empty() {
         return Ok(Some(q20_output(Vec::new())?));
     }
+    let stage = tpch_profile_start();
     let nation_keys = q21_nation_keys(engine, nation.path, batch_size, "CANADA").await?;
+    tpch_profile_elapsed("Q20 nation keys", stage);
+    let stage = tpch_profile_start();
     let mut rows = q20_supplier_rows(
         engine,
         supplier.path,
@@ -11969,7 +12038,10 @@ async fn try_execute_q20_potential_part_promotion_fast(
         &eligible_suppliers,
     )
     .await?;
+    tpch_profile_elapsed("Q20 supplier rows", stage);
+    let stage = tpch_profile_start();
     rows.sort_by(|left, right| left.s_name.cmp(&right.s_name));
+    tpch_profile_elapsed("Q20 final sort", stage);
     Ok(Some(q20_output(rows)?))
 }
 
@@ -12018,7 +12090,7 @@ async fn q20_lineitem_quantity_sums(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-    forest_parts: &HashSet<i64>,
+    forest_parts: &AdaptiveI64Set,
 ) -> Result<HashMap<(i64, i64), f64>> {
     let mut stream = engine
         .scan_parquet_batches(
@@ -12056,7 +12128,7 @@ async fn q20_lineitem_quantity_sums(
 
 fn q20_lineitem_quantity_sums_batch(
     batch: RecordBatch,
-    forest_parts: &HashSet<i64>,
+    forest_parts: &AdaptiveI64Set,
 ) -> Result<HashMap<(i64, i64), f64>> {
     let partkeys = batch_column(&batch, "l_partkey")?;
     let suppkeys = batch_column(&batch, "l_suppkey")?;
@@ -12082,7 +12154,7 @@ fn q20_lineitem_quantity_sums_batch(
         ) else {
             continue;
         };
-        if forest_parts.contains(&partkey) {
+        if forest_parts.contains(partkey) {
             *sums.entry((partkey, suppkey)).or_insert(0.0) += quantity;
         }
     }
@@ -12094,7 +12166,7 @@ fn q20_lineitem_quantity_sums_typed(
     suppkeys: &ArrayRef,
     quantities: &ArrayRef,
     shipdates: &ArrayRef,
-    forest_parts: &HashSet<i64>,
+    forest_parts: &AdaptiveI64Set,
 ) -> Result<Option<HashMap<(i64, i64), f64>>> {
     let (Some(partkeys), Some(suppkeys), Some(quantities), Some(shipdates)) = (
         partkeys.as_any().downcast_ref::<Int64Array>(),
@@ -12116,7 +12188,7 @@ fn q20_lineitem_quantity_sums_typed(
                 continue;
             }
             let partkey = partkeys.value(row);
-            if forest_parts.contains(&partkey) {
+            if forest_parts.contains(partkey) {
                 *sums.entry((partkey, suppkeys.value(row))).or_insert(0.0) += quantities.value(row);
             }
         }
@@ -12135,7 +12207,7 @@ fn q20_lineitem_quantity_sums_typed(
             continue;
         }
         let partkey = partkeys.value(row);
-        if forest_parts.contains(&partkey) {
+        if forest_parts.contains(partkey) {
             *sums.entry((partkey, suppkeys.value(row))).or_insert(0.0) += quantities.value(row);
         }
     }
@@ -12146,7 +12218,7 @@ async fn q20_eligible_supplier_keys(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-    forest_parts: &HashSet<i64>,
+    forest_parts: &AdaptiveI64Set,
     lineitem_sums: &HashMap<(i64, i64), f64>,
 ) -> Result<HashSet<i64>> {
     let mut stream = engine
@@ -12168,6 +12240,16 @@ async fn q20_eligible_supplier_keys(
         let partkeys = batch_column(&batch, "ps_partkey")?;
         let suppkeys = batch_column(&batch, "ps_suppkey")?;
         let availqty = batch_column(&batch, "ps_availqty")?;
+        if let Some(batch_suppliers) = q20_eligible_supplier_keys_typed(
+            partkeys,
+            suppkeys,
+            availqty,
+            forest_parts,
+            lineitem_sums,
+        ) {
+            suppliers.extend(batch_suppliers);
+            continue;
+        }
         for row in 0..batch.num_rows() {
             let (Some(partkey), Some(suppkey), Some(availqty)) = (
                 numeric_i64_value(partkeys, row)?,
@@ -12176,7 +12258,7 @@ async fn q20_eligible_supplier_keys(
             ) else {
                 continue;
             };
-            if !forest_parts.contains(&partkey) {
+            if !forest_parts.contains(partkey) {
                 continue;
             }
             let Some(quantity_sum) = lineitem_sums.get(&(partkey, suppkey)) else {
@@ -12188,6 +12270,56 @@ async fn q20_eligible_supplier_keys(
         }
     }
     Ok(suppliers)
+}
+
+fn q20_eligible_supplier_keys_typed(
+    partkeys: &ArrayRef,
+    suppkeys: &ArrayRef,
+    availqtys: &ArrayRef,
+    forest_parts: &AdaptiveI64Set,
+    lineitem_sums: &HashMap<(i64, i64), f64>,
+) -> Option<HashSet<i64>> {
+    let (Some(partkeys), Some(suppkeys), Some(availqtys)) = (
+        partkeys.as_any().downcast_ref::<Int64Array>(),
+        suppkeys.as_any().downcast_ref::<Int64Array>(),
+        availqtys.as_any().downcast_ref::<Int32Array>(),
+    ) else {
+        return None;
+    };
+    let mut suppliers = HashSet::new();
+    if partkeys.null_count() == 0 && suppkeys.null_count() == 0 && availqtys.null_count() == 0 {
+        for row in 0..partkeys.len() {
+            let partkey = partkeys.value(row);
+            if !forest_parts.contains(partkey) {
+                continue;
+            }
+            let suppkey = suppkeys.value(row);
+            let Some(quantity_sum) = lineitem_sums.get(&(partkey, suppkey)) else {
+                continue;
+            };
+            if f64::from(availqtys.value(row)) > 0.5 * *quantity_sum {
+                suppliers.insert(suppkey);
+            }
+        }
+        return Some(suppliers);
+    }
+    for row in 0..partkeys.len() {
+        if partkeys.is_null(row) || suppkeys.is_null(row) || availqtys.is_null(row) {
+            continue;
+        }
+        let partkey = partkeys.value(row);
+        if !forest_parts.contains(partkey) {
+            continue;
+        }
+        let suppkey = suppkeys.value(row);
+        let Some(quantity_sum) = lineitem_sums.get(&(partkey, suppkey)) else {
+            continue;
+        };
+        if f64::from(availqtys.value(row)) > 0.5 * *quantity_sum {
+            suppliers.insert(suppkey);
+        }
+    }
+    Some(suppliers)
 }
 
 struct Q20Row {
