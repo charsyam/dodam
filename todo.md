@@ -328,6 +328,13 @@ Effective or retained:
   - This is different from the earlier rejected raw-product experiment: it keeps the same f64 arithmetic path and only removes repeated Arrow accessor/scale work.
   - Q01 focused aggregate profile improved from about `58ms` to about `51ms`, and standalone Parquet COPY median improved from about `0.074s` to about `0.063s`.
   - Full SF=1 TPC-H Parquet COPY sum-of-medians improved to about `1.211s` Dodam / `1.088s` DuckDB (`1.11x`).
+- Q16 dense integer membership/map:
+  - Changed Q16 `p_size IN (...)`, bad-supplier membership, and `partkey -> group_id` lookup to use existing adaptive dense integer set/map structures instead of hash probes on dense TPC-H keys.
+  - Focused Q16 profile improved materially:
+    - part groups about `25.9ms` to `17.0ms`
+    - partsupp supplier counts about `28.8ms` to `15.1ms`
+    - standalone Parquet COPY median about `0.061s` to `0.045s`
+  - Full SF=1 TPC-H sampled Q16 improved from about `0.0485s` to about `0.0463s`, while total 22-query sum stayed noise-sensitive around `1.11-1.12x`.
 
 Tried and rejected or neutral:
 
@@ -417,6 +424,12 @@ Tried and rejected or neutral:
 - Q18 raw decimal quantity accumulation:
   - Tested reading `Decimal128` raw values and multiplying by reciprocal scale instead of using the existing decimal value accessor.
   - Q18 profile and median were neutral to slightly worse, so the simpler existing decimal conversion was kept.
+- Q18 adaptive map retention:
+  - Tested keeping qualifying order quantities as `AdaptiveI64Map<f64>` instead of materializing a filtered `HashMap`.
+  - Rejected because cloning/retaining the dense present vector and downstream lookup shape regressed Q18 median to about `0.101s`.
+- Q18 consecutive-key run aggregation:
+  - Tested aggregating consecutive identical `l_orderkey` runs inside each batch before updating the dense sum vector.
+  - Rejected because branch/run tracking overhead outweighed fewer dense updates on the current lineitem ordering; Q18 median regressed to about `0.099s`.
 
 ### Planning And DAG Execution
 

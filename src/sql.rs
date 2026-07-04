@@ -5553,6 +5553,7 @@ async fn try_execute_q16_parts_supplier_relationship_fast(
     let Some(sizes) = numeric_in_i64_literals(&conjuncts, "p_size")? else {
         return Ok(None);
     };
+    let sizes = adaptive_i64_set_from_hash(sizes);
     let Some(comment_parts) = like_substrings_literal(selection, "s_comment")? else {
         return Ok(None);
     };
@@ -5793,7 +5794,7 @@ struct Q16GroupKey {
 
 struct Q16PartGroups {
     groups: Vec<Q16GroupKey>,
-    part_to_group: HashMap<i64, usize>,
+    part_to_group: AdaptiveI64Map<usize>,
 }
 
 async fn q16_part_groups(
@@ -5802,7 +5803,7 @@ async fn q16_part_groups(
     batch_size: usize,
     excluded_brand: &str,
     excluded_type_prefix: &str,
-    sizes: &HashSet<i64>,
+    sizes: &AdaptiveI64Set,
 ) -> Result<Q16PartGroups> {
     let mut stream = engine
         .scan_parquet_batches(
@@ -5841,7 +5842,7 @@ async fn q16_part_groups(
             ) else {
                 continue;
             };
-            if !sizes.contains(&size) {
+            if !sizes.contains(size) {
                 continue;
             }
             let key = Q16GroupKey {
@@ -5862,7 +5863,7 @@ async fn q16_part_groups(
     }
     Ok(Q16PartGroups {
         groups,
-        part_to_group,
+        part_to_group: adaptive_i64_map_from_hash(part_to_group),
     })
 }
 
@@ -5891,7 +5892,7 @@ async fn q16_supplier_counts(
         .await?;
     let groups = part_groups.groups;
     let part_to_group = Arc::new(part_groups.part_to_group);
-    let bad_suppliers = Arc::new(bad_suppliers);
+    let bad_suppliers = Arc::new(adaptive_i64_set_from_hash(bad_suppliers));
     let supplier_sets = parallel_batch_fold(
         &mut stream,
         move |batch| q16_supplier_counts_batch(batch, &part_to_group, &bad_suppliers),
@@ -5924,8 +5925,8 @@ async fn q16_supplier_counts(
 
 fn q16_supplier_counts_batch(
     batch: RecordBatch,
-    part_to_group: &HashMap<i64, usize>,
-    bad_suppliers: &HashSet<i64>,
+    part_to_group: &AdaptiveI64Map<usize>,
+    bad_suppliers: &AdaptiveI64Set,
 ) -> Result<HashMap<usize, HashSet<i64>>> {
     let partkeys = batch_column(&batch, "ps_partkey")?;
     let suppkeys = batch_column(&batch, "ps_suppkey")?;
@@ -5942,10 +5943,10 @@ fn q16_supplier_counts_batch(
         ) else {
             continue;
         };
-        if bad_suppliers.contains(&suppkey) {
+        if bad_suppliers.contains(suppkey) {
             continue;
         }
-        let Some(group_id) = part_to_group.get(&partkey).copied() else {
+        let Some(group_id) = part_to_group.get(partkey) else {
             continue;
         };
         groups.entry(group_id).or_default().insert(suppkey);
@@ -5956,8 +5957,8 @@ fn q16_supplier_counts_batch(
 fn q16_supplier_counts_batch_typed(
     partkeys: &ArrayRef,
     suppkeys: &ArrayRef,
-    part_to_group: &HashMap<i64, usize>,
-    bad_suppliers: &HashSet<i64>,
+    part_to_group: &AdaptiveI64Map<usize>,
+    bad_suppliers: &AdaptiveI64Set,
 ) -> Result<Option<HashMap<usize, HashSet<i64>>>> {
     let (Some(partkeys), Some(suppkeys)) = (
         partkeys.as_any().downcast_ref::<Int64Array>(),
@@ -5971,10 +5972,10 @@ fn q16_supplier_counts_batch_typed(
             continue;
         }
         let suppkey = suppkeys.value(row);
-        if bad_suppliers.contains(&suppkey) {
+        if bad_suppliers.contains(suppkey) {
             continue;
         }
-        let Some(group_id) = part_to_group.get(&partkeys.value(row)).copied() else {
+        let Some(group_id) = part_to_group.get(partkeys.value(row)) else {
             continue;
         };
         groups.entry(group_id).or_default().insert(suppkey);
