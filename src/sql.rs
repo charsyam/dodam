@@ -10767,6 +10767,24 @@ fn q18_quantity_batch_into_dense(batch: &RecordBatch, sums: &mut DenseI64F64Sum)
         return Ok(false);
     };
     let mut max_orderkey = None::<usize>;
+    if orderkeys.null_count() == 0 && quantities.null_count() == 0 {
+        for row in 0..orderkeys.len() {
+            let Some(orderkey) =
+                adaptive_dense_index(orderkeys.value(row), DEFAULT_MAX_DENSE_I64_KEY)
+            else {
+                return Ok(false);
+            };
+            max_orderkey = Some(max_orderkey.map_or(orderkey, |max| max.max(orderkey)));
+        }
+        if let Some(max_orderkey) = max_orderkey {
+            sums.reserve_dense_to(max_orderkey);
+        }
+        for row in 0..orderkeys.len() {
+            let orderkey = usize::try_from(orderkeys.value(row)).expect("validated dense orderkey");
+            sums.add_dense_index(orderkey, quantities.value(row));
+        }
+        return Ok(true);
+    }
     for row in 0..orderkeys.len() {
         if orderkeys.is_null(row) || quantities.is_null(row) {
             continue;
@@ -11833,9 +11851,19 @@ async fn q21_lineitem_order_states(
         .await?;
     let output_capacity = final_orders.len();
     let final_orders = Arc::new(final_orders);
-    parallel_batch_fold(
+    parallel_batch_fold_chunks(
         &mut stream,
-        move |batch| q21_lineitem_order_states_batch(batch, &final_orders),
+        8,
+        move |batches| {
+            let mut states = HashMap::<i64, Q21OrderState>::new();
+            for batch in batches {
+                q21_merge_order_states(
+                    &mut states,
+                    q21_lineitem_order_states_batch(batch, &final_orders)?,
+                );
+            }
+            Ok(states)
+        },
         HashMap::<i64, Q21OrderState>::with_capacity(output_capacity),
         q21_merge_order_states,
         "Q21 lineitem order states",
@@ -11896,6 +11924,25 @@ fn q21_lineitem_order_states_typed(
         return None;
     };
     let mut states = HashMap::<i64, Q21OrderState>::new();
+    if orderkeys.null_count() == 0
+        && suppkeys.null_count() == 0
+        && receipt.null_count() == 0
+        && commit.null_count() == 0
+    {
+        for row in 0..orderkeys.len() {
+            let orderkey = orderkeys.value(row);
+            if !final_orders.contains(orderkey) {
+                continue;
+            }
+            let suppkey = suppkeys.value(row);
+            let state = states.entry(orderkey).or_default();
+            state.add_supplier(suppkey);
+            if receipt.value(row) > commit.value(row) {
+                state.add_late_supplier(suppkey);
+            }
+        }
+        return Some(states);
+    }
     for row in 0..orderkeys.len() {
         if orderkeys.is_null(row) || suppkeys.is_null(row) {
             continue;
