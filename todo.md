@@ -310,6 +310,14 @@ Effective or retained:
   - Retained a general fast path for outer `GROUP BY` + `count(*)` over a derived aggregate output column.
   - This covers Q13's `GROUP BY c_count` shape without matching on query names or table names.
   - Latest Q13 standalone CLI median improved from about `0.025s` to about `0.018s` under stdout capture.
+- Parallel Parquet scan row-group chunking:
+  - Changed parallel scan tasks to read up to 4 row groups per `ParquetBatchReader` instead of opening/building one reader per row group.
+  - This is a general scan executor rule, not a query-name specialization: it reduces repeated local file opens, metadata/builder setup, and channel fanout while preserving enough parallelism for SF=1 TPC-H files.
+  - Focused SF=1 TPC-H Parquet COPY medians improved on scan-heavy cases:
+    - Q01 about `0.096s` to `0.067s`
+    - Q06 about `0.054s` to `0.042s`
+    - Q19 about `0.087s` to `0.056s`
+  - Full SF=1 TPC-H 22-query Parquet COPY sum-of-medians improved from about `1.389s` Dodam / `1.085s` DuckDB (`1.28x`) to about `1.226s` Dodam / `1.089s` DuckDB (`1.13x`).
 
 Tried and rejected or neutral:
 
@@ -387,6 +395,15 @@ Tried and rejected or neutral:
 - Forcing very small Parquet scans to sequential reader:
   - Restored file-order duplicate payload output, but regressed engine time for dense and duplicate joins.
   - Rejected as a broad heuristic.
+- Parallel Parquet scan chunk size 2:
+  - Helped Q18 somewhat versus chunk size 4, but regressed Q01/Q06/Q19 and the full TPC-H comparison.
+  - A 2-run full SF=1 TPC-H check was about `1.343s` Dodam / `1.099s` DuckDB (`1.22x`), so it was rejected.
+- Parallel Parquet scan chunk size 8:
+  - Improved pure scan-heavy Q01/Q06 further, but reduced parallelism enough to regress Q18/Q19/Q21.
+  - Rejected as a global default; a future adaptive policy needs a better signal than query shape.
+- Low-cardinality two-`Utf8` grouped aggregate linear lookup:
+  - Tested a small-group linear lookup before the nested string hash-map path.
+  - A/B results were noisy and not clearly better, so it was not retained.
 
 ### Planning And DAG Execution
 
@@ -499,7 +516,17 @@ Tried and rejected or neutral:
 - Use the new per-stage metrics to identify excessive task counts in row-group-heavy plans.
 - Add configurable local execution options to CLI/profile entry points when DAG execution becomes user-facing.
 
-### 5. Finish Declarative Plan Coverage
+### 5. TPC-H Remaining Performance Gaps
+
+- Current SF=1 Parquet COPY 22-query comparison is about `1.13x` Dodam/DuckDB by sum of medians.
+- Biggest remaining slow queries after row-group chunking:
+  - Q18: about `1.61x`; likely dominated by derived aggregate + multi-join materialization rather than output write.
+  - Q01: about `1.47x`; scan + two-key grouped aggregate still slower than DuckDB.
+  - Q06: about `1.38x`; narrow scan/filter/expression aggregate still has engine overhead after chunking.
+  - Q16/Q10/Q21 remain around `1.17x-1.25x`.
+- Several queries are now faster than DuckDB on this fixture, including Q02, Q11, Q13, Q14, Q17, Q19, and Q20.
+
+### 6. Finish Declarative Plan Coverage
 
 - Move `EXPLAIN` for scan/join/aggregate/sort/limit/copy fully onto declarative plan representation.
 - Add aggregate execution lowering to declarative physical nodes.
@@ -511,7 +538,7 @@ Tried and rejected or neutral:
 - Add sort-merge join ordering requirements to physical planning.
 - Preserve current fast local execution paths while moving planning state out of ad hoc execution objects.
 
-### 6. SQL And Compatibility Expansion
+### 7. SQL And Compatibility Expansion
 
 - TPC-H 22 queries now execute on the current SF=0.01 real-data Parquet fixture, but general SQL compatibility is still limited.
 - Extend nested/list/struct behavior beyond projection:

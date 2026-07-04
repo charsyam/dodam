@@ -439,6 +439,14 @@ struct ParallelParquetScanStream {
     receiver: mpsc::Receiver<Result<RecordBatch>>,
 }
 
+struct ParquetScanTaskChunk {
+    path: PathBuf,
+    row_groups: Vec<usize>,
+    partition_values: BTreeMap<String, String>,
+}
+
+const PARALLEL_PARQUET_SCAN_ROW_GROUP_CHUNK: usize = 4;
+
 impl ParallelParquetScanStream {
     fn new(
         tasks: Vec<ParquetScanTask>,
@@ -449,7 +457,7 @@ impl ParallelParquetScanStream {
         metrics: Arc<ScanPlanMetricsCounter>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel();
-        for task in tasks {
+        for task in chunk_parquet_scan_tasks(tasks, PARALLEL_PARQUET_SCAN_ROW_GROUP_CHUNK) {
             let sender = sender.clone();
             let projection = projection.clone();
             let parquet_projection =
@@ -459,48 +467,46 @@ impl ParallelParquetScanStream {
             let object_store = object_store.clone();
             let metrics = metrics.clone();
             rayon::spawn(move || {
-                let result = ParquetBatchReader::try_new_with_row_groups(
+                let mut reader = match ParquetBatchReader::try_new_with_row_groups(
                     &task.path,
                     batch_size,
                     &parquet_projection,
-                    vec![task.row_group],
+                    task.row_groups,
                     &metadata_cache,
                     object_store.as_ref(),
-                )
-                .map(|mut reader| {
-                    metrics.add_metadata_time(Duration::from_nanos(reader.metadata_nanos()));
-                    metrics.add_planning_time(Duration::from_nanos(reader.planning_nanos()));
-                    let mut batches = Vec::new();
-                    let mut decode_nanos = 0_u64;
-                    loop {
-                        let start = Instant::now();
-                        let Some(batch) = reader.next() else {
-                            break;
-                        };
-                        decode_nanos = decode_nanos.saturating_add(elapsed_nanos(start));
-                        batches.push(add_partition_columns(
-                            batch?,
-                            &projection,
-                            &partition_values,
-                        )?);
+                ) {
+                    Ok(reader) => reader,
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                        return;
                     }
-                    if decode_nanos > 0 {
-                        metrics.add_decode_time(Duration::from_nanos(decode_nanos));
-                    }
-                    Ok(batches)
-                });
-
-                match result {
-                    Ok(Ok(batches)) => {
-                        for batch in batches {
+                };
+                metrics.add_metadata_time(Duration::from_nanos(reader.metadata_nanos()));
+                metrics.add_planning_time(Duration::from_nanos(reader.planning_nanos()));
+                let mut decode_nanos = 0_u64;
+                loop {
+                    let start = Instant::now();
+                    let Some(batch) = reader.next() else {
+                        break;
+                    };
+                    decode_nanos = decode_nanos.saturating_add(elapsed_nanos(start));
+                    let batch = batch.and_then(|batch| {
+                        add_partition_columns(batch, &projection, &partition_values)
+                    });
+                    match batch {
+                        Ok(batch) => {
                             if sender.send(Ok(batch)).is_err() {
-                                return;
+                                break;
                             }
                         }
+                        Err(error) => {
+                            let _ = sender.send(Err(error));
+                            break;
+                        }
                     }
-                    Ok(Err(error)) | Err(error) => {
-                        let _ = sender.send(Err(error));
-                    }
+                }
+                if decode_nanos > 0 {
+                    metrics.add_decode_time(Duration::from_nanos(decode_nanos));
                 }
             });
         }
@@ -508,6 +514,30 @@ impl ParallelParquetScanStream {
 
         Self { receiver }
     }
+}
+
+fn chunk_parquet_scan_tasks(
+    tasks: Vec<ParquetScanTask>,
+    target_row_groups: usize,
+) -> Vec<ParquetScanTaskChunk> {
+    let target_row_groups = target_row_groups.max(1);
+    let mut chunks: Vec<ParquetScanTaskChunk> = Vec::new();
+    for task in tasks {
+        if let Some(chunk) = chunks.last_mut()
+            && chunk.path == task.path
+            && chunk.partition_values == task.partition_values
+            && chunk.row_groups.len() < target_row_groups
+        {
+            chunk.row_groups.push(task.row_group);
+            continue;
+        }
+        chunks.push(ParquetScanTaskChunk {
+            path: task.path,
+            row_groups: vec![task.row_group],
+            partition_values: task.partition_values,
+        });
+    }
+    chunks
 }
 
 impl Iterator for ParallelParquetScanStream {
