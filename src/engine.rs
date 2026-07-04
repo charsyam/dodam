@@ -1191,6 +1191,101 @@ impl DodamEngine {
         Ok(Some(results))
     }
 
+    pub async fn parquet_row_group_map<State, Output, BuildState, ConsumeBatch, Finish>(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        projection: Projection,
+        row_group_chunk: usize,
+        build_state: BuildState,
+        consume_batch: ConsumeBatch,
+        finish: Finish,
+    ) -> Result<Option<Vec<Output>>>
+    where
+        State: Send + 'static,
+        Output: Send + 'static,
+        BuildState: Fn() -> State + Clone + Send + Sync + 'static,
+        ConsumeBatch:
+            Fn(RecordBatch, &mut State) -> Result<Option<()>> + Clone + Send + Sync + 'static,
+        Finish: Fn(State) -> Result<Option<Output>> + Clone + Send + Sync + 'static,
+    {
+        let source = self.plan_table_source(path.clone()).await?;
+        if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
+            return Ok(None);
+        }
+        let local_path = source.fragments[0].parquet_local_path()?.to_path_buf();
+        let plan = plan_parquet_scan_tasks(
+            &local_path,
+            &projection,
+            &[],
+            &self.metadata_cache,
+            self.object_store.as_ref(),
+        )?;
+        let row_groups = plan
+            .tasks
+            .into_iter()
+            .map(|task| task.row_group)
+            .collect::<Vec<_>>();
+        if row_groups.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let chunks = row_groups
+            .chunks(row_group_chunk.max(1))
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
+        let (sender, receiver) = mpsc::channel();
+        for (index, row_groups) in chunks.iter().cloned().enumerate() {
+            let sender = sender.clone();
+            let path = local_path.clone();
+            let projection = projection.clone();
+            let metadata_cache = self.metadata_cache.clone();
+            let file_cache = self.file_cache.clone();
+            let object_store = self.object_store.clone();
+            let build_state = build_state.clone();
+            let consume_batch = consume_batch.clone();
+            let finish = finish.clone();
+            rayon::spawn(move || {
+                let result = parquet_row_group_map_chunk(
+                    path,
+                    batch_size,
+                    row_groups,
+                    &projection,
+                    &metadata_cache,
+                    file_cache,
+                    object_store.as_ref(),
+                    build_state(),
+                    consume_batch,
+                    finish,
+                );
+                let _ = sender.send((index, result));
+            });
+        }
+        drop(sender);
+
+        let mut outputs = (0..chunks.len())
+            .map(|_| None)
+            .collect::<Vec<Option<Option<Output>>>>();
+        for _ in 0..chunks.len() {
+            let (index, result) = receiver.recv().map_err(|_| {
+                DodamError::UnsupportedSql("parquet row-group map worker stopped".to_string())
+            })?;
+            outputs[index] = Some(result?);
+        }
+        let mut results = Vec::with_capacity(outputs.len());
+        for output in outputs {
+            let Some(output) = output else {
+                return Err(DodamError::UnsupportedSql(
+                    "parquet row-group map result missing".to_string(),
+                ));
+            };
+            let Some(output) = output else {
+                return Ok(None);
+            };
+            results.push(output);
+        }
+        Ok(Some(results))
+    }
+
     pub async fn plan_parquet_scan(
         &self,
         path: PathBuf,
@@ -3130,6 +3225,41 @@ where
         return Ok(None);
     };
     Ok(Some(LateMaterializedChunkResult { output, metrics }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parquet_row_group_map_chunk<State, Output, ConsumeBatch, Finish>(
+    path: PathBuf,
+    batch_size: usize,
+    row_groups: Vec<usize>,
+    projection: &Projection,
+    metadata_cache: &ParquetMetadataCache,
+    file_cache: Arc<ParquetFileCache>,
+    object_store: &dyn ObjectStore,
+    mut state: State,
+    mut consume_batch: ConsumeBatch,
+    finish: Finish,
+) -> Result<Option<Output>>
+where
+    ConsumeBatch: FnMut(RecordBatch, &mut State) -> Result<Option<()>>,
+    Finish: FnOnce(State) -> Result<Option<Output>>,
+{
+    let mut reader = ParquetBatchReader::try_new_with_row_groups(
+        path,
+        batch_size,
+        projection,
+        row_groups,
+        metadata_cache,
+        file_cache,
+        object_store,
+    )?;
+    while let Some(batch) = reader.next() {
+        let batch = batch?;
+        if consume_batch(batch, &mut state)?.is_none() {
+            return Ok(None);
+        }
+    }
+    finish(state)
 }
 
 fn log_late_materialized_metrics(label: &str, metrics: LateMaterializedMetrics, chunks: usize) {

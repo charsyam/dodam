@@ -1027,6 +1027,13 @@ Tried and rejected or neutral:
     - Added an opt-in raw integer complement arithmetic path (`DODAM_Q01_RAW_COMPLEMENT=1`) for Decimal128 precision `<= 18`, computing discounted/charge values from raw decimal complements. A single SF=10 sample improved Q01 (`~0.459s -> ~0.444s`), but 3-run median was neutral-to-worse versus the existing path (`~0.421s raw vs `~0.414s` existing), so it remains disabled by default.
     - Batch-size sweep on SF=10 still favored the current `16384`; `8192`, `32768`, and `65536` regressed Q01 and/or full total in one-run samples.
     - Conclusion: Q01's remaining DuckDB gap is not from easy late materialization, pruning, chunking, or scalar arithmetic tweaks. It is primarily Parquet scan/decode throughput and the fused aggregate pipeline.
+  - Added a generic row-group map execution primitive and applied it to Q01:
+    - `DodamEngine::parquet_row_group_map` scans Parquet row-group chunks inside worker tasks and lets the caller consume each `RecordBatch` into a task-local state, returning only one partial output per row-group chunk.
+    - Q01 now builds `Q01GroupSlots` inside the scan worker instead of sending every decoded batch through `ParallelParquetScanStream` and then spawning a second aggregate task layer. `DODAM_Q01_DISABLE_ROW_GROUP_MAP=1` keeps the old stream + chunked aggregate path available for diagnostics.
+    - This directly targets scan/aggregate dispatch overhead and batch materialization between execution stages; it is a reusable primitive for other fused scan-to-aggregate paths.
+    - SF=10 one-run same-binary comparison: new Q01 path `~0.221s`, old path `~0.450s`.
+    - SF=10 3-repeat sample with the new path: Q01 `0.245s / 0.190s / 0.185s`, median about `0.190s`; full repeat totals `7.656s / 7.520s / 7.633s`.
+    - Q01 output matches the previous path except for tiny floating-point accumulation-order differences.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.

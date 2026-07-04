@@ -2925,6 +2925,28 @@ async fn q01_pricing_summary_rows(
         "l_tax".to_string(),
         "l_shipdate".to_string(),
     ]);
+    if q01_row_group_map_enabled()
+        && let Some(partials) = engine
+            .parquet_row_group_map(
+                path.clone(),
+                batch_size,
+                projection.clone(),
+                q01_row_group_map_chunk(),
+                Q01GroupSlots::new,
+                move |batch, groups| {
+                    groups.merge_slots(q01_pricing_summary_batch(batch, cutoff_days)?);
+                    Ok(Some(()))
+                },
+                |groups| Ok(Some(groups)),
+            )
+            .await?
+    {
+        let mut groups = Q01GroupSlots::new();
+        for partial in partials {
+            groups.merge_slots(partial);
+        }
+        return Ok(q01_sorted_rows(groups));
+    }
     let mut stream = if q01_pruning_enabled() {
         engine
             .scan_parquet_batches_pruned(
@@ -2953,13 +2975,32 @@ async fn q01_pricing_summary_rows(
         |groups, rows| groups.merge_slots(rows),
         "Q01 aggregate",
     )?;
+    Ok(q01_sorted_rows(groups))
+}
+
+fn q01_sorted_rows(groups: Q01GroupSlots) -> Vec<Q01Row> {
     let mut rows = groups.into_rows();
     rows.sort_by(|left, right| {
         left.returnflag
             .cmp(&right.returnflag)
             .then_with(|| left.linestatus.cmp(&right.linestatus))
     });
-    Ok(rows)
+    rows
+}
+
+fn q01_row_group_map_enabled() -> bool {
+    match std::env::var("DODAM_Q01_DISABLE_ROW_GROUP_MAP") {
+        Ok(value) => !matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"),
+        Err(_) => true,
+    }
+}
+
+fn q01_row_group_map_chunk() -> usize {
+    std::env::var("DODAM_Q01_ROW_GROUP_MAP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4)
 }
 
 fn q01_pruning_enabled() -> bool {
