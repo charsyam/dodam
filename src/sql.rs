@@ -28,7 +28,8 @@ use sqlparser::parser::Parser;
 
 use crate::dense::{AdaptiveI64Map, AdaptiveI64Set, adaptive_dense_index};
 use crate::engine::{
-    DodamEngine, JoinAlgorithm, JoinParquetRequest, LateMaterializedMetrics, LateSelectionBuilder,
+    DodamEngine, JoinAlgorithm, JoinParquetRequest, LateMaterializationPolicy,
+    LateMaterializedMetrics, LateSelectionBuilder,
 };
 use crate::error::{DodamError, Result};
 use crate::execution::JoinType;
@@ -61,6 +62,7 @@ fn tpch_profile_elapsed(label: &str, started: Option<Instant>) {
 }
 
 const DEFAULT_MAX_DENSE_I64_KEY: usize = 20_000_000;
+const DEFAULT_Q09_ORDER_YEAR_DENSE_BYTES: usize = 384 * 1024 * 1024;
 
 struct DenseI64F64Sum {
     dense: Vec<f64>,
@@ -156,6 +158,7 @@ impl DenseI64F64Sum {
 
 struct DenseI64I32Map {
     dense: Vec<i32>,
+    base_key: i64,
     missing: i32,
     fallback: Option<AdaptiveI64Map<i32>>,
 }
@@ -164,6 +167,7 @@ impl DenseI64I32Map {
     fn new(missing: i32) -> Self {
         Self {
             dense: Vec::new(),
+            base_key: 0,
             missing,
             fallback: None,
         }
@@ -173,22 +177,67 @@ impl DenseI64I32Map {
         if let Some(fallback) = self.fallback.as_ref() {
             return fallback.get(key);
         }
-        let index = usize::try_from(key).ok()?;
+        let index = usize::try_from(key.checked_sub(self.base_key)?).ok()?;
         self.dense
             .get(index)
             .copied()
             .filter(|value| *value != self.missing)
     }
 
-    fn reserve_dense_to(&mut self, max_key: usize) {
-        if self.fallback.is_none() && max_key >= self.dense.len() {
-            self.dense.resize(max_key + 1, self.missing);
+    fn reserve_dense_range(&mut self, min_key: i64, max_key: i64, max_entries: usize) -> bool {
+        debug_assert!(self.fallback.is_none());
+        if min_key < 0 || max_key < min_key {
+            return false;
         }
+        let (new_min, new_max) = if self.dense.is_empty() {
+            (min_key, max_key)
+        } else {
+            let current_max = self
+                .base_key
+                .checked_add(self.dense.len() as i64)
+                .and_then(|value| value.checked_sub(1));
+            let Some(current_max) = current_max else {
+                return false;
+            };
+            (self.base_key.min(min_key), current_max.max(max_key))
+        };
+        let Some(width) = new_max
+            .checked_sub(new_min)
+            .and_then(|width| width.checked_add(1))
+            .and_then(|width| usize::try_from(width).ok())
+        else {
+            return false;
+        };
+        if width > max_entries {
+            return false;
+        }
+        if self.dense.is_empty() {
+            self.base_key = new_min;
+            self.dense.resize(width, self.missing);
+            return true;
+        }
+        if new_min == self.base_key {
+            if width > self.dense.len() {
+                self.dense.resize(width, self.missing);
+            }
+            return true;
+        }
+        let offset = usize::try_from(self.base_key - new_min).expect("validated dense offset");
+        let mut dense = vec![self.missing; width];
+        dense[offset..offset + self.dense.len()].copy_from_slice(&self.dense);
+        self.base_key = new_min;
+        self.dense = dense;
+        true
     }
 
-    fn insert_dense_index(&mut self, index: usize, value: i32) {
+    fn insert_dense_key(&mut self, key: i64, value: i32) {
         debug_assert!(self.fallback.is_none());
-        self.dense[index] = value;
+        if let Some(delta) = key.checked_sub(self.base_key)
+            && let Ok(index) = usize::try_from(delta)
+            && index < self.dense.len()
+        {
+            self.dense[index] = value;
+        }
     }
 
     fn fallback_mut(&mut self) -> Option<&mut AdaptiveI64Map<i32>> {
@@ -202,7 +251,7 @@ impl DenseI64I32Map {
         let mut fallback = AdaptiveI64Map::<i32>::new_dense();
         for (key, value) in self.dense.iter().copied().enumerate() {
             if value != self.missing {
-                fallback.insert(key as i64, value);
+                fallback.insert(self.base_key + key as i64, value);
             }
         }
         self.dense.clear();
@@ -2782,6 +2831,25 @@ impl Q01GroupSlots {
         );
     }
 
+    fn update_key_raw_values(
+        &mut self,
+        returnflag: u8,
+        linestatus: u8,
+        quantity: f64,
+        extendedprice: f64,
+        discounted: f64,
+        charge: f64,
+        discount: f64,
+    ) {
+        let state = self.state_for_key_mut(returnflag, linestatus);
+        state.sum_qty += quantity;
+        state.sum_base_price += extendedprice;
+        state.sum_disc_price += discounted;
+        state.sum_charge += charge;
+        state.sum_discount += discount;
+        state.count_order += 1;
+    }
+
     fn state_for_key_mut(&mut self, returnflag: u8, linestatus: u8) -> &mut Q01State {
         let key = (u16::from(returnflag) << 8) | u16::from(linestatus);
         for index in 0..self.len {
@@ -2848,23 +2916,29 @@ async fn q01_pricing_summary_rows(
     batch_size: usize,
     cutoff_days: i32,
 ) -> Result<Vec<Q01Row>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec![
-                "l_returnflag".to_string(),
-                "l_linestatus".to_string(),
-                "l_quantity".to_string(),
-                "l_extendedprice".to_string(),
-                "l_discount".to_string(),
-                "l_tax".to_string(),
-                "l_shipdate".to_string(),
-            ]),
-            None,
-        )
-        .await?;
+    let projection = Projection::Columns(vec![
+        "l_returnflag".to_string(),
+        "l_linestatus".to_string(),
+        "l_quantity".to_string(),
+        "l_extendedprice".to_string(),
+        "l_discount".to_string(),
+        "l_tax".to_string(),
+        "l_shipdate".to_string(),
+    ]);
+    let mut stream = if q01_pruning_enabled() {
+        engine
+            .scan_parquet_batches_pruned(
+                path,
+                batch_size,
+                projection,
+                q01_shipdate_pruning_predicates(cutoff_days),
+            )
+            .await?
+    } else {
+        engine
+            .scan_parquet_batches(path, batch_size, None, projection, None)
+            .await?
+    };
     let groups = parallel_batch_fold_chunks(
         &mut stream,
         q01_chunk_size(),
@@ -2886,6 +2960,19 @@ async fn q01_pricing_summary_rows(
             .then_with(|| left.linestatus.cmp(&right.linestatus))
     });
     Ok(rows)
+}
+
+fn q01_pruning_enabled() -> bool {
+    std::env::var("DODAM_Q01_ENABLE_PRUNING")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn q01_shipdate_pruning_predicates(cutoff_days: i32) -> Vec<Expr> {
+    vec![Expr::Comparison(ComparisonExpr {
+        column: "l_shipdate".to_string(),
+        op: ComparisonOp::LtEq,
+        value: LiteralValue::Int64(i64::from(cutoff_days)),
+    })]
 }
 
 fn q01_chunk_size() -> usize {
@@ -3112,6 +3199,29 @@ fn q01_update_decimal_batch(
                 && discounts.precision <= 18
                 && taxes.precision <= 18
             {
+                if q01_raw_complement_enabled()
+                    && let (Some(discount_one), Some(tax_one)) =
+                        (discounts.scale_i64(), taxes.scale_i64())
+                {
+                    q01_update_raw_complement_batch(
+                        groups,
+                        cutoff_days,
+                        shipdate_values,
+                        quantity_values,
+                        extendedprice_values,
+                        discount_values,
+                        tax_values,
+                        returnflag_bytes,
+                        linestatus_bytes,
+                        quantity_scale,
+                        extendedprice_scale,
+                        discount_scale,
+                        tax_scale,
+                        discount_one,
+                        tax_one,
+                    );
+                    return Ok(true);
+                }
                 let row_count = shipdate_values.len();
                 debug_assert_eq!(quantity_values.len(), row_count);
                 debug_assert_eq!(extendedprice_values.len(), row_count);
@@ -3229,6 +3339,82 @@ fn q01_update_decimal_batch(
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn q01_update_raw_complement_batch(
+    groups: &mut Q01GroupSlots,
+    cutoff_days: i32,
+    shipdate_values: &[i32],
+    quantity_values: &[i128],
+    extendedprice_values: &[i128],
+    discount_values: &[i128],
+    tax_values: &[i128],
+    returnflag_bytes: &[u8],
+    linestatus_bytes: &[u8],
+    quantity_scale: f64,
+    extendedprice_scale: f64,
+    discount_scale: f64,
+    tax_scale: f64,
+    discount_one: i64,
+    tax_one: i64,
+) {
+    let discounted_scale = extendedprice_scale * discount_scale;
+    let charge_scale = discounted_scale * tax_scale;
+    let row_count = shipdate_values.len();
+    debug_assert_eq!(quantity_values.len(), row_count);
+    debug_assert_eq!(extendedprice_values.len(), row_count);
+    debug_assert_eq!(discount_values.len(), row_count);
+    debug_assert_eq!(tax_values.len(), row_count);
+    debug_assert_eq!(returnflag_bytes.len(), row_count);
+    debug_assert_eq!(linestatus_bytes.len(), row_count);
+    for row in 0..row_count {
+        let (
+            shipdate,
+            quantity_raw,
+            extendedprice_raw,
+            discount_raw,
+            tax_raw,
+            returnflag,
+            linestatus,
+        ) = unsafe {
+            (
+                *shipdate_values.get_unchecked(row),
+                *quantity_values.get_unchecked(row) as i64,
+                *extendedprice_values.get_unchecked(row) as i64,
+                *discount_values.get_unchecked(row) as i64,
+                *tax_values.get_unchecked(row) as i64,
+                *returnflag_bytes.get_unchecked(row),
+                *linestatus_bytes.get_unchecked(row),
+            )
+        };
+        if shipdate > cutoff_days {
+            continue;
+        }
+        let quantity = quantity_raw as f64 * quantity_scale;
+        let extendedprice = extendedprice_raw as f64 * extendedprice_scale;
+        let discount = discount_raw as f64 * discount_scale;
+        let discounted =
+            extendedprice_raw as f64 * (discount_one - discount_raw) as f64 * discounted_scale;
+        let charge = extendedprice_raw as f64
+            * (discount_one - discount_raw) as f64
+            * (tax_one + tax_raw) as f64
+            * charge_scale;
+        groups.update_key_raw_values(
+            returnflag,
+            linestatus,
+            quantity,
+            extendedprice,
+            discounted,
+            charge,
+            discount,
+        );
+    }
+}
+
+fn q01_raw_complement_enabled() -> bool {
+    std::env::var("DODAM_Q01_RAW_COMPLEMENT")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
 fn q01_group_state<'a>(
     groups: &'a mut Vec<Q01Row>,
     returnflag: &str,
@@ -3292,6 +3478,10 @@ impl Q01DecimalInput<'_> {
 
     fn raw_values(&self) -> &[i128] {
         self.values.values().as_ref()
+    }
+
+    fn scale_i64(&self) -> Option<i64> {
+        (self.scale <= i64::MAX as f64).then_some(self.scale as i64)
     }
 }
 
@@ -4777,7 +4967,7 @@ async fn q09_supplier_nations(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-) -> Result<HashMap<i64, i64>> {
+) -> Result<FastHashMap<i64, i64>> {
     let mut stream = engine
         .scan_parquet_batches(
             path,
@@ -4787,7 +4977,7 @@ async fn q09_supplier_nations(
             None,
         )
         .await?;
-    let mut suppliers = HashMap::new();
+    let mut suppliers = fast_hash_map();
     while let Some(batch) = stream.next() {
         let batch = batch?;
         let suppkeys = batch_column(&batch, "s_suppkey")?;
@@ -4830,6 +5020,15 @@ async fn q09_order_years(
 
 type Q09OrderYears = DenseI64I32Map;
 
+fn q09_order_year_max_dense_entries() -> usize {
+    std::env::var("DODAM_Q09_ORDER_YEAR_DENSE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|bytes| bytes / std::mem::size_of::<i32>())
+        .filter(|entries| *entries > 0)
+        .unwrap_or_else(|| DEFAULT_Q09_ORDER_YEAR_DENSE_BYTES / std::mem::size_of::<i32>())
+}
+
 fn q09_order_years_batch_into(
     batch: &RecordBatch,
     years: &mut Q09OrderYears,
@@ -4844,48 +5043,61 @@ fn q09_order_years_batch_into(
         orderkeys.as_any().downcast_ref::<Int64Array>(),
         orderdates.as_any().downcast_ref::<Date32Array>(),
     ) {
+        let max_dense_entries = q09_order_year_max_dense_entries();
         if orderkeys.null_count() == 0 && orderdates.null_count() == 0 {
             let orderkey_values = orderkeys.values().as_ref();
             let orderdate_values = orderdates.values().as_ref();
-            let mut max_orderkey = 0_usize;
+            let mut min_orderkey = i64::MAX;
+            let mut max_orderkey = i64::MIN;
             for &orderkey in orderkey_values {
-                let Some(index) = adaptive_dense_index(orderkey, DEFAULT_MAX_DENSE_I64_KEY) else {
+                if orderkey < 0 {
                     years.convert_to_fallback();
                     let fallback = years.fallback_mut().expect("converted q09 fallback");
                     return q09_order_years_batch_into_fallback(batch, fallback, year_cache);
-                };
-                max_orderkey = max_orderkey.max(index);
+                }
+                min_orderkey = min_orderkey.min(orderkey);
+                max_orderkey = max_orderkey.max(orderkey);
             }
-            years.reserve_dense_to(max_orderkey);
-            for (&orderkey, &orderdate) in orderkey_values.iter().zip(orderdate_values) {
-                let index = usize::try_from(orderkey).expect("validated q09 orderkey");
-                years.insert_dense_index(index, year_cache.year(orderdate)?);
-            }
-            return Ok(());
-        }
-        let mut max_orderkey = None::<usize>;
-        for row in 0..orderkeys.len() {
-            if orderkeys.is_null(row) || orderdates.is_null(row) {
-                continue;
-            }
-            let Some(orderkey) =
-                adaptive_dense_index(orderkeys.value(row), DEFAULT_MAX_DENSE_I64_KEY)
-            else {
+            if !years.reserve_dense_range(min_orderkey, max_orderkey, max_dense_entries) {
                 years.convert_to_fallback();
                 let fallback = years.fallback_mut().expect("converted q09 fallback");
                 return q09_order_years_batch_into_fallback(batch, fallback, year_cache);
-            };
-            max_orderkey = Some(max_orderkey.map_or(orderkey, |max| max.max(orderkey)));
+            }
+            for (&orderkey, &orderdate) in orderkey_values.iter().zip(orderdate_values) {
+                years.insert_dense_key(orderkey, year_cache.year(orderdate)?);
+            }
+            return Ok(());
         }
-        if let Some(max_orderkey) = max_orderkey {
-            years.reserve_dense_to(max_orderkey);
+        let mut min_orderkey = i64::MAX;
+        let mut max_orderkey = i64::MIN;
+        let mut has_key = false;
+        for row in 0..orderkeys.len() {
+            if orderkeys.is_null(row) || orderdates.is_null(row) {
+                continue;
+            }
+            let orderkey = orderkeys.value(row);
+            if orderkey < 0 {
+                years.convert_to_fallback();
+                let fallback = years.fallback_mut().expect("converted q09 fallback");
+                return q09_order_years_batch_into_fallback(batch, fallback, year_cache);
+            }
+            min_orderkey = min_orderkey.min(orderkey);
+            max_orderkey = max_orderkey.max(orderkey);
+            has_key = true;
+        }
+        if has_key && !years.reserve_dense_range(min_orderkey, max_orderkey, max_dense_entries) {
+            years.convert_to_fallback();
+            let fallback = years.fallback_mut().expect("converted q09 fallback");
+            return q09_order_years_batch_into_fallback(batch, fallback, year_cache);
         }
         for row in 0..orderkeys.len() {
             if orderkeys.is_null(row) || orderdates.is_null(row) {
                 continue;
             }
-            let orderkey = usize::try_from(orderkeys.value(row)).expect("validated q09 orderkey");
-            years.insert_dense_index(orderkey, year_cache.year(orderdates.value(row))?);
+            years.insert_dense_key(
+                orderkeys.value(row),
+                year_cache.year(orderdates.value(row))?,
+            );
         }
         return Ok(());
     }
@@ -4918,7 +5130,7 @@ async fn q09_supply_costs(
     path: PathBuf,
     batch_size: usize,
     part_keys: &AdaptiveI64Set,
-) -> Result<HashMap<(i64, i64), f64>> {
+) -> Result<FastHashMap<(i64, i64), f64>> {
     let mut stream = engine
         .scan_parquet_batches(
             path,
@@ -4936,7 +5148,7 @@ async fn q09_supply_costs(
     parallel_batch_fold(
         &mut stream,
         move |batch| q09_supply_costs_batch(batch, &part_keys),
-        HashMap::<(i64, i64), f64>::new(),
+        fast_hash_map(),
         merge_maps,
         "Q09 supply costs",
     )
@@ -4945,14 +5157,14 @@ async fn q09_supply_costs(
 fn q09_supply_costs_batch(
     batch: RecordBatch,
     part_keys: &AdaptiveI64Set,
-) -> Result<HashMap<(i64, i64), f64>> {
+) -> Result<FastHashMap<(i64, i64), f64>> {
     let partkeys = batch_column(&batch, "ps_partkey")?;
     let suppkeys = batch_column(&batch, "ps_suppkey")?;
     let supplycosts = batch_column(&batch, "ps_supplycost")?;
     if let Some(costs) = q09_supply_costs_batch_typed(partkeys, suppkeys, supplycosts, part_keys)? {
         return Ok(costs);
     }
-    let mut costs = HashMap::new();
+    let mut costs = fast_hash_map();
     for row in 0..batch.num_rows() {
         let (Some(partkey), Some(suppkey), Some(supplycost)) = (
             numeric_i64_value(partkeys, row)?,
@@ -4973,7 +5185,7 @@ fn q09_supply_costs_batch_typed(
     suppkeys: &ArrayRef,
     supplycosts: &ArrayRef,
     part_keys: &AdaptiveI64Set,
-) -> Result<Option<HashMap<(i64, i64), f64>>> {
+) -> Result<Option<FastHashMap<(i64, i64), f64>>> {
     let (Some(partkeys), Some(suppkeys), Some(supplycosts)) = (
         partkeys.as_any().downcast_ref::<Int64Array>(),
         suppkeys.as_any().downcast_ref::<Int64Array>(),
@@ -4981,7 +5193,7 @@ fn q09_supply_costs_batch_typed(
     ) else {
         return Ok(None);
     };
-    let mut costs = HashMap::new();
+    let mut costs = fast_hash_map();
     for row in 0..partkeys.len() {
         if partkeys.is_null(row) || suppkeys.is_null(row) || supplycosts.is_null(row) {
             continue;
@@ -5005,10 +5217,10 @@ async fn q09_profit_rows(
     path: PathBuf,
     batch_size: usize,
     part_keys: &AdaptiveI64Set,
-    supplier_nations: &HashMap<i64, i64>,
+    supplier_nations: &FastHashMap<i64, i64>,
     nation_names: &HashMap<i64, String>,
     order_years: Q09OrderYears,
-    supply_costs: HashMap<(i64, i64), f64>,
+    supply_costs: FastHashMap<(i64, i64), f64>,
 ) -> Result<Vec<Q09Row>> {
     let mut stream = engine
         .scan_parquet_batches(
@@ -5041,7 +5253,7 @@ async fn q09_profit_rows(
                 &supply_costs,
             )
         },
-        HashMap::<(i64, i32), f64>::new(),
+        fast_hash_map(),
         merge_f64_groups,
         "Q09 profit aggregate",
     )?;
@@ -5066,10 +5278,10 @@ async fn q09_profit_rows(
 fn q09_profit_batch(
     batch: RecordBatch,
     part_keys: &AdaptiveI64Set,
-    supplier_nations: &HashMap<i64, i64>,
+    supplier_nations: &FastHashMap<i64, i64>,
     order_years: &Q09OrderYears,
-    supply_costs: &HashMap<(i64, i64), f64>,
-) -> Result<HashMap<(i64, i32), f64>> {
+    supply_costs: &FastHashMap<(i64, i64), f64>,
+) -> Result<FastHashMap<(i64, i32), f64>> {
     let orderkeys = batch_column(&batch, "l_orderkey")?;
     let partkeys = batch_column(&batch, "l_partkey")?;
     let suppkeys = batch_column(&batch, "l_suppkey")?;
@@ -5090,7 +5302,7 @@ fn q09_profit_batch(
     )? {
         return Ok(groups);
     }
-    let mut groups = HashMap::<(i64, i32), f64>::new();
+    let mut groups = fast_hash_map();
     for row in 0..batch.num_rows() {
         let (Some(orderkey), Some(partkey), Some(suppkey)) = (
             numeric_i64_value(orderkeys, row)?,
@@ -5130,10 +5342,10 @@ fn q09_profit_decimal_batch(
     extendedprices: &ArrayRef,
     discounts: &ArrayRef,
     part_keys: &AdaptiveI64Set,
-    supplier_nations: &HashMap<i64, i64>,
+    supplier_nations: &FastHashMap<i64, i64>,
     order_years: &Q09OrderYears,
-    supply_costs: &HashMap<(i64, i64), f64>,
-) -> Result<Option<HashMap<(i64, i32), f64>>> {
+    supply_costs: &FastHashMap<(i64, i64), f64>,
+) -> Result<Option<FastHashMap<(i64, i32), f64>>> {
     let (
         Some(orderkeys),
         Some(partkeys),
@@ -5153,7 +5365,7 @@ fn q09_profit_decimal_batch(
         return Ok(None);
     };
 
-    let mut groups = HashMap::<(i64, i32), f64>::new();
+    let mut groups = fast_hash_map();
     for row in 0..orderkeys.len() {
         if orderkeys.is_null(row)
             || partkeys.is_null(row)
@@ -7593,7 +7805,7 @@ async fn try_execute_q04_order_priority_fast(
         return Ok(None);
     };
     let stage = tpch_profile_start();
-    let (mut candidate_priorities, priority_labels) =
+    let (mut candidate_priorities, priority_labels, candidate_keys) =
         q04_candidate_order_priorities(engine, orders.path, batch_size, start_days, end_days)
             .await?;
     tpch_profile_elapsed("Q04 candidate order priorities", stage);
@@ -7606,6 +7818,7 @@ async fn try_execute_q04_order_priority_fast(
         lineitem_path,
         batch_size,
         &mut candidate_priorities,
+        &candidate_keys,
         priority_labels.len(),
     )
     .await?;
@@ -7694,7 +7907,19 @@ async fn q04_candidate_order_priorities(
     batch_size: usize,
     start_days: i32,
     end_days: i32,
-) -> Result<(Vec<u8>, Vec<String>)> {
+) -> Result<(Vec<u8>, Vec<String>, HashSet<i64>)> {
+    if std::env::var_os("DODAM_Q04_DISABLE_LATE_CANDIDATES").is_none()
+        && let Some(candidates) = q04_candidate_order_priorities_late(
+            engine,
+            path.clone(),
+            batch_size,
+            start_days,
+            end_days,
+        )
+        .await?
+    {
+        return Ok(candidates);
+    }
     let mut stream = engine
         .scan_parquet_batches(
             path,
@@ -7711,6 +7936,7 @@ async fn q04_candidate_order_priorities(
     let mut priorities = Vec::<u8>::new();
     let mut labels = Vec::<String>::new();
     let mut label_indices = HashMap::<String, u8>::new();
+    let mut candidate_keys = HashSet::<i64>::new();
     while let Some(batch) = stream.next() {
         let batch = batch?;
         let orderkeys = batch_column(&batch, "o_orderkey")?;
@@ -7725,6 +7951,7 @@ async fn q04_candidate_order_priorities(
             &mut priorities,
             &mut labels,
             &mut label_indices,
+            &mut candidate_keys,
         )? {
             continue;
         }
@@ -7758,9 +7985,226 @@ async fn q04_candidate_order_priorities(
                 priorities.resize(orderkey + 1, 0);
             }
             priorities[orderkey] = priority_index + 1;
+            candidate_keys.insert(orderkey as i64);
         }
     }
-    Ok((priorities, labels))
+    Ok((priorities, labels, candidate_keys))
+}
+
+async fn q04_candidate_order_priorities_late(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    start_days: i32,
+    end_days: i32,
+) -> Result<Option<(Vec<u8>, Vec<String>, HashSet<i64>)>> {
+    let Some(chunks) = engine
+        .late_materialized_parquet_map_with_policy(
+            path,
+            batch_size,
+            Projection::Columns(vec!["o_orderkey".to_string(), "o_orderdate".to_string()]),
+            Projection::Columns(vec!["o_orderpriority".to_string()]),
+            q04_late_candidate_row_group_chunk(),
+            late_materialization_policy_from_env("DODAM_Q04_LATE_MAX_SELECTED_RATIO", 0.60),
+            move || Q04LateCandidateState {
+                start_days,
+                end_days,
+                selected_orderkeys: Vec::new(),
+                priority_offset: 0,
+                labels: Vec::new(),
+                label_indices: HashMap::new(),
+                rows: Vec::new(),
+            },
+            q04_late_candidate_build_selection_batch,
+            q04_late_candidate_consume_priority_batch,
+            |state, _metrics| {
+                if state.priority_offset != state.selected_orderkeys.len() {
+                    return Err(DodamError::UnsupportedSql(
+                        "Q04 candidate row selection payload mismatch".to_string(),
+                    ));
+                }
+                Ok(Some(Q04CandidatePartial {
+                    labels: state.labels,
+                    rows: state.rows,
+                }))
+            },
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    let mut metrics = LateMaterializedMetrics::default();
+    let mut partials = Vec::new();
+    for chunk in chunks {
+        metrics.add(chunk.metrics);
+        partials.push(chunk.output);
+    }
+    q04_log_late_candidate_profile(metrics, q04_late_candidate_row_group_chunk());
+    Ok(Some(q04_candidate_priorities_from_partials(partials)?))
+}
+
+fn q04_late_candidate_row_group_chunk() -> usize {
+    std::env::var("DODAM_Q04_LATE_CANDIDATE_ROW_GROUP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1)
+}
+
+fn late_materialization_policy_from_env(
+    env_name: &str,
+    default_max_selected_ratio: f64,
+) -> LateMaterializationPolicy {
+    let max_selected_ratio = std::env::var(env_name)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(default_max_selected_ratio);
+    LateMaterializationPolicy::selective(max_selected_ratio)
+}
+
+struct Q04LateCandidateState {
+    start_days: i32,
+    end_days: i32,
+    selected_orderkeys: Vec<i64>,
+    priority_offset: usize,
+    labels: Vec<String>,
+    label_indices: HashMap<String, u8>,
+    rows: Vec<(i64, u8)>,
+}
+
+struct Q04CandidatePartial {
+    labels: Vec<String>,
+    rows: Vec<(i64, u8)>,
+}
+
+fn q04_late_candidate_build_selection_batch(
+    batch: RecordBatch,
+    selection: &mut LateSelectionBuilder,
+    state: &mut Q04LateCandidateState,
+) -> Result<Option<()>> {
+    let orderkeys = batch_column(&batch, "o_orderkey")?;
+    let orderdates = batch_column(&batch, "o_orderdate")?;
+    let (Some(orderkeys), Some(orderdates)) = (
+        orderkeys.as_any().downcast_ref::<Int64Array>(),
+        orderdates.as_any().downcast_ref::<Date32Array>(),
+    ) else {
+        return Ok(None);
+    };
+    if orderkeys.null_count() == 0 && orderdates.null_count() == 0 {
+        let orderkey_values = orderkeys.values().as_ref();
+        let orderdate_values = orderdates.values().as_ref();
+        for (&orderkey, &orderdate) in orderkey_values.iter().zip(orderdate_values) {
+            let selected =
+                orderkey >= 0 && orderdate >= state.start_days && orderdate < state.end_days;
+            selection.push(selected);
+            if selected {
+                state.selected_orderkeys.push(orderkey);
+            }
+        }
+        return Ok(Some(()));
+    }
+    for row in 0..batch.num_rows() {
+        let selected = if orderkeys.is_null(row) || orderdates.is_null(row) {
+            false
+        } else {
+            let orderkey = orderkeys.value(row);
+            let orderdate = orderdates.value(row);
+            orderkey >= 0 && orderdate >= state.start_days && orderdate < state.end_days
+        };
+        selection.push(selected);
+        if selected {
+            state.selected_orderkeys.push(orderkeys.value(row));
+        }
+    }
+    Ok(Some(()))
+}
+
+fn q04_late_candidate_consume_priority_batch(
+    batch: RecordBatch,
+    state: &mut Q04LateCandidateState,
+) -> Result<Option<()>> {
+    let priorities = batch_string_column(&batch, "o_orderpriority")?;
+    for row in 0..batch.num_rows() {
+        let Some(&orderkey) = state.selected_orderkeys.get(state.priority_offset) else {
+            return Err(DodamError::UnsupportedSql(
+                "Q04 candidate payload row overflow".to_string(),
+            ));
+        };
+        state.priority_offset += 1;
+        if priorities.is_valid(row) {
+            let priority = priorities.value(row);
+            let priority_index = if let Some(index) = state.label_indices.get(priority) {
+                *index
+            } else {
+                let next_index = u8::try_from(state.labels.len()).map_err(|_| {
+                    DodamError::UnsupportedSql("too many Q04 order priorities".to_string())
+                })?;
+                state.labels.push(priority.to_string());
+                state.label_indices.insert(priority.to_string(), next_index);
+                next_index
+            };
+            state.rows.push((orderkey, priority_index));
+        }
+    }
+    Ok(Some(()))
+}
+
+fn q04_candidate_priorities_from_partials(
+    partials: Vec<Q04CandidatePartial>,
+) -> Result<(Vec<u8>, Vec<String>, HashSet<i64>)> {
+    let mut priorities = Vec::<u8>::new();
+    let mut labels = Vec::<String>::new();
+    let mut label_indices = HashMap::<String, u8>::new();
+    let row_count = partials.iter().map(|partial| partial.rows.len()).sum();
+    let mut candidate_keys = HashSet::<i64>::with_capacity(row_count);
+    for partial in partials {
+        let mut label_remap = Vec::with_capacity(partial.labels.len());
+        for priority in partial.labels {
+            let priority_index = if let Some(index) = label_indices.get(priority.as_str()) {
+                *index
+            } else {
+                let next_index = u8::try_from(labels.len()).map_err(|_| {
+                    DodamError::UnsupportedSql("too many Q04 order priorities".to_string())
+                })?;
+                labels.push(priority.clone());
+                label_indices.insert(priority, next_index);
+                next_index
+            };
+            label_remap.push(priority_index);
+        }
+        for (orderkey, local_priority_index) in partial.rows {
+            let priority_index = *label_remap
+                .get(usize::from(local_priority_index))
+                .ok_or_else(|| {
+                    DodamError::UnsupportedSql("Q04 priority label mismatch".to_string())
+                })?;
+            let orderkey = usize::try_from(orderkey)
+                .map_err(|_| DodamError::UnsupportedSql("order key overflow".to_string()))?;
+            if orderkey >= priorities.len() {
+                priorities.resize(orderkey + 1, 0);
+            }
+            priorities[orderkey] = priority_index + 1;
+            candidate_keys.insert(orderkey as i64);
+        }
+    }
+    Ok((priorities, labels, candidate_keys))
+}
+
+fn q04_log_late_candidate_profile(metrics: LateMaterializedMetrics, row_group_chunk: usize) {
+    if !tpch_profile_enabled() {
+        return;
+    }
+    let ratio = if metrics.total_rows == 0 {
+        0.0
+    } else {
+        metrics.selected_rows as f64 / metrics.total_rows as f64
+    };
+    eprintln!(
+        "[dodam:tpch-profile] Q04 candidates: late_materialized rows={} selected={} ratio={:.6} selector_runs={} row_group_chunk={}",
+        metrics.total_rows, metrics.selected_rows, ratio, metrics.selector_runs, row_group_chunk
+    );
 }
 
 fn q04_candidate_order_priorities_typed(
@@ -7772,6 +8216,7 @@ fn q04_candidate_order_priorities_typed(
     priorities: &mut Vec<u8>,
     labels: &mut Vec<String>,
     label_indices: &mut HashMap<String, u8>,
+    candidate_keys: &mut HashSet<i64>,
 ) -> Result<bool> {
     try_for_each_i64_date32_str(
         orderkeys,
@@ -7797,6 +8242,7 @@ fn q04_candidate_order_priorities_typed(
                 priorities.resize(orderkey + 1, 0);
             }
             priorities[orderkey] = priority_index + 1;
+            candidate_keys.insert(orderkey as i64);
             Ok(())
         },
     )
@@ -7807,6 +8253,7 @@ async fn q04_count_late_candidate_priorities(
     path: PathBuf,
     batch_size: usize,
     candidate_priorities: &mut [u8],
+    candidate_keys: &HashSet<i64>,
     priority_count: usize,
 ) -> Result<Vec<u64>> {
     let projection = Projection::Columns(vec![
@@ -7814,7 +8261,17 @@ async fn q04_count_late_candidate_priorities(
         "l_commitdate".to_string(),
         "l_receiptdate".to_string(),
     ]);
-    let mut stream = if let Some((min_key, max_key)) =
+    let mut stream = if q04_lineitem_row_filter_enabled() {
+        engine
+            .scan_parquet_batches_i64_set_filtered(
+                path,
+                batch_size,
+                projection,
+                "l_orderkey",
+                candidate_keys.clone(),
+            )
+            .await?
+    } else if let Some((min_key, max_key)) =
         selective_candidate_priority_range(candidate_priorities)
     {
         engine
@@ -7871,6 +8328,13 @@ async fn q04_count_late_candidate_priorities(
         }
     }
     Ok(counts)
+}
+
+fn q04_lineitem_row_filter_enabled() -> bool {
+    match std::env::var("DODAM_Q04_DISABLE_LINEITEM_ROW_FILTER") {
+        Ok(value) => !matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"),
+        Err(_) => true,
+    }
 }
 
 fn q04_count_late_candidate_priorities_typed(
@@ -11953,12 +12417,13 @@ async fn q19_late_materialized_lineitem_revenue(
     let rules_for_state = rules.clone();
     let part_masks_for_state = part_masks.clone();
     let Some(chunks) = engine
-        .late_materialized_parquet_map(
+        .late_materialized_parquet_map_with_policy(
             path,
             batch_size,
             predicate_projection,
             payload_projection,
             q19_late_materialized_row_group_chunk(),
+            late_materialization_policy_from_env("DODAM_Q19_LATE_MAX_SELECTED_RATIO", 0.60),
             move || Q19LateState {
                 rules: rules_for_state.clone(),
                 part_masks: part_masks_for_state.clone(),

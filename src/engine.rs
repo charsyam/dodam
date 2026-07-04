@@ -1056,6 +1056,59 @@ impl DodamEngine {
             + Sync
             + 'static,
     {
+        self.late_materialized_parquet_map_with_policy(
+            path,
+            batch_size,
+            predicate_projection,
+            payload_projection,
+            row_group_chunk,
+            LateMaterializationPolicy::always(),
+            build_state,
+            build_selection,
+            consume_payload,
+            finish,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn late_materialized_parquet_map_with_policy<
+        State,
+        Output,
+        BuildState,
+        BuildSelection,
+        ConsumePayload,
+        Finish,
+    >(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        predicate_projection: Projection,
+        payload_projection: Projection,
+        row_group_chunk: usize,
+        policy: LateMaterializationPolicy,
+        build_state: BuildState,
+        build_selection: BuildSelection,
+        consume_payload: ConsumePayload,
+        finish: Finish,
+    ) -> Result<Option<Vec<LateMaterializedChunkResult<Output>>>>
+    where
+        State: Send + 'static,
+        Output: Send + 'static,
+        BuildState: Fn() -> State + Clone + Send + Sync + 'static,
+        BuildSelection: Fn(RecordBatch, &mut LateSelectionBuilder, &mut State) -> Result<Option<()>>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        ConsumePayload:
+            Fn(RecordBatch, &mut State) -> Result<Option<()>> + Clone + Send + Sync + 'static,
+        Finish: Fn(State, LateMaterializedMetrics) -> Result<Option<Output>>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
         let source = self.plan_table_source(path.clone()).await?;
         if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
             return Ok(None);
@@ -1103,6 +1156,7 @@ impl DodamEngine {
                     &metadata_cache,
                     file_cache,
                     object_store.as_ref(),
+                    policy,
                     build_state(),
                     build_selection,
                     consume_payload,
@@ -2911,6 +2965,36 @@ impl LateMaterializedMetrics {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct LateMaterializationPolicy {
+    max_selected_ratio: Option<f64>,
+}
+
+impl LateMaterializationPolicy {
+    pub fn always() -> Self {
+        Self {
+            max_selected_ratio: None,
+        }
+    }
+
+    pub fn selective(max_selected_ratio: f64) -> Self {
+        Self {
+            max_selected_ratio: Some(max_selected_ratio.clamp(0.0, 1.0)),
+        }
+    }
+
+    fn accepts(&self, metrics: &LateMaterializedMetrics) -> bool {
+        let Some(max_selected_ratio) = self.max_selected_ratio else {
+            return true;
+        };
+        if metrics.total_rows == 0 {
+            return true;
+        }
+        let selected_ratio = metrics.selected_rows as f64 / metrics.total_rows as f64;
+        selected_ratio <= max_selected_ratio
+    }
+}
+
 pub struct LateMaterializedChunkResult<T> {
     pub output: T,
     pub metrics: LateMaterializedMetrics,
@@ -2993,6 +3077,7 @@ fn late_materialized_chunk<State, Output, BuildSelection, ConsumePayload, Finish
     metadata_cache: &ParquetMetadataCache,
     file_cache: Arc<ParquetFileCache>,
     object_store: &dyn ObjectStore,
+    policy: LateMaterializationPolicy,
     mut state: State,
     mut build_selection: BuildSelection,
     mut consume_payload: ConsumePayload,
@@ -3020,6 +3105,9 @@ where
         }
     }
     let (row_selection, metrics) = selection_builder.finish();
+    if !policy.accepts(&metrics) {
+        return Ok(None);
+    }
     if let Some(row_selection) = row_selection {
         let mut payload_reader = ParquetBatchReader::try_new_with_row_groups_selection(
             path,
@@ -3091,6 +3179,7 @@ fn q14_late_materialized_promo_revenue_chunk(
         metadata_cache,
         file_cache,
         object_store,
+        LateMaterializationPolicy::always(),
         state,
         |batch, selection, _state| {
             q14_build_date_selection_batch(batch, start_days, end_days, selection)
@@ -3217,6 +3306,7 @@ fn q06_late_materialized_revenue_sum_chunk(
         metadata_cache,
         file_cache,
         object_store,
+        LateMaterializationPolicy::always(),
         state,
         |batch, selection, state| {
             q06_build_selection_batch(

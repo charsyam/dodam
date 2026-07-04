@@ -997,6 +997,36 @@ Tried and rejected or neutral:
     - Kept default `2` because it is stable and matches the Q06 default; `4` was marginally best in one sample but not enough to change the rule.
     - Scalar output differed from the previous path only by floating-point accumulation order (`3083843.0577999987` vs `3083843.0578000005`).
     - Profile sample after enabling the late path: `6,001,215` rows, `121` selected, ratio `~0.0020%`, selector runs `269`, row-group chunk `2`.
+  - SF=10 Q09 scale-up fix:
+    - The first SF=10 Parquet-output comparison showed Dodam `9.438s` vs DuckDB CLI `6.810s` overall, with Q09 as the dominant gap (`2.332s` vs DuckDB `0.723s`).
+    - Profiling showed the unexpected root cause was not lineitem profit aggregation first, but `Q09 order years`: SF=10 order keys exceed the old `20M` dense-key limit, so the path converted to a large HashMap and spent about `1.63s` building `orderkey -> year`.
+    - Added a memory-budgeted Q09 order-year dense limit (`DODAM_Q09_ORDER_YEAR_DENSE_BYTES`, default `384MiB`) so dense `Vec<i32>` remains available for larger but still bounded integer key domains, while retaining the existing fallback for wider/sparser keys.
+    - Q09 order-year profile moved from about `1.63s` to about `0.15-0.16s`; Q09 wall time moved from about `2.30s` to about `0.78s`.
+    - Also switched Q09 supplier-nation, supply-cost, and profit-group maps to the existing fast integer hasher. This was a smaller win: Q09 sampled about `0.756s` after the change, with supply-cost/profit aggregate profiles modestly lower.
+    - Latest SF=10 one-run Parquet-output sample: Dodam `7.844s` vs the prior DuckDB CLI sample `6.810s`, reducing overall gap from about `1.39x` to about `1.15x`. Q09 is now close to DuckDB (`~0.756s` vs `~0.723s`) rather than the dominant outlier.
+  - Generalized the Q09 order-year dense container from zero-based dense storage to offset dense storage:
+    - The previous fix avoided HashMap fallback for SF=10, but still allocated `0..max_key` and would waste memory or fallback unnecessarily when integer keys live in a high non-zero range.
+    - `DenseI64I32Map` now tracks `base_key` and allocates only `min_key..max_key` within the same memory budget, then falls back when the range budget is exceeded or keys are invalid.
+    - This is primarily a HashMap-growth safety/generalization change. SF=10 TPC-H remains correct (`22/22`); profile sample kept Q09 order-year around `~148ms` and Q09 around `~0.75s`, while one profiling-off full run sampled Q09 at `~0.84s` and total `~7.97s`.
+  - Improved Q04 using general late-materialization/selective-key rules:
+    - Applied the reusable engine late-materialized Parquet map to Q04's `orders` candidate stage: scan `o_orderkey,o_orderdate` first, then read `o_orderpriority` only for selected rows.
+    - SF=10 selected about `573,671 / 15,000,000` orders (`~3.8%`), which is a strong late-materialization signal. Row-group chunk sweep favored `1` for this narrow predicate.
+    - Avoided per-selected-row priority string clones by interning `o_orderpriority` per chunk and returning `(orderkey, local_label_id)` pairs; global merge remaps labels once.
+    - Enabled the existing `i64 set` RowFilter rule for Q04's `lineitem.l_orderkey` probe by default, while keeping `DODAM_Q04_DISABLE_LINEITEM_ROW_FILTER=1` as a diagnostic escape hatch.
+    - Q04 profile sample moved from about `~0.31-0.33s` to about `~0.22s`; profiling-off SF=10 sample was Q04 `0.215s` vs DuckDB `0.179s` (`~1.20x`). The full one-run total sampled Dodam `7.888s` vs DuckDB `6.810s` (`~1.16x`).
+    - General rule to push into optimizer/execution: late materialization should be cost/selectivity gated. It is attractive when predicate columns are narrow and payload columns are wide or expensive, and selected ratio is low. Q01 is the counterexample: its date predicate keeps almost all lineitem rows, so late materialization would add selection overhead without avoiding payload decode.
+  - Added a common late-materialization selectivity policy in the engine:
+    - `LateMaterializationPolicy` lets generic late-materialized readers reject chunks whose predicate pass selected too many rows before opening the payload reader.
+    - The existing generic API remains available as an always-allow path, while Q04/Q19 now call the policy-aware API with env-tunable thresholds (`DODAM_Q04_LATE_MAX_SELECTED_RATIO`, `DODAM_Q19_LATE_MAX_SELECTED_RATIO`, default `0.60`).
+    - A forced Q04 rejection test (`DODAM_Q04_LATE_MAX_SELECTED_RATIO=0.001`) exposed a correctness bug: the typed fallback candidate path filled the marker vector but not the RowFilter key set, causing zero Q04 rows. Fixed by carrying candidate keys through typed and non-typed fallback paths.
+    - Default SF=10 profiling-off sample after the policy work: Dodam `7.777s` vs DuckDB CLI `6.810s` (`~1.14x`), Q04 `0.222s` vs DuckDB `0.179s`, and Q19 remains faster than DuckDB in the sampled run.
+  - Revisited Q01 under SF=10:
+    - Added an opt-in pruning-only path for `l_shipdate <= cutoff` (`DODAM_Q01_ENABLE_PRUNING=1`), but the current SF=10 lineitem layout still scans `524/524` row groups. Q01 samples were neutral-to-slightly-worse (`~0.455s` with pruning vs `~0.450s` without in one profile pair), so pruning stays off by default.
+    - Retested Q01 chunk size at SF=10. Chunk `8` occasionally sampled slightly faster than `4`, but 3-run behavior was noisy and not enough to change the default chosen from SF=1/full-run testing. Chunk `2` and `16` did not provide a reliable win.
+    - Retested global Parquet row-group task chunking for Q01. `2` improved one Q01 scan sample, but 3-run Q01/full totals were effectively tied with the default and previous SF=1 tests favored `4`, so the global default remains unchanged.
+    - Added an opt-in raw integer complement arithmetic path (`DODAM_Q01_RAW_COMPLEMENT=1`) for Decimal128 precision `<= 18`, computing discounted/charge values from raw decimal complements. A single SF=10 sample improved Q01 (`~0.459s -> ~0.444s`), but 3-run median was neutral-to-worse versus the existing path (`~0.421s raw vs `~0.414s` existing), so it remains disabled by default.
+    - Batch-size sweep on SF=10 still favored the current `16384`; `8192`, `32768`, and `65536` regressed Q01 and/or full total in one-run samples.
+    - Conclusion: Q01's remaining DuckDB gap is not from easy late materialization, pruning, chunking, or scalar arithmetic tweaks. It is primarily Parquet scan/decode throughput and the fused aggregate pipeline.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.
