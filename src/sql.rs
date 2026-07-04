@@ -317,6 +317,16 @@ impl DenseI64F64Sum {
         self.dense[index] += value;
     }
 
+    fn add_dense_key(&mut self, key: i64, value: f64) -> bool {
+        debug_assert!(self.fallback.is_none());
+        let Some(index) = adaptive_dense_index(key, DEFAULT_MAX_DENSE_I64_KEY) else {
+            return false;
+        };
+        self.reserve_dense_to(index);
+        self.add_dense_index(index, value);
+        true
+    }
+
     fn reserve_dense_to(&mut self, max_key: usize) {
         if self.fallback.is_none() && max_key >= self.dense.len() {
             self.dense.resize(max_key + 1, 0.0);
@@ -10664,7 +10674,8 @@ async fn try_execute_q18_large_volume_customer_fast(
     if order_quantity_sums.is_empty() {
         return Ok(Some(q18_output(Vec::new())?));
     }
-    let qualifying_order_keys = order_quantity_sums.keys().copied().collect::<HashSet<_>>();
+    let qualifying_order_keys =
+        adaptive_i64_set_from_hash(order_quantity_sums.keys().copied().collect::<HashSet<_>>());
     let stage = tpch_profile_start();
     let order_rows =
         q18_qualifying_orders(engine, orders.path, batch_size, &qualifying_order_keys).await?;
@@ -10673,6 +10684,7 @@ async fn try_execute_q18_large_volume_customer_fast(
         .values()
         .map(|order| order.custkey)
         .collect::<HashSet<_>>();
+    let customer_keys = adaptive_i64_set_from_hash(customer_keys);
     let stage = tpch_profile_start();
     let customer_names =
         q18_customer_names(engine, customer.path, batch_size, &customer_keys).await?;
@@ -10776,22 +10788,12 @@ fn q18_quantity_batch_into_dense(batch: &RecordBatch, sums: &mut DenseI64F64Sum)
     ) else {
         return Ok(false);
     };
-    let mut max_orderkey = None::<usize>;
     if orderkeys.null_count() == 0 && quantities.null_count() == 0 {
         for row in 0..orderkeys.len() {
-            let Some(orderkey) =
-                adaptive_dense_index(orderkeys.value(row), DEFAULT_MAX_DENSE_I64_KEY)
-            else {
-                return Ok(false);
-            };
-            max_orderkey = Some(max_orderkey.map_or(orderkey, |max| max.max(orderkey)));
-        }
-        if let Some(max_orderkey) = max_orderkey {
-            sums.reserve_dense_to(max_orderkey);
-        }
-        for row in 0..orderkeys.len() {
-            let orderkey = usize::try_from(orderkeys.value(row)).expect("validated dense orderkey");
-            sums.add_dense_index(orderkey, quantities.value(row));
+            if !sums.add_dense_key(orderkeys.value(row), quantities.value(row)) {
+                q18_quantity_batch_remaining_into_fallback(row, orderkeys, &quantities, sums);
+                break;
+            }
         }
         return Ok(true);
     }
@@ -10799,28 +10801,35 @@ fn q18_quantity_batch_into_dense(batch: &RecordBatch, sums: &mut DenseI64F64Sum)
         if orderkeys.is_null(row) || quantities.is_null(row) {
             continue;
         }
-        let Some(orderkey) = adaptive_dense_index(orderkeys.value(row), DEFAULT_MAX_DENSE_I64_KEY)
-        else {
-            return Ok(false);
-        };
-        max_orderkey = Some(max_orderkey.map_or(orderkey, |max| max.max(orderkey)));
+        if !sums.add_dense_key(orderkeys.value(row), quantities.value(row)) {
+            q18_quantity_batch_remaining_into_fallback(row, orderkeys, &quantities, sums);
+            break;
+        }
     }
-    if let Some(max_orderkey) = max_orderkey
-        && max_orderkey > DEFAULT_MAX_DENSE_I64_KEY
-    {
-        return Ok(false);
-    }
-    if let Some(max_orderkey) = max_orderkey {
-        sums.reserve_dense_to(max_orderkey);
-    }
-    for row in 0..orderkeys.len() {
+    Ok(true)
+}
+
+fn q18_quantity_batch_remaining_into_fallback(
+    start_row: usize,
+    orderkeys: &Int64Array,
+    quantities: &Q01DecimalInput<'_>,
+    sums: &mut DenseI64F64Sum,
+) {
+    sums.convert_to_fallback();
+    let fallback = sums
+        .fallback
+        .as_mut()
+        .expect("converted Q18 quantity fallback");
+    for row in start_row..orderkeys.len() {
         if orderkeys.is_null(row) || quantities.is_null(row) {
             continue;
         }
-        let orderkey = usize::try_from(orderkeys.value(row)).expect("validated dense orderkey");
-        sums.add_dense_index(orderkey, quantities.value(row));
+        fallback.update(
+            orderkeys.value(row),
+            || 0.0,
+            |sum| *sum += quantities.value(row),
+        );
     }
-    Ok(true)
 }
 
 fn q18_quantity_batch_into(batch: &RecordBatch, sums: &mut AdaptiveI64Map<f64>) -> Result<()> {
@@ -10858,7 +10867,7 @@ async fn q18_qualifying_orders(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-    qualifying_orders: &HashSet<i64>,
+    qualifying_orders: &AdaptiveI64Set,
 ) -> Result<HashMap<i64, Q18Order>> {
     let mut stream = engine
         .scan_parquet_batches(
@@ -10886,7 +10895,7 @@ async fn q18_qualifying_orders(
 
 fn q18_qualifying_orders_batch(
     batch: RecordBatch,
-    qualifying_orders: &HashSet<i64>,
+    qualifying_orders: &AdaptiveI64Set,
 ) -> Result<HashMap<i64, Q18Order>> {
     let orderkeys = batch_column(&batch, "o_orderkey")?;
     let custkeys = batch_column(&batch, "o_custkey")?;
@@ -10906,7 +10915,7 @@ fn q18_qualifying_orders_batch(
         let Some(orderkey) = numeric_i64_value(orderkeys, row)? else {
             continue;
         };
-        if !qualifying_orders.contains(&orderkey) {
+        if !qualifying_orders.contains(orderkey) {
             continue;
         }
         let (Some(custkey), Some(orderdate), Some(totalprice)) = (
@@ -10933,7 +10942,7 @@ fn q18_qualifying_orders_batch_typed(
     custkeys: &ArrayRef,
     orderdates: &ArrayRef,
     totalprices: &ArrayRef,
-    qualifying_orders: &HashSet<i64>,
+    qualifying_orders: &AdaptiveI64Set,
 ) -> Result<Option<HashMap<i64, Q18Order>>> {
     let (Some(orderkeys), Some(custkeys), Some(orderdates), Some(totalprices)) = (
         orderkeys.as_any().downcast_ref::<Int64Array>(),
@@ -10953,7 +10962,7 @@ fn q18_qualifying_orders_batch_typed(
             continue;
         }
         let orderkey = orderkeys.value(row);
-        if !qualifying_orders.contains(&orderkey) {
+        if !qualifying_orders.contains(orderkey) {
             continue;
         }
         orders.insert(
@@ -10972,7 +10981,7 @@ async fn q18_customer_names(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-    customer_keys: &HashSet<i64>,
+    customer_keys: &AdaptiveI64Set,
 ) -> Result<HashMap<i64, String>> {
     let mut stream = engine
         .scan_parquet_batches(
@@ -10991,12 +11000,28 @@ async fn q18_customer_names(
         let batch = batch?;
         let keys = batch_column(&batch, "c_custkey")?;
         let names = batch_string_column(&batch, "c_name")?;
+        if let Some(keys) = keys.as_any().downcast_ref::<Int64Array>() {
+            for row in 0..batch.num_rows() {
+                if keys.is_null(row) || names.is_null(row) {
+                    continue;
+                }
+                let key = keys.value(row);
+                if !customer_keys.contains(key) {
+                    continue;
+                }
+                customers.insert(key, names.value(row).to_string());
+            }
+            if customers.len() == customer_keys.len() {
+                break;
+            }
+            continue;
+        }
         for row in 0..batch.num_rows() {
             if names.is_null(row) {
                 continue;
             }
             if let Some(key) = numeric_i64_value(keys, row)? {
-                if !customer_keys.contains(&key) {
+                if !customer_keys.contains(key) {
                     continue;
                 }
                 customers.insert(key, names.value(row).to_string());

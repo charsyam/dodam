@@ -318,6 +318,11 @@ Effective or retained:
     - Q06 about `0.054s` to `0.042s`
     - Q19 about `0.087s` to `0.056s`
   - Full SF=1 TPC-H 22-query Parquet COPY sum-of-medians improved from about `1.389s` Dodam / `1.085s` DuckDB (`1.28x`) to about `1.226s` Dodam / `1.089s` DuckDB (`1.13x`).
+- Q18 large-volume customer fast-path cleanup:
+  - Changed dense `Int64 -> Float64` quantity aggregation to update the dense vector in one pass instead of pre-scanning every batch for the maximum key and then scanning again to accumulate.
+  - Changed Q18 order/customer membership checks from `HashSet<i64>` probes to `AdaptiveI64Set`, so dense key fixtures use vector membership during scan.
+  - Added a typed `Int64` customer-key loop in Q18 customer-name lookup to avoid generic numeric conversion per row.
+  - Q18 focused median improved from about `0.102s` after scan chunking to about `0.096s`; full SF=1 TPC-H Parquet COPY sum-of-medians improved slightly to about `1.221s` Dodam / `1.087s` DuckDB (`1.12x`).
 
 Tried and rejected or neutral:
 
@@ -404,6 +409,9 @@ Tried and rejected or neutral:
 - Low-cardinality two-`Utf8` grouped aggregate linear lookup:
   - Tested a small-group linear lookup before the nested string hash-map path.
   - A/B results were noisy and not clearly better, so it was not retained.
+- Q18 raw decimal quantity accumulation:
+  - Tested reading `Decimal128` raw values and multiplying by reciprocal scale instead of using the existing decimal value accessor.
+  - Q18 profile and median were neutral to slightly worse, so the simpler existing decimal conversion was kept.
 
 ### Planning And DAG Execution
 
@@ -518,11 +526,11 @@ Tried and rejected or neutral:
 
 ### 5. TPC-H Remaining Performance Gaps
 
-- Current SF=1 Parquet COPY 22-query comparison is about `1.13x` Dodam/DuckDB by sum of medians.
+- Current SF=1 Parquet COPY 22-query comparison is about `1.12x` Dodam/DuckDB by sum of medians.
 - Biggest remaining slow queries after row-group chunking:
-  - Q18: about `1.61x`; likely dominated by derived aggregate + multi-join materialization rather than output write.
-  - Q01: about `1.47x`; scan + two-key grouped aggregate still slower than DuckDB.
-  - Q06: about `1.38x`; narrow scan/filter/expression aggregate still has engine overhead after chunking.
+  - Q18: about `1.54x`; still dominated by the lineitem order-quantity aggregate step rather than output write.
+  - Q01: about `1.44x`; scan + two-key grouped aggregate still slower than DuckDB.
+  - Q06: about `1.37x`; narrow scan/filter/expression aggregate still has engine overhead after chunking.
   - Q16/Q10/Q21 remain around `1.17x-1.25x`.
 - Several queries are now faster than DuckDB on this fixture, including Q02, Q11, Q13, Q14, Q17, Q19, and Q20.
 
