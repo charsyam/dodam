@@ -979,6 +979,24 @@ Tried and rejected or neutral:
       - Q14: `6,001,215` rows, `75,983` selected, ratio `~1.27%`, `125,599` selector runs, `14` chunks.
     - Same-binary 5-repeat after the refactor kept performance in the expected range: Q06 median about `17.6ms`, Q14 median about `25.2ms`, full run `22/22`.
     - This confirms the first general rule: date/range predicates with `~1-2%` selectivity and expensive payload columns are strong late-materialization candidates. The next candidate should be measured first by selected ratio before enabling by default.
+  - Added Q19 predicate selected-ratio profiling without changing the default execution path:
+    - The existing Q19 lineitem pass now records predicate-selected rows only when `DODAM_TPCH_PROFILE=1`; default execution avoids row-level profile bookkeeping.
+    - Profile sample: `6,001,215` rows, `121` selected, ratio `~0.0020%`, selector runs `613`.
+    - Q19 lineitem stage in that profile was about `48.3ms`, with part-mask build about `6.8ms`. Same-binary 5-repeat after adding the profile hook showed Q19 median around `32-33ms` with profiling off.
+    - This is a very strong late-materialization signal: predicate columns are wider than Q06/Q14, but selected payload rows are almost zero. Next step is to split Q19 into predicate pass (`l_partkey`, `l_quantity`, `l_discount`, `l_shipmode`, `l_shipinstruct`) and payload pass (`l_extendedprice`), reusing selected discount raw values like Q06.
+  - Applied Q19 late materialization:
+    - Promoted the late-materialized chunk runner to a generic engine API so SQL fast paths can provide their own predicate builder and payload consumer.
+    - Q19 now scans predicate columns first (`l_partkey`, `l_quantity`, `l_discount`, `l_shipmode`, `l_shipinstruct`), stores selected discount raw values, and scans only selected `l_extendedprice` rows.
+    - Added `DODAM_Q19_DISABLE_LATE_MATERIALIZE=1` and `DODAM_Q19_LATE_ROW_GROUP_CHUNK` with default `2`.
+    - Chunk sweep on SF=1:
+      - chunk `1`: Q19 median about `28.7ms`
+      - chunk `2`: Q19 median about `28.7ms`
+      - chunk `4`: Q19 median about `28.2ms`
+      - chunk `8`: Q19 median about `39.8ms`
+      - chunk `16`: Q19 median about `66.5ms`
+    - Kept default `2` because it is stable and matches the Q06 default; `4` was marginally best in one sample but not enough to change the rule.
+    - Scalar output differed from the previous path only by floating-point accumulation order (`3083843.0577999987` vs `3083843.0578000005`).
+    - Profile sample after enabling the late path: `6,001,215` rows, `121` selected, ratio `~0.0020%`, selector runs `269`, row-group chunk `2`.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.

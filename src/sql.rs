@@ -27,7 +27,9 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::dense::{AdaptiveI64Map, AdaptiveI64Set, adaptive_dense_index};
-use crate::engine::{DodamEngine, JoinAlgorithm, JoinParquetRequest};
+use crate::engine::{
+    DodamEngine, JoinAlgorithm, JoinParquetRequest, LateMaterializedMetrics, LateSelectionBuilder,
+};
 use crate::error::{DodamError, Result};
 use crate::execution::JoinType;
 use crate::execution::{
@@ -11862,6 +11864,20 @@ async fn q19_lineitem_revenue(
     rules: Arc<Vec<Q19Rule>>,
     part_masks: Arc<AdaptiveI64Map<u8>>,
 ) -> Result<(f64, u64)> {
+    if std::env::var_os("DODAM_Q19_DISABLE_LATE_MATERIALIZE").is_none() {
+        if let Some(result) = q19_late_materialized_lineitem_revenue(
+            engine,
+            path.clone(),
+            batch_size,
+            rules.clone(),
+            part_masks.clone(),
+        )
+        .await?
+        {
+            return Ok(result);
+        }
+    }
+    let profile = tpch_profile_enabled();
     let mut stream = engine
         .scan_parquet_batches(
             path,
@@ -11884,22 +11900,234 @@ async fn q19_lineitem_revenue(
         move |batches| {
             let mut sum = 0.0;
             let mut count = 0_u64;
+            let mut profile_metrics = Q19SelectionProfile::default();
             let mut raw_rule_cache = None;
             for batch in batches {
-                let (batch_sum, batch_count) =
-                    q19_lineitem_revenue_batch(batch, &rules, &part_masks, &mut raw_rule_cache)?;
+                let mut batch_profile = profile.then_some(Q19SelectionProfile::default());
+                let (batch_sum, batch_count) = q19_lineitem_revenue_batch(
+                    batch,
+                    &rules,
+                    &part_masks,
+                    &mut raw_rule_cache,
+                    batch_profile.as_mut(),
+                )?;
                 sum += batch_sum;
                 count += batch_count;
+                if let Some(batch_profile) = batch_profile {
+                    profile_metrics.add(batch_profile);
+                }
             }
-            Ok((sum, count))
+            Ok((sum, count, profile_metrics))
         },
-        (0.0, 0_u64),
+        (0.0, 0_u64, Q19SelectionProfile::default()),
         |total, batch| {
             total.0 += batch.0;
             total.1 += batch.1;
+            total.2.add(batch.2);
         },
         "Q19 lineitem revenue",
     )
+    .map(|(sum, count, profile_metrics)| {
+        if profile {
+            q19_log_selection_profile(profile_metrics);
+        }
+        (sum, count)
+    })
+}
+
+async fn q19_late_materialized_lineitem_revenue(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    rules: Arc<Vec<Q19Rule>>,
+    part_masks: Arc<AdaptiveI64Map<u8>>,
+) -> Result<Option<(f64, u64)>> {
+    let predicate_projection = Projection::Columns(vec![
+        "l_partkey".to_string(),
+        "l_quantity".to_string(),
+        "l_discount".to_string(),
+        "l_shipmode".to_string(),
+        "l_shipinstruct".to_string(),
+    ]);
+    let payload_projection = Projection::Columns(vec!["l_extendedprice".to_string()]);
+    let rules_for_state = rules.clone();
+    let part_masks_for_state = part_masks.clone();
+    let Some(chunks) = engine
+        .late_materialized_parquet_map(
+            path,
+            batch_size,
+            predicate_projection,
+            payload_projection,
+            q19_late_materialized_row_group_chunk(),
+            move || Q19LateState {
+                rules: rules_for_state.clone(),
+                part_masks: part_masks_for_state.clone(),
+                raw_rule_cache: None,
+                selected_discounts: Vec::new(),
+                discount_scale: None,
+                extendedprice_scale: None,
+                discount_offset: 0,
+                sum: 0.0,
+            },
+            q19_late_build_selection_batch,
+            q19_late_consume_payload_batch,
+            |state, _metrics| {
+                if state.discount_offset != state.selected_discounts.len() {
+                    return Err(DodamError::UnsupportedSql(
+                        "Q19 row selection payload mismatch".to_string(),
+                    ));
+                }
+                Ok(Some((state.sum, state.selected_discounts.len() as u64)))
+            },
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let mut sum = 0.0;
+    let mut count = 0_u64;
+    let mut metrics = LateMaterializedMetrics::default();
+    for chunk in chunks {
+        sum += chunk.output.0;
+        count += chunk.output.1;
+        metrics.add(chunk.metrics);
+    }
+    q19_log_late_materialized_profile(metrics, q19_late_materialized_row_group_chunk());
+    Ok(Some((sum, count)))
+}
+
+fn q19_late_materialized_row_group_chunk() -> usize {
+    std::env::var("DODAM_Q19_LATE_ROW_GROUP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2)
+}
+
+struct Q19LateState {
+    rules: Arc<Vec<Q19Rule>>,
+    part_masks: Arc<AdaptiveI64Map<u8>>,
+    raw_rule_cache: Option<(u64, Vec<Q19RawLineRule>)>,
+    selected_discounts: Vec<i64>,
+    discount_scale: Option<i64>,
+    extendedprice_scale: Option<i64>,
+    discount_offset: usize,
+    sum: f64,
+}
+
+fn q19_late_build_selection_batch(
+    batch: RecordBatch,
+    selection: &mut LateSelectionBuilder,
+    state: &mut Q19LateState,
+) -> Result<Option<()>> {
+    let partkeys = batch_column(&batch, "l_partkey")?;
+    let quantities = batch_column(&batch, "l_quantity")?;
+    let discounts = batch_column(&batch, "l_discount")?;
+    let shipmodes = batch_string_column(&batch, "l_shipmode")?;
+    let shipinstructs = batch_string_column(&batch, "l_shipinstruct")?;
+    let (Some(partkeys), Some(quantities), Some(discounts)) = (
+        partkeys.as_any().downcast_ref::<Int64Array>(),
+        q01_decimal_input(quantities)?,
+        q01_decimal_input(discounts)?,
+    ) else {
+        return Ok(None);
+    };
+    if partkeys.null_count() != 0
+        || quantities.null_count() != 0
+        || discounts.null_count() != 0
+        || shipmodes.null_count() != 0
+        || shipinstructs.null_count() != 0
+        || quantities.precision > 18
+        || discounts.precision > 18
+    {
+        return Ok(None);
+    }
+    let discount_scale = discounts.scale as i64;
+    if let Some(existing) = state.discount_scale {
+        if existing != discount_scale {
+            return Ok(None);
+        }
+    } else {
+        state.discount_scale = Some(discount_scale);
+    }
+    let raw_rules =
+        q19_raw_line_rules_cached(&state.rules, quantities.scale, &mut state.raw_rule_cache);
+    let shipmode_offsets = shipmodes.value_offsets();
+    let shipmode_data = shipmodes.value_data();
+    let shipinstruct_offsets = shipinstructs.value_offsets();
+    let shipinstruct_data = shipinstructs.value_data();
+    let partkey_values = partkeys.values();
+    let quantity_values = quantities.raw_values();
+    let discount_values = discounts.raw_values();
+    for row in 0..batch.num_rows() {
+        let selected = if let Some(mask) = state.part_masks.get(partkey_values[row]) {
+            q19_rule_matches_lineitem_raw(
+                raw_rules,
+                mask,
+                quantity_values[row],
+                bytes_string_parts(shipmode_offsets, shipmode_data, row),
+                bytes_string_parts(shipinstruct_offsets, shipinstruct_data, row),
+            )
+        } else {
+            false
+        };
+        if selected {
+            state.selected_discounts.push(discount_values[row] as i64);
+        }
+        selection.push(selected);
+    }
+    Ok(Some(()))
+}
+
+fn q19_late_consume_payload_batch(
+    batch: RecordBatch,
+    state: &mut Q19LateState,
+) -> Result<Option<()>> {
+    let extendedprices = batch_column(&batch, "l_extendedprice")?;
+    let Some(extendedprices) = q01_decimal_input(extendedprices)? else {
+        return Ok(None);
+    };
+    if extendedprices.null_count() != 0 || extendedprices.precision > 18 {
+        return Ok(None);
+    }
+    let price_scale = extendedprices.scale as i64;
+    if let Some(existing) = state.extendedprice_scale {
+        if existing != price_scale {
+            return Ok(None);
+        }
+    } else {
+        state.extendedprice_scale = Some(price_scale);
+    }
+    let discount_scale = state
+        .discount_scale
+        .ok_or_else(|| DodamError::UnsupportedSql("Q19 missing discount scale".to_string()))?;
+    let revenue_scale = 1.0 / ((price_scale as f64) * (discount_scale as f64));
+    for &extendedprice in extendedprices.raw_values() {
+        let discount = *state
+            .selected_discounts
+            .get(state.discount_offset)
+            .ok_or_else(|| {
+                DodamError::UnsupportedSql("Q19 row selection payload mismatch".to_string())
+            })?;
+        state.sum += ((extendedprice as i64) * (discount_scale - discount)) as f64 * revenue_scale;
+        state.discount_offset += 1;
+    }
+    Ok(Some(()))
+}
+
+fn q19_log_late_materialized_profile(metrics: LateMaterializedMetrics, row_group_chunk: usize) {
+    if !tpch_profile_enabled() {
+        return;
+    }
+    let ratio = if metrics.total_rows == 0 {
+        0.0
+    } else {
+        metrics.selected_rows as f64 / metrics.total_rows as f64
+    };
+    eprintln!(
+        "[dodam:tpch-profile] Q19: late_materialized rows={} selected={} ratio={:.6} selector_runs={} row_group_chunk={}",
+        metrics.total_rows, metrics.selected_rows, ratio, metrics.selector_runs, row_group_chunk
+    );
 }
 
 fn q19_lineitem_revenue_batch(
@@ -11907,6 +12135,7 @@ fn q19_lineitem_revenue_batch(
     rules: &[Q19Rule],
     part_masks: &AdaptiveI64Map<u8>,
     raw_rule_cache: &mut Option<(u64, Vec<Q19RawLineRule>)>,
+    mut profile: Option<&mut Q19SelectionProfile>,
 ) -> Result<(f64, u64)> {
     let partkeys = batch_column(&batch, "l_partkey")?;
     let quantities = batch_column(&batch, "l_quantity")?;
@@ -11941,16 +12170,21 @@ fn q19_lineitem_revenue_batch(
             let extendedprice_values = extendedprices.raw_values();
             let discount_values = discounts.raw_values();
             for row in 0..batch.num_rows() {
-                let Some(mask) = part_masks.get(partkey_values[row]) else {
-                    continue;
+                let selected = if let Some(mask) = part_masks.get(partkey_values[row]) {
+                    q19_rule_matches_lineitem_raw(
+                        &raw_rules,
+                        mask,
+                        quantity_values[row],
+                        bytes_string_parts(shipmode_offsets, shipmode_data, row),
+                        bytes_string_parts(shipinstruct_offsets, shipinstruct_data, row),
+                    )
+                } else {
+                    false
                 };
-                if !q19_rule_matches_lineitem_raw(
-                    &raw_rules,
-                    mask,
-                    quantity_values[row],
-                    bytes_string_parts(shipmode_offsets, shipmode_data, row),
-                    bytes_string_parts(shipinstruct_offsets, shipinstruct_data, row),
-                ) {
+                if let Some(profile) = profile.as_deref_mut() {
+                    profile.record(selected);
+                }
+                if !selected {
                     continue;
                 }
                 sum += (extendedprice_values[row] * (discount_one_raw - discount_values[row]))
@@ -11968,19 +12202,27 @@ fn q19_lineitem_revenue_batch(
                 || shipmodes.is_null(row)
                 || shipinstructs.is_null(row)
             {
+                if let Some(profile) = profile.as_deref_mut() {
+                    profile.record(false);
+                }
                 continue;
             }
-            let Some(mask) = part_masks.get(partkeys.value(row)) else {
-                continue;
-            };
             let quantity = quantities.value(row);
-            if !q19_rule_matches_lineitem(
-                rules,
-                mask,
-                quantity,
-                shipmodes.value(row),
-                shipinstructs.value(row),
-            ) {
+            let selected = if let Some(mask) = part_masks.get(partkeys.value(row)) {
+                q19_rule_matches_lineitem(
+                    rules,
+                    mask,
+                    quantity,
+                    shipmodes.value(row),
+                    shipinstructs.value(row),
+                )
+            } else {
+                false
+            };
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.record(selected);
+            }
+            if !selected {
                 continue;
             }
             sum += extendedprices.value(row) * (1.0 - discounts.value(row));
@@ -11990,6 +12232,9 @@ fn q19_lineitem_revenue_batch(
     }
     for row in 0..batch.num_rows() {
         if shipmodes.is_null(row) || shipinstructs.is_null(row) {
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.record(false);
+            }
             continue;
         }
         let (Some(partkey), Some(quantity), Some(extendedprice), Some(discount)) = (
@@ -11998,23 +12243,74 @@ fn q19_lineitem_revenue_batch(
             numeric_f64_value(extendedprices, row)?,
             numeric_f64_value(discounts, row)?,
         ) else {
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.record(false);
+            }
             continue;
         };
-        let Some(mask) = part_masks.get(partkey) else {
-            continue;
+        let selected = if let Some(mask) = part_masks.get(partkey) {
+            q19_rule_matches_lineitem(
+                rules,
+                mask,
+                quantity,
+                shipmodes.value(row),
+                shipinstructs.value(row),
+            )
+        } else {
+            false
         };
-        if q19_rule_matches_lineitem(
-            rules,
-            mask,
-            quantity,
-            shipmodes.value(row),
-            shipinstructs.value(row),
-        ) {
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.record(selected);
+        }
+        if selected {
             sum += extendedprice * (1.0 - discount);
             count += 1;
         }
     }
     Ok((sum, count))
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Q19SelectionProfile {
+    total_rows: u64,
+    selected_rows: u64,
+    selector_runs: u64,
+    last_selected: Option<bool>,
+}
+
+impl Q19SelectionProfile {
+    fn record(&mut self, selected: bool) {
+        self.total_rows += 1;
+        if selected {
+            self.selected_rows += 1;
+        }
+        if self.last_selected != Some(selected) {
+            self.selector_runs += 1;
+            self.last_selected = Some(selected);
+        }
+    }
+
+    fn add(&mut self, other: Self) {
+        if other.total_rows == 0 {
+            return;
+        }
+        self.total_rows += other.total_rows;
+        self.selected_rows += other.selected_rows;
+        self.selector_runs += other.selector_runs;
+        self.last_selected = other.last_selected.or(self.last_selected);
+    }
+}
+
+fn q19_log_selection_profile(profile: Q19SelectionProfile) {
+    let ratio = if profile.total_rows == 0 {
+        0.0
+    } else {
+        profile.selected_rows as f64 / profile.total_rows as f64
+    };
+    eprintln!(
+        "[dodam:tpch-profile] Q19: predicate_selected rows={} selected={} ratio={:.6} selector_runs={}",
+        profile.total_rows, profile.selected_rows, ratio, profile.selector_runs
+    );
 }
 
 struct Q19RawLineRule {
