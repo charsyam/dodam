@@ -11880,6 +11880,16 @@ fn q21_final_orders_batch_into(batch: &RecordBatch, keys: &mut Q21FinalOrders) -
     let orderkeys = batch_column(batch, "o_orderkey")?;
     let statuses = batch_string_column(batch, "o_orderstatus")?;
     if let Some(orderkeys) = orderkeys.as_any().downcast_ref::<Int64Array>() {
+        if orderkeys.null_count() == 0 && statuses.null_count() == 0 {
+            let status_offsets = statuses.value_offsets();
+            let status_data = statuses.value_data();
+            for row in 0..orderkeys.len() {
+                if bytes_string_parts(status_offsets, status_data, row) == b"F" {
+                    keys.insert(orderkeys.value(row));
+                }
+            }
+            return Ok(());
+        }
         for row in 0..orderkeys.len() {
             if orderkeys.is_null(row) || statuses.is_null(row) || statuses.value(row) != "F" {
                 continue;
