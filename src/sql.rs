@@ -3062,7 +3062,7 @@ async fn q01_pricing_summary_rows(
         .await?;
     let groups = parallel_batch_fold_chunks(
         &mut stream,
-        4,
+        8,
         move |batches| {
             let mut groups = Q01GroupSlots::new();
             for batch in batches {
@@ -3366,8 +3366,8 @@ impl Q01DecimalInput<'_> {
         self.values.value(row) as f64 / self.scale
     }
 
-    fn raw_value(&self, row: usize) -> i128 {
-        self.values.value(row)
+    fn raw_values(&self) -> &[i128] {
+        self.values.values().as_ref()
     }
 }
 
@@ -6726,9 +6726,19 @@ async fn q15_revenue_by_supplier(
             None,
         )
         .await?;
-    parallel_batch_fold(
+    parallel_batch_fold_chunks(
         &mut stream,
-        move |batch| q15_revenue_by_supplier_batch(batch, start_days, end_days),
+        8,
+        move |batches| {
+            let mut revenues = HashMap::<i64, f64>::new();
+            for batch in batches {
+                merge_f64_groups(
+                    &mut revenues,
+                    q15_revenue_by_supplier_batch(batch, start_days, end_days)?,
+                );
+            }
+            Ok(revenues)
+        },
         HashMap::<i64, f64>::new(),
         merge_f64_groups,
         "Q15 revenue aggregate",
@@ -7076,7 +7086,7 @@ async fn q03_order_rows(
     let customers = Arc::new(adaptive_i64_set_from_hash(customers.clone()));
     parallel_batch_fold_chunks(
         &mut stream,
-        4,
+        1,
         move |batches| {
             let mut orders = HashMap::<i64, Q03Order>::new();
             for batch in batches {
@@ -8265,7 +8275,7 @@ async fn q05_revenue_by_nation(
     let supplier_nations = Arc::new(adaptive_i64_map_from_hash(supplier_nations.clone()));
     let groups = parallel_batch_fold_chunks(
         &mut stream,
-        4,
+        2,
         move |batches| {
             let mut groups = HashMap::<i64, f64>::new();
             for batch in batches {
@@ -8654,19 +8664,19 @@ fn q06_revenue_sum_batch(
             let discount_low_raw = scaled_f64_to_i128(discount_low, discounts.scale);
             let discount_high_raw = scaled_f64_to_i128(discount_high, discounts.scale);
             let quantity_limit_raw = scaled_f64_to_i128(quantity_limit, quantities.scale);
+            let revenue_scale = 1.0 / (extendedprices.scale * discounts.scale);
             for row in 0..batch.num_rows() {
                 let shipdate = shipdates.value(row);
-                let discount = discounts.raw_value(row);
+                let discount = discounts.values.value(row);
                 if shipdate < start_days
                     || shipdate >= end_days
                     || discount < discount_low_raw
                     || discount > discount_high_raw
-                    || quantities.raw_value(row) >= quantity_limit_raw
+                    || quantities.values.value(row) >= quantity_limit_raw
                 {
                     continue;
                 }
-                sum += (extendedprices.raw_value(row) as f64 / extendedprices.scale)
-                    * (discount as f64 / discounts.scale);
+                sum += (extendedprices.values.value(row) * discount) as f64 * revenue_scale;
                 count += 1;
             }
             return Ok(Some((sum, count)));
@@ -9092,7 +9102,7 @@ async fn q07_volume_rows(
     let order_customer_nations = Arc::new(order_customer_nations.clone());
     let groups = parallel_batch_fold_chunks(
         &mut stream,
-        4,
+        2,
         move |batches| {
             let mut groups = HashMap::<(i64, i64, i32), f64>::new();
             for batch in batches {
@@ -9718,7 +9728,7 @@ async fn q08_market_share_rows(
     let supplier_nations = Arc::new(supplier_nations.clone());
     let groups = parallel_batch_fold_chunks(
         &mut stream,
-        4,
+        2,
         move |batches| {
             let mut groups = HashMap::<i32, (f64, f64)>::new();
             for batch in batches {
@@ -11121,7 +11131,9 @@ async fn try_execute_q19_discounted_revenue_fast(
     if rules.is_empty() || rules.len() > 8 {
         return Ok(None);
     }
+    let stage = tpch_profile_start();
     let part_masks = q19_matching_part_masks(engine, part.path, batch_size, &rules).await?;
+    tpch_profile_elapsed("Q19 matching part masks", stage);
     if part_masks.is_empty() {
         return Ok(Some(q17_output("revenue".to_string(), None)?));
     }
@@ -11252,12 +11264,42 @@ async fn q19_matching_part_masks(
         )
         .await?;
     let mut masks = AdaptiveI64Map::<u8>::new_dense();
+    let raw_rules = q19_raw_part_rules(rules);
     while let Some(batch) = stream.next() {
         let batch = batch?;
         let partkeys = batch_column(&batch, "p_partkey")?;
         let brands = batch_string_column(&batch, "p_brand")?;
         let containers = batch_string_column(&batch, "p_container")?;
         let sizes = batch_column(&batch, "p_size")?;
+        if let Some(size_values) = q19_part_size_values(sizes) {
+            if let Some(partkeys) = partkeys.as_any().downcast_ref::<Int64Array>() {
+                if partkeys.null_count() == 0
+                    && brands.null_count() == 0
+                    && containers.null_count() == 0
+                    && size_values.null_count() == 0
+                {
+                    let brand_offsets = brands.value_offsets();
+                    let brand_data = brands.value_data();
+                    let container_offsets = containers.value_offsets();
+                    let container_data = containers.value_data();
+                    for row in 0..batch.num_rows() {
+                        let brand = bytes_string_parts(brand_offsets, brand_data, row);
+                        let container = bytes_string_parts(container_offsets, container_data, row);
+                        let size = size_values.value(row);
+                        let mut mask = 0_u8;
+                        for (index, rule) in raw_rules.iter().enumerate() {
+                            if q19_raw_part_rule_matches(rule, brand, container, size) {
+                                mask |= 1 << index;
+                            }
+                        }
+                        if mask != 0 {
+                            masks.insert(partkeys.value(row), mask);
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
         for row in 0..batch.num_rows() {
             if brands.is_null(row) || containers.is_null(row) {
                 continue;
@@ -11284,6 +11326,78 @@ async fn q19_matching_part_masks(
         }
     }
     Ok(masks)
+}
+
+struct Q19RawPartRule {
+    brand: Vec<u8>,
+    containers: Vec<Vec<u8>>,
+    size_low: i64,
+    size_high: i64,
+}
+
+fn q19_raw_part_rules(rules: &[Q19Rule]) -> Vec<Q19RawPartRule> {
+    rules
+        .iter()
+        .map(|rule| Q19RawPartRule {
+            brand: rule.brand.as_bytes().to_vec(),
+            containers: rule
+                .containers
+                .iter()
+                .map(|container| container.as_bytes().to_vec())
+                .collect(),
+            size_low: rule.size_low.ceil() as i64,
+            size_high: rule.size_high.floor() as i64,
+        })
+        .collect()
+}
+
+fn q19_raw_part_rule_matches(
+    rule: &Q19RawPartRule,
+    brand: &[u8],
+    container: &[u8],
+    size: i64,
+) -> bool {
+    rule.brand.as_slice() == brand
+        && size >= rule.size_low
+        && size <= rule.size_high
+        && rule
+            .containers
+            .iter()
+            .any(|candidate| candidate.as_slice() == container)
+}
+
+enum Q19PartSizeValues<'a> {
+    Int32(&'a Int32Array),
+    Int64(&'a Int64Array),
+}
+
+impl Q19PartSizeValues<'_> {
+    fn null_count(&self) -> usize {
+        match self {
+            Self::Int32(values) => values.null_count(),
+            Self::Int64(values) => values.null_count(),
+        }
+    }
+
+    fn value(&self, row: usize) -> i64 {
+        match self {
+            Self::Int32(values) => i64::from(values.value(row)),
+            Self::Int64(values) => values.value(row),
+        }
+    }
+}
+
+fn q19_part_size_values(column: &ArrayRef) -> Option<Q19PartSizeValues<'_>> {
+    column
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .map(Q19PartSizeValues::Int32)
+        .or_else(|| {
+            column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .map(Q19PartSizeValues::Int64)
+        })
 }
 
 async fn q19_lineitem_revenue(
@@ -11315,9 +11429,10 @@ async fn q19_lineitem_revenue(
         move |batches| {
             let mut sum = 0.0;
             let mut count = 0_u64;
+            let mut raw_rule_cache = None;
             for batch in batches {
                 let (batch_sum, batch_count) =
-                    q19_lineitem_revenue_batch(batch, &rules, &part_masks)?;
+                    q19_lineitem_revenue_batch(batch, &rules, &part_masks, &mut raw_rule_cache)?;
                 sum += batch_sum;
                 count += batch_count;
             }
@@ -11336,6 +11451,7 @@ fn q19_lineitem_revenue_batch(
     batch: RecordBatch,
     rules: &[Q19Rule],
     part_masks: &AdaptiveI64Map<u8>,
+    raw_rule_cache: &mut Option<(u64, Vec<Q19RawLineRule>)>,
 ) -> Result<(f64, u64)> {
     let partkeys = batch_column(&batch, "l_partkey")?;
     let quantities = batch_column(&batch, "l_quantity")?;
@@ -11351,7 +11467,7 @@ fn q19_lineitem_revenue_batch(
         q01_decimal_input(extendedprices)?,
         q01_decimal_input(discounts)?,
     ) {
-        let raw_rules = q19_raw_line_rules(rules, quantities.scale);
+        let raw_rules = q19_raw_line_rules_cached(rules, quantities.scale, raw_rule_cache);
         if partkeys.null_count() == 0
             && quantities.null_count() == 0
             && extendedprices.null_count() == 0
@@ -11359,24 +11475,31 @@ fn q19_lineitem_revenue_batch(
             && shipmodes.null_count() == 0
             && shipinstructs.null_count() == 0
         {
+            let discount_one_raw = scaled_f64_to_i128(1.0, discounts.scale);
+            let revenue_scale = 1.0 / (extendedprices.scale * discounts.scale);
             let shipmode_offsets = shipmodes.value_offsets();
             let shipmode_data = shipmodes.value_data();
             let shipinstruct_offsets = shipinstructs.value_offsets();
             let shipinstruct_data = shipinstructs.value_data();
+            let partkeys = partkeys.values();
+            let quantities = quantities.raw_values();
+            let extendedprices = extendedprices.raw_values();
+            let discounts = discounts.raw_values();
             for row in 0..batch.num_rows() {
-                let Some(mask) = part_masks.get(partkeys.value(row)) else {
+                let Some(mask) = part_masks.get(partkeys[row]) else {
                     continue;
                 };
                 if !q19_rule_matches_lineitem_raw(
                     &raw_rules,
                     mask,
-                    quantities.raw_value(row),
+                    quantities[row],
                     bytes_string_parts(shipmode_offsets, shipmode_data, row),
                     bytes_string_parts(shipinstruct_offsets, shipinstruct_data, row),
                 ) {
                     continue;
                 }
-                sum += extendedprices.value(row) * (1.0 - discounts.value(row));
+                sum += (extendedprices[row] * (discount_one_raw - discounts[row])) as f64
+                    * revenue_scale;
                 count += 1;
             }
             return Ok((sum, count));
@@ -11461,6 +11584,22 @@ fn q19_raw_line_rules(rules: &[Q19Rule], quantity_scale: f64) -> Vec<Q19RawLineR
         .collect()
 }
 
+fn q19_raw_line_rules_cached<'a>(
+    rules: &[Q19Rule],
+    quantity_scale: f64,
+    cache: &'a mut Option<(u64, Vec<Q19RawLineRule>)>,
+) -> &'a [Q19RawLineRule] {
+    let scale_key = quantity_scale.to_bits();
+    if !matches!(cache, Some((cached_key, _)) if *cached_key == scale_key) {
+        *cache = Some((scale_key, q19_raw_line_rules(rules, quantity_scale)));
+    }
+    cache
+        .as_ref()
+        .expect("q19 raw rule cache populated")
+        .1
+        .as_slice()
+}
+
 fn bytes_string_parts<'a>(offsets: &[i32], data: &'a [u8], row: usize) -> &'a [u8] {
     let start = offsets[row] as usize;
     let end = offsets[row + 1] as usize;
@@ -11474,22 +11613,38 @@ fn q19_rule_matches_lineitem_raw(
     shipmode: &[u8],
     shipinstruct: &[u8],
 ) -> bool {
+    let relevant_mask = (u16::from(mask) & ((1_u16 << rules.len().min(8)) - 1)) as u8;
+    if relevant_mask != 0 && (relevant_mask & (relevant_mask - 1)) == 0 {
+        return rules
+            .get(relevant_mask.trailing_zeros() as usize)
+            .is_some_and(|rule| {
+                q19_raw_rule_matches_lineitem(rule, quantity, shipmode, shipinstruct)
+            });
+    }
     for (index, rule) in rules.iter().enumerate() {
         if mask & (1 << index) == 0 {
             continue;
         }
-        if quantity >= rule.quantity_low
-            && quantity <= rule.quantity_high
-            && rule.shipinstruct == shipinstruct
-            && rule
-                .shipmodes
-                .iter()
-                .any(|candidate| candidate.as_slice() == shipmode)
-        {
+        if q19_raw_rule_matches_lineitem(rule, quantity, shipmode, shipinstruct) {
             return true;
         }
     }
     false
+}
+
+fn q19_raw_rule_matches_lineitem(
+    rule: &Q19RawLineRule,
+    quantity: i128,
+    shipmode: &[u8],
+    shipinstruct: &[u8],
+) -> bool {
+    quantity >= rule.quantity_low
+        && quantity <= rule.quantity_high
+        && rule.shipinstruct == shipinstruct
+        && rule
+            .shipmodes
+            .iter()
+            .any(|candidate| candidate.as_slice() == shipmode)
 }
 
 fn q19_rule_matches_lineitem(
