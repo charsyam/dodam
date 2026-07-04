@@ -25,7 +25,7 @@ use sqlparser::ast::{CopyOption, CopySource, CopyTarget, Ident, Statement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser as SqlParser;
 
-const DEFAULT_BATCH_SIZE: usize = 32 * 1024;
+const DEFAULT_BATCH_SIZE: usize = 16 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "dodam")]

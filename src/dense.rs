@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::hash::{FastHashMap, FastHashSet};
+
 const DEFAULT_MAX_DENSE_I64_KEY: usize = 20_000_000;
 
 #[derive(Clone)]
 pub(crate) enum AdaptiveI64Set {
     Dense { contains: Vec<bool>, len: usize },
-    Hash(HashSet<i64>),
+    Hash(FastHashSet<i64>),
 }
 
 impl AdaptiveI64Set {
@@ -38,6 +40,22 @@ impl AdaptiveI64Set {
         }
     }
 
+    pub(crate) fn selective_key_range(&self) -> Option<(i64, i64)> {
+        let (min_key, max_key, len) = match self {
+            Self::Dense { contains, len } => {
+                let min_key = contains.iter().position(|contains| *contains)? as i64;
+                let max_key = contains.iter().rposition(|contains| *contains)? as i64;
+                (min_key, max_key, *len)
+            }
+            Self::Hash(keys) => {
+                let min_key = keys.iter().copied().min()?;
+                let max_key = keys.iter().copied().max()?;
+                (min_key, max_key, keys.len())
+            }
+        };
+        selective_i64_range(min_key, max_key, len)
+    }
+
     pub(crate) fn insert(&mut self, key: i64) {
         match self {
             Self::Dense { contains, len } => {
@@ -68,7 +86,7 @@ impl AdaptiveI64Set {
         let mut max_key = 0_usize;
         for key in values.iter().copied() {
             let Some(index) = adaptive_dense_index(key, DEFAULT_MAX_DENSE_I64_KEY) else {
-                return Self::Hash(values);
+                return Self::Hash(values.into_iter().collect());
             };
             max_key = max_key.max(index);
         }
@@ -85,7 +103,7 @@ impl AdaptiveI64Set {
     }
 }
 
-fn adaptive_i64_set_dense_to_hash(contains: &[bool]) -> HashSet<i64> {
+fn adaptive_i64_set_dense_to_hash(contains: &[bool]) -> FastHashSet<i64> {
     contains
         .iter()
         .copied()
@@ -100,7 +118,7 @@ pub(crate) enum AdaptiveI64Map<V> {
         present: Vec<bool>,
         len: usize,
     },
-    Hash(HashMap<i64, V>),
+    Hash(FastHashMap<i64, V>),
 }
 
 impl<V> AdaptiveI64Map<V>
@@ -122,7 +140,7 @@ where
         let mut max_key = 0_usize;
         for key in values.keys().copied() {
             let Some(index) = adaptive_dense_index(key, DEFAULT_MAX_DENSE_I64_KEY) else {
-                return Self::Hash(values);
+                return Self::Hash(values.into_iter().collect());
             };
             max_key = max_key.max(index);
         }
@@ -255,7 +273,7 @@ where
     }
 }
 
-fn adaptive_i64_map_dense_to_hash<V>(values: &[V], present: &[bool]) -> HashMap<i64, V>
+fn adaptive_i64_map_dense_to_hash<V>(values: &[V], present: &[bool]) -> FastHashMap<i64, V>
 where
     V: Copy,
 {
@@ -266,6 +284,14 @@ where
         .enumerate()
         .filter_map(|(key, (value, present))| present.then_some((key as i64, value)))
         .collect()
+}
+
+fn selective_i64_range(min_key: i64, max_key: i64, len: usize) -> Option<(i64, i64)> {
+    if len == 0 || min_key < 0 || max_key < min_key {
+        return None;
+    }
+    let width = usize::try_from(max_key.checked_sub(min_key)?.checked_add(1)?).ok()?;
+    (width <= len.saturating_mul(8).max(1024)).then_some((min_key, max_key))
 }
 
 pub(crate) fn adaptive_dense_index(key: i64, max_dense_key: usize) -> Option<usize> {

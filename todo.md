@@ -339,6 +339,22 @@ Effective or retained:
   - Moved `AdaptiveI64Set` and `AdaptiveI64Map` out of `sql.rs` into a shared `dense` module.
   - The common rule is now reusable by future operators and fast paths: use vector-backed lookup for non-negative dense `i64` domains up to the configured bound, and fall back to `HashSet`/`HashMap` for sparse or negative keys.
   - Q16 focused median stayed around `0.047s` after extraction, so this was a structural cleanup rather than a performance regression.
+- Build-side map task chunking:
+  - Added `DODAM_BUILD_MAP_CHUNK_SIZE` and changed Q03's orders build map from one task per batch to the same chunked task policy used by join/aggregate scans.
+  - This is a general task scheduling rule for build-side map creation, not a Q03 data-only shortcut: fewer tiny Rayon tasks and fewer small partial maps before the final merge.
+  - SF=1 TPC-H in-process 3-run total improved from about `2.433s` to about `2.381s` in the retained build-map chunk run, although individual hot-run query medians remain noise-sensitive.
+- Parquet statistics-assisted dense aggregate reserve:
+  - Added a storage/engine helper to read exact `Int64` column max from Parquet row-group statistics.
+  - Q18 now uses `l_orderkey` max statistics to pre-size dense quantity aggregation and only uses the one-pass dense loop when exact stats provide full dense capacity.
+  - This avoided the earlier repeated-resize regression and slightly improved Q18 hot-run timings in the 3-run check (`~68.97ms` to `~66.67ms` on the third run), while total runtime stayed roughly neutral (`~2.381s` to `~2.383s`).
+- Ordered scan option for sorted-key streaming aggregates:
+  - Added a physical scan `preserve_order` flag and an engine `scan_parquet_batches_preserve_order` helper that forces sequential Parquet scan when a consumer needs file/row-group order.
+  - Q18 now first attempts an ordered `l_orderkey` run aggregate that only stores qualifying orders; if the input is not actually nondecreasing by `l_orderkey`, it falls back to the dense aggregate path.
+  - On the SF=1 TPC-H 10-run check, Q18 improved from about `65.3ms` to about `61.8ms`; 22-query sum-of-medians improved from about `750.4ms` to about `746.0ms`.
+- Q08 dense/boolean hot-loop lookups:
+  - Replaced per-row supplier nation string lookup/compare with `suppkey -> is_brazil` boolean lookup.
+  - Converted Q08 lineitem's `orderkey -> year` lookup to `AdaptiveI64Map<i32>` and supplier lookup to `AdaptiveI64Map<bool>`, keeping the same sparse fallback behavior.
+  - On the SF=1 TPC-H 10-run check, Q08 improved from about `50.0ms` to about `48.8ms`; whole-query sum stayed noise-sensitive because the remaining Q08 cost is mostly scan/decode.
 
 Tried and rejected or neutral:
 
@@ -434,6 +450,16 @@ Tried and rejected or neutral:
 - Q18 consecutive-key run aggregation:
   - Tested aggregating consecutive identical `l_orderkey` runs inside each batch before updating the dense sum vector.
   - Rejected because branch/run tracking overhead outweighed fewer dense updates on the current lineitem ordering; Q18 median regressed to about `0.099s`.
+- FastHashMap expansion for Q05/Q07/Q08 lineitem aggregate groups:
+  - Tested replacing the small revenue group maps with the project-wide fast integer hasher.
+  - Rejected because the 3-run TPC-H in-process total regressed slightly (`~2.433s` to `~2.454s`), showing these queries are dominated by scan/decode and join predicate work rather than the tiny final group-map hasher.
+- Q18 dense aggregate one-pass with progressive resize:
+  - Tested removing the batch max pre-scan and growing the dense vector geometrically while accumulating.
+  - Rejected because repeated resize/cache effects regressed Q18 materially (`~68-69ms` to `~76-82ms` in the 3-run check).
+  - The retained version only skips the max pre-scan when Parquet statistics provide an exact full-capacity reserve.
+- Q18 parallel local HashMap aggregation:
+  - Tested keeping the normal parallel scan and aggregating chunk-local `FastHashMap<i64, f64>` maps before merging.
+  - Rejected because scan finished quickly but partial map merging dominated: Q18 lineitem aggregation rose to about `74ms` and query runtime to about `87ms`.
 
 ### Planning And DAG Execution
 
@@ -798,6 +824,161 @@ Tried and rejected or neutral:
     - Rejected it because Q09 profit stage stayed neutral-to-worse (`~44-46ms` samples); packing/probe overhead did not beat the existing tuple HashMap path.
     - Also rejected a Q09 raw `Decimal128` no-null profit loop; it regressed the focused profit stage versus the existing `value()` path.
     - Retained a small ownership cleanup: `q09_profit_rows` now takes the supply-cost map by value and moves it into `Arc`, avoiding a full HashMap clone before the lineitem stage.
+  - Added opt-in scan-level profiling with `DODAM_SCAN_PROFILE=1`:
+    - Wraps executed scan streams and prints per-scan wall elapsed, rows, batches, row groups, compressed bytes, metadata/planning/decode/filter/projection/limit time.
+    - Decode time is cumulative worker time, so it can exceed wall elapsed on parallel Parquet scans; this is useful for separating decode work from downstream compute/merge time.
+    - Initial SF=1 in-process observations:
+      - Q21 lineitem scan (`l_orderkey,l_suppkey,l_receiptdate,l_commitdate`) walls around `~11ms` with cumulative decode around `~127ms`, while the Q21 query remains around `~85ms`; the remaining gap is therefore mostly state build/merge rather than scan wall time.
+      - Q18 lineitem quantity scan walls around `~52ms` with cumulative decode around `~87ms`; Q18 remains scan/dense-accumulator dominated.
+      - Q09 lineitem profit scan walls around `~36ms` with cumulative decode around `~448ms`; Q09's lineitem stage still mixes expensive decode and lookup/aggregate work.
+  - Improved Q21 lineitem state build:
+    - Batch-local Q21 state construction now exploits contiguous `l_orderkey` runs in the non-null typed path, so it updates the batch HashMap once per orderkey run instead of once per lineitem row.
+    - Replaced Q21's `HashMap<i64, Q21OrderState>` with a local fast integer-key hasher, matching the approach already used in join/aggregate hot paths.
+    - After the faster hasher, retuned Q21's chunked fold default from `8` to `16`; focused samples moved Q21 lineitem state construction from roughly `~69ms` to the `~44-50ms` band, and Q21 end-to-end samples moved from the `~82-86ms` band toward `~60-66ms`.
+    - Latest 5-run in-process full TPC-H after the Q21 change sampled around `0.810-0.837s`, median about `0.821s`.
+  - Generalized the fast integer hasher:
+    - Moved the duplicated join/aggregate/Q21 integer-key hasher into `src/hash.rs` as `FastHasher`, `FastHashMap`, and `FastHashSet`.
+    - Rewired physical join maps/sets, grouped aggregate maps, Q21 order-state maps, and adaptive dense fallback hash maps/sets to use the same implementation.
+    - SF=1 Parquet-output 3-run in-process median sum moved from about `782.9ms` to `777.3ms` (`~0.7%` faster), so this is a cleanup plus small win rather than a structural fix.
+    - Improvements in that sample: Q04 `27.8ms -> 24.9ms`, Q03 `40.0ms -> 37.2ms`, Q10 `49.7ms -> 47.9ms`, Q06 `23.8ms -> 22.4ms`, Q09/Q08/Q07 small wins.
+    - Regressions/noise in that sample: Q18 `67.7ms -> 69.9ms`, Q16 `29.4ms -> 31.4ms`, Q21 `60.2ms -> 61.3ms`, Q13 `33.9ms -> 34.9ms`; keep watching before expanding the hasher blindly to every SQL-local map.
+    - Current DuckDB CLI comparison under the same SF=1 Parquet input/output shape after this change: Dodam median-sum about `777ms`, DuckDB about `561ms`, ratio `~1.39x`. Largest remaining ratios are Q16/Q06 (`~2.2x`), Q22 (`~2.0x`), Q18 (`~1.8x`), Q08/Q07/Q05 (`~1.7x`).
+  - Improved Q16 `COUNT(DISTINCT ps_suppkey)`:
+    - Replaced the previous `HashMap<group_id, HashSet<suppkey>>` partial state with a single `FastHashSet<(group_id, suppkey)>`, then counted distinct pairs per group at finalization.
+    - This keeps exact distinct semantics while avoiding many small per-group sets and reducing merge work.
+    - Interned Q16 `p_brand`/`p_type` strings during `part` filtering and used an integer `Q16GroupIdKey` for group lookup, avoiding per-row cloned string keys for repeated group-id probes.
+    - Rejected for now: a Q18 sorted-key streaming aggregate. The idea is generally useful, but the current parallel Parquet scan does not preserve sorted batch order, so the path fell back to a second dense scan and regressed Q18. A future version needs scan-order guarantees or an ordered scan mode before enabling sorted streaming aggregates.
+    - SF=1 Parquet-output 3-run median without profiling: Q16 moved from about `31.4ms` to `24.2ms` (`~23%` faster). Overall TPC-H median-sum stayed roughly flat (`777.3ms -> 776.9ms`) because the remaining large gaps are in other queries and run-to-run noise dominates sub-10ms total changes.
+    - Current largest DuckDB gaps after this Q16 work: Q06 `~2.33x`, Q22 `~1.95x`, Q18/Q03/Q07/Q04/Q16/Q08 in the `~1.7-1.8x` band; Q16 is no longer the top outlier.
+  - Clarified filter pushdown vs row-group pruning:
+    - Q06 fast path previously did not pass a `FilterExpr` into scan; it performed condition checks inside the specialized raw loop.
+    - Trying generic scan filter pushdown for Q06 enabled row-group pruning plus row filtering, but the SF=1 `lineitem.l_shipdate` row-group min/max spans almost the full date range in every row group, so pruning scanned `53/53` row groups.
+    - The result regressed badly (`~23ms -> ~72ms`) because all data was still decoded and generic Arrow filtering added about `~13ms`; this path was reverted.
+    - Important rule: fast paths need row-group pruning and row-level filtering separated. Pruning-only is useful when metadata actually eliminates row groups; generic row filtering can be slower than a fused specialized loop when no pruning happens.
+  - Improved pruning execution structure:
+    - Removed the old `ParquetScanExec` behavior that forced all scans with `pruning_predicates` onto `SequentialFragmentScanStream`.
+    - `plan_parquet_scan_tasks` now receives pruning predicates in the normal parallel path, so row-group pruning can still produce parallel row-group tasks.
+    - Added `DodamEngine::scan_parquet_batches_pruned` for fast paths that want pruning-only behavior: use predicates for Parquet row-group selection, but do not attach a residual `FilterExec`.
+    - Applied pruning-only range predicates conservatively to Q03/Q04/Q18 probe scans when the selected `orderkey` set has a narrow min/max range. The current SF=1 TPC-H data has order keys spread across almost the full range, so it usually scans all row groups; the rule is mainly for clustered or selective datasets.
+    - Also rejected Q18 batch-local run aggregation: collecting `(orderkey, sum)` runs before dense updates regressed Q18 (`~66.8ms -> ~73.9ms`) because Vec/run bookkeeping cost outweighed fewer dense updates.
+    - SF=1 Parquet-output 3-run median after the parallel-pruning structure and conservative range pruning sampled about `771.6ms` versus the prior `776.9ms`; this is a small/noisy win, not the next structural breakthrough.
+  - Retuned Q01 chunking:
+    - Added `DODAM_Q01_CHUNK_SIZE` and changed the default from `8` batches/chunk to `4`.
+    - Sweep samples: chunk `4` was best among `2/4/8/16`; chunk `16` increased merge wait, while chunk `2` created too many tasks.
+    - Profile-free 3-run median sample moved Q01 from about `45.1ms` to `42.8ms`, with full TPC-H median-sum around `764.1ms` in that run.
+  - Improved Q22 customer scan reuse:
+    - Replaced the two customer scans (`avg(c_acctbal)` input and final customer grouping input) with one scan that records `(custkey, country_index, acctbal)` candidates and computes the average at the same time.
+    - After the orders customer-key set is built, final Q22 grouping runs over the in-memory candidates instead of scanning customer again.
+  - Re-profiled the current largest DuckDB gaps under the one-process Parquet COPY comparison:
+    - Current 5-run median-sum sample before this pass: Dodam about `754ms` vs DuckDB about `566ms` (`~1.33x`).
+    - Largest absolute gaps were Q18 (`+25ms`), Q08 (`+20ms`), Q01 (`+17ms`), Q07/Q03/Q05 (`+14-15ms`), and Q06 (`+13ms`).
+    - Q18 is dominated by the ordered `lineitem[l_orderkey,l_quantity]` scan (`~49ms`), Q08 by the 5-column lineitem scan (`~31ms`), and Q01 by the 7-column lineitem full scan/aggregate (`~54ms` scan wall in the profiled run). The common remaining gap is Parquet scan/decode/late-materialization structure, not final Parquet write.
+  - Added an env-tunable parallel Parquet row-group task size (`DODAM_PARQUET_SCAN_ROW_GROUP_CHUNK`) instead of a hard-coded `4` row groups per scan task.
+    - Sweep result: global `4` still had the best total in the current 3-run sample (`~748ms`), while `1`/`2`/`8` regressed total.
+    - Query-level behavior was mixed: `8` helped Q01/Q06/Q14 but hurt Q18/Q08/Q03/Q05/Q10/Q12, so this is useful as a diagnostic/tuning knob but not a better global default.
+  - Added key-range row-group pruning to Q10's final customer payload lookup using the already-known top customer key set.
+    - The current SF=1 customer data still scans `4/4` row groups because the key range spans the file, so the full 5-run total was effectively neutral (`~753.9ms -> ~753.6ms`).
+    - Retained because it is the same general selective-key lookup rule used elsewhere and should help clustered/selective customer datasets without changing semantics.
+  - Re-tested read batch size after the cache and scan changes:
+    - `16384` sampled best in the current 3-run comparison (`~739ms`) versus `32768` (`~750ms`) and `65536` (`~807ms`).
+    - Lowered the CLI and TPC-H in-process default batch size from `32768` to `16384`; `--batch-size` remains available for workload-specific tuning.
+  - Added an experimental scan-level Parquet `RowFilter` hook and a `DODAM_Q06_ROW_FILTER=1` Q06 trial path:
+    - Naive split predicates regressed Q06 badly (`~24ms -> ~62ms`) because `l_shipdate` and `l_discount` were decoded more than once.
+    - A combined predicate with final projection reduced to `l_discount,l_extendedprice` was better but still slower (`~31.5ms`) than the fused typed loop (`~22-24ms`).
+    - Keep the hook off by default; the current TPC-H Q06 shape is better served by the specialized fused loop unless page-index/selection can skip much more IO.
+  - Re-tested Q18 ordered streaming versus dense fallback after the `16384` batch-size change:
+    - Ordered path remained faster in the focused profile (`~63.6ms` query, `~50.2ms` lineitem stage) than disabling ordered aggregation (`~66.3ms` query, `~53.0ms` lineitem stage).
+    - Added `DODAM_Q18_DISABLE_ORDERED` only as a diagnostic knob; default stays ordered-first.
+  - Rejected reordering Q08 lineitem membership checks to test `part_keys` before `order_years`.
+    - Although part type is logically selective, the 3-run TPC-H sample regressed Q08 (`~50.4ms -> ~51.8ms`) and total runtime (`~749.8ms -> ~762.6ms`), likely from worse branch/cache behavior in the hot scan loop.
+  - Added a generic-ish ordered `i64 -> Decimal128 sum` helper on `DodamEngine` for clustered grouped aggregation:
+    - It scans Parquet row-group chunks in parallel, builds ordered run partials per chunk, keeps only threshold-passing complete middle groups, and merges first/last boundary runs in row-group order.
+    - Q18 now tries this parallel ordered aggregate before the older sequential ordered path and dense fallback.
+    - Correctness check: Q18 output matched the previous sequential ordered output via DuckDB `EXCEPT` in both directions, with `57` rows on both sides.
+    - Focused Q18 profile moved the lineitem quantity stage from about `50ms` to about `7ms`, and Q18 query time from about `64ms` to about `20ms` in the single-run profile.
+    - Latest 5-run SF=1 Parquet COPY comparison after this change sampled Dodam `~687ms` vs DuckDB `~566ms` (`~1.21x`), with Q18 median about `17.3ms` vs DuckDB about `37ms`.
+  - Added a reusable Parquet `i64 set` RowFilter scan primitive and applied it to Q08's `l_partkey` membership filter:
+    - This is a selective dimension-key-to-fact scan rule: decode the membership key first, then decode the wider payload only for matching rows.
+    - Same-build 3-run comparison improved Q08 from about `49.7ms` to about `43.6ms`, and total median-sum from about `697.2ms` to about `694.0ms`.
+    - Q08 output differs from the non-filter path only by tiny floating-point accumulation order noise (`~1e-17` in the sampled `mkt_share` values).
+  - Rejected applying the same `i64 set` RowFilter to Q03 `l_orderkey`:
+    - Focused sample regressed Q03 from about `55.7ms` to about `74.6ms`.
+    - The candidate order key set is not selective enough to pay for RowFilter setup and key-column predecode; keep Q03 on the existing fused loop with row-group pruning only.
+    - Profile-free 3-run median sample moved Q22 from about `21.3ms` to `16.9ms` (`~21%` faster). Full TPC-H median-sum was noisy in that run (`~770.9ms`), but the targeted Q22 improvement was consistent.
+  - Rejected applying the `i64 set` RowFilter rule to Q05/Q07 `lineitem.l_suppkey`:
+    - Same-binary sequential 5-run showed Q05 regressed from about `37.8ms` to `52.3ms` and Q07 from about `41.5ms` to `59.2ms`.
+    - Even though the supplier key set is logically selective, the extra key-column predecode and Arrow RowFilter selection cost outweighed payload decode savings for the current SF=1 Parquet layout.
+    - Keep the rule selective: it remains useful for Q08 `l_partkey`, but should not be blindly applied to every dimension-key filter without measuring.
+  - Rejected replacing Q05/Q07 `orderkey -> nation` probe maps with `AdaptiveI64Map`:
+    - Same-binary 5-run regressed Q05 from about `37.8ms` to `50.3ms` and Q07 from about `41.5ms` to `56.2ms`.
+    - The orderkey domain is large and sparse, so dense-vector probes create worse cache behavior than the existing hash map despite cheaper indexing.
+    - Rule: dense maps are only good when key density is high enough; sparse foreign-key joins should prefer compact hash tables or a better sparse-index layout.
+  - Applied compact fast hashing to Q05/Q07 sparse `orderkey -> nation` fact-side probes:
+    - Converted the hot probe map to `FastHashMap<i64, i64>` at the start of the lineitem stage, avoiding the dense sparse-key regression while still reducing integer hash overhead.
+    - Same-binary 5-run sample improved Q05 from about `37.8ms` to `34.8ms`; Q07 stayed neutral (`~41.5ms` both ways).
+    - Full TPC-H median-sum was noisy in that sample (`~679ms` baseline vs `~692ms` after), so treat this as a targeted Q05 win rather than a proven total-runtime shift.
+  - Improved Q01 decimal aggregate hot loop:
+    - Re-tested Q01 batch/chunk sweep and kept the existing `batch_size=16384`, `DODAM_Q01_CHUNK_SIZE=4` default; larger batches were worse for Q01 and total runtime.
+    - Direct `Q01GroupSlots::update_key_values` removed the closure from the per-row typed path but was neutral by itself (`~40.4ms` median both ways).
+    - Added a precision `<= 18` decimal path that casts raw Decimal128 values through `i64` before `f64`, mirroring the Q06 lesson; Q01 improved from about `40.4ms` to `38.4ms`.
+    - Added length-checked unchecked slice access in the same no-null/single-byte/i64 fast path to avoid repeated bounds checks across seven columns. Same-binary 5-run moved Q01 from about `38.4ms` to `33.0ms`; DuckDB's sampled Q01 baseline is about `24ms`.
+    - Current remaining Q01 gap is therefore mostly Parquet scan/decode structure plus residual aggregate arithmetic, not task chunking.
+    - Rejected two Q01 group-slot lookup variants after measurement:
+      - A `u16 key -> slot index` direct table regressed Q01 from about `33.0ms` to `39.6ms`; the 64KiB index initialization/cache footprint cost more than the tiny 4-group linear search.
+      - A one-entry `last_key` cache regressed Q01 from about `33.0ms` to `39.0ms`; Q01 group keys were not run-local enough to pay for the extra branch/state.
+      - Rule: Q01's current 8-slot linear search is cheap enough; further Q01 gains should target Parquet scan/decode or arithmetic representation, not group lookup.
+  - Improved Parquet file-cache chunking:
+    - Tested scan-level cache bypass for large wide scans; rejected it. Q01 did not consistently improve in same-binary comparison and Q09 regressed, so keeping a global shared file cache is still better for repeated TPC-H lineitem scans.
+    - Swept `DODAM_FILE_CACHE_CHUNK_BYTES` across `256KiB/512KiB/1MiB/2MiB/4MiB`.
+    - Larger chunks reduce cache shard/hash/lock traffic at the cost of extra read amplification. On the current SF=1 TPC-H run, 4MiB had the best full-run median.
+    - Same-binary 5-run: `512KiB` median-sum about `671.3ms`, `4MiB` about `664.0ms`; Q09 improved notably (`~70.8ms -> ~60.0ms`) while Q01 was neutral.
+    - Changed the default file cache chunk size from `512KiB` to `4MiB`; `DODAM_FILE_CACHE_CHUNK_BYTES` remains available for smaller-cache or remote-storage tuning.
+  - Revisited single-lineitem decimal compute paths after the Q01 work:
+    - Tried a Q14 no-null Decimal128 `precision <= 18` raw-i64 revenue path. Rejected it because Q14 did not improve in 5-run comparison (`~32.3ms -> ~33.3ms` in the sampled median); the existing `value(row)` loop is not the dominant cost there.
+    - Tried a Q19 `precision <= 18` i64 revenue multiply path inside the existing raw predicate loop. Rejected it because Q19 regressed in the sampled median (`~29.6ms -> ~31.5ms`); Q19 is dominated by predicate/string/mask work plus scan decode, not the final revenue multiply.
+    - Tried unchecked slice access in the existing Q06 i64 raw path. Rejected it because Q06 was neutral-to-worse (`~21.5ms -> ~22.1ms`); bounds checks are not the meaningful bottleneck after the earlier raw-value work.
+    - Current scan profile with 4MiB cache chunks:
+      - Q06 lineitem scan wall about `20.6ms`, cumulative decode about `229ms`, stage total about `21.1ms`.
+      - Q14 lineitem scan wall about `16.7ms`, cumulative decode about `199ms`, stage total about `16.9ms`.
+      - Q19 lineitem scan wall about `23.1ms`, cumulative decode about `255ms`, stage total about `23.4ms`.
+    - Conclusion: further wins for these queries need lower-level Parquet/page decode or late materialization. More arithmetic-loop tweaks are unlikely to move the needle.
+  - Applied Q06 late materialization:
+    - Added a Parquet `RowSelection` reader hook and a Q06 path that first scans predicate columns (`l_shipdate`, `l_discount`, `l_quantity`), keeps selected discount raw values, and then reads only selected `l_extendedprice` rows.
+    - This is guarded by schema/null checks and falls back to the existing fused scan if the data is not non-null `Date32` + `Decimal128(precision <= 18)`.
+    - Retained `DODAM_Q06_DISABLE_LATE_MATERIALIZE=1` as an escape hatch and tuned `DODAM_Q06_LATE_ROW_GROUP_CHUNK` default to `2`.
+    - Same-binary 5-repeat in-process sample: default late path Q06 median about `23.3ms`, disabled fallback median about `32.4ms`; a prior chunk sweep showed best samples around `12-13ms` for chunk `2/4`, but query timings are noisy.
+    - Correctness spot check: Q06 scalar output matched the existing path (`123141078.22830002`), full TPC-H in-process still ran `22/22`, and `cargo test` passed.
+    - Generalization rule: this pattern is promising when predicate selectivity is low and payload columns are expensive enough to skip. It should not be blindly used for broad scans like Q01 or for predicates whose predecode cost is similar to the payload saved.
+  - Improved Q06 late materialization reader setup:
+    - Changed the implementation from opening predicate/payload readers per row group to opening one predicate reader and one payload reader per row-group chunk. The `RowSelection` spans the concatenated selected row groups, which matches Parquet's row-selection semantics.
+    - Re-swept `DODAM_Q06_LATE_ROW_GROUP_CHUNK` after this change. Same-binary 5-repeat samples:
+      - chunk `1`: Q06 median about `18.1ms`
+      - chunk `2`: Q06 median about `17.5ms`
+      - chunk `4`: Q06 median about `18.4ms`
+      - chunk `8`: Q06 median about `25.0ms`
+      - chunk `16`: Q06 median about `38.0ms`
+    - Kept chunk `2` as default. Larger chunks reduce reader setup but hurt parallelism/selection materialization enough to regress.
+    - Disabled fallback in the same sample had Q06 median around `50.6ms`, so late materialization remains clearly beneficial on this run. Full-query totals are noisy, but all samples still ran `22/22`.
+  - Applied the same late-materialization pattern to Q14:
+    - Q14 first scans only `l_shipdate` to build a `RowSelection`, then scans selected rows for `l_partkey`, `l_extendedprice`, and `l_discount`.
+    - The existing `part` reduction still builds `partkey -> is_promo`; payload processing computes numerator/denominator directly from selected lineitem rows.
+    - The path is schema/null guarded and falls back to the existing Q14 scan if the lineitem payload is not non-null `Int64` + `Decimal128(precision <= 18)`.
+    - Added `DODAM_Q14_DISABLE_LATE_MATERIALIZE=1` and `DODAM_Q14_LATE_ROW_GROUP_CHUNK`; chunk sweep favored default `4`:
+      - chunk `1`: Q14 median about `22.4ms`
+      - chunk `2`: Q14 median about `25.8ms`
+      - chunk `4`: Q14 median about `22.4ms`
+      - chunk `8`: Q14 median about `29.1ms`
+      - chunk `16`: Q14 median about `40.3ms`
+    - Scalar result differed from the previous path only by floating-point accumulation order (`16.380778626395536` vs `16.380778626395543`).
+    - Final 5-repeat sample after setting chunk `4`: late path Q14 median about `37.7ms`, disabled fallback about `54.4ms`; run-to-run noise is high, but the fallback comparison still shows a clear win.
+  - Refactored Q06/Q14 late materialization into a common chunk primitive:
+    - Added a reusable predicate-pass + `RowSelection` + selected-payload reader helper. Q06 and Q14 now provide only their predicate-selection and payload-consumption logic.
+    - The helper records `total_rows`, `selected_rows`, and selector run count; with `DODAM_TPCH_PROFILE=1`, the engine logs one aggregate line per query.
+    - Profile sample after refactor:
+      - Q06: `6,001,215` rows, `114,160` selected, ratio `~1.90%`, `208,099` selector runs, `27` chunks.
+      - Q14: `6,001,215` rows, `75,983` selected, ratio `~1.27%`, `125,599` selector runs, `14` chunks.
+    - Same-binary 5-repeat after the refactor kept performance in the expected range: Q06 median about `17.6ms`, Q14 median about `25.2ms`, full run `22/22`.
+    - This confirms the first general rule: date/range predicates with `~1-2%` selectivity and expensive payload columns are strong late-materialization candidates. The next candidate should be measured first by selected ratio before enabling by default.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.

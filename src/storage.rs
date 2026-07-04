@@ -7,20 +7,27 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use std::time::SystemTime;
 
+use arrow::array::{Array, BooleanArray, Int64Array};
 use arrow::datatypes::{DataType, SchemaRef};
+use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::arrow_reader::{
+    ArrowPredicate, ArrowPredicateFn, ArrowReaderMetadata, ParquetRecordBatchReaderBuilder,
+    RowFilter, RowSelection,
+};
 use parquet::data_type::{ByteArray, FixedLenByteArray};
 use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::reader::{ChunkReader, Length};
 use parquet::file::statistics::Statistics;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use crate::error::{DodamError, Result};
-use crate::execution::{ComparisonExpr, ComparisonOp, Expr, Projection};
+use crate::execution::{
+    ComparisonExpr, ComparisonOp, Expr, FilterExpr, Projection, evaluate_filter_mask,
+};
 
 #[derive(Debug, Clone)]
 pub struct ObjectMetadata {
@@ -153,6 +160,23 @@ impl Default for ParquetFileCache {
 }
 
 impl ParquetFileCache {
+    pub fn disabled() -> Self {
+        Self {
+            max_bytes: 0,
+            chunk_bytes: 512 * 1024,
+            shards: (0..PARQUET_FILE_CACHE_SHARDS)
+                .map(|_| ParquetFileCacheShard::default())
+                .collect(),
+            bytes: AtomicU64::new(0),
+            access_epoch: AtomicU64::new(1),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+            read_bytes: AtomicU64::new(0),
+            deferred_admissions: AtomicU64::new(0),
+        }
+    }
+
     pub fn from_env() -> Self {
         let max_bytes = std::env::var("DODAM_FILE_CACHE_BYTES")
             .ok()
@@ -162,7 +186,7 @@ impl ParquetFileCache {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
-            .unwrap_or(512 * 1024);
+            .unwrap_or(4 * 1024 * 1024);
         Self {
             max_bytes,
             chunk_bytes,
@@ -540,6 +564,7 @@ impl ParquetBatchReader {
         batch_size: usize,
         projection: &Projection,
         pruning_predicates: &[Expr],
+        row_filter_predicates: &[Expr],
         metadata_cache: &ParquetMetadataCache,
         file_cache: Arc<ParquetFileCache>,
         store: &dyn ObjectStore,
@@ -557,6 +582,7 @@ impl ParquetBatchReader {
                 batch_size,
                 projection,
                 pruning_predicates,
+                row_filter_predicates,
                 None,
             )
         } else {
@@ -568,6 +594,7 @@ impl ParquetBatchReader {
                 batch_size,
                 projection,
                 pruning_predicates,
+                row_filter_predicates,
                 None,
             )
         }
@@ -595,6 +622,7 @@ impl ParquetBatchReader {
                 batch_size,
                 projection,
                 &[],
+                &[],
                 Some(row_groups),
             )
         } else {
@@ -606,7 +634,131 @@ impl ParquetBatchReader {
                 batch_size,
                 projection,
                 &[],
+                &[],
                 Some(row_groups),
+            )
+        }
+    }
+
+    pub fn try_new_with_row_groups_selection(
+        path: impl AsRef<Path>,
+        batch_size: usize,
+        projection: &Projection,
+        row_groups: Vec<usize>,
+        row_selection: RowSelection,
+        metadata_cache: &ParquetMetadataCache,
+        file_cache: Arc<ParquetFileCache>,
+        store: &dyn ObjectStore,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let metadata_start = Instant::now();
+        let metadata = metadata_cache.get_with_store(path, store)?;
+        let metadata_nanos = elapsed_nanos(metadata_start);
+        if file_cache.enabled() {
+            let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
+            Self::build_with_row_selection(
+                reader,
+                metadata,
+                metadata_nanos,
+                batch_size,
+                projection,
+                row_groups,
+                row_selection,
+            )
+        } else {
+            let file = store.open(path)?;
+            Self::build_with_row_selection(
+                file,
+                metadata,
+                metadata_nanos,
+                batch_size,
+                projection,
+                row_groups,
+                row_selection,
+            )
+        }
+    }
+
+    pub fn try_new_with_row_groups_filtered(
+        path: impl AsRef<Path>,
+        batch_size: usize,
+        projection: &Projection,
+        row_groups: Vec<usize>,
+        row_filter_predicates: &[Expr],
+        metadata_cache: &ParquetMetadataCache,
+        file_cache: Arc<ParquetFileCache>,
+        store: &dyn ObjectStore,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let metadata_start = Instant::now();
+        let metadata = metadata_cache.get_with_store(path, store)?;
+        let metadata_nanos = elapsed_nanos(metadata_start);
+        if file_cache.enabled() {
+            let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
+            Self::build(
+                reader,
+                metadata,
+                metadata_nanos,
+                batch_size,
+                projection,
+                &[],
+                row_filter_predicates,
+                Some(row_groups),
+            )
+        } else {
+            let file = store.open(path)?;
+            Self::build(
+                file,
+                metadata,
+                metadata_nanos,
+                batch_size,
+                projection,
+                &[],
+                row_filter_predicates,
+                Some(row_groups),
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_row_groups_i64_set_filter(
+        path: impl AsRef<Path>,
+        batch_size: usize,
+        projection: &Projection,
+        row_groups: Vec<usize>,
+        filter_column: &str,
+        keys: Arc<HashSet<i64>>,
+        metadata_cache: &ParquetMetadataCache,
+        file_cache: Arc<ParquetFileCache>,
+        store: &dyn ObjectStore,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let metadata_start = Instant::now();
+        let metadata = metadata_cache.get_with_store(path, store)?;
+        let metadata_nanos = elapsed_nanos(metadata_start);
+        if file_cache.enabled() {
+            let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
+            Self::build_i64_set_filter(
+                reader,
+                metadata,
+                metadata_nanos,
+                batch_size,
+                projection,
+                row_groups,
+                filter_column,
+                keys,
+            )
+        } else {
+            let file = store.open(path)?;
+            Self::build_i64_set_filter(
+                file,
+                metadata,
+                metadata_nanos,
+                batch_size,
+                projection,
+                row_groups,
+                filter_column,
+                keys,
             )
         }
     }
@@ -618,6 +770,7 @@ impl ParquetBatchReader {
         batch_size: usize,
         projection: &Projection,
         pruning_predicates: &[Expr],
+        row_filter_predicates: &[Expr],
         requested_row_groups: Option<Vec<usize>>,
     ) -> Result<Self> {
         let planning_start = Instant::now();
@@ -650,9 +803,112 @@ impl ParquetBatchReader {
         } else {
             builder
         };
+        let builder = if let Some(row_filter) = row_filter(&builder, row_filter_predicates)? {
+            builder.with_row_filter(row_filter)
+        } else {
+            builder
+        };
         let planning_nanos = elapsed_nanos(planning_start);
         let inner = builder.build()?;
 
+        Ok(Self {
+            inner,
+            projected_columns,
+            row_groups_total,
+            row_groups_scanned,
+            compressed_bytes_total,
+            compressed_bytes_scanned,
+            metadata_nanos,
+            planning_nanos,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_i64_set_filter<T: ChunkReader + 'static>(
+        input: T,
+        metadata: ArrowReaderMetadata,
+        metadata_nanos: u64,
+        batch_size: usize,
+        projection: &Projection,
+        row_groups: Vec<usize>,
+        filter_column: &str,
+        keys: Arc<HashSet<i64>>,
+    ) -> Result<Self> {
+        let planning_start = Instant::now();
+        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(input, metadata)
+            .with_batch_size(batch_size);
+        let projected_columns = projected_column_count(builder.schema(), projection);
+        let row_groups_total = builder.metadata().num_row_groups();
+        let column_indices = projection_indices_for_schema(builder.schema(), projection)?;
+        let all_row_groups = (0..row_groups_total).collect::<Vec<_>>();
+        let compressed_bytes_total =
+            compressed_bytes_for_row_groups(&builder, &column_indices, &all_row_groups);
+        let compressed_bytes_scanned =
+            compressed_bytes_for_row_groups(&builder, &column_indices, &row_groups);
+        let filter_index = projection_indices(builder.schema(), &[filter_column.to_string()])?[0];
+        let filter_mask = ProjectionMask::roots(builder.parquet_schema(), [filter_index]);
+        let filter = ArrowPredicateFn::new(filter_mask, move |batch: RecordBatch| {
+            let Some(values) = batch.column(0).as_any().downcast_ref::<Int64Array>() else {
+                return Err(ArrowError::ComputeError(
+                    "i64 set row filter requires Int64Array".to_string(),
+                ));
+            };
+            Ok(BooleanArray::from(
+                (0..values.len())
+                    .map(|row| {
+                        if values.is_null(row) {
+                            Some(false)
+                        } else {
+                            Some(keys.contains(&values.value(row)))
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            ))
+        });
+        let builder = apply_projection(builder, projection)?
+            .with_row_groups(row_groups.clone())
+            .with_row_filter(RowFilter::new(vec![Box::new(filter)]));
+        let planning_nanos = elapsed_nanos(planning_start);
+        let inner = builder.build()?;
+        Ok(Self {
+            inner,
+            projected_columns,
+            row_groups_total,
+            row_groups_scanned: row_groups.len(),
+            compressed_bytes_total,
+            compressed_bytes_scanned,
+            metadata_nanos,
+            planning_nanos,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_with_row_selection<T: ChunkReader + 'static>(
+        input: T,
+        metadata: ArrowReaderMetadata,
+        metadata_nanos: u64,
+        batch_size: usize,
+        projection: &Projection,
+        row_groups: Vec<usize>,
+        row_selection: RowSelection,
+    ) -> Result<Self> {
+        let planning_start = Instant::now();
+        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(input, metadata)
+            .with_batch_size(batch_size);
+        let projected_columns = projected_column_count(builder.schema(), projection);
+        let row_groups_total = builder.metadata().num_row_groups();
+        let column_indices = projection_indices_for_schema(builder.schema(), projection)?;
+        let all_row_groups = (0..row_groups_total).collect::<Vec<_>>();
+        let compressed_bytes_total =
+            compressed_bytes_for_row_groups(&builder, &column_indices, &all_row_groups);
+        let compressed_bytes_scanned =
+            compressed_bytes_for_row_groups(&builder, &column_indices, &row_groups);
+        let row_groups_scanned = row_groups.len();
+        let inner = apply_projection(builder, projection)?
+            .with_row_groups(row_groups)
+            .with_row_selection(row_selection)
+            .build()?;
+        let planning_nanos = elapsed_nanos(planning_start);
         Ok(Self {
             inner,
             projected_columns,
@@ -805,6 +1061,49 @@ pub fn read_parquet_file_statistics(
     })
 }
 
+pub fn read_parquet_i64_column_max(
+    path: impl AsRef<Path>,
+    column: &str,
+    metadata_cache: &ParquetMetadataCache,
+    store: &dyn ObjectStore,
+) -> Result<Option<i64>> {
+    let path = path.as_ref();
+    let file = store.open(path)?;
+    let metadata = metadata_cache.get_with_store(path, store)?;
+    let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata);
+    let Some(column_index) = builder
+        .schema()
+        .fields()
+        .iter()
+        .position(|field| field.name() == column && field.data_type() == &DataType::Int64)
+    else {
+        return Ok(None);
+    };
+    let mut max_value = None;
+    for row_group in builder.metadata().row_groups() {
+        let Some(column) = row_group.columns().get(column_index) else {
+            return Ok(None);
+        };
+        let Some(statistics) = column.statistics() else {
+            return Ok(None);
+        };
+        if statistics.is_min_max_deprecated()
+            || !statistics.min_is_exact()
+            || !statistics.max_is_exact()
+        {
+            return Ok(None);
+        }
+        let Statistics::Int64(statistics) = statistics else {
+            return Ok(None);
+        };
+        let Some(value) = statistics.max_opt().copied() else {
+            return Ok(None);
+        };
+        max_value = Some(max_value.map_or(value, |current: i64| current.max(value)));
+    }
+    Ok(max_value)
+}
+
 impl Iterator for ParquetBatchReader {
     type Item = Result<RecordBatch>;
 
@@ -824,6 +1123,60 @@ fn apply_projection<T: ChunkReader + 'static>(
     let indices = projection_indices(builder.schema(), columns)?;
     let mask = ProjectionMask::roots(builder.parquet_schema(), indices);
     Ok(builder.with_projection(mask))
+}
+
+fn row_filter<T: ChunkReader + 'static>(
+    builder: &ParquetRecordBatchReaderBuilder<T>,
+    predicates: &[Expr],
+) -> Result<Option<RowFilter>> {
+    if predicates.is_empty() {
+        return Ok(None);
+    }
+    let mut arrow_predicates = Vec::<Box<dyn ArrowPredicate>>::new();
+    for predicate in predicates {
+        let mut columns = Vec::new();
+        collect_expr_columns(predicate, &mut columns);
+        if columns.is_empty() {
+            continue;
+        }
+        let indices = projection_indices(builder.schema(), &columns)?;
+        let mask = ProjectionMask::roots(builder.parquet_schema(), indices);
+        let filter = FilterExpr::new(predicate.clone());
+        arrow_predicates.push(Box::new(ArrowPredicateFn::new(mask, move |batch| {
+            evaluate_filter_mask(&batch, &filter)
+                .map_err(|error| ArrowError::ComputeError(error.to_string()))
+        })));
+    }
+    if arrow_predicates.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(RowFilter::new(arrow_predicates)))
+    }
+}
+
+fn collect_expr_columns(expr: &Expr, columns: &mut Vec<String>) {
+    match expr {
+        Expr::Boolean(_) => {}
+        Expr::Comparison(comparison) => push_unique_column(columns, &comparison.column),
+        Expr::ColumnComparison { left, right, .. } => {
+            push_unique_column(columns, left);
+            push_unique_column(columns, right);
+        }
+        Expr::InList { column, .. } | Expr::Like { column, .. } | Expr::IsNull { column, .. } => {
+            push_unique_column(columns, column);
+        }
+        Expr::Not(expr) => collect_expr_columns(expr, columns),
+        Expr::And(left, right) | Expr::Or(left, right) => {
+            collect_expr_columns(left, columns);
+            collect_expr_columns(right, columns);
+        }
+    }
+}
+
+fn push_unique_column(columns: &mut Vec<String>, column: &str) {
+    if !columns.iter().any(|existing| existing == column) {
+        columns.push(column.to_string());
+    }
 }
 
 fn projected_column_count(schema: &arrow::datatypes::SchemaRef, projection: &Projection) -> usize {

@@ -3,14 +3,16 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use arrow::array::{Array, UInt32Array};
+use arrow::array::{Array, Date32Array, Decimal128Array, Int64Array, UInt32Array};
+use arrow::datatypes::DataType;
 use arrow::ipc::writer::FileWriter as IpcFileWriter;
 use arrow::record_batch::RecordBatch;
 use arrow_row::{RowConverter, SortField};
 use arrow_select::take::take_record_batch;
+use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
 
 use crate::catalog::{
     FileFragmentStatistics, LocalParquetTable, PersistentCatalog, StorageFormat, TableProvider,
@@ -18,6 +20,7 @@ use crate::catalog::{
 };
 use crate::cost::{JoinCostInput, choose_join_strategy};
 use crate::error::{DodamError, Result};
+use crate::execution::metrics::ScanPlanMetricsCounter;
 use crate::execution::{
     AggregateExpr, AggregateMetrics, ComparisonOp, DistinctExec, Expr, FilterExec, FilterExpr,
     HashJoinExec, IpcExec, JoinBuildSide, JoinType, LimitExec, LiteralValue, MemoryExec,
@@ -31,8 +34,9 @@ use crate::plan::{
     PhysicalJoinStrategy, PhysicalOperator, PhysicalPlanNode, PlanTableSource, TaskInput, TaskPlan,
 };
 use crate::storage::{
-    LocalFileSystemObjectStore, ObjectStore, ParquetFileCache, ParquetFileCacheStats,
-    ParquetMetadataCache, plan_parquet_scan_tasks, read_parquet_file_statistics,
+    LocalFileSystemObjectStore, ObjectStore, ParquetBatchReader, ParquetFileCache,
+    ParquetFileCacheStats, ParquetMetadataCache, plan_parquet_scan_tasks,
+    read_parquet_file_statistics, read_parquet_i64_column_max,
 };
 
 const LOCAL_SHUFFLE_FILE_TARGET_BYTES: u64 = 64 * 1024 * 1024;
@@ -212,11 +216,13 @@ pub struct ScanPlan {
     pub filter: Option<FilterExpr>,
     pub residual_filter: Option<FilterExpr>,
     pub pushdown_predicates: Vec<Expr>,
+    pub row_filter_predicates: Vec<Expr>,
     pub has_filter: bool,
     pub distinct: bool,
     pub order_by: Option<SortKey>,
     pub estimated_bytes: u64,
     pub operators: Vec<ScanOperator>,
+    pub preserve_order: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -589,6 +595,430 @@ impl DodamEngine {
         self.scan_table_source_batches(source, batch_size, limit, projection, filter, None)
     }
 
+    pub async fn scan_parquet_batches_pruned(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        projection: Projection,
+        pruning_predicates: Vec<Expr>,
+    ) -> Result<SendableBatchStream> {
+        let source = self.plan_table_source(path).await?;
+        let estimated_bytes = source.statistics.compressed_bytes;
+        let plan = ScanPlan {
+            source,
+            batch_size,
+            limit: None,
+            output_projection: projection.clone(),
+            scan_projection: projection,
+            filter: None,
+            residual_filter: None,
+            pushdown_predicates: pruning_predicates,
+            row_filter_predicates: Vec::new(),
+            has_filter: false,
+            distinct: false,
+            order_by: None,
+            estimated_bytes,
+            operators: vec![ScanOperator::Scan],
+            preserve_order: false,
+        };
+        self.execute_scan_plan(plan)
+    }
+
+    pub async fn scan_parquet_batches_row_filtered(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        projection: Projection,
+        predicates: Vec<Expr>,
+    ) -> Result<SendableBatchStream> {
+        let source = self.plan_table_source(path).await?;
+        let estimated_bytes = source.statistics.compressed_bytes;
+        let plan = ScanPlan {
+            source,
+            batch_size,
+            limit: None,
+            output_projection: projection.clone(),
+            scan_projection: projection,
+            filter: None,
+            residual_filter: None,
+            pushdown_predicates: predicates.clone(),
+            row_filter_predicates: predicates,
+            has_filter: true,
+            distinct: false,
+            order_by: None,
+            estimated_bytes,
+            operators: vec![ScanOperator::Scan],
+            preserve_order: false,
+        };
+        self.execute_scan_plan(plan)
+    }
+
+    pub async fn scan_parquet_batches_preserve_order(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        projection: Projection,
+    ) -> Result<SendableBatchStream> {
+        let source = self.plan_table_source(path).await?;
+        let estimated_bytes = source.statistics.compressed_bytes;
+        let plan = ScanPlan {
+            source,
+            batch_size,
+            limit: None,
+            output_projection: projection.clone(),
+            scan_projection: projection,
+            filter: None,
+            residual_filter: None,
+            pushdown_predicates: Vec::new(),
+            row_filter_predicates: Vec::new(),
+            has_filter: false,
+            distinct: false,
+            order_by: None,
+            estimated_bytes,
+            operators: vec![ScanOperator::Scan],
+            preserve_order: true,
+        };
+        self.execute_scan_plan(plan)
+    }
+
+    pub async fn parquet_i64_column_max(&self, path: PathBuf, column: &str) -> Result<Option<i64>> {
+        let source = self.plan_table_source(path).await?;
+        if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
+            return Ok(None);
+        }
+        read_parquet_i64_column_max(
+            source.fragments[0].parquet_local_path()?,
+            column,
+            &self.metadata_cache,
+            self.object_store.as_ref(),
+        )
+    }
+
+    pub async fn ordered_i64_decimal_group_sum_above(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        key_column: &str,
+        value_column: &str,
+        threshold: f64,
+    ) -> Result<Option<HashMap<i64, f64>>> {
+        let source = self.plan_table_source(path.clone()).await?;
+        if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
+            return Ok(None);
+        }
+        let projection =
+            Projection::Columns(vec![key_column.to_string(), value_column.to_string()]);
+        let plan = plan_parquet_scan_tasks(
+            source.fragments[0].parquet_local_path()?,
+            &projection,
+            &[],
+            &self.metadata_cache,
+            self.object_store.as_ref(),
+        )?;
+        let row_groups = plan
+            .tasks
+            .into_iter()
+            .map(|task| task.row_group)
+            .collect::<Vec<_>>();
+        if row_groups.is_empty() {
+            return Ok(Some(HashMap::new()));
+        }
+        let row_group_chunk = ordered_group_sum_row_group_chunk();
+        let chunks = row_groups
+            .chunks(row_group_chunk)
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
+        let (sender, receiver) = mpsc::channel();
+        for (index, row_groups) in chunks.iter().cloned().enumerate() {
+            let sender = sender.clone();
+            let path = path.clone();
+            let projection = projection.clone();
+            let key_column = key_column.to_string();
+            let value_column = value_column.to_string();
+            let metadata_cache = self.metadata_cache.clone();
+            let file_cache = self.file_cache.clone();
+            let object_store = self.object_store.clone();
+            rayon::spawn(move || {
+                let result = ordered_i64_decimal_group_sum_chunk(
+                    path,
+                    batch_size,
+                    &projection,
+                    row_groups,
+                    &key_column,
+                    &value_column,
+                    threshold,
+                    &metadata_cache,
+                    file_cache,
+                    object_store.as_ref(),
+                );
+                let _ = sender.send((index, result));
+            });
+        }
+        drop(sender);
+
+        let mut partials = (0..chunks.len())
+            .map(|_| None)
+            .collect::<Vec<Option<OrderedGroupSumPartial>>>();
+        for _ in 0..chunks.len() {
+            let (index, result) = receiver.recv().map_err(|_| {
+                DodamError::UnsupportedSql("ordered group worker stopped".to_string())
+            })?;
+            partials[index] = result?;
+        }
+        merge_ordered_group_sum_partials(partials, threshold)
+    }
+
+    pub async fn scan_parquet_batches_i64_set_filtered(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        projection: Projection,
+        filter_column: &str,
+        keys: HashSet<i64>,
+    ) -> Result<SendableBatchStream> {
+        let source = self.plan_table_source(path.clone()).await?;
+        if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
+            return self
+                .scan_parquet_batches(path, batch_size, None, projection, None)
+                .await;
+        }
+        let plan = plan_parquet_scan_tasks(
+            source.fragments[0].parquet_local_path()?,
+            &projection,
+            &[],
+            &self.metadata_cache,
+            self.object_store.as_ref(),
+        )?;
+        let row_groups = plan
+            .tasks
+            .into_iter()
+            .map(|task| task.row_group)
+            .collect::<Vec<_>>();
+        if row_groups.is_empty() {
+            return Ok(SendableBatchStream::empty());
+        }
+        let chunks = row_groups
+            .chunks(parallel_i64_set_filter_row_group_chunk())
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
+        let keys = Arc::new(keys);
+        let (sender, receiver) = mpsc::channel();
+        for row_groups in chunks {
+            let sender = sender.clone();
+            let path = path.clone();
+            let projection = projection.clone();
+            let filter_column = filter_column.to_string();
+            let keys = keys.clone();
+            let metadata_cache = self.metadata_cache.clone();
+            let file_cache = self.file_cache.clone();
+            let object_store = self.object_store.clone();
+            rayon::spawn(move || {
+                let result = scan_i64_set_filtered_row_groups(
+                    path,
+                    batch_size,
+                    &projection,
+                    row_groups,
+                    &filter_column,
+                    keys,
+                    &metadata_cache,
+                    file_cache,
+                    object_store.as_ref(),
+                );
+                match result {
+                    Ok(batches) => {
+                        for batch in batches {
+                            if sender.send(Ok(batch)).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                    }
+                }
+            });
+        }
+        drop(sender);
+        Ok(SendableBatchStream::new(
+            Box::new(receiver.into_iter()),
+            Arc::default(),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn q06_late_materialized_revenue_sum(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        start_days: i32,
+        end_days: i32,
+        discount_low: f64,
+        discount_high: f64,
+        quantity_limit: f64,
+    ) -> Result<Option<(f64, u64)>> {
+        let source = self.plan_table_source(path.clone()).await?;
+        if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
+            return Ok(None);
+        }
+        let local_path = source.fragments[0].parquet_local_path()?.to_path_buf();
+        let predicate_projection = Projection::Columns(vec![
+            "l_shipdate".to_string(),
+            "l_discount".to_string(),
+            "l_quantity".to_string(),
+        ]);
+        let plan = plan_parquet_scan_tasks(
+            &local_path,
+            &predicate_projection,
+            &[],
+            &self.metadata_cache,
+            self.object_store.as_ref(),
+        )?;
+        let row_groups = plan
+            .tasks
+            .into_iter()
+            .map(|task| task.row_group)
+            .collect::<Vec<_>>();
+        if row_groups.is_empty() {
+            return Ok(Some((0.0, 0)));
+        }
+        let chunks = row_groups
+            .chunks(q06_late_materialized_row_group_chunk())
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
+        let (sender, receiver) = mpsc::channel();
+        for (index, row_groups) in chunks.iter().cloned().enumerate() {
+            let sender = sender.clone();
+            let path = local_path.clone();
+            let metadata_cache = self.metadata_cache.clone();
+            let file_cache = self.file_cache.clone();
+            let object_store = self.object_store.clone();
+            rayon::spawn(move || {
+                let result = q06_late_materialized_revenue_sum_chunk(
+                    path,
+                    batch_size,
+                    row_groups,
+                    start_days,
+                    end_days,
+                    discount_low,
+                    discount_high,
+                    quantity_limit,
+                    &metadata_cache,
+                    file_cache,
+                    object_store.as_ref(),
+                );
+                let _ = sender.send((index, result));
+            });
+        }
+        drop(sender);
+
+        let mut partials = (0..chunks.len())
+            .map(|_| None)
+            .collect::<Vec<Option<Option<LateMaterializedChunkResult<(f64, u64)>>>>>();
+        for _ in 0..chunks.len() {
+            let (index, result) = receiver.recv().map_err(|_| {
+                DodamError::UnsupportedSql("Q06 late materialized worker stopped".to_string())
+            })?;
+            partials[index] = Some(result?);
+        }
+        let mut sum = 0.0;
+        let mut count = 0_u64;
+        let mut metrics = LateMaterializedMetrics::default();
+        for partial in partials {
+            let Some(Some(partial)) = partial else {
+                return Ok(None);
+            };
+            let (partial_sum, partial_count) = partial.output;
+            sum += partial_sum;
+            count += partial_count;
+            metrics.add(partial.metrics);
+        }
+        log_late_materialized_metrics("Q06", metrics, chunks.len());
+        Ok(Some((sum, count)))
+    }
+
+    pub async fn q14_late_materialized_promo_revenue(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        start_days: i32,
+        end_days: i32,
+        promo_parts: Arc<HashMap<i64, bool>>,
+    ) -> Result<Option<(f64, f64)>> {
+        let source = self.plan_table_source(path.clone()).await?;
+        if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
+            return Ok(None);
+        }
+        let local_path = source.fragments[0].parquet_local_path()?.to_path_buf();
+        let predicate_projection = Projection::Columns(vec!["l_shipdate".to_string()]);
+        let plan = plan_parquet_scan_tasks(
+            &local_path,
+            &predicate_projection,
+            &[],
+            &self.metadata_cache,
+            self.object_store.as_ref(),
+        )?;
+        let row_groups = plan
+            .tasks
+            .into_iter()
+            .map(|task| task.row_group)
+            .collect::<Vec<_>>();
+        if row_groups.is_empty() {
+            return Ok(Some((0.0, 0.0)));
+        }
+        let chunks = row_groups
+            .chunks(q14_late_materialized_row_group_chunk())
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
+        let (sender, receiver) = mpsc::channel();
+        for (index, row_groups) in chunks.iter().cloned().enumerate() {
+            let sender = sender.clone();
+            let path = local_path.clone();
+            let promo_parts = promo_parts.clone();
+            let metadata_cache = self.metadata_cache.clone();
+            let file_cache = self.file_cache.clone();
+            let object_store = self.object_store.clone();
+            rayon::spawn(move || {
+                let result = q14_late_materialized_promo_revenue_chunk(
+                    path,
+                    batch_size,
+                    row_groups,
+                    start_days,
+                    end_days,
+                    promo_parts,
+                    &metadata_cache,
+                    file_cache,
+                    object_store.as_ref(),
+                );
+                let _ = sender.send((index, result));
+            });
+        }
+        drop(sender);
+
+        let mut partials = (0..chunks.len())
+            .map(|_| None)
+            .collect::<Vec<Option<Option<LateMaterializedChunkResult<(f64, f64)>>>>>();
+        for _ in 0..chunks.len() {
+            let (index, result) = receiver.recv().map_err(|_| {
+                DodamError::UnsupportedSql("Q14 late materialized worker stopped".to_string())
+            })?;
+            partials[index] = Some(result?);
+        }
+        let mut promo = 0.0;
+        let mut total = 0.0;
+        let mut metrics = LateMaterializedMetrics::default();
+        for partial in partials {
+            let Some(Some(partial)) = partial else {
+                return Ok(None);
+            };
+            let (partial_promo, partial_total) = partial.output;
+            promo += partial_promo;
+            total += partial_total;
+            metrics.add(partial.metrics);
+        }
+        log_late_materialized_metrics("Q14", metrics, chunks.len());
+        Ok(Some((promo, total)))
+    }
+
     pub async fn plan_parquet_scan(
         &self,
         path: PathBuf,
@@ -714,11 +1144,13 @@ impl DodamEngine {
             filter: filter.clone(),
             residual_filter,
             pushdown_predicates,
+            row_filter_predicates: Vec::new(),
             has_filter: filter.is_some(),
             distinct: options.distinct,
             order_by: options.order_by,
             estimated_bytes,
             operators,
+            preserve_order: false,
         })
     }
 
@@ -1123,9 +1555,11 @@ impl DodamEngine {
                 batch_size,
                 projection,
                 pushdown_predicates,
+                Vec::new(),
                 self.metadata_cache.clone(),
                 self.file_cache.clone(),
                 self.object_store.clone(),
+                false,
             ))),
             (PhysicalOperator::Memory, Some(PhysicalExecutionConfig::Memory { batches })) => {
                 Ok(Box::new(MemoryExec::new(batches)))
@@ -1617,7 +2051,9 @@ impl DodamEngine {
     }
 
     fn execute_scan_plan(&self, plan: ScanPlan) -> Result<SendableBatchStream> {
-        self.build_physical_scan_plan(plan).execute()
+        let profile_label = scan_profile_label(&plan);
+        let stream = self.build_physical_scan_plan(plan).execute()?;
+        Ok(wrap_scan_profile(stream, profile_label))
     }
 
     fn build_physical_scan_plan(&self, plan: ScanPlan) -> Box<dyn PhysicalPlan> {
@@ -1626,9 +2062,11 @@ impl DodamEngine {
             plan.batch_size,
             plan.scan_projection,
             plan.pushdown_predicates,
+            plan.row_filter_predicates,
             self.metadata_cache.clone(),
             self.file_cache.clone(),
             self.object_store.clone(),
+            plan.preserve_order,
         );
         let mut physical: Box<dyn PhysicalPlan> = Box::new(scan);
 
@@ -1656,6 +2094,111 @@ impl DodamEngine {
 
         physical
     }
+}
+
+fn scan_profile_enabled() -> bool {
+    std::env::var("DODAM_SCAN_PROFILE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn scan_profile_label(plan: &ScanPlan) -> String {
+    let table = plan
+        .source
+        .fragments
+        .first()
+        .and_then(|fragment| fragment.parquet_local_path().ok())
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("scan");
+    let projection = match &plan.scan_projection {
+        Projection::All => "*".to_string(),
+        Projection::Columns(columns) => columns.join(","),
+    };
+    format!("{table}[{projection}]")
+}
+
+fn wrap_scan_profile(stream: SendableBatchStream, label: String) -> SendableBatchStream {
+    if !scan_profile_enabled() {
+        return stream;
+    }
+    let (inner, metrics) = stream.into_parts();
+    SendableBatchStream::new(
+        Box::new(ProfiledScanStream {
+            inner,
+            metrics: metrics.clone(),
+            label,
+            started: Instant::now(),
+            rows: 0,
+            batches: 0,
+            logged: false,
+        }),
+        metrics,
+    )
+}
+
+struct ProfiledScanStream {
+    inner: Box<dyn Iterator<Item = Result<RecordBatch>> + Send>,
+    metrics: Arc<ScanPlanMetricsCounter>,
+    label: String,
+    started: Instant,
+    rows: usize,
+    batches: usize,
+    logged: bool,
+}
+
+impl ProfiledScanStream {
+    fn log_once(&mut self) {
+        if self.logged {
+            return;
+        }
+        self.logged = true;
+        let metrics = self.metrics.snapshot();
+        eprintln!(
+            "[dodam:scan-profile] {}: elapsed={:.3} ms rows={} batches={} row_groups={}/{} bytes={} metadata={:.3} ms planning={:.3} ms decode={:.3} ms filter={:.3} ms projection={:.3} ms limit={:.3} ms",
+            self.label,
+            self.started.elapsed().as_secs_f64() * 1000.0,
+            self.rows,
+            self.batches,
+            metrics.row_groups_scanned,
+            metrics.row_groups_total,
+            metrics.compressed_bytes_scanned,
+            nanos_to_millis(metrics.metadata_nanos),
+            nanos_to_millis(metrics.planning_nanos),
+            nanos_to_millis(metrics.decode_nanos),
+            nanos_to_millis(metrics.filter_nanos),
+            nanos_to_millis(metrics.projection_nanos),
+            nanos_to_millis(metrics.limit_nanos),
+        );
+    }
+}
+
+impl Iterator for ProfiledScanStream {
+    type Item = Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.inner.next() {
+            Some(Ok(batch)) => {
+                self.rows = self.rows.saturating_add(batch.num_rows());
+                self.batches = self.batches.saturating_add(1);
+                Some(Ok(batch))
+            }
+            Some(Err(error)) => Some(Err(error)),
+            None => {
+                self.log_once();
+                None
+            }
+        }
+    }
+}
+
+impl Drop for ProfiledScanStream {
+    fn drop(&mut self) {
+        self.log_once();
+    }
+}
+
+fn nanos_to_millis(nanos: u64) -> f64 {
+    nanos as f64 / 1_000_000.0
 }
 
 fn aggregate_projection(aggregates: &[AggregateExpr], group_by: &[String]) -> Projection {
@@ -2198,6 +2741,738 @@ fn physical_batch_column_index(batch: &RecordBatch, column: &str) -> Result<usiz
                     .join(",")
             ))
         })
+}
+
+#[derive(Debug, Clone)]
+struct OrderedGroupSumPartial {
+    first: Option<(i64, f64)>,
+    last: Option<(i64, f64)>,
+    middle: HashMap<i64, f64>,
+}
+
+impl OrderedGroupSumPartial {
+    fn new() -> Self {
+        Self {
+            first: None,
+            last: None,
+            middle: HashMap::new(),
+        }
+    }
+
+    fn push_run(&mut self, key: i64, sum: f64, threshold: f64) {
+        if self.first.is_none() {
+            self.first = Some((key, sum));
+            return;
+        }
+        if let Some((last_key, last_sum)) = self.last.replace((key, sum))
+            && last_sum > threshold
+        {
+            self.middle.insert(last_key, last_sum);
+        }
+    }
+
+    fn finish_current(&mut self, key: Option<i64>, sum: f64, threshold: f64) {
+        if let Some(key) = key {
+            self.push_run(key, sum, threshold);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct LateMaterializedMetrics {
+    total_rows: usize,
+    selected_rows: usize,
+    selector_runs: usize,
+}
+
+impl LateMaterializedMetrics {
+    fn add(&mut self, other: Self) {
+        self.total_rows = self.total_rows.saturating_add(other.total_rows);
+        self.selected_rows = self.selected_rows.saturating_add(other.selected_rows);
+        self.selector_runs = self.selector_runs.saturating_add(other.selector_runs);
+    }
+}
+
+struct LateMaterializedChunkResult<T> {
+    output: T,
+    metrics: LateMaterializedMetrics,
+}
+
+#[derive(Default)]
+struct LateSelectionBuilder {
+    selectors: Vec<RowSelector>,
+    current_selected: Option<bool>,
+    run_len: usize,
+    total_rows: usize,
+    selected_rows: usize,
+}
+
+impl LateSelectionBuilder {
+    fn push(&mut self, selected: bool) {
+        self.total_rows += 1;
+        if selected {
+            self.selected_rows += 1;
+        }
+        push_late_selector_run(
+            &mut self.selectors,
+            &mut self.current_selected,
+            &mut self.run_len,
+            selected,
+        );
+    }
+
+    fn finish(mut self) -> (Option<RowSelection>, LateMaterializedMetrics) {
+        finish_late_selector_run(&mut self.selectors, self.current_selected, self.run_len);
+        let metrics = LateMaterializedMetrics {
+            total_rows: self.total_rows,
+            selected_rows: self.selected_rows,
+            selector_runs: self.selectors.len(),
+        };
+        let selection = (self.selected_rows > 0).then(|| RowSelection::from(self.selectors));
+        (selection, metrics)
+    }
+}
+
+fn ordered_group_sum_row_group_chunk() -> usize {
+    std::env::var("DODAM_ORDERED_GROUP_ROW_GROUP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4)
+}
+
+fn parallel_i64_set_filter_row_group_chunk() -> usize {
+    std::env::var("DODAM_I64_SET_FILTER_ROW_GROUP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4)
+}
+
+fn q06_late_materialized_row_group_chunk() -> usize {
+    std::env::var("DODAM_Q06_LATE_ROW_GROUP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2)
+}
+
+fn q14_late_materialized_row_group_chunk() -> usize {
+    std::env::var("DODAM_Q14_LATE_ROW_GROUP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn late_materialized_chunk<State, Output, BuildSelection, ConsumePayload, Finish>(
+    path: PathBuf,
+    batch_size: usize,
+    row_groups: Vec<usize>,
+    predicate_projection: &Projection,
+    payload_projection: &Projection,
+    metadata_cache: &ParquetMetadataCache,
+    file_cache: Arc<ParquetFileCache>,
+    object_store: &dyn ObjectStore,
+    mut state: State,
+    mut build_selection: BuildSelection,
+    mut consume_payload: ConsumePayload,
+    finish: Finish,
+) -> Result<Option<LateMaterializedChunkResult<Output>>>
+where
+    BuildSelection: FnMut(RecordBatch, &mut LateSelectionBuilder, &mut State) -> Result<Option<()>>,
+    ConsumePayload: FnMut(RecordBatch, &mut State) -> Result<Option<()>>,
+    Finish: FnOnce(State, LateMaterializedMetrics) -> Result<Option<Output>>,
+{
+    let mut predicate_reader = ParquetBatchReader::try_new_with_row_groups(
+        path.clone(),
+        batch_size,
+        predicate_projection,
+        row_groups.clone(),
+        metadata_cache,
+        file_cache.clone(),
+        object_store,
+    )?;
+    let mut selection_builder = LateSelectionBuilder::default();
+    while let Some(batch) = predicate_reader.next() {
+        let batch = batch?;
+        if build_selection(batch, &mut selection_builder, &mut state)?.is_none() {
+            return Ok(None);
+        }
+    }
+    let (row_selection, metrics) = selection_builder.finish();
+    if let Some(row_selection) = row_selection {
+        let mut payload_reader = ParquetBatchReader::try_new_with_row_groups_selection(
+            path,
+            batch_size,
+            payload_projection,
+            row_groups,
+            row_selection,
+            metadata_cache,
+            file_cache,
+            object_store,
+        )?;
+        while let Some(batch) = payload_reader.next() {
+            let batch = batch?;
+            if consume_payload(batch, &mut state)?.is_none() {
+                return Ok(None);
+            }
+        }
+    }
+    let Some(output) = finish(state, metrics)? else {
+        return Ok(None);
+    };
+    Ok(Some(LateMaterializedChunkResult { output, metrics }))
+}
+
+fn log_late_materialized_metrics(label: &str, metrics: LateMaterializedMetrics, chunks: usize) {
+    if std::env::var_os("DODAM_TPCH_PROFILE").is_none() {
+        return;
+    }
+    let ratio = if metrics.total_rows == 0 {
+        0.0
+    } else {
+        metrics.selected_rows as f64 / metrics.total_rows as f64
+    };
+    eprintln!(
+        "[dodam:tpch-profile] {label}: late_materialized rows={} selected={} ratio={:.6} selector_runs={} chunks={chunks}",
+        metrics.total_rows, metrics.selected_rows, ratio, metrics.selector_runs
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q14_late_materialized_promo_revenue_chunk(
+    path: PathBuf,
+    batch_size: usize,
+    row_groups: Vec<usize>,
+    start_days: i32,
+    end_days: i32,
+    promo_parts: Arc<HashMap<i64, bool>>,
+    metadata_cache: &ParquetMetadataCache,
+    file_cache: Arc<ParquetFileCache>,
+    object_store: &dyn ObjectStore,
+) -> Result<Option<LateMaterializedChunkResult<(f64, f64)>>> {
+    let predicate_projection = Projection::Columns(vec!["l_shipdate".to_string()]);
+    let payload_projection = Projection::Columns(vec![
+        "l_partkey".to_string(),
+        "l_extendedprice".to_string(),
+        "l_discount".to_string(),
+    ]);
+    let state = Q14LateState {
+        promo_parts,
+        promo: 0.0,
+        total: 0.0,
+    };
+    late_materialized_chunk(
+        path,
+        batch_size,
+        row_groups,
+        &predicate_projection,
+        &payload_projection,
+        metadata_cache,
+        file_cache,
+        object_store,
+        state,
+        |batch, selection, _state| {
+            q14_build_date_selection_batch(batch, start_days, end_days, selection)
+        },
+        q14_consume_payload_batch,
+        |state, _metrics| Ok(Some((state.promo, state.total))),
+    )
+}
+
+struct Q14LateState {
+    promo_parts: Arc<HashMap<i64, bool>>,
+    promo: f64,
+    total: f64,
+}
+
+fn q14_build_date_selection_batch(
+    batch: RecordBatch,
+    start_days: i32,
+    end_days: i32,
+    selection: &mut LateSelectionBuilder,
+) -> Result<Option<()>> {
+    let shipdate_index = physical_batch_column_index(&batch, "l_shipdate")?;
+    let Some(shipdates) = batch
+        .column(shipdate_index)
+        .as_any()
+        .downcast_ref::<Date32Array>()
+    else {
+        return Ok(None);
+    };
+    if shipdates.null_count() != 0 {
+        return Ok(None);
+    }
+    for &shipdate in shipdates.values().as_ref() {
+        selection.push(shipdate >= start_days && shipdate < end_days);
+    }
+    Ok(Some(()))
+}
+
+fn q14_consume_payload_batch(batch: RecordBatch, state: &mut Q14LateState) -> Result<Option<()>> {
+    let partkey_index = physical_batch_column_index(&batch, "l_partkey")?;
+    let extendedprice_index = physical_batch_column_index(&batch, "l_extendedprice")?;
+    let discount_index = physical_batch_column_index(&batch, "l_discount")?;
+    let Some(partkeys) = batch
+        .column(partkey_index)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+    else {
+        return Ok(None);
+    };
+    let Some(extendedprices) = batch
+        .column(extendedprice_index)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+    else {
+        return Ok(None);
+    };
+    let Some(discounts) = batch
+        .column(discount_index)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+    else {
+        return Ok(None);
+    };
+    if partkeys.null_count() != 0 || extendedprices.null_count() != 0 || discounts.null_count() != 0
+    {
+        return Ok(None);
+    }
+    let (price_precision, price_decimal_scale) = decimal128_precision_scale(extendedprices)?;
+    let (discount_precision, discount_decimal_scale) = decimal128_precision_scale(discounts)?;
+    if price_precision > 18 || discount_precision > 18 {
+        return Ok(None);
+    }
+    let price_scale = decimal_scale_i64(price_decimal_scale)?;
+    let discount_scale = decimal_scale_i64(discount_decimal_scale)?;
+    let revenue_scale = 1.0 / ((price_scale as f64) * (discount_scale as f64));
+    for row in 0..batch.num_rows() {
+        let Some(is_promo) = state.promo_parts.get(&partkeys.value(row)).copied() else {
+            continue;
+        };
+        let value = ((extendedprices.values()[row] as i64)
+            * (discount_scale - discounts.values()[row] as i64)) as f64
+            * revenue_scale;
+        if is_promo {
+            state.promo += value;
+        }
+        state.total += value;
+    }
+    Ok(Some(()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q06_late_materialized_revenue_sum_chunk(
+    path: PathBuf,
+    batch_size: usize,
+    row_groups: Vec<usize>,
+    start_days: i32,
+    end_days: i32,
+    discount_low: f64,
+    discount_high: f64,
+    quantity_limit: f64,
+    metadata_cache: &ParquetMetadataCache,
+    file_cache: Arc<ParquetFileCache>,
+    object_store: &dyn ObjectStore,
+) -> Result<Option<LateMaterializedChunkResult<(f64, u64)>>> {
+    let predicate_projection = Projection::Columns(vec![
+        "l_shipdate".to_string(),
+        "l_discount".to_string(),
+        "l_quantity".to_string(),
+    ]);
+    let payload_projection = Projection::Columns(vec!["l_extendedprice".to_string()]);
+    let state = Q06LateState {
+        selected_discounts: Vec::new(),
+        discount_scale: None,
+        extendedprice_scale: None,
+        discount_offset: 0,
+        sum: 0.0,
+    };
+    late_materialized_chunk(
+        path,
+        batch_size,
+        row_groups,
+        &predicate_projection,
+        &payload_projection,
+        metadata_cache,
+        file_cache,
+        object_store,
+        state,
+        |batch, selection, state| {
+            q06_build_selection_batch(
+                batch,
+                start_days,
+                end_days,
+                discount_low,
+                discount_high,
+                quantity_limit,
+                selection,
+                state,
+            )
+        },
+        q06_consume_payload_batch,
+        |state, _metrics| {
+            if state.discount_offset != state.selected_discounts.len() {
+                return Err(DodamError::UnsupportedSql(
+                    "Q06 row selection payload mismatch".to_string(),
+                ));
+            }
+            Ok(Some((state.sum, state.selected_discounts.len() as u64)))
+        },
+    )
+}
+
+struct Q06LateState {
+    selected_discounts: Vec<i64>,
+    discount_scale: Option<i64>,
+    extendedprice_scale: Option<i64>,
+    discount_offset: usize,
+    sum: f64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q06_build_selection_batch(
+    batch: RecordBatch,
+    start_days: i32,
+    end_days: i32,
+    discount_low: f64,
+    discount_high: f64,
+    quantity_limit: f64,
+    selection: &mut LateSelectionBuilder,
+    state: &mut Q06LateState,
+) -> Result<Option<()>> {
+    let shipdate_index = physical_batch_column_index(&batch, "l_shipdate")?;
+    let discount_index = physical_batch_column_index(&batch, "l_discount")?;
+    let quantity_index = physical_batch_column_index(&batch, "l_quantity")?;
+    let Some(shipdates) = batch
+        .column(shipdate_index)
+        .as_any()
+        .downcast_ref::<Date32Array>()
+    else {
+        return Ok(None);
+    };
+    let Some(discounts) = batch
+        .column(discount_index)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+    else {
+        return Ok(None);
+    };
+    let Some(quantities) = batch
+        .column(quantity_index)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+    else {
+        return Ok(None);
+    };
+    if shipdates.null_count() != 0 || discounts.null_count() != 0 || quantities.null_count() != 0 {
+        return Ok(None);
+    }
+    let (discount_precision, discount_decimal_scale) = decimal128_precision_scale(discounts)?;
+    let (quantity_precision, quantity_decimal_scale) = decimal128_precision_scale(quantities)?;
+    if discount_precision > 18 || quantity_precision > 18 {
+        return Ok(None);
+    }
+    let discount_scale_value = decimal_scale_i64(discount_decimal_scale)?;
+    let quantity_scale_value = decimal_scale_i64(quantity_decimal_scale)?;
+    if let Some(existing) = state.discount_scale {
+        if existing != discount_scale_value {
+            return Ok(None);
+        }
+    } else {
+        state.discount_scale = Some(discount_scale_value);
+    }
+    let discount_low_raw = scaled_f64_to_i64(discount_low, discount_scale_value);
+    let discount_high_raw = scaled_f64_to_i64(discount_high, discount_scale_value);
+    let quantity_limit_raw = scaled_f64_to_i64(quantity_limit, quantity_scale_value);
+    let shipdate_values = shipdates.values().as_ref();
+    let discount_values = discounts.values();
+    let quantity_values = quantities.values();
+    for row in 0..shipdate_values.len() {
+        let shipdate = shipdate_values[row];
+        let discount = discount_values[row] as i64;
+        let selected = shipdate >= start_days
+            && shipdate < end_days
+            && discount >= discount_low_raw
+            && discount <= discount_high_raw
+            && (quantity_values[row] as i64) < quantity_limit_raw;
+        if selected {
+            state.selected_discounts.push(discount);
+        }
+        selection.push(selected);
+    }
+    Ok(Some(()))
+}
+
+fn q06_consume_payload_batch(batch: RecordBatch, state: &mut Q06LateState) -> Result<Option<()>> {
+    let extendedprice_index = physical_batch_column_index(&batch, "l_extendedprice")?;
+    let Some(extendedprices) = batch
+        .column(extendedprice_index)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+    else {
+        return Ok(None);
+    };
+    if extendedprices.null_count() != 0 {
+        return Ok(None);
+    }
+    let (precision, decimal_scale) = decimal128_precision_scale(extendedprices)?;
+    if precision > 18 {
+        return Ok(None);
+    }
+    let price_scale = decimal_scale_i64(decimal_scale)?;
+    if let Some(existing) = state.extendedprice_scale {
+        if existing != price_scale {
+            return Ok(None);
+        }
+    } else {
+        state.extendedprice_scale = Some(price_scale);
+    }
+    let discount_scale = state
+        .discount_scale
+        .ok_or_else(|| DodamError::UnsupportedSql("Q06 missing discount scale".to_string()))?;
+    let revenue_scale = 1.0 / ((price_scale as f64) * (discount_scale as f64));
+    for &extendedprice in extendedprices.values() {
+        let discount = *state
+            .selected_discounts
+            .get(state.discount_offset)
+            .ok_or_else(|| {
+                DodamError::UnsupportedSql("Q06 row selection payload mismatch".to_string())
+            })?;
+        state.sum += ((extendedprice as i64) * discount) as f64 * revenue_scale;
+        state.discount_offset += 1;
+    }
+    Ok(Some(()))
+}
+
+fn push_late_selector_run(
+    selectors: &mut Vec<RowSelector>,
+    current_selected: &mut Option<bool>,
+    run_len: &mut usize,
+    selected: bool,
+) {
+    match *current_selected {
+        Some(current) if current == selected => *run_len += 1,
+        Some(current) => {
+            selectors.push(if current {
+                RowSelector::select(*run_len)
+            } else {
+                RowSelector::skip(*run_len)
+            });
+            *current_selected = Some(selected);
+            *run_len = 1;
+        }
+        None => {
+            *current_selected = Some(selected);
+            *run_len = 1;
+        }
+    }
+}
+
+fn finish_late_selector_run(
+    selectors: &mut Vec<RowSelector>,
+    current_selected: Option<bool>,
+    run_len: usize,
+) {
+    if run_len == 0 {
+        return;
+    }
+    if current_selected.unwrap_or(false) {
+        selectors.push(RowSelector::select(run_len));
+    } else {
+        selectors.push(RowSelector::skip(run_len));
+    }
+}
+
+fn decimal128_precision_scale(values: &Decimal128Array) -> Result<(u8, i8)> {
+    match values.data_type() {
+        DataType::Decimal128(precision, scale) => Ok((*precision, *scale)),
+        _ => Ok((0, 0)),
+    }
+}
+
+fn decimal_scale_i64(scale: i8) -> Result<i64> {
+    let scale = u32::try_from(scale).map_err(|_| {
+        DodamError::UnsupportedSql(format!("negative decimal scale {scale} is unsupported"))
+    })?;
+    10_i64
+        .checked_pow(scale)
+        .ok_or_else(|| DodamError::UnsupportedSql(format!("decimal scale {scale} overflows i64")))
+}
+
+fn scaled_f64_to_i64(value: f64, scale: i64) -> i64 {
+    (value * scale as f64).round() as i64
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_i64_set_filtered_row_groups(
+    path: PathBuf,
+    batch_size: usize,
+    projection: &Projection,
+    row_groups: Vec<usize>,
+    filter_column: &str,
+    keys: Arc<HashSet<i64>>,
+    metadata_cache: &ParquetMetadataCache,
+    file_cache: Arc<ParquetFileCache>,
+    object_store: &dyn ObjectStore,
+) -> Result<Vec<RecordBatch>> {
+    let mut reader = ParquetBatchReader::try_new_with_row_groups_i64_set_filter(
+        path,
+        batch_size,
+        projection,
+        row_groups,
+        filter_column,
+        keys,
+        metadata_cache,
+        file_cache,
+        object_store,
+    )?;
+    let mut batches = Vec::new();
+    while let Some(batch) = reader.next() {
+        let batch = batch?;
+        if batch.num_rows() > 0 {
+            batches.push(batch);
+        }
+    }
+    Ok(batches)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ordered_i64_decimal_group_sum_chunk(
+    path: PathBuf,
+    batch_size: usize,
+    projection: &Projection,
+    row_groups: Vec<usize>,
+    key_column: &str,
+    value_column: &str,
+    threshold: f64,
+    metadata_cache: &ParquetMetadataCache,
+    file_cache: Arc<ParquetFileCache>,
+    object_store: &dyn ObjectStore,
+) -> Result<Option<OrderedGroupSumPartial>> {
+    let mut reader = ParquetBatchReader::try_new_with_row_groups(
+        path,
+        batch_size,
+        projection,
+        row_groups,
+        metadata_cache,
+        file_cache,
+        object_store,
+    )?;
+    let mut partial = OrderedGroupSumPartial::new();
+    let mut current_key = None;
+    let mut current_sum = 0.0;
+    while let Some(batch) = reader.next() {
+        let batch = batch?;
+        let key_index = physical_batch_column_index(&batch, key_column)?;
+        let value_index = physical_batch_column_index(&batch, value_column)?;
+        let Some(keys) = batch
+            .column(key_index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+        else {
+            return Ok(None);
+        };
+        let Some(values) = batch
+            .column(value_index)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+        else {
+            return Ok(None);
+        };
+        let scale = match values.data_type() {
+            arrow::datatypes::DataType::Decimal128(_, scale) => 10_f64.powi(i32::from(*scale)),
+            _ => return Ok(None),
+        };
+        if keys.null_count() == 0 && values.null_count() == 0 {
+            for (&key, &value) in keys.values().iter().zip(values.values()) {
+                let quantity = value as f64 / scale;
+                if let Some(current) = current_key {
+                    if key < current {
+                        return Ok(None);
+                    }
+                    if key == current {
+                        current_sum += quantity;
+                        continue;
+                    }
+                    partial.push_run(current, current_sum, threshold);
+                }
+                current_key = Some(key);
+                current_sum = quantity;
+            }
+            continue;
+        }
+        for row in 0..batch.num_rows() {
+            if keys.is_null(row) || values.is_null(row) {
+                continue;
+            }
+            let key = keys.value(row);
+            let quantity = values.value(row) as f64 / scale;
+            if let Some(current) = current_key {
+                if key < current {
+                    return Ok(None);
+                }
+                if key == current {
+                    current_sum += quantity;
+                    continue;
+                }
+                partial.push_run(current, current_sum, threshold);
+            }
+            current_key = Some(key);
+            current_sum = quantity;
+        }
+    }
+    partial.finish_current(current_key, current_sum, threshold);
+    Ok(Some(partial))
+}
+
+fn merge_ordered_group_sum_partials(
+    partials: Vec<Option<OrderedGroupSumPartial>>,
+    threshold: f64,
+) -> Result<Option<HashMap<i64, f64>>> {
+    let mut output = HashMap::new();
+    let mut carry: Option<(i64, f64)> = None;
+    for partial in partials {
+        let Some(partial) = partial else {
+            return Ok(None);
+        };
+        let Some(first) = partial.first else {
+            continue;
+        };
+        if let Some((carry_key, carry_sum)) = carry.take() {
+            if first.0 < carry_key {
+                return Ok(None);
+            }
+            if first.0 == carry_key {
+                carry = Some((carry_key, carry_sum + first.1));
+            } else {
+                if carry_sum > threshold {
+                    output.insert(carry_key, carry_sum);
+                }
+                carry = Some(first);
+            }
+        } else {
+            carry = Some(first);
+        }
+
+        if partial.last.is_some() {
+            if let Some((carry_key, carry_sum)) = carry.take()
+                && carry_sum > threshold
+            {
+                output.insert(carry_key, carry_sum);
+            }
+            output.extend(partial.middle);
+            carry = partial.last;
+        }
+    }
+    if let Some((key, sum)) = carry
+        && sum > threshold
+    {
+        output.insert(key, sum);
+    }
+    Ok(Some(output))
 }
 
 fn hash_physical_row(row: &impl Hash) -> usize {

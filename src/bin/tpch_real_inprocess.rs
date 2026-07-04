@@ -13,7 +13,7 @@ use parquet::basic::{Compression, Encoding};
 use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
 
-const DEFAULT_BATCH_SIZE: usize = 32 * 1024;
+const DEFAULT_BATCH_SIZE: usize = 16 * 1024;
 const DEFAULT_OUTPUT_DIR: &str = "/tmp/dodam-tpch-inprocess";
 
 const TABLES: &[&str] = &[

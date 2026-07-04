@@ -1,7 +1,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
-use std::hash::{BuildHasherDefault, Hash, Hasher};
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,68 +36,22 @@ use crate::execution::logical::{
 use crate::execution::metrics::{
     RecordBatchSink, ScanMetrics, ScanPlanMetrics, ScanPlanMetricsCounter, SendableBatchStream,
 };
+use crate::hash::{FastHashMap as JoinKeyHashMap, FastHashSet as JoinKeyHashSet};
 use crate::storage::{
     ObjectStore, ParquetBatchReader, ParquetFileCache, ParquetMetadataCache, ParquetScanTask,
     plan_parquet_scan_tasks,
 };
-
-type JoinKeyHashMap<K, V> = HashMap<K, V, BuildHasherDefault<JoinKeyHasher>>;
-type JoinKeyHashSet<K> = HashSet<K, BuildHasherDefault<JoinKeyHasher>>;
-
-#[derive(Default)]
-struct JoinKeyHasher {
-    hash: u64,
-}
-
-impl Hasher for JoinKeyHasher {
-    fn finish(&self) -> u64 {
-        self.hash
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        let mut hash = self.hash ^ 0xcbf2_9ce4_8422_2325;
-        for byte in bytes {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x1000_0000_01b3);
-        }
-        self.hash = hash;
-    }
-
-    fn write_i32(&mut self, value: i32) {
-        self.write_u32(value as u32);
-    }
-
-    fn write_u32(&mut self, value: u32) {
-        self.write_u64(u64::from(value));
-    }
-
-    fn write_i64(&mut self, value: i64) {
-        self.write_u64(value as u64);
-    }
-
-    fn write_u64(&mut self, value: u64) {
-        let mut hash = self.hash ^ value;
-        hash ^= hash >> 33;
-        hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
-        hash ^= hash >> 33;
-        hash = hash.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-        hash ^= hash >> 33;
-        self.hash = hash;
-    }
-
-    fn write_usize(&mut self, value: usize) {
-        self.write_u64(value as u64);
-    }
-}
 
 pub struct ScanExec {
     fragments: Vec<FileFragment>,
     batch_size: usize,
     projection: Projection,
     pruning_predicates: Vec<Expr>,
+    row_filter_predicates: Vec<Expr>,
     metadata_cache: Arc<ParquetMetadataCache>,
     file_cache: Arc<ParquetFileCache>,
     object_store: Arc<dyn ObjectStore>,
+    preserve_order: bool,
 }
 
 pub struct MemoryExec {
@@ -155,18 +109,22 @@ impl ScanExec {
         batch_size: usize,
         projection: Projection,
         pruning_predicates: Vec<Expr>,
+        row_filter_predicates: Vec<Expr>,
         metadata_cache: Arc<ParquetMetadataCache>,
         file_cache: Arc<ParquetFileCache>,
         object_store: Arc<dyn ObjectStore>,
+        preserve_order: bool,
     ) -> Self {
         Self {
             fragments,
             batch_size,
             projection,
             pruning_predicates,
+            row_filter_predicates,
             metadata_cache,
             file_cache,
             object_store,
+            preserve_order,
         }
     }
 
@@ -184,9 +142,11 @@ impl PhysicalPlan for ScanExec {
                 self.batch_size,
                 self.projection,
                 self.pruning_predicates,
+                self.row_filter_predicates,
                 self.metadata_cache,
                 self.file_cache,
                 self.object_store,
+                self.preserve_order,
             ))
             .execute(),
             StorageFormat::Csv | StorageFormat::Json | StorageFormat::ArrowIpc => {
@@ -214,9 +174,11 @@ struct ParquetScanExec {
     batch_size: usize,
     projection: Projection,
     pruning_predicates: Vec<Expr>,
+    row_filter_predicates: Vec<Expr>,
     metadata_cache: Arc<ParquetMetadataCache>,
     file_cache: Arc<ParquetFileCache>,
     object_store: Arc<dyn ObjectStore>,
+    preserve_order: bool,
 }
 
 impl ParquetScanExec {
@@ -225,18 +187,22 @@ impl ParquetScanExec {
         batch_size: usize,
         projection: Projection,
         pruning_predicates: Vec<Expr>,
+        row_filter_predicates: Vec<Expr>,
         metadata_cache: Arc<ParquetMetadataCache>,
         file_cache: Arc<ParquetFileCache>,
         object_store: Arc<dyn ObjectStore>,
+        preserve_order: bool,
     ) -> Self {
         Self {
             fragments,
             batch_size,
             projection,
             pruning_predicates,
+            row_filter_predicates,
             metadata_cache,
             file_cache,
             object_store,
+            preserve_order,
         }
     }
 }
@@ -244,26 +210,6 @@ impl ParquetScanExec {
 impl PhysicalPlan for ParquetScanExec {
     fn execute(self: Box<Self>) -> Result<SendableBatchStream> {
         let metrics = Arc::new(ScanPlanMetricsCounter::default());
-        if !self.pruning_predicates.is_empty() {
-            return Ok(SendableBatchStream::new(
-                Box::new(SequentialFragmentScanStream {
-                    fragments: self.fragments,
-                    batch_size: self.batch_size,
-                    projection: self.projection,
-                    pruning_predicates: self.pruning_predicates,
-                    current_reader: None,
-                    current_partition_values: BTreeMap::new(),
-                    next_fragment: 0,
-                    decode_nanos: 0,
-                    metrics: metrics.clone(),
-                    metadata_cache: self.metadata_cache,
-                    file_cache: self.file_cache,
-                    object_store: self.object_store,
-                }),
-                metrics,
-            ));
-        }
-
         let mut tasks = Vec::new();
         let mut row_groups_total = 0;
         let mut schema_columns_total = 0;
@@ -277,7 +223,7 @@ impl PhysicalPlan for ParquetScanExec {
             let plan = plan_parquet_scan_tasks(
                 fragment.parquet_local_path()?,
                 &parquet_projection,
-                &[],
+                &self.pruning_predicates,
                 &self.metadata_cache,
                 self.object_store.as_ref(),
             )?;
@@ -308,7 +254,8 @@ impl PhysicalPlan for ParquetScanExec {
             && projected_columns_fixed_width
             && projected_columns_total <= SEQUENTIAL_PARQUET_SCAN_MAX_FIXED_WIDTH_COLUMNS
             && row_groups_total <= SEQUENTIAL_PARQUET_SCAN_MAX_FIXED_WIDTH_ROW_GROUPS;
-        if tasks.len() == 1
+        if self.preserve_order
+            || tasks.len() == 1
             || (compressed_bytes_scanned <= SEQUENTIAL_PARQUET_SCAN_BYTES
                 && pruned_columns >= SEQUENTIAL_PARQUET_SCAN_MIN_PRUNED_COLUMNS)
             || small_fixed_width_scan
@@ -319,6 +266,7 @@ impl PhysicalPlan for ParquetScanExec {
                     batch_size: self.batch_size,
                     projection: self.projection,
                     pruning_predicates: self.pruning_predicates,
+                    row_filter_predicates: self.row_filter_predicates,
                     current_reader: None,
                     current_partition_values: BTreeMap::new(),
                     next_fragment: 0,
@@ -346,6 +294,7 @@ impl PhysicalPlan for ParquetScanExec {
                 self.metadata_cache,
                 self.file_cache,
                 self.object_store,
+                self.row_filter_predicates,
                 metrics.clone(),
             )),
             metrics,
@@ -363,6 +312,7 @@ struct SequentialFragmentScanStream {
     batch_size: usize,
     projection: Projection,
     pruning_predicates: Vec<Expr>,
+    row_filter_predicates: Vec<Expr>,
     current_reader: Option<ParquetBatchReader>,
     current_partition_values: BTreeMap<String, String>,
     next_fragment: usize,
@@ -406,6 +356,7 @@ impl Iterator for SequentialFragmentScanStream {
                 self.batch_size,
                 &parquet_projection,
                 &self.pruning_predicates,
+                &self.row_filter_predicates,
                 &self.metadata_cache,
                 self.file_cache.clone(),
                 self.object_store.as_ref(),
@@ -458,7 +409,15 @@ struct ParquetScanTaskChunk {
     partition_values: BTreeMap<String, String>,
 }
 
-const PARALLEL_PARQUET_SCAN_ROW_GROUP_CHUNK: usize = 4;
+const DEFAULT_PARALLEL_PARQUET_SCAN_ROW_GROUP_CHUNK: usize = 4;
+
+fn parallel_parquet_scan_row_group_chunk() -> usize {
+    std::env::var("DODAM_PARQUET_SCAN_ROW_GROUP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_PARALLEL_PARQUET_SCAN_ROW_GROUP_CHUNK)
+}
 
 impl ParallelParquetScanStream {
     fn new(
@@ -468,10 +427,12 @@ impl ParallelParquetScanStream {
         metadata_cache: Arc<ParquetMetadataCache>,
         file_cache: Arc<ParquetFileCache>,
         object_store: Arc<dyn ObjectStore>,
+        row_filter_predicates: Vec<Expr>,
         metrics: Arc<ScanPlanMetricsCounter>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel();
-        for task in chunk_parquet_scan_tasks(tasks, PARALLEL_PARQUET_SCAN_ROW_GROUP_CHUNK) {
+        let row_group_chunk = parallel_parquet_scan_row_group_chunk();
+        for task in chunk_parquet_scan_tasks(tasks, row_group_chunk) {
             let sender = sender.clone();
             let projection = projection.clone();
             let parquet_projection =
@@ -481,12 +442,14 @@ impl ParallelParquetScanStream {
             let file_cache = file_cache.clone();
             let object_store = object_store.clone();
             let metrics = metrics.clone();
+            let row_filter_predicates = row_filter_predicates.clone();
             rayon::spawn(move || {
-                let mut reader = match ParquetBatchReader::try_new_with_row_groups(
+                let mut reader = match ParquetBatchReader::try_new_with_row_groups_filtered(
                     &task.path,
                     batch_size,
                     &parquet_projection,
                     task.row_groups,
+                    &row_filter_predicates,
                     &metadata_cache,
                     file_cache.clone(),
                     object_store.as_ref(),

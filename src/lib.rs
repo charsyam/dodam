@@ -4,6 +4,7 @@ mod dense;
 pub mod engine;
 pub mod error;
 pub mod execution;
+mod hash;
 pub mod optimizer;
 pub mod plan;
 pub mod sql;

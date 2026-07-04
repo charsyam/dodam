@@ -1,6 +1,5 @@
+use std::collections::HashSet;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
-use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::mpsc;
 
 use arrow::array::{
@@ -19,50 +18,7 @@ use crate::execution::logical::{
 };
 use crate::execution::metrics::SendableBatchStream;
 use crate::execution::physical::column_index;
-
-type AggregateHashMap<K, V> = HashMap<K, V, BuildHasherDefault<AggregateHasher>>;
-
-#[derive(Default)]
-struct AggregateHasher {
-    hash: u64,
-}
-
-impl Hasher for AggregateHasher {
-    fn finish(&self) -> u64 {
-        self.hash
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        let mut hash = self.hash ^ 0xcbf2_9ce4_8422_2325;
-        for byte in bytes {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x1000_0000_01b3);
-        }
-        self.hash = hash;
-    }
-
-    fn write_i32(&mut self, value: i32) {
-        self.write_u64(value as u32 as u64);
-    }
-
-    fn write_i64(&mut self, value: i64) {
-        self.write_u64(value as u64);
-    }
-
-    fn write_u64(&mut self, value: u64) {
-        let mut hash = self.hash ^ value;
-        hash ^= hash >> 33;
-        hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
-        hash ^= hash >> 33;
-        hash = hash.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-        hash ^= hash >> 33;
-        self.hash = hash;
-    }
-
-    fn write_usize(&mut self, value: usize) {
-        self.write_u64(value as u64);
-    }
-}
+use crate::hash::FastHashMap as AggregateHashMap;
 
 pub fn collect_aggregates(
     mut stream: SendableBatchStream,
