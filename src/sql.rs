@@ -7657,6 +7657,19 @@ async fn q12_filtered_lineitem_counts(
     start_days: i32,
     end_days: i32,
 ) -> Result<HashMap<i64, Q12PendingOrder>> {
+    if q12_late_materialized_enabled()
+        && let Some(pending) = q12_filtered_lineitem_counts_late_materialized(
+            engine,
+            path.clone(),
+            batch_size,
+            shipmodes,
+            start_days,
+            end_days,
+        )
+        .await?
+    {
+        return Ok(pending);
+    }
     let projection = Projection::Columns(vec![
         "l_orderkey".to_string(),
         "l_shipmode".to_string(),
@@ -7699,6 +7712,69 @@ async fn q12_filtered_lineitem_counts(
         engine, path, batch_size, projection, shipmodes, start_days, end_days,
     )
     .await
+}
+
+async fn q12_filtered_lineitem_counts_late_materialized(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    shipmodes: &[String],
+    start_days: i32,
+    end_days: i32,
+) -> Result<Option<HashMap<i64, Q12PendingOrder>>> {
+    let predicate_projection = Projection::Columns(vec![
+        "l_shipmode".to_string(),
+        "l_commitdate".to_string(),
+        "l_receiptdate".to_string(),
+        "l_shipdate".to_string(),
+    ]);
+    let payload_projection = Projection::Columns(vec!["l_orderkey".to_string()]);
+    let shipmodes = Arc::new(shipmodes.to_vec());
+    let Some(chunks) = engine
+        .late_materialized_parquet_map_with_policy(
+            path,
+            batch_size,
+            predicate_projection,
+            payload_projection,
+            q12_late_materialized_row_group_chunk(),
+            LateMaterializationPolicy::selective_with_selector_run_ratio(
+                q12_late_materialized_max_selected_ratio(),
+                q12_late_materialized_max_selector_run_ratio(),
+            ),
+            {
+                let shipmodes = shipmodes.clone();
+                move || Q12LateState {
+                    shipmodes: shipmodes.clone(),
+                    start_days,
+                    end_days,
+                    selected_modes: Vec::new(),
+                    selected_offset: 0,
+                    pending: HashMap::new(),
+                }
+            },
+            q12_late_build_selection_batch,
+            q12_late_consume_orderkey_payload_batch,
+            |state, _metrics| {
+                if state.selected_offset != state.selected_modes.len() {
+                    return Err(DodamError::UnsupportedSql(
+                        "Q12 row selection payload mismatch".to_string(),
+                    ));
+                }
+                Ok(Some(state.pending))
+            },
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let mut pending = HashMap::new();
+    let mut metrics = LateMaterializedMetrics::default();
+    for chunk in chunks {
+        q12_merge_pending_orders(&mut pending, chunk.output);
+        metrics.add(chunk.metrics);
+    }
+    q12_log_late_materialized_profile(metrics, q12_late_materialized_row_group_chunk());
+    Ok(Some(pending))
 }
 
 fn q12_lineitem_chunk_size() -> usize {
@@ -7752,6 +7828,34 @@ fn q12_row_group_map_chunk() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(2)
+}
+
+fn q12_late_materialized_enabled() -> bool {
+    std::env::var_os("DODAM_Q12_ENABLE_LATE_MATERIALIZE").is_some()
+}
+
+fn q12_late_materialized_row_group_chunk() -> usize {
+    std::env::var("DODAM_Q12_LATE_ROW_GROUP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2)
+}
+
+fn q12_late_materialized_max_selected_ratio() -> f64 {
+    std::env::var("DODAM_Q12_LATE_MAX_SELECTED_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.20)
+}
+
+fn q12_late_materialized_max_selector_run_ratio() -> f64 {
+    std::env::var("DODAM_Q12_LATE_MAX_SELECTOR_RUN_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.50)
 }
 
 fn q12_filtered_lineitem_counts_batch(
@@ -7933,6 +8037,121 @@ fn q12_shipmode_index(shipmodes: &[String], mode: &str) -> Option<usize> {
 
 fn q12_typed_loop_enabled() -> bool {
     std::env::var_os("DODAM_Q12_DISABLE_TYPED_LOOP").is_none()
+}
+
+struct Q12LateState {
+    shipmodes: Arc<Vec<String>>,
+    start_days: i32,
+    end_days: i32,
+    selected_modes: Vec<u8>,
+    selected_offset: usize,
+    pending: HashMap<i64, Q12PendingOrder>,
+}
+
+fn q12_late_build_selection_batch(
+    batch: RecordBatch,
+    selection: &mut LateSelectionBuilder,
+    state: &mut Q12LateState,
+) -> Result<Option<()>> {
+    let modes = batch_string_column(&batch, "l_shipmode")?;
+    let Some(commitdates) = batch_column(&batch, "l_commitdate")?
+        .as_any()
+        .downcast_ref::<Date32Array>()
+    else {
+        return Ok(None);
+    };
+    let Some(receiptdates) = batch_column(&batch, "l_receiptdate")?
+        .as_any()
+        .downcast_ref::<Date32Array>()
+    else {
+        return Ok(None);
+    };
+    let Some(shipdates) = batch_column(&batch, "l_shipdate")?
+        .as_any()
+        .downcast_ref::<Date32Array>()
+    else {
+        return Ok(None);
+    };
+    let [left_mode, right_mode] = state.shipmodes.as_slice() else {
+        return Ok(None);
+    };
+    if modes.null_count() != 0
+        || commitdates.null_count() != 0
+        || receiptdates.null_count() != 0
+        || shipdates.null_count() != 0
+    {
+        return Ok(None);
+    }
+    let left_mode = left_mode.as_bytes();
+    let right_mode = right_mode.as_bytes();
+    let mode_offsets = modes.value_offsets();
+    let mode_data = modes.value_data();
+    let commitdate_values = commitdates.values().as_ref();
+    let receiptdate_values = receiptdates.values().as_ref();
+    let shipdate_values = shipdates.values().as_ref();
+    for row in 0..batch.num_rows() {
+        let mode = bytes_string_parts(mode_offsets, mode_data, row);
+        let mode_index = if mode == left_mode {
+            0
+        } else if mode == right_mode {
+            1
+        } else {
+            selection.push(false);
+            continue;
+        };
+        let commitdate = commitdate_values[row];
+        let receiptdate = receiptdate_values[row];
+        let selected = commitdate < receiptdate
+            && shipdate_values[row] < commitdate
+            && receiptdate >= state.start_days
+            && receiptdate < state.end_days;
+        if selected {
+            state.selected_modes.push(mode_index);
+        }
+        selection.push(selected);
+    }
+    Ok(Some(()))
+}
+
+fn q12_late_consume_orderkey_payload_batch(
+    batch: RecordBatch,
+    state: &mut Q12LateState,
+) -> Result<Option<()>> {
+    let Some(orderkeys) = batch_column(&batch, "l_orderkey")?
+        .as_any()
+        .downcast_ref::<Int64Array>()
+    else {
+        return Ok(None);
+    };
+    if orderkeys.null_count() != 0 {
+        return Ok(None);
+    }
+    for &orderkey in orderkeys.values() {
+        let mode_index = *state
+            .selected_modes
+            .get(state.selected_offset)
+            .ok_or_else(|| {
+                DodamError::UnsupportedSql("Q12 row selection payload mismatch".to_string())
+            })? as usize;
+        state.pending.entry(orderkey).or_default().counts[mode_index] += 1;
+        state.selected_offset += 1;
+    }
+    Ok(Some(()))
+}
+
+fn q12_log_late_materialized_profile(metrics: LateMaterializedMetrics, row_group_chunk: usize) {
+    if !tpch_profile_enabled() {
+        return;
+    }
+    let ratio = if metrics.total_rows == 0 {
+        0.0
+    } else {
+        metrics.selected_rows as f64 / metrics.total_rows as f64
+    };
+    eprintln!(
+        "[dodam:tpch-profile] Q12 lineitem: late_materialized rows={} selected={} ratio={:.6} selector_runs={} row_group_chunk={}",
+        metrics.total_rows, metrics.selected_rows, ratio, metrics.selector_runs, row_group_chunk
+    );
 }
 
 fn q12_merge_pending_orders(

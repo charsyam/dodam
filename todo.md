@@ -1172,6 +1172,10 @@ Tried and rejected or neutral:
       - This is mainly a benchmark-control and operational convenience feature. It keeps catalog/metadata/file cache state alive across statements and avoids measuring process startup once per TPC-H query.
       - SF=1 TPC-H 22-query Parquet COPY sample: `query-file` completed in about `0.84s`, close to the existing in-process runner's `0.80s`. A same-process DuckDB CLI script completed in about `0.67s`, so the fairer current gap is roughly `1.25x` for CLI COPY and `1.19x` for direct in-process execution, rather than the larger per-query CLI gap.
       - DuckDB `.timer` per-query comparison showed the biggest remaining same-process gaps around Q12, Q03, and Q01; Q09/Q18/Q21 are already competitive or faster in the sampled SF=1 run.
+    - Tried Q12 late materialization for the lineitem shipping predicate:
+      - The path reads `l_shipmode/l_commitdate/l_receiptdate/l_shipdate` first, builds a row selection, and then reads `l_orderkey` only for selected rows. This fixed an important projection-order assumption in the late path by using column-name lookup instead of ordinal-only lookup.
+      - SF=1 Q12 selectivity was very low (`30,988 / 6,001,215`, about `0.52%`) with about `60k` selector runs, so it looked promising. However, same-process Q12 10-repeat samples did not beat the existing row-group map path once the full predicate pass plus row-selection payload read was included.
+      - Enabling it by default with broader late-materialization sampling regressed Q12 warm samples from roughly `0.55-0.57s` per 10 repeats to `0.59-0.61s`, so the default was reverted. The path remains opt-in behind `DODAM_Q12_ENABLE_LATE_MATERIALIZE=1` for clustered/selective datasets.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.
