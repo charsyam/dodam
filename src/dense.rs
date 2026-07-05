@@ -40,6 +40,13 @@ impl AdaptiveI64Set {
         }
     }
 
+    pub(crate) fn dense_contains_slice(&self) -> Option<&[bool]> {
+        match self {
+            Self::Dense { contains, .. } => Some(contains),
+            Self::Hash(_) => None,
+        }
+    }
+
     pub(crate) fn selective_key_range(&self) -> Option<(i64, i64)> {
         let (min_key, max_key, len) = match self {
             Self::Dense { contains, len } => {
@@ -112,6 +119,7 @@ fn adaptive_i64_set_dense_to_hash(contains: &[bool]) -> FastHashSet<i64> {
         .collect()
 }
 
+#[derive(Clone)]
 pub(crate) enum AdaptiveI64Map<V> {
     Dense {
         values: Vec<V>,
@@ -395,6 +403,12 @@ impl DenseI64I32Map {
             .get(index)
             .copied()
             .filter(|value| *value != self.missing)
+    }
+
+    pub(crate) fn dense_slice(&self) -> Option<(&[i32], i64, i32)> {
+        self.fallback
+            .is_none()
+            .then_some((self.dense.as_slice(), self.base_key, self.missing))
     }
 
     pub(crate) fn reserve_dense_range(

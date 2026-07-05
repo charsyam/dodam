@@ -1130,6 +1130,37 @@ impl DodamEngine {
         if row_groups.is_empty() {
             return Ok(Some(Vec::new()));
         }
+        let payload_columns = match &payload_projection {
+            Projection::All => source
+                .schema
+                .as_ref()
+                .map_or(plan.schema_columns, |schema| schema.fields().len()),
+            Projection::Columns(columns) => columns.len(),
+        };
+        if late_materialization_sample_enabled(policy, plan.projected_columns, payload_columns) {
+            let sample_row_groups = row_groups
+                .iter()
+                .copied()
+                .take(late_materialization_sample_row_groups())
+                .collect::<Vec<_>>();
+            let Some(sample_metrics) = sample_late_materialized_selection(
+                local_path.clone(),
+                batch_size,
+                sample_row_groups,
+                &predicate_projection,
+                &self.metadata_cache,
+                self.file_cache.clone(),
+                self.object_store.as_ref(),
+                build_state.clone()(),
+                build_selection.clone(),
+            )?
+            else {
+                return Ok(None);
+            };
+            if !policy.accepts(&sample_metrics) {
+                return Ok(None);
+            }
+        }
         let chunks = row_groups
             .chunks(row_group_chunk.max(1))
             .map(|chunk| chunk.to_vec())
@@ -2527,6 +2558,7 @@ impl DodamEngine {
 
 fn scan_profile_enabled() -> bool {
     std::env::var("DODAM_SCAN_PROFILE")
+        .or_else(|_| std::env::var("DODAM_TPCH_PROFILE"))
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
@@ -2559,6 +2591,7 @@ fn wrap_scan_profile(stream: SendableBatchStream, label: String) -> SendableBatc
             started: Instant::now(),
             rows: 0,
             batches: 0,
+            next_wait_nanos: 0,
             logged: false,
         }),
         metrics,
@@ -2572,6 +2605,7 @@ struct ProfiledScanStream {
     started: Instant,
     rows: usize,
     batches: usize,
+    next_wait_nanos: u64,
     logged: bool,
 }
 
@@ -2582,10 +2616,15 @@ impl ProfiledScanStream {
         }
         self.logged = true;
         let metrics = self.metrics.snapshot();
+        let elapsed_ms = self.started.elapsed().as_secs_f64() * 1000.0;
+        let next_wait_ms = nanos_to_millis(self.next_wait_nanos);
+        let consumer_gap_ms = (elapsed_ms - next_wait_ms).max(0.0);
         eprintln!(
-            "[dodam:scan-profile] {}: elapsed={:.3} ms rows={} batches={} row_groups={}/{} bytes={} metadata={:.3} ms planning={:.3} ms decode={:.3} ms filter={:.3} ms projection={:.3} ms limit={:.3} ms",
+            "[dodam:scan-profile] {}: elapsed={:.3} ms next_wait={:.3} ms consumer_gap={:.3} ms rows={} batches={} row_groups={}/{} bytes={} metadata={:.3} ms planning={:.3} ms decode={:.3} ms filter={:.3} ms projection={:.3} ms limit={:.3} ms",
             self.label,
-            self.started.elapsed().as_secs_f64() * 1000.0,
+            elapsed_ms,
+            next_wait_ms,
+            consumer_gap_ms,
             self.rows,
             self.batches,
             metrics.row_groups_scanned,
@@ -2605,7 +2644,12 @@ impl Iterator for ProfiledScanStream {
     type Item = Result<RecordBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.inner.next() {
+        let started = Instant::now();
+        let next = self.inner.next();
+        self.next_wait_nanos = self
+            .next_wait_nanos
+            .saturating_add(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        match next {
             Some(Ok(batch)) => {
                 self.rows = self.rows.saturating_add(batch.num_rows());
                 self.batches = self.batches.saturating_add(1);
@@ -3313,6 +3357,10 @@ impl LateMaterializationPolicy {
         }
         true
     }
+
+    fn has_selectivity_gate(&self) -> bool {
+        self.max_selected_ratio.is_some() || self.max_selector_run_ratio.is_some()
+    }
 }
 
 pub struct LateMaterializedChunkResult<T> {
@@ -3385,6 +3433,62 @@ fn q14_late_materialized_row_group_chunk() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(4)
+}
+
+fn late_materialization_sample_row_groups() -> usize {
+    std::env::var("DODAM_LATE_SAMPLE_ROW_GROUPS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1)
+}
+
+fn late_materialization_sample_enabled(
+    policy: LateMaterializationPolicy,
+    predicate_columns: usize,
+    payload_columns: usize,
+) -> bool {
+    if !policy.has_selectivity_gate() || late_materialization_sample_row_groups() == 0 {
+        return false;
+    }
+    if std::env::var_os("DODAM_LATE_SAMPLE_FORCE").is_some() {
+        return true;
+    }
+    payload_columns >= predicate_columns.saturating_mul(2).max(1)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sample_late_materialized_selection<State, BuildSelection>(
+    path: PathBuf,
+    batch_size: usize,
+    row_groups: Vec<usize>,
+    predicate_projection: &Projection,
+    metadata_cache: &ParquetMetadataCache,
+    file_cache: Arc<ParquetFileCache>,
+    object_store: &dyn ObjectStore,
+    mut state: State,
+    mut build_selection: BuildSelection,
+) -> Result<Option<LateMaterializedMetrics>>
+where
+    BuildSelection: FnMut(RecordBatch, &mut LateSelectionBuilder, &mut State) -> Result<Option<()>>,
+{
+    let mut predicate_reader = ParquetBatchReader::try_new_with_row_groups(
+        path,
+        batch_size,
+        predicate_projection,
+        row_groups,
+        metadata_cache,
+        file_cache,
+        object_store,
+    )?;
+    let mut selection_builder = LateSelectionBuilder::default();
+    while let Some(batch) = predicate_reader.next() {
+        let batch = batch?;
+        if build_selection(batch, &mut selection_builder, &mut state)?.is_none() {
+            return Ok(None);
+        }
+    }
+    let (_, metrics) = selection_builder.finish();
+    Ok(Some(metrics))
 }
 
 #[allow(clippy::too_many_arguments)]
