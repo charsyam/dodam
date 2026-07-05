@@ -1232,6 +1232,10 @@ Tried and rejected or neutral:
       - The ordered path did become active, but Q21 warmed around `0.086-0.090s` with `Q21 ordered lineitem counts` at `~75-78ms`.
       - The existing parallel row-group fallback was faster in the same run range (`~0.057-0.064s` Q21). Preserving physical order loses too much scan parallelism for SF=1 lineitem.
       - Conclusion: ordered-run aggregation is only worth revisiting if the scan can preserve row-group order while still decoding row groups in parallel and merging boundary states deterministically.
+    - Added Q21 parallel ordered-lineitem boundary merge:
+      - Reworked the ordered Q21 lineitem path to use `parquet_row_group_map`, preserving parallel row-group decode while returning chunk outputs in row-group order.
+      - Each chunk counts fully internal orders and returns first/last order-state boundaries. The final merge stitches adjacent boundaries deterministically before counting qualifying suppliers.
+      - Same-binary comparison: fallback Q21 was `~0.056-0.063s`; the new ordered partial merge was `~0.017-0.018s`, with identical Q21 Parquet output. Full SF=1 `query-file` warmed around `0.664-0.676s`.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.

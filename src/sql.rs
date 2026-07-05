@@ -16085,57 +16085,66 @@ async fn q21_lineitem_supplier_counts_ordered(
     final_orders: &Q21FinalOrders,
     suppliers: &HashMap<i64, String>,
 ) -> Result<Option<HashMap<i64, u64>>> {
-    let mut stream = engine
-        .scan_parquet_batches(
+    let projection = Projection::Columns(vec![
+        "l_orderkey".to_string(),
+        "l_suppkey".to_string(),
+        "l_receiptdate".to_string(),
+        "l_commitdate".to_string(),
+    ]);
+    let final_orders = Arc::new(final_orders.clone());
+    let suppliers = Arc::new(suppliers.clone());
+    let Some(chunks) = engine
+        .parquet_row_group_map(
             path,
             batch_size,
-            None,
-            Projection::Columns(vec![
-                "l_orderkey".to_string(),
-                "l_suppkey".to_string(),
-                "l_receiptdate".to_string(),
-                "l_commitdate".to_string(),
-            ]),
-            None,
+            projection,
+            q21_row_group_map_chunk(),
+            Q21OrderedLineitemChunkState::default,
+            {
+                let final_orders = final_orders.clone();
+                let suppliers = suppliers.clone();
+                move |batch, state| {
+                    q21_ordered_lineitem_chunk_batch(
+                        &batch,
+                        &final_orders,
+                        suppliers.as_ref(),
+                        state,
+                    )
+                }
+            },
+            |state| Ok(Some(state)),
         )
-        .await?;
-    let mut counts = HashMap::<i64, u64>::with_capacity(suppliers.len());
-    let mut current_orderkey = None::<i64>;
-    let mut current_selected = false;
-    let mut current_state = Q21OrderState::default();
-    let dense_final_orders = final_orders.dense_contains_slice();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        if !q21_ordered_lineitem_counts_projected_batch(
-            &batch,
-            final_orders,
-            dense_final_orders,
-            suppliers,
-            &mut counts,
-            &mut current_orderkey,
-            &mut current_selected,
-            &mut current_state,
-        )? {
-            return Ok(None);
-        }
-    }
-    if current_selected {
-        q21_count_qualifying_order(&mut counts, suppliers, &current_state);
-    }
-    Ok(Some(counts))
+        .await?
+    else {
+        return Ok(None);
+    };
+    q21_merge_ordered_lineitem_chunks(chunks, suppliers.as_ref())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn q21_ordered_lineitem_counts_projected_batch(
+#[derive(Default)]
+struct Q21OrderedLineitemChunkState {
+    counts: HashMap<i64, u64>,
+    current_orderkey: Option<i64>,
+    current_selected: bool,
+    current_state: Q21OrderState,
+    first: Option<Q21OrderedLineitemBoundary>,
+    last: Option<Q21OrderedLineitemBoundary>,
+    order_count: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Q21OrderedLineitemBoundary {
+    orderkey: i64,
+    selected: bool,
+    state: Q21OrderState,
+}
+
+fn q21_ordered_lineitem_chunk_batch(
     batch: &RecordBatch,
     final_orders: &Q21FinalOrders,
-    dense_final_orders: Option<&[bool]>,
     suppliers: &HashMap<i64, String>,
-    counts: &mut HashMap<i64, u64>,
-    current_orderkey: &mut Option<i64>,
-    current_selected: &mut bool,
-    current_state: &mut Q21OrderState,
-) -> Result<bool> {
+    state: &mut Q21OrderedLineitemChunkState,
+) -> Result<Option<()>> {
     if batch.num_columns() == 4
         && let (Some(orderkeys), Some(suppkeys), Some(receipt), Some(commit)) = (
             batch.column(0).as_any().downcast_ref::<Int64Array>(),
@@ -16144,120 +16153,157 @@ fn q21_ordered_lineitem_counts_projected_batch(
             batch.column(3).as_any().downcast_ref::<Date32Array>(),
         )
     {
-        return q21_ordered_lineitem_counts_typed_batch(
+        return q21_ordered_lineitem_chunk_typed_batch(
             orderkeys,
             suppkeys,
             receipt,
             commit,
             final_orders,
-            dense_final_orders,
             suppliers,
-            counts,
-            current_orderkey,
-            current_selected,
-            current_state,
+            state,
         );
     }
-    q21_ordered_lineitem_counts_batch(
-        batch,
-        final_orders,
-        dense_final_orders,
-        suppliers,
-        counts,
-        current_orderkey,
-        current_selected,
-        current_state,
-    )
+    Ok(None)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn q21_ordered_lineitem_counts_batch(
-    batch: &RecordBatch,
-    final_orders: &Q21FinalOrders,
-    dense_final_orders: Option<&[bool]>,
-    suppliers: &HashMap<i64, String>,
-    counts: &mut HashMap<i64, u64>,
-    current_orderkey: &mut Option<i64>,
-    current_selected: &mut bool,
-    current_state: &mut Q21OrderState,
-) -> Result<bool> {
-    let orderkeys = batch_column(batch, "l_orderkey")?;
-    let suppkeys = batch_column(batch, "l_suppkey")?;
-    let receipt = batch_column(batch, "l_receiptdate")?;
-    let commit = batch_column(batch, "l_commitdate")?;
-    let (Some(orderkeys), Some(suppkeys), Some(receipt), Some(commit)) = (
-        orderkeys.as_any().downcast_ref::<Int64Array>(),
-        suppkeys.as_any().downcast_ref::<Int64Array>(),
-        receipt.as_any().downcast_ref::<Date32Array>(),
-        commit.as_any().downcast_ref::<Date32Array>(),
-    ) else {
-        return Ok(false);
-    };
-    q21_ordered_lineitem_counts_typed_batch(
-        orderkeys,
-        suppkeys,
-        receipt,
-        commit,
-        final_orders,
-        dense_final_orders,
-        suppliers,
-        counts,
-        current_orderkey,
-        current_selected,
-        current_state,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn q21_ordered_lineitem_counts_typed_batch(
+fn q21_ordered_lineitem_chunk_typed_batch(
     orderkeys: &Int64Array,
     suppkeys: &Int64Array,
     receipt: &Date32Array,
     commit: &Date32Array,
     final_orders: &Q21FinalOrders,
-    dense_final_orders: Option<&[bool]>,
     suppliers: &HashMap<i64, String>,
-    counts: &mut HashMap<i64, u64>,
-    current_orderkey: &mut Option<i64>,
-    current_selected: &mut bool,
-    current_state: &mut Q21OrderState,
-) -> Result<bool> {
+    chunk: &mut Q21OrderedLineitemChunkState,
+) -> Result<Option<()>> {
+    let dense_final_orders = final_orders.dense_contains_slice();
     for row in 0..orderkeys.len() {
         if orderkeys.is_null(row) || suppkeys.is_null(row) {
             continue;
         }
         let orderkey = orderkeys.value(row);
-        if let Some(current) = *current_orderkey {
+        if let Some(current) = chunk.current_orderkey {
             if orderkey < current {
-                return Ok(false);
+                return Ok(None);
             }
             if orderkey != current {
-                if *current_selected {
-                    q21_count_qualifying_order(counts, suppliers, current_state);
-                }
-                *current_state = Q21OrderState::default();
-                *current_selected =
+                q21_ordered_chunk_finish_current(chunk, suppliers);
+                chunk.current_orderkey = Some(orderkey);
+                chunk.current_selected =
                     q21_final_order_contains(final_orders, dense_final_orders, orderkey);
-                *current_orderkey = Some(orderkey);
+                chunk.current_state = Q21OrderState::default();
+                chunk.order_count += 1;
             }
         } else {
-            *current_selected =
+            chunk.current_orderkey = Some(orderkey);
+            chunk.current_selected =
                 q21_final_order_contains(final_orders, dense_final_orders, orderkey);
-            *current_orderkey = Some(orderkey);
+            chunk.order_count = 1;
         }
-        if !*current_selected {
+        if !chunk.current_selected {
             continue;
         }
         let suppkey = suppkeys.value(row);
-        current_state.add_supplier(suppkey);
-        if receipt.is_null(row) || commit.is_null(row) {
-            continue;
-        }
-        if receipt.value(row) > commit.value(row) {
-            current_state.add_late_supplier(suppkey);
+        chunk.current_state.add_supplier(suppkey);
+        if receipt.is_valid(row) && commit.is_valid(row) && receipt.value(row) > commit.value(row) {
+            chunk.current_state.add_late_supplier(suppkey);
         }
     }
-    Ok(true)
+    Ok(Some(()))
+}
+
+fn q21_ordered_chunk_finish_current(
+    chunk: &mut Q21OrderedLineitemChunkState,
+    suppliers: &HashMap<i64, String>,
+) {
+    let Some(orderkey) = chunk.current_orderkey else {
+        return;
+    };
+    let boundary = Q21OrderedLineitemBoundary {
+        orderkey,
+        selected: chunk.current_selected,
+        state: chunk.current_state,
+    };
+    if chunk.order_count == 1 {
+        chunk.first = Some(boundary);
+    } else if boundary.selected {
+        q21_count_qualifying_order(&mut chunk.counts, suppliers, &boundary.state);
+    }
+}
+
+fn q21_merge_ordered_lineitem_chunks(
+    mut chunks: Vec<Q21OrderedLineitemChunkState>,
+    suppliers: &HashMap<i64, String>,
+) -> Result<Option<HashMap<i64, u64>>> {
+    let mut counts = HashMap::<i64, u64>::with_capacity(suppliers.len());
+    let mut pending = None::<Q21OrderedLineitemBoundary>;
+    for chunk in chunks.iter_mut() {
+        if let Some(orderkey) = chunk.current_orderkey {
+            let boundary = Q21OrderedLineitemBoundary {
+                orderkey,
+                selected: chunk.current_selected,
+                state: chunk.current_state,
+            };
+            if chunk.order_count <= 1 {
+                chunk.first = Some(boundary);
+            } else {
+                chunk.last = Some(boundary);
+            }
+        }
+        if let Some(first) = chunk.first {
+            q21_merge_ordered_boundary(
+                &mut counts,
+                suppliers,
+                &mut pending,
+                first,
+                chunk.last.is_some(),
+            );
+        }
+        for (suppkey, count) in chunk.counts.drain() {
+            *counts.entry(suppkey).or_insert(0) += count;
+        }
+        if let Some(last) = chunk.last {
+            pending = Some(last);
+        }
+    }
+    if let Some(boundary) = pending
+        && boundary.selected
+    {
+        q21_count_qualifying_order(&mut counts, suppliers, &boundary.state);
+    }
+    Ok(Some(counts))
+}
+
+fn q21_merge_ordered_boundary(
+    counts: &mut HashMap<i64, u64>,
+    suppliers: &HashMap<i64, String>,
+    pending: &mut Option<Q21OrderedLineitemBoundary>,
+    boundary: Q21OrderedLineitemBoundary,
+    complete_in_chunk: bool,
+) {
+    if let Some(mut existing) = pending.take() {
+        if existing.orderkey == boundary.orderkey {
+            existing.state.merge(boundary.state);
+            existing.selected |= boundary.selected;
+            if complete_in_chunk {
+                if existing.selected {
+                    q21_count_qualifying_order(counts, suppliers, &existing.state);
+                }
+            } else {
+                *pending = Some(existing);
+            }
+            return;
+        }
+        if existing.selected {
+            q21_count_qualifying_order(counts, suppliers, &existing.state);
+        }
+    }
+    if complete_in_chunk {
+        if boundary.selected {
+            q21_count_qualifying_order(counts, suppliers, &boundary.state);
+        }
+    } else {
+        *pending = Some(boundary);
+    }
 }
 
 fn q21_count_qualifying_order(
