@@ -1223,6 +1223,11 @@ Tried and rejected or neutral:
       - Added a shared aggregate column read plan that separates payload columns (aggregate inputs and group keys), predicate columns (filter inputs), and normal scan columns (`payload + predicate`).
       - Normal aggregate scans and late-materialized aggregate attempts now use the same helper, so future optimizer rules can decide between full scan and late payload reads from one place instead of duplicating projection logic.
       - `DODAM_COLUMN_READ_PROFILE=1` prints this decision; `DODAM_PARQUET_COLUMN_PROFILE=1` also enables it so column role decisions and Parquet bytes/encoding attribution can be read together.
+    - Tried and rejected preserving Parquet dictionary arrays for Q01's tiny string group keys:
+      - Added a local opt-in experiment that forced `l_returnflag/l_linestatus` to Arrow `Dictionary<Int32, Utf8>` and consumed dictionary keys directly in the Q01 aggregate loop.
+      - Correctness matched Q01, and Q01-only warm samples improved only from roughly `0.068-0.085s` to `0.065-0.070s`.
+      - Full SF=1 TPC-H `query-file` Parquet COPY was unchanged (`~0.68-0.70s` warm), and a global column-name env broke other queries that expect `StringArray` for `l_returnflag` unless projection-aware guards were added.
+      - Conclusion: this is not a meaningful general optimization. The remaining Q01 gap is not dominated by decoding one-byte string group keys; it is still mostly numeric column decode/materialization and scan/operator dispatch.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.
