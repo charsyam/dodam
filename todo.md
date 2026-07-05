@@ -1228,6 +1228,10 @@ Tried and rejected or neutral:
       - Correctness matched Q01, and Q01-only warm samples improved only from roughly `0.068-0.085s` to `0.065-0.070s`.
       - Full SF=1 TPC-H `query-file` Parquet COPY was unchanged (`~0.68-0.70s` warm), and a global column-name env broke other queries that expect `StringArray` for `l_returnflag` unless projection-aware guards were added.
       - Conclusion: this is not a meaningful general optimization. The remaining Q01 gap is not dominated by decoding one-byte string group keys; it is still mostly numeric column decode/materialization and scan/operator dispatch.
+    - Tried and rejected forcing Q21 ordered-lineitem counting through preserve-order scan:
+      - The ordered path did become active, but Q21 warmed around `0.086-0.090s` with `Q21 ordered lineitem counts` at `~75-78ms`.
+      - The existing parallel row-group fallback was faster in the same run range (`~0.057-0.064s` Q21). Preserving physical order loses too much scan parallelism for SF=1 lineitem.
+      - Conclusion: ordered-run aggregation is only worth revisiting if the scan can preserve row-group order while still decoding row groups in parallel and merging boundary states deterministically.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.
