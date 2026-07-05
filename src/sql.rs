@@ -32,7 +32,8 @@ use crate::dense::{
 };
 use crate::engine::{
     DodamEngine, JoinAlgorithm, JoinParquetRequest, LateMaterializationPolicy,
-    LateMaterializedMetrics, LateSelectionBuilder,
+    LateMaterializedMetrics, LateSelectionBuilder, OrderedRowGroupBoundary, OrderedRowGroupChunk,
+    merge_ordered_row_group_chunks,
 };
 use crate::error::{DodamError, Result};
 use crate::execution::JoinType;
@@ -5032,13 +5033,15 @@ async fn q09_supply_costs(
         )
         .await?;
     let part_keys = Arc::new(part_keys.clone());
-    parallel_batch_fold(
+    let costs = parallel_batch_fold(
         &mut stream,
         move |batch| q09_supply_costs_batch(batch, &part_keys),
         Q09SupplyCosts::new(),
         Q09SupplyCosts::merge,
         "Q09 supply costs",
-    )
+    )?;
+    q09_log_supply_cost_layout(&costs);
+    Ok(costs)
 }
 
 fn q09_supply_costs_batch(
@@ -5101,10 +5104,10 @@ enum Q09SupplyCosts {
 
 impl Q09SupplyCosts {
     fn new() -> Self {
-        if std::env::var_os("DODAM_Q09_SUPPLYCOST_FANOUT").is_some() {
-            Self::SmallFanout(fast_hash_map())
-        } else if std::env::var_os("DODAM_Q09_SUPPLYCOST_PAIR_HASH").is_some() {
+        if std::env::var_os("DODAM_Q09_SUPPLYCOST_PAIR_HASH").is_some() {
             Self::PairHash(fast_hash_map())
+        } else if std::env::var_os("DODAM_Q09_SUPPLYCOST_FANOUT").is_some() {
+            Self::SmallFanout(fast_hash_map())
         } else {
             Self::PackedU64(fast_hash_map())
         }
@@ -5124,12 +5127,24 @@ impl Q09SupplyCosts {
                 costs.insert(key, supplycost);
             }
             Self::SmallFanout(costs) => {
-                let entries = costs.entry(partkey).or_default();
-                if let Some((_, cost)) = entries.iter_mut().find(|(key, _)| *key == suppkey) {
-                    *cost = supplycost;
-                } else {
-                    entries.push((suppkey, supplycost));
+                let should_convert = {
+                    let entries = costs.entry(partkey).or_default();
+                    if let Some((_, cost)) = entries.iter_mut().find(|(key, _)| *key == suppkey) {
+                        *cost = supplycost;
+                        return;
+                    }
+                    entries.len() >= q09_supplycost_max_fanout()
+                };
+                if should_convert {
+                    self.convert_small_fanout_to_packed();
+                    self.insert(partkey, suppkey, supplycost);
+                    return;
                 }
+                let entries = match self {
+                    Self::SmallFanout(costs) => costs.entry(partkey).or_default(),
+                    _ => unreachable!("Q09 supply cost layout converted"),
+                };
+                entries.push((suppkey, supplycost));
             }
         }
     }
@@ -5180,6 +5195,95 @@ impl Q09SupplyCosts {
         }
         *self = Self::PairHash(pair_hash);
     }
+
+    fn convert_small_fanout_to_packed(&mut self) {
+        let Self::SmallFanout(fanout) = self else {
+            return;
+        };
+        let mut packed = fast_hash_map();
+        let mut pair_hash = None::<FastHashMap<(i64, i64), f64>>;
+        for (partkey, entries) in std::mem::take(fanout) {
+            for (suppkey, supplycost) in entries {
+                if let Some(pair_hash) = pair_hash.as_mut() {
+                    pair_hash.insert((partkey, suppkey), supplycost);
+                } else if let Some(key) = q09_pack_part_supp_key(partkey, suppkey) {
+                    packed.insert(key, supplycost);
+                } else {
+                    let mut converted = fast_hash_map_with_capacity(packed.len() + 1);
+                    for (key, cost) in std::mem::take(&mut packed) {
+                        converted.insert(q09_unpack_part_supp_key(key), cost);
+                    }
+                    converted.insert((partkey, suppkey), supplycost);
+                    pair_hash = Some(converted);
+                }
+            }
+        }
+        *self = if let Some(pair_hash) = pair_hash {
+            Self::PairHash(pair_hash)
+        } else {
+            Self::PackedU64(packed)
+        };
+    }
+
+    fn layout_name(&self) -> &'static str {
+        match self {
+            Self::PairHash(_) => "pair_hash",
+            Self::PackedU64(_) => "packed_u64",
+            Self::SmallFanout(_) => "small_fanout",
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::PairHash(costs) => costs.len(),
+            Self::PackedU64(costs) => costs.len(),
+            Self::SmallFanout(costs) => costs.values().map(Vec::len).sum(),
+        }
+    }
+
+    fn part_keys_len(&self) -> usize {
+        match self {
+            Self::PairHash(costs) => costs
+                .keys()
+                .map(|(partkey, _)| *partkey)
+                .collect::<FastHashSet<_>>()
+                .len(),
+            Self::PackedU64(costs) => costs
+                .keys()
+                .map(|key| q09_unpack_part_supp_key(*key).0)
+                .collect::<FastHashSet<_>>()
+                .len(),
+            Self::SmallFanout(costs) => costs.len(),
+        }
+    }
+
+    fn max_fanout(&self) -> usize {
+        match self {
+            Self::SmallFanout(costs) => costs.values().map(Vec::len).max().unwrap_or(0),
+            Self::PairHash(_) | Self::PackedU64(_) => 0,
+        }
+    }
+}
+
+fn q09_supplycost_max_fanout() -> usize {
+    std::env::var("DODAM_Q09_SUPPLYCOST_MAX_FANOUT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(16)
+}
+
+fn q09_log_supply_cost_layout(costs: &Q09SupplyCosts) {
+    if !tpch_profile_enabled() {
+        return;
+    }
+    eprintln!(
+        "[dodam:tpch-profile] Q09 supply cost layout: layout={} entries={} part_keys={} max_fanout={}",
+        costs.layout_name(),
+        costs.len(),
+        costs.part_keys_len(),
+        costs.max_fanout()
+    );
 }
 
 fn q09_pack_part_supp_key(partkey: i64, suppkey: i64) -> Option<u64> {
@@ -5369,7 +5473,7 @@ fn projection_column_count(projection: &Projection) -> usize {
 }
 
 fn q09_profit_rows_from_groups(
-    groups: FastHashMap<(i64, i32), f64>,
+    groups: Q09ProfitGroups,
     nation_names: &HashMap<i64, String>,
 ) -> Result<Vec<Q09Row>> {
     let mut rows = groups
@@ -5612,11 +5716,7 @@ fn q09_late_consume_profit_payload_batch(
         state.partial.profile.supply_hits += 1;
         let amount = extendedprice * (1.0 - discount) - supplycost * quantity;
         state.partial.profile.amount_rows += 1;
-        *state
-            .partial
-            .groups
-            .entry((nationkey, o_year))
-            .or_insert(0.0) += amount;
+        state.partial.groups.add(nationkey, o_year, amount);
     }
     Ok(Some(()))
 }
@@ -5671,11 +5771,7 @@ fn q09_late_consume_profit_decimal_batch(
                 * revenue_scale
                 - supplycost * (quantity_values[row] as f64) * quantity_scale;
             state.partial.profile.amount_rows += 1;
-            *state
-                .partial
-                .groups
-                .entry((nationkey, o_year))
-                .or_insert(0.0) += amount;
+            state.partial.groups.add(nationkey, o_year, amount);
         }
         return Ok(());
     }
@@ -5714,26 +5810,61 @@ fn q09_late_consume_profit_decimal_batch(
             * revenue_scale
             - supplycost * (quantity_values[row] as f64) * quantity_scale;
         state.partial.profile.amount_rows += 1;
-        *state
-            .partial
-            .groups
-            .entry((nationkey, o_year))
-            .or_insert(0.0) += amount;
+        state.partial.groups.add(nationkey, o_year, amount);
     }
     Ok(())
 }
 
 #[derive(Default)]
 struct Q09ProfitPartial {
-    groups: FastHashMap<(i64, i32), f64>,
+    groups: Q09ProfitGroups,
     profile: Q09ProfitProfile,
 }
 
 impl Q09ProfitPartial {
     fn merge(&mut self, batch: Self) {
-        merge_f64_groups(&mut self.groups, batch.groups);
+        self.groups.merge(batch.groups);
         self.profile.add(batch.profile);
     }
+}
+
+#[derive(Default)]
+struct Q09ProfitGroups {
+    packed: FastHashMap<u64, f64>,
+    fallback: FastHashMap<(i64, i32), f64>,
+}
+
+impl Q09ProfitGroups {
+    fn add(&mut self, nationkey: i64, year: i32, amount: f64) {
+        if let Some(key) = q09_pack_profit_group_key(nationkey, year) {
+            *self.packed.entry(key).or_insert(0.0) += amount;
+        } else {
+            *self.fallback.entry((nationkey, year)).or_insert(0.0) += amount;
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        for (key, amount) in other.packed {
+            *self.packed.entry(key).or_insert(0.0) += amount;
+        }
+        merge_f64_groups(&mut self.fallback, other.fallback);
+    }
+
+    fn into_iter(self) -> impl Iterator<Item = ((i64, i32), f64)> {
+        self.packed
+            .into_iter()
+            .map(|(key, amount)| (q09_unpack_profit_group_key(key), amount))
+            .chain(self.fallback)
+    }
+}
+
+fn q09_pack_profit_group_key(nationkey: i64, year: i32) -> Option<u64> {
+    let nationkey = u32::try_from(nationkey).ok()?;
+    Some((u64::from(nationkey) << 32) | u64::from(year as u32))
+}
+
+fn q09_unpack_profit_group_key(key: u64) -> (i64, i32) {
+    ((key >> 32) as i64, (key as u32) as i32)
 }
 
 #[derive(Default)]
@@ -5814,7 +5945,7 @@ fn q09_profit_batch(
     )? {
         return Ok(groups);
     }
-    let mut groups = fast_hash_map();
+    let mut groups = Q09ProfitGroups::default();
     let mut profile = Q09ProfitProfile::default();
     let collect_profile = tpch_profile_enabled();
     let dense_part_keys = part_keys.dense_contains_slice();
@@ -5899,7 +6030,7 @@ fn q09_profit_batch(
         if collect_profile {
             profile.amount_rows += 1;
         }
-        *groups.entry((nationkey, o_year)).or_insert(0.0) += amount;
+        groups.add(nationkey, o_year, amount);
     }
     Ok(Q09ProfitPartial { groups, profile })
 }
@@ -6000,7 +6131,7 @@ fn q09_profit_decimal_batch(
         return Ok(None);
     };
 
-    let mut groups = fast_hash_map();
+    let mut groups = Q09ProfitGroups::default();
     let mut profile = Q09ProfitProfile::default();
     let collect_profile = tpch_profile_enabled();
     let dense_part_keys = part_keys.dense_contains_slice();
@@ -6114,7 +6245,7 @@ fn q09_profit_decimal_batch(
             if collect_profile {
                 profile.amount_rows += 1;
             }
-            *groups.entry((nationkey, o_year)).or_insert(0.0) += amount;
+            groups.add(nationkey, o_year, amount);
         }
         return Ok(Some(Q09ProfitPartial { groups, profile }));
     }
@@ -6199,7 +6330,7 @@ fn q09_profit_decimal_batch(
         if collect_profile {
             profile.amount_rows += 1;
         }
-        *groups.entry((nationkey, o_year)).or_insert(0.0) += amount;
+        groups.add(nationkey, o_year, amount);
     }
     Ok(Some(Q09ProfitPartial { groups, profile }))
 }
@@ -6222,7 +6353,7 @@ fn q09_profit_decimal_batch_matched_index(
     supply_costs: &Q09SupplyCosts,
     collect_profile: bool,
 ) -> Q09ProfitPartial {
-    let mut groups = fast_hash_map();
+    let mut groups = Q09ProfitGroups::default();
     let mut profile = Q09ProfitProfile::default();
     if collect_profile {
         profile.rows = partkey_values.len();
@@ -6298,7 +6429,7 @@ fn q09_profit_decimal_batch_matched_index(
                 .amount_nanos
                 .saturating_add(sql_elapsed_nanos(started));
         }
-        *groups.entry((nationkey, o_year)).or_insert(0.0) += amount;
+        groups.add(nationkey, o_year, amount);
         if collect_profile {
             profile.amount_rows += 1;
         }
@@ -16118,7 +16249,10 @@ async fn q21_lineitem_supplier_counts_ordered(
     else {
         return Ok(None);
     };
-    q21_merge_ordered_lineitem_chunks(chunks, suppliers.as_ref())
+    Ok(Some(q21_merge_ordered_lineitem_chunks(
+        chunks,
+        suppliers.as_ref(),
+    )))
 }
 
 #[derive(Default)]
@@ -16127,14 +16261,13 @@ struct Q21OrderedLineitemChunkState {
     current_orderkey: Option<i64>,
     current_selected: bool,
     current_state: Q21OrderState,
-    first: Option<Q21OrderedLineitemBoundary>,
-    last: Option<Q21OrderedLineitemBoundary>,
+    first: Option<OrderedRowGroupBoundary<i64, Q21SelectedOrderState>>,
+    last: Option<OrderedRowGroupBoundary<i64, Q21SelectedOrderState>>,
     order_count: usize,
 }
 
-#[derive(Clone, Copy)]
-struct Q21OrderedLineitemBoundary {
-    orderkey: i64,
+#[derive(Clone, Copy, Default)]
+struct Q21SelectedOrderState {
     selected: bool,
     state: Q21OrderState,
 }
@@ -16218,30 +16351,33 @@ fn q21_ordered_chunk_finish_current(
     let Some(orderkey) = chunk.current_orderkey else {
         return;
     };
-    let boundary = Q21OrderedLineitemBoundary {
-        orderkey,
-        selected: chunk.current_selected,
-        state: chunk.current_state,
+    let boundary = OrderedRowGroupBoundary {
+        key: orderkey,
+        state: Q21SelectedOrderState {
+            selected: chunk.current_selected,
+            state: chunk.current_state,
+        },
     };
     if chunk.order_count == 1 {
         chunk.first = Some(boundary);
-    } else if boundary.selected {
-        q21_count_qualifying_order(&mut chunk.counts, suppliers, &boundary.state);
+    } else if boundary.state.selected {
+        q21_count_qualifying_order(&mut chunk.counts, suppliers, &boundary.state.state);
     }
 }
 
 fn q21_merge_ordered_lineitem_chunks(
     mut chunks: Vec<Q21OrderedLineitemChunkState>,
     suppliers: &HashMap<i64, String>,
-) -> Result<Option<HashMap<i64, u64>>> {
-    let mut counts = HashMap::<i64, u64>::with_capacity(suppliers.len());
-    let mut pending = None::<Q21OrderedLineitemBoundary>;
-    for chunk in chunks.iter_mut() {
+) -> HashMap<i64, u64> {
+    let mut ordered_chunks = Vec::with_capacity(chunks.len());
+    for mut chunk in chunks.drain(..) {
         if let Some(orderkey) = chunk.current_orderkey {
-            let boundary = Q21OrderedLineitemBoundary {
-                orderkey,
-                selected: chunk.current_selected,
-                state: chunk.current_state,
+            let boundary = OrderedRowGroupBoundary {
+                key: orderkey,
+                state: Q21SelectedOrderState {
+                    selected: chunk.current_selected,
+                    state: chunk.current_state,
+                },
             };
             if chunk.order_count <= 1 {
                 chunk.first = Some(boundary);
@@ -16249,61 +16385,32 @@ fn q21_merge_ordered_lineitem_chunks(
                 chunk.last = Some(boundary);
             }
         }
-        if let Some(first) = chunk.first {
-            q21_merge_ordered_boundary(
-                &mut counts,
-                suppliers,
-                &mut pending,
-                first,
-                chunk.last.is_some(),
-            );
-        }
-        for (suppkey, count) in chunk.counts.drain() {
-            *counts.entry(suppkey).or_insert(0) += count;
-        }
-        if let Some(last) = chunk.last {
-            pending = Some(last);
-        }
+        ordered_chunks.push(OrderedRowGroupChunk {
+            output: chunk.counts,
+            first: chunk.first,
+            last: chunk.last,
+        });
     }
-    if let Some(boundary) = pending
-        && boundary.selected
-    {
-        q21_count_qualifying_order(&mut counts, suppliers, &boundary.state);
-    }
-    Ok(Some(counts))
-}
-
-fn q21_merge_ordered_boundary(
-    counts: &mut HashMap<i64, u64>,
-    suppliers: &HashMap<i64, String>,
-    pending: &mut Option<Q21OrderedLineitemBoundary>,
-    boundary: Q21OrderedLineitemBoundary,
-    complete_in_chunk: bool,
-) {
-    if let Some(mut existing) = pending.take() {
-        if existing.orderkey == boundary.orderkey {
-            existing.state.merge(boundary.state);
-            existing.selected |= boundary.selected;
-            if complete_in_chunk {
-                if existing.selected {
-                    q21_count_qualifying_order(counts, suppliers, &existing.state);
-                }
-            } else {
-                *pending = Some(existing);
+    let mut counts = HashMap::<i64, u64>::with_capacity(suppliers.len());
+    merge_ordered_row_group_chunks(
+        ordered_chunks,
+        &mut counts,
+        |counts, chunk_counts| {
+            for (suppkey, count) in chunk_counts {
+                *counts.entry(suppkey).or_insert(0) += count;
             }
-            return;
-        }
-        if existing.selected {
-            q21_count_qualifying_order(counts, suppliers, &existing.state);
-        }
-    }
-    if complete_in_chunk {
-        if boundary.selected {
-            q21_count_qualifying_order(counts, suppliers, &boundary.state);
-        }
-    } else {
-        *pending = Some(boundary);
-    }
+        },
+        |left, right| {
+            left.selected |= right.selected;
+            left.state.merge(right.state);
+        },
+        |counts, boundary| {
+            if boundary.selected {
+                q21_count_qualifying_order(counts, suppliers, &boundary.state);
+            }
+        },
+    );
+    counts
 }
 
 fn q21_count_qualifying_order(

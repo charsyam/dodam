@@ -69,6 +69,82 @@ pub struct LocalExecutionGraphOutput {
     pub stage_metrics: Vec<LocalStageExecutionMetrics>,
 }
 
+pub struct OrderedRowGroupBoundary<K, State> {
+    pub key: K,
+    pub state: State,
+}
+
+pub struct OrderedRowGroupChunk<K, State, Output> {
+    pub output: Output,
+    pub first: Option<OrderedRowGroupBoundary<K, State>>,
+    pub last: Option<OrderedRowGroupBoundary<K, State>>,
+}
+
+pub fn merge_ordered_row_group_chunks<K, State, Output, MergeOutput, MergeState, EmitState>(
+    chunks: Vec<OrderedRowGroupChunk<K, State, Output>>,
+    output: &mut Output,
+    mut merge_output: MergeOutput,
+    mut merge_state: MergeState,
+    mut emit_state: EmitState,
+) where
+    K: Eq,
+    MergeOutput: FnMut(&mut Output, Output),
+    MergeState: FnMut(&mut State, State),
+    EmitState: FnMut(&mut Output, State),
+{
+    let mut pending = None::<OrderedRowGroupBoundary<K, State>>;
+    for chunk in chunks {
+        if let Some(first) = chunk.first {
+            merge_ordered_row_group_boundary(
+                output,
+                &mut pending,
+                first,
+                chunk.last.is_some(),
+                &mut merge_state,
+                &mut emit_state,
+            );
+        }
+        merge_output(output, chunk.output);
+        if let Some(last) = chunk.last {
+            pending = Some(last);
+        }
+    }
+    if let Some(boundary) = pending {
+        emit_state(output, boundary.state);
+    }
+}
+
+fn merge_ordered_row_group_boundary<K, State, Output, MergeState, EmitState>(
+    output: &mut Output,
+    pending: &mut Option<OrderedRowGroupBoundary<K, State>>,
+    boundary: OrderedRowGroupBoundary<K, State>,
+    complete_in_chunk: bool,
+    merge_state: &mut MergeState,
+    emit_state: &mut EmitState,
+) where
+    K: Eq,
+    MergeState: FnMut(&mut State, State),
+    EmitState: FnMut(&mut Output, State),
+{
+    if let Some(mut existing) = pending.take() {
+        if existing.key == boundary.key {
+            merge_state(&mut existing.state, boundary.state);
+            if complete_in_chunk {
+                emit_state(output, existing.state);
+            } else {
+                *pending = Some(existing);
+            }
+            return;
+        }
+        emit_state(output, existing.state);
+    }
+    if complete_in_chunk {
+        emit_state(output, boundary.state);
+    } else {
+        *pending = Some(boundary);
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LocalExecutionGraphMetrics {
     pub stages_executed: usize,

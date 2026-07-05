@@ -1236,6 +1236,11 @@ Tried and rejected or neutral:
       - Reworked the ordered Q21 lineitem path to use `parquet_row_group_map`, preserving parallel row-group decode while returning chunk outputs in row-group order.
       - Each chunk counts fully internal orders and returns first/last order-state boundaries. The final merge stitches adjacent boundaries deterministically before counting qualifying suppliers.
       - Same-binary comparison: fallback Q21 was `~0.056-0.063s`; the new ordered partial merge was `~0.017-0.018s`, with identical Q21 Parquet output. Full SF=1 `query-file` warmed around `0.664-0.676s`.
+      - Generalized the boundary stitching into `merge_ordered_row_group_chunks` plus reusable ordered boundary/chunk types in the engine layer. Q21 now supplies only its selected-order state merge and emit logic. Post-generalization Q21 stayed around `~0.018-0.020s` with identical output.
+    - Rechecked Q09 lookup/layout options:
+      - `DODAM_Q09_SUPPLYCOST_FANOUT=1` was not stable enough to become the default. One run set favored it slightly, but the next same-binary comparison had packed supply-cost lookup faster (`packed ~0.047-0.054s`, fanout/default attempt ~0.052-0.053s` for Q09 warm samples). Kept packed as default and retained fanout as opt-in.
+      - Added Q09 supply-cost layout profiling (`layout`, `entries`, `part_keys`, `max_fanout`) under `DODAM_TPCH_PROFILE=1`; SF=1 uses `packed_u64`, `42656` entries, `10664` part keys.
+      - Added a packed/fallback accumulator for Q09 `(nationkey, year)` profit groups to avoid tuple hash keys on the hot group update. Q09 output matched prior Parquet output; Q09 samples were mixed (`~0.046-0.059s`), while full `query-file` warm samples were `~0.641-0.671s`. Retain as a small general packed-key cleanup, not a major speed claim.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.
