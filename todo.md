@@ -1168,6 +1168,10 @@ Tried and rejected or neutral:
       - Rejected Q12 row-group pruning on `l_receiptdate`: current SF=1 lineitem row groups all overlap the 1994 receipt-date range, so no row groups were skipped and the extra pruning setup did not help.
       - Rejected Q12 pending-map `FastHashMap`: focused samples were neutral to slightly worse than the default hasher, likely because the dominant cost is scan/decode and selected-row work rather than generic hash quality.
       - Rejected Q12 vector partials and priority-first join-aggregate lowering: vector partials added final reconstruction cost, and priority-first had to build a full `orders` priority map before the lineitem scan, regressing Q12 substantially on this data.
+    - Added `dodam query-file <path>` to execute many semicolon-separated SQL/COPY statements in one Dodam process through the same `query` execution path:
+      - This is mainly a benchmark-control and operational convenience feature. It keeps catalog/metadata/file cache state alive across statements and avoids measuring process startup once per TPC-H query.
+      - SF=1 TPC-H 22-query Parquet COPY sample: `query-file` completed in about `0.84s`, close to the existing in-process runner's `0.80s`. A same-process DuckDB CLI script completed in about `0.67s`, so the fairer current gap is roughly `1.25x` for CLI COPY and `1.19x` for direct in-process execution, rather than the larger per-query CLI gap.
+      - DuckDB `.timer` per-query comparison showed the biggest remaining same-process gaps around Q12, Q03, and Q01; Q09/Q18/Q21 are already competitive or faster in the sampled SF=1 run.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.

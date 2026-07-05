@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -99,6 +99,20 @@ enum Commands {
     Query {
         /// SQL query text.
         sql: String,
+
+        /// Number of rows per Arrow RecordBatch.
+        #[arg(long, default_value_t = DEFAULT_BATCH_SIZE)]
+        batch_size: usize,
+
+        /// COPY TO output buffer size in bytes.
+        #[arg(long)]
+        copy_buffer_size: Option<usize>,
+    },
+
+    /// Execute SQL statements from a file in one process.
+    QueryFile {
+        /// File containing one or more SQL statements separated by semicolons.
+        path: PathBuf,
 
         /// Number of rows per Arrow RecordBatch.
         #[arg(long, default_value_t = DEFAULT_BATCH_SIZE)]
@@ -284,117 +298,169 @@ async fn main() -> Result<()> {
             batch_size,
             copy_buffer_size,
         } => {
-            let command_started = Instant::now();
-            let profile_enabled = copy_profile_enabled();
-            let query_profile_enabled = query_profile_enabled();
-            let copy_parse_started = Instant::now();
-            let copy = parse_copy_to_select(&sql)?;
-            let copy_parse_elapsed = copy_parse_started.elapsed();
-            if let Some(copy) = copy {
-                let mut profile = CopyProfile::new(profile_enabled, command_started);
-                profile.copy_parse = copy_parse_elapsed;
-                let sink_started = Instant::now();
-                let mut sink = CopyFileQuerySink::new(
-                    &copy.path,
-                    copy.format,
-                    copy.header,
-                    copy.parquet_options,
-                    copy_buffer_size,
-                    profile_enabled,
-                )?;
-                profile.sink_create = sink_started.elapsed();
-
-                if copy_sql_may_use_direct_or_streaming(&copy.sql) {
-                    let direct_started = Instant::now();
-                    if let Some(metrics) =
-                        try_execute_sql_to_sink(&engine, &copy.sql, batch_size, &mut sink).await?
-                    {
-                        profile.direct_sink = Some(direct_started.elapsed());
-                        profile.scan_plan_metrics = Some(metrics);
-                        profile.print(sink.stats());
-                        return Ok(());
-                    }
-                    profile.direct_sink = Some(direct_started.elapsed());
-
-                    let streaming_started = Instant::now();
-                    if let Some(stream) =
-                        try_execute_sql_streaming(&engine, &copy.sql, batch_size).await?
-                    {
-                        engine.write_batches_to_sink(stream, &mut sink)?;
-                        profile.streaming = Some(streaming_started.elapsed());
-                        profile.print(sink.stats());
-                        return Ok(());
-                    }
-                    profile.streaming = Some(streaming_started.elapsed());
-                } else {
-                    profile.direct_sink = Some(Duration::ZERO);
-                    profile.streaming = Some(Duration::ZERO);
-                }
-
-                let materialize_started = Instant::now();
-                let output = execute_sql(&engine, &copy.sql, batch_size).await?;
-                profile.materialize = Some(materialize_started.elapsed());
-                let write_output_started = Instant::now();
-                sink.write_output(output)?;
-                profile.write_output = Some(write_output_started.elapsed());
-                let finish_started = Instant::now();
-                sink.finish()?;
-                profile.finish = Some(finish_started.elapsed());
-                profile.print(sink.stats());
-                return Ok(());
+            run_query_sql(&engine, &sql, batch_size, copy_buffer_size).await?;
+        }
+        Commands::QueryFile {
+            path,
+            batch_size,
+            copy_buffer_size,
+        } => {
+            let contents = fs::read_to_string(path)?;
+            let statements = split_sql_statements(&contents);
+            for statement in statements {
+                run_query_sql(&engine, &statement, batch_size, copy_buffer_size).await?;
             }
-
-            let mut sink = StdoutQuerySink;
-            let direct_started = Instant::now();
-            if try_execute_sql_to_sink(&engine, &sql, batch_size, &mut sink)
-                .await?
-                .is_some()
-            {
-                print_query_profile(
-                    query_profile_enabled,
-                    command_started,
-                    copy_parse_elapsed,
-                    Some(direct_started.elapsed()),
-                    None,
-                    None,
-                    None,
-                );
-                return Ok(());
-            }
-            let direct_elapsed = direct_started.elapsed();
-            let streaming_started = Instant::now();
-            if let Some(stream) = try_execute_sql_streaming(&engine, &sql, batch_size).await? {
-                engine.write_batches_to_sink(stream, &mut sink)?;
-                print_query_profile(
-                    query_profile_enabled,
-                    command_started,
-                    copy_parse_elapsed,
-                    Some(direct_elapsed),
-                    Some(streaming_started.elapsed()),
-                    None,
-                    None,
-                );
-                return Ok(());
-            }
-            let streaming_elapsed = streaming_started.elapsed();
-            let execute_started = Instant::now();
-            let output = execute_sql(&engine, &sql, batch_size).await?;
-            let execute_elapsed = execute_started.elapsed();
-            let write_started = Instant::now();
-            sink.write_output(output)?;
-            print_query_profile(
-                query_profile_enabled,
-                command_started,
-                copy_parse_elapsed,
-                Some(direct_elapsed),
-                Some(streaming_elapsed),
-                Some(execute_elapsed),
-                Some(write_started.elapsed()),
-            );
         }
     }
 
     Ok(())
+}
+
+async fn run_query_sql(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+    copy_buffer_size: Option<usize>,
+) -> Result<()> {
+    let command_started = Instant::now();
+    let profile_enabled = copy_profile_enabled();
+    let query_profile_enabled = query_profile_enabled();
+    let copy_parse_started = Instant::now();
+    let copy = parse_copy_to_select(sql)?;
+    let copy_parse_elapsed = copy_parse_started.elapsed();
+    if let Some(copy) = copy {
+        let mut profile = CopyProfile::new(profile_enabled, command_started);
+        profile.copy_parse = copy_parse_elapsed;
+        let sink_started = Instant::now();
+        let mut sink = CopyFileQuerySink::new(
+            &copy.path,
+            copy.format,
+            copy.header,
+            copy.parquet_options,
+            copy_buffer_size,
+            profile_enabled,
+        )?;
+        profile.sink_create = sink_started.elapsed();
+
+        if copy_sql_may_use_direct_or_streaming(&copy.sql) {
+            let direct_started = Instant::now();
+            if let Some(metrics) =
+                try_execute_sql_to_sink(engine, &copy.sql, batch_size, &mut sink).await?
+            {
+                profile.direct_sink = Some(direct_started.elapsed());
+                profile.scan_plan_metrics = Some(metrics);
+                profile.print(sink.stats());
+                return Ok(());
+            }
+            profile.direct_sink = Some(direct_started.elapsed());
+
+            let streaming_started = Instant::now();
+            if let Some(stream) = try_execute_sql_streaming(engine, &copy.sql, batch_size).await? {
+                engine.write_batches_to_sink(stream, &mut sink)?;
+                profile.streaming = Some(streaming_started.elapsed());
+                profile.print(sink.stats());
+                return Ok(());
+            }
+            profile.streaming = Some(streaming_started.elapsed());
+        } else {
+            profile.direct_sink = Some(Duration::ZERO);
+            profile.streaming = Some(Duration::ZERO);
+        }
+
+        let materialize_started = Instant::now();
+        let output = execute_sql(engine, &copy.sql, batch_size).await?;
+        profile.materialize = Some(materialize_started.elapsed());
+        let write_output_started = Instant::now();
+        sink.write_output(output)?;
+        profile.write_output = Some(write_output_started.elapsed());
+        let finish_started = Instant::now();
+        sink.finish()?;
+        profile.finish = Some(finish_started.elapsed());
+        profile.print(sink.stats());
+        return Ok(());
+    }
+
+    let mut sink = StdoutQuerySink;
+    let direct_started = Instant::now();
+    if try_execute_sql_to_sink(engine, sql, batch_size, &mut sink)
+        .await?
+        .is_some()
+    {
+        print_query_profile(
+            query_profile_enabled,
+            command_started,
+            copy_parse_elapsed,
+            Some(direct_started.elapsed()),
+            None,
+            None,
+            None,
+        );
+        return Ok(());
+    }
+    let direct_elapsed = direct_started.elapsed();
+    let streaming_started = Instant::now();
+    if let Some(stream) = try_execute_sql_streaming(engine, sql, batch_size).await? {
+        engine.write_batches_to_sink(stream, &mut sink)?;
+        print_query_profile(
+            query_profile_enabled,
+            command_started,
+            copy_parse_elapsed,
+            Some(direct_elapsed),
+            Some(streaming_started.elapsed()),
+            None,
+            None,
+        );
+        return Ok(());
+    }
+    let streaming_elapsed = streaming_started.elapsed();
+    let execute_started = Instant::now();
+    let output = execute_sql(engine, sql, batch_size).await?;
+    let execute_elapsed = execute_started.elapsed();
+    let write_started = Instant::now();
+    sink.write_output(output)?;
+    print_query_profile(
+        query_profile_enabled,
+        command_started,
+        copy_parse_elapsed,
+        Some(direct_elapsed),
+        Some(streaming_elapsed),
+        Some(execute_elapsed),
+        Some(write_started.elapsed()),
+    );
+    Ok(())
+}
+
+fn split_sql_statements(sql: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut start = 0usize;
+    let mut in_quote = false;
+    let bytes = sql.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' => {
+                if in_quote && bytes.get(index + 1) == Some(&b'\'') {
+                    index += 1;
+                } else {
+                    in_quote = !in_quote;
+                }
+            }
+            b';' if !in_quote => {
+                let statement = sql[start..index].trim();
+                if !statement.is_empty() {
+                    statements.push(statement.to_string());
+                }
+                start = index + 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    let statement = sql[start..].trim();
+    if !statement.is_empty() {
+        statements.push(statement.to_string());
+    }
+    statements
 }
 
 struct CopyToSelect {
