@@ -1206,7 +1206,7 @@ impl DodamEngine {
         Output: Send + 'static,
         BuildState: Fn() -> State + Clone + Send + Sync + 'static,
         ConsumeBatch:
-            Fn(RecordBatch, &mut State) -> Result<Option<()>> + Clone + Send + Sync + 'static,
+            FnMut(RecordBatch, &mut State) -> Result<Option<()>> + Clone + Send + Sync + 'static,
         Finish: Fn(State) -> Result<Option<Output>> + Clone + Send + Sync + 'static,
     {
         let source = self.plan_table_source(path.clone()).await?;

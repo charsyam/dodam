@@ -273,6 +273,210 @@ where
     }
 }
 
+pub(crate) struct DenseI64F64Sum {
+    dense: Vec<f64>,
+    fallback: Option<AdaptiveI64Map<f64>>,
+    threshold: Option<f64>,
+    threshold_candidates: Vec<i64>,
+    all_non_negative: bool,
+}
+
+impl DenseI64F64Sum {
+    pub(crate) fn new() -> Self {
+        Self {
+            dense: Vec::new(),
+            fallback: None,
+            threshold: None,
+            threshold_candidates: Vec::new(),
+            all_non_negative: true,
+        }
+    }
+
+    pub(crate) fn new_tracking_threshold(threshold: f64) -> Self {
+        Self {
+            threshold: Some(threshold),
+            ..Self::new()
+        }
+    }
+
+    pub(crate) fn add_dense_index(&mut self, index: usize, value: f64) {
+        debug_assert!(self.fallback.is_none());
+        if value < 0.0 {
+            self.all_non_negative = false;
+        }
+        let previous = self.dense[index];
+        self.dense[index] += value;
+        if let Some(threshold) = self.threshold
+            && previous <= threshold
+            && self.dense[index] > threshold
+        {
+            self.threshold_candidates.push(index as i64);
+        }
+    }
+
+    pub(crate) fn reserve_dense_to(&mut self, max_key: usize) {
+        if self.fallback.is_none() && max_key >= self.dense.len() {
+            self.dense.resize(max_key + 1, 0.0);
+        }
+    }
+
+    pub(crate) fn has_fallback(&self) -> bool {
+        self.fallback.is_some()
+    }
+
+    pub(crate) fn fallback_mut(&mut self) -> Option<&mut AdaptiveI64Map<f64>> {
+        self.fallback.as_mut()
+    }
+
+    pub(crate) fn convert_to_fallback(&mut self) {
+        if self.fallback.is_some() {
+            return;
+        }
+        let mut fallback = AdaptiveI64Map::<f64>::new_dense();
+        for (key, value) in self.dense.iter().copied().enumerate() {
+            if value != 0.0 {
+                fallback.insert(key as i64, value);
+            }
+        }
+        self.dense.clear();
+        self.fallback = Some(fallback);
+        self.threshold_candidates.clear();
+    }
+
+    pub(crate) fn into_filtered_hash<P>(self, predicate: P) -> HashMap<i64, f64>
+    where
+        P: Fn(f64) -> bool,
+    {
+        if let Some(fallback) = self.fallback {
+            return fallback.into_filtered_hash(predicate);
+        }
+        if self.threshold.is_some() && self.all_non_negative {
+            return self
+                .threshold_candidates
+                .iter()
+                .copied()
+                .filter_map(|key| {
+                    let value = self.dense.get(usize::try_from(key).ok()?).copied()?;
+                    predicate(value).then_some((key, value))
+                })
+                .collect();
+        }
+        self.dense
+            .into_iter()
+            .enumerate()
+            .filter_map(|(key, value)| predicate(value).then_some((key as i64, value)))
+            .collect()
+    }
+}
+
+pub(crate) struct DenseI64I32Map {
+    dense: Vec<i32>,
+    base_key: i64,
+    missing: i32,
+    fallback: Option<AdaptiveI64Map<i32>>,
+}
+
+impl DenseI64I32Map {
+    pub(crate) fn new(missing: i32) -> Self {
+        Self {
+            dense: Vec::new(),
+            base_key: 0,
+            missing,
+            fallback: None,
+        }
+    }
+
+    pub(crate) fn get(&self, key: i64) -> Option<i32> {
+        if let Some(fallback) = self.fallback.as_ref() {
+            return fallback.get(key);
+        }
+        let index = usize::try_from(key.checked_sub(self.base_key)?).ok()?;
+        self.dense
+            .get(index)
+            .copied()
+            .filter(|value| *value != self.missing)
+    }
+
+    pub(crate) fn reserve_dense_range(
+        &mut self,
+        min_key: i64,
+        max_key: i64,
+        max_entries: usize,
+    ) -> bool {
+        debug_assert!(self.fallback.is_none());
+        if min_key < 0 || max_key < min_key {
+            return false;
+        }
+        let (new_min, new_max) = if self.dense.is_empty() {
+            (min_key, max_key)
+        } else {
+            let current_max = self
+                .base_key
+                .checked_add(self.dense.len() as i64)
+                .and_then(|value| value.checked_sub(1));
+            let Some(current_max) = current_max else {
+                return false;
+            };
+            (self.base_key.min(min_key), current_max.max(max_key))
+        };
+        let Some(width) = new_max
+            .checked_sub(new_min)
+            .and_then(|width| width.checked_add(1))
+            .and_then(|width| usize::try_from(width).ok())
+        else {
+            return false;
+        };
+        if width > max_entries {
+            return false;
+        }
+        if self.dense.is_empty() {
+            self.base_key = new_min;
+            self.dense.resize(width, self.missing);
+            return true;
+        }
+        if new_min == self.base_key {
+            if width > self.dense.len() {
+                self.dense.resize(width, self.missing);
+            }
+            return true;
+        }
+        let offset = usize::try_from(self.base_key - new_min).expect("validated dense offset");
+        let mut dense = vec![self.missing; width];
+        dense[offset..offset + self.dense.len()].copy_from_slice(&self.dense);
+        self.base_key = new_min;
+        self.dense = dense;
+        true
+    }
+
+    pub(crate) fn insert_dense_key(&mut self, key: i64, value: i32) {
+        debug_assert!(self.fallback.is_none());
+        if let Some(delta) = key.checked_sub(self.base_key)
+            && let Ok(index) = usize::try_from(delta)
+            && index < self.dense.len()
+        {
+            self.dense[index] = value;
+        }
+    }
+
+    pub(crate) fn fallback_mut(&mut self) -> Option<&mut AdaptiveI64Map<i32>> {
+        self.fallback.as_mut()
+    }
+
+    pub(crate) fn convert_to_fallback(&mut self) {
+        if self.fallback.is_some() {
+            return;
+        }
+        let mut fallback = AdaptiveI64Map::<i32>::new_dense();
+        for (key, value) in self.dense.iter().copied().enumerate() {
+            if value != self.missing {
+                fallback.insert(self.base_key + key as i64, value);
+            }
+        }
+        self.dense.clear();
+        self.fallback = Some(fallback);
+    }
+}
+
 fn adaptive_i64_map_dense_to_hash<V>(values: &[V], present: &[bool]) -> FastHashMap<i64, V>
 where
     V: Copy,

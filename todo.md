@@ -1034,6 +1034,17 @@ Tried and rejected or neutral:
     - SF=10 one-run same-binary comparison: new Q01 path `~0.221s`, old path `~0.450s`.
     - SF=10 3-repeat sample with the new path: Q01 `0.245s / 0.190s / 0.185s`, median about `0.190s`; full repeat totals `7.656s / 7.520s / 7.633s`.
     - Q01 output matches the previous path except for tiny floating-point accumulation-order differences.
+  - Generalized scan-to-aggregate fusion above the Q01-specific path:
+    - Added a SQL-layer `parquet_scan_fold_chunks` helper that first tries `DodamEngine::parquet_row_group_map` and falls back to the old `scan_parquet_batches + parallel_batch_fold_chunks` path when the source is not eligible or `DODAM_DISABLE_SCAN_AGG_FUSION=1` is set.
+    - The helper separates worker-local partial state construction from final output construction. This matters for high-cardinality aggregates: Q21 initially regressed badly when every row-group worker reserved the final output capacity; Q21 is now deliberately left on the old stream/chunk path until a state-size/cardinality cost rule exists.
+    - Applied the helper to Q01, Q15, Q20, and the non-default fallback paths for Q06/Q19. Q06/Q19 usually still take their late-materialized paths first.
+    - Current-binary SF=10 one-run comparison with fusion disabled: total `7.805s`, Q01 `0.464s`, Q15 `0.328s`, Q20 `0.313s`.
+    - Final retained SF=10 one-run sample with fusion enabled and Q21 excluded: total `7.388s`, Q01 `0.215s`, Q15 `0.214s`, Q20 `0.223s`, Q21 `0.943s`.
+    - General rule: fuse scan and aggregate when partial state is small/medium and merge is cheap; avoid fusing high-cardinality or large-capacity partial maps until the optimizer has a real state-size estimate.
+  - Generalized more dense integer containers out of TPC-H query code:
+    - Moved the Q18 dense `i64 -> f64 sum` threshold-tracking accumulator and the Q09 offset dense `i64 -> i32` map into `dense.rs` next to `AdaptiveI64Set`/`AdaptiveI64Map`.
+    - This is primarily structural, not a new speed win: future physical operators can now reuse dense range maps/sums without depending on `sql.rs` TPC-H helpers.
+    - Kept the same fallback behavior and added an accessor instead of letting Q18 inspect the dense sum's fallback field directly.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.

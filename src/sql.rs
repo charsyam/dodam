@@ -26,7 +26,9 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use crate::dense::{AdaptiveI64Map, AdaptiveI64Set, adaptive_dense_index};
+use crate::dense::{
+    AdaptiveI64Map, AdaptiveI64Set, DenseI64F64Sum, DenseI64I32Map, adaptive_dense_index,
+};
 use crate::engine::{
     DodamEngine, JoinAlgorithm, JoinParquetRequest, LateMaterializationPolicy,
     LateMaterializedMetrics, LateSelectionBuilder,
@@ -63,201 +65,6 @@ fn tpch_profile_elapsed(label: &str, started: Option<Instant>) {
 
 const DEFAULT_MAX_DENSE_I64_KEY: usize = 20_000_000;
 const DEFAULT_Q09_ORDER_YEAR_DENSE_BYTES: usize = 384 * 1024 * 1024;
-
-struct DenseI64F64Sum {
-    dense: Vec<f64>,
-    fallback: Option<AdaptiveI64Map<f64>>,
-    threshold: Option<f64>,
-    threshold_candidates: Vec<i64>,
-    all_non_negative: bool,
-}
-
-impl DenseI64F64Sum {
-    fn new() -> Self {
-        Self {
-            dense: Vec::new(),
-            fallback: None,
-            threshold: None,
-            threshold_candidates: Vec::new(),
-            all_non_negative: true,
-        }
-    }
-
-    fn new_tracking_threshold(threshold: f64) -> Self {
-        Self {
-            threshold: Some(threshold),
-            ..Self::new()
-        }
-    }
-
-    fn add_dense_index(&mut self, index: usize, value: f64) {
-        debug_assert!(self.fallback.is_none());
-        if value < 0.0 {
-            self.all_non_negative = false;
-        }
-        let previous = self.dense[index];
-        self.dense[index] += value;
-        if let Some(threshold) = self.threshold
-            && previous <= threshold
-            && self.dense[index] > threshold
-        {
-            self.threshold_candidates.push(index as i64);
-        }
-    }
-
-    fn reserve_dense_to(&mut self, max_key: usize) {
-        if self.fallback.is_none() && max_key >= self.dense.len() {
-            self.dense.resize(max_key + 1, 0.0);
-        }
-    }
-
-    fn has_fallback(&self) -> bool {
-        self.fallback.is_some()
-    }
-
-    fn convert_to_fallback(&mut self) {
-        if self.fallback.is_some() {
-            return;
-        }
-        let mut fallback = AdaptiveI64Map::<f64>::new_dense();
-        for (key, value) in self.dense.iter().copied().enumerate() {
-            if value != 0.0 {
-                fallback.insert(key as i64, value);
-            }
-        }
-        self.dense.clear();
-        self.fallback = Some(fallback);
-        self.threshold_candidates.clear();
-    }
-
-    fn into_filtered_hash<P>(self, predicate: P) -> HashMap<i64, f64>
-    where
-        P: Fn(f64) -> bool,
-    {
-        if let Some(fallback) = self.fallback {
-            return fallback.into_filtered_hash(predicate);
-        }
-        if self.threshold.is_some() && self.all_non_negative {
-            return self
-                .threshold_candidates
-                .iter()
-                .copied()
-                .filter_map(|key| {
-                    let value = self.dense.get(usize::try_from(key).ok()?).copied()?;
-                    predicate(value).then_some((key, value))
-                })
-                .collect();
-        }
-        self.dense
-            .into_iter()
-            .enumerate()
-            .filter_map(|(key, value)| predicate(value).then_some((key as i64, value)))
-            .collect()
-    }
-}
-
-struct DenseI64I32Map {
-    dense: Vec<i32>,
-    base_key: i64,
-    missing: i32,
-    fallback: Option<AdaptiveI64Map<i32>>,
-}
-
-impl DenseI64I32Map {
-    fn new(missing: i32) -> Self {
-        Self {
-            dense: Vec::new(),
-            base_key: 0,
-            missing,
-            fallback: None,
-        }
-    }
-
-    fn get(&self, key: i64) -> Option<i32> {
-        if let Some(fallback) = self.fallback.as_ref() {
-            return fallback.get(key);
-        }
-        let index = usize::try_from(key.checked_sub(self.base_key)?).ok()?;
-        self.dense
-            .get(index)
-            .copied()
-            .filter(|value| *value != self.missing)
-    }
-
-    fn reserve_dense_range(&mut self, min_key: i64, max_key: i64, max_entries: usize) -> bool {
-        debug_assert!(self.fallback.is_none());
-        if min_key < 0 || max_key < min_key {
-            return false;
-        }
-        let (new_min, new_max) = if self.dense.is_empty() {
-            (min_key, max_key)
-        } else {
-            let current_max = self
-                .base_key
-                .checked_add(self.dense.len() as i64)
-                .and_then(|value| value.checked_sub(1));
-            let Some(current_max) = current_max else {
-                return false;
-            };
-            (self.base_key.min(min_key), current_max.max(max_key))
-        };
-        let Some(width) = new_max
-            .checked_sub(new_min)
-            .and_then(|width| width.checked_add(1))
-            .and_then(|width| usize::try_from(width).ok())
-        else {
-            return false;
-        };
-        if width > max_entries {
-            return false;
-        }
-        if self.dense.is_empty() {
-            self.base_key = new_min;
-            self.dense.resize(width, self.missing);
-            return true;
-        }
-        if new_min == self.base_key {
-            if width > self.dense.len() {
-                self.dense.resize(width, self.missing);
-            }
-            return true;
-        }
-        let offset = usize::try_from(self.base_key - new_min).expect("validated dense offset");
-        let mut dense = vec![self.missing; width];
-        dense[offset..offset + self.dense.len()].copy_from_slice(&self.dense);
-        self.base_key = new_min;
-        self.dense = dense;
-        true
-    }
-
-    fn insert_dense_key(&mut self, key: i64, value: i32) {
-        debug_assert!(self.fallback.is_none());
-        if let Some(delta) = key.checked_sub(self.base_key)
-            && let Ok(index) = usize::try_from(delta)
-            && index < self.dense.len()
-        {
-            self.dense[index] = value;
-        }
-    }
-
-    fn fallback_mut(&mut self) -> Option<&mut AdaptiveI64Map<i32>> {
-        self.fallback.as_mut()
-    }
-
-    fn convert_to_fallback(&mut self) {
-        if self.fallback.is_some() {
-            return;
-        }
-        let mut fallback = AdaptiveI64Map::<i32>::new_dense();
-        for (key, value) in self.dense.iter().copied().enumerate() {
-            if value != self.missing {
-                fallback.insert(self.base_key + key as i64, value);
-            }
-        }
-        self.dense.clear();
-        self.fallback = Some(fallback);
-    }
-}
 
 fn try_for_each_i64_date32_str<Visit>(
     int_values: &ArrayRef,
@@ -2925,26 +2732,21 @@ async fn q01_pricing_summary_rows(
         "l_tax".to_string(),
         "l_shipdate".to_string(),
     ]);
-    if q01_row_group_map_enabled()
-        && let Some(partials) = engine
-            .parquet_row_group_map(
-                path.clone(),
-                batch_size,
-                projection.clone(),
-                q01_row_group_map_chunk(),
-                Q01GroupSlots::new,
-                move |batch, groups| {
-                    groups.merge_slots(q01_pricing_summary_batch(batch, cutoff_days)?);
-                    Ok(Some(()))
-                },
-                |groups| Ok(Some(groups)),
-            )
-            .await?
-    {
-        let mut groups = Q01GroupSlots::new();
-        for partial in partials {
-            groups.merge_slots(partial);
-        }
+    if q01_row_group_map_enabled() && !q01_pruning_enabled() {
+        let groups = parquet_scan_fold_chunks(
+            engine,
+            path.clone(),
+            batch_size,
+            projection.clone(),
+            q01_row_group_map_chunk(),
+            q01_chunk_size(),
+            Q01GroupSlots::new,
+            Q01GroupSlots::new,
+            move |batch| q01_pricing_summary_batch(batch, cutoff_days),
+            |groups, rows| groups.merge_slots(rows),
+            "Q01 aggregate",
+        )
+        .await?;
         return Ok(q01_sorted_rows(groups));
     }
     let mut stream = if q01_pruning_enabled() {
@@ -3034,6 +2836,20 @@ fn join_aggregate_chunk_size() -> usize {
 
 fn build_map_chunk_size() -> usize {
     std::env::var("DODAM_BUILD_MAP_CHUNK_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4)
+}
+
+fn scan_aggregate_fusion_enabled() -> bool {
+    std::env::var("DODAM_DISABLE_SCAN_AGG_FUSION")
+        .map(|value| !matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(true)
+}
+
+fn scan_aggregate_row_group_chunk() -> usize {
+    std::env::var("DODAM_SCAN_AGG_ROW_GROUP_CHUNK")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -3188,6 +3004,85 @@ where
         );
     }
     Ok(output)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn parquet_scan_fold_chunks<Output, BuildPartial, BuildOutput, Map, Merge>(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    projection: Projection,
+    row_group_chunk: usize,
+    stream_chunk: usize,
+    build_partial: BuildPartial,
+    build_output: BuildOutput,
+    map: Map,
+    mut merge: Merge,
+    label: &str,
+) -> Result<Output>
+where
+    Output: Send + 'static,
+    BuildPartial: Fn() -> Output + Clone + Send + Sync + 'static,
+    BuildOutput: Fn() -> Output + Clone + Send + Sync + 'static,
+    Map: Fn(RecordBatch) -> Result<Output> + Clone + Send + Sync + 'static,
+    Merge: FnMut(&mut Output, Output) + Clone + Send + Sync + 'static,
+{
+    if scan_aggregate_fusion_enabled()
+        && let Some(partials) = engine
+            .parquet_row_group_map(
+                path.clone(),
+                batch_size,
+                projection.clone(),
+                row_group_chunk,
+                build_partial.clone(),
+                {
+                    let map = map.clone();
+                    let merge = merge.clone();
+                    move |batch, output| {
+                        let mut merge = merge.clone();
+                        merge(output, map(batch)?);
+                        Ok(Some(()))
+                    }
+                },
+                |output| Ok(Some(output)),
+            )
+            .await?
+    {
+        let profile = tpch_profile_enabled();
+        let started = profile.then(Instant::now);
+        let mut output = build_output();
+        for partial in partials {
+            merge(&mut output, partial);
+        }
+        if let Some(started) = started {
+            eprintln!(
+                "[dodam:tpch-profile] {label}: fused_total={:.3} ms row_group_chunk={row_group_chunk}",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        return Ok(output);
+    }
+
+    let mut stream = engine
+        .scan_parquet_batches(path, batch_size, None, projection, None)
+        .await?;
+    let build_partial_for_map = build_partial.clone();
+    let merge_for_map = merge.clone();
+    parallel_batch_fold_chunks(
+        &mut stream,
+        stream_chunk,
+        move |batches| {
+            let mut output = build_partial_for_map();
+            let mut merge = merge_for_map.clone();
+            for batch in batches {
+                merge(&mut output, map(batch)?);
+            }
+            Ok(output)
+        },
+        build_output(),
+        move |output, partial| merge(output, partial),
+        label,
+    )
 }
 
 fn q01_update_decimal_batch(
@@ -7023,37 +6918,32 @@ async fn q15_revenue_by_supplier(
     start_days: i32,
     end_days: i32,
 ) -> Result<HashMap<i64, f64>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec![
-                "l_suppkey".to_string(),
-                "l_shipdate".to_string(),
-                "l_extendedprice".to_string(),
-                "l_discount".to_string(),
-            ]),
-            None,
-        )
-        .await?;
-    parallel_batch_fold_chunks(
-        &mut stream,
+    parquet_scan_fold_chunks(
+        engine,
+        path,
+        batch_size,
+        Projection::Columns(vec![
+            "l_suppkey".to_string(),
+            "l_shipdate".to_string(),
+            "l_extendedprice".to_string(),
+            "l_discount".to_string(),
+        ]),
+        scan_aggregate_row_group_chunk(),
         8,
+        HashMap::<i64, f64>::new,
+        HashMap::<i64, f64>::new,
         move |batches| {
             let mut revenues = HashMap::<i64, f64>::new();
-            for batch in batches {
-                merge_f64_groups(
-                    &mut revenues,
-                    q15_revenue_by_supplier_batch(batch, start_days, end_days)?,
-                );
-            }
+            merge_f64_groups(
+                &mut revenues,
+                q15_revenue_by_supplier_batch(batches, start_days, end_days)?,
+            );
             Ok(revenues)
         },
-        HashMap::<i64, f64>::new(),
         merge_f64_groups,
         "Q15 revenue aggregate",
     )
+    .await
 }
 
 fn q15_revenue_by_supplier_batch(
@@ -9264,7 +9154,40 @@ async fn q06_revenue_sum(
             "l_extendedprice".to_string(),
         ])
     };
-    let mut stream = if row_filter_enabled {
+    if !row_filter_enabled {
+        return parquet_scan_fold_chunks(
+            engine,
+            path,
+            batch_size,
+            projection,
+            scan_aggregate_row_group_chunk(),
+            q06_revenue_chunk_size(),
+            || Some((0.0, 0_u64)),
+            || Some((0.0, 0_u64)),
+            move |batch| {
+                q06_revenue_sum_batch(
+                    batch,
+                    start_days,
+                    end_days,
+                    discount_low,
+                    discount_high,
+                    quantity_limit,
+                )
+            },
+            |total, batch| {
+                if let (Some(total), Some(batch)) = (total.as_mut(), batch) {
+                    total.0 += batch.0;
+                    total.1 += batch.1;
+                } else {
+                    *total = None;
+                }
+            },
+            "Q06 revenue sum",
+        )
+        .await;
+    }
+
+    let mut stream = {
         engine
             .scan_parquet_batches_row_filtered(
                 path,
@@ -9278,10 +9201,6 @@ async fn q06_revenue_sum(
                     quantity_limit,
                 ),
             )
-            .await?
-    } else {
-        engine
-            .scan_parquet_batches(path, batch_size, None, projection, None)
             .await?
     };
     parallel_batch_fold_chunks(
@@ -11570,7 +11489,7 @@ async fn q18_qualifying_order_quantities(
     while let Some(batch) = stream.next() {
         let batch = batch?;
         if sums.has_fallback() {
-            let fallback = sums.fallback.as_mut().expect("checked q18 fallback");
+            let fallback = sums.fallback_mut().expect("checked q18 fallback");
             q18_quantity_batch_into(&batch, fallback)?;
             continue;
         }
@@ -11578,7 +11497,7 @@ async fn q18_qualifying_order_quantities(
             continue;
         }
         sums.convert_to_fallback();
-        let fallback = sums.fallback.as_mut().expect("converted q18 fallback");
+        let fallback = sums.fallback_mut().expect("converted q18 fallback");
         q18_quantity_batch_into(&batch, fallback)?;
     }
     Ok(sums.into_filtered_hash(|quantity| quantity > threshold))
@@ -12383,48 +12302,42 @@ async fn q19_lineitem_revenue(
         }
     }
     let profile = tpch_profile_enabled();
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec![
-                "l_partkey".to_string(),
-                "l_quantity".to_string(),
-                "l_extendedprice".to_string(),
-                "l_discount".to_string(),
-                "l_shipmode".to_string(),
-                "l_shipinstruct".to_string(),
-            ]),
-            None,
-        )
-        .await?;
-    parallel_batch_fold_chunks(
-        &mut stream,
+    parquet_scan_fold_chunks(
+        engine,
+        path,
+        batch_size,
+        Projection::Columns(vec![
+            "l_partkey".to_string(),
+            "l_quantity".to_string(),
+            "l_extendedprice".to_string(),
+            "l_discount".to_string(),
+            "l_shipmode".to_string(),
+            "l_shipinstruct".to_string(),
+        ]),
+        scan_aggregate_row_group_chunk(),
         4,
-        move |batches| {
+        || (0.0, 0_u64, Q19SelectionProfile::default()),
+        || (0.0, 0_u64, Q19SelectionProfile::default()),
+        move |batch| {
             let mut sum = 0.0;
             let mut count = 0_u64;
             let mut profile_metrics = Q19SelectionProfile::default();
             let mut raw_rule_cache = None;
-            for batch in batches {
-                let mut batch_profile = profile.then_some(Q19SelectionProfile::default());
-                let (batch_sum, batch_count) = q19_lineitem_revenue_batch(
-                    batch,
-                    &rules,
-                    &part_masks,
-                    &mut raw_rule_cache,
-                    batch_profile.as_mut(),
-                )?;
-                sum += batch_sum;
-                count += batch_count;
-                if let Some(batch_profile) = batch_profile {
-                    profile_metrics.add(batch_profile);
-                }
+            let mut batch_profile = profile.then_some(Q19SelectionProfile::default());
+            let (batch_sum, batch_count) = q19_lineitem_revenue_batch(
+                batch,
+                &rules,
+                &part_masks,
+                &mut raw_rule_cache,
+                batch_profile.as_mut(),
+            )?;
+            sum += batch_sum;
+            count += batch_count;
+            if let Some(batch_profile) = batch_profile {
+                profile_metrics.add(batch_profile);
             }
             Ok((sum, count, profile_metrics))
         },
-        (0.0, 0_u64, Q19SelectionProfile::default()),
         |total, batch| {
             total.0 += batch.0;
             total.1 += batch.1;
@@ -12432,6 +12345,7 @@ async fn q19_lineitem_revenue(
         },
         "Q19 lineitem revenue",
     )
+    .await
     .map(|(sum, count, profile_metrics)| {
         if profile {
             q19_log_selection_profile(profile_metrics);
@@ -13602,38 +13516,33 @@ async fn q20_lineitem_quantity_sums(
     batch_size: usize,
     forest_parts: &AdaptiveI64Set,
 ) -> Result<HashMap<(i64, i64), f64>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec![
-                "l_partkey".to_string(),
-                "l_suppkey".to_string(),
-                "l_quantity".to_string(),
-                "l_shipdate".to_string(),
-            ]),
-            None,
-        )
-        .await?;
     let forest_parts = Arc::new(forest_parts.clone());
-    parallel_batch_fold_chunks(
-        &mut stream,
+    parquet_scan_fold_chunks(
+        engine,
+        path,
+        batch_size,
+        Projection::Columns(vec![
+            "l_partkey".to_string(),
+            "l_suppkey".to_string(),
+            "l_quantity".to_string(),
+            "l_shipdate".to_string(),
+        ]),
+        scan_aggregate_row_group_chunk(),
         4,
-        move |batches| {
+        HashMap::<(i64, i64), f64>::new,
+        HashMap::<(i64, i64), f64>::new,
+        move |batch| {
             let mut sums = HashMap::<(i64, i64), f64>::new();
-            for batch in batches {
-                merge_f64_groups(
-                    &mut sums,
-                    q20_lineitem_quantity_sums_batch(batch, &forest_parts)?,
-                );
-            }
+            merge_f64_groups(
+                &mut sums,
+                q20_lineitem_quantity_sums_batch(batch, &forest_parts)?,
+            );
             Ok(sums)
         },
-        HashMap::<(i64, i64), f64>::new(),
         merge_f64_groups,
         "Q20 lineitem quantity aggregate",
     )
+    .await
 }
 
 fn q20_lineitem_quantity_sums_batch(
