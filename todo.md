@@ -1245,6 +1245,14 @@ Tried and rejected or neutral:
       - Tried converting Q10's `orderkey -> custkey` returned-order map to `AdaptiveI64Map`; it regressed focused Q10 from the retained `~45ms` range to about `~75-79ms`, likely from dense-range/cache cost and conversion/materialization overhead. Reverted it.
       - Reordered Q12 shipping-mode predicates so cheap Date32 predicates run before UTF-8 shipmode slicing/comparison in both the typed aggregate loop and the late-materialized selector. Focused Q12 samples were small/neutral-positive around `~46-50ms`, and output matched prior results.
       - Extended `merge_ordered_row_group_chunks` to emit the full boundary (`key + state`) instead of state only, then rewired the engine's ordered `i64 + Decimal128 SUM > threshold` merge onto the same helper used by Q21. This removes the separate Q18-style carry merge logic and makes ordered row-group boundary stitching a common engine rule. Full SF=1 in-process checks stayed `22/22`; warm samples showed Q18 around `~17-19ms`, Q21 around `~17-20ms`, and Q12 around `~45-48ms`.
+    - Added `--only` to the in-process TPC-H runner so focused experiments can run a single query or comma-separated query-name filters without creating temporary query inventories.
+    - Rechecked the current Q12 opt-in paths with focused repeats:
+      - `DODAM_Q12_ENABLE_ORDER_ROW_FILTER=1` and late materialization remained neutral-to-noisy for the warm single-query shape. Even though cold profile can show less `orders` payload decode, selected keys are spread enough that row-selection overhead usually offsets the saved narrow `o_orderpriority` read. Kept both non-default.
+      - Q12 row-group chunk `4` plus order row-filter was also only a sub-millisecond/noise-level change, so the default remains unchanged.
+    - Retained Q03 sorted integer lookup by default:
+      - The Q03 lineitem revenue scan now defaults to `SortedI64Lookup` for the built order-key payload, with `DODAM_Q03_DISABLE_SORTED_ORDER_LOOKUP=1` as the rollback knob.
+      - Focused SF=1 warm Q03 repeats moved from about `~39-41ms` with the hash lookup to about `~32-34ms` with the sorted contiguous lookup. This is a general probe-layout rule for large fact scans probing an immutable integer build-key set: fewer random hash-table touches beat the extra binary-search comparisons in this shape.
+      - Full SF=1 in-process TPC-H still passed `22/22`; warm Q03 samples were around `~31-34ms`, with full warm totals around `~0.52-0.55s` in the local run.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.

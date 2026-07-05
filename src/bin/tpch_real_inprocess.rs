@@ -45,6 +45,9 @@ struct Args {
 
     #[arg(long, default_value_t = 1)]
     repeats: usize,
+
+    #[arg(long, value_delimiter = ',')]
+    only: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -60,7 +63,7 @@ async fn main() -> Result<()> {
     validate_data_dir(&args.data_dir)?;
     fs::create_dir_all(&args.output_dir)?;
 
-    let queries = load_tpch_queries(&args.queries)?;
+    let queries = filter_queries(load_tpch_queries(&args.queries)?, &args.only)?;
     let engine = DodamEngine::default();
     let mut total = 0.0;
     let mut ok = 0usize;
@@ -191,6 +194,29 @@ fn load_tpch_queries(path: &Path) -> Result<Vec<TpchQuery>> {
             name: name.to_string(),
             sql: sql.to_string(),
         });
+    }
+    Ok(queries)
+}
+
+fn filter_queries(mut queries: Vec<TpchQuery>, filters: &[String]) -> Result<Vec<TpchQuery>> {
+    if filters.is_empty() {
+        return Ok(queries);
+    }
+    let filters = filters
+        .iter()
+        .map(|filter| filter.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    queries.retain(|query| {
+        let name = query.name.to_ascii_lowercase();
+        filters
+            .iter()
+            .any(|filter| name == *filter || name.contains(filter.as_str()))
+    });
+    if queries.is_empty() {
+        return Err(DodamError::UnsupportedSql(format!(
+            "no TPC-H queries matched --only {}",
+            filters.join(",")
+        )));
     }
     Ok(queries)
 }

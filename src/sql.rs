@@ -9529,9 +9529,10 @@ fn q03_row_group_map_chunk() -> usize {
 }
 
 fn q03_sorted_order_lookup_enabled() -> bool {
-    std::env::var("DODAM_Q03_ENABLE_SORTED_ORDER_LOOKUP")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
+    match std::env::var("DODAM_Q03_DISABLE_SORTED_ORDER_LOOKUP") {
+        Ok(value) => !matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"),
+        Err(_) => true,
+    }
 }
 
 fn q03_row_ordering(left: &Q03Row, right: &Q03Row) -> std::cmp::Ordering {
