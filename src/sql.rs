@@ -21317,6 +21317,26 @@ fn apply_output_order_limit(
     if batches.is_empty() {
         return Ok(batches);
     }
+    if topk_batch_prune_enabled()
+        && let Some(limit) = limit
+        && batches.len() > 1
+    {
+        let candidates = batches
+            .iter()
+            .filter(|batch| batch.num_rows() > 0)
+            .map(|batch| sort_output_batch(batch, order_by, Some(limit)))
+            .collect::<Result<Vec<_>>>()?;
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let schema = candidates[0].schema();
+        let batch = if candidates.len() == 1 {
+            candidates[0].clone()
+        } else {
+            concat_batches(&schema, candidates.iter())?
+        };
+        return Ok(vec![sort_output_batch(&batch, order_by, Some(limit))?]);
+    }
 
     let schema = batches[0].schema();
     let batch = if batches.len() == 1 {
@@ -21324,6 +21344,20 @@ fn apply_output_order_limit(
     } else {
         concat_batches(&schema, batches.iter())?
     };
+    Ok(vec![sort_output_batch(&batch, order_by, limit)?])
+}
+
+fn topk_batch_prune_enabled() -> bool {
+    std::env::var("DODAM_DISABLE_TOPK_BATCH_PRUNE")
+        .map(|value| value != "1" && !value.eq_ignore_ascii_case("true"))
+        .unwrap_or(true)
+}
+
+fn sort_output_batch(
+    batch: &RecordBatch,
+    order_by: &SortKey,
+    limit: Option<usize>,
+) -> Result<RecordBatch> {
     let sort_columns = order_by
         .expressions
         .iter()
@@ -21344,7 +21378,7 @@ fn apply_output_order_limit(
         })
         .collect::<Result<Vec<_>>>()?;
     let indices = lexsort_to_indices(&sort_columns, limit)?;
-    Ok(vec![take_record_batch(&batch, &indices)?])
+    Ok(take_record_batch(batch, &indices)?)
 }
 
 fn limit_batches(batches: Vec<RecordBatch>, limit: usize) -> Vec<RecordBatch> {

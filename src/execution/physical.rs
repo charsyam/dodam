@@ -788,12 +788,46 @@ fn sort_batches(
     sort: &SortKey,
     limit: Option<usize>,
 ) -> Result<RecordBatch> {
+    if topk_batch_prune_enabled()
+        && let Some(limit) = limit
+        && batches.len() > 1
+    {
+        let candidates = batches
+            .iter()
+            .filter(|batch| batch.num_rows() > 0)
+            .map(|batch| sort_single_batch(batch, sort, Some(limit)))
+            .collect::<Result<Vec<_>>>()?;
+        if candidates.is_empty() {
+            return Ok(RecordBatch::new_empty(batches[0].schema()));
+        }
+        let schema = candidates[0].schema();
+        let batch = if candidates.len() == 1 {
+            candidates[0].clone()
+        } else {
+            concat_batches(&schema, candidates.iter())?
+        };
+        return sort_single_batch(&batch, sort, Some(limit));
+    }
     let schema = batches[0].schema();
     let batch = if batches.len() == 1 {
         batches[0].clone()
     } else {
         concat_batches(&schema, batches.iter())?
     };
+    sort_single_batch(&batch, sort, limit)
+}
+
+fn topk_batch_prune_enabled() -> bool {
+    std::env::var("DODAM_DISABLE_TOPK_BATCH_PRUNE")
+        .map(|value| value != "1" && !value.eq_ignore_ascii_case("true"))
+        .unwrap_or(true)
+}
+
+fn sort_single_batch(
+    batch: &RecordBatch,
+    sort: &SortKey,
+    limit: Option<usize>,
+) -> Result<RecordBatch> {
     let sort_columns = sort
         .expressions
         .iter()
@@ -809,7 +843,7 @@ fn sort_batches(
         })
         .collect::<Result<Vec<_>>>()?;
     let indices = lexsort_to_indices(&sort_columns, limit)?;
-    Ok(take_record_batch(&batch, &indices)?)
+    Ok(take_record_batch(batch, &indices)?)
 }
 
 pub struct DistinctExec {

@@ -20,6 +20,23 @@ use crate::execution::metrics::SendableBatchStream;
 use crate::execution::physical::column_index;
 use crate::hash::FastHashMap as AggregateHashMap;
 
+const SMALL_GROUP_LINEAR_LIMIT: usize = 8;
+const TWO_UTF8_SMALL_GROUP_LIMIT: usize = 8;
+
+fn small_group_linear_limit() -> usize {
+    std::env::var("DODAM_SMALL_GROUP_LINEAR_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(SMALL_GROUP_LINEAR_LIMIT)
+}
+
+fn two_utf8_small_group_limit() -> usize {
+    std::env::var("DODAM_TWO_UTF8_SMALL_GROUP_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(TWO_UTF8_SMALL_GROUP_LIMIT)
+}
+
 pub fn collect_aggregates(
     mut stream: SendableBatchStream,
     fragments: usize,
@@ -308,15 +325,95 @@ fn collect_two_utf8_key_groups(
     Ok(metrics)
 }
 
+enum TwoUtf8KeyGroupIndex {
+    Small(Vec<TwoUtf8SmallGroup>),
+    Hash(TwoUtf8HashGroupIndex),
+}
+
+impl Default for TwoUtf8KeyGroupIndex {
+    fn default() -> Self {
+        Self::Small(Vec::new())
+    }
+}
+
+struct TwoUtf8SmallGroup {
+    first: Option<String>,
+    second: Option<String>,
+    group_id: usize,
+}
+
+impl TwoUtf8KeyGroupIndex {
+    fn group_id(
+        &mut self,
+        first: Option<&str>,
+        second: Option<&str>,
+        groups_out: &mut Vec<TwoKeyGroup>,
+        inputs: &[FastAggregateInput<'_>],
+    ) -> usize {
+        match self {
+            Self::Small(groups) => {
+                if let Some(group_id) = groups.iter().find_map(|group| {
+                    (group.first.as_deref() == first && group.second.as_deref() == second)
+                        .then_some(group.group_id)
+                }) {
+                    return group_id;
+                }
+                if groups.len() < two_utf8_small_group_limit() {
+                    let group_id = push_two_utf8_group(
+                        groups_out,
+                        first.map(str::to_string),
+                        second.map(str::to_string),
+                        inputs,
+                    );
+                    groups.push(TwoUtf8SmallGroup {
+                        first: first.map(str::to_string),
+                        second: second.map(str::to_string),
+                        group_id,
+                    });
+                    return group_id;
+                }
+                let mut hash = TwoUtf8HashGroupIndex::default();
+                for group in groups.drain(..) {
+                    hash.insert_existing(group.first, group.second, group.group_id);
+                }
+                let group_id = hash.group_id(first, second, groups_out, inputs);
+                *self = Self::Hash(hash);
+                group_id
+            }
+            Self::Hash(hash) => hash.group_id(first, second, groups_out, inputs),
+        }
+    }
+}
+
 #[derive(Default)]
-struct TwoUtf8KeyGroupIndex {
+struct TwoUtf8HashGroupIndex {
     groups: AggregateHashMap<String, AggregateHashMap<String, usize>>,
     null_first: AggregateHashMap<String, usize>,
     null_second: AggregateHashMap<String, usize>,
     null_both: Option<usize>,
 }
 
-impl TwoUtf8KeyGroupIndex {
+impl TwoUtf8HashGroupIndex {
+    fn insert_existing(&mut self, first: Option<String>, second: Option<String>, group_id: usize) {
+        match (first, second) {
+            (Some(first), Some(second)) => {
+                self.groups
+                    .entry(first)
+                    .or_default()
+                    .insert(second, group_id);
+            }
+            (None, Some(second)) => {
+                self.null_first.insert(second, group_id);
+            }
+            (Some(first), None) => {
+                self.null_second.insert(first, group_id);
+            }
+            (None, None) => {
+                self.null_both = Some(group_id);
+            }
+        }
+    }
+
     fn group_id(
         &mut self,
         first: Option<&str>,
@@ -389,6 +486,20 @@ impl TwoUtf8KeyGroupIndex {
             }
         }
     }
+}
+
+fn push_two_utf8_group(
+    groups_out: &mut Vec<TwoKeyGroup>,
+    first: Option<String>,
+    second: Option<String>,
+    inputs: &[FastAggregateInput<'_>],
+) -> usize {
+    let group_id = groups_out.len();
+    groups_out.push(TwoKeyGroup::new(
+        vec![GroupValue::Utf8(first), GroupValue::Utf8(second)],
+        inputs,
+    ));
+    group_id
 }
 
 struct TwoKeyGroup {
@@ -1165,17 +1276,58 @@ enum SingleKeyGroupIndex {
         null_group: Option<usize>,
     },
     Int32 {
-        groups: AggregateHashMap<i32, usize>,
+        groups: AdaptiveCopyGroupIndex<i32>,
         null_group: Option<usize>,
     },
     Int64 {
-        groups: AggregateHashMap<i64, usize>,
+        groups: AdaptiveCopyGroupIndex<i64>,
         null_group: Option<usize>,
     },
     UInt64 {
-        groups: AggregateHashMap<u64, usize>,
+        groups: AdaptiveCopyGroupIndex<u64>,
         null_group: Option<usize>,
     },
+}
+
+enum AdaptiveCopyGroupIndex<K> {
+    Small(Vec<(K, usize)>),
+    Hash(AggregateHashMap<K, usize>),
+}
+
+impl<K> Default for AdaptiveCopyGroupIndex<K> {
+    fn default() -> Self {
+        Self::Small(Vec::new())
+    }
+}
+
+impl<K> AdaptiveCopyGroupIndex<K>
+where
+    K: Copy + Eq + std::hash::Hash,
+{
+    fn get(&self, key: K) -> Option<usize> {
+        match self {
+            Self::Small(groups) => groups
+                .iter()
+                .find_map(|(candidate, group_id)| (*candidate == key).then_some(*group_id)),
+            Self::Hash(groups) => groups.get(&key).copied(),
+        }
+    }
+
+    fn insert(&mut self, key: K, group_id: usize) {
+        match self {
+            Self::Small(groups) if groups.len() < small_group_linear_limit() => {
+                groups.push((key, group_id));
+            }
+            Self::Small(groups) => {
+                let mut hash = groups.drain(..).collect::<AggregateHashMap<_, _>>();
+                hash.insert(key, group_id);
+                *self = Self::Hash(hash);
+            }
+            Self::Hash(groups) => {
+                groups.insert(key, group_id);
+            }
+        }
+    }
 }
 
 impl SingleKeyGroupIndex {
@@ -1189,15 +1341,15 @@ impl SingleKeyGroupIndex {
                 null_group: None,
             },
             DataType::Int32 => Self::Int32 {
-                groups: AggregateHashMap::default(),
+                groups: AdaptiveCopyGroupIndex::default(),
                 null_group: None,
             },
             DataType::Int64 => Self::Int64 {
-                groups: AggregateHashMap::default(),
+                groups: AdaptiveCopyGroupIndex::default(),
                 null_group: None,
             },
             DataType::UInt64 => Self::UInt64 {
-                groups: AggregateHashMap::default(),
+                groups: AdaptiveCopyGroupIndex::default(),
                 null_group: None,
             },
             _ => unreachable!("fast path key type precondition"),
@@ -1251,7 +1403,7 @@ impl SingleKeyGroupIndex {
                     ));
                 }
                 let key = values.value(row);
-                if let Some(group_id) = groups.get(&key).copied() {
+                if let Some(group_id) = groups.get(key) {
                     return Ok(group_id);
                 }
                 let group_id = groups_out.len();
@@ -1276,7 +1428,7 @@ impl SingleKeyGroupIndex {
                     ));
                 }
                 let key = values.value(row);
-                if let Some(group_id) = groups.get(&key).copied() {
+                if let Some(group_id) = groups.get(key) {
                     return Ok(group_id);
                 }
                 let group_id = groups_out.len();
@@ -1298,7 +1450,7 @@ impl SingleKeyGroupIndex {
                     ));
                 }
                 let key = values.value(row);
-                if let Some(group_id) = groups.get(&key).copied() {
+                if let Some(group_id) = groups.get(key) {
                     return Ok(group_id);
                 }
                 let group_id = groups_out.len();

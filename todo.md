@@ -1053,6 +1053,22 @@ Tried and rejected or neutral:
       - `sum(l_extendedprice * (1 - l_discount))`: fast median about `0.66s`, disabled median about `0.87s`.
     - Output differences versus the old path are tiny f64 accumulation/order differences (`~8e-16` and `~3e-16` relative in the checked samples), not semantic decimal scale changes.
     - Full SF=10 TPC-H fast-path run still passed `22/22`; this change mostly benefits non-specialized SQL expression paths because most canonical TPC-H queries still route through their typed fast paths.
+  - Tried to generalize small-cardinality single-key group lookup:
+    - Added an adaptive small linear slot index for integer single-key grouped aggregate fast paths (`Int32`, `Int64`, `UInt64`) before falling back to the existing hash index. `DODAM_SMALL_GROUP_LINEAR_LIMIT=0` disables it for diagnostics; default limit is `8`.
+    - Kept `Utf8` group lookup on the existing hash index. A linear string slot attempt regressed SF=10 `GROUP BY l_returnflag, count(*)` from about `0.61s` to `0.76-0.83s`, so string keys are not a good fit for this rule.
+    - Integer small group sample (`GROUP BY l_linenumber, count(*)`) was neutral-to-slightly-better: adaptive about `0.49-0.50s`, forced hash about `0.50-0.51s`.
+    - Full SF=10 TPC-H run still passed `22/22` with a one-run total around `7.51s`; most canonical TPC-H small groups still use query-specific fast paths, so this mainly benefits generic SQL grouped aggregate on tiny integer domains.
+  - Generalized `ORDER BY ... LIMIT` TopK pruning before final sort:
+    - `SortExec` and SQL output ordering now sort each input batch down to the requested limit before concatenating candidates and applying the final global TopK. `DODAM_DISABLE_TOPK_BATCH_PRUNE=1` keeps the old concatenate-then-sort path available for diagnostics.
+    - This is a general TopK rule, not tied to TPC-H columns: for any ordering, rows outside a batch-local top K cannot enter the global top K except for SQL tie-order ambiguity, which is already not stable without explicit tie-breakers.
+    - SF=10 lineitem sample (`ORDER BY l_orderkey DESC, l_linenumber ASC LIMIT 100`) improved from about `0.95-0.97s` disabled to about `0.48s` enabled after warmup; on/off outputs matched in the checked sample.
+    - Full SF=10 TPC-H remained correct (`22/22`). The total was effectively neutral in one-run samples (`7.478s` enabled vs `7.481s` disabled) because most canonical paths already produce small/single-batch outputs before final ordering.
+  - Generalized the tiny two-`Utf8` group-key idea from Q01-style workloads into the generic grouped aggregate path:
+    - `GROUP BY utf8, utf8` now starts with a small linear slot table before promoting to the existing nested hash index. `DODAM_TWO_UTF8_SMALL_GROUP_LIMIT=0` disables the slot phase for diagnostics; default limit is `8`.
+    - This removes the dependency on fixed column names like `l_returnflag`/`l_linestatus` for this specific group lookup optimization. The Q01 typed aggregate still has its own more specialized accumulator, but ordinary SQL with tiny two-string groups now gets a similar lookup rule.
+    - SF=10 generic sample (`GROUP BY l_returnflag, l_linestatus` with `count(*)`/`sum(l_quantity)`, not the Q01 canonical fast path) improved after warmup from about `1.29-1.30s` with forced hash to about `1.19s` adaptive; outputs matched.
+    - A larger-cardinality sample (`GROUP BY o_orderpriority, o_clerk`) was roughly neutral/slightly slower (`0.80-0.82s` adaptive vs `0.78-0.81s` forced hash), which is expected from the small initial slot checks before promotion. Keep the limit small unless broader benchmarks show a better crossover.
+    - Full SF=10 TPC-H remained correct (`22/22`) with one-run total around `7.55s`; canonical Q01 still routes through its typed path, so this is mostly a generic SQL benefit.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.
