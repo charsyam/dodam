@@ -2843,7 +2843,7 @@ impl ProfiledScanStream {
         let next_wait_ms = nanos_to_millis(self.next_wait_nanos);
         let consumer_gap_ms = (elapsed_ms - next_wait_ms).max(0.0);
         eprintln!(
-            "[dodam:scan-profile] {}: elapsed={:.3} ms next_wait={:.3} ms consumer_gap={:.3} ms rows={} batches={} row_groups={}/{} bytes={} metadata={:.3} ms planning={:.3} ms decode={:.3} ms filter={:.3} ms projection={:.3} ms limit={:.3} ms",
+            "[dodam:scan-profile] {}: elapsed={:.3} ms next_wait={:.3} ms consumer_gap={:.3} ms rows={} batches={} row_groups={}/{} bytes={} metadata={:.3} ms planning={:.3} ms decode={:.3} ms parquet_next={:.3} ms parquet_calls={} parquet_eof={} parquet_rows={} parquet_batches={} avg_batch_rows={:.1} filter={:.3} ms projection={:.3} ms limit={:.3} ms",
             self.label,
             elapsed_ms,
             next_wait_ms,
@@ -2856,6 +2856,12 @@ impl ProfiledScanStream {
             nanos_to_millis(metrics.metadata_nanos),
             nanos_to_millis(metrics.planning_nanos),
             nanos_to_millis(metrics.decode_nanos),
+            nanos_to_millis(metrics.parquet_next_nanos),
+            metrics.parquet_next_calls,
+            metrics.parquet_eof_calls,
+            metrics.parquet_output_rows,
+            metrics.parquet_output_batches,
+            average_rows_per_batch(metrics.parquet_output_rows, metrics.parquet_output_batches),
             nanos_to_millis(metrics.filter_nanos),
             nanos_to_millis(metrics.projection_nanos),
             nanos_to_millis(metrics.limit_nanos),
@@ -2895,6 +2901,14 @@ impl Drop for ProfiledScanStream {
 
 fn nanos_to_millis(nanos: u64) -> f64 {
     nanos as f64 / 1_000_000.0
+}
+
+fn average_rows_per_batch(rows: usize, batches: usize) -> f64 {
+    if batches == 0 {
+        0.0
+    } else {
+        rows as f64 / batches as f64
+    }
 }
 
 fn aggregate_projection(aggregates: &[AggregateExpr], group_by: &[String]) -> Projection {
@@ -3834,7 +3848,7 @@ where
     let finished = finish(state);
     if let (Some(label), Some(started)) = (profile_label, started) {
         eprintln!(
-            "[dodam:tpch-profile] row_group_map {label}: chunk={} row_groups={} rows={} batches={} total={:.3} ms setup={:.3} ms metadata={:.3} ms planning={:.3} ms read_next={:.3} ms consume={:.3} ms compressed={}/{}",
+            "[dodam:tpch-profile] row_group_map {label}: chunk={} row_groups={} rows={} batches={} total={:.3} ms setup={:.3} ms metadata={:.3} ms planning={:.3} ms read_next={:.3} ms reader_next={:.3} ms reader_calls={} reader_eof={} avg_batch_rows={:.1} consume={:.3} ms compressed={}/{}",
             profile_chunk,
             row_groups.len(),
             rows,
@@ -3844,6 +3858,10 @@ where
             nanos_to_millis(reader.metadata_nanos()),
             nanos_to_millis(reader.planning_nanos()),
             nanos_to_millis(read_nanos),
+            nanos_to_millis(reader.next_nanos()),
+            reader.next_calls(),
+            reader.eof_calls(),
+            average_rows_per_batch(reader.output_rows(), reader.output_batches()),
             nanos_to_millis(consume_nanos),
             reader.compressed_bytes_scanned(),
             reader.compressed_bytes_total(),

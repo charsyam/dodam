@@ -568,6 +568,11 @@ pub struct ParquetBatchReader {
     compressed_bytes_scanned: u64,
     metadata_nanos: u64,
     planning_nanos: u64,
+    next_calls: usize,
+    eof_calls: usize,
+    output_batches: usize,
+    output_rows: usize,
+    next_nanos: u64,
 }
 
 impl ParquetBatchReader {
@@ -832,6 +837,11 @@ impl ParquetBatchReader {
             compressed_bytes_scanned,
             metadata_nanos,
             planning_nanos,
+            next_calls: 0,
+            eof_calls: 0,
+            output_batches: 0,
+            output_rows: 0,
+            next_nanos: 0,
         })
     }
 
@@ -882,6 +892,11 @@ impl ParquetBatchReader {
             compressed_bytes_scanned,
             metadata_nanos,
             planning_nanos,
+            next_calls: 0,
+            eof_calls: 0,
+            output_batches: 0,
+            output_rows: 0,
+            next_nanos: 0,
         })
     }
 
@@ -921,6 +936,11 @@ impl ParquetBatchReader {
             compressed_bytes_scanned,
             metadata_nanos,
             planning_nanos,
+            next_calls: 0,
+            eof_calls: 0,
+            output_batches: 0,
+            output_rows: 0,
+            next_nanos: 0,
         })
     }
 
@@ -950,6 +970,26 @@ impl ParquetBatchReader {
 
     pub fn planning_nanos(&self) -> u64 {
         self.planning_nanos
+    }
+
+    pub fn next_calls(&self) -> usize {
+        self.next_calls
+    }
+
+    pub fn eof_calls(&self) -> usize {
+        self.eof_calls
+    }
+
+    pub fn output_batches(&self) -> usize {
+        self.output_batches
+    }
+
+    pub fn output_rows(&self) -> usize {
+        self.output_rows
+    }
+
+    pub fn next_nanos(&self) -> u64 {
+        self.next_nanos
     }
 }
 
@@ -1165,7 +1205,22 @@ impl Iterator for ParquetBatchReader {
     type Item = Result<RecordBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|result| result.map_err(Into::into))
+        let started = Instant::now();
+        let next = self.inner.next();
+        self.next_calls = self.next_calls.saturating_add(1);
+        self.next_nanos = self.next_nanos.saturating_add(elapsed_nanos(started));
+        match next {
+            Some(Ok(batch)) => {
+                self.output_batches = self.output_batches.saturating_add(1);
+                self.output_rows = self.output_rows.saturating_add(batch.num_rows());
+                Some(Ok(batch))
+            }
+            Some(Err(error)) => Some(Err(error.into())),
+            None => {
+                self.eof_calls = self.eof_calls.saturating_add(1);
+                None
+            }
+        }
     }
 }
 

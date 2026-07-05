@@ -340,7 +340,15 @@ impl Iterator for SequentialFragmentScanStream {
                         )
                     }));
                 }
+                self.metrics.add_parquet_reader_stats(
+                    reader.next_calls(),
+                    reader.eof_calls(),
+                    reader.output_batches(),
+                    reader.output_rows(),
+                    reader.next_nanos(),
+                );
                 self.flush_decode_time();
+                self.current_reader = None;
             }
 
             let fragment = self.fragments.get(self.next_fragment)?;
@@ -487,6 +495,13 @@ impl ParallelParquetScanStream {
                 if decode_nanos > 0 {
                     metrics.add_decode_time(Duration::from_nanos(decode_nanos));
                 }
+                metrics.add_parquet_reader_stats(
+                    reader.next_calls(),
+                    reader.eof_calls(),
+                    reader.output_batches(),
+                    reader.output_rows(),
+                    reader.next_nanos(),
+                );
             });
         }
         drop(sender);
