@@ -7595,13 +7595,31 @@ async fn q12_filtered_lineitem_counts(
         )
         .await?;
     let shipmodes = Arc::new(shipmodes.to_vec());
-    parallel_batch_fold(
+    parallel_batch_fold_chunks(
         &mut stream,
-        move |batch| q12_filtered_lineitem_counts_batch(batch, &shipmodes, start_days, end_days),
+        q12_lineitem_chunk_size(),
+        move |batches| {
+            let mut pending = HashMap::<i64, Q12PendingOrder>::new();
+            for batch in batches {
+                q12_merge_pending_orders(
+                    &mut pending,
+                    q12_filtered_lineitem_counts_batch(batch, &shipmodes, start_days, end_days)?,
+                );
+            }
+            Ok(pending)
+        },
         HashMap::<i64, Q12PendingOrder>::new(),
         q12_merge_pending_orders,
         "Q12 lineitem aggregate",
     )
+}
+
+fn q12_lineitem_chunk_size() -> usize {
+    std::env::var("DODAM_Q12_LINEITEM_CHUNK_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(8)
 }
 
 fn q12_filtered_lineitem_counts_batch(
@@ -7779,18 +7797,25 @@ async fn q12_shipping_mode_counts_from_orders(
     shipmodes: &[String],
     pending: &HashMap<i64, Q12PendingOrder>,
 ) -> Result<Vec<Q12Row>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec![
-                "o_orderkey".to_string(),
-                "o_orderpriority".to_string(),
-            ]),
-            None,
-        )
-        .await?;
+    let projection = Projection::Columns(vec![
+        "o_orderkey".to_string(),
+        "o_orderpriority".to_string(),
+    ]);
+    let mut stream = if q12_order_row_filter_enabled() {
+        engine
+            .scan_parquet_batches_i64_set_filtered(
+                path,
+                batch_size,
+                projection,
+                "o_orderkey",
+                pending.keys().copied().collect(),
+            )
+            .await?
+    } else {
+        engine
+            .scan_parquet_batches(path, batch_size, None, projection, None)
+            .await?
+    };
     let pending = Arc::new(AdaptiveI64Map::from_hash((*pending).clone()));
     let groups = parallel_batch_fold(
         &mut stream,
@@ -7809,6 +7834,10 @@ async fn q12_shipping_mode_counts_from_orders(
         })
         .collect::<Vec<_>>();
     Ok(rows)
+}
+
+fn q12_order_row_filter_enabled() -> bool {
+    std::env::var_os("DODAM_Q12_ENABLE_ORDER_ROW_FILTER").is_some()
 }
 
 fn q12_shipping_mode_counts_batch(
