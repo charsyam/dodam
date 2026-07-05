@@ -1176,6 +1176,10 @@ Tried and rejected or neutral:
       - Added `SqlResultSink` plus `execute_sql_to_result_sink` in the SQL/engine-facing layer. Direct sink, streaming, and materialized fallback selection now lives with SQL execution instead of in `main.rs`.
       - CLI still owns command-line parsing, COPY statement parsing, and concrete stdout/file sink construction for now, but it no longer decides the direct/stream/materialize execution strategy.
       - SF=1 TPC-H `query-file` warm samples stayed around `0.68s`, matching the pre-refactor `0.67-0.69s` range, so this was retained as a structural cleanup rather than a speed claim.
+    - Continued the Engine/CLI boundary cleanup by moving COPY statement parsing into the library:
+      - Added `dodam::copy` with `parse_copy_to_select`, `CopyFormat`, and `ParquetCopyOptions`.
+      - `main.rs` no longer depends on `sqlparser` for COPY parsing or owns COPY option sanitization/parsing. It still owns concrete stdout/file sink construction and output profile printing.
+      - COPY option smoke test with Parquet `COMPRESSION`, `DICTIONARY`, `ROW_GROUP_SIZE`, `WRITE_BATCH_SIZE`, and `DATA_PAGE_ROW_COUNT_LIMIT` passed. SF=1 TPC-H `query-file` warm samples remained around `0.68-0.69s`, so this was retained as structure-only cleanup.
     - Tried Q12 late materialization for the lineitem shipping predicate:
       - The path reads `l_shipmode/l_commitdate/l_receiptdate/l_shipdate` first, builds a row selection, and then reads `l_orderkey` only for selected rows. This fixed an important projection-order assumption in the late path by using column-name lookup instead of ordinal-only lookup.
       - SF=1 Q12 selectivity was very low (`30,988 / 6,001,215`, about `0.52%`) with about `60k` selector runs, so it looked promising. However, same-process Q12 10-repeat samples did not beat the existing row-group map path once the full predicate pass plus row-selection payload read was included.

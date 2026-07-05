@@ -1,4 +1,5 @@
 pub mod catalog;
+pub mod copy;
 pub mod cost;
 mod dense;
 pub mod engine;
