@@ -9110,21 +9110,44 @@ async fn q03_order_rows(
     customers: &HashSet<i64>,
     order_cutoff: i32,
 ) -> Result<HashMap<i64, Q03Order>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec![
-                "o_orderkey".to_string(),
-                "o_custkey".to_string(),
-                "o_orderdate".to_string(),
-                "o_shippriority".to_string(),
-            ]),
-            None,
-        )
-        .await?;
+    let projection = Projection::Columns(vec![
+        "o_orderkey".to_string(),
+        "o_custkey".to_string(),
+        "o_orderdate".to_string(),
+        "o_shippriority".to_string(),
+    ]);
     let customers = Arc::new(AdaptiveI64Set::from_hash(customers.clone()));
+    if q03_order_row_group_map_enabled()
+        && let Some(partials) = engine
+            .parquet_row_group_map(
+                path.clone(),
+                batch_size,
+                projection.clone(),
+                q03_order_row_group_map_chunk(),
+                HashMap::<i64, Q03Order>::new,
+                {
+                    let customers = customers.clone();
+                    move |batch, orders| {
+                        merge_maps(
+                            orders,
+                            q03_order_rows_projected_batch(batch, &customers, order_cutoff)?,
+                        );
+                        Ok(Some(()))
+                    }
+                },
+                |orders| Ok(Some(orders)),
+            )
+            .await?
+    {
+        let mut orders = HashMap::new();
+        for partial in partials {
+            merge_maps(&mut orders, partial);
+        }
+        return Ok(orders);
+    }
+    let mut stream = engine
+        .scan_parquet_batches(path, batch_size, None, projection, None)
+        .await?;
     parallel_batch_fold_chunks(
         &mut stream,
         build_map_chunk_size(),
@@ -9142,6 +9165,18 @@ async fn q03_order_rows(
         merge_maps,
         "Q03 order rows",
     )
+}
+
+fn q03_order_row_group_map_enabled() -> bool {
+    std::env::var_os("DODAM_Q03_ENABLE_ORDER_ROW_GROUP_MAP").is_some()
+}
+
+fn q03_order_row_group_map_chunk() -> usize {
+    std::env::var("DODAM_Q03_ORDER_ROW_GROUP_MAP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2)
 }
 
 fn q03_order_rows_batch(
@@ -9186,6 +9221,26 @@ fn q03_order_rows_batch(
     Ok(orders)
 }
 
+fn q03_order_rows_projected_batch(
+    batch: RecordBatch,
+    customers: &AdaptiveI64Set,
+    order_cutoff: i32,
+) -> Result<HashMap<i64, Q03Order>> {
+    if batch.num_columns() == 4
+        && let Some(orders) = q03_order_rows_batch_typed(
+            batch.column(0),
+            batch.column(1),
+            batch.column(2),
+            batch.column(3),
+            customers,
+            order_cutoff,
+        )?
+    {
+        return Ok(orders);
+    }
+    q03_order_rows_batch(batch, customers, order_cutoff)
+}
+
 fn q03_order_rows_batch_typed(
     orderkeys: &ArrayRef,
     custkeys: &ArrayRef,
@@ -9208,13 +9263,37 @@ fn q03_order_rows_batch_typed(
         && orderdates.null_count() == 0
         && priorities.null_count() == 0
     {
-        for row in 0..orderkeys.len() {
-            if orderdates.value(row) < order_cutoff && customers.contains(custkeys.value(row)) {
+        let orderkey_values = orderkeys.values().as_ref();
+        let custkey_values = custkeys.values().as_ref();
+        let orderdate_values = orderdates.values().as_ref();
+        let priority_values = priorities.values().as_ref();
+        if let Some(customer_contains) = customers.dense_contains_slice() {
+            for row in 0..orderkey_values.len() {
+                let custkey = custkey_values[row];
+                let customer_hit = usize::try_from(custkey)
+                    .ok()
+                    .and_then(|index| customer_contains.get(index))
+                    .copied()
+                    .unwrap_or(false);
+                if orderdate_values[row] < order_cutoff && customer_hit {
+                    orders.insert(
+                        orderkey_values[row],
+                        Q03Order {
+                            o_orderdate: orderdate_values[row],
+                            o_shippriority: priority_values[row],
+                        },
+                    );
+                }
+            }
+            return Ok(Some(orders));
+        }
+        for row in 0..orderkey_values.len() {
+            if orderdate_values[row] < order_cutoff && customers.contains(custkey_values[row]) {
                 orders.insert(
-                    orderkeys.value(row),
+                    orderkey_values[row],
                     Q03Order {
-                        o_orderdate: orderdates.value(row),
-                        o_shippriority: priorities.value(row),
+                        o_orderdate: orderdate_values[row],
+                        o_shippriority: priority_values[row],
                     },
                 );
             }
