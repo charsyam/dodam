@@ -1255,6 +1255,171 @@ impl DodamEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub async fn parquet_scan_fold_chunks<Output, BuildPartial, BuildOutput, Map, Merge>(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        projection: Projection,
+        row_group_chunk: usize,
+        stream_chunk: usize,
+        enable_row_group_map: bool,
+        build_partial: BuildPartial,
+        build_output: BuildOutput,
+        map: Map,
+        mut merge: Merge,
+        label: &str,
+    ) -> Result<Output>
+    where
+        Output: Send + 'static,
+        BuildPartial: Fn() -> Output + Clone + Send + Sync + 'static,
+        BuildOutput: Fn() -> Output + Clone + Send + Sync + 'static,
+        Map: Fn(RecordBatch) -> Result<Output> + Clone + Send + Sync + 'static,
+        Merge: FnMut(&mut Output, Output) + Clone + Send + Sync + 'static,
+    {
+        if enable_row_group_map
+            && let Some(partials) = self
+                .parquet_row_group_map(
+                    path.clone(),
+                    batch_size,
+                    projection.clone(),
+                    row_group_chunk,
+                    build_partial.clone(),
+                    {
+                        let map = map.clone();
+                        let merge = merge.clone();
+                        move |batch, output| {
+                            let mut merge = merge.clone();
+                            merge(output, map(batch)?);
+                            Ok(Some(()))
+                        }
+                    },
+                    |output| Ok(Some(output)),
+                )
+                .await?
+        {
+            let profile = scan_profile_enabled();
+            let started = profile.then(Instant::now);
+            let mut output = build_output();
+            for partial in partials {
+                merge(&mut output, partial);
+            }
+            if let Some(started) = started {
+                eprintln!(
+                    "[dodam:scan-fold-profile] {label}: fused_total={:.3} ms row_group_chunk={row_group_chunk}",
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            return Ok(output);
+        }
+
+        let mut stream = self
+            .scan_parquet_batches(path, batch_size, None, projection, None)
+            .await?;
+        self.fold_scan_stream_chunks(
+            &mut stream,
+            stream_chunk,
+            build_partial,
+            build_output,
+            map,
+            merge,
+            label,
+        )
+    }
+
+    fn fold_scan_stream_chunks<Output, BuildPartial, BuildOutput, Map, Merge>(
+        &self,
+        stream: &mut SendableBatchStream,
+        chunk_size: usize,
+        build_partial: BuildPartial,
+        build_output: BuildOutput,
+        map: Map,
+        mut merge: Merge,
+        label: &str,
+    ) -> Result<Output>
+    where
+        Output: Send + 'static,
+        BuildPartial: Fn() -> Output + Clone + Send + Sync + 'static,
+        BuildOutput: Fn() -> Output + Clone + Send + Sync + 'static,
+        Map: Fn(RecordBatch) -> Result<Output> + Clone + Send + Sync + 'static,
+        Merge: FnMut(&mut Output, Output) + Clone + Send + Sync + 'static,
+    {
+        let profile = scan_profile_enabled();
+        let started = profile.then(Instant::now);
+        let (sender, receiver) = mpsc::channel();
+        let mut pending_chunks = 0_usize;
+        let mut chunk = Vec::with_capacity(chunk_size.max(1));
+        let stream_started = profile.then(Instant::now);
+        while let Some(batch) = stream.next() {
+            chunk.push(batch?);
+            if chunk.len() < chunk_size.max(1) {
+                continue;
+            }
+            let sender = sender.clone();
+            let map = map.clone();
+            let build_partial = build_partial.clone();
+            let merge = merge.clone();
+            let task_chunk = std::mem::replace(&mut chunk, Vec::with_capacity(chunk_size.max(1)));
+            pending_chunks += 1;
+            rayon::spawn(move || {
+                let mut output = build_partial();
+                let mut merge = merge.clone();
+                let result = task_chunk
+                    .into_iter()
+                    .try_for_each(|batch| -> Result<()> {
+                        merge(&mut output, map(batch)?);
+                        Ok(())
+                    })
+                    .map(|()| output);
+                let _ = sender.send(result);
+            });
+        }
+        if !chunk.is_empty() {
+            let sender = sender.clone();
+            let map = map.clone();
+            let build_partial = build_partial.clone();
+            let merge = merge.clone();
+            pending_chunks += 1;
+            rayon::spawn(move || {
+                let mut output = build_partial();
+                let mut merge = merge.clone();
+                let result = chunk
+                    .into_iter()
+                    .try_for_each(|batch| -> Result<()> {
+                        merge(&mut output, map(batch)?);
+                        Ok(())
+                    })
+                    .map(|()| output);
+                let _ = sender.send(result);
+            });
+        }
+        let stream_ms = stream_started
+            .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or_default();
+        drop(sender);
+
+        let merge_started = profile.then(Instant::now);
+        let mut output = build_output();
+        for _ in 0..pending_chunks {
+            let partial = receiver.recv().map_err(|_| {
+                DodamError::UnsupportedSql(format!("{label} scan-fold worker stopped"))
+            })??;
+            merge(&mut output, partial);
+        }
+        if let Some(started) = started {
+            let merge_ms = merge_started
+                .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or_default();
+            eprintln!(
+                "[dodam:scan-fold-profile] {label}: total={:.3} ms stream_read={:.3} ms worker_wait_merge={:.3} ms chunks={pending_chunks}",
+                started.elapsed().as_secs_f64() * 1000.0,
+                stream_ms,
+                merge_ms
+            );
+        }
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn parquet_row_group_map_pruned<State, Output, BuildState, ConsumeBatch, Finish>(
         &self,
         path: PathBuf,
