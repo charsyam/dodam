@@ -7982,14 +7982,6 @@ fn q12_filtered_lineitem_counts_batch_typed(
         let receiptdate_values = receiptdates.values().as_ref();
         let shipdate_values = shipdates.values().as_ref();
         for row in 0..orderkeys.len() {
-            let mode = bytes_string_parts(mode_offsets, mode_data, row);
-            let mode_index = if mode == left_mode {
-                0
-            } else if mode == right_mode {
-                1
-            } else {
-                continue;
-            };
             let commitdate = commitdate_values[row];
             let receiptdate = receiptdate_values[row];
             if commitdate >= receiptdate
@@ -7999,6 +7991,14 @@ fn q12_filtered_lineitem_counts_batch_typed(
             {
                 continue;
             }
+            let mode = bytes_string_parts(mode_offsets, mode_data, row);
+            let mode_index = if mode == left_mode {
+                0
+            } else if mode == right_mode {
+                1
+            } else {
+                continue;
+            };
             pending.entry(orderkey_values[row]).or_default().counts[mode_index] += 1;
         }
         return Some(pending);
@@ -8012,14 +8012,6 @@ fn q12_filtered_lineitem_counts_batch_typed(
         {
             continue;
         }
-        let mode = bytes_string_parts(mode_offsets, mode_data, row);
-        let mode_index = if mode == left_mode {
-            0
-        } else if mode == right_mode {
-            1
-        } else {
-            continue;
-        };
         let commitdate = commitdates.value(row);
         let receiptdate = receiptdates.value(row);
         if commitdate >= receiptdate
@@ -8029,6 +8021,14 @@ fn q12_filtered_lineitem_counts_batch_typed(
         {
             continue;
         }
+        let mode = bytes_string_parts(mode_offsets, mode_data, row);
+        let mode_index = if mode == left_mode {
+            0
+        } else if mode == right_mode {
+            1
+        } else {
+            continue;
+        };
         pending.entry(orderkeys.value(row)).or_default().counts[mode_index] += 1;
     }
     Some(pending)
@@ -8097,6 +8097,16 @@ fn q12_late_build_selection_batch(
     let receiptdate_values = receiptdates.values().as_ref();
     let shipdate_values = shipdates.values().as_ref();
     for row in 0..batch.num_rows() {
+        let commitdate = commitdate_values[row];
+        let receiptdate = receiptdate_values[row];
+        if commitdate >= receiptdate
+            || shipdate_values[row] >= commitdate
+            || receiptdate < state.start_days
+            || receiptdate >= state.end_days
+        {
+            selection.push(false);
+            continue;
+        }
         let mode = bytes_string_parts(mode_offsets, mode_data, row);
         let mode_index = if mode == left_mode {
             0
@@ -8106,16 +8116,8 @@ fn q12_late_build_selection_batch(
             selection.push(false);
             continue;
         };
-        let commitdate = commitdate_values[row];
-        let receiptdate = receiptdate_values[row];
-        let selected = commitdate < receiptdate
-            && shipdate_values[row] < commitdate
-            && receiptdate >= state.start_days
-            && receiptdate < state.end_days;
-        if selected {
-            state.selected_modes.push(mode_index);
-        }
-        selection.push(selected);
+        state.selected_modes.push(mode_index);
+        selection.push(true);
     }
     Ok(Some(()))
 }
@@ -16405,8 +16407,8 @@ fn q21_merge_ordered_lineitem_chunks(
             left.state.merge(right.state);
         },
         |counts, boundary| {
-            if boundary.selected {
-                q21_count_qualifying_order(counts, suppliers, &boundary.state);
+            if boundary.state.selected {
+                q21_count_qualifying_order(counts, suppliers, &boundary.state.state);
             }
         },
     );

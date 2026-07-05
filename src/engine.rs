@@ -69,11 +69,13 @@ pub struct LocalExecutionGraphOutput {
     pub stage_metrics: Vec<LocalStageExecutionMetrics>,
 }
 
+#[derive(Debug, Clone)]
 pub struct OrderedRowGroupBoundary<K, State> {
     pub key: K,
     pub state: State,
 }
 
+#[derive(Debug, Clone)]
 pub struct OrderedRowGroupChunk<K, State, Output> {
     pub output: Output,
     pub first: Option<OrderedRowGroupBoundary<K, State>>,
@@ -90,7 +92,7 @@ pub fn merge_ordered_row_group_chunks<K, State, Output, MergeOutput, MergeState,
     K: Eq,
     MergeOutput: FnMut(&mut Output, Output),
     MergeState: FnMut(&mut State, State),
-    EmitState: FnMut(&mut Output, State),
+    EmitState: FnMut(&mut Output, OrderedRowGroupBoundary<K, State>),
 {
     let mut pending = None::<OrderedRowGroupBoundary<K, State>>;
     for chunk in chunks {
@@ -110,7 +112,7 @@ pub fn merge_ordered_row_group_chunks<K, State, Output, MergeOutput, MergeState,
         }
     }
     if let Some(boundary) = pending {
-        emit_state(output, boundary.state);
+        emit_state(output, boundary);
     }
 }
 
@@ -124,22 +126,22 @@ fn merge_ordered_row_group_boundary<K, State, Output, MergeState, EmitState>(
 ) where
     K: Eq,
     MergeState: FnMut(&mut State, State),
-    EmitState: FnMut(&mut Output, State),
+    EmitState: FnMut(&mut Output, OrderedRowGroupBoundary<K, State>),
 {
     if let Some(mut existing) = pending.take() {
         if existing.key == boundary.key {
             merge_state(&mut existing.state, boundary.state);
             if complete_in_chunk {
-                emit_state(output, existing.state);
+                emit_state(output, existing);
             } else {
                 *pending = Some(existing);
             }
             return;
         }
-        emit_state(output, existing.state);
+        emit_state(output, existing);
     }
     if complete_in_chunk {
-        emit_state(output, boundary.state);
+        emit_state(output, boundary);
     } else {
         *pending = Some(boundary);
     }
@@ -3646,8 +3648,8 @@ fn physical_batch_column_index(batch: &RecordBatch, column: &str) -> Result<usiz
 
 #[derive(Debug, Clone)]
 struct OrderedGroupSumPartial {
-    first: Option<(i64, f64)>,
-    last: Option<(i64, f64)>,
+    first: Option<OrderedRowGroupBoundary<i64, f64>>,
+    last: Option<OrderedRowGroupBoundary<i64, f64>>,
     middle: HashMap<i64, f64>,
 }
 
@@ -3661,14 +3663,15 @@ impl OrderedGroupSumPartial {
     }
 
     fn push_run(&mut self, key: i64, sum: f64, threshold: f64) {
+        let boundary = OrderedRowGroupBoundary { key, state: sum };
         if self.first.is_none() {
-            self.first = Some((key, sum));
+            self.first = Some(boundary);
             return;
         }
-        if let Some((last_key, last_sum)) = self.last.replace((key, sum))
-            && last_sum > threshold
+        if let Some(last) = self.last.replace(boundary)
+            && last.state > threshold
         {
-            self.middle.insert(last_key, last_sum);
+            self.middle.insert(last.key, last.state);
         }
     }
 
@@ -4527,46 +4530,34 @@ fn merge_ordered_group_sum_partials(
     partials: Vec<Option<OrderedGroupSumPartial>>,
     threshold: f64,
 ) -> Result<Option<HashMap<i64, f64>>> {
-    let mut output = HashMap::new();
-    let mut carry: Option<(i64, f64)> = None;
+    let mut chunks = Vec::with_capacity(partials.len());
     for partial in partials {
         let Some(partial) = partial else {
             return Ok(None);
         };
-        let Some(first) = partial.first else {
-            continue;
-        };
-        if let Some((carry_key, carry_sum)) = carry.take() {
-            if first.0 < carry_key {
-                return Ok(None);
-            }
-            if first.0 == carry_key {
-                carry = Some((carry_key, carry_sum + first.1));
-            } else {
-                if carry_sum > threshold {
-                    output.insert(carry_key, carry_sum);
-                }
-                carry = Some(first);
-            }
-        } else {
-            carry = Some(first);
+        if let (Some(first), Some(last)) = (&partial.first, &partial.last)
+            && last.key < first.key
+        {
+            return Ok(None);
         }
-
-        if partial.last.is_some() {
-            if let Some((carry_key, carry_sum)) = carry.take()
-                && carry_sum > threshold
-            {
-                output.insert(carry_key, carry_sum);
+        chunks.push(OrderedRowGroupChunk {
+            output: partial.middle,
+            first: partial.first,
+            last: partial.last,
+        });
+    }
+    let mut output = HashMap::new();
+    merge_ordered_row_group_chunks(
+        chunks,
+        &mut output,
+        |output, partial| output.extend(partial),
+        |left, right| *left += right,
+        |output, boundary| {
+            if boundary.state > threshold {
+                output.insert(boundary.key, boundary.state);
             }
-            output.extend(partial.middle);
-            carry = partial.last;
-        }
-    }
-    if let Some((key, sum)) = carry
-        && sum > threshold
-    {
-        output.insert(key, sum);
-    }
+        },
+    );
     Ok(Some(output))
 }
 
