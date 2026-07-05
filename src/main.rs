@@ -16,7 +16,7 @@ use dodam::execution::{
     AggregateExpr, AggregateMetrics, FilterExpr, Projection, RecordBatchSink, ScanPlanMetrics,
     SortExpr,
 };
-use dodam::sql::{QueryOutput, execute_sql, try_execute_sql_streaming, try_execute_sql_to_sink};
+use dodam::sql::{QueryOutput, SqlResultSink, SqlSinkExecutionOptions, execute_sql_to_result_sink};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, Encoding};
 use parquet::file::properties::WriterProperties;
@@ -342,37 +342,19 @@ async fn run_query_sql(
         )?;
         profile.sink_create = sink_started.elapsed();
 
-        if copy_sql_may_use_direct_or_streaming(&copy.sql) {
-            let direct_started = Instant::now();
-            if let Some(metrics) =
-                try_execute_sql_to_sink(engine, &copy.sql, batch_size, &mut sink).await?
-            {
-                profile.direct_sink = Some(direct_started.elapsed());
-                profile.scan_plan_metrics = Some(metrics);
-                profile.print(sink.stats());
-                return Ok(());
-            }
-            profile.direct_sink = Some(direct_started.elapsed());
-
-            let streaming_started = Instant::now();
-            if let Some(stream) = try_execute_sql_streaming(engine, &copy.sql, batch_size).await? {
-                engine.write_batches_to_sink(stream, &mut sink)?;
-                profile.streaming = Some(streaming_started.elapsed());
-                profile.print(sink.stats());
-                return Ok(());
-            }
-            profile.streaming = Some(streaming_started.elapsed());
-        } else {
-            profile.direct_sink = Some(Duration::ZERO);
-            profile.streaming = Some(Duration::ZERO);
-        }
-
-        let materialize_started = Instant::now();
-        let output = execute_sql(engine, &copy.sql, batch_size).await?;
-        profile.materialize = Some(materialize_started.elapsed());
-        let write_output_started = Instant::now();
-        sink.write_output(output)?;
-        profile.write_output = Some(write_output_started.elapsed());
+        let execution = execute_sql_to_result_sink(
+            engine,
+            &copy.sql,
+            batch_size,
+            &mut sink,
+            SqlSinkExecutionOptions::default(),
+        )
+        .await?;
+        profile.direct_sink = execution.direct_sink;
+        profile.streaming = execution.streaming;
+        profile.materialize = execution.execute;
+        profile.write_output = execution.write_output;
+        profile.scan_plan_metrics = execution.scan_plan_metrics;
         let finish_started = Instant::now();
         sink.finish()?;
         profile.finish = Some(finish_started.elapsed());
@@ -381,51 +363,22 @@ async fn run_query_sql(
     }
 
     let mut sink = StdoutQuerySink;
-    let direct_started = Instant::now();
-    if try_execute_sql_to_sink(engine, sql, batch_size, &mut sink)
-        .await?
-        .is_some()
-    {
-        print_query_profile(
-            query_profile_enabled,
-            command_started,
-            copy_parse_elapsed,
-            Some(direct_started.elapsed()),
-            None,
-            None,
-            None,
-        );
-        return Ok(());
-    }
-    let direct_elapsed = direct_started.elapsed();
-    let streaming_started = Instant::now();
-    if let Some(stream) = try_execute_sql_streaming(engine, sql, batch_size).await? {
-        engine.write_batches_to_sink(stream, &mut sink)?;
-        print_query_profile(
-            query_profile_enabled,
-            command_started,
-            copy_parse_elapsed,
-            Some(direct_elapsed),
-            Some(streaming_started.elapsed()),
-            None,
-            None,
-        );
-        return Ok(());
-    }
-    let streaming_elapsed = streaming_started.elapsed();
-    let execute_started = Instant::now();
-    let output = execute_sql(engine, sql, batch_size).await?;
-    let execute_elapsed = execute_started.elapsed();
-    let write_started = Instant::now();
-    sink.write_output(output)?;
+    let execution = execute_sql_to_result_sink(
+        engine,
+        sql,
+        batch_size,
+        &mut sink,
+        SqlSinkExecutionOptions::default(),
+    )
+    .await?;
     print_query_profile(
         query_profile_enabled,
         command_started,
         copy_parse_elapsed,
-        Some(direct_elapsed),
-        Some(streaming_elapsed),
-        Some(execute_elapsed),
-        Some(write_started.elapsed()),
+        execution.direct_sink,
+        execution.streaming,
+        execution.execute,
+        execution.write_output,
     );
     Ok(())
 }
@@ -882,6 +835,16 @@ impl RecordBatchSink for CopyFileQuerySink {
     }
 }
 
+impl SqlResultSink for CopyFileQuerySink {
+    fn record_batch_sink(&mut self) -> &mut dyn RecordBatchSink {
+        self
+    }
+
+    fn write_output(&mut self, output: QueryOutput) -> Result<()> {
+        CopyFileQuerySink::write_output(self, output)
+    }
+}
+
 const CSV_SINK_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const PARQUET_SINK_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const PARQUET_WIDE_SINK_BUFFER_BYTES: usize = 1024 * 1024;
@@ -1245,25 +1208,6 @@ fn query_profile_enabled() -> bool {
             "1" | "true" | "yes" | "on"
         )
     })
-}
-
-fn copy_sql_may_use_direct_or_streaming(sql: &str) -> bool {
-    let lower = sql.to_ascii_lowercase();
-    if lower.contains(" group by ")
-        || lower.contains(" order by ")
-        || lower.contains(" having ")
-        || lower.contains(" distinct ")
-        || lower.contains(" exists")
-        || lower.contains(" in (select")
-        || lower.contains(" sum(")
-        || lower.contains(" count(")
-        || lower.contains(" avg(")
-        || lower.contains(" min(")
-        || lower.contains(" max(")
-    {
-        return false;
-    }
-    true
 }
 
 fn configure_default_rayon_threads() {
@@ -1888,6 +1832,16 @@ impl StdoutQuerySink {
 impl RecordBatchSink for StdoutQuerySink {
     fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         self.write_stdout_batch(batch)
+    }
+}
+
+impl SqlResultSink for StdoutQuerySink {
+    fn record_batch_sink(&mut self) -> &mut dyn RecordBatchSink {
+        self
+    }
+
+    fn write_output(&mut self, output: QueryOutput) -> Result<()> {
+        StdoutQuerySink::write_output(self, output)
     }
 }
 

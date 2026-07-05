@@ -3,7 +3,7 @@ use std::fs::File;
 use std::hash::BuildHasher;
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float64Array,
@@ -144,6 +144,33 @@ pub enum QueryOutput {
     Explain {
         plan: String,
     },
+}
+
+pub trait SqlResultSink {
+    fn record_batch_sink(&mut self) -> &mut dyn RecordBatchSink;
+    fn write_output(&mut self, output: QueryOutput) -> Result<()>;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SqlSinkExecutionOptions {
+    pub allow_direct_or_streaming: bool,
+}
+
+impl Default for SqlSinkExecutionOptions {
+    fn default() -> Self {
+        Self {
+            allow_direct_or_streaming: true,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct SqlSinkExecutionProfile {
+    pub direct_sink: Option<Duration>,
+    pub streaming: Option<Duration>,
+    pub execute: Option<Duration>,
+    pub write_output: Option<Duration>,
+    pub scan_plan_metrics: Option<ScanPlanMetrics>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -20083,6 +20110,65 @@ pub async fn try_execute_sql_to_sink(
         })
         .await?;
     engine.write_join_plan_to_sink(plan, sink).map(Some)
+}
+
+pub async fn execute_sql_to_result_sink(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+    sink: &mut dyn SqlResultSink,
+    options: SqlSinkExecutionOptions,
+) -> Result<SqlSinkExecutionProfile> {
+    let mut profile = SqlSinkExecutionProfile::default();
+    if options.allow_direct_or_streaming && sql_may_use_direct_or_streaming(sql) {
+        let direct_started = Instant::now();
+        if let Some(metrics) =
+            try_execute_sql_to_sink(engine, sql, batch_size, sink.record_batch_sink()).await?
+        {
+            profile.direct_sink = Some(direct_started.elapsed());
+            profile.scan_plan_metrics = Some(metrics);
+            return Ok(profile);
+        }
+        profile.direct_sink = Some(direct_started.elapsed());
+
+        let streaming_started = Instant::now();
+        if let Some(stream) = try_execute_sql_streaming(engine, sql, batch_size).await? {
+            engine.write_batches_to_sink(stream, sink.record_batch_sink())?;
+            profile.streaming = Some(streaming_started.elapsed());
+            return Ok(profile);
+        }
+        profile.streaming = Some(streaming_started.elapsed());
+    } else {
+        profile.direct_sink = Some(Duration::ZERO);
+        profile.streaming = Some(Duration::ZERO);
+    }
+
+    let execute_started = Instant::now();
+    let output = execute_sql(engine, sql, batch_size).await?;
+    profile.execute = Some(execute_started.elapsed());
+    let write_started = Instant::now();
+    sink.write_output(output)?;
+    profile.write_output = Some(write_started.elapsed());
+    Ok(profile)
+}
+
+fn sql_may_use_direct_or_streaming(sql: &str) -> bool {
+    let lower = sql.to_ascii_lowercase();
+    if lower.contains(" group by ")
+        || lower.contains(" order by ")
+        || lower.contains(" having ")
+        || lower.contains(" distinct ")
+        || lower.contains(" exists")
+        || lower.contains(" in (select")
+        || lower.contains(" sum(")
+        || lower.contains(" count(")
+        || lower.contains(" avg(")
+        || lower.contains(" min(")
+        || lower.contains(" max(")
+    {
+        return false;
+    }
+    true
 }
 
 async fn explain_sql(engine: &DodamEngine, sql: &str, batch_size: usize) -> Result<Option<String>> {

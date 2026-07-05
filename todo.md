@@ -1172,6 +1172,10 @@ Tried and rejected or neutral:
       - This is mainly a benchmark-control and operational convenience feature. It keeps catalog/metadata/file cache state alive across statements and avoids measuring process startup once per TPC-H query.
       - SF=1 TPC-H 22-query Parquet COPY sample: `query-file` completed in about `0.84s`, close to the existing in-process runner's `0.80s`. A same-process DuckDB CLI script completed in about `0.67s`, so the fairer current gap is roughly `1.25x` for CLI COPY and `1.19x` for direct in-process execution, rather than the larger per-query CLI gap.
       - DuckDB `.timer` per-query comparison showed the biggest remaining same-process gaps around Q12, Q03, and Q01; Q09/Q18/Q21 are already competitive or faster in the sampled SF=1 run.
+    - Started clarifying the Engine/CLI boundary:
+      - Added `SqlResultSink` plus `execute_sql_to_result_sink` in the SQL/engine-facing layer. Direct sink, streaming, and materialized fallback selection now lives with SQL execution instead of in `main.rs`.
+      - CLI still owns command-line parsing, COPY statement parsing, and concrete stdout/file sink construction for now, but it no longer decides the direct/stream/materialize execution strategy.
+      - SF=1 TPC-H `query-file` warm samples stayed around `0.68s`, matching the pre-refactor `0.67-0.69s` range, so this was retained as a structural cleanup rather than a speed claim.
     - Tried Q12 late materialization for the lineitem shipping predicate:
       - The path reads `l_shipmode/l_commitdate/l_receiptdate/l_shipdate` first, builds a row selection, and then reads `l_orderkey` only for selected rows. This fixed an important projection-order assumption in the late path by using column-name lookup instead of ordinal-only lookup.
       - SF=1 Q12 selectivity was very low (`30,988 / 6,001,215`, about `0.52%`) with about `60k` selector runs, so it looked promising. However, same-process Q12 10-repeat samples did not beat the existing row-group map path once the full predicate pass plus row-selection payload read was included.
