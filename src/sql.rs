@@ -5419,7 +5419,7 @@ async fn q09_profit_rows(
                 q09_row_group_map_chunk(),
                 Q09ProfitPartial::default,
                 move |batch, partial| {
-                    partial.merge(q09_profit_batch(
+                    partial.merge(q09_profit_projected_batch(
                         batch,
                         &part_keys_for_scan,
                         &supplier_nations_for_scan,
@@ -6026,6 +6026,38 @@ fn q09_profit_batch(
         *groups.entry((nationkey, o_year)).or_insert(0.0) += amount;
     }
     Ok(Q09ProfitPartial { groups, profile })
+}
+
+fn q09_profit_projected_batch(
+    batch: RecordBatch,
+    part_keys: &AdaptiveI64Set,
+    supplier_nations: &AdaptiveI64Map<i64>,
+    order_years: &Q09OrderYears,
+    supply_costs: &Q09SupplyCosts,
+) -> Result<Q09ProfitPartial> {
+    if batch.num_columns() == 6
+        && let Some(groups) = q09_profit_decimal_batch(
+            batch.column(0),
+            batch.column(1),
+            batch.column(2),
+            batch.column(3),
+            batch.column(4),
+            batch.column(5),
+            part_keys,
+            supplier_nations,
+            order_years,
+            supply_costs,
+        )?
+    {
+        return Ok(groups);
+    }
+    q09_profit_batch(
+        batch,
+        part_keys,
+        supplier_nations,
+        order_years,
+        supply_costs,
+    )
 }
 
 fn q09_part_key_contains(
@@ -7646,7 +7678,7 @@ async fn q12_filtered_lineitem_counts(
                     move |batch, pending| {
                         q12_merge_pending_orders(
                             pending,
-                            q12_filtered_lineitem_counts_batch(
+                            q12_filtered_lineitem_counts_projected_batch(
                                 batch, &shipmodes, start_days, end_days,
                             )?,
                         );
@@ -7697,7 +7729,9 @@ async fn q12_filtered_lineitem_counts_stream(
             for batch in batches {
                 q12_merge_pending_orders(
                     &mut pending,
-                    q12_filtered_lineitem_counts_batch(batch, &shipmodes, start_days, end_days)?,
+                    q12_filtered_lineitem_counts_projected_batch(
+                        batch, &shipmodes, start_days, end_days,
+                    )?,
                 );
             }
             Ok(pending)
@@ -7772,6 +7806,31 @@ fn q12_filtered_lineitem_counts_batch(
         pending.entry(orderkey).or_default().counts[mode_index] += 1;
     }
     Ok(pending)
+}
+
+fn q12_filtered_lineitem_counts_projected_batch(
+    batch: RecordBatch,
+    shipmodes: &[String],
+    start_days: i32,
+    end_days: i32,
+) -> Result<HashMap<i64, Q12PendingOrder>> {
+    if batch.num_columns() == 5
+        && let Some(modes) = batch.column(1).as_any().downcast_ref::<StringArray>()
+        && q12_typed_loop_enabled()
+        && let Some(pending) = q12_filtered_lineitem_counts_batch_typed(
+            batch.column(0),
+            modes,
+            batch.column(2),
+            batch.column(3),
+            batch.column(4),
+            shipmodes,
+            start_days,
+            end_days,
+        )
+    {
+        return Ok(pending);
+    }
+    q12_filtered_lineitem_counts_batch(batch, shipmodes, start_days, end_days)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7917,7 +7976,7 @@ async fn q12_shipping_mode_counts_from_orders(
     let pending = Arc::new(AdaptiveI64Map::from_hash((*pending).clone()));
     let groups = parallel_batch_fold(
         &mut stream,
-        move |batch| q12_shipping_mode_counts_batch(batch, &pending),
+        move |batch| q12_shipping_mode_counts_projected_batch(batch, &pending),
         [Q12State::default(); 2],
         q12_merge_shipping_mode_counts,
         "Q12 orders aggregate",
@@ -7975,6 +8034,21 @@ fn q12_shipping_mode_counts_batch(
         }
     }
     Ok(groups)
+}
+
+fn q12_shipping_mode_counts_projected_batch(
+    batch: RecordBatch,
+    pending: &AdaptiveI64Map<Q12PendingOrder>,
+) -> Result<[Q12State; 2]> {
+    if batch.num_columns() == 2
+        && let Some(orderpriorities) = batch.column(1).as_any().downcast_ref::<StringArray>()
+        && q12_typed_loop_enabled()
+        && let Some(groups) =
+            q12_shipping_mode_counts_batch_typed(batch.column(0), orderpriorities, pending)
+    {
+        return Ok(groups);
+    }
+    q12_shipping_mode_counts_batch(batch, pending)
 }
 
 fn q12_shipping_mode_counts_batch_typed(
@@ -8984,7 +9058,9 @@ async fn q03_revenue_rows(
                 batch_size,
                 projection,
                 pruning_predicates,
-                move |batch| q03_revenue_batch_sorted(batch, &orders_for_scan, ship_cutoff),
+                move |batch| {
+                    q03_revenue_projected_batch_sorted(batch, &orders_for_scan, ship_cutoff)
+                },
             )
             .await?
         } else {
@@ -8995,7 +9071,7 @@ async fn q03_revenue_rows(
                 batch_size,
                 projection,
                 pruning_predicates,
-                move |batch| q03_revenue_batch(batch, &orders_for_scan, ship_cutoff),
+                move |batch| q03_revenue_projected_batch(batch, &orders_for_scan, ship_cutoff),
             )
             .await?
         }
@@ -9199,6 +9275,26 @@ fn q03_revenue_batch(
     Ok(revenues)
 }
 
+fn q03_revenue_projected_batch(
+    batch: RecordBatch,
+    orders: &HashMap<i64, Q03Order>,
+    ship_cutoff: i32,
+) -> Result<HashMap<i64, f64>> {
+    if batch.num_columns() == 4
+        && let Some(revenues) = q03_revenue_batch_typed(
+            batch.column(0),
+            batch.column(1),
+            batch.column(2),
+            batch.column(3),
+            orders,
+            ship_cutoff,
+        )?
+    {
+        return Ok(revenues);
+    }
+    q03_revenue_batch(batch, orders, ship_cutoff)
+}
+
 fn q03_revenue_batch_typed(
     orderkeys: &ArrayRef,
     shipdates: &ArrayRef,
@@ -9298,6 +9394,26 @@ fn q03_revenue_batch_sorted(
         *revenues.entry(orderkey).or_insert(0.0) += extendedprice * (1.0 - discount);
     }
     Ok(revenues)
+}
+
+fn q03_revenue_projected_batch_sorted(
+    batch: RecordBatch,
+    orders: &SortedI64Lookup<Q03Order>,
+    ship_cutoff: i32,
+) -> Result<HashMap<i64, f64>> {
+    if batch.num_columns() == 4
+        && let Some(revenues) = q03_revenue_batch_sorted_typed(
+            batch.column(0),
+            batch.column(1),
+            batch.column(2),
+            batch.column(3),
+            orders,
+            ship_cutoff,
+        )?
+    {
+        return Ok(revenues);
+    }
+    q03_revenue_batch_sorted(batch, orders, ship_cutoff)
 }
 
 fn q03_revenue_batch_sorted_typed(
@@ -10588,7 +10704,7 @@ async fn q05_revenue_by_nation(
                 move |batch, groups| {
                     merge_f64_groups(
                         groups,
-                        q05_revenue_by_nation_batch(
+                        q05_revenue_by_nation_projected_batch(
                             batch,
                             &order_customer_nations_for_scan,
                             &supplier_nations_for_scan,
@@ -10732,6 +10848,26 @@ fn q05_revenue_by_nation_batch(
         *groups.entry(customer_nation).or_insert(0.0) += extendedprice * (1.0 - discount);
     }
     Ok(groups)
+}
+
+fn q05_revenue_by_nation_projected_batch(
+    batch: RecordBatch,
+    order_customer_nations: &FastHashMap<i64, i64>,
+    supplier_nations: &AdaptiveI64Map<i64>,
+) -> Result<HashMap<i64, f64>> {
+    if batch.num_columns() == 4
+        && let Some(groups) = q05_revenue_by_nation_typed(
+            batch.column(0),
+            batch.column(1),
+            batch.column(2),
+            batch.column(3),
+            order_customer_nations,
+            supplier_nations,
+        )?
+    {
+        return Ok(groups);
+    }
+    q05_revenue_by_nation_batch(batch, order_customer_nations, supplier_nations)
 }
 
 fn q05_revenue_by_nation_typed(
@@ -11701,7 +11837,7 @@ async fn q07_volume_rows(
                 move |batch, groups| {
                     merge_f64_groups(
                         groups,
-                        q07_volume_batch(
+                        q07_volume_projected_batch(
                             batch,
                             &supplier_nations_for_scan,
                             &order_customer_nations_for_scan,
@@ -11875,6 +12011,37 @@ fn q07_volume_batch(
             .or_insert(0.0) += extendedprice * (1.0 - discount);
     }
     Ok(groups)
+}
+
+fn q07_volume_projected_batch(
+    batch: RecordBatch,
+    supplier_nations: &AdaptiveI64Map<i64>,
+    order_customer_nations: &FastHashMap<i64, i64>,
+    start_days: i32,
+    end_days: i32,
+) -> Result<HashMap<(i64, i64, i32), f64>> {
+    if batch.num_columns() == 5
+        && let Some(groups) = q07_volume_batch_typed(
+            batch.column(0),
+            batch.column(1),
+            batch.column(2),
+            batch.column(3),
+            batch.column(4),
+            supplier_nations,
+            order_customer_nations,
+            start_days,
+            end_days,
+        )?
+    {
+        return Ok(groups);
+    }
+    q07_volume_batch(
+        batch,
+        supplier_nations,
+        order_customer_nations,
+        start_days,
+        end_days,
+    )
 }
 
 fn q07_volume_batch_typed(
@@ -14891,9 +15058,7 @@ async fn try_execute_q21_suppliers_who_kept_orders_waiting_fast(
 }
 
 fn q21_ordered_lineitem_enabled() -> bool {
-    std::env::var("DODAM_Q21_ENABLE_ORDERED_LINEITEM")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
+    std::env::var_os("DODAM_Q21_DISABLE_ORDERED_LINEITEM").is_none()
 }
 
 fn q21_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
@@ -15163,7 +15328,11 @@ async fn q21_lineitem_order_states(
                 {
                     let final_orders = final_orders.clone();
                     move |batch, states| {
-                        q21_lineitem_order_states_batch_into(batch, &final_orders, states)?;
+                        q21_lineitem_order_states_projected_batch_into(
+                            batch,
+                            &final_orders,
+                            states,
+                        )?;
                         Ok(Some(()))
                     }
                 },
@@ -15187,7 +15356,7 @@ async fn q21_lineitem_order_states(
         move |batches| {
             let mut states = q21_order_state_map();
             for batch in batches {
-                q21_lineitem_order_states_batch_into(batch, &final_orders, &mut states)?;
+                q21_lineitem_order_states_projected_batch_into(batch, &final_orders, &mut states)?;
             }
             Ok(states)
         },
@@ -15597,6 +15766,26 @@ fn q21_lineitem_order_states_batch_into(
     Ok(())
 }
 
+fn q21_lineitem_order_states_projected_batch_into(
+    batch: RecordBatch,
+    final_orders: &Q21FinalOrders,
+    states: &mut Q21OrderStateMap,
+) -> Result<()> {
+    if batch.num_columns() == 4
+        && q21_lineitem_order_states_typed_into(
+            batch.column(0),
+            batch.column(1),
+            batch.column(2),
+            batch.column(3),
+            final_orders,
+            states,
+        )
+    {
+        return Ok(());
+    }
+    q21_lineitem_order_states_batch_into(batch, final_orders, states)
+}
+
 fn q21_lineitem_order_states_typed_into(
     orderkeys: &ArrayRef,
     suppkeys: &ArrayRef,
@@ -15735,7 +15924,7 @@ async fn q21_lineitem_supplier_counts_ordered(
     let dense_final_orders = final_orders.dense_contains_slice();
     while let Some(batch) = stream.next() {
         let batch = batch?;
-        if !q21_ordered_lineitem_counts_batch(
+        if !q21_ordered_lineitem_counts_projected_batch(
             &batch,
             final_orders,
             dense_final_orders,
@@ -15752,6 +15941,51 @@ async fn q21_lineitem_supplier_counts_ordered(
         q21_count_qualifying_order(&mut counts, suppliers, &current_state);
     }
     Ok(Some(counts))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q21_ordered_lineitem_counts_projected_batch(
+    batch: &RecordBatch,
+    final_orders: &Q21FinalOrders,
+    dense_final_orders: Option<&[bool]>,
+    suppliers: &HashMap<i64, String>,
+    counts: &mut HashMap<i64, u64>,
+    current_orderkey: &mut Option<i64>,
+    current_selected: &mut bool,
+    current_state: &mut Q21OrderState,
+) -> Result<bool> {
+    if batch.num_columns() == 4
+        && let (Some(orderkeys), Some(suppkeys), Some(receipt), Some(commit)) = (
+            batch.column(0).as_any().downcast_ref::<Int64Array>(),
+            batch.column(1).as_any().downcast_ref::<Int64Array>(),
+            batch.column(2).as_any().downcast_ref::<Date32Array>(),
+            batch.column(3).as_any().downcast_ref::<Date32Array>(),
+        )
+    {
+        return q21_ordered_lineitem_counts_typed_batch(
+            orderkeys,
+            suppkeys,
+            receipt,
+            commit,
+            final_orders,
+            dense_final_orders,
+            suppliers,
+            counts,
+            current_orderkey,
+            current_selected,
+            current_state,
+        );
+    }
+    q21_ordered_lineitem_counts_batch(
+        batch,
+        final_orders,
+        dense_final_orders,
+        suppliers,
+        counts,
+        current_orderkey,
+        current_selected,
+        current_state,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -15777,6 +16011,35 @@ fn q21_ordered_lineitem_counts_batch(
     ) else {
         return Ok(false);
     };
+    q21_ordered_lineitem_counts_typed_batch(
+        orderkeys,
+        suppkeys,
+        receipt,
+        commit,
+        final_orders,
+        dense_final_orders,
+        suppliers,
+        counts,
+        current_orderkey,
+        current_selected,
+        current_state,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q21_ordered_lineitem_counts_typed_batch(
+    orderkeys: &Int64Array,
+    suppkeys: &Int64Array,
+    receipt: &Date32Array,
+    commit: &Date32Array,
+    final_orders: &Q21FinalOrders,
+    dense_final_orders: Option<&[bool]>,
+    suppliers: &HashMap<i64, String>,
+    counts: &mut HashMap<i64, u64>,
+    current_orderkey: &mut Option<i64>,
+    current_selected: &mut bool,
+    current_state: &mut Q21OrderState,
+) -> Result<bool> {
     for row in 0..orderkeys.len() {
         if orderkeys.is_null(row) || suppkeys.is_null(row) {
             continue;
