@@ -2810,7 +2810,7 @@ fn q01_row_group_map_chunk() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(4)
+        .unwrap_or(2)
 }
 
 fn q01_pruning_enabled() -> bool {

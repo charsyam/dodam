@@ -1265,11 +1265,14 @@ impl DodamEngine {
             .chunks(row_group_chunk.max(1))
             .map(|chunk| chunk.to_vec())
             .collect::<Vec<_>>();
+        let profile = scan_profile_enabled();
+        let label = profile.then(|| parquet_map_profile_label(&local_path, &projection));
         let (sender, receiver) = mpsc::channel();
         for (index, row_groups) in chunks.iter().cloned().enumerate() {
             let sender = sender.clone();
             let path = local_path.clone();
             let projection = projection.clone();
+            let label = label.clone();
             let metadata_cache = self.metadata_cache.clone();
             let file_cache = self.file_cache.clone();
             let object_store = self.object_store.clone();
@@ -1288,6 +1291,8 @@ impl DodamEngine {
                     build_state(),
                     consume_batch,
                     finish,
+                    label.as_deref(),
+                    index,
                 );
                 let _ = sender.send((index, result));
             });
@@ -2556,6 +2561,18 @@ impl DodamEngine {
     }
 }
 
+fn parquet_map_profile_label(path: &Path, projection: &Projection) -> String {
+    let table = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("scan");
+    let projection = match projection {
+        Projection::All => "*".to_string(),
+        Projection::Columns(columns) => columns.join(","),
+    };
+    format!("{table}[{projection}]")
+}
+
 fn scan_profile_enabled() -> bool {
     std::env::var("DODAM_SCAN_PROFILE")
         .or_else(|_| std::env::var("DODAM_TPCH_PROFILE"))
@@ -3568,27 +3585,65 @@ fn parquet_row_group_map_chunk<State, Output, ConsumeBatch, Finish>(
     mut state: State,
     mut consume_batch: ConsumeBatch,
     finish: Finish,
+    profile_label: Option<&str>,
+    profile_chunk: usize,
 ) -> Result<Option<Output>>
 where
     ConsumeBatch: FnMut(RecordBatch, &mut State) -> Result<Option<()>>,
     Finish: FnOnce(State) -> Result<Option<Output>>,
 {
+    let started = profile_label.map(|_| Instant::now());
     let mut reader = ParquetBatchReader::try_new_with_row_groups(
         path,
         batch_size,
         projection,
-        row_groups,
+        row_groups.clone(),
         metadata_cache,
         file_cache,
         object_store,
     )?;
-    while let Some(batch) = reader.next() {
+    let reader_setup_nanos = started
+        .map(|started| elapsed_nanos(started.elapsed()))
+        .unwrap_or_default();
+    let mut batches = 0_usize;
+    let mut rows = 0_usize;
+    let mut read_nanos = 0_u64;
+    let mut consume_nanos = 0_u64;
+    loop {
+        let read_start = Instant::now();
+        let Some(batch) = reader.next() else {
+            read_nanos = read_nanos.saturating_add(elapsed_nanos(read_start.elapsed()));
+            break;
+        };
         let batch = batch?;
+        read_nanos = read_nanos.saturating_add(elapsed_nanos(read_start.elapsed()));
+        batches += 1;
+        rows += batch.num_rows();
+        let consume_start = Instant::now();
         if consume_batch(batch, &mut state)?.is_none() {
             return Ok(None);
         }
+        consume_nanos = consume_nanos.saturating_add(elapsed_nanos(consume_start.elapsed()));
     }
-    finish(state)
+    let finished = finish(state);
+    if let (Some(label), Some(started)) = (profile_label, started) {
+        eprintln!(
+            "[dodam:tpch-profile] row_group_map {label}: chunk={} row_groups={} rows={} batches={} total={:.3} ms setup={:.3} ms metadata={:.3} ms planning={:.3} ms read_next={:.3} ms consume={:.3} ms compressed={}/{}",
+            profile_chunk,
+            row_groups.len(),
+            rows,
+            batches,
+            started.elapsed().as_secs_f64() * 1000.0,
+            nanos_to_millis(reader_setup_nanos),
+            nanos_to_millis(reader.metadata_nanos()),
+            nanos_to_millis(reader.planning_nanos()),
+            nanos_to_millis(read_nanos),
+            nanos_to_millis(consume_nanos),
+            reader.compressed_bytes_scanned(),
+            reader.compressed_bytes_total(),
+        );
+    }
+    finished
 }
 
 fn log_late_materialized_metrics(label: &str, metrics: LateMaterializedMetrics, chunks: usize) {

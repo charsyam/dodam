@@ -1107,6 +1107,11 @@ Tried and rejected or neutral:
       - Added dense final-order membership probing in the Q21 lineitem typed loop, then cached the final-order membership per contiguous orderkey run so repeated lineitem rows for the same order do not re-check the final order set.
       - Changed Q21 chunk processing to accumulate each batch directly into the chunk-local state map instead of building a temporary per-batch state map and merging it immediately.
       - Profile samples were noisy (`~42-45ms` for the lineitem state stage), but SF=1 5-repeat in-process total improved in the sampled run to about `~3.40s`, with Q21 warm samples around `~59-62ms`. Treat this as a small retained Q21 cleanup.
+    - Revisited Q01 row-group fused aggregate attribution:
+      - Added `DODAM_TPCH_PROFILE=1` detail logging for the common `parquet_row_group_map` path, splitting row-group chunk wall time into reader setup, metadata/planning, `read_next` decode/read wait, and aggregate `consume`.
+      - Q01 warm SF=1 profile shows the remaining time is dominated by Parquet read/decode (`~16-22ms` per 4-row-group chunk) rather than the fused aggregate loop (`~4-6ms` per chunk). Reader setup/metadata/planning are effectively negligible after cache warmup.
+      - Re-swept Q01 row-group chunk size on the current binary. Chunk `1` and `2` were best in the sample, while `3+` regressed or became noisier. Changed the default `DODAM_Q01_ROW_GROUP_MAP_CHUNK` from `4` to `2` as the less task-heavy of the two best settings.
+      - SF=1 Q01-only 7-repeat sample totals were roughly `0.163s` for chunk `1`, `0.163s` for chunk `2`, `0.173s` for chunk `4`, and `0.218s+` for chunk `3/6/8`. This is a small Q01 cleanup; the larger remaining opportunity is still Parquet decode throughput.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.
