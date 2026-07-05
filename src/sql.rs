@@ -21718,6 +21718,11 @@ fn evaluate_scalar_expression(
         ScalarSqlExpression::Column(column) => evaluated_column(batch, column),
         ScalarSqlExpression::Literal(value) => Ok(evaluated_literal(value, batch.num_rows())),
         ScalarSqlExpression::Binary { left, op, right } => {
+            if decimal_expression_fast_enabled()
+                && let Some(values) = evaluate_decimal_product_expression(batch, left, op, right)?
+            {
+                return Ok(EvaluatedScalar::Float64(values));
+            }
             let left = evaluate_scalar_expression(batch, left)?;
             let right = evaluate_scalar_expression(batch, right)?;
             evaluate_binary_scalar(left, op, right)
@@ -21811,6 +21816,173 @@ fn evaluate_scalar_expression(
             else_result,
         } => evaluate_case_expression(batch, conditions, results, else_result.as_deref()),
     }
+}
+
+struct DecimalScalarColumn<'a> {
+    values: &'a Decimal128Array,
+    scale: f64,
+}
+
+fn decimal_expression_fast_enabled() -> bool {
+    std::env::var("DODAM_DISABLE_DECIMAL_EXPR_FAST")
+        .map(|value| !matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(true)
+}
+
+fn evaluate_decimal_product_expression(
+    batch: &RecordBatch,
+    left: &ScalarSqlExpression,
+    op: &BinaryOperator,
+    right: &ScalarSqlExpression,
+) -> Result<Option<Vec<Option<f64>>>> {
+    if *op != BinaryOperator::Multiply {
+        return Ok(None);
+    }
+    if let Some((value, complement)) = decimal_discount_product_operands(batch, left, right)? {
+        return Ok(Some(decimal_complement_product(value, complement)));
+    }
+    if let Some((value, complement)) = decimal_discount_product_operands(batch, right, left)? {
+        return Ok(Some(decimal_complement_product(value, complement)));
+    }
+    if let (Some(left), Some(right)) = (
+        decimal_scalar_column(batch, left)?,
+        decimal_scalar_column(batch, right)?,
+    ) {
+        return Ok(Some(decimal_product(left, right)));
+    }
+    Ok(None)
+}
+
+fn decimal_discount_product_operands<'a>(
+    batch: &'a RecordBatch,
+    value: &ScalarSqlExpression,
+    complement: &ScalarSqlExpression,
+) -> Result<Option<(DecimalScalarColumn<'a>, DecimalScalarColumn<'a>)>> {
+    let Some(value) = decimal_scalar_column(batch, value)? else {
+        return Ok(None);
+    };
+    let Some(complement) = decimal_one_minus_column(batch, complement)? else {
+        return Ok(None);
+    };
+    Ok(Some((value, complement)))
+}
+
+fn decimal_one_minus_column<'a>(
+    batch: &'a RecordBatch,
+    expr: &ScalarSqlExpression,
+) -> Result<Option<DecimalScalarColumn<'a>>> {
+    let ScalarSqlExpression::Binary { left, op, right } = expr else {
+        return Ok(None);
+    };
+    if *op != BinaryOperator::Minus || !scalar_literal_is_one(left) {
+        return Ok(None);
+    }
+    decimal_scalar_column(batch, right)
+}
+
+fn decimal_scalar_column<'a>(
+    batch: &'a RecordBatch,
+    expr: &ScalarSqlExpression,
+) -> Result<Option<DecimalScalarColumn<'a>>> {
+    let ScalarSqlExpression::Column(column) = expr else {
+        return Ok(None);
+    };
+    let index = batch
+        .schema()
+        .fields()
+        .iter()
+        .position(|field| field.name() == column)
+        .ok_or_else(|| DodamError::UnknownColumn(column.to_string()))?;
+    let array = batch.column(index);
+    let DataType::Decimal128(precision, scale) = array.data_type() else {
+        return Ok(None);
+    };
+    if *precision > 18 {
+        return Ok(None);
+    }
+    let Some(scale_raw) = decimal_scale_i128(*scale) else {
+        return Ok(None);
+    };
+    Ok(Some(DecimalScalarColumn {
+        values: array
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("Decimal128 scalar input"),
+        scale: scale_raw as f64,
+    }))
+}
+
+fn scalar_literal_is_one(expr: &ScalarSqlExpression) -> bool {
+    match expr {
+        ScalarSqlExpression::Literal(LiteralValue::Int64(1)) => true,
+        ScalarSqlExpression::Literal(LiteralValue::Float64(value)) => *value == 1.0,
+        _ => false,
+    }
+}
+
+fn decimal_scale_i128(scale: i8) -> Option<i128> {
+    let scale = u32::try_from(scale).ok()?;
+    Some(10_i128.checked_pow(scale)?)
+}
+
+fn decimal_complement_product(
+    value: DecimalScalarColumn<'_>,
+    complement: DecimalScalarColumn<'_>,
+) -> Vec<Option<f64>> {
+    let value_raw = value.values.values();
+    let complement_raw = complement.values.values();
+    if value.values.null_count() == 0 && complement.values.null_count() == 0 {
+        return value_raw
+            .iter()
+            .copied()
+            .zip(complement_raw.iter().copied())
+            .map(|(value_raw, complement_value)| {
+                Some(
+                    (value_raw as f64 / value.scale)
+                        * (1.0 - complement_value as f64 / complement.scale),
+                )
+            })
+            .collect();
+    }
+    (0..value.values.len())
+        .map(|row| {
+            if value.values.is_null(row) || complement.values.is_null(row) {
+                None
+            } else {
+                Some(
+                    (value_raw[row] as f64 / value.scale)
+                        * (1.0 - complement_raw[row] as f64 / complement.scale),
+                )
+            }
+        })
+        .collect()
+}
+
+fn decimal_product(
+    left: DecimalScalarColumn<'_>,
+    right: DecimalScalarColumn<'_>,
+) -> Vec<Option<f64>> {
+    let left_raw = left.values.values();
+    let right_raw = right.values.values();
+    if left.values.null_count() == 0 && right.values.null_count() == 0 {
+        return left_raw
+            .iter()
+            .copied()
+            .zip(right_raw.iter().copied())
+            .map(|(left_value, right_value)| {
+                Some((left_value as f64 / left.scale) * (right_value as f64 / right.scale))
+            })
+            .collect();
+    }
+    (0..left.values.len())
+        .map(|row| {
+            if left.values.is_null(row) || right.values.is_null(row) {
+                None
+            } else {
+                Some((left_raw[row] as f64 / left.scale) * (right_raw[row] as f64 / right.scale))
+            }
+        })
+        .collect()
 }
 
 fn evaluate_case_expression(

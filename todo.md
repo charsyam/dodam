@@ -1045,6 +1045,14 @@ Tried and rejected or neutral:
     - Moved the Q18 dense `i64 -> f64 sum` threshold-tracking accumulator and the Q09 offset dense `i64 -> i32` map into `dense.rs` next to `AdaptiveI64Set`/`AdaptiveI64Map`.
     - This is primarily structural, not a new speed win: future physical operators can now reuse dense range maps/sums without depending on `sql.rs` TPC-H helpers.
     - Kept the same fallback behavior and added an accessor instead of letting Q18 inspect the dense sum's fallback field directly.
+  - Added a general Decimal128 product fast evaluator for SQL scalar/aggregate input expressions:
+    - The generic scalar expression path now recognizes `Decimal128 column * Decimal128 column` and `Decimal128 column * (1 - Decimal128 column)` independent of column names.
+    - This avoids building intermediate `Vec<Option<f64>>` columns for each decimal operand and evaluates the product in one batch loop. `DODAM_DISABLE_DECIMAL_EXPR_FAST=1` keeps the old path available for diagnostics.
+    - SF=10 lineitem generic SQL benchmark, 5-run wall-clock samples:
+      - `sum(l_extendedprice * l_discount)`: fast median about `0.66s`, disabled median about `0.80s`.
+      - `sum(l_extendedprice * (1 - l_discount))`: fast median about `0.66s`, disabled median about `0.87s`.
+    - Output differences versus the old path are tiny f64 accumulation/order differences (`~8e-16` and `~3e-16` relative in the checked samples), not semantic decimal scale changes.
+    - Full SF=10 TPC-H fast-path run still passed `22/22`; this change mostly benefits non-specialized SQL expression paths because most canonical TPC-H queries still route through their typed fast paths.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.
