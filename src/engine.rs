@@ -321,6 +321,7 @@ pub struct AggregatePlan {
     pub scan: ScanPlan,
     pub aggregates: Vec<AggregateExpr>,
     pub group_by: Vec<String>,
+    pub column_read_plan: AggregateColumnReadPlan,
 }
 
 impl AggregatePlan {
@@ -348,6 +349,18 @@ impl AggregatePlan {
             )
             .attr("group_by", format!("[{}]", self.group_by.join(",")))
             .attr(
+                "payload_columns",
+                projection_display(&self.column_read_plan.payload_projection),
+            )
+            .attr(
+                "predicate_columns",
+                projection_display(&self.column_read_plan.predicate_projection),
+            )
+            .attr(
+                "scan_columns",
+                projection_display(&self.column_read_plan.scan_projection),
+            )
+            .attr(
                 "aggregates",
                 format!(
                     "[{}]",
@@ -360,6 +373,13 @@ impl AggregatePlan {
             )
             .child(self.scan.to_plan_node())
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct AggregateColumnReadPlan {
+    pub payload_projection: Projection,
+    pub predicate_projection: Projection,
+    pub scan_projection: Projection,
 }
 
 #[derive(Debug, Clone)]
@@ -2462,24 +2482,22 @@ impl DodamEngine {
         if !late_materialized_aggregate_enabled() {
             return Ok(None);
         }
-        let predicate_columns = filter.referenced_columns();
-        if predicate_columns.is_empty() {
+        let column_read_plan = aggregate_column_read_plan(&aggregates, &group_by, Some(&filter));
+        if projection_column_count(&column_read_plan.predicate_projection) == Some(0) {
             return Ok(None);
         }
-        let payload_projection = aggregate_projection(&aggregates, &group_by);
-        let Projection::Columns(payload_columns) = &payload_projection else {
-            return Ok(None);
-        };
-        if payload_columns.is_empty() {
+        if matches!(column_read_plan.payload_projection, Projection::All)
+            || projection_column_count(&column_read_plan.payload_projection) == Some(0)
+        {
             return Ok(None);
         }
-        let predicate_projection = Projection::Columns(predicate_columns);
+        log_aggregate_column_read_plan(&column_read_plan);
         let Some(partials) = self
             .late_materialized_parquet_map_with_policy(
                 path,
                 batch_size,
-                predicate_projection,
-                payload_projection,
+                column_read_plan.predicate_projection.clone(),
+                column_read_plan.payload_projection.clone(),
                 late_materialized_aggregate_row_group_chunk(),
                 LateMaterializationPolicy::selective_with_selector_run_ratio(
                     late_materialized_aggregate_max_selected_ratio(),
@@ -2539,18 +2557,21 @@ impl DodamEngine {
         group_by: Vec<String>,
         filter: Option<FilterExpr>,
     ) -> Result<AggregatePlan> {
+        let column_read_plan = aggregate_column_read_plan(&aggregates, &group_by, filter.as_ref());
         let plan = self.plan_table_scan(
             source,
             batch_size,
             None,
-            aggregate_projection(&aggregates, &group_by),
+            column_read_plan.payload_projection.clone(),
             filter,
             None,
         )?;
+        log_aggregate_column_read_plan(&column_read_plan);
         Ok(AggregatePlan {
             scan: plan,
             aggregates,
             group_by,
+            column_read_plan,
         })
     }
 
@@ -2562,14 +2583,23 @@ impl DodamEngine {
         group_by: Vec<String>,
         filter: Option<FilterExpr>,
     ) -> Result<AggregatePlan> {
-        let projection = aggregate_projection(&aggregates, &group_by);
+        let column_read_plan = aggregate_column_read_plan(&aggregates, &group_by, filter.as_ref());
         let scan = self
-            .plan_parquet_scan(path, batch_size, None, projection, filter, None)
+            .plan_parquet_scan(
+                path,
+                batch_size,
+                None,
+                column_read_plan.payload_projection.clone(),
+                filter,
+                None,
+            )
             .await?;
+        log_aggregate_column_read_plan(&column_read_plan);
         Ok(AggregatePlan {
             scan,
             aggregates,
             group_by,
+            column_read_plan,
         })
     }
 
@@ -2931,6 +2961,49 @@ fn aggregate_projection(aggregates: &[AggregateExpr], group_by: &[String]) -> Pr
     } else {
         Projection::Columns(columns)
     }
+}
+
+fn aggregate_column_read_plan(
+    aggregates: &[AggregateExpr],
+    group_by: &[String],
+    filter: Option<&FilterExpr>,
+) -> AggregateColumnReadPlan {
+    let payload_projection = aggregate_projection(aggregates, group_by);
+    let predicate_columns = filter
+        .map(FilterExpr::referenced_columns)
+        .unwrap_or_default();
+    let predicate_projection = Projection::Columns(predicate_columns);
+    let scan_projection = scan_projection(&payload_projection, filter);
+    AggregateColumnReadPlan {
+        payload_projection,
+        predicate_projection,
+        scan_projection,
+    }
+}
+
+fn projection_column_count(projection: &Projection) -> Option<usize> {
+    match projection {
+        Projection::All => None,
+        Projection::Columns(columns) => Some(columns.len()),
+    }
+}
+
+fn log_aggregate_column_read_plan(plan: &AggregateColumnReadPlan) {
+    if !column_read_profile_enabled() {
+        return;
+    }
+    eprintln!(
+        "[dodam:column-read-plan] aggregate: payload={} predicate={} normal_scan={}",
+        projection_display(&plan.payload_projection),
+        projection_display(&plan.predicate_projection),
+        projection_display(&plan.scan_projection),
+    );
+}
+
+fn column_read_profile_enabled() -> bool {
+    std::env::var("DODAM_COLUMN_READ_PROFILE")
+        .or_else(|_| std::env::var("DODAM_PARQUET_COLUMN_PROFILE"))
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 fn fused_parquet_aggregate_enabled() -> bool {

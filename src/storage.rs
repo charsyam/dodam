@@ -21,7 +21,7 @@ use parquet::data_type::{ByteArray, FixedLenByteArray};
 use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::reader::{ChunkReader, Length};
 use parquet::file::statistics::Statistics;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use crate::error::{DodamError, Result};
@@ -1082,6 +1082,13 @@ pub fn plan_parquet_scan_tasks(
         compressed_bytes_for_row_groups(&builder, &column_indices, &all_row_groups);
     let compressed_bytes_scanned =
         compressed_bytes_for_row_groups(&builder, &column_indices, &row_groups);
+    maybe_profile_parquet_projected_columns(
+        path,
+        &builder,
+        &column_indices,
+        &all_row_groups,
+        &row_groups,
+    );
 
     let tasks = row_groups
         .into_iter()
@@ -1343,6 +1350,92 @@ fn compressed_bytes_for_row_groups<T: ChunkReader + 'static>(
         })
         .map(|column| column.compressed_size().max(0) as u64)
         .sum()
+}
+
+fn maybe_profile_parquet_projected_columns<T: ChunkReader + 'static>(
+    path: &Path,
+    builder: &ParquetRecordBatchReaderBuilder<T>,
+    column_indices: &[usize],
+    all_row_groups: &[usize],
+    scanned_row_groups: &[usize],
+) {
+    if !parquet_column_profile_enabled() {
+        return;
+    }
+    let fields = builder.schema().fields();
+    let columns = column_indices
+        .iter()
+        .map(|column_index| {
+            let name = fields
+                .get(*column_index)
+                .map(|field| field.name().as_str())
+                .unwrap_or("<unknown>");
+            let total_compressed =
+                parquet_column_compressed_bytes(builder, *column_index, all_row_groups);
+            let scanned_compressed =
+                parquet_column_compressed_bytes(builder, *column_index, scanned_row_groups);
+            let scanned_uncompressed =
+                parquet_column_uncompressed_bytes(builder, *column_index, scanned_row_groups);
+            let encodings = parquet_column_encodings(builder, *column_index, scanned_row_groups);
+            format!(
+                "{name}:compressed={scanned_compressed}/{total_compressed} uncompressed={scanned_uncompressed} encodings={}",
+                encodings.into_iter().collect::<Vec<_>>().join("|")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!(
+        "[dodam:parquet-column-profile] {}: row_groups={}/{} columns=[{}]",
+        path.display(),
+        scanned_row_groups.len(),
+        all_row_groups.len(),
+        columns
+    );
+}
+
+fn parquet_column_profile_enabled() -> bool {
+    std::env::var("DODAM_PARQUET_COLUMN_PROFILE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn parquet_column_compressed_bytes<T: ChunkReader + 'static>(
+    builder: &ParquetRecordBatchReaderBuilder<T>,
+    column_index: usize,
+    row_groups: &[usize],
+) -> u64 {
+    row_groups
+        .iter()
+        .filter_map(|row_group| builder.metadata().row_groups().get(*row_group))
+        .filter_map(|row_group| row_group.columns().get(column_index))
+        .map(|column| column.compressed_size().max(0) as u64)
+        .sum()
+}
+
+fn parquet_column_uncompressed_bytes<T: ChunkReader + 'static>(
+    builder: &ParquetRecordBatchReaderBuilder<T>,
+    column_index: usize,
+    row_groups: &[usize],
+) -> u64 {
+    row_groups
+        .iter()
+        .filter_map(|row_group| builder.metadata().row_groups().get(*row_group))
+        .filter_map(|row_group| row_group.columns().get(column_index))
+        .map(|column| column.uncompressed_size().max(0) as u64)
+        .sum()
+}
+
+fn parquet_column_encodings<T: ChunkReader + 'static>(
+    builder: &ParquetRecordBatchReaderBuilder<T>,
+    column_index: usize,
+    row_groups: &[usize],
+) -> BTreeSet<String> {
+    row_groups
+        .iter()
+        .filter_map(|row_group| builder.metadata().row_groups().get(*row_group))
+        .filter_map(|row_group| row_group.columns().get(column_index))
+        .flat_map(|column| column.encodings())
+        .map(|encoding| format!("{encoding:?}"))
+        .collect()
 }
 
 fn prune_row_groups<T: ChunkReader + 'static>(

@@ -1211,6 +1211,18 @@ Tried and rejected or neutral:
       - Q01/Q03/Q12 profiles show `reader_next` is essentially the same as the previously measured `read_next`, while fused consumer time is much smaller. Example Q01 row-group chunks spend roughly `16-40ms` inside reader `next()` and only about `2-4ms` in the aggregate consumer.
       - Q03/Q12 narrow `orders` scans show the same pattern: scan `decode` and `parquet_next` match closely, while downstream aggregation/build work is small. This means the current remaining gap is mostly Arrow/Parquet reader decode plus `RecordBatch` construction/materialization, not the typed consumer loops.
       - SF=1 TPC-H `query-file` Parquet COPY samples with the instrumentation were `0.830s` cold-ish then `0.692s` and `0.696s` warm, so the profile fields are retained as low-overhead diagnostics for the next scan/decode optimization work.
+    - Tried and rejected a Q01 direct Parquet column-reader path to bypass Arrow `RecordBatch` construction:
+      - Built an opt-in local experiment that reads TPC-H lineitem's physical `INT64 DECIMAL(15,2)`, `INT32 DATE`, and `BYTE_ARRAY STRING` columns through parquet-rs `RowGroupReader::get_column_reader()` and aggregates directly into Q01 slots.
+      - Correctness matched the default path except for tiny floating-point accumulation-order differences.
+      - It did not beat the retained Arrow row-group map path. Q01 warm samples were roughly `0.08-0.12s` for the direct path versus `0.06-0.10s` for the default path, and full SF=1 TPC-H `query-file` with the direct path warmed around `0.76s` versus the default `0.68-0.69s`. Wiring the experiment through Dodam's `CachedParquetChunkReader` did not help; Q01 direct samples worsened to roughly `0.13-0.15s`.
+      - Likely causes: the low-level reader still materializes per-column `Vec`s, loses Arrow's optimized string array path, and does not avoid enough decode work to pay for the extra per-column orchestration. Conclusion: simply replacing Arrow `RecordBatchReader` with row-group column readers is not enough; the next useful direction is encoding-aware attribution and then cache-integrated page/column decode only for columns where the profile justifies it.
+    - Added projected Parquet column attribution:
+      - `DODAM_PARQUET_COLUMN_PROFILE=1` now prints projected column compressed bytes, uncompressed bytes, and encoding sets during scan planning. This is intentionally diagnostic-only and does not alter the scan path.
+      - This should be used before the next custom decode attempt so that page/encoding work targets the largest decoded columns instead of guessing from query shape alone.
+    - Made aggregate column-read decisions explicit:
+      - Added a shared aggregate column read plan that separates payload columns (aggregate inputs and group keys), predicate columns (filter inputs), and normal scan columns (`payload + predicate`).
+      - Normal aggregate scans and late-materialized aggregate attempts now use the same helper, so future optimizer rules can decide between full scan and late payload reads from one place instead of duplicating projection logic.
+      - `DODAM_COLUMN_READ_PROFILE=1` prints this decision; `DODAM_PARQUET_COLUMN_PROFILE=1` also enables it so column role decisions and Parquet bytes/encoding attribution can be read together.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.
