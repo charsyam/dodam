@@ -304,27 +304,32 @@ async fn main() -> Result<()> {
                 )?;
                 profile.sink_create = sink_started.elapsed();
 
-                let direct_started = Instant::now();
-                if let Some(metrics) =
-                    try_execute_sql_to_sink(&engine, &copy.sql, batch_size, &mut sink).await?
-                {
+                if copy_sql_may_use_direct_or_streaming(&copy.sql) {
+                    let direct_started = Instant::now();
+                    if let Some(metrics) =
+                        try_execute_sql_to_sink(&engine, &copy.sql, batch_size, &mut sink).await?
+                    {
+                        profile.direct_sink = Some(direct_started.elapsed());
+                        profile.scan_plan_metrics = Some(metrics);
+                        profile.print(sink.stats());
+                        return Ok(());
+                    }
                     profile.direct_sink = Some(direct_started.elapsed());
-                    profile.scan_plan_metrics = Some(metrics);
-                    profile.print(sink.stats());
-                    return Ok(());
-                }
-                profile.direct_sink = Some(direct_started.elapsed());
 
-                let streaming_started = Instant::now();
-                if let Some(stream) =
-                    try_execute_sql_streaming(&engine, &copy.sql, batch_size).await?
-                {
-                    engine.write_batches_to_sink(stream, &mut sink)?;
+                    let streaming_started = Instant::now();
+                    if let Some(stream) =
+                        try_execute_sql_streaming(&engine, &copy.sql, batch_size).await?
+                    {
+                        engine.write_batches_to_sink(stream, &mut sink)?;
+                        profile.streaming = Some(streaming_started.elapsed());
+                        profile.print(sink.stats());
+                        return Ok(());
+                    }
                     profile.streaming = Some(streaming_started.elapsed());
-                    profile.print(sink.stats());
-                    return Ok(());
+                } else {
+                    profile.direct_sink = Some(Duration::ZERO);
+                    profile.streaming = Some(Duration::ZERO);
                 }
-                profile.streaming = Some(streaming_started.elapsed());
 
                 let materialize_started = Instant::now();
                 let output = execute_sql(&engine, &copy.sql, batch_size).await?;
@@ -1174,6 +1179,25 @@ fn query_profile_enabled() -> bool {
             "1" | "true" | "yes" | "on"
         )
     })
+}
+
+fn copy_sql_may_use_direct_or_streaming(sql: &str) -> bool {
+    let lower = sql.to_ascii_lowercase();
+    if lower.contains(" group by ")
+        || lower.contains(" order by ")
+        || lower.contains(" having ")
+        || lower.contains(" distinct ")
+        || lower.contains(" exists")
+        || lower.contains(" in (select")
+        || lower.contains(" sum(")
+        || lower.contains(" count(")
+        || lower.contains(" avg(")
+        || lower.contains(" min(")
+        || lower.contains(" max(")
+    {
+        return false;
+    }
+    true
 }
 
 fn configure_default_rayon_threads() {
