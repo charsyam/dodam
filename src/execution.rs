@@ -3,7 +3,10 @@ pub mod logical;
 pub mod metrics;
 pub mod physical;
 
-pub use aggregate::{collect_aggregates, collect_grouped_aggregates};
+pub use aggregate::{
+    can_merge_partial_aggregates, collect_aggregates, collect_grouped_aggregates,
+    merge_partial_aggregate_metrics,
+};
 pub use logical::{
     AggregateExpr, AggregateMetrics, AggregateResult, AggregateValue, ComparisonExpr, ComparisonOp,
     Expr, FilterExpr, GroupAggregateResult, GroupValue, LiteralValue, PhysicalPlan, PredicateSet,

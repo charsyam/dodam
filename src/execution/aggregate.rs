@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::sync::mpsc;
+use std::time::Instant;
 
 use arrow::array::{
     Array, ArrayRef, Date32Array, Date64Array, Decimal128Array, Float64Array, Int32Array,
@@ -42,6 +43,7 @@ pub fn collect_aggregates(
     fragments: usize,
     aggregates: &[AggregateExpr],
 ) -> Result<AggregateMetrics> {
+    let aggregate_started = Instant::now();
     let mut state = GlobalAggregateState::new(aggregates);
     let mut metrics = AggregateMetrics {
         fragments,
@@ -66,14 +68,17 @@ pub fn collect_aggregates(
         });
     }
     drop(sender);
+    let merge_started = Instant::now();
     for _ in 0..pending_batches {
         let partial = receiver
             .recv()
             .map_err(|_| DodamError::InvalidAggregate("aggregate worker stopped".to_string()))??;
         state.merge(partial);
     }
+    metrics.aggregate_merge_nanos = elapsed_nanos(merge_started);
 
     metrics.values = state.finish()?;
+    metrics.aggregate_nanos = elapsed_nanos(aggregate_started);
     Ok(metrics)
 }
 
@@ -235,20 +240,205 @@ pub fn collect_grouped_aggregates(
     group_by: &[String],
     aggregates: &[AggregateExpr],
 ) -> Result<AggregateMetrics> {
-    if can_use_single_key_count_sum_path(group_by, aggregates) {
-        return collect_single_key_count_sum_groups(stream, fragments, group_by, aggregates);
+    let aggregate_started = Instant::now();
+    let mut metrics = if can_use_single_key_count_sum_path(group_by, aggregates) {
+        collect_single_key_count_sum_groups(stream, fragments, group_by, aggregates)?
+    } else if can_use_single_key_fast_path(group_by, aggregates) {
+        collect_single_key_groups(stream, fragments, group_by, aggregates)?
+    } else if can_use_two_utf8_key_fast_path(group_by, aggregates) {
+        collect_two_utf8_key_groups(stream, fragments, group_by, aggregates)?
+    } else if can_use_two_key_sum_path(group_by, aggregates) {
+        collect_two_key_sum_groups(stream, fragments, group_by, aggregates)?
+    } else {
+        collect_grouped_aggregates_generic(stream, fragments, group_by, aggregates, None, None)?
+    };
+    metrics.aggregate_nanos = elapsed_nanos(aggregate_started);
+    Ok(metrics)
+}
+
+pub fn can_merge_partial_aggregates(aggregates: &[AggregateExpr]) -> bool {
+    aggregates.iter().all(|aggregate| {
+        !matches!(
+            aggregate,
+            AggregateExpr::Avg(_) | AggregateExpr::CountDistinct(_)
+        )
+    })
+}
+
+pub fn merge_partial_aggregate_metrics(
+    partials: Vec<AggregateMetrics>,
+    fragments: usize,
+    group_by: &[String],
+    aggregates: &[AggregateExpr],
+) -> Result<AggregateMetrics> {
+    if !can_merge_partial_aggregates(aggregates) {
+        return Err(DodamError::UnsupportedSql(
+            "partial aggregate merge currently supports count/sum/min/max only".to_string(),
+        ));
     }
-    if can_use_single_key_fast_path(group_by, aggregates) {
-        return collect_single_key_groups(stream, fragments, group_by, aggregates);
+    let mut metrics = AggregateMetrics {
+        fragments,
+        ..AggregateMetrics::default()
+    };
+    for partial in &partials {
+        metrics.batches += partial.batches;
+        metrics.rows += partial.rows;
     }
-    if can_use_two_utf8_key_fast_path(group_by, aggregates) {
-        return collect_two_utf8_key_groups(stream, fragments, group_by, aggregates);
-    }
-    if can_use_two_key_sum_path(group_by, aggregates) {
-        return collect_two_key_sum_groups(stream, fragments, group_by, aggregates);
+    if group_by.is_empty() {
+        let merge_started = Instant::now();
+        let mut values: Option<Vec<AggregateResult>> = None;
+        for partial in partials {
+            metrics.aggregate_nanos = metrics
+                .aggregate_nanos
+                .saturating_add(partial.aggregate_nanos);
+            if partial.values.is_empty() {
+                continue;
+            }
+            match &mut values {
+                Some(values) => merge_aggregate_results(values, partial.values)?,
+                None => values = Some(partial.values),
+            }
+        }
+        metrics.aggregate_merge_nanos = elapsed_nanos(merge_started);
+        metrics.values = values.unwrap_or_default();
+        return Ok(metrics);
     }
 
-    collect_grouped_aggregates_generic(stream, fragments, group_by, aggregates, None, None)
+    let merge_started = Instant::now();
+    let mut groups = AggregateHashMap::<Vec<GroupValue>, Vec<AggregateResult>>::default();
+    for partial in partials {
+        metrics.aggregate_nanos = metrics
+            .aggregate_nanos
+            .saturating_add(partial.aggregate_nanos);
+        for group in partial.groups {
+            match groups.entry(group.keys) {
+                Entry::Occupied(mut entry) => {
+                    merge_aggregate_results(entry.get_mut(), group.values)?
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(group.values);
+                }
+            }
+        }
+    }
+    let mut groups = groups
+        .into_iter()
+        .map(|(keys, values)| GroupAggregateResult { keys, values })
+        .collect::<Vec<_>>();
+    groups.sort_by(|left, right| compare_group_keys(&left.keys, &right.keys));
+    metrics.aggregate_merge_nanos = elapsed_nanos(merge_started);
+    metrics.groups = groups;
+    Ok(metrics)
+}
+
+fn elapsed_nanos(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
+fn merge_aggregate_results(
+    values: &mut [AggregateResult],
+    other: Vec<AggregateResult>,
+) -> Result<()> {
+    if values.len() != other.len() {
+        return Err(DodamError::UnsupportedSql(
+            "partial aggregate result shape mismatch".to_string(),
+        ));
+    }
+    for (value, other) in values.iter_mut().zip(other) {
+        if value.expr != other.expr {
+            return Err(DodamError::UnsupportedSql(
+                "partial aggregate expression mismatch".to_string(),
+            ));
+        }
+        merge_aggregate_value(&value.expr, &mut value.value, other.value)?;
+    }
+    Ok(())
+}
+
+fn merge_aggregate_value(
+    expr: &AggregateExpr,
+    value: &mut AggregateValue,
+    other: AggregateValue,
+) -> Result<()> {
+    match expr {
+        AggregateExpr::CountStar | AggregateExpr::Count(_) => {
+            let (AggregateValue::Count(value), AggregateValue::Count(other)) = (value, other)
+            else {
+                return Err(DodamError::UnsupportedSql(
+                    "partial count aggregate type mismatch".to_string(),
+                ));
+            };
+            *value += other;
+        }
+        AggregateExpr::Sum(_) => merge_sum_value(value, other)?,
+        AggregateExpr::Min(_) | AggregateExpr::Max(_) => merge_min_max_value(expr, value, other),
+        AggregateExpr::Avg(_) | AggregateExpr::CountDistinct(_) => {
+            return Err(DodamError::UnsupportedSql(
+                "partial aggregate merge currently supports count/sum/min/max only".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn merge_min_max_value(expr: &AggregateExpr, value: &mut AggregateValue, other: AggregateValue) {
+    if aggregate_value_is_null(&other) {
+        return;
+    }
+    let mut state = if aggregate_value_is_null(value) {
+        None
+    } else {
+        Some(value.clone())
+    };
+    update_min_max_value(expr, &mut state, other);
+    if let Some(state) = state {
+        *value = state;
+    }
+}
+
+fn merge_sum_value(value: &mut AggregateValue, other: AggregateValue) -> Result<()> {
+    match (value, other) {
+        (AggregateValue::Int64(value), AggregateValue::Int64(other)) => {
+            if let Some(other) = other {
+                *value = Some(value.unwrap_or_default() + other);
+            }
+        }
+        (AggregateValue::Float64(value), AggregateValue::Float64(other)) => {
+            if let Some(other) = other {
+                *value = Some(value.unwrap_or_default() + other);
+            }
+        }
+        (
+            AggregateValue::Decimal128(value, precision, scale),
+            AggregateValue::Decimal128(other, _, _),
+        ) => {
+            if let Some(other) = other {
+                *value = Some(value.unwrap_or_default() + other);
+            }
+            let _ = (precision, scale);
+        }
+        (_, other) => {
+            if !aggregate_value_is_null(&other) {
+                return Err(DodamError::UnsupportedSql(
+                    "partial sum aggregate type mismatch".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn aggregate_value_is_null(value: &AggregateValue) -> bool {
+    matches!(
+        value,
+        AggregateValue::Int64(None)
+            | AggregateValue::Float64(None)
+            | AggregateValue::Date32(None)
+            | AggregateValue::Date64(None)
+            | AggregateValue::TimestampMillisecond(None, _)
+            | AggregateValue::Decimal128(None, _, _)
+            | AggregateValue::Utf8(None)
+    )
 }
 
 fn can_use_two_utf8_key_fast_path(group_by: &[String], aggregates: &[AggregateExpr]) -> bool {

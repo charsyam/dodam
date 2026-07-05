@@ -8,6 +8,8 @@ pub struct AggregateMetrics {
     pub fragments: usize,
     pub batches: usize,
     pub rows: usize,
+    pub aggregate_nanos: u64,
+    pub aggregate_merge_nanos: u64,
     pub values: Vec<AggregateResult>,
     pub groups: Vec<GroupAggregateResult>,
 }

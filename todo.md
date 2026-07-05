@@ -1069,6 +1069,18 @@ Tried and rejected or neutral:
     - SF=10 generic sample (`GROUP BY l_returnflag, l_linestatus` with `count(*)`/`sum(l_quantity)`, not the Q01 canonical fast path) improved after warmup from about `1.29-1.30s` with forced hash to about `1.19s` adaptive; outputs matched.
     - A larger-cardinality sample (`GROUP BY o_orderpriority, o_clerk`) was roughly neutral/slightly slower (`0.80-0.82s` adaptive vs `0.78-0.81s` forced hash), which is expected from the small initial slot checks before promotion. Keep the limit small unless broader benchmarks show a better crossover.
     - Full SF=10 TPC-H remained correct (`22/22`) with one-run total around `7.55s`; canonical Q01 still routes through its typed path, so this is mostly a generic SQL benefit.
+  - Generalized row-group fused Parquet aggregate for mergeable aggregate functions:
+    - Added a common partial `AggregateMetrics` merge path and routed single-table Parquet aggregate through `parquet_row_group_map` when aggregates are mergeable (`count`, `sum`, `min`, `max`; not `avg` or `count_distinct` yet because partial output loses the extra merge state).
+    - This is not tied to TPC-H column names. It applies to ordinary single-table Parquet aggregates with explicit aggregate/group columns and no expression aggregate.
+    - SF=10 generic grouped aggregate sample (`GROUP BY l_returnflag, l_linestatus`, `count(*)`, `sum(l_quantity)`) improved from roughly `1.22-1.32s` with `DODAM_DISABLE_FUSED_PARQUET_AGGREGATE=1` to roughly `0.19-0.40s` enabled, depending on run noise.
+    - SF=10 TPC-H still passed `22/22`; a noisy concurrent run sampled `8.62s`, while a clean rerun sampled `7.39s`, so no retained regression signal.
+  - Tried generic late-materialized aggregate:
+    - Added an opt-in generic path (`DODAM_ENABLE_LATE_MATERIALIZED_AGGREGATE=1`) that reads predicate columns first, builds a `RowSelection`, and then reads aggregate/group payload columns before partial aggregate merge.
+    - Added a selector-fragmentation guard (`DODAM_LATE_AGG_MAX_SELECTOR_RUN_RATIO`, default `0.02`) because selected-row ratio alone allowed highly fragmented selections that made Parquet row-selection reads extremely slow. Before the guard, a selective-looking filter sample ran around `98s`; with the guard it falls back quickly.
+    - Kept this path disabled by default. In tested aggregate samples the payload was already narrow, so generic late materialization did not beat the normal scan path (`date-only sum` was roughly neutral/slower, and fragmented date+quantity was slower after fallback overhead). The existing Q06/Q14/Q19 specialized late paths remain enabled because they carry extra predicate-side values or use query-specific payload logic.
+  - Expanded aggregate timing instrumentation:
+    - `AggregateMetrics` now includes `aggregate_nanos` and `aggregate_merge_nanos`; `dodam aggregate` and SQL aggregate summaries print these as milliseconds.
+    - This complements the existing scan metrics (`metadata`, `planning`, `decode`, `filter`, `projection`, `limit`) and makes scan-vs-aggregate attribution easier before deeper decode/filter instrumentation.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.

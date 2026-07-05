@@ -26,8 +26,9 @@ use crate::execution::{
     HashJoinExec, IpcExec, JoinBuildSide, JoinType, LimitExec, LiteralValue, MemoryExec,
     PartitionedHashJoinExec, PartitionedHashJoinOptions, PhysicalPlan, PredicateSet, Projection,
     ProjectionExec, RecordBatchSink, ScanExec, ScanMetrics, ScanPlanMetrics, SendableBatchStream,
-    SortExec, SortExpr, SortKey, SortMergeJoinExec, collect_aggregates, collect_grouped_aggregates,
-    collect_metrics, scan_projection, write_stream_to_sink,
+    SortExec, SortExpr, SortKey, SortMergeJoinExec, can_merge_partial_aggregates,
+    collect_aggregates, collect_grouped_aggregates, collect_metrics, evaluate_filter_mask,
+    merge_partial_aggregate_metrics, scan_projection, write_stream_to_sink,
 };
 use crate::plan::{
     ExchangeKind, ExecutionGraphPlan, LogicalPlan, LogicalScan, PhysicalExecutionConfig,
@@ -2107,6 +2108,18 @@ impl DodamEngine {
         aggregates: Vec<AggregateExpr>,
         filter: Option<FilterExpr>,
     ) -> Result<AggregateMetrics> {
+        if let Some(metrics) = self
+            .try_aggregate_parquet_fused(
+                path.clone(),
+                batch_size,
+                aggregates.clone(),
+                Vec::new(),
+                filter.clone(),
+            )
+            .await?
+        {
+            return Ok(metrics);
+        }
         let source = self.plan_table_source(path).await?;
         self.aggregate_table(source, batch_size, aggregates, Vec::new(), filter)
     }
@@ -2131,8 +2144,157 @@ impl DodamEngine {
         group_by: Vec<String>,
         filter: Option<FilterExpr>,
     ) -> Result<AggregateMetrics> {
+        if let Some(metrics) = self
+            .try_aggregate_parquet_fused(
+                path.clone(),
+                batch_size,
+                aggregates.clone(),
+                group_by.clone(),
+                filter.clone(),
+            )
+            .await?
+        {
+            return Ok(metrics);
+        }
         let source = self.plan_table_source(path).await?;
         self.aggregate_table(source, batch_size, aggregates, group_by, filter)
+    }
+
+    async fn try_aggregate_parquet_fused(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        aggregates: Vec<AggregateExpr>,
+        group_by: Vec<String>,
+        filter: Option<FilterExpr>,
+    ) -> Result<Option<AggregateMetrics>> {
+        if !fused_parquet_aggregate_enabled() || !can_merge_partial_aggregates(&aggregates) {
+            return Ok(None);
+        }
+        if let Some(filter) = filter {
+            return self
+                .try_late_materialized_parquet_aggregate(
+                    path, batch_size, aggregates, group_by, filter,
+                )
+                .await;
+        }
+        let projection = aggregate_projection(&aggregates, &group_by);
+        if matches!(projection, Projection::All) {
+            return Ok(None);
+        }
+        let Some(partials) = self
+            .parquet_row_group_map(
+                path,
+                batch_size,
+                projection,
+                fused_parquet_aggregate_row_group_chunk(),
+                Vec::<RecordBatch>::new,
+                |batch, batches| {
+                    batches.push(batch);
+                    Ok(Some(()))
+                },
+                {
+                    let aggregates = aggregates.clone();
+                    let group_by = group_by.clone();
+                    move |batches| {
+                        let stream = Box::new(MemoryExec::new(batches)).execute()?;
+                        let metrics = if group_by.is_empty() {
+                            collect_aggregates(stream, 1, &aggregates)?
+                        } else {
+                            collect_grouped_aggregates(stream, 1, &group_by, &aggregates)?
+                        };
+                        Ok(Some(metrics))
+                    }
+                },
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        if partials.is_empty() {
+            return Ok(None);
+        }
+        merge_partial_aggregate_metrics(partials, 1, &group_by, &aggregates).map(Some)
+    }
+
+    async fn try_late_materialized_parquet_aggregate(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        aggregates: Vec<AggregateExpr>,
+        group_by: Vec<String>,
+        filter: FilterExpr,
+    ) -> Result<Option<AggregateMetrics>> {
+        if !late_materialized_aggregate_enabled() {
+            return Ok(None);
+        }
+        let predicate_columns = filter.referenced_columns();
+        if predicate_columns.is_empty() {
+            return Ok(None);
+        }
+        let payload_projection = aggregate_projection(&aggregates, &group_by);
+        let Projection::Columns(payload_columns) = &payload_projection else {
+            return Ok(None);
+        };
+        if payload_columns.is_empty() {
+            return Ok(None);
+        }
+        let predicate_projection = Projection::Columns(predicate_columns);
+        let Some(partials) = self
+            .late_materialized_parquet_map_with_policy(
+                path,
+                batch_size,
+                predicate_projection,
+                payload_projection,
+                late_materialized_aggregate_row_group_chunk(),
+                LateMaterializationPolicy::selective_with_selector_run_ratio(
+                    late_materialized_aggregate_max_selected_ratio(),
+                    late_materialized_aggregate_max_selector_run_ratio(),
+                ),
+                Vec::<RecordBatch>::new,
+                {
+                    let filter = filter.clone();
+                    move |batch, selection, _batches| {
+                        let mask = evaluate_filter_mask(&batch, &filter)?;
+                        for row in 0..mask.len() {
+                            selection.push(mask.is_valid(row) && mask.value(row));
+                        }
+                        Ok(Some(()))
+                    }
+                },
+                |batch, batches| {
+                    batches.push(batch);
+                    Ok(Some(()))
+                },
+                {
+                    let aggregates = aggregates.clone();
+                    let group_by = group_by.clone();
+                    move |batches, _metrics| {
+                        let stream = Box::new(MemoryExec::new(batches)).execute()?;
+                        let metrics = if group_by.is_empty() {
+                            collect_aggregates(stream, 1, &aggregates)?
+                        } else {
+                            collect_grouped_aggregates(stream, 1, &group_by, &aggregates)?
+                        };
+                        Ok(Some(metrics))
+                    }
+                },
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let mut late_metrics = LateMaterializedMetrics::default();
+        let mut partial_metrics = Vec::with_capacity(partials.len());
+        for partial in partials {
+            late_metrics.add(partial.metrics);
+            partial_metrics.push(partial.output);
+        }
+        log_late_materialized_metrics("Aggregate", late_metrics, partial_metrics.len());
+        if partial_metrics.is_empty() {
+            return Ok(None);
+        }
+        merge_partial_aggregate_metrics(partial_metrics, 1, &group_by, &aggregates).map(Some)
     }
 
     pub fn plan_table_aggregate(
@@ -2488,6 +2650,48 @@ fn aggregate_projection(aggregates: &[AggregateExpr], group_by: &[String]) -> Pr
     } else {
         Projection::Columns(columns)
     }
+}
+
+fn fused_parquet_aggregate_enabled() -> bool {
+    std::env::var("DODAM_DISABLE_FUSED_PARQUET_AGGREGATE")
+        .map(|value| !matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(true)
+}
+
+fn fused_parquet_aggregate_row_group_chunk() -> usize {
+    std::env::var("DODAM_FUSED_PARQUET_AGG_ROW_GROUP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4)
+}
+
+fn late_materialized_aggregate_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_LATE_MATERIALIZED_AGGREGATE")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn late_materialized_aggregate_row_group_chunk() -> usize {
+    std::env::var("DODAM_LATE_AGG_ROW_GROUP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4)
+}
+
+fn late_materialized_aggregate_max_selected_ratio() -> f64 {
+    std::env::var("DODAM_LATE_AGG_MAX_SELECTED_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.60)
+}
+
+fn late_materialized_aggregate_max_selector_run_ratio() -> f64 {
+    std::env::var("DODAM_LATE_AGG_MAX_SELECTOR_RUN_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.02)
 }
 
 fn prune_table_source_partitions(
@@ -3063,30 +3267,51 @@ impl LateMaterializedMetrics {
 #[derive(Clone, Copy)]
 pub struct LateMaterializationPolicy {
     max_selected_ratio: Option<f64>,
+    max_selector_run_ratio: Option<f64>,
 }
 
 impl LateMaterializationPolicy {
     pub fn always() -> Self {
         Self {
             max_selected_ratio: None,
+            max_selector_run_ratio: None,
         }
     }
 
     pub fn selective(max_selected_ratio: f64) -> Self {
         Self {
             max_selected_ratio: Some(max_selected_ratio.clamp(0.0, 1.0)),
+            max_selector_run_ratio: None,
+        }
+    }
+
+    pub fn selective_with_selector_run_ratio(
+        max_selected_ratio: f64,
+        max_selector_run_ratio: f64,
+    ) -> Self {
+        Self {
+            max_selected_ratio: Some(max_selected_ratio.clamp(0.0, 1.0)),
+            max_selector_run_ratio: Some(max_selector_run_ratio.clamp(0.0, 1.0)),
         }
     }
 
     fn accepts(&self, metrics: &LateMaterializedMetrics) -> bool {
-        let Some(max_selected_ratio) = self.max_selected_ratio else {
-            return true;
-        };
         if metrics.total_rows == 0 {
             return true;
         }
-        let selected_ratio = metrics.selected_rows as f64 / metrics.total_rows as f64;
-        selected_ratio <= max_selected_ratio
+        if let Some(max_selected_ratio) = self.max_selected_ratio {
+            let selected_ratio = metrics.selected_rows as f64 / metrics.total_rows as f64;
+            if selected_ratio > max_selected_ratio {
+                return false;
+            }
+        }
+        if let Some(max_selector_run_ratio) = self.max_selector_run_ratio {
+            let selector_run_ratio = metrics.selector_runs as f64 / metrics.total_rows as f64;
+            if selector_run_ratio > max_selector_run_ratio {
+                return false;
+            }
+        }
+        true
     }
 }
 

@@ -15087,6 +15087,7 @@ async fn try_execute_derived_left_join_count_distribution_sql(
         rows,
         values: Vec::new(),
         groups,
+        ..AggregateMetrics::default()
     };
     let mut batches =
         aggregate_metrics_to_batches(&metrics, &outer_group_by, &projection.aggregates)?;
@@ -15369,6 +15370,7 @@ fn try_count_derived_aggregate_groups(
         rows: inner_metrics.groups.len(),
         values: Vec::new(),
         groups,
+        ..AggregateMetrics::default()
     };
     let mut batches = aggregate_metrics_to_batches(&metrics, group_by, &projection.aggregates)?;
     batches = apply_output_order_limit(batches, order_by, limit)?;

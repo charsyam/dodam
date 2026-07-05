@@ -241,19 +241,26 @@ async fn main() -> Result<()> {
                     .collect::<Vec<_>>()
                     .join(", ");
                 println!(
-                    "aggregated {} rows in {} batches from {} fragment(s): {}",
-                    metrics.rows, metrics.batches, metrics.fragments, values
+                    "aggregated {} rows in {} batches from {} fragment(s) aggregate={:.3}ms merge={:.3}ms: {}",
+                    metrics.rows,
+                    metrics.batches,
+                    metrics.fragments,
+                    nanos_to_millis(metrics.aggregate_nanos),
+                    nanos_to_millis(metrics.aggregate_merge_nanos),
+                    values
                 );
             } else {
                 let metrics = engine
                     .aggregate_parquet_grouped(path, batch_size, aggregates, group_by, filter)
                     .await?;
                 println!(
-                    "aggregated {} rows into {} group(s) in {} batches from {} fragment(s)",
+                    "aggregated {} rows into {} group(s) in {} batches from {} fragment(s) aggregate={:.3}ms merge={:.3}ms",
                     metrics.rows,
                     metrics.groups.len(),
                     metrics.batches,
-                    metrics.fragments
+                    metrics.fragments,
+                    nanos_to_millis(metrics.aggregate_nanos),
+                    nanos_to_millis(metrics.aggregate_merge_nanos)
                 );
                 for group in metrics.groups {
                     let keys = group
@@ -1750,18 +1757,25 @@ impl StdoutQuerySink {
                 .collect::<Vec<_>>()
                 .join(", ");
             println!(
-                "aggregated {} rows in {} batches from {} fragment(s): {}",
-                metrics.rows, metrics.batches, metrics.fragments, values
+                "aggregated {} rows in {} batches from {} fragment(s) aggregate={:.3}ms merge={:.3}ms: {}",
+                metrics.rows,
+                metrics.batches,
+                metrics.fragments,
+                nanos_to_millis(metrics.aggregate_nanos),
+                nanos_to_millis(metrics.aggregate_merge_nanos),
+                values
             );
             return;
         }
 
         println!(
-            "aggregated {} rows into {} group(s) in {} batches from {} fragment(s)",
+            "aggregated {} rows into {} group(s) in {} batches from {} fragment(s) aggregate={:.3}ms merge={:.3}ms",
             metrics.rows,
             metrics.groups.len(),
             metrics.batches,
-            metrics.fragments
+            metrics.fragments,
+            nanos_to_millis(metrics.aggregate_nanos),
+            nanos_to_millis(metrics.aggregate_merge_nanos)
         );
         for group in &metrics.groups {
             let keys = group
@@ -1789,6 +1803,10 @@ impl RecordBatchSink for StdoutQuerySink {
 
 fn nanos_to_micros(nanos: u64) -> u64 {
     nanos / 1_000
+}
+
+fn nanos_to_millis(nanos: u64) -> f64 {
+    nanos as f64 / 1_000_000.0
 }
 
 fn query_summary_enabled() -> bool {
