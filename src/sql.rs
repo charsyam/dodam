@@ -5406,6 +5406,40 @@ async fn q09_profit_rows(
         "l_extendedprice".to_string(),
         "l_discount".to_string(),
     ]);
+    if q09_row_group_map_enabled() && !q09_lineitem_partkey_row_filter_enabled() {
+        let part_keys_for_scan = part_keys.clone();
+        let supplier_nations_for_scan = supplier_nations.clone();
+        let order_years_for_scan = order_years.clone();
+        let supply_costs_for_scan = supply_costs.clone();
+        if let Some(partials) = engine
+            .parquet_row_group_map(
+                path.clone(),
+                batch_size,
+                projection.clone(),
+                q09_row_group_map_chunk(),
+                Q09ProfitPartial::default,
+                move |batch, partial| {
+                    partial.merge(q09_profit_batch(
+                        batch,
+                        &part_keys_for_scan,
+                        &supplier_nations_for_scan,
+                        &order_years_for_scan,
+                        &supply_costs_for_scan,
+                    )?);
+                    Ok(Some(()))
+                },
+                |partial| Ok(Some(partial)),
+            )
+            .await?
+        {
+            let mut partial = Q09ProfitPartial::default();
+            for batch in partials {
+                partial.merge(batch);
+            }
+            q09_log_profit_profile(&partial.profile);
+            return q09_profit_rows_from_groups(partial.groups, nation_names);
+        }
+    }
     let mut stream = if q09_lineitem_partkey_row_filter_enabled() {
         engine
             .scan_parquet_batches_i64_set_filtered(
@@ -5438,6 +5472,18 @@ async fn q09_profit_rows(
     )?;
     q09_log_profit_profile(&partial.profile);
     q09_profit_rows_from_groups(partial.groups, nation_names)
+}
+
+fn q09_row_group_map_enabled() -> bool {
+    std::env::var_os("DODAM_Q09_DISABLE_ROW_GROUP_MAP").is_none()
+}
+
+fn q09_row_group_map_chunk() -> usize {
+    std::env::var("DODAM_Q09_ROW_GROUP_MAP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2)
 }
 
 fn q09_lineitem_partkey_row_filter_enabled() -> bool {
@@ -7579,22 +7625,70 @@ async fn q12_filtered_lineitem_counts(
     start_days: i32,
     end_days: i32,
 ) -> Result<HashMap<i64, Q12PendingOrder>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec![
-                "l_orderkey".to_string(),
-                "l_shipmode".to_string(),
-                "l_commitdate".to_string(),
-                "l_receiptdate".to_string(),
-                "l_shipdate".to_string(),
-            ]),
-            None,
-        )
-        .await?;
+    let projection = Projection::Columns(vec![
+        "l_orderkey".to_string(),
+        "l_shipmode".to_string(),
+        "l_commitdate".to_string(),
+        "l_receiptdate".to_string(),
+        "l_shipdate".to_string(),
+    ]);
     let shipmodes = Arc::new(shipmodes.to_vec());
+    if q12_row_group_map_enabled()
+        && let Some(partials) = engine
+            .parquet_row_group_map(
+                path.clone(),
+                batch_size,
+                projection.clone(),
+                q12_row_group_map_chunk(),
+                HashMap::<i64, Q12PendingOrder>::new,
+                {
+                    let shipmodes = shipmodes.clone();
+                    move |batch, pending| {
+                        q12_merge_pending_orders(
+                            pending,
+                            q12_filtered_lineitem_counts_batch(
+                                batch, &shipmodes, start_days, end_days,
+                            )?,
+                        );
+                        Ok(Some(()))
+                    }
+                },
+                |pending| Ok(Some(pending)),
+            )
+            .await?
+    {
+        let mut pending = HashMap::<i64, Q12PendingOrder>::new();
+        for partial in partials {
+            q12_merge_pending_orders(&mut pending, partial);
+        }
+        return Ok(pending);
+    }
+    q12_filtered_lineitem_counts_stream(
+        engine, path, batch_size, projection, shipmodes, start_days, end_days,
+    )
+    .await
+}
+
+fn q12_lineitem_chunk_size() -> usize {
+    std::env::var("DODAM_Q12_LINEITEM_CHUNK_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(8)
+}
+
+async fn q12_filtered_lineitem_counts_stream(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    projection: Projection,
+    shipmodes: Arc<Vec<String>>,
+    start_days: i32,
+    end_days: i32,
+) -> Result<HashMap<i64, Q12PendingOrder>> {
+    let mut stream = engine
+        .scan_parquet_batches(path, batch_size, None, projection, None)
+        .await?;
     parallel_batch_fold_chunks(
         &mut stream,
         q12_lineitem_chunk_size(),
@@ -7614,12 +7708,16 @@ async fn q12_filtered_lineitem_counts(
     )
 }
 
-fn q12_lineitem_chunk_size() -> usize {
-    std::env::var("DODAM_Q12_LINEITEM_CHUNK_SIZE")
+fn q12_row_group_map_enabled() -> bool {
+    std::env::var_os("DODAM_Q12_DISABLE_ROW_GROUP_MAP").is_none()
+}
+
+fn q12_row_group_map_chunk() -> usize {
+    std::env::var("DODAM_Q12_ROW_GROUP_MAP_CHUNK")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(8)
+        .unwrap_or(2)
 }
 
 fn q12_filtered_lineitem_counts_batch(
@@ -8686,6 +8784,7 @@ struct Q03Order {
     o_shippriority: i64,
 }
 
+#[derive(Clone)]
 struct SortedI64Lookup<V> {
     entries: Vec<(i64, V)>,
 }
@@ -8870,22 +8969,39 @@ async fn q03_revenue_rows(
         "l_extendedprice".to_string(),
         "l_discount".to_string(),
     ]);
-    let mut stream =
+    let pruning_predicates =
         if let Some((min_key, max_key)) = selective_i64_key_range(orders.keys().copied()) {
-            engine
-                .scan_parquet_batches_pruned(
-                    path,
-                    batch_size,
-                    projection,
-                    i64_range_pruning_predicates("l_orderkey", min_key, max_key),
-                )
-                .await?
+            i64_range_pruning_predicates("l_orderkey", min_key, max_key)
         } else {
-            engine
-                .scan_parquet_batches(path, batch_size, None, projection, None)
-                .await?
+            Vec::new()
         };
-    let revenues = if q03_sorted_order_lookup_enabled() {
+    let revenues = if q03_row_group_map_enabled() {
+        if q03_sorted_order_lookup_enabled() {
+            let orders_for_scan = Arc::new(SortedI64Lookup::from_hash_map(orders));
+            q03_revenue_rows_row_group_map(
+                engine,
+                path,
+                batch_size,
+                projection,
+                pruning_predicates,
+                move |batch| q03_revenue_batch_sorted(batch, &orders_for_scan, ship_cutoff),
+            )
+            .await?
+        } else {
+            let orders_for_scan = Arc::new(orders.clone());
+            q03_revenue_rows_row_group_map(
+                engine,
+                path,
+                batch_size,
+                projection,
+                pruning_predicates,
+                move |batch| q03_revenue_batch(batch, &orders_for_scan, ship_cutoff),
+            )
+            .await?
+        }
+    } else if q03_sorted_order_lookup_enabled() {
+        let mut stream =
+            q03_revenue_stream(engine, path, batch_size, projection, pruning_predicates).await?;
         let orders_for_scan = Arc::new(SortedI64Lookup::from_hash_map(orders));
         parallel_batch_fold_chunks(
             &mut stream,
@@ -8905,6 +9021,8 @@ async fn q03_revenue_rows(
             "Q03 revenue aggregate",
         )?
     } else {
+        let mut stream =
+            q03_revenue_stream(engine, path, batch_size, projection, pruning_predicates).await?;
         let orders_for_scan = Arc::new(orders.clone());
         parallel_batch_fold_chunks(
             &mut stream,
@@ -8941,6 +9059,89 @@ async fn q03_revenue_rows(
     }
     rows.sort_by(q03_row_ordering);
     Ok(rows)
+}
+
+async fn q03_revenue_stream(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    projection: Projection,
+    pruning_predicates: Vec<Expr>,
+) -> Result<SendableBatchStream> {
+    if pruning_predicates.is_empty() {
+        engine
+            .scan_parquet_batches(path, batch_size, None, projection, None)
+            .await
+    } else {
+        engine
+            .scan_parquet_batches_pruned(path, batch_size, projection, pruning_predicates)
+            .await
+    }
+}
+
+async fn q03_revenue_rows_row_group_map<Map>(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    projection: Projection,
+    pruning_predicates: Vec<Expr>,
+    map: Map,
+) -> Result<HashMap<i64, f64>>
+where
+    Map: Fn(RecordBatch) -> Result<HashMap<i64, f64>> + Clone + Send + Sync + 'static,
+{
+    let map_for_row_group = map.clone();
+    if let Some(partials) = engine
+        .parquet_row_group_map_pruned(
+            path.clone(),
+            batch_size,
+            projection.clone(),
+            pruning_predicates.clone(),
+            q03_row_group_map_chunk(),
+            HashMap::<i64, f64>::new,
+            move |batch, revenues| {
+                merge_f64_groups(revenues, map_for_row_group(batch)?);
+                Ok(Some(()))
+            },
+            |revenues| Ok(Some(revenues)),
+        )
+        .await?
+    {
+        let mut revenues = HashMap::<i64, f64>::new();
+        for partial in partials {
+            merge_f64_groups(&mut revenues, partial);
+        }
+        Ok(revenues)
+    } else {
+        let mut stream =
+            q03_revenue_stream(engine, path, batch_size, projection, pruning_predicates).await?;
+        parallel_batch_fold_chunks(
+            &mut stream,
+            4,
+            move |batches| {
+                let mut revenues = HashMap::<i64, f64>::new();
+                for batch in batches {
+                    merge_f64_groups(&mut revenues, map(batch)?);
+                }
+                Ok(revenues)
+            },
+            HashMap::<i64, f64>::new(),
+            merge_f64_groups,
+            "Q03 revenue aggregate",
+        )
+    }
+}
+
+fn q03_row_group_map_enabled() -> bool {
+    std::env::var_os("DODAM_Q03_DISABLE_ROW_GROUP_MAP").is_none()
+}
+
+fn q03_row_group_map_chunk() -> usize {
+    std::env::var("DODAM_Q03_ROW_GROUP_MAP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2)
 }
 
 fn q03_sorted_order_lookup_enabled() -> bool {
@@ -10361,20 +10562,12 @@ async fn q05_revenue_by_nation(
     supplier_nations: &HashMap<i64, i64>,
     nation_names: &HashMap<i64, String>,
 ) -> Result<Vec<Q05Row>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec![
-                "l_orderkey".to_string(),
-                "l_suppkey".to_string(),
-                "l_extendedprice".to_string(),
-                "l_discount".to_string(),
-            ]),
-            None,
-        )
-        .await?;
+    let projection = Projection::Columns(vec![
+        "l_orderkey".to_string(),
+        "l_suppkey".to_string(),
+        "l_extendedprice".to_string(),
+        "l_discount".to_string(),
+    ]);
     let order_customer_nations = Arc::new(
         order_customer_nations
             .iter()
@@ -10382,23 +10575,58 @@ async fn q05_revenue_by_nation(
             .collect::<FastHashMap<_, _>>(),
     );
     let supplier_nations = Arc::new(AdaptiveI64Map::from_hash(supplier_nations.clone()));
-    let groups = parallel_batch_fold_chunks(
-        &mut stream,
-        join_aggregate_chunk_size(),
-        move |batches| {
+    let groups = if q05_row_group_map_enabled() {
+        let order_customer_nations_for_scan = order_customer_nations.clone();
+        let supplier_nations_for_scan = supplier_nations.clone();
+        if let Some(partials) = engine
+            .parquet_row_group_map(
+                path.clone(),
+                batch_size,
+                projection.clone(),
+                q05_row_group_map_chunk(),
+                HashMap::<i64, f64>::new,
+                move |batch, groups| {
+                    merge_f64_groups(
+                        groups,
+                        q05_revenue_by_nation_batch(
+                            batch,
+                            &order_customer_nations_for_scan,
+                            &supplier_nations_for_scan,
+                        )?,
+                    );
+                    Ok(Some(()))
+                },
+                |groups| Ok(Some(groups)),
+            )
+            .await?
+        {
             let mut groups = HashMap::<i64, f64>::new();
-            for batch in batches {
-                merge_f64_groups(
-                    &mut groups,
-                    q05_revenue_by_nation_batch(batch, &order_customer_nations, &supplier_nations)?,
-                );
+            for partial in partials {
+                merge_f64_groups(&mut groups, partial);
             }
-            Ok(groups)
-        },
-        HashMap::<i64, f64>::new(),
-        merge_f64_groups,
-        "Q05 revenue aggregate",
-    )?;
+            groups
+        } else {
+            q05_revenue_by_nation_stream(
+                engine,
+                path,
+                batch_size,
+                projection,
+                order_customer_nations,
+                supplier_nations,
+            )
+            .await?
+        }
+    } else {
+        q05_revenue_by_nation_stream(
+            engine,
+            path,
+            batch_size,
+            projection,
+            order_customer_nations,
+            supplier_nations,
+        )
+        .await?
+    };
     let mut rows = groups
         .into_iter()
         .filter_map(|(nationkey, revenue)| {
@@ -10415,6 +10643,48 @@ async fn q05_revenue_by_nation(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     Ok(rows)
+}
+
+async fn q05_revenue_by_nation_stream(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    projection: Projection,
+    order_customer_nations: Arc<FastHashMap<i64, i64>>,
+    supplier_nations: Arc<AdaptiveI64Map<i64>>,
+) -> Result<HashMap<i64, f64>> {
+    let mut stream = engine
+        .scan_parquet_batches(path, batch_size, None, projection, None)
+        .await?;
+    parallel_batch_fold_chunks(
+        &mut stream,
+        join_aggregate_chunk_size(),
+        move |batches| {
+            let mut groups = HashMap::<i64, f64>::new();
+            for batch in batches {
+                merge_f64_groups(
+                    &mut groups,
+                    q05_revenue_by_nation_batch(batch, &order_customer_nations, &supplier_nations)?,
+                );
+            }
+            Ok(groups)
+        },
+        HashMap::<i64, f64>::new(),
+        merge_f64_groups,
+        "Q05 revenue aggregate",
+    )
+}
+
+fn q05_row_group_map_enabled() -> bool {
+    std::env::var_os("DODAM_Q05_DISABLE_ROW_GROUP_MAP").is_none()
+}
+
+fn q05_row_group_map_chunk() -> usize {
+    std::env::var("DODAM_Q05_ROW_GROUP_MAP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2)
 }
 
 fn q05_revenue_by_nation_batch(
@@ -11404,21 +11674,13 @@ async fn q07_volume_rows(
     start_days: i32,
     end_days: i32,
 ) -> Result<Vec<Q07Row>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec![
-                "l_orderkey".to_string(),
-                "l_suppkey".to_string(),
-                "l_shipdate".to_string(),
-                "l_extendedprice".to_string(),
-                "l_discount".to_string(),
-            ]),
-            None,
-        )
-        .await?;
+    let projection = Projection::Columns(vec![
+        "l_orderkey".to_string(),
+        "l_suppkey".to_string(),
+        "l_shipdate".to_string(),
+        "l_extendedprice".to_string(),
+        "l_discount".to_string(),
+    ]);
     let supplier_nations = Arc::new(AdaptiveI64Map::from_hash(supplier_nations.clone()));
     let order_customer_nations = Arc::new(
         order_customer_nations
@@ -11426,7 +11688,99 @@ async fn q07_volume_rows(
             .map(|(&key, &value)| (key, value))
             .collect::<FastHashMap<_, _>>(),
     );
-    let groups = parallel_batch_fold_chunks(
+    let groups = if q07_row_group_map_enabled() {
+        let supplier_nations_for_scan = supplier_nations.clone();
+        let order_customer_nations_for_scan = order_customer_nations.clone();
+        if let Some(partials) = engine
+            .parquet_row_group_map(
+                path.clone(),
+                batch_size,
+                projection.clone(),
+                q07_row_group_map_chunk(),
+                HashMap::<(i64, i64, i32), f64>::new,
+                move |batch, groups| {
+                    merge_f64_groups(
+                        groups,
+                        q07_volume_batch(
+                            batch,
+                            &supplier_nations_for_scan,
+                            &order_customer_nations_for_scan,
+                            start_days,
+                            end_days,
+                        )?,
+                    );
+                    Ok(Some(()))
+                },
+                |groups| Ok(Some(groups)),
+            )
+            .await?
+        {
+            let mut groups = HashMap::<(i64, i64, i32), f64>::new();
+            for partial in partials {
+                merge_f64_groups(&mut groups, partial);
+            }
+            groups
+        } else {
+            q07_volume_rows_stream(
+                engine,
+                path,
+                batch_size,
+                projection,
+                supplier_nations,
+                order_customer_nations,
+                start_days,
+                end_days,
+            )
+            .await?
+        }
+    } else {
+        q07_volume_rows_stream(
+            engine,
+            path,
+            batch_size,
+            projection,
+            supplier_nations,
+            order_customer_nations,
+            start_days,
+            end_days,
+        )
+        .await?
+    };
+    let mut rows = groups
+        .into_iter()
+        .filter_map(|((supp_nation_key, cust_nation_key, l_year), revenue)| {
+            Some(Q07Row {
+                supp_nation: nation_names.get(&supp_nation_key)?.clone(),
+                cust_nation: nation_names.get(&cust_nation_key)?.clone(),
+                l_year,
+                revenue,
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        left.supp_nation
+            .cmp(&right.supp_nation)
+            .then_with(|| left.cust_nation.cmp(&right.cust_nation))
+            .then_with(|| left.l_year.cmp(&right.l_year))
+    });
+    Ok(rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn q07_volume_rows_stream(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    projection: Projection,
+    supplier_nations: Arc<AdaptiveI64Map<i64>>,
+    order_customer_nations: Arc<FastHashMap<i64, i64>>,
+    start_days: i32,
+    end_days: i32,
+) -> Result<HashMap<(i64, i64, i32), f64>> {
+    let mut stream = engine
+        .scan_parquet_batches(path, batch_size, None, projection, None)
+        .await?;
+    parallel_batch_fold_chunks(
         &mut stream,
         join_aggregate_chunk_size(),
         move |batches| {
@@ -11448,25 +11802,19 @@ async fn q07_volume_rows(
         HashMap::<(i64, i64, i32), f64>::new(),
         merge_f64_groups,
         "Q07 volume aggregate",
-    )?;
-    let mut rows = groups
-        .into_iter()
-        .filter_map(|((supp_nation_key, cust_nation_key, l_year), revenue)| {
-            Some(Q07Row {
-                supp_nation: nation_names.get(&supp_nation_key)?.clone(),
-                cust_nation: nation_names.get(&cust_nation_key)?.clone(),
-                l_year,
-                revenue,
-            })
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| {
-        left.supp_nation
-            .cmp(&right.supp_nation)
-            .then_with(|| left.cust_nation.cmp(&right.cust_nation))
-            .then_with(|| left.l_year.cmp(&right.l_year))
-    });
-    Ok(rows)
+    )
+}
+
+fn q07_row_group_map_enabled() -> bool {
+    std::env::var_os("DODAM_Q07_DISABLE_ROW_GROUP_MAP").is_none()
+}
+
+fn q07_row_group_map_chunk() -> usize {
+    std::env::var("DODAM_Q07_ROW_GROUP_MAP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2)
 }
 
 fn q07_volume_batch(
@@ -14796,22 +15144,42 @@ async fn q21_lineitem_order_states(
     {
         return Ok(states);
     }
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec![
-                "l_orderkey".to_string(),
-                "l_suppkey".to_string(),
-                "l_receiptdate".to_string(),
-                "l_commitdate".to_string(),
-            ]),
-            None,
-        )
-        .await?;
+    let projection = Projection::Columns(vec![
+        "l_orderkey".to_string(),
+        "l_suppkey".to_string(),
+        "l_receiptdate".to_string(),
+        "l_commitdate".to_string(),
+    ]);
     let output_capacity = final_orders.len();
     let final_orders = Arc::new(final_orders);
+    if q21_row_group_map_enabled()
+        && let Some(partials) = engine
+            .parquet_row_group_map(
+                path.clone(),
+                batch_size,
+                projection.clone(),
+                q21_row_group_map_chunk(),
+                q21_order_state_map,
+                {
+                    let final_orders = final_orders.clone();
+                    move |batch, states| {
+                        q21_lineitem_order_states_batch_into(batch, &final_orders, states)?;
+                        Ok(Some(()))
+                    }
+                },
+                |states| Ok(Some(states)),
+            )
+            .await?
+    {
+        let mut output = q21_order_state_map_with_capacity(output_capacity);
+        for partial in partials {
+            q21_merge_order_states(&mut output, partial);
+        }
+        return Ok(output);
+    }
+    let mut stream = engine
+        .scan_parquet_batches(path, batch_size, None, projection, None)
+        .await?;
     q21_parallel_batch_order_states(
         &mut stream,
         q21_lineitem_order_state_chunk_size(),
@@ -14824,6 +15192,18 @@ async fn q21_lineitem_order_states(
             Ok(states)
         },
     )
+}
+
+fn q21_row_group_map_enabled() -> bool {
+    std::env::var_os("DODAM_Q21_DISABLE_ROW_GROUP_MAP").is_none()
+}
+
+fn q21_row_group_map_chunk() -> usize {
+    std::env::var("DODAM_Q21_ROW_GROUP_MAP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2)
 }
 
 fn q21_dense_order_state_enabled() -> bool {

@@ -1241,6 +1241,39 @@ impl DodamEngine {
             FnMut(RecordBatch, &mut State) -> Result<Option<()>> + Clone + Send + Sync + 'static,
         Finish: Fn(State) -> Result<Option<Output>> + Clone + Send + Sync + 'static,
     {
+        self.parquet_row_group_map_pruned(
+            path,
+            batch_size,
+            projection,
+            Vec::new(),
+            row_group_chunk,
+            build_state,
+            consume_batch,
+            finish,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn parquet_row_group_map_pruned<State, Output, BuildState, ConsumeBatch, Finish>(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        projection: Projection,
+        pruning_predicates: Vec<Expr>,
+        row_group_chunk: usize,
+        build_state: BuildState,
+        consume_batch: ConsumeBatch,
+        finish: Finish,
+    ) -> Result<Option<Vec<Output>>>
+    where
+        State: Send + 'static,
+        Output: Send + 'static,
+        BuildState: Fn() -> State + Clone + Send + Sync + 'static,
+        ConsumeBatch:
+            FnMut(RecordBatch, &mut State) -> Result<Option<()>> + Clone + Send + Sync + 'static,
+        Finish: Fn(State) -> Result<Option<Output>> + Clone + Send + Sync + 'static,
+    {
         let source = self.plan_table_source(path.clone()).await?;
         if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
             return Ok(None);
@@ -1249,7 +1282,7 @@ impl DodamEngine {
         let plan = plan_parquet_scan_tasks(
             &local_path,
             &projection,
-            &[],
+            &pruning_predicates,
             &self.metadata_cache,
             self.object_store.as_ref(),
         )?;
