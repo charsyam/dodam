@@ -19985,63 +19985,10 @@ pub async fn try_execute_sql_streaming(
     if explain_sql(engine, sql, batch_size).await?.is_some() {
         return Ok(None);
     }
-    if sql_uses_materialized_subquery(sql)? {
-        return Ok(None);
-    }
-    if sql_uses_multi_comma_join(sql)? {
-        return Ok(None);
-    }
-    if sql_uses_expression_predicate(sql)? {
-        return Ok(None);
-    }
-    let query = parse_sql(sql)?;
-    let Some(join) = query.join.clone() else {
+    let Some(request) = plan_direct_join_sink_request(sql, batch_size)? else {
         return Ok(None);
     };
-    if query.is_aggregate()
-        || query.having.is_some()
-        || query.distinct
-        || query.filter.is_some()
-        || query.order_by.is_some()
-        || !query.aliases.is_empty()
-    {
-        return Ok(None);
-    }
-
-    let join_plan = plan_join_inputs(
-        &query.projection,
-        None,
-        None,
-        &join.left_alias,
-        &join.left_keys,
-        &join.right_alias,
-        &join.right_keys,
-    );
-    let output_projection = pushed_join_output_projection(&query);
-    if matches!(output_projection, Projection::All) && !matches!(query.projection, Projection::All)
-    {
-        return Ok(None);
-    }
-    engine
-        .join_parquet_batches(JoinParquetRequest {
-            left_path: query.path,
-            right_path: join.right.path,
-            batch_size,
-            left_keys: join.left_keys,
-            right_keys: join.right_keys,
-            left_prefix: join.left_alias,
-            right_prefix: join.right_alias,
-            left_projection: join_plan.left_projection,
-            right_projection: join_plan.right_projection,
-            left_filter: join_plan.left_filter,
-            right_filter: combine_filter_options(join_plan.right_filter, join.right_filter.clone()),
-            output_projection,
-            join_memory_limit_bytes: default_join_memory_limit_bytes(),
-            join_algorithm: JoinAlgorithm::Auto,
-            join_type: join.join_type,
-        })
-        .await
-        .map(Some)
+    engine.join_parquet_batches(request).await.map(Some)
 }
 
 pub async fn try_execute_sql_to_sink(
@@ -20053,62 +20000,10 @@ pub async fn try_execute_sql_to_sink(
     if explain_sql(engine, sql, batch_size).await?.is_some() {
         return Ok(None);
     }
-    if sql_uses_materialized_subquery(sql)? {
-        return Ok(None);
-    }
-    if sql_uses_multi_comma_join(sql)? {
-        return Ok(None);
-    }
-    if sql_uses_expression_predicate(sql)? {
-        return Ok(None);
-    }
-    let query = parse_sql(sql)?;
-    let Some(join) = query.join.clone() else {
+    let Some(request) = plan_direct_join_sink_request(sql, batch_size)? else {
         return Ok(None);
     };
-    if query.is_aggregate()
-        || query.having.is_some()
-        || query.distinct
-        || query.filter.is_some()
-        || query.order_by.is_some()
-        || !query.aliases.is_empty()
-    {
-        return Ok(None);
-    }
-
-    let join_plan = plan_join_inputs(
-        &query.projection,
-        None,
-        None,
-        &join.left_alias,
-        &join.left_keys,
-        &join.right_alias,
-        &join.right_keys,
-    );
-    let output_projection = pushed_join_output_projection(&query);
-    if matches!(output_projection, Projection::All) && !matches!(query.projection, Projection::All)
-    {
-        return Ok(None);
-    }
-    let plan = engine
-        .plan_parquet_join(JoinParquetRequest {
-            left_path: query.path,
-            right_path: join.right.path,
-            batch_size,
-            left_keys: join.left_keys,
-            right_keys: join.right_keys,
-            left_prefix: join.left_alias,
-            right_prefix: join.right_alias,
-            left_projection: join_plan.left_projection,
-            right_projection: join_plan.right_projection,
-            left_filter: join_plan.left_filter,
-            right_filter: combine_filter_options(join_plan.right_filter, join.right_filter.clone()),
-            output_projection,
-            join_memory_limit_bytes: default_join_memory_limit_bytes(),
-            join_algorithm: JoinAlgorithm::Auto,
-            join_type: join.join_type,
-        })
-        .await?;
+    let plan = engine.plan_parquet_join(request).await?;
     engine.write_join_plan_to_sink(plan, sink).map(Some)
 }
 
@@ -20120,24 +20015,17 @@ pub async fn execute_sql_to_result_sink(
     options: SqlSinkExecutionOptions,
 ) -> Result<SqlSinkExecutionProfile> {
     let mut profile = SqlSinkExecutionProfile::default();
-    if options.allow_direct_or_streaming && sql_may_use_direct_or_streaming(sql) {
+    if options.allow_direct_or_streaming && explain_sql(engine, sql, batch_size).await?.is_none() {
         let direct_started = Instant::now();
-        if let Some(metrics) =
-            try_execute_sql_to_sink(engine, sql, batch_size, sink.record_batch_sink()).await?
-        {
+        if let Some(request) = plan_direct_join_sink_request(sql, batch_size)? {
+            let plan = engine.plan_parquet_join(request).await?;
+            let metrics = engine.write_join_plan_to_sink(plan, sink.record_batch_sink())?;
             profile.direct_sink = Some(direct_started.elapsed());
             profile.scan_plan_metrics = Some(metrics);
             return Ok(profile);
         }
         profile.direct_sink = Some(direct_started.elapsed());
-
-        let streaming_started = Instant::now();
-        if let Some(stream) = try_execute_sql_streaming(engine, sql, batch_size).await? {
-            engine.write_batches_to_sink(stream, sink.record_batch_sink())?;
-            profile.streaming = Some(streaming_started.elapsed());
-            return Ok(profile);
-        }
-        profile.streaming = Some(streaming_started.elapsed());
+        profile.streaming = Some(Duration::ZERO);
     } else {
         profile.direct_sink = Some(Duration::ZERO);
         profile.streaming = Some(Duration::ZERO);
@@ -20152,23 +20040,73 @@ pub async fn execute_sql_to_result_sink(
     Ok(profile)
 }
 
-fn sql_may_use_direct_or_streaming(sql: &str) -> bool {
-    let lower = sql.to_ascii_lowercase();
-    if lower.contains(" group by ")
-        || lower.contains(" order by ")
-        || lower.contains(" having ")
-        || lower.contains(" distinct ")
-        || lower.contains(" exists")
-        || lower.contains(" in (select")
-        || lower.contains(" sum(")
-        || lower.contains(" count(")
-        || lower.contains(" avg(")
-        || lower.contains(" min(")
-        || lower.contains(" max(")
+fn plan_direct_join_sink_request(
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<JoinParquetRequest>> {
+    if sql_uses_materialized_subquery(sql)?
+        || sql_uses_multi_comma_join(sql)?
+        || sql_uses_expression_predicate(sql)?
     {
-        return false;
+        return Ok(None);
     }
-    true
+    let query = parse_sql(sql)?;
+    direct_join_sink_request(query, batch_size)
+}
+
+fn direct_join_sink_request(
+    query: SqlQuery,
+    batch_size: usize,
+) -> Result<Option<JoinParquetRequest>> {
+    let Some(join) = query.join.clone() else {
+        return Ok(None);
+    };
+    if !query_allows_direct_join_sink(&query) {
+        return Ok(None);
+    }
+
+    let join_plan = plan_join_inputs(
+        &query.projection,
+        None,
+        None,
+        &join.left_alias,
+        &join.left_keys,
+        &join.right_alias,
+        &join.right_keys,
+    );
+    let output_projection = pushed_join_output_projection(&query);
+    if matches!(output_projection, Projection::All) && !matches!(query.projection, Projection::All)
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(JoinParquetRequest {
+        left_path: query.path,
+        right_path: join.right.path,
+        batch_size,
+        left_keys: join.left_keys,
+        right_keys: join.right_keys,
+        left_prefix: join.left_alias,
+        right_prefix: join.right_alias,
+        left_projection: join_plan.left_projection,
+        right_projection: join_plan.right_projection,
+        left_filter: join_plan.left_filter,
+        right_filter: combine_filter_options(join_plan.right_filter, join.right_filter.clone()),
+        output_projection,
+        join_memory_limit_bytes: default_join_memory_limit_bytes(),
+        join_algorithm: JoinAlgorithm::Auto,
+        join_type: join.join_type,
+    }))
+}
+
+fn query_allows_direct_join_sink(query: &SqlQuery) -> bool {
+    query.join.is_some()
+        && !query.is_aggregate()
+        && query.having.is_none()
+        && !query.distinct
+        && query.filter.is_none()
+        && query.order_by.is_none()
+        && query.aliases.is_empty()
 }
 
 async fn explain_sql(engine: &DodamEngine, sql: &str, batch_size: usize) -> Result<Option<String>> {
@@ -26272,6 +26210,61 @@ fn aggregate_values_to_column(
                 Field::new(name, DataType::Int64, true),
                 Arc::new(Int64Array::from(values)),
             )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_join_sink_request_accepts_plain_projected_join() {
+        let sql = "SELECT l.l_orderkey, o.o_orderdate \
+                   FROM '/tmp/lineitem.parquet' l \
+                   JOIN '/tmp/orders.parquet' o \
+                   ON l.l_orderkey = o.o_orderkey";
+
+        let request = plan_direct_join_sink_request(sql, 1024)
+            .expect("query should parse")
+            .expect("plain projected join should use direct sink");
+
+        assert_eq!(request.left_keys, vec!["l_orderkey"]);
+        assert_eq!(request.right_keys, vec!["o_orderkey"]);
+        assert_eq!(
+            request.left_projection,
+            Projection::Columns(vec!["l_orderkey".to_string()])
+        );
+        assert_eq!(
+            request.right_projection,
+            Projection::Columns(vec!["o_orderkey".to_string(), "o_orderdate".to_string()])
+        );
+    }
+
+    #[test]
+    fn direct_join_sink_request_rejects_materialized_join_shapes() {
+        for sql in [
+            "SELECT l.l_orderkey, count(*) \
+             FROM '/tmp/lineitem.parquet' l \
+             JOIN '/tmp/orders.parquet' o \
+             ON l.l_orderkey = o.o_orderkey \
+             GROUP BY l.l_orderkey",
+            "SELECT l.l_orderkey \
+             FROM '/tmp/lineitem.parquet' l \
+             JOIN '/tmp/orders.parquet' o \
+             ON l.l_orderkey = o.o_orderkey \
+             ORDER BY l.l_orderkey",
+            "SELECT l.l_orderkey AS key \
+             FROM '/tmp/lineitem.parquet' l \
+             JOIN '/tmp/orders.parquet' o \
+             ON l.l_orderkey = o.o_orderkey",
+        ] {
+            assert!(
+                plan_direct_join_sink_request(sql, 1024)
+                    .expect("query should parse")
+                    .is_none(),
+                "{sql}"
+            );
         }
     }
 }

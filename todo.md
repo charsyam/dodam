@@ -1188,6 +1188,11 @@ Tried and rejected or neutral:
       - `dodam::output::StdoutQuerySink` now implements `SqlResultSink` and `RecordBatchSink`, reusing the shared CSV `RecordBatch` writer.
       - CLI now constructs `StdoutQuerySink::new()` and no longer owns stdout query serialization, `QueryOutput` handling, or query-summary formatting.
       - Stdout SELECT smoke and Parquet COPY smoke passed after the move. This further narrows CLI to command parsing, engine setup, and dispatch.
+    - Generalized direct join sink planning out of string heuristics:
+      - Replaced the `sql_may_use_direct_or_streaming` substring gate with a parsed `SqlQuery` shape rule that builds a reusable `JoinParquetRequest` for plain projected joins.
+      - `execute_sql_to_result_sink`, `try_execute_sql_to_sink`, and `try_execute_sql_streaming` now share the same direct-sink planning rule instead of duplicating join eligibility checks and request construction.
+      - Aggregate, `ORDER BY`, aliased, expression-predicate, materialized-subquery, and multi-comma join shapes fall through to the materialized SQL path by query structure rather than by SQL text tokens. Added parser-only unit coverage for accepted/rejected sink shapes.
+      - SF=1 TPC-H `query-file` Parquet COPY samples after the change were `0.850s` cold-ish then `0.696s` and `0.671s` warm, matching the previous `~0.67-0.71s` range. This is retained as a general planning cleanup, not a speed claim.
     - Tried Q12 late materialization for the lineitem shipping predicate:
       - The path reads `l_shipmode/l_commitdate/l_receiptdate/l_shipdate` first, builds a row selection, and then reads `l_orderkey` only for selected rows. This fixed an important projection-order assumption in the late path by using column-name lookup instead of ordinal-only lookup.
       - SF=1 Q12 selectivity was very low (`30,988 / 6,001,215`, about `0.52%`) with about `60k` selector runs, so it looked promising. However, same-process Q12 10-repeat samples did not beat the existing row-group map path once the full predicate pass plus row-selection payload read was included.
