@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use std::time::SystemTime;
 
-use arrow::array::{Array, BooleanArray, Int64Array};
+use arrow::array::{Array, BooleanArray, BooleanBuilder, Int64Array};
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
@@ -141,6 +141,7 @@ struct CachedFileChunkEntry {
 pub struct ParquetFileCache {
     max_bytes: usize,
     chunk_bytes: usize,
+    admit_on_first_read: bool,
     shards: Vec<ParquetFileCacheShard>,
     bytes: AtomicU64,
     access_epoch: AtomicU64,
@@ -152,6 +153,8 @@ pub struct ParquetFileCache {
 }
 
 const PARQUET_FILE_CACHE_SHARDS: usize = 64;
+const DEFAULT_PARQUET_FILE_CACHE_BYTES: usize = 512 * 1024 * 1024;
+const DEFAULT_PARQUET_FILE_CACHE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
 impl Default for ParquetFileCache {
     fn default() -> Self {
@@ -163,7 +166,8 @@ impl ParquetFileCache {
     pub fn disabled() -> Self {
         Self {
             max_bytes: 0,
-            chunk_bytes: 512 * 1024,
+            chunk_bytes: DEFAULT_PARQUET_FILE_CACHE_CHUNK_BYTES,
+            admit_on_first_read: false,
             shards: (0..PARQUET_FILE_CACHE_SHARDS)
                 .map(|_| ParquetFileCacheShard::default())
                 .collect(),
@@ -181,15 +185,16 @@ impl ParquetFileCache {
         let max_bytes = std::env::var("DODAM_FILE_CACHE_BYTES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(0);
+            .unwrap_or(DEFAULT_PARQUET_FILE_CACHE_BYTES);
         let chunk_bytes = std::env::var("DODAM_FILE_CACHE_CHUNK_BYTES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
-            .unwrap_or(4 * 1024 * 1024);
+            .unwrap_or(DEFAULT_PARQUET_FILE_CACHE_CHUNK_BYTES);
         Self {
             max_bytes,
             chunk_bytes,
+            admit_on_first_read: true,
             shards: (0..PARQUET_FILE_CACHE_SHARDS)
                 .map(|_| ParquetFileCacheShard::default())
                 .collect(),
@@ -211,17 +216,20 @@ impl ParquetFileCache {
         self.chunk_bytes
     }
 
-    fn get_or_read_chunk(
+    fn get_or_read_range(
         &self,
         path: impl AsRef<Path>,
         len: u64,
         modified: Option<SystemTime>,
         file: &File,
-        chunk_start: u64,
+        start: u64,
+        length: usize,
     ) -> ParquetResult<Bytes> {
         if self.max_bytes == 0 {
-            return read_file_range(file, chunk_start, self.chunk_len(len, chunk_start));
+            return read_file_range(file, start, length);
         }
+        let chunk_start = (start / self.chunk_bytes as u64) * self.chunk_bytes as u64;
+        let local_start = (start - chunk_start) as usize;
         let chunk_len = self.chunk_len(len, chunk_start);
         let key = CachedFileChunkKey {
             path: path.as_ref().to_path_buf(),
@@ -240,17 +248,14 @@ impl ParquetFileCache {
             if let Some(entry) = entries.get(&key) {
                 entry.last_access_epoch.store(epoch, Ordering::Relaxed);
                 self.hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(entry.bytes.clone());
+                return Ok(entry.bytes.slice(local_start..local_start + length));
             }
         }
 
         if chunk_len > self.max_bytes {
-            return read_file_range(file, chunk_start, chunk_len);
+            return read_file_range(file, start, length);
         }
         self.misses.fetch_add(1, Ordering::Relaxed);
-        let bytes = read_file_range(file, chunk_start, chunk_len)?;
-        self.read_bytes
-            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
 
         let mut entries = self.shards[shard_index]
             .entries
@@ -259,13 +264,19 @@ impl ParquetFileCache {
         if let Some(entry) = entries.get(&key) {
             entry.last_access_epoch.store(epoch, Ordering::Relaxed);
             self.hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(entry.bytes.clone());
+            return Ok(entry.bytes.slice(local_start..local_start + length));
         }
 
-        let entry_size = bytes.len() as u64;
+        let entry_size = chunk_len as u64;
         if !self.should_admit(&key, shard_index, epoch, entry_size) {
+            let bytes = read_file_range(file, start, length)?;
+            self.read_bytes
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
             return Ok(bytes);
         }
+        let bytes = read_file_range(file, chunk_start, chunk_len)?;
+        self.read_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         self.evict_until_has_space(entry_size, shard_index, &mut entries);
         entries.insert(
             key,
@@ -275,7 +286,7 @@ impl ParquetFileCache {
             }),
         );
         self.bytes.fetch_add(entry_size, Ordering::Relaxed);
-        Ok(bytes)
+        Ok(bytes.slice(local_start..local_start + length))
     }
 
     fn should_admit(
@@ -285,7 +296,7 @@ impl ParquetFileCache {
         epoch: u64,
         entry_size: u64,
     ) -> bool {
-        if !self.cache_pressure(entry_size) {
+        if self.admit_on_first_read && !self.cache_pressure(entry_size) {
             return true;
         }
 
@@ -474,32 +485,33 @@ impl ChunkReader for CachedParquetChunkReader {
         let request_end = start + length as u64;
         let mut chunk_start = (start / chunk_bytes) * chunk_bytes;
         if request_end <= chunk_start.saturating_add(chunk_bytes) {
-            let chunk = self.cache.get_or_read_chunk(
+            return self.cache.get_or_read_range(
                 &self.path,
                 self.len,
                 self.modified,
                 &self.file,
-                chunk_start,
-            )?;
-            let local_start = (start - chunk_start) as usize;
-            return Ok(chunk.slice(local_start..local_start + length));
+                start,
+                length,
+            );
         }
 
         let mut output = Vec::with_capacity(length);
         while chunk_start < request_end {
-            let chunk = self.cache.get_or_read_chunk(
+            let chunk_end = chunk_start
+                .saturating_add(chunk_bytes)
+                .min(self.len)
+                .min(request_end);
+            let copy_start = start.max(chunk_start);
+            let segment_len = (chunk_end - copy_start) as usize;
+            let chunk = self.cache.get_or_read_range(
                 &self.path,
                 self.len,
                 self.modified,
                 &self.file,
-                chunk_start,
+                copy_start,
+                segment_len,
             )?;
-            let chunk_end = chunk_start + chunk.len() as u64;
-            let copy_start = start.max(chunk_start);
-            let copy_end = request_end.min(chunk_end);
-            let local_start = (copy_start - chunk_start) as usize;
-            let local_end = (copy_end - chunk_start) as usize;
-            output.extend_from_slice(&chunk[local_start..local_end]);
+            output.extend_from_slice(&chunk);
             chunk_start = chunk_start.saturating_add(chunk_bytes);
         }
         Ok(Bytes::from(output))
@@ -847,23 +859,14 @@ impl ParquetBatchReader {
             compressed_bytes_for_row_groups(&builder, &column_indices, &row_groups);
         let filter_index = projection_indices(builder.schema(), &[filter_column.to_string()])?[0];
         let filter_mask = ProjectionMask::roots(builder.parquet_schema(), [filter_index]);
+        let keys = I64SetPredicate::from_hash_set(keys.as_ref());
         let filter = ArrowPredicateFn::new(filter_mask, move |batch: RecordBatch| {
             let Some(values) = batch.column(0).as_any().downcast_ref::<Int64Array>() else {
                 return Err(ArrowError::ComputeError(
                     "i64 set row filter requires Int64Array".to_string(),
                 ));
             };
-            Ok(BooleanArray::from(
-                (0..values.len())
-                    .map(|row| {
-                        if values.is_null(row) {
-                            Some(false)
-                        } else {
-                            Some(keys.contains(&values.value(row)))
-                        }
-                    })
-                    .collect::<Vec<_>>(),
-            ))
+            Ok(keys.evaluate(values))
         });
         let builder = apply_projection(builder, projection)?
             .with_row_groups(row_groups.clone())
@@ -947,6 +950,60 @@ impl ParquetBatchReader {
 
     pub fn planning_nanos(&self) -> u64 {
         self.planning_nanos
+    }
+}
+
+enum I64SetPredicate {
+    Dense(Vec<bool>),
+    Hash(HashSet<i64>),
+}
+
+impl I64SetPredicate {
+    const MAX_DENSE_KEY: usize = 20_000_000;
+
+    fn from_hash_set(keys: &HashSet<i64>) -> Self {
+        let mut max_key = 0_usize;
+        for key in keys.iter().copied() {
+            let Ok(index) = usize::try_from(key) else {
+                return Self::Hash(keys.clone());
+            };
+            if index > Self::MAX_DENSE_KEY {
+                return Self::Hash(keys.clone());
+            }
+            max_key = max_key.max(index);
+        }
+        let mut dense = vec![false; max_key.saturating_add(1)];
+        for key in keys.iter().copied() {
+            let index = usize::try_from(key).expect("validated dense i64 set key");
+            dense[index] = true;
+        }
+        Self::Dense(dense)
+    }
+
+    fn contains(&self, key: i64) -> bool {
+        match self {
+            Self::Dense(values) => {
+                let Ok(index) = usize::try_from(key) else {
+                    return false;
+                };
+                values.get(index).copied().unwrap_or(false)
+            }
+            Self::Hash(values) => values.contains(&key),
+        }
+    }
+
+    fn evaluate(&self, values: &Int64Array) -> BooleanArray {
+        let mut output = BooleanBuilder::with_capacity(values.len());
+        if values.null_count() == 0 {
+            for row in 0..values.len() {
+                output.append_value(self.contains(values.value(row)));
+            }
+        } else {
+            for row in 0..values.len() {
+                output.append_value(!values.is_null(row) && self.contains(values.value(row)));
+            }
+        }
+        output.finish()
     }
 }
 

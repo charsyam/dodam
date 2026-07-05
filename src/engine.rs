@@ -2522,6 +2522,7 @@ impl DodamEngine {
     }
 
     fn build_physical_scan_plan(&self, plan: ScanPlan) -> Box<dyn PhysicalPlan> {
+        let needs_output_projection = plan.scan_projection != plan.output_projection;
         let scan = ScanExec::new(
             plan.source.fragments,
             plan.batch_size,
@@ -2540,7 +2541,12 @@ impl DodamEngine {
         }
 
         if plan.distinct {
-            physical = Box::new(ProjectionExec::new(physical, plan.output_projection));
+            if needs_output_projection {
+                physical = Box::new(ProjectionExec::new(
+                    physical,
+                    plan.output_projection.clone(),
+                ));
+            }
             physical = Box::new(DistinctExec::new(physical));
 
             if let Some(order_by) = plan.order_by {
@@ -2550,7 +2556,9 @@ impl DodamEngine {
             if let Some(order_by) = plan.order_by {
                 physical = Box::new(SortExec::new(physical, order_by, plan.limit));
             }
-            physical = Box::new(ProjectionExec::new(physical, plan.output_projection));
+            if needs_output_projection {
+                physical = Box::new(ProjectionExec::new(physical, plan.output_projection));
+            }
         }
 
         if let Some(limit) = plan.limit {
