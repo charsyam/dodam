@@ -1184,6 +1184,10 @@ Tried and rejected or neutral:
       - `dodam::copy` now owns `CopyFileQuerySink`, CSV serialization, Parquet `ArrowWriter` setup, COPY sink stats, and COPY profile printing.
       - CLI no longer owns file output serialization details; it creates the library sink and passes it to `execute_sql_to_result_sink`. Stdout still remains a CLI concern but reuses the shared CSV `RecordBatch` writer helper.
       - Parquet COPY option smoke test passed, and SF=1 TPC-H `query-file` warm samples stayed in the `0.67-0.71s` range. This is retained as an Engine/CLI boundary cleanup rather than a performance change.
+    - Added a library-owned stdout sink:
+      - `dodam::output::StdoutQuerySink` now implements `SqlResultSink` and `RecordBatchSink`, reusing the shared CSV `RecordBatch` writer.
+      - CLI now constructs `StdoutQuerySink::new()` and no longer owns stdout query serialization, `QueryOutput` handling, or query-summary formatting.
+      - Stdout SELECT smoke and Parquet COPY smoke passed after the move. This further narrows CLI to command parsing, engine setup, and dispatch.
     - Tried Q12 late materialization for the lineitem shipping predicate:
       - The path reads `l_shipmode/l_commitdate/l_receiptdate/l_shipdate` first, builds a row selection, and then reads `l_orderkey` only for selected rows. This fixed an important projection-order assumption in the late path by using column-name lookup instead of ordinal-only lookup.
       - SF=1 Q12 selectivity was very low (`30,988 / 6,001,215`, about `0.52%`) with about `60k` selector runs, so it looked promising. However, same-process Q12 10-repeat samples did not beat the existing row-group map path once the full predicate pass plus row-selection payload read was included.

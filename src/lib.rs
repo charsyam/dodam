@@ -7,6 +7,7 @@ pub mod error;
 pub mod execution;
 mod hash;
 pub mod optimizer;
+pub mod output;
 pub mod plan;
 pub mod sql;
 pub mod storage;

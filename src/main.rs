@@ -2,16 +2,14 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use arrow::record_batch::RecordBatch;
 use clap::{Parser, Subcommand};
 use dodam::catalog::PersistentCatalog;
-use dodam::copy::{CopyFileQuerySink, CopyProfile, parse_copy_to_select, write_csv_record_batch};
+use dodam::copy::{CopyFileQuerySink, CopyProfile, parse_copy_to_select};
 use dodam::engine::DodamEngine;
 use dodam::error::Result;
-use dodam::execution::{
-    AggregateExpr, AggregateMetrics, FilterExpr, Projection, RecordBatchSink, SortExpr,
-};
-use dodam::sql::{QueryOutput, SqlResultSink, SqlSinkExecutionOptions, execute_sql_to_result_sink};
+use dodam::execution::{AggregateExpr, FilterExpr, Projection, RecordBatchSink, SortExpr};
+use dodam::output::StdoutQuerySink;
+use dodam::sql::{SqlSinkExecutionOptions, execute_sql_to_result_sink};
 
 const DEFAULT_BATCH_SIZE: usize = 16 * 1024;
 
@@ -350,7 +348,7 @@ async fn run_query_sql(
         return Ok(());
     }
 
-    let mut sink = StdoutQuerySink;
+    let mut sink = StdoutQuerySink::new();
     let execution = execute_sql_to_result_sink(
         engine,
         sql,
@@ -469,114 +467,10 @@ fn micros(duration: Duration) -> u128 {
     duration.as_micros()
 }
 
-struct StdoutQuerySink;
-
-impl StdoutQuerySink {
-    fn write_output(&mut self, output: QueryOutput) -> Result<()> {
-        match output {
-            QueryOutput::Scan { batches } => self.write_batches(batches)?,
-            QueryOutput::Aggregate { metrics, batches } => {
-                self.write_batches(batches)?;
-                if query_summary_enabled() {
-                    self.write_aggregate_summary(&metrics);
-                }
-            }
-            QueryOutput::Explain { plan } => println!("{plan}"),
-        }
-        Ok(())
-    }
-
-    fn write_batches(&mut self, batches: Vec<RecordBatch>) -> Result<()> {
-        for batch in batches {
-            self.write_batch(&batch)?;
-        }
-        Ok(())
-    }
-
-    fn write_stdout_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        match write_csv_record_batch(batch, &mut std::io::stdout()) {
-            Ok(()) => Ok(()),
-            Err(dodam::error::DodamError::UnsupportedSql(_)) => {
-                println!("{batch:?}");
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        }
-    }
-
-    fn write_aggregate_summary(&mut self, metrics: &AggregateMetrics) {
-        if metrics.groups.is_empty() {
-            let values = metrics
-                .values
-                .iter()
-                .map(|value| format!("{}={}", value.expr, value.value))
-                .collect::<Vec<_>>()
-                .join(", ");
-            println!(
-                "aggregated {} rows in {} batches from {} fragment(s) aggregate={:.3}ms merge={:.3}ms: {}",
-                metrics.rows,
-                metrics.batches,
-                metrics.fragments,
-                nanos_to_millis(metrics.aggregate_nanos),
-                nanos_to_millis(metrics.aggregate_merge_nanos),
-                values
-            );
-            return;
-        }
-
-        println!(
-            "aggregated {} rows into {} group(s) in {} batches from {} fragment(s) aggregate={:.3}ms merge={:.3}ms",
-            metrics.rows,
-            metrics.groups.len(),
-            metrics.batches,
-            metrics.fragments,
-            nanos_to_millis(metrics.aggregate_nanos),
-            nanos_to_millis(metrics.aggregate_merge_nanos)
-        );
-        for group in &metrics.groups {
-            let keys = group
-                .keys
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            let values = group
-                .values
-                .iter()
-                .map(|value| format!("{}={}", value.expr, value.value))
-                .collect::<Vec<_>>()
-                .join(", ");
-            println!("group [{keys}]: {values}");
-        }
-    }
-}
-
-impl RecordBatchSink for StdoutQuerySink {
-    fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        self.write_stdout_batch(batch)
-    }
-}
-
-impl SqlResultSink for StdoutQuerySink {
-    fn record_batch_sink(&mut self) -> &mut dyn RecordBatchSink {
-        self
-    }
-
-    fn write_output(&mut self, output: QueryOutput) -> Result<()> {
-        StdoutQuerySink::write_output(self, output)
-    }
-}
-
 fn nanos_to_micros(nanos: u64) -> u64 {
     nanos / 1_000
 }
 
 fn nanos_to_millis(nanos: u64) -> f64 {
     nanos as f64 / 1_000_000.0
-}
-
-fn query_summary_enabled() -> bool {
-    std::env::var("DODAM_QUERY_SUMMARY")
-        .ok()
-        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
