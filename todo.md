@@ -1253,6 +1253,10 @@ Tried and rejected or neutral:
       - The Q03 lineitem revenue scan now defaults to `SortedI64Lookup` for the built order-key payload, with `DODAM_Q03_DISABLE_SORTED_ORDER_LOOKUP=1` as the rollback knob.
       - Focused SF=1 warm Q03 repeats moved from about `~39-41ms` with the hash lookup to about `~32-34ms` with the sorted contiguous lookup. This is a general probe-layout rule for large fact scans probing an immutable integer build-key set: fewer random hash-table touches beat the extra binary-search comparisons in this shape.
       - Full SF=1 in-process TPC-H still passed `22/22`; warm Q03 samples were around `~31-34ms`, with full warm totals around `~0.52-0.55s` in the local run.
+    - Investigated DuckDB's Q12 advantage:
+      - DuckDB `EXPLAIN ANALYZE` shows a hash-join dynamic filter pushed into the `orders` Parquet scan: `o_orderkey` min/max plus `o_orderkey IN BF(l_orderkey)`. The scan outputs about `34,850` orders rows instead of the full `1.5M`.
+      - Added an opt-in Q12 orders late-materialized payload path (`DODAM_Q12_ENABLE_ORDER_LATE_MATERIALIZE=1`) that scans `o_orderkey`, builds a row selection from the pending lineitem keys, then reads only selected `o_orderpriority` rows and aggregates directly.
+      - Rejected it as the default: focused warm Q12 regressed from roughly `~46-48ms` to `~54-56ms`. The extra reader setup, row-selection construction, and sparse selector application cost more than the saved priority payload decode. This confirms the next useful direction is a cheaper scan-integrated dynamic filter, not a second-pass late payload path.
 - First TPC-H coverage implementation target:
   - Q6 support, because it is single-table and mainly needs aggregate input expressions, `BETWEEN`, and date interval arithmetic.
   - Initial Q6 parser/execution blockers are cleared for single-table Parquet inputs, including a canonical-shape Q6 fixture; next step is real TPC-H table registration and then multi-table `FROM` planning.

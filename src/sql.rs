@@ -8182,6 +8182,18 @@ async fn q12_shipping_mode_counts_from_orders(
     shipmodes: &[String],
     pending: &HashMap<i64, Q12PendingOrder>,
 ) -> Result<Vec<Q12Row>> {
+    if q12_order_late_materialized_enabled()
+        && let Some(rows) = q12_shipping_mode_counts_from_orders_late(
+            engine,
+            path.clone(),
+            batch_size,
+            shipmodes,
+            pending,
+        )
+        .await?
+    {
+        return Ok(rows);
+    }
     let projection = Projection::Columns(vec![
         "o_orderkey".to_string(),
         "o_orderpriority".to_string(),
@@ -8221,8 +8233,166 @@ async fn q12_shipping_mode_counts_from_orders(
     Ok(rows)
 }
 
+async fn q12_shipping_mode_counts_from_orders_late(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    shipmodes: &[String],
+    pending: &HashMap<i64, Q12PendingOrder>,
+) -> Result<Option<Vec<Q12Row>>> {
+    let pending = Arc::new(AdaptiveI64Map::from_hash((*pending).clone()));
+    let Some(chunks) = engine
+        .late_materialized_parquet_map_with_policy(
+            path,
+            batch_size,
+            Projection::Columns(vec!["o_orderkey".to_string()]),
+            Projection::Columns(vec!["o_orderpriority".to_string()]),
+            q12_order_late_materialized_row_group_chunk(),
+            LateMaterializationPolicy::always(),
+            {
+                let pending = pending.clone();
+                move || Q12OrderLateState {
+                    pending: pending.clone(),
+                    selected_orders: Vec::new(),
+                    selected_offset: 0,
+                    groups: [Q12State::default(); 2],
+                }
+            },
+            q12_order_late_build_selection_batch,
+            q12_order_late_consume_priority_batch,
+            |state, _metrics| {
+                if state.selected_offset != state.selected_orders.len() {
+                    return Err(DodamError::UnsupportedSql(
+                        "Q12 order priority payload mismatch".to_string(),
+                    ));
+                }
+                Ok(Some(state.groups))
+            },
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let mut groups = [Q12State::default(); 2];
+    let mut metrics = LateMaterializedMetrics::default();
+    for chunk in chunks {
+        q12_merge_shipping_mode_counts(&mut groups, chunk.output);
+        metrics.add(chunk.metrics);
+    }
+    q12_log_order_late_materialized_profile(metrics, q12_order_late_materialized_row_group_chunk());
+    Ok(Some(
+        groups
+            .into_iter()
+            .enumerate()
+            .map(|(index, state)| Q12Row {
+                shipmode: shipmodes[index].clone(),
+                high_line_count: state.high_line_count,
+                low_line_count: state.low_line_count,
+            })
+            .collect(),
+    ))
+}
+
 fn q12_order_row_filter_enabled() -> bool {
     std::env::var_os("DODAM_Q12_ENABLE_ORDER_ROW_FILTER").is_some()
+}
+
+fn q12_order_late_materialized_enabled() -> bool {
+    std::env::var_os("DODAM_Q12_ENABLE_ORDER_LATE_MATERIALIZE").is_some()
+}
+
+fn q12_order_late_materialized_row_group_chunk() -> usize {
+    std::env::var("DODAM_Q12_ORDER_LATE_ROW_GROUP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4)
+}
+
+struct Q12OrderLateState {
+    pending: Arc<AdaptiveI64Map<Q12PendingOrder>>,
+    selected_orders: Vec<Q12PendingOrder>,
+    selected_offset: usize,
+    groups: [Q12State; 2],
+}
+
+fn q12_order_late_build_selection_batch(
+    batch: RecordBatch,
+    selection: &mut LateSelectionBuilder,
+    state: &mut Q12OrderLateState,
+) -> Result<Option<()>> {
+    let Some(orderkeys) = batch_column(&batch, "o_orderkey")?
+        .as_any()
+        .downcast_ref::<Int64Array>()
+    else {
+        return Ok(None);
+    };
+    if orderkeys.null_count() == 0 {
+        for &orderkey in orderkeys.values() {
+            if let Some(order) = state.pending.get(orderkey) {
+                state.selected_orders.push(order);
+                selection.push(true);
+            } else {
+                selection.push(false);
+            }
+        }
+        return Ok(Some(()));
+    }
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) {
+            selection.push(false);
+            continue;
+        }
+        if let Some(order) = state.pending.get(orderkeys.value(row)) {
+            state.selected_orders.push(order);
+            selection.push(true);
+        } else {
+            selection.push(false);
+        }
+    }
+    Ok(Some(()))
+}
+
+fn q12_order_late_consume_priority_batch(
+    batch: RecordBatch,
+    state: &mut Q12OrderLateState,
+) -> Result<Option<()>> {
+    let priorities = batch_string_column(&batch, "o_orderpriority")?;
+    let priority_offsets = priorities.value_offsets();
+    let priority_data = priorities.value_data();
+    for row in 0..batch.num_rows() {
+        let Some(&order) = state.selected_orders.get(state.selected_offset) else {
+            return Err(DodamError::UnsupportedSql(
+                "Q12 order priority payload overflow".to_string(),
+            ));
+        };
+        state.selected_offset += 1;
+        if priorities.is_null(row) {
+            continue;
+        }
+        let priority = bytes_string_parts(priority_offsets, priority_data, row);
+        let is_high_priority = matches!(priority, b"1-URGENT" | b"2-HIGH");
+        q12_apply_pending_order(&mut state.groups, order, is_high_priority);
+    }
+    Ok(Some(()))
+}
+
+fn q12_log_order_late_materialized_profile(
+    metrics: LateMaterializedMetrics,
+    row_group_chunk: usize,
+) {
+    if !tpch_profile_enabled() {
+        return;
+    }
+    let ratio = if metrics.total_rows == 0 {
+        0.0
+    } else {
+        metrics.selected_rows as f64 / metrics.total_rows as f64
+    };
+    eprintln!(
+        "[dodam:tpch-profile] Q12 orders: late_materialized rows={} selected={} ratio={:.6} selector_runs={} row_group_chunk={}",
+        metrics.total_rows, metrics.selected_rows, ratio, metrics.selector_runs, row_group_chunk
+    );
 }
 
 fn q12_shipping_mode_counts_batch(
