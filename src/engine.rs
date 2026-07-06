@@ -4416,6 +4416,11 @@ fn scan_i64_set_filtered_row_groups(
     file_cache: Arc<ParquetFileCache>,
     object_store: &dyn ObjectStore,
 ) -> Result<Vec<RecordBatch>> {
+    let profile_label =
+        scan_profile_enabled().then(|| parquet_map_profile_label(&path, projection));
+    let row_group_count = row_groups.len();
+    let started = Instant::now();
+    let setup_started = Instant::now();
     let mut reader = ParquetBatchReader::try_new_with_row_groups_i64_set_filter(
         path,
         batch_size,
@@ -4427,12 +4432,43 @@ fn scan_i64_set_filtered_row_groups(
         file_cache,
         object_store,
     )?;
+    let setup_nanos = elapsed_nanos(setup_started.elapsed());
     let mut batches = Vec::new();
-    while let Some(batch) = reader.next() {
+    let mut read_loop_nanos = 0_u64;
+    let mut output_rows = 0_usize;
+    loop {
+        let next_started = Instant::now();
+        let next = reader.next();
+        read_loop_nanos = read_loop_nanos.saturating_add(elapsed_nanos(next_started.elapsed()));
+        let Some(batch) = next else {
+            break;
+        };
         let batch = batch?;
         if batch.num_rows() > 0 {
+            output_rows = output_rows.saturating_add(batch.num_rows());
             batches.push(batch);
         }
+    }
+    if let Some(label) = profile_label {
+        eprintln!(
+            "[dodam:scan-profile] i64_set_filter {label}: elapsed={:.3} ms setup={:.3} ms read_loop={:.3} ms row_groups={}/{} rows={} batches={} bytes={} metadata={:.3} ms planning={:.3} ms parquet_next={:.3} ms parquet_calls={} parquet_eof={} parquet_rows={} parquet_batches={} avg_batch_rows={:.1}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            nanos_to_millis(setup_nanos),
+            nanos_to_millis(read_loop_nanos),
+            row_group_count,
+            reader.row_groups_total(),
+            output_rows,
+            batches.len(),
+            reader.compressed_bytes_scanned(),
+            nanos_to_millis(reader.metadata_nanos()),
+            nanos_to_millis(reader.planning_nanos()),
+            nanos_to_millis(reader.next_nanos()),
+            reader.next_calls(),
+            reader.eof_calls(),
+            reader.output_rows(),
+            reader.output_batches(),
+            average_rows_per_batch(reader.output_rows(), reader.output_batches()),
+        );
     }
     Ok(batches)
 }

@@ -186,6 +186,15 @@ where
         }
     }
 
+    pub(crate) fn dense_slices(&self) -> Option<(&[V], &[bool])> {
+        match self {
+            Self::Dense {
+                values, present, ..
+            } => Some((values, present)),
+            Self::Hash(_) => None,
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         match self {
             Self::Dense { len, .. } => *len == 0,

@@ -8460,6 +8460,20 @@ fn q12_shipping_mode_counts_batch_typed(
     let mut groups = [Q12State::default(); 2];
     if orderkeys.null_count() == 0 && orderpriorities.null_count() == 0 {
         let orderkey_values = orderkeys.values().as_ref();
+        if let Some((pending_values, pending_present)) = pending.dense_slices() {
+            for row in 0..orderkey_values.len() {
+                let Ok(index) = usize::try_from(orderkey_values[row]) else {
+                    continue;
+                };
+                if index >= pending_present.len() || !pending_present[index] {
+                    continue;
+                }
+                let priority = bytes_string_parts(priority_offsets, priority_data, row);
+                let is_high_priority = matches!(priority, b"1-URGENT" | b"2-HIGH");
+                q12_apply_pending_order(&mut groups, pending_values[index], is_high_priority);
+            }
+            return Some(groups);
+        }
         for row in 0..orderkey_values.len() {
             let Some(order) = pending.get(orderkey_values[row]) else {
                 continue;
