@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasher;
 
 use crate::hash::{FastHashMap, FastHashSet};
 
@@ -86,6 +87,30 @@ impl AdaptiveI64Set {
         }
     }
 
+    pub(crate) fn try_insert_dense_values(&mut self, values: &[i64]) -> bool {
+        let Self::Dense { contains, len } = self else {
+            return false;
+        };
+        let mut max_index = 0_usize;
+        for &key in values {
+            let Some(index) = adaptive_dense_index(key, DEFAULT_MAX_DENSE_I64_KEY) else {
+                return false;
+            };
+            max_index = max_index.max(index);
+        }
+        if max_index >= contains.len() {
+            contains.resize(max_index + 1, false);
+        }
+        for &key in values {
+            let index = usize::try_from(key).expect("validated dense key");
+            if !contains[index] {
+                contains[index] = true;
+                *len += 1;
+            }
+        }
+        true
+    }
+
     pub(crate) fn from_hash(values: HashSet<i64>) -> Self {
         if values.is_empty() {
             return Self::new_dense();
@@ -108,6 +133,76 @@ impl AdaptiveI64Set {
         }
         Self::Dense { contains, len }
     }
+}
+
+#[derive(Clone)]
+pub(crate) struct SortedI64Lookup<V> {
+    entries: Vec<(i64, V)>,
+}
+
+impl<V: Copy> SortedI64Lookup<V> {
+    pub(crate) fn from_hash_map<S>(values: &HashMap<i64, V, S>) -> Self
+    where
+        S: BuildHasher,
+    {
+        let mut entries = values
+            .iter()
+            .map(|(&key, &value)| (key, value))
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|(key, _)| *key);
+        Self { entries }
+    }
+
+    pub(crate) fn get(&self, key: i64) -> Option<V> {
+        self.entries
+            .binary_search_by_key(&key, |(entry_key, _)| *entry_key)
+            .ok()
+            .map(|index| self.entries[index].1)
+    }
+}
+
+pub(crate) struct PackedU32PairDistinct {
+    pairs: Vec<u64>,
+}
+
+impl PackedU32PairDistinct {
+    pub(crate) fn new() -> Self {
+        Self { pairs: Vec::new() }
+    }
+
+    pub(crate) fn push(&mut self, first: usize, second: i64) -> bool {
+        let Some(key) = pack_u32_pair(first, second) else {
+            return false;
+        };
+        self.pairs.push(key);
+        true
+    }
+
+    pub(crate) fn append(&mut self, other: &mut Self) {
+        self.pairs.append(&mut other.pairs);
+    }
+
+    pub(crate) fn counts_by_first(mut self, first_count: usize) -> Vec<u64> {
+        self.pairs.sort_unstable();
+        self.pairs.dedup();
+        let mut counts = vec![0_u64; first_count];
+        for key in self.pairs {
+            if let Some(count) = counts.get_mut(unpack_u32_pair_first(key)) {
+                *count += 1;
+            }
+        }
+        counts
+    }
+}
+
+fn pack_u32_pair(first: usize, second: i64) -> Option<u64> {
+    let first = u32::try_from(first).ok()?;
+    let second = u32::try_from(second).ok()?;
+    Some((u64::from(first) << 32) | u64::from(second))
+}
+
+fn unpack_u32_pair_first(key: u64) -> usize {
+    (key >> 32) as usize
 }
 
 fn adaptive_i64_set_dense_to_hash(contains: &[bool]) -> FastHashSet<i64> {
@@ -141,7 +236,10 @@ where
         }
     }
 
-    pub(crate) fn from_hash(values: HashMap<i64, V>) -> Self {
+    pub(crate) fn from_hash<S>(values: HashMap<i64, V, S>) -> Self
+    where
+        S: BuildHasher,
+    {
         if values.is_empty() {
             return Self::new_dense();
         }

@@ -10,8 +10,10 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use arrow_cast::display::array_value_to_string;
+use dodam::copy::{CopyFileQuerySink, parse_copy_to_select};
 use dodam::engine::DodamEngine;
-use dodam::sql::{QueryOutput, execute_sql};
+use dodam::execution::RecordBatchSink;
+use dodam::sql::{QueryOutput, SqlSinkExecutionOptions, execute_sql, execute_sql_to_result_sink};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -91,6 +93,47 @@ async fn duckdb_differential_scan_filter_and_nulls() {
         tempdir.path(),
     )
     .await;
+}
+
+#[tokio::test]
+async fn duckdb_differential_null_boolean_matrix() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let facts_path = tempdir.path().join("facts.parquet");
+    write_facts_parquet(&facts_path);
+
+    let predicates = [
+        "key = NULL",
+        "key <> NULL",
+        "key IS NULL",
+        "key IS NOT NULL",
+        "(key = 2 OR key IS NULL) AND payload IS NOT NULL",
+        "NOT (key = 2 OR payload IS NULL)",
+        "key IN (SELECT key FROM facts_sub WHERE key IS NULL) OR id = 1",
+        "key NOT IN (SELECT key FROM facts_sub WHERE key IS NULL) OR id = 1",
+    ];
+    for predicate in predicates {
+        let dodam_predicate =
+            predicate.replace("facts_sub", &format!("'{}'", facts_path.display()));
+        let duckdb_predicate = predicate.replace(
+            "facts_sub",
+            &format!("read_parquet('{}')", facts_path.display()),
+        );
+        assert_same_as_duckdb(
+            &format!(
+                "SELECT id, key, payload FROM '{}' WHERE {dodam_predicate} ORDER BY id",
+                facts_path.display()
+            ),
+            &format!(
+                "SELECT id, key, payload FROM read_parquet('{}') WHERE {duckdb_predicate} ORDER BY id",
+                facts_path.display()
+            ),
+            tempdir.path(),
+        )
+        .await;
+    }
 }
 
 #[tokio::test]
@@ -223,6 +266,21 @@ async fn duckdb_differential_join_matrix() {
         ),
         &format!(
             "SELECT f.id, f.key, d.name FROM read_parquet('{}') f LEFT JOIN read_parquet('{}') d ON f.key = d.key WHERE f.key IS NULL ORDER BY f.id, d.name",
+            facts_path.display(),
+            dim_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT f.id, f.key, d.name FROM '{}' f FULL OUTER JOIN '{}' d ON f.key = d.key WHERE f.key IS NULL OR d.key IS NULL ORDER BY f.id, d.name",
+            facts_path.display(),
+            dim_path.display()
+        ),
+        &format!(
+            "SELECT f.id, f.key, d.name FROM read_parquet('{}') f FULL OUTER JOIN read_parquet('{}') d ON f.key = d.key WHERE f.key IS NULL OR d.key IS NULL ORDER BY f.id, d.name",
             facts_path.display(),
             dim_path.display()
         ),
@@ -407,6 +465,66 @@ async fn duckdb_differential_scalar_type_filters() {
         )
         .await;
     }
+}
+
+#[tokio::test]
+async fn duckdb_differential_type_projection_matrix() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let types_path = tempdir.path().join("types.parquet");
+    write_types_parquet(&types_path);
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, flag, score, note, amount, event_date FROM '{}' ORDER BY id",
+            types_path.display()
+        ),
+        &format!(
+            "SELECT id, flag, score, note, amount, event_date FROM read_parquet('{}') ORDER BY id",
+            types_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id FROM '{}' WHERE amount = '123.45' OR event_date = '1970-01-01' ORDER BY id",
+            types_path.display()
+        ),
+        &format!(
+            "SELECT id FROM read_parquet('{}') WHERE amount = '123.45' OR event_date = '1970-01-01' ORDER BY id",
+            types_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "known gap: CAST(Date32/Timestamp/Decimal/Float64 AS VARCHAR) display semantics differ from DuckDB"]
+async fn duckdb_differential_known_gap_cast_display_semantics() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let types_path = tempdir.path().join("types.parquet");
+    write_types_parquet(&types_path);
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, CAST(amount AS VARCHAR), CAST(event_date AS VARCHAR), CAST(created_at AS VARCHAR), COALESCE(CAST(score AS VARCHAR), 'missing') FROM '{}' ORDER BY id",
+            types_path.display()
+        ),
+        &format!(
+            "SELECT id, CAST(amount AS VARCHAR), CAST(event_date AS VARCHAR), CAST(created_at AS VARCHAR), COALESCE(CAST(score AS VARCHAR), 'missing') FROM read_parquet('{}') ORDER BY id",
+            types_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -768,6 +886,61 @@ async fn duckdb_differential_in_subquery() {
 }
 
 #[tokio::test]
+async fn duckdb_differential_subquery_null_semantics() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let facts_path = tempdir.path().join("facts.parquet");
+    write_facts_parquet(&facts_path);
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id FROM '{}' WHERE key IN (SELECT key FROM '{}' WHERE key IS NULL OR key = 2) ORDER BY id",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id FROM read_parquet('{}') WHERE key IN (SELECT key FROM read_parquet('{}') WHERE key IS NULL OR key = 2) ORDER BY id",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id FROM '{}' WHERE key NOT IN (SELECT key FROM '{}' WHERE key IS NULL OR key = 2) OR id = 1 ORDER BY id",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id FROM read_parquet('{}') WHERE key NOT IN (SELECT key FROM read_parquet('{}') WHERE key IS NULL OR key = 2) OR id = 1 ORDER BY id",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id FROM '{}' WHERE id = (SELECT key FROM '{}' WHERE key IS NULL) ORDER BY id",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id FROM read_parquet('{}') WHERE id = (SELECT key FROM read_parquet('{}') WHERE key IS NULL) ORDER BY id",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn duckdb_differential_exists_subquery() {
     let Some(_duckdb) = DuckDbGuard::new() else {
         return;
@@ -892,6 +1065,59 @@ async fn duckdb_differential_correlated_in_and_scalar_subquery() {
     .await;
 }
 
+#[tokio::test]
+async fn duckdb_differential_scalar_subquery_errors() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let facts_path = tempdir.path().join("facts.parquet");
+    write_facts_parquet(&facts_path);
+
+    assert_both_error(
+        &format!(
+            "SELECT id FROM '{}' WHERE id = (SELECT id FROM '{}' WHERE key = 2) ORDER BY id",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id FROM read_parquet('{}') WHERE id = (SELECT id FROM read_parquet('{}') WHERE key = 2) ORDER BY id",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn duckdb_differential_copy_parquet_readback() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let facts_path = tempdir.path().join("facts.parquet");
+    let output_path = tempdir.path().join("copy-output.parquet");
+    write_facts_parquet(&facts_path);
+
+    let copy_sql = format!(
+        "COPY (SELECT key, count(*), sum(value), min(payload), max(payload) FROM '{}' GROUP BY key ORDER BY key) TO '{}' (FORMAT parquet, COMPRESSION snappy, ROW_GROUP_SIZE 2, DICTIONARY true)",
+        facts_path.display(),
+        output_path.display()
+    );
+    run_dodam_copy(&copy_sql).await;
+
+    assert_same_as_duckdb(
+        &format!("SELECT * FROM '{}' ORDER BY key", output_path.display()),
+        &format!(
+            "SELECT * FROM read_parquet('{}') ORDER BY key",
+            output_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+}
+
 async fn assert_same_as_duckdb(dodam_sql: &str, duckdb_sql: &str, tempdir: &Path) {
     let dodam_rows = run_dodam(dodam_sql).await;
     let duckdb_rows = run_duckdb(duckdb_sql, tempdir);
@@ -901,19 +1127,39 @@ async fn assert_same_as_duckdb(dodam_sql: &str, duckdb_sql: &str, tempdir: &Path
     );
 }
 
+async fn assert_both_error(dodam_sql: &str, duckdb_sql: &str, tempdir: &Path) {
+    let dodam_error = run_dodam_result(dodam_sql)
+        .await
+        .expect_err("Dodam query should fail");
+    let duckdb_error =
+        run_duckdb_result(duckdb_sql, tempdir).expect_err("DuckDB query should fail");
+    assert!(
+        !dodam_error.is_empty() && !duckdb_error.is_empty(),
+        "\nDodam SQL:\n{dodam_sql}\n\nDuckDB SQL:\n{duckdb_sql}"
+    );
+}
+
 async fn run_dodam(sql: &str) -> Vec<String> {
+    run_dodam_result(sql).await.expect("execute dodam sql")
+}
+
+async fn run_dodam_result(sql: &str) -> std::result::Result<Vec<String>, String> {
     let output = execute_sql(&DodamEngine::default(), sql, BATCH_SIZE)
         .await
-        .expect("execute dodam sql");
+        .map_err(|error| error.to_string())?;
     match output {
         QueryOutput::Scan { batches } | QueryOutput::Aggregate { batches, .. } => {
-            canonical_rows(&batches)
+            Ok(canonical_rows(&batches))
         }
         QueryOutput::Explain { .. } => panic!("differential tests do not compare EXPLAIN output"),
     }
 }
 
 fn run_duckdb(sql: &str, tempdir: &Path) -> Vec<String> {
+    run_duckdb_result(sql, tempdir).expect("run duckdb query")
+}
+
+fn run_duckdb_result(sql: &str, tempdir: &Path) -> std::result::Result<Vec<String>, String> {
     let output_path = tempdir.join("duckdb-output.tsv");
     let copy_sql = format!(
         "COPY ({sql}) TO '{}' (FORMAT CSV, HEADER false, DELIMITER '|', NULL '__DODAM_NULL__')",
@@ -923,16 +1169,39 @@ fn run_duckdb(sql: &str, tempdir: &Path) -> Vec<String> {
         .args(["-csv", "-noheader", "-c", &copy_sql])
         .output()
         .expect("run duckdb");
-    assert!(
-        output.status.success(),
-        "duckdb failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let contents = std::fs::read_to_string(output_path).expect("read duckdb output");
-    contents
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+    let contents = std::fs::read_to_string(output_path).map_err(|error| error.to_string())?;
+    Ok(contents
         .lines()
         .map(|line| line.split('|').collect::<Vec<_>>().join("|"))
-        .collect()
+        .collect())
+}
+
+async fn run_dodam_copy(sql: &str) {
+    let copy = parse_copy_to_select(sql)
+        .expect("parse COPY")
+        .expect("COPY statement");
+    let mut sink = CopyFileQuerySink::new(
+        &copy.path,
+        copy.format,
+        copy.header,
+        copy.parquet_options,
+        None,
+        false,
+    )
+    .expect("create COPY sink");
+    execute_sql_to_result_sink(
+        &DodamEngine::default(),
+        &copy.sql,
+        BATCH_SIZE,
+        &mut sink,
+        SqlSinkExecutionOptions::default(),
+    )
+    .await
+    .expect("execute COPY query");
+    sink.finish().expect("finish COPY sink");
 }
 
 fn canonical_rows(batches: &[RecordBatch]) -> Vec<String> {

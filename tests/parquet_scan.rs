@@ -425,6 +425,37 @@ async fn scan_api_returns_vectorized_record_batches() {
 }
 
 #[tokio::test]
+async fn dictionary_scan_preserves_requested_projection_order() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let path = tempdir.path().join("part-000.parquet");
+    write_test_parquet(&path, 10);
+
+    let batches = DodamEngine::default()
+        .scan_parquet_batches_dictionary_columns(
+            path,
+            4,
+            Projection::Columns(vec!["payload".to_string(), "id".to_string()]),
+            vec!["payload".to_string()],
+        )
+        .await
+        .expect("scan batch stream")
+        .collect::<dodam::error::Result<Vec<_>>>()
+        .expect("batches");
+
+    assert!(!batches.is_empty());
+    for batch in batches {
+        assert_eq!(batch.num_columns(), 2);
+        assert_eq!(batch.schema().field(0).name(), "payload");
+        assert_eq!(batch.schema().field(1).name(), "id");
+        assert!(matches!(
+            batch.schema().field(0).data_type(),
+            DataType::Dictionary(_, _)
+        ));
+        assert_eq!(batch.schema().field(1).data_type(), &DataType::Int32);
+    }
+}
+
+#[tokio::test]
 async fn scans_nullable_and_richer_parquet_types() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let path = tempdir.path().join("rich.parquet");

@@ -202,6 +202,59 @@ struct LocalShuffleReadMetrics {
     bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct ParquetMapChunkMetrics {
+    chunks: usize,
+    row_groups: usize,
+    rows: usize,
+    batches: usize,
+    zero_batches: usize,
+    total_nanos: u64,
+    read_nanos: u64,
+    reader_next_nanos: u64,
+    reader_max_next_nanos: u64,
+    reader_calls: usize,
+    reader_eof: usize,
+    consume_nanos: u64,
+    compressed_bytes_scanned: u64,
+    compressed_bytes_total: u64,
+}
+
+impl ParquetMapChunkMetrics {
+    fn add(&mut self, other: Self) {
+        self.chunks = self.chunks.saturating_add(other.chunks);
+        self.row_groups = self.row_groups.saturating_add(other.row_groups);
+        self.rows = self.rows.saturating_add(other.rows);
+        self.batches = self.batches.saturating_add(other.batches);
+        self.zero_batches = self.zero_batches.saturating_add(other.zero_batches);
+        self.total_nanos = self.total_nanos.saturating_add(other.total_nanos);
+        self.read_nanos = self.read_nanos.saturating_add(other.read_nanos);
+        self.reader_next_nanos = self
+            .reader_next_nanos
+            .saturating_add(other.reader_next_nanos);
+        self.reader_max_next_nanos = self.reader_max_next_nanos.max(other.reader_max_next_nanos);
+        self.reader_calls = self.reader_calls.saturating_add(other.reader_calls);
+        self.reader_eof = self.reader_eof.saturating_add(other.reader_eof);
+        self.consume_nanos = self.consume_nanos.saturating_add(other.consume_nanos);
+        self.compressed_bytes_scanned = self
+            .compressed_bytes_scanned
+            .saturating_add(other.compressed_bytes_scanned);
+        self.compressed_bytes_total = self
+            .compressed_bytes_total
+            .max(other.compressed_bytes_total);
+    }
+}
+
+struct ParquetMapChunkResult<Output> {
+    output: Output,
+    metrics: ParquetMapChunkMetrics,
+}
+
+struct ParquetMapResults<Output> {
+    outputs: Vec<Output>,
+    metrics: ParquetMapChunkMetrics,
+}
+
 impl LocalExecutionGraphMetrics {
     fn add_shuffle_write(&mut self, metrics: LocalShuffleWriteMetrics) {
         self.shuffle_write_files = self.shuffle_write_files.saturating_add(metrics.files);
@@ -1021,6 +1074,83 @@ impl DodamEngine {
         ))
     }
 
+    pub async fn scan_parquet_batches_dictionary_columns(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        projection: Projection,
+        dictionary_columns: Vec<String>,
+    ) -> Result<SendableBatchStream> {
+        let source = self.plan_table_source(path.clone()).await?;
+        if source.format != StorageFormat::Parquet
+            || source.fragments.len() != 1
+            || dictionary_columns.is_empty()
+        {
+            return self
+                .scan_parquet_batches(path, batch_size, None, projection, None)
+                .await;
+        }
+        let plan = plan_parquet_scan_tasks(
+            source.fragments[0].parquet_local_path()?,
+            &projection,
+            &[],
+            &self.metadata_cache,
+            self.object_store.as_ref(),
+        )?;
+        let row_groups = plan
+            .tasks
+            .into_iter()
+            .map(|task| task.row_group)
+            .collect::<Vec<_>>();
+        if row_groups.is_empty() {
+            return Ok(SendableBatchStream::empty());
+        }
+        let chunks = row_groups
+            .chunks(parallel_i64_set_filter_row_group_chunk())
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
+        let dictionary_columns = Arc::new(dictionary_columns);
+        let (sender, receiver) = mpsc::channel();
+        for row_groups in chunks {
+            let sender = sender.clone();
+            let path = path.clone();
+            let projection = projection.clone();
+            let dictionary_columns = dictionary_columns.clone();
+            let metadata_cache = self.metadata_cache.clone();
+            let file_cache = self.file_cache.clone();
+            let object_store = self.object_store.clone();
+            rayon::spawn(move || {
+                let result = scan_dictionary_column_row_groups(
+                    path,
+                    batch_size,
+                    &projection,
+                    row_groups,
+                    dictionary_columns.as_ref(),
+                    &metadata_cache,
+                    file_cache,
+                    object_store.as_ref(),
+                );
+                match result {
+                    Ok(batches) => {
+                        for batch in batches {
+                            if sender.send(Ok(batch)).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                    }
+                }
+            });
+        }
+        drop(sender);
+        Ok(SendableBatchStream::new(
+            Box::new(receiver.into_iter()),
+            Arc::default(),
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn q06_late_materialized_revenue_sum(
         &self,
@@ -1416,11 +1546,49 @@ impl DodamEngine {
             FnMut(RecordBatch, &mut State) -> Result<Option<()>> + Clone + Send + Sync + 'static,
         Finish: Fn(State) -> Result<Option<Output>> + Clone + Send + Sync + 'static,
     {
-        self.parquet_row_group_map_pruned(
+        Ok(self
+            .parquet_row_group_map_results(
+                "row_group_map",
+                path,
+                batch_size,
+                projection,
+                Vec::new(),
+                row_group_chunk,
+                build_state,
+                consume_batch,
+                finish,
+            )
+            .await?
+            .map(|results| results.outputs))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn parquet_row_group_map_results<State, Output, BuildState, ConsumeBatch, Finish>(
+        &self,
+        profile_kind: &str,
+        path: PathBuf,
+        batch_size: usize,
+        projection: Projection,
+        pruning_predicates: Vec<Expr>,
+        row_group_chunk: usize,
+        build_state: BuildState,
+        consume_batch: ConsumeBatch,
+        finish: Finish,
+    ) -> Result<Option<ParquetMapResults<Output>>>
+    where
+        State: Send + 'static,
+        Output: Send + 'static,
+        BuildState: Fn() -> State + Clone + Send + Sync + 'static,
+        ConsumeBatch:
+            FnMut(RecordBatch, &mut State) -> Result<Option<()>> + Clone + Send + Sync + 'static,
+        Finish: Fn(State) -> Result<Option<Output>> + Clone + Send + Sync + 'static,
+    {
+        self.parquet_row_group_map_pruned_results(
+            profile_kind,
             path,
             batch_size,
             projection,
-            Vec::new(),
+            pruning_predicates,
             row_group_chunk,
             build_state,
             consume_batch,
@@ -1453,10 +1621,12 @@ impl DodamEngine {
     {
         if enable_row_group_map
             && let Some(partials) = self
-                .parquet_row_group_map(
+                .parquet_row_group_map_results(
+                    "row_group_map",
                     path.clone(),
                     batch_size,
                     projection.clone(),
+                    Vec::new(),
                     row_group_chunk,
                     build_partial.clone(),
                     {
@@ -1475,13 +1645,20 @@ impl DodamEngine {
             let profile = scan_profile_enabled();
             let started = profile.then(Instant::now);
             let mut output = build_output();
-            for partial in partials {
+            for partial in partials.outputs {
                 merge(&mut output, partial);
             }
             if let Some(started) = started {
                 eprintln!(
-                    "[dodam:scan-fold-profile] {label}: fused_total={:.3} ms row_group_chunk={row_group_chunk}",
-                    started.elapsed().as_secs_f64() * 1000.0
+                    "[dodam:scan-fold-profile] {label}: fused_merge={:.3} ms scan_total_sum={:.3} ms scan_read_next={:.3} ms scan_consume={:.3} ms chunks={} row_groups={} batches={} rows={} row_group_chunk={row_group_chunk}",
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    nanos_to_millis(partials.metrics.total_nanos),
+                    nanos_to_millis(partials.metrics.read_nanos),
+                    nanos_to_millis(partials.metrics.consume_nanos),
+                    partials.metrics.chunks,
+                    partials.metrics.row_groups,
+                    partials.metrics.batches,
+                    partials.metrics.rows,
                 );
             }
             return Ok(output);
@@ -1496,6 +1673,80 @@ impl DodamEngine {
             build_partial,
             build_output,
             map,
+            merge,
+            label,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn parquet_scan_accumulate_chunks<Output, BuildPartial, BuildOutput, Consume, Merge>(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        projection: Projection,
+        row_group_chunk: usize,
+        stream_chunk: usize,
+        enable_row_group_map: bool,
+        build_partial: BuildPartial,
+        build_output: BuildOutput,
+        consume_batch: Consume,
+        mut merge: Merge,
+        label: &str,
+    ) -> Result<Output>
+    where
+        Output: Send + 'static,
+        BuildPartial: Fn() -> Output + Clone + Send + Sync + 'static,
+        BuildOutput: Fn() -> Output + Clone + Send + Sync + 'static,
+        Consume:
+            FnMut(RecordBatch, &mut Output) -> Result<Option<()>> + Clone + Send + Sync + 'static,
+        Merge: FnMut(&mut Output, Output) + Clone + Send + Sync + 'static,
+    {
+        if enable_row_group_map
+            && let Some(partials) = self
+                .parquet_row_group_map_results(
+                    "row_group_map",
+                    path.clone(),
+                    batch_size,
+                    projection.clone(),
+                    Vec::new(),
+                    row_group_chunk,
+                    build_partial.clone(),
+                    consume_batch.clone(),
+                    |output| Ok(Some(output)),
+                )
+                .await?
+        {
+            let profile = scan_profile_enabled();
+            let started = profile.then(Instant::now);
+            let mut output = build_output();
+            for partial in partials.outputs {
+                merge(&mut output, partial);
+            }
+            if let Some(started) = started {
+                eprintln!(
+                    "[dodam:scan-fold-profile] {label}: accumulate_merge={:.3} ms scan_total_sum={:.3} ms scan_read_next={:.3} ms scan_consume={:.3} ms chunks={} row_groups={} batches={} rows={} row_group_chunk={row_group_chunk}",
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    nanos_to_millis(partials.metrics.total_nanos),
+                    nanos_to_millis(partials.metrics.read_nanos),
+                    nanos_to_millis(partials.metrics.consume_nanos),
+                    partials.metrics.chunks,
+                    partials.metrics.row_groups,
+                    partials.metrics.batches,
+                    partials.metrics.rows,
+                );
+            }
+            return Ok(output);
+        }
+
+        let mut stream = self
+            .scan_parquet_batches(path, batch_size, None, projection, None)
+            .await?;
+        self.accumulate_scan_stream_chunks(
+            &mut stream,
+            stream_chunk,
+            build_partial,
+            build_output,
+            consume_batch,
             merge,
             label,
         )
@@ -1594,6 +1845,100 @@ impl DodamEngine {
         Ok(output)
     }
 
+    fn accumulate_scan_stream_chunks<Output, BuildPartial, BuildOutput, Consume, Merge>(
+        &self,
+        stream: &mut SendableBatchStream,
+        chunk_size: usize,
+        build_partial: BuildPartial,
+        build_output: BuildOutput,
+        consume_batch: Consume,
+        mut merge: Merge,
+        label: &str,
+    ) -> Result<Output>
+    where
+        Output: Send + 'static,
+        BuildPartial: Fn() -> Output + Clone + Send + Sync + 'static,
+        BuildOutput: Fn() -> Output + Clone + Send + Sync + 'static,
+        Consume:
+            FnMut(RecordBatch, &mut Output) -> Result<Option<()>> + Clone + Send + Sync + 'static,
+        Merge: FnMut(&mut Output, Output) + Clone + Send + Sync + 'static,
+    {
+        let profile = scan_profile_enabled();
+        let started = profile.then(Instant::now);
+        let (sender, receiver) = mpsc::channel();
+        let mut pending_chunks = 0_usize;
+        let mut chunk = Vec::with_capacity(chunk_size.max(1));
+        let stream_started = profile.then(Instant::now);
+        while let Some(batch) = stream.next() {
+            chunk.push(batch?);
+            if chunk.len() < chunk_size.max(1) {
+                continue;
+            }
+            let sender = sender.clone();
+            let build_partial = build_partial.clone();
+            let mut consume_batch = consume_batch.clone();
+            let task_chunk = std::mem::replace(&mut chunk, Vec::with_capacity(chunk_size.max(1)));
+            pending_chunks += 1;
+            rayon::spawn(move || {
+                let mut output = build_partial();
+                let result = task_chunk
+                    .into_iter()
+                    .try_for_each(|batch| -> Result<()> {
+                        consume_batch(batch, &mut output)?.ok_or_else(|| {
+                            DodamError::UnsupportedSql("scan accumulate worker stopped".to_string())
+                        })?;
+                        Ok(())
+                    })
+                    .map(|()| output);
+                let _ = sender.send(result);
+            });
+        }
+        if !chunk.is_empty() {
+            let sender = sender.clone();
+            let build_partial = build_partial.clone();
+            let mut consume_batch = consume_batch.clone();
+            pending_chunks += 1;
+            rayon::spawn(move || {
+                let mut output = build_partial();
+                let result = chunk
+                    .into_iter()
+                    .try_for_each(|batch| -> Result<()> {
+                        consume_batch(batch, &mut output)?.ok_or_else(|| {
+                            DodamError::UnsupportedSql("scan accumulate worker stopped".to_string())
+                        })?;
+                        Ok(())
+                    })
+                    .map(|()| output);
+                let _ = sender.send(result);
+            });
+        }
+        let stream_ms = stream_started
+            .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or_default();
+        drop(sender);
+
+        let merge_started = profile.then(Instant::now);
+        let mut output = build_output();
+        for _ in 0..pending_chunks {
+            let partial = receiver.recv().map_err(|_| {
+                DodamError::UnsupportedSql(format!("{label} scan-accumulate worker stopped"))
+            })??;
+            merge(&mut output, partial);
+        }
+        if let Some(started) = started {
+            let merge_ms = merge_started
+                .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or_default();
+            eprintln!(
+                "[dodam:scan-fold-profile] {label}: accumulate_total={:.3} ms stream_read={:.3} ms worker_wait_merge={:.3} ms chunks={pending_chunks}",
+                started.elapsed().as_secs_f64() * 1000.0,
+                stream_ms,
+                merge_ms
+            );
+        }
+        Ok(output)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn parquet_row_group_map_pruned<State, Output, BuildState, ConsumeBatch, Finish>(
         &self,
@@ -1606,6 +1951,43 @@ impl DodamEngine {
         consume_batch: ConsumeBatch,
         finish: Finish,
     ) -> Result<Option<Vec<Output>>>
+    where
+        State: Send + 'static,
+        Output: Send + 'static,
+        BuildState: Fn() -> State + Clone + Send + Sync + 'static,
+        ConsumeBatch:
+            FnMut(RecordBatch, &mut State) -> Result<Option<()>> + Clone + Send + Sync + 'static,
+        Finish: Fn(State) -> Result<Option<Output>> + Clone + Send + Sync + 'static,
+    {
+        Ok(self
+            .parquet_row_group_map_pruned_results(
+                "row_group_map",
+                path,
+                batch_size,
+                projection,
+                pruning_predicates,
+                row_group_chunk,
+                build_state,
+                consume_batch,
+                finish,
+            )
+            .await?
+            .map(|results| results.outputs))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn parquet_row_group_map_pruned_results<State, Output, BuildState, ConsumeBatch, Finish>(
+        &self,
+        profile_kind: &str,
+        path: PathBuf,
+        batch_size: usize,
+        projection: Projection,
+        pruning_predicates: Vec<Expr>,
+        row_group_chunk: usize,
+        build_state: BuildState,
+        consume_batch: ConsumeBatch,
+        finish: Finish,
+    ) -> Result<Option<ParquetMapResults<Output>>>
     where
         State: Send + 'static,
         Output: Send + 'static,
@@ -1632,7 +2014,10 @@ impl DodamEngine {
             .map(|task| task.row_group)
             .collect::<Vec<_>>();
         if row_groups.is_empty() {
-            return Ok(Some(Vec::new()));
+            return Ok(Some(ParquetMapResults {
+                outputs: Vec::new(),
+                metrics: ParquetMapChunkMetrics::default(),
+            }));
         }
         let chunks = row_groups
             .chunks(row_group_chunk.max(1))
@@ -1674,7 +2059,7 @@ impl DodamEngine {
 
         let mut outputs = (0..chunks.len())
             .map(|_| None)
-            .collect::<Vec<Option<Option<Output>>>>();
+            .collect::<Vec<Option<Option<ParquetMapChunkResult<Output>>>>>();
         for _ in 0..chunks.len() {
             let (index, result) = receiver.recv().map_err(|_| {
                 DodamError::UnsupportedSql("parquet row-group map worker stopped".to_string())
@@ -1682,6 +2067,7 @@ impl DodamEngine {
             outputs[index] = Some(result?);
         }
         let mut results = Vec::with_capacity(outputs.len());
+        let mut summary = ParquetMapChunkMetrics::default();
         for output in outputs {
             let Some(output) = output else {
                 return Err(DodamError::UnsupportedSql(
@@ -1691,8 +2077,173 @@ impl DodamEngine {
             let Some(output) = output else {
                 return Ok(None);
             };
-            results.push(output);
+            summary.add(output.metrics);
+            results.push(output.output);
         }
+        log_parquet_map_summary(profile_kind, label.as_deref(), summary);
+        Ok(Some(ParquetMapResults {
+            outputs: results,
+            metrics: summary,
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn parquet_row_group_map_dictionary_columns<
+        State,
+        Output,
+        BuildState,
+        ConsumeBatch,
+        Finish,
+    >(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        projection: Projection,
+        dictionary_columns: Vec<String>,
+        row_group_chunk: usize,
+        build_state: BuildState,
+        consume_batch: ConsumeBatch,
+        finish: Finish,
+    ) -> Result<Option<Vec<Output>>>
+    where
+        State: Send + 'static,
+        Output: Send + 'static,
+        BuildState: Fn() -> State + Clone + Send + Sync + 'static,
+        ConsumeBatch:
+            FnMut(RecordBatch, &mut State) -> Result<Option<()>> + Clone + Send + Sync + 'static,
+        Finish: Fn(State) -> Result<Option<Output>> + Clone + Send + Sync + 'static,
+    {
+        self.parquet_row_group_map_dictionary_columns_pruned(
+            path,
+            batch_size,
+            projection,
+            dictionary_columns,
+            Vec::new(),
+            row_group_chunk,
+            build_state,
+            consume_batch,
+            finish,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn parquet_row_group_map_dictionary_columns_pruned<
+        State,
+        Output,
+        BuildState,
+        ConsumeBatch,
+        Finish,
+    >(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        projection: Projection,
+        dictionary_columns: Vec<String>,
+        pruning_predicates: Vec<Expr>,
+        row_group_chunk: usize,
+        build_state: BuildState,
+        consume_batch: ConsumeBatch,
+        finish: Finish,
+    ) -> Result<Option<Vec<Output>>>
+    where
+        State: Send + 'static,
+        Output: Send + 'static,
+        BuildState: Fn() -> State + Clone + Send + Sync + 'static,
+        ConsumeBatch:
+            FnMut(RecordBatch, &mut State) -> Result<Option<()>> + Clone + Send + Sync + 'static,
+        Finish: Fn(State) -> Result<Option<Output>> + Clone + Send + Sync + 'static,
+    {
+        let source = self.plan_table_source(path.clone()).await?;
+        if source.format != StorageFormat::Parquet
+            || source.fragments.len() != 1
+            || dictionary_columns.is_empty()
+        {
+            return Ok(None);
+        }
+        let local_path = source.fragments[0].parquet_local_path()?.to_path_buf();
+        let plan = plan_parquet_scan_tasks(
+            &local_path,
+            &projection,
+            &pruning_predicates,
+            &self.metadata_cache,
+            self.object_store.as_ref(),
+        )?;
+        let row_groups = plan
+            .tasks
+            .into_iter()
+            .map(|task| task.row_group)
+            .collect::<Vec<_>>();
+        if row_groups.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let chunks = row_groups
+            .chunks(row_group_chunk.max(1))
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
+        let profile = scan_profile_enabled();
+        let label = profile.then(|| parquet_map_profile_label(&local_path, &projection));
+        let dictionary_columns = Arc::new(dictionary_columns);
+        let (sender, receiver) = mpsc::channel();
+        for (index, row_groups) in chunks.iter().cloned().enumerate() {
+            let sender = sender.clone();
+            let path = local_path.clone();
+            let projection = projection.clone();
+            let dictionary_columns = dictionary_columns.clone();
+            let label = label.clone();
+            let metadata_cache = self.metadata_cache.clone();
+            let file_cache = self.file_cache.clone();
+            let object_store = self.object_store.clone();
+            let build_state = build_state.clone();
+            let consume_batch = consume_batch.clone();
+            let finish = finish.clone();
+            rayon::spawn(move || {
+                let result = parquet_row_group_map_dictionary_chunk(
+                    path,
+                    batch_size,
+                    row_groups,
+                    &projection,
+                    dictionary_columns.as_ref(),
+                    &metadata_cache,
+                    file_cache,
+                    object_store.as_ref(),
+                    build_state(),
+                    consume_batch,
+                    finish,
+                    label.as_deref(),
+                    index,
+                );
+                let _ = sender.send((index, result));
+            });
+        }
+        drop(sender);
+
+        let mut outputs = (0..chunks.len())
+            .map(|_| None)
+            .collect::<Vec<Option<Option<ParquetMapChunkResult<Output>>>>>();
+        for _ in 0..chunks.len() {
+            let (index, result) = receiver.recv().map_err(|_| {
+                DodamError::UnsupportedSql(
+                    "parquet dictionary row-group map worker stopped".to_string(),
+                )
+            })?;
+            outputs[index] = Some(result?);
+        }
+        let mut results = Vec::with_capacity(outputs.len());
+        let mut summary = ParquetMapChunkMetrics::default();
+        for output in outputs {
+            let Some(output) = output else {
+                return Err(DodamError::UnsupportedSql(
+                    "parquet dictionary row-group map result missing".to_string(),
+                ));
+            };
+            let Some(output) = output else {
+                return Ok(None);
+            };
+            summary.add(output.metrics);
+            results.push(output.output);
+        }
+        log_parquet_map_summary("dictionary_row_group_map", label.as_deref(), summary);
         Ok(Some(results))
     }
 
@@ -3028,7 +3579,7 @@ impl ProfiledScanStream {
         let next_wait_ms = nanos_to_millis(self.next_wait_nanos);
         let consumer_gap_ms = (elapsed_ms - next_wait_ms).max(0.0);
         eprintln!(
-            "[dodam:scan-profile] {}: elapsed={:.3} ms next_wait={:.3} ms consumer_gap={:.3} ms rows={} batches={} row_groups={}/{} bytes={} metadata={:.3} ms planning={:.3} ms decode={:.3} ms parquet_next={:.3} ms parquet_calls={} parquet_eof={} parquet_rows={} parquet_batches={} avg_batch_rows={:.1} filter={:.3} ms projection={:.3} ms limit={:.3} ms",
+            "[dodam:scan-profile] {}: elapsed={:.3} ms next_wait={:.3} ms consumer_gap={:.3} ms rows={} batches={} row_groups={}/{} bytes={} metadata={:.3} ms planning={:.3} ms decode={:.3} ms parquet_next={:.3} ms parquet_next_avg={:.3} ms parquet_next_max={:.3} ms parquet_calls={} parquet_eof={} parquet_rows={} parquet_batches={} parquet_zero_batches={} avg_batch_rows={:.1} filter={:.3} ms projection={:.3} ms limit={:.3} ms",
             self.label,
             elapsed_ms,
             next_wait_ms,
@@ -3042,10 +3593,13 @@ impl ProfiledScanStream {
             nanos_to_millis(metrics.planning_nanos),
             nanos_to_millis(metrics.decode_nanos),
             nanos_to_millis(metrics.parquet_next_nanos),
+            average_nanos_millis(metrics.parquet_next_nanos, metrics.parquet_next_calls),
+            nanos_to_millis(metrics.parquet_max_next_nanos),
             metrics.parquet_next_calls,
             metrics.parquet_eof_calls,
             metrics.parquet_output_rows,
             metrics.parquet_output_batches,
+            metrics.parquet_zero_row_batches,
             average_rows_per_batch(metrics.parquet_output_rows, metrics.parquet_output_batches),
             nanos_to_millis(metrics.filter_nanos),
             nanos_to_millis(metrics.projection_nanos),
@@ -3093,6 +3647,14 @@ fn average_rows_per_batch(rows: usize, batches: usize) -> f64 {
         0.0
     } else {
         rows as f64 / batches as f64
+    }
+}
+
+fn average_nanos_millis(nanos: u64, count: usize) -> f64 {
+    if count == 0 {
+        0.0
+    } else {
+        nanos_to_millis(nanos) / count as f64
     }
 }
 
@@ -3778,6 +4340,7 @@ impl LateMaterializedMetrics {
 pub struct LateMaterializationPolicy {
     max_selected_ratio: Option<f64>,
     max_selector_run_ratio: Option<f64>,
+    max_selector_runs_per_selected: Option<f64>,
 }
 
 impl LateMaterializationPolicy {
@@ -3785,6 +4348,7 @@ impl LateMaterializationPolicy {
         Self {
             max_selected_ratio: None,
             max_selector_run_ratio: None,
+            max_selector_runs_per_selected: None,
         }
     }
 
@@ -3792,6 +4356,7 @@ impl LateMaterializationPolicy {
         Self {
             max_selected_ratio: Some(max_selected_ratio.clamp(0.0, 1.0)),
             max_selector_run_ratio: None,
+            max_selector_runs_per_selected: None,
         }
     }
 
@@ -3802,7 +4367,15 @@ impl LateMaterializationPolicy {
         Self {
             max_selected_ratio: Some(max_selected_ratio.clamp(0.0, 1.0)),
             max_selector_run_ratio: Some(max_selector_run_ratio.clamp(0.0, 1.0)),
+            max_selector_runs_per_selected: None,
         }
+    }
+
+    pub fn with_selector_runs_per_selected(mut self, max_selector_runs_per_selected: f64) -> Self {
+        self.max_selector_runs_per_selected = max_selector_runs_per_selected
+            .is_finite()
+            .then_some(max_selector_runs_per_selected.max(0.0));
+        self
     }
 
     fn accepts(&self, metrics: &LateMaterializedMetrics) -> bool {
@@ -3821,11 +4394,23 @@ impl LateMaterializationPolicy {
                 return false;
             }
         }
+        if let Some(max_selector_runs_per_selected) = self.max_selector_runs_per_selected {
+            if metrics.selected_rows == 0 {
+                return true;
+            }
+            let selector_runs_per_selected =
+                metrics.selector_runs as f64 / metrics.selected_rows as f64;
+            if selector_runs_per_selected > max_selector_runs_per_selected {
+                return false;
+            }
+        }
         true
     }
 
     fn has_selectivity_gate(&self) -> bool {
-        self.max_selected_ratio.is_some() || self.max_selector_run_ratio.is_some()
+        self.max_selected_ratio.is_some()
+            || self.max_selector_run_ratio.is_some()
+            || self.max_selector_runs_per_selected.is_some()
     }
 }
 
@@ -4036,7 +4621,7 @@ fn parquet_row_group_map_chunk<State, Output, ConsumeBatch, Finish>(
     finish: Finish,
     profile_label: Option<&str>,
     profile_chunk: usize,
-) -> Result<Option<Output>>
+) -> Result<Option<ParquetMapChunkResult<Output>>>
 where
     ConsumeBatch: FnMut(RecordBatch, &mut State) -> Result<Option<()>>,
     Finish: FnOnce(State) -> Result<Option<Output>>,
@@ -4074,20 +4659,43 @@ where
         }
         consume_nanos = consume_nanos.saturating_add(elapsed_nanos(consume_start.elapsed()));
     }
+    let total_nanos = started
+        .map(|started| elapsed_nanos(started.elapsed()))
+        .unwrap_or_default();
+    let metrics = ParquetMapChunkMetrics {
+        chunks: 1,
+        row_groups: row_groups.len(),
+        rows,
+        batches,
+        zero_batches: reader.zero_row_batches(),
+        total_nanos,
+        read_nanos,
+        reader_next_nanos: reader.next_nanos(),
+        reader_max_next_nanos: reader.max_next_nanos(),
+        reader_calls: reader.next_calls(),
+        reader_eof: reader.eof_calls(),
+        consume_nanos,
+        compressed_bytes_scanned: reader.compressed_bytes_scanned(),
+        compressed_bytes_total: reader.compressed_bytes_total(),
+    };
     let finished = finish(state);
-    if let (Some(label), Some(started)) = (profile_label, started) {
+    if let (Some(label), Some(_)) = (profile_label, started) {
         eprintln!(
-            "[dodam:tpch-profile] row_group_map {label}: chunk={} row_groups={} rows={} batches={} total={:.3} ms setup={:.3} ms metadata={:.3} ms planning={:.3} ms read_next={:.3} ms reader_next={:.3} ms reader_calls={} reader_eof={} avg_batch_rows={:.1} consume={:.3} ms compressed={}/{}",
+            "[dodam:tpch-profile] row_group_map {label}: chunk={} row_groups={} projected_columns={} rows={} batches={} zero_batches={} total={:.3} ms setup={:.3} ms metadata={:.3} ms planning={:.3} ms read_next={:.3} ms reader_next={:.3} ms reader_next_avg={:.3} ms reader_next_max={:.3} ms reader_calls={} reader_eof={} avg_batch_rows={:.1} consume={:.3} ms compressed={}/{}",
             profile_chunk,
             row_groups.len(),
+            reader.projected_columns(),
             rows,
             batches,
-            started.elapsed().as_secs_f64() * 1000.0,
+            reader.zero_row_batches(),
+            nanos_to_millis(metrics.total_nanos),
             nanos_to_millis(reader_setup_nanos),
             nanos_to_millis(reader.metadata_nanos()),
             nanos_to_millis(reader.planning_nanos()),
             nanos_to_millis(read_nanos),
             nanos_to_millis(reader.next_nanos()),
+            average_nanos_millis(reader.next_nanos(), reader.next_calls()),
+            nanos_to_millis(reader.max_next_nanos()),
             reader.next_calls(),
             reader.eof_calls(),
             average_rows_per_batch(reader.output_rows(), reader.output_batches()),
@@ -4096,7 +4704,115 @@ where
             reader.compressed_bytes_total(),
         );
     }
-    finished
+    let Some(output) = finished? else {
+        return Ok(None);
+    };
+    Ok(Some(ParquetMapChunkResult { output, metrics }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parquet_row_group_map_dictionary_chunk<State, Output, ConsumeBatch, Finish>(
+    path: PathBuf,
+    batch_size: usize,
+    row_groups: Vec<usize>,
+    projection: &Projection,
+    dictionary_columns: &[String],
+    metadata_cache: &ParquetMetadataCache,
+    file_cache: Arc<ParquetFileCache>,
+    object_store: &dyn ObjectStore,
+    mut state: State,
+    mut consume_batch: ConsumeBatch,
+    finish: Finish,
+    profile_label: Option<&str>,
+    profile_chunk: usize,
+) -> Result<Option<ParquetMapChunkResult<Output>>>
+where
+    ConsumeBatch: FnMut(RecordBatch, &mut State) -> Result<Option<()>>,
+    Finish: FnOnce(State) -> Result<Option<Output>>,
+{
+    let started = profile_label.map(|_| Instant::now());
+    let mut reader = ParquetBatchReader::try_new_with_row_groups_dictionary_columns(
+        path,
+        batch_size,
+        projection,
+        row_groups.clone(),
+        dictionary_columns,
+        metadata_cache,
+        file_cache,
+        object_store,
+    )?;
+    let reader_setup_nanos = started
+        .map(|started| elapsed_nanos(started.elapsed()))
+        .unwrap_or_default();
+    let mut batches = 0_usize;
+    let mut rows = 0_usize;
+    let mut read_nanos = 0_u64;
+    let mut consume_nanos = 0_u64;
+    loop {
+        let read_start = Instant::now();
+        let Some(batch) = reader.next() else {
+            read_nanos = read_nanos.saturating_add(elapsed_nanos(read_start.elapsed()));
+            break;
+        };
+        let batch = batch?;
+        read_nanos = read_nanos.saturating_add(elapsed_nanos(read_start.elapsed()));
+        batches += 1;
+        rows += batch.num_rows();
+        let consume_start = Instant::now();
+        if consume_batch(batch, &mut state)?.is_none() {
+            return Ok(None);
+        }
+        consume_nanos = consume_nanos.saturating_add(elapsed_nanos(consume_start.elapsed()));
+    }
+    let total_nanos = started
+        .map(|started| elapsed_nanos(started.elapsed()))
+        .unwrap_or_default();
+    let metrics = ParquetMapChunkMetrics {
+        chunks: 1,
+        row_groups: row_groups.len(),
+        rows,
+        batches,
+        zero_batches: reader.zero_row_batches(),
+        total_nanos,
+        read_nanos,
+        reader_next_nanos: reader.next_nanos(),
+        reader_max_next_nanos: reader.max_next_nanos(),
+        reader_calls: reader.next_calls(),
+        reader_eof: reader.eof_calls(),
+        consume_nanos,
+        compressed_bytes_scanned: reader.compressed_bytes_scanned(),
+        compressed_bytes_total: reader.compressed_bytes_total(),
+    };
+    let finished = finish(state);
+    if let (Some(label), Some(_)) = (profile_label, started) {
+        eprintln!(
+            "[dodam:tpch-profile] dictionary_row_group_map {label}: chunk={} row_groups={} projected_columns={} rows={} batches={} zero_batches={} total={:.3} ms setup={:.3} ms metadata={:.3} ms planning={:.3} ms read_next={:.3} ms reader_next={:.3} ms reader_next_avg={:.3} ms reader_next_max={:.3} ms reader_calls={} reader_eof={} avg_batch_rows={:.1} consume={:.3} ms compressed={}/{}",
+            profile_chunk,
+            row_groups.len(),
+            reader.projected_columns(),
+            rows,
+            batches,
+            reader.zero_row_batches(),
+            nanos_to_millis(metrics.total_nanos),
+            nanos_to_millis(reader_setup_nanos),
+            nanos_to_millis(reader.metadata_nanos()),
+            nanos_to_millis(reader.planning_nanos()),
+            nanos_to_millis(read_nanos),
+            nanos_to_millis(reader.next_nanos()),
+            average_nanos_millis(reader.next_nanos(), reader.next_calls()),
+            nanos_to_millis(reader.max_next_nanos()),
+            reader.next_calls(),
+            reader.eof_calls(),
+            average_rows_per_batch(reader.output_rows(), reader.output_batches()),
+            nanos_to_millis(consume_nanos),
+            reader.compressed_bytes_scanned(),
+            reader.compressed_bytes_total(),
+        );
+    }
+    let Some(output) = finished? else {
+        return Ok(None);
+    };
+    Ok(Some(ParquetMapChunkResult { output, metrics }))
 }
 
 fn log_late_materialized_metrics(label: &str, metrics: LateMaterializedMetrics, chunks: usize) {
@@ -4111,6 +4827,31 @@ fn log_late_materialized_metrics(label: &str, metrics: LateMaterializedMetrics, 
     eprintln!(
         "[dodam:tpch-profile] {label}: late_materialized rows={} selected={} ratio={:.6} selector_runs={} chunks={chunks}",
         metrics.total_rows, metrics.selected_rows, ratio, metrics.selector_runs
+    );
+}
+
+fn log_parquet_map_summary(kind: &str, label: Option<&str>, metrics: ParquetMapChunkMetrics) {
+    let Some(label) = label else {
+        return;
+    };
+    eprintln!(
+        "[dodam:scan-profile] {kind}_summary {label}: chunks={} row_groups={} rows={} batches={} zero_batches={} total_sum={:.3} ms read_next={:.3} ms reader_next={:.3} ms reader_next_avg={:.3} ms reader_next_max={:.3} ms reader_calls={} reader_eof={} avg_batch_rows={:.1} consume={:.3} ms compressed={}/{}",
+        metrics.chunks,
+        metrics.row_groups,
+        metrics.rows,
+        metrics.batches,
+        metrics.zero_batches,
+        nanos_to_millis(metrics.total_nanos),
+        nanos_to_millis(metrics.read_nanos),
+        nanos_to_millis(metrics.reader_next_nanos),
+        average_nanos_millis(metrics.reader_next_nanos, metrics.reader_calls),
+        nanos_to_millis(metrics.reader_max_next_nanos),
+        metrics.reader_calls,
+        metrics.reader_eof,
+        average_rows_per_batch(metrics.rows, metrics.batches),
+        nanos_to_millis(metrics.consume_nanos),
+        metrics.compressed_bytes_scanned,
+        metrics.compressed_bytes_total,
     );
 }
 
@@ -4528,18 +5269,22 @@ fn scan_i64_set_filtered_row_groups(
     }
     if let Some(label) = profile_label {
         eprintln!(
-            "[dodam:scan-profile] i64_set_filter {label}: elapsed={:.3} ms setup={:.3} ms read_loop={:.3} ms row_groups={}/{} rows={} batches={} bytes={} metadata={:.3} ms planning={:.3} ms parquet_next={:.3} ms parquet_calls={} parquet_eof={} parquet_rows={} parquet_batches={} avg_batch_rows={:.1}",
+            "[dodam:scan-profile] i64_set_filter {label}: elapsed={:.3} ms setup={:.3} ms read_loop={:.3} ms row_groups={}/{} projected_columns={} rows={} batches={} zero_batches={} bytes={} metadata={:.3} ms planning={:.3} ms parquet_next={:.3} ms parquet_next_avg={:.3} ms parquet_next_max={:.3} ms parquet_calls={} parquet_eof={} parquet_rows={} parquet_batches={} avg_batch_rows={:.1}",
             started.elapsed().as_secs_f64() * 1000.0,
             nanos_to_millis(setup_nanos),
             nanos_to_millis(read_loop_nanos),
             row_group_count,
             reader.row_groups_total(),
+            reader.projected_columns(),
             output_rows,
             batches.len(),
+            reader.zero_row_batches(),
             reader.compressed_bytes_scanned(),
             nanos_to_millis(reader.metadata_nanos()),
             nanos_to_millis(reader.planning_nanos()),
             nanos_to_millis(reader.next_nanos()),
+            average_nanos_millis(reader.next_nanos(), reader.next_calls()),
+            nanos_to_millis(reader.max_next_nanos()),
             reader.next_calls(),
             reader.eof_calls(),
             reader.output_rows(),
@@ -4597,18 +5342,93 @@ fn scan_i64_bloom_filtered_row_groups(
     }
     if let Some(label) = profile_label {
         eprintln!(
-            "[dodam:scan-profile] i64_bloom_filter {label}: elapsed={:.3} ms setup={:.3} ms read_loop={:.3} ms row_groups={}/{} rows={} batches={} bytes={} metadata={:.3} ms planning={:.3} ms parquet_next={:.3} ms parquet_calls={} parquet_eof={} parquet_rows={} parquet_batches={} avg_batch_rows={:.1}",
+            "[dodam:scan-profile] i64_bloom_filter {label}: elapsed={:.3} ms setup={:.3} ms read_loop={:.3} ms row_groups={}/{} projected_columns={} rows={} batches={} zero_batches={} bytes={} metadata={:.3} ms planning={:.3} ms parquet_next={:.3} ms parquet_next_avg={:.3} ms parquet_next_max={:.3} ms parquet_calls={} parquet_eof={} parquet_rows={} parquet_batches={} avg_batch_rows={:.1}",
             started.elapsed().as_secs_f64() * 1000.0,
             nanos_to_millis(setup_nanos),
             nanos_to_millis(read_loop_nanos),
             row_group_count,
             reader.row_groups_total(),
+            reader.projected_columns(),
             output_rows,
             batches.len(),
+            reader.zero_row_batches(),
             reader.compressed_bytes_scanned(),
             nanos_to_millis(reader.metadata_nanos()),
             nanos_to_millis(reader.planning_nanos()),
             nanos_to_millis(reader.next_nanos()),
+            average_nanos_millis(reader.next_nanos(), reader.next_calls()),
+            nanos_to_millis(reader.max_next_nanos()),
+            reader.next_calls(),
+            reader.eof_calls(),
+            reader.output_rows(),
+            reader.output_batches(),
+            average_rows_per_batch(reader.output_rows(), reader.output_batches()),
+        );
+    }
+    Ok(batches)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_dictionary_column_row_groups(
+    path: PathBuf,
+    batch_size: usize,
+    projection: &Projection,
+    row_groups: Vec<usize>,
+    dictionary_columns: &[String],
+    metadata_cache: &ParquetMetadataCache,
+    file_cache: Arc<ParquetFileCache>,
+    object_store: &dyn ObjectStore,
+) -> Result<Vec<RecordBatch>> {
+    let profile_label =
+        scan_profile_enabled().then(|| parquet_map_profile_label(&path, projection));
+    let row_group_count = row_groups.len();
+    let started = Instant::now();
+    let setup_started = Instant::now();
+    let mut reader = ParquetBatchReader::try_new_with_row_groups_dictionary_columns(
+        path,
+        batch_size,
+        projection,
+        row_groups,
+        dictionary_columns,
+        metadata_cache,
+        file_cache,
+        object_store,
+    )?;
+    let setup_nanos = elapsed_nanos(setup_started.elapsed());
+    let mut batches = Vec::new();
+    let mut read_loop_nanos = 0_u64;
+    let mut output_rows = 0_usize;
+    loop {
+        let next_started = Instant::now();
+        let next = reader.next();
+        read_loop_nanos = read_loop_nanos.saturating_add(elapsed_nanos(next_started.elapsed()));
+        let Some(batch) = next else {
+            break;
+        };
+        let batch = batch?;
+        if batch.num_rows() > 0 {
+            output_rows = output_rows.saturating_add(batch.num_rows());
+            batches.push(batch);
+        }
+    }
+    if let Some(label) = profile_label {
+        eprintln!(
+            "[dodam:scan-profile] dictionary_columns {label}: elapsed={:.3} ms setup={:.3} ms read_loop={:.3} ms row_groups={}/{} projected_columns={} rows={} batches={} zero_batches={} bytes={} metadata={:.3} ms planning={:.3} ms parquet_next={:.3} ms parquet_next_avg={:.3} ms parquet_next_max={:.3} ms parquet_calls={} parquet_eof={} parquet_rows={} parquet_batches={} avg_batch_rows={:.1}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            nanos_to_millis(setup_nanos),
+            nanos_to_millis(read_loop_nanos),
+            row_group_count,
+            reader.row_groups_total(),
+            reader.projected_columns(),
+            output_rows,
+            batches.len(),
+            reader.zero_row_batches(),
+            reader.compressed_bytes_scanned(),
+            nanos_to_millis(reader.metadata_nanos()),
+            nanos_to_millis(reader.planning_nanos()),
+            nanos_to_millis(reader.next_nanos()),
+            average_nanos_millis(reader.next_nanos(), reader.next_calls()),
+            nanos_to_millis(reader.max_next_nanos()),
             reader.next_calls(),
             reader.eof_calls(),
             reader.output_rows(),

@@ -8,14 +8,14 @@ use std::time::Instant;
 use std::time::SystemTime;
 
 use arrow::array::{Array, BooleanArray, BooleanBuilder, Int64Array};
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
-    ArrowPredicate, ArrowPredicateFn, ArrowReaderMetadata, ParquetRecordBatchReaderBuilder,
-    RowFilter, RowSelection,
+    ArrowPredicate, ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions,
+    ParquetRecordBatchReaderBuilder, RowFilter, RowSelection,
 };
 use parquet::data_type::{ByteArray, FixedLenByteArray};
 use parquet::errors::{ParquetError, Result as ParquetResult};
@@ -561,6 +561,7 @@ pub struct ParquetFileStatistics {
 
 pub struct ParquetBatchReader {
     inner: parquet::arrow::arrow_reader::ParquetRecordBatchReader,
+    projection_order: Option<Vec<String>>,
     projected_columns: usize,
     row_groups_total: usize,
     row_groups_scanned: usize,
@@ -572,7 +573,9 @@ pub struct ParquetBatchReader {
     eof_calls: usize,
     output_batches: usize,
     output_rows: usize,
+    zero_row_batches: usize,
     next_nanos: u64,
+    max_next_nanos: u64,
 }
 
 impl ParquetBatchReader {
@@ -593,6 +596,7 @@ impl ParquetBatchReader {
         if file_cache.enabled() {
             let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
             Self::build(
+                path,
                 reader,
                 metadata,
                 metadata_nanos,
@@ -605,6 +609,7 @@ impl ParquetBatchReader {
         } else {
             let file = store.open(path)?;
             Self::build(
+                path,
                 file,
                 metadata,
                 metadata_nanos,
@@ -633,6 +638,7 @@ impl ParquetBatchReader {
         if file_cache.enabled() {
             let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
             Self::build(
+                path,
                 reader,
                 metadata,
                 metadata_nanos,
@@ -645,6 +651,51 @@ impl ParquetBatchReader {
         } else {
             let file = store.open(path)?;
             Self::build(
+                path,
+                file,
+                metadata,
+                metadata_nanos,
+                batch_size,
+                projection,
+                &[],
+                &[],
+                Some(row_groups),
+            )
+        }
+    }
+
+    pub fn try_new_with_row_groups_dictionary_columns(
+        path: impl AsRef<Path>,
+        batch_size: usize,
+        projection: &Projection,
+        row_groups: Vec<usize>,
+        dictionary_columns: &[String],
+        metadata_cache: &ParquetMetadataCache,
+        file_cache: Arc<ParquetFileCache>,
+        store: &dyn ObjectStore,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let metadata_start = Instant::now();
+        let metadata = metadata_cache.get_with_store(path, store)?;
+        let metadata_nanos = elapsed_nanos(metadata_start);
+        let metadata = metadata_with_dictionary_columns(metadata, dictionary_columns)?;
+        if file_cache.enabled() {
+            let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
+            Self::build(
+                path,
+                reader,
+                metadata,
+                metadata_nanos,
+                batch_size,
+                projection,
+                &[],
+                &[],
+                Some(row_groups),
+            )
+        } else {
+            let file = store.open(path)?;
+            Self::build(
+                path,
                 file,
                 metadata,
                 metadata_nanos,
@@ -674,6 +725,7 @@ impl ParquetBatchReader {
         if file_cache.enabled() {
             let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
             Self::build_with_row_selection(
+                path,
                 reader,
                 metadata,
                 metadata_nanos,
@@ -685,6 +737,7 @@ impl ParquetBatchReader {
         } else {
             let file = store.open(path)?;
             Self::build_with_row_selection(
+                path,
                 file,
                 metadata,
                 metadata_nanos,
@@ -713,6 +766,7 @@ impl ParquetBatchReader {
         if file_cache.enabled() {
             let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
             Self::build(
+                path,
                 reader,
                 metadata,
                 metadata_nanos,
@@ -725,6 +779,7 @@ impl ParquetBatchReader {
         } else {
             let file = store.open(path)?;
             Self::build(
+                path,
                 file,
                 metadata,
                 metadata_nanos,
@@ -756,6 +811,7 @@ impl ParquetBatchReader {
         if file_cache.enabled() {
             let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
             Self::build_i64_set_filter(
+                path,
                 reader,
                 metadata,
                 metadata_nanos,
@@ -768,6 +824,7 @@ impl ParquetBatchReader {
         } else {
             let file = store.open(path)?;
             Self::build_i64_set_filter(
+                path,
                 file,
                 metadata,
                 metadata_nanos,
@@ -799,6 +856,7 @@ impl ParquetBatchReader {
         if file_cache.enabled() {
             let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
             Self::build_i64_bloom_filter(
+                path,
                 reader,
                 metadata,
                 metadata_nanos,
@@ -811,6 +869,7 @@ impl ParquetBatchReader {
         } else {
             let file = store.open(path)?;
             Self::build_i64_bloom_filter(
+                path,
                 file,
                 metadata,
                 metadata_nanos,
@@ -824,6 +883,7 @@ impl ParquetBatchReader {
     }
 
     fn build<T: ChunkReader + 'static>(
+        path: &Path,
         input: T,
         metadata: ArrowReaderMetadata,
         metadata_nanos: u64,
@@ -857,6 +917,19 @@ impl ParquetBatchReader {
             &column_indices,
             row_groups.as_deref().unwrap_or(&all_row_groups),
         );
+        let scanned_row_groups = row_groups.as_deref().unwrap_or(&all_row_groups);
+        if row_groups.is_none()
+            || scanned_row_groups.len() == all_row_groups.len()
+            || parquet_column_chunk_profile_enabled()
+        {
+            maybe_profile_parquet_projected_columns(
+                path,
+                &builder,
+                &column_indices,
+                &all_row_groups,
+                scanned_row_groups,
+            );
+        }
         let builder = apply_projection(builder, projection)?;
         let builder = if let Some(row_groups) = row_groups {
             builder.with_row_groups(row_groups)
@@ -873,6 +946,7 @@ impl ParquetBatchReader {
 
         Ok(Self {
             inner,
+            projection_order: projection_order(projection),
             projected_columns,
             row_groups_total,
             row_groups_scanned,
@@ -884,12 +958,15 @@ impl ParquetBatchReader {
             eof_calls: 0,
             output_batches: 0,
             output_rows: 0,
+            zero_row_batches: 0,
             next_nanos: 0,
+            max_next_nanos: 0,
         })
     }
 
     #[allow(clippy::too_many_arguments)]
     fn build_i64_set_filter<T: ChunkReader + 'static>(
+        path: &Path,
         input: T,
         metadata: ArrowReaderMetadata,
         metadata_nanos: u64,
@@ -910,6 +987,15 @@ impl ParquetBatchReader {
             compressed_bytes_for_row_groups(&builder, &column_indices, &all_row_groups);
         let compressed_bytes_scanned =
             compressed_bytes_for_row_groups(&builder, &column_indices, &row_groups);
+        if row_groups.len() == all_row_groups.len() || parquet_column_chunk_profile_enabled() {
+            maybe_profile_parquet_projected_columns(
+                path,
+                &builder,
+                &column_indices,
+                &all_row_groups,
+                &row_groups,
+            );
+        }
         let filter_index = projection_indices(builder.schema(), &[filter_column.to_string()])?[0];
         let filter_mask = ProjectionMask::roots(builder.parquet_schema(), [filter_index]);
         let keys = I64SetPredicate::from_hash_set(keys.as_ref());
@@ -928,6 +1014,7 @@ impl ParquetBatchReader {
         let inner = builder.build()?;
         Ok(Self {
             inner,
+            projection_order: projection_order(projection),
             projected_columns,
             row_groups_total,
             row_groups_scanned: row_groups.len(),
@@ -939,12 +1026,15 @@ impl ParquetBatchReader {
             eof_calls: 0,
             output_batches: 0,
             output_rows: 0,
+            zero_row_batches: 0,
             next_nanos: 0,
+            max_next_nanos: 0,
         })
     }
 
     #[allow(clippy::too_many_arguments)]
     fn build_i64_bloom_filter<T: ChunkReader + 'static>(
+        path: &Path,
         input: T,
         metadata: ArrowReaderMetadata,
         metadata_nanos: u64,
@@ -965,6 +1055,15 @@ impl ParquetBatchReader {
             compressed_bytes_for_row_groups(&builder, &column_indices, &all_row_groups);
         let compressed_bytes_scanned =
             compressed_bytes_for_row_groups(&builder, &column_indices, &row_groups);
+        if row_groups.len() == all_row_groups.len() || parquet_column_chunk_profile_enabled() {
+            maybe_profile_parquet_projected_columns(
+                path,
+                &builder,
+                &column_indices,
+                &all_row_groups,
+                &row_groups,
+            );
+        }
         let filter_index = projection_indices(builder.schema(), &[filter_column.to_string()])?[0];
         let filter_mask = ProjectionMask::roots(builder.parquet_schema(), [filter_index]);
         let filter = ArrowPredicateFn::new(filter_mask, move |batch: RecordBatch| {
@@ -982,6 +1081,7 @@ impl ParquetBatchReader {
         let inner = builder.build()?;
         Ok(Self {
             inner,
+            projection_order: projection_order(projection),
             projected_columns,
             row_groups_total,
             row_groups_scanned: row_groups.len(),
@@ -993,12 +1093,15 @@ impl ParquetBatchReader {
             eof_calls: 0,
             output_batches: 0,
             output_rows: 0,
+            zero_row_batches: 0,
             next_nanos: 0,
+            max_next_nanos: 0,
         })
     }
 
     #[allow(clippy::too_many_arguments)]
     fn build_with_row_selection<T: ChunkReader + 'static>(
+        path: &Path,
         input: T,
         metadata: ArrowReaderMetadata,
         metadata_nanos: u64,
@@ -1018,6 +1121,15 @@ impl ParquetBatchReader {
             compressed_bytes_for_row_groups(&builder, &column_indices, &all_row_groups);
         let compressed_bytes_scanned =
             compressed_bytes_for_row_groups(&builder, &column_indices, &row_groups);
+        if row_groups.len() == all_row_groups.len() || parquet_column_chunk_profile_enabled() {
+            maybe_profile_parquet_projected_columns(
+                path,
+                &builder,
+                &column_indices,
+                &all_row_groups,
+                &row_groups,
+            );
+        }
         let row_groups_scanned = row_groups.len();
         let inner = apply_projection(builder, projection)?
             .with_row_groups(row_groups)
@@ -1026,6 +1138,7 @@ impl ParquetBatchReader {
         let planning_nanos = elapsed_nanos(planning_start);
         Ok(Self {
             inner,
+            projection_order: projection_order(projection),
             projected_columns,
             row_groups_total,
             row_groups_scanned,
@@ -1037,7 +1150,9 @@ impl ParquetBatchReader {
             eof_calls: 0,
             output_batches: 0,
             output_rows: 0,
+            zero_row_batches: 0,
             next_nanos: 0,
+            max_next_nanos: 0,
         })
     }
 
@@ -1085,8 +1200,16 @@ impl ParquetBatchReader {
         self.output_rows
     }
 
+    pub fn zero_row_batches(&self) -> usize {
+        self.zero_row_batches
+    }
+
     pub fn next_nanos(&self) -> u64 {
         self.next_nanos
+    }
+
+    pub fn max_next_nanos(&self) -> u64 {
+        self.max_next_nanos
     }
 }
 
@@ -1393,12 +1516,22 @@ impl Iterator for ParquetBatchReader {
     fn next(&mut self) -> Option<Self::Item> {
         let started = Instant::now();
         let next = self.inner.next();
+        let next_nanos = elapsed_nanos(started);
         self.next_calls = self.next_calls.saturating_add(1);
-        self.next_nanos = self.next_nanos.saturating_add(elapsed_nanos(started));
+        self.next_nanos = self.next_nanos.saturating_add(next_nanos);
+        self.max_next_nanos = self.max_next_nanos.max(next_nanos);
         match next {
             Some(Ok(batch)) => {
+                let batch = match enforce_projection_order(batch, self.projection_order.as_deref())
+                {
+                    Ok(batch) => batch,
+                    Err(error) => return Some(Err(error)),
+                };
                 self.output_batches = self.output_batches.saturating_add(1);
                 self.output_rows = self.output_rows.saturating_add(batch.num_rows());
+                if batch.num_rows() == 0 {
+                    self.zero_row_batches = self.zero_row_batches.saturating_add(1);
+                }
                 Some(Ok(batch))
             }
             Some(Err(error)) => Some(Err(error.into())),
@@ -1421,6 +1554,50 @@ fn apply_projection<T: ChunkReader + 'static>(
     let indices = projection_indices(builder.schema(), columns)?;
     let mask = ProjectionMask::roots(builder.parquet_schema(), indices);
     Ok(builder.with_projection(mask))
+}
+
+fn projection_order(projection: &Projection) -> Option<Vec<String>> {
+    match projection {
+        Projection::All => None,
+        Projection::Columns(columns) => Some(columns.clone()),
+    }
+}
+
+fn enforce_projection_order(
+    batch: RecordBatch,
+    projection_order: Option<&[String]>,
+) -> Result<RecordBatch> {
+    let Some(projection_order) = projection_order else {
+        return Ok(batch);
+    };
+    if projection_order.len() != batch.num_columns() {
+        return Ok(batch);
+    }
+    if batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .eq(projection_order.iter().map(|column| column.as_str()))
+    {
+        return Ok(batch);
+    }
+    let mut columns = Vec::with_capacity(projection_order.len());
+    let mut fields = Vec::with_capacity(projection_order.len());
+    for column in projection_order {
+        let index = batch
+            .schema()
+            .fields()
+            .iter()
+            .position(|field| field.name() == column)
+            .ok_or_else(|| DodamError::UnknownColumn(column.clone()))?;
+        columns.push(batch.column(index).clone());
+        fields.push(batch.schema().field(index).clone());
+    }
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns,
+    )?)
 }
 
 fn row_filter<T: ChunkReader + 'static>(
@@ -1482,6 +1659,43 @@ fn projected_column_count(schema: &arrow::datatypes::SchemaRef, projection: &Pro
         Projection::All => schema.fields().len(),
         Projection::Columns(columns) => columns.len(),
     }
+}
+
+fn metadata_with_dictionary_columns(
+    metadata: ArrowReaderMetadata,
+    dictionary_columns: &[String],
+) -> Result<ArrowReaderMetadata> {
+    if dictionary_columns.is_empty() {
+        return Ok(metadata);
+    }
+    let dictionary_columns = dictionary_columns
+        .iter()
+        .map(|column| column.as_str())
+        .collect::<BTreeSet<_>>();
+    let fields = metadata
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| {
+            if dictionary_columns.contains(field.name().as_str())
+                && matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8)
+            {
+                Arc::new(Field::new(
+                    field.name(),
+                    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                    field.is_nullable(),
+                ))
+            } else {
+                field.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    let schema = Arc::new(Schema::new(fields));
+    let options = ArrowReaderOptions::new().with_schema(schema);
+    Ok(ArrowReaderMetadata::try_new(
+        metadata.metadata().clone(),
+        options,
+    )?)
 }
 
 fn elapsed_nanos(start: Instant) -> u64 {
@@ -1574,6 +1788,13 @@ fn maybe_profile_parquet_projected_columns<T: ChunkReader + 'static>(
 
 fn parquet_column_profile_enabled() -> bool {
     std::env::var("DODAM_PARQUET_COLUMN_PROFILE")
+        .or_else(|_| std::env::var("DODAM_SCAN_PROFILE"))
+        .or_else(|_| std::env::var("DODAM_TPCH_PROFILE"))
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn parquet_column_chunk_profile_enabled() -> bool {
+    std::env::var("DODAM_PARQUET_COLUMN_CHUNK_PROFILE")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 

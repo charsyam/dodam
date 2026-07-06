@@ -127,7 +127,9 @@ pub struct ScanPlanMetrics {
     pub parquet_eof_calls: usize,
     pub parquet_output_batches: usize,
     pub parquet_output_rows: usize,
+    pub parquet_zero_row_batches: usize,
     pub parquet_next_nanos: u64,
+    pub parquet_max_next_nanos: u64,
     pub join_build_rows: usize,
     pub join_probe_rows: usize,
     pub join_output_rows: usize,
@@ -158,7 +160,9 @@ pub struct ScanPlanMetricsCounter {
     parquet_eof_calls: AtomicUsize,
     parquet_output_batches: AtomicUsize,
     parquet_output_rows: AtomicUsize,
+    parquet_zero_row_batches: AtomicUsize,
     parquet_next_nanos: AtomicU64,
+    parquet_max_next_nanos: AtomicU64,
     join_build_rows: AtomicUsize,
     join_probe_rows: AtomicUsize,
     join_output_rows: AtomicUsize,
@@ -239,7 +243,9 @@ impl ScanPlanMetricsCounter {
         eof_calls: usize,
         output_batches: usize,
         output_rows: usize,
+        zero_row_batches: usize,
         next_nanos: u64,
+        max_next_nanos: u64,
     ) {
         self.parquet_next_calls
             .fetch_add(next_calls, Ordering::Relaxed);
@@ -249,8 +255,22 @@ impl ScanPlanMetricsCounter {
             .fetch_add(output_batches, Ordering::Relaxed);
         self.parquet_output_rows
             .fetch_add(output_rows, Ordering::Relaxed);
+        self.parquet_zero_row_batches
+            .fetch_add(zero_row_batches, Ordering::Relaxed);
         self.parquet_next_nanos
             .fetch_add(next_nanos, Ordering::Relaxed);
+        let mut current = self.parquet_max_next_nanos.load(Ordering::Relaxed);
+        while max_next_nanos > current {
+            match self.parquet_max_next_nanos.compare_exchange_weak(
+                current,
+                max_next_nanos,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     pub(crate) fn add_join_build_rows(&self, rows: usize) {
@@ -342,7 +362,9 @@ impl ScanPlanMetricsCounter {
             parquet_eof_calls: self.parquet_eof_calls.load(Ordering::Relaxed),
             parquet_output_batches: self.parquet_output_batches.load(Ordering::Relaxed),
             parquet_output_rows: self.parquet_output_rows.load(Ordering::Relaxed),
+            parquet_zero_row_batches: self.parquet_zero_row_batches.load(Ordering::Relaxed),
             parquet_next_nanos: self.parquet_next_nanos.load(Ordering::Relaxed),
+            parquet_max_next_nanos: self.parquet_max_next_nanos.load(Ordering::Relaxed),
             join_build_rows: self.join_build_rows.load(Ordering::Relaxed),
             join_probe_rows: self.join_probe_rows.load(Ordering::Relaxed),
             join_output_rows: self.join_output_rows.load(Ordering::Relaxed),

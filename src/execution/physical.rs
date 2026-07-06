@@ -345,7 +345,9 @@ impl Iterator for SequentialFragmentScanStream {
                     reader.eof_calls(),
                     reader.output_batches(),
                     reader.output_rows(),
+                    reader.zero_row_batches(),
                     reader.next_nanos(),
+                    reader.max_next_nanos(),
                 );
                 self.flush_decode_time();
                 self.current_reader = None;
@@ -500,7 +502,9 @@ impl ParallelParquetScanStream {
                     reader.eof_calls(),
                     reader.output_batches(),
                     reader.output_rows(),
+                    reader.zero_row_batches(),
                     reader.next_nanos(),
+                    reader.max_next_nanos(),
                 );
             });
         }

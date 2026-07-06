@@ -6,17 +6,21 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float64Array,
-    Int32Array, Int64Array, StringArray, TimestampMillisecondArray, UInt64Array,
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Decimal128Array, DictionaryArray,
+    Float64Array, Int32Array, Int64Array, LargeStringArray, StringArray, TimestampMillisecondArray,
+    UInt64Array,
 };
 use arrow::compute::filter_record_batch;
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::datatypes::{DataType, Field, Int32Type, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use arrow_ord::sort::{SortColumn, SortOptions, lexsort_to_indices};
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take_record_batch;
 use memchr::memmem::Finder;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::column::reader::ColumnReader;
+use parquet::file::reader::FileReader;
+use parquet::file::serialized_reader::SerializedFileReader;
 use rayon::prelude::*;
 use sqlparser::ast::{
     BinaryOperator, DateTimeField, Distinct, DuplicateTreatment, Expr as SqlExpr, FunctionArg,
@@ -28,7 +32,8 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::dense::{
-    AdaptiveI64Map, AdaptiveI64Set, DenseI64F64Sum, DenseI64I32Map, adaptive_dense_index,
+    AdaptiveI64Map, AdaptiveI64Set, DenseI64F64Sum, DenseI64I32Map, PackedU32PairDistinct,
+    SortedI64Lookup, adaptive_dense_index,
 };
 use crate::engine::{
     DodamEngine, JoinAlgorithm, JoinParquetRequest, LateMaterializationPolicy,
@@ -2716,7 +2721,7 @@ async fn q01_pricing_summary_rows(
     ]);
     if q01_row_group_map_enabled() && !q01_pruning_enabled() {
         let groups = engine
-            .parquet_scan_fold_chunks(
+            .parquet_scan_accumulate_chunks(
                 path.clone(),
                 batch_size,
                 projection.clone(),
@@ -2725,7 +2730,10 @@ async fn q01_pricing_summary_rows(
                 scan_aggregate_fusion_enabled(),
                 Q01GroupSlots::new,
                 Q01GroupSlots::new,
-                move |batch| q01_pricing_summary_projected_batch(batch, cutoff_days),
+                move |batch, groups| {
+                    q01_pricing_summary_projected_batch_into(batch, cutoff_days, groups)?;
+                    Ok(Some(()))
+                },
                 |groups, rows| groups.merge_slots(rows),
                 "Q01 aggregate",
             )
@@ -2752,7 +2760,7 @@ async fn q01_pricing_summary_rows(
         move |batches| {
             let mut groups = Q01GroupSlots::new();
             for batch in batches {
-                groups.merge_slots(q01_pricing_summary_projected_batch(batch, cutoff_days)?);
+                q01_pricing_summary_projected_batch_into(batch, cutoff_days, &mut groups)?;
             }
             Ok(groups)
         },
@@ -2839,7 +2847,11 @@ fn scan_aggregate_row_group_chunk() -> usize {
         .unwrap_or(4)
 }
 
-fn q01_pricing_summary_batch(batch: RecordBatch, cutoff_days: i32) -> Result<Q01GroupSlots> {
+fn q01_pricing_summary_batch_into(
+    batch: RecordBatch,
+    cutoff_days: i32,
+    groups: &mut Q01GroupSlots,
+) -> Result<()> {
     let returnflags = batch_string_column(&batch, "l_returnflag")?;
     let linestatuses = batch_string_column(&batch, "l_linestatus")?;
     let quantities = batch_column(&batch, "l_quantity")?;
@@ -2847,7 +2859,6 @@ fn q01_pricing_summary_batch(batch: RecordBatch, cutoff_days: i32) -> Result<Q01
     let discounts = batch_column(&batch, "l_discount")?;
     let taxes = batch_column(&batch, "l_tax")?;
     let shipdates = batch_column(&batch, "l_shipdate")?;
-    let mut groups = Q01GroupSlots::new();
     if q01_update_decimal_batch(
         returnflags,
         linestatuses,
@@ -2857,9 +2868,9 @@ fn q01_pricing_summary_batch(batch: RecordBatch, cutoff_days: i32) -> Result<Q01
         taxes,
         shipdates,
         cutoff_days,
-        &mut groups,
+        groups,
     )? {
-        return Ok(groups);
+        return Ok(());
     }
     for row in 0..batch.num_rows() {
         let Some(shipdate) = date32_value(shipdates, row)? else {
@@ -2880,21 +2891,21 @@ fn q01_pricing_summary_batch(batch: RecordBatch, cutoff_days: i32) -> Result<Q01
             state.update(quantity, extendedprice, discount, tax);
         });
     }
-    Ok(groups)
+    Ok(())
 }
 
-fn q01_pricing_summary_projected_batch(
+fn q01_pricing_summary_projected_batch_into(
     batch: RecordBatch,
     cutoff_days: i32,
-) -> Result<Q01GroupSlots> {
+    groups: &mut Q01GroupSlots,
+) -> Result<()> {
     if batch.num_columns() == 7 {
         let Some(returnflags) = batch.column(0).as_any().downcast_ref::<StringArray>() else {
-            return q01_pricing_summary_batch(batch, cutoff_days);
+            return q01_pricing_summary_batch_into(batch, cutoff_days, groups);
         };
         let Some(linestatuses) = batch.column(1).as_any().downcast_ref::<StringArray>() else {
-            return q01_pricing_summary_batch(batch, cutoff_days);
+            return q01_pricing_summary_batch_into(batch, cutoff_days, groups);
         };
-        let mut groups = Q01GroupSlots::new();
         if q01_update_decimal_batch(
             returnflags,
             linestatuses,
@@ -2904,12 +2915,12 @@ fn q01_pricing_summary_projected_batch(
             batch.column(5),
             batch.column(6),
             cutoff_days,
-            &mut groups,
+            groups,
         )? {
-            return Ok(groups);
+            return Ok(());
         }
     }
-    q01_pricing_summary_batch(batch, cutoff_days)
+    q01_pricing_summary_batch_into(batch, cutoff_days, groups)
 }
 
 fn parallel_batch_fold<Partial, Output, Map, Merge>(
@@ -3641,6 +3652,18 @@ async fn q10_customer_rows(
     customer_keys: &AdaptiveI64Set,
     customer_key_filter: &HashSet<i64>,
 ) -> Result<HashMap<i64, Q10Customer>> {
+    if q10_customer_late_materialized_enabled()
+        && let Some(customers) = q10_customer_rows_late_materialized(
+            engine,
+            path.clone(),
+            batch_size,
+            customer_keys.clone(),
+            customer_key_filter.clone(),
+        )
+        .await?
+    {
+        return Ok(customers);
+    }
     let projection = Projection::Columns(vec![
         "c_custkey".to_string(),
         "c_name".to_string(),
@@ -3650,11 +3673,11 @@ async fn q10_customer_rows(
         "c_phone".to_string(),
         "c_comment".to_string(),
     ]);
-    let mut stream = if should_use_i64_set_row_filter(
+    let mut stream = if should_use_i64_set_row_filter_for_keys(
         true,
         "DODAM_Q10_DISABLE_CUSTOMER_ROW_FILTER",
         None,
-        customer_key_filter.len(),
+        customer_key_filter,
         projection_column_count(&projection),
     ) {
         engine
@@ -3764,6 +3787,278 @@ async fn q10_customer_rows(
         }
     }
     Ok(customers)
+}
+
+fn q10_customer_late_materialized_enabled() -> bool {
+    std::env::var_os("DODAM_Q10_DISABLE_CUSTOMER_LATE").is_none()
+}
+
+async fn q10_customer_rows_late_materialized(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    customer_keys: AdaptiveI64Set,
+    customer_key_filter: HashSet<i64>,
+) -> Result<Option<HashMap<i64, Q10Customer>>> {
+    let customer_keys = Arc::new(customer_keys);
+    let customer_key_filter = Arc::new(AdaptiveI64Set::from_hash(customer_key_filter));
+    let Some(chunks) = engine
+        .late_materialized_parquet_map_with_policy(
+            path,
+            batch_size,
+            Projection::Columns(vec!["c_custkey".to_string()]),
+            Projection::Columns(vec![
+                "c_name".to_string(),
+                "c_acctbal".to_string(),
+                "c_nationkey".to_string(),
+                "c_address".to_string(),
+                "c_phone".to_string(),
+                "c_comment".to_string(),
+            ]),
+            q10_customer_late_row_group_chunk(),
+            LateMaterializationPolicy::selective_with_selector_run_ratio(
+                q10_customer_late_max_selected_ratio(),
+                q10_customer_late_max_selector_run_ratio(),
+            ),
+            {
+                let customer_keys = customer_keys.clone();
+                let customer_key_filter = customer_key_filter.clone();
+                move || {
+                    Q10CustomerLateState::new(
+                        customer_key_filter.clone(),
+                        Q10CustomerLatePayload {
+                            customer_keys: customer_keys.clone(),
+                            customers: HashMap::new(),
+                        },
+                    )
+                }
+            },
+            q10_customer_late_build_selection_batch,
+            q10_customer_late_consume_payload_batch,
+            |state, _metrics| {
+                if !state.payload_consumed() {
+                    return Err(DodamError::UnsupportedSql(
+                        "Q10 customer payload row mismatch".to_string(),
+                    ));
+                }
+                Ok(Some(state.payload.customers))
+            },
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let mut customers = HashMap::new();
+    let mut metrics = LateMaterializedMetrics::default();
+    for chunk in chunks {
+        metrics.add(chunk.metrics);
+        customers.extend(chunk.output);
+    }
+    q10_log_customer_late_profile(metrics, q10_customer_late_row_group_chunk());
+    Ok(Some(customers))
+}
+
+fn q10_customer_late_row_group_chunk() -> usize {
+    std::env::var("DODAM_Q10_CUSTOMER_LATE_ROW_GROUP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1)
+}
+
+fn q10_customer_late_max_selected_ratio() -> f64 {
+    std::env::var("DODAM_Q10_CUSTOMER_LATE_MAX_SELECTED_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.01)
+}
+
+fn q10_customer_late_max_selector_run_ratio() -> f64 {
+    std::env::var("DODAM_Q10_CUSTOMER_LATE_MAX_SELECTOR_RUN_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.01)
+}
+
+struct I64SetLateSelectionState<T> {
+    key_filter: Arc<AdaptiveI64Set>,
+    selected_keys: Vec<i64>,
+    payload_offset: usize,
+    payload: T,
+}
+
+impl<T> I64SetLateSelectionState<T> {
+    fn new(key_filter: Arc<AdaptiveI64Set>, payload: T) -> Self {
+        Self {
+            key_filter,
+            selected_keys: Vec::new(),
+            payload_offset: 0,
+            payload,
+        }
+    }
+
+    fn next_payload_key(&mut self, overflow_message: &str) -> Result<i64> {
+        let Some(&key) = self.selected_keys.get(self.payload_offset) else {
+            return Err(DodamError::UnsupportedSql(overflow_message.to_string()));
+        };
+        self.payload_offset += 1;
+        Ok(key)
+    }
+
+    fn payload_consumed(&self) -> bool {
+        self.payload_offset == self.selected_keys.len()
+    }
+}
+
+#[derive(Default)]
+struct I64SetLateSelectionBatchMetrics {
+    total_rows: usize,
+    selected_rows: usize,
+}
+
+fn i64_set_late_build_selection_batch<T>(
+    batch: RecordBatch,
+    key_column: &str,
+    selection: &mut LateSelectionBuilder,
+    state: &mut I64SetLateSelectionState<T>,
+) -> Result<Option<()>> {
+    i64_set_late_build_selection_batch_into(
+        batch,
+        key_column,
+        &state.key_filter,
+        &mut state.selected_keys,
+        selection,
+    )
+    .map(|metrics| metrics.map(|_| ()))
+}
+
+fn i64_set_late_build_selection_batch_into(
+    batch: RecordBatch,
+    key_column: &str,
+    key_filter: &AdaptiveI64Set,
+    selected_keys: &mut Vec<i64>,
+    selection: &mut LateSelectionBuilder,
+) -> Result<Option<I64SetLateSelectionBatchMetrics>> {
+    let keys = batch_column(&batch, key_column)?;
+    let Some(keys) = keys.as_any().downcast_ref::<Int64Array>() else {
+        return Ok(None);
+    };
+    let dense_key_filter = key_filter.dense_contains_slice();
+    let mut metrics = I64SetLateSelectionBatchMetrics {
+        total_rows: keys.len(),
+        selected_rows: 0,
+    };
+    if keys.null_count() == 0 {
+        for &key in keys.values().as_ref() {
+            let selected = adaptive_i64_set_contains_cached(key_filter, dense_key_filter, key);
+            selection.push(selected);
+            if selected {
+                selected_keys.push(key);
+                metrics.selected_rows += 1;
+            }
+        }
+        return Ok(Some(metrics));
+    }
+    for row in 0..keys.len() {
+        let selected = keys.is_valid(row)
+            && adaptive_i64_set_contains_cached(key_filter, dense_key_filter, keys.value(row));
+        selection.push(selected);
+        if selected {
+            selected_keys.push(keys.value(row));
+            metrics.selected_rows += 1;
+        }
+    }
+    Ok(Some(metrics))
+}
+
+fn adaptive_i64_set_contains_cached(
+    keys: &AdaptiveI64Set,
+    dense_keys: Option<&[bool]>,
+    key: i64,
+) -> bool {
+    if let Some(dense_keys) = dense_keys {
+        return usize::try_from(key)
+            .ok()
+            .and_then(|index| dense_keys.get(index))
+            .copied()
+            .unwrap_or(false);
+    }
+    keys.contains(key)
+}
+
+struct Q10CustomerLatePayload {
+    customer_keys: Arc<AdaptiveI64Set>,
+    customers: HashMap<i64, Q10Customer>,
+}
+
+type Q10CustomerLateState = I64SetLateSelectionState<Q10CustomerLatePayload>;
+
+fn q10_customer_late_build_selection_batch(
+    batch: RecordBatch,
+    selection: &mut LateSelectionBuilder,
+    state: &mut Q10CustomerLateState,
+) -> Result<Option<()>> {
+    i64_set_late_build_selection_batch(batch, "c_custkey", selection, state)
+}
+
+fn q10_customer_late_consume_payload_batch(
+    batch: RecordBatch,
+    state: &mut Q10CustomerLateState,
+) -> Result<Option<()>> {
+    let names = batch_string_column(&batch, "c_name")?;
+    let acctbals = batch_column(&batch, "c_acctbal")?;
+    let nationkeys = batch_column(&batch, "c_nationkey")?;
+    let addresses = batch_string_column(&batch, "c_address")?;
+    let phones = batch_string_column(&batch, "c_phone")?;
+    let comments = batch_string_column(&batch, "c_comment")?;
+    let (Some(acctbals), Some(nationkeys)) = (
+        decimal_input(acctbals)?,
+        nationkeys.as_any().downcast_ref::<Int64Array>(),
+    ) else {
+        return Ok(None);
+    };
+    for row in 0..batch.num_rows() {
+        let custkey = state.next_payload_key("Q10 customer payload row overflow")?;
+        if !state.payload.customer_keys.contains(custkey)
+            || names.is_null(row)
+            || acctbals.is_null(row)
+            || nationkeys.is_null(row)
+            || addresses.is_null(row)
+            || phones.is_null(row)
+            || comments.is_null(row)
+        {
+            continue;
+        }
+        state.payload.customers.insert(
+            custkey,
+            Q10Customer {
+                c_name: names.value(row).to_string(),
+                c_acctbal: acctbals.value(row),
+                c_nationkey: nationkeys.value(row),
+                c_address: addresses.value(row).to_string(),
+                c_phone: phones.value(row).to_string(),
+                c_comment: comments.value(row).to_string(),
+            },
+        );
+    }
+    Ok(Some(()))
+}
+
+fn q10_log_customer_late_profile(metrics: LateMaterializedMetrics, row_group_chunk: usize) {
+    if !tpch_profile_enabled() {
+        return;
+    }
+    let ratio = if metrics.total_rows == 0 {
+        0.0
+    } else {
+        metrics.selected_rows as f64 / metrics.total_rows as f64
+    };
+    eprintln!(
+        "[dodam:tpch-profile] Q10 customers: late_materialized rows={} selected={} ratio={:.6} selector_runs={} row_group_chunk={}",
+        metrics.total_rows, metrics.selected_rows, ratio, metrics.selector_runs, row_group_chunk
+    );
 }
 
 async fn q10_order_customers(
@@ -5340,11 +5635,11 @@ async fn q09_profit_rows(
         "l_extendedprice".to_string(),
         "l_discount".to_string(),
     ]);
-    let use_partkey_row_filter = should_use_i64_set_row_filter(
+    let use_partkey_row_filter = should_use_i64_set_row_filter_for_keys(
         false,
         "DODAM_Q09_DISABLE_LINEITEM_PARTKEY_ROW_FILTER",
         Some("DODAM_Q09_ENABLE_LINEITEM_PARTKEY_ROW_FILTER"),
-        part_key_filter.len(),
+        part_key_filter,
         projection_column_count(&projection),
     );
     if q09_row_group_map_enabled() && !use_partkey_row_filter {
@@ -5444,6 +5739,44 @@ fn should_use_i64_set_row_filter(
         && projected_columns >= i64_set_row_filter_min_projected_columns()
 }
 
+fn should_use_i64_set_row_filter_for_keys(
+    default_enabled: bool,
+    disable_env: &str,
+    enable_env: Option<&str>,
+    keys: &HashSet<i64>,
+    projected_columns: usize,
+) -> bool {
+    let forced_enabled = enable_env.is_some_and(env_flag_enabled);
+    if !should_use_i64_set_row_filter(
+        default_enabled,
+        disable_env,
+        enable_env,
+        keys.len(),
+        projected_columns,
+    ) {
+        return false;
+    }
+    if forced_enabled {
+        return true;
+    }
+    let Some((min_key, max_key)) = raw_i64_key_range(keys.iter().copied()) else {
+        return false;
+    };
+    let Some(width) = max_key
+        .checked_sub(min_key)
+        .and_then(|width| width.checked_add(1))
+        .and_then(|width| usize::try_from(width).ok())
+    else {
+        return false;
+    };
+    if width == 0 {
+        return false;
+    }
+    let density = keys.len() as f64 / width as f64;
+    density <= i64_set_row_filter_max_density()
+        || keys.len() <= i64_set_row_filter_always_allow_keys()
+}
+
 fn env_flag_enabled(name: &str) -> bool {
     std::env::var(name)
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
@@ -5463,6 +5796,33 @@ fn i64_set_row_filter_min_projected_columns() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(4)
+}
+
+fn i64_set_row_filter_max_density() -> f64 {
+    std::env::var("DODAM_I64_SET_ROW_FILTER_MAX_DENSITY")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(0.35)
+}
+
+fn i64_set_row_filter_always_allow_keys() -> usize {
+    std::env::var("DODAM_I64_SET_ROW_FILTER_ALWAYS_ALLOW_KEYS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(4096)
+}
+
+fn raw_i64_key_range(keys: impl IntoIterator<Item = i64>) -> Option<(i64, i64)> {
+    let mut iter = keys.into_iter();
+    let first = iter.next()?;
+    let mut min_key = first;
+    let mut max_key = first;
+    for key in iter {
+        min_key = min_key.min(key);
+        max_key = max_key.max(key);
+    }
+    Some((min_key, max_key))
 }
 
 fn projection_column_count(projection: &Projection) -> usize {
@@ -5617,36 +5977,18 @@ fn q09_late_build_partkey_selection_batch(
     selection: &mut LateSelectionBuilder,
     state: &mut Q09LateProfitState,
 ) -> Result<Option<()>> {
-    let partkeys = batch_column(&batch, "l_partkey")?;
-    let Some(partkeys) = partkeys.as_any().downcast_ref::<Int64Array>() else {
+    let Some(metrics) = i64_set_late_build_selection_batch_into(
+        batch,
+        "l_partkey",
+        &state.part_keys,
+        &mut state.selected_partkeys,
+        selection,
+    )?
+    else {
         return Ok(None);
     };
-    let dense_part_keys = state.part_keys.dense_contains_slice();
-    if partkeys.null_count() == 0 {
-        for &partkey in partkeys.values().as_ref() {
-            state.partial.profile.rows += 1;
-            let selected = q09_part_key_contains(&state.part_keys, dense_part_keys, partkey);
-            selection.push(selected);
-            if selected {
-                state.partial.profile.part_hits += 1;
-                state.selected_partkeys.push(partkey);
-            }
-        }
-        return Ok(Some(()));
-    }
-    for row in 0..partkeys.len() {
-        state.partial.profile.rows += 1;
-        let selected = if partkeys.is_null(row) {
-            false
-        } else {
-            q09_part_key_contains(&state.part_keys, dense_part_keys, partkeys.value(row))
-        };
-        selection.push(selected);
-        if selected {
-            state.partial.profile.part_hits += 1;
-            state.selected_partkeys.push(partkeys.value(row));
-        }
-    }
+    state.partial.profile.rows += metrics.total_rows;
+    state.partial.profile.part_hits += metrics.selected_rows;
     Ok(Some(()))
 }
 
@@ -6072,14 +6414,7 @@ fn q09_part_key_contains(
     dense_part_keys: Option<&[bool]>,
     partkey: i64,
 ) -> bool {
-    if let Some(dense_part_keys) = dense_part_keys {
-        return usize::try_from(partkey)
-            .ok()
-            .and_then(|index| dense_part_keys.get(index))
-            .copied()
-            .unwrap_or(false);
-    }
-    part_keys.contains(partkey)
+    adaptive_i64_set_contains_cached(part_keys, dense_part_keys, partkey)
 }
 
 fn q09_order_year_get(
@@ -7181,46 +7516,67 @@ async fn q16_supplier_counts(
     let groups = part_groups.groups;
     let part_to_group = Arc::new(part_groups.part_to_group);
     let bad_supplier_keys = Arc::new(AdaptiveI64Set::from_hash(bad_suppliers.keys));
-    let supplier_counts =
-        if let Some(layout) = q16_supplier_bitset_layout(groups.len(), bad_suppliers.max_suppkey) {
-            let layout_for_scan = Arc::new(layout.clone());
-            let partial = parallel_batch_fold_chunks(
-                &mut stream,
-                q16_supplier_count_chunk_size(),
-                move |batches| {
-                    let mut distinct_suppliers =
-                        Q16GroupSupplierBitset::new((*layout_for_scan).clone());
-                    for batch in batches {
-                        q16_supplier_counts_bitset_batch(
-                            batch,
-                            &part_to_group,
-                            &bad_supplier_keys,
-                            &mut distinct_suppliers,
-                        )?;
-                    }
-                    Ok(distinct_suppliers)
-                },
-                Q16GroupSupplierBitset::new(layout),
-                q16_merge_supplier_bitsets,
-                "Q16 partsupp supplier counts",
-            )?;
-            partial.counts()
-        } else {
-            let distinct_suppliers = parallel_batch_fold(
-                &mut stream,
-                move |batch| q16_supplier_counts_batch(batch, &part_to_group, &bad_supplier_keys),
-                FastHashSet::<(usize, i64)>::default(),
-                q16_merge_supplier_counts,
-                "Q16 partsupp supplier counts",
-            )?;
-            let mut supplier_counts = vec![0_u64; groups.len()];
-            for (group_id, _) in distinct_suppliers {
-                if let Some(count) = supplier_counts.get_mut(group_id) {
-                    *count += 1;
+    let supplier_counts = if q16_packed_distinct_enabled(groups.len(), bad_suppliers.max_suppkey) {
+        let packed = parallel_batch_fold_chunks(
+            &mut stream,
+            q16_supplier_count_chunk_size(),
+            move |batches| {
+                let mut distinct_suppliers = PackedU32PairDistinct::new();
+                for batch in batches {
+                    q16_supplier_counts_packed_batch(
+                        batch,
+                        &part_to_group,
+                        &bad_supplier_keys,
+                        &mut distinct_suppliers,
+                    )?;
                 }
+                Ok(distinct_suppliers)
+            },
+            PackedU32PairDistinct::new(),
+            q16_merge_supplier_counts_packed,
+            "Q16 partsupp supplier counts",
+        )?;
+        packed.counts_by_first(groups.len())
+    } else if let Some(layout) = q16_supplier_bitset_layout(groups.len(), bad_suppliers.max_suppkey)
+    {
+        let layout_for_scan = Arc::new(layout.clone());
+        let partial = parallel_batch_fold_chunks(
+            &mut stream,
+            q16_supplier_count_chunk_size(),
+            move |batches| {
+                let mut distinct_suppliers =
+                    Q16GroupSupplierBitset::new((*layout_for_scan).clone());
+                for batch in batches {
+                    q16_supplier_counts_bitset_batch(
+                        batch,
+                        &part_to_group,
+                        &bad_supplier_keys,
+                        &mut distinct_suppliers,
+                    )?;
+                }
+                Ok(distinct_suppliers)
+            },
+            Q16GroupSupplierBitset::new(layout),
+            q16_merge_supplier_bitsets,
+            "Q16 partsupp supplier counts",
+        )?;
+        partial.counts()
+    } else {
+        let distinct_suppliers = parallel_batch_fold(
+            &mut stream,
+            move |batch| q16_supplier_counts_batch(batch, &part_to_group, &bad_supplier_keys),
+            FastHashSet::<(usize, i64)>::default(),
+            q16_merge_supplier_counts,
+            "Q16 partsupp supplier counts",
+        )?;
+        let mut supplier_counts = vec![0_u64; groups.len()];
+        for (group_id, _) in distinct_suppliers {
+            if let Some(count) = supplier_counts.get_mut(group_id) {
+                *count += 1;
             }
-            supplier_counts
-        };
+        }
+        supplier_counts
+    };
     let mut rows = supplier_counts
         .into_iter()
         .enumerate()
@@ -7328,6 +7684,106 @@ fn q16_supplier_count_chunk_size() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(8)
+}
+
+fn q16_packed_distinct_enabled(group_count: usize, max_suppkey: Option<i64>) -> bool {
+    std::env::var_os("DODAM_Q16_DISABLE_PACKED_DISTINCT").is_none()
+        && group_count <= u32::MAX as usize
+        && max_suppkey.is_some_and(|key| key >= 0 && key <= u32::MAX as i64)
+}
+
+fn q16_supplier_counts_packed_batch(
+    batch: RecordBatch,
+    part_to_group: &AdaptiveI64Map<usize>,
+    bad_suppliers: &AdaptiveI64Set,
+    distinct_suppliers: &mut PackedU32PairDistinct,
+) -> Result<()> {
+    let partkeys = batch_column(&batch, "ps_partkey")?;
+    let suppkeys = batch_column(&batch, "ps_suppkey")?;
+    if q16_supplier_counts_packed_batch_typed(
+        partkeys,
+        suppkeys,
+        part_to_group,
+        bad_suppliers,
+        distinct_suppliers,
+    ) {
+        return Ok(());
+    }
+    for row in 0..batch.num_rows() {
+        let (Some(partkey), Some(suppkey)) = (
+            numeric_i64_value(partkeys, row)?,
+            numeric_i64_value(suppkeys, row)?,
+        ) else {
+            continue;
+        };
+        if bad_suppliers.contains(suppkey) {
+            continue;
+        }
+        let Some(group_id) = part_to_group.get(partkey) else {
+            continue;
+        };
+        if !distinct_suppliers.push(group_id, suppkey) {
+            return Err(DodamError::UnsupportedSql(
+                "packed distinct key is out of range".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn q16_supplier_counts_packed_batch_typed(
+    partkeys: &ArrayRef,
+    suppkeys: &ArrayRef,
+    part_to_group: &AdaptiveI64Map<usize>,
+    bad_suppliers: &AdaptiveI64Set,
+    distinct_suppliers: &mut PackedU32PairDistinct,
+) -> bool {
+    let (Some(partkeys), Some(suppkeys)) = (
+        partkeys.as_any().downcast_ref::<Int64Array>(),
+        suppkeys.as_any().downcast_ref::<Int64Array>(),
+    ) else {
+        return false;
+    };
+    if partkeys.null_count() == 0 && suppkeys.null_count() == 0 {
+        let partkey_values = partkeys.values().as_ref();
+        let suppkey_values = suppkeys.values().as_ref();
+        for row in 0..partkey_values.len() {
+            let suppkey = suppkey_values[row];
+            if bad_suppliers.contains(suppkey) {
+                continue;
+            }
+            let Some(group_id) = part_to_group.get(partkey_values[row]) else {
+                continue;
+            };
+            if !distinct_suppliers.push(group_id, suppkey) {
+                return false;
+            }
+        }
+        return true;
+    }
+    for row in 0..partkeys.len() {
+        if partkeys.is_null(row) || suppkeys.is_null(row) {
+            continue;
+        }
+        let suppkey = suppkeys.value(row);
+        if bad_suppliers.contains(suppkey) {
+            continue;
+        }
+        let Some(group_id) = part_to_group.get(partkeys.value(row)) else {
+            continue;
+        };
+        if !distinct_suppliers.push(group_id, suppkey) {
+            return false;
+        }
+    }
+    true
+}
+
+fn q16_merge_supplier_counts_packed(
+    groups: &mut PackedU32PairDistinct,
+    mut batch_groups: PackedU32PairDistinct,
+) {
+    groups.append(&mut batch_groups);
 }
 
 fn q16_supplier_counts_bitset_batch(
@@ -7656,6 +8112,19 @@ struct Q12PendingOrder {
     counts: [u64; 2],
 }
 
+type Q12PendingMap = HashMap<i64, Q12PendingOrder>;
+
+fn q12_pending_map_new() -> Q12PendingMap {
+    HashMap::with_capacity(q12_pending_map_initial_capacity())
+}
+
+fn q12_pending_map_initial_capacity() -> usize {
+    std::env::var("DODAM_Q12_PENDING_MAP_INITIAL_CAPACITY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(2048)
+}
+
 #[derive(Default)]
 struct Q12OrdersPartial {
     groups: [Q12State; 2],
@@ -7710,7 +8179,7 @@ async fn q12_filtered_lineitem_counts(
     shipmodes: &[String],
     start_days: i32,
     end_days: i32,
-) -> Result<HashMap<i64, Q12PendingOrder>> {
+) -> Result<Q12PendingMap> {
     if q12_late_materialized_enabled()
         && let Some(pending) = q12_filtered_lineitem_counts_late_materialized(
             engine,
@@ -7732,31 +8201,25 @@ async fn q12_filtered_lineitem_counts(
         "l_shipdate".to_string(),
     ]);
     let shipmodes = Arc::new(shipmodes.to_vec());
+    if q12_lineitem_row_filter_enabled() {
+        return q12_filtered_lineitem_counts_row_filtered(
+            engine, path, batch_size, projection, shipmodes, start_days, end_days,
+        )
+        .await;
+    }
     if q12_row_group_map_enabled()
-        && let Some(partials) = engine
-            .parquet_row_group_map(
-                path.clone(),
-                batch_size,
-                projection.clone(),
-                q12_row_group_map_chunk(),
-                HashMap::<i64, Q12PendingOrder>::new,
-                {
-                    let shipmodes = shipmodes.clone();
-                    move |batch, pending| {
-                        q12_merge_pending_orders(
-                            pending,
-                            q12_filtered_lineitem_counts_projected_batch(
-                                batch, &shipmodes, start_days, end_days,
-                            )?,
-                        );
-                        Ok(Some(()))
-                    }
-                },
-                |pending| Ok(Some(pending)),
-            )
-            .await?
+        && let Some(partials) = q12_filtered_lineitem_counts_row_group_map(
+            engine,
+            path.clone(),
+            batch_size,
+            projection.clone(),
+            shipmodes.clone(),
+            start_days,
+            end_days,
+        )
+        .await?
     {
-        let mut pending = HashMap::<i64, Q12PendingOrder>::new();
+        let mut pending = q12_pending_map_new();
         for partial in partials {
             q12_merge_pending_orders(&mut pending, partial);
         }
@@ -7768,6 +8231,97 @@ async fn q12_filtered_lineitem_counts(
     .await
 }
 
+async fn q12_filtered_lineitem_counts_row_filtered(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    projection: Projection,
+    shipmodes: Arc<Vec<String>>,
+    start_days: i32,
+    end_days: i32,
+) -> Result<Q12PendingMap> {
+    let mut stream = engine
+        .scan_parquet_batches_row_filtered(
+            path,
+            batch_size,
+            projection,
+            q12_receiptdate_pruning_predicates(start_days, end_days),
+        )
+        .await?;
+    parallel_batch_fold_chunks(
+        &mut stream,
+        q12_lineitem_chunk_size(),
+        move |batches| {
+            let mut pending = q12_pending_map_new();
+            for batch in batches {
+                q12_merge_pending_orders(
+                    &mut pending,
+                    q12_filtered_lineitem_counts_projected_batch(
+                        batch, &shipmodes, start_days, end_days,
+                    )?,
+                );
+            }
+            Ok(pending)
+        },
+        q12_pending_map_new(),
+        q12_merge_pending_orders,
+        "Q12 lineitem row-filter aggregate",
+    )
+}
+
+async fn q12_filtered_lineitem_counts_row_group_map(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    projection: Projection,
+    shipmodes: Arc<Vec<String>>,
+    start_days: i32,
+    end_days: i32,
+) -> Result<Option<Vec<Q12PendingMap>>> {
+    let build_state = q12_pending_map_new;
+    let consume_batch = {
+        let shipmodes = shipmodes.clone();
+        move |batch, pending: &mut Q12PendingMap| {
+            q12_merge_pending_orders(
+                pending,
+                q12_filtered_lineitem_counts_projected_batch(
+                    batch, &shipmodes, start_days, end_days,
+                )?,
+            );
+            Ok(Some(()))
+        }
+    };
+    let finish = |pending| Ok(Some(pending));
+    if q12_lineitem_dictionary_shipmode_enabled()
+        && let Some(partials) = engine
+            .parquet_row_group_map_dictionary_columns_pruned(
+                path.clone(),
+                batch_size,
+                projection.clone(),
+                vec!["l_shipmode".to_string()],
+                q12_receiptdate_pruning_predicates(start_days, end_days),
+                q12_row_group_map_chunk(),
+                build_state,
+                consume_batch.clone(),
+                finish,
+            )
+            .await?
+    {
+        return Ok(Some(partials));
+    }
+    engine
+        .parquet_row_group_map(
+            path,
+            batch_size,
+            projection,
+            q12_row_group_map_chunk(),
+            build_state,
+            consume_batch,
+            finish,
+        )
+        .await
+}
+
 async fn q12_filtered_lineitem_counts_late_materialized(
     engine: &DodamEngine,
     path: PathBuf,
@@ -7775,7 +8329,7 @@ async fn q12_filtered_lineitem_counts_late_materialized(
     shipmodes: &[String],
     start_days: i32,
     end_days: i32,
-) -> Result<Option<HashMap<i64, Q12PendingOrder>>> {
+) -> Result<Option<Q12PendingMap>> {
     let predicate_projection = Projection::Columns(vec![
         "l_shipmode".to_string(),
         "l_commitdate".to_string(),
@@ -7794,7 +8348,8 @@ async fn q12_filtered_lineitem_counts_late_materialized(
             LateMaterializationPolicy::selective_with_selector_run_ratio(
                 q12_late_materialized_max_selected_ratio(),
                 q12_late_materialized_max_selector_run_ratio(),
-            ),
+            )
+            .with_selector_runs_per_selected(q12_late_materialized_max_runs_per_selected()),
             {
                 let shipmodes = shipmodes.clone();
                 move || Q12LateState {
@@ -7803,7 +8358,7 @@ async fn q12_filtered_lineitem_counts_late_materialized(
                     end_days,
                     selected_modes: Vec::new(),
                     selected_offset: 0,
-                    pending: HashMap::new(),
+                    pending: q12_pending_map_new(),
                 }
             },
             q12_late_build_selection_batch,
@@ -7821,7 +8376,7 @@ async fn q12_filtered_lineitem_counts_late_materialized(
     else {
         return Ok(None);
     };
-    let mut pending = HashMap::new();
+    let mut pending = q12_pending_map_new();
     let mut metrics = LateMaterializedMetrics::default();
     for chunk in chunks {
         q12_merge_pending_orders(&mut pending, chunk.output);
@@ -7847,7 +8402,7 @@ async fn q12_filtered_lineitem_counts_stream(
     shipmodes: Arc<Vec<String>>,
     start_days: i32,
     end_days: i32,
-) -> Result<HashMap<i64, Q12PendingOrder>> {
+) -> Result<Q12PendingMap> {
     let mut stream = engine
         .scan_parquet_batches(path, batch_size, None, projection, None)
         .await?;
@@ -7855,7 +8410,7 @@ async fn q12_filtered_lineitem_counts_stream(
         &mut stream,
         q12_lineitem_chunk_size(),
         move |batches| {
-            let mut pending = HashMap::<i64, Q12PendingOrder>::new();
+            let mut pending = q12_pending_map_new();
             for batch in batches {
                 q12_merge_pending_orders(
                     &mut pending,
@@ -7866,7 +8421,7 @@ async fn q12_filtered_lineitem_counts_stream(
             }
             Ok(pending)
         },
-        HashMap::<i64, Q12PendingOrder>::new(),
+        q12_pending_map_new(),
         q12_merge_pending_orders,
         "Q12 lineitem aggregate",
     )
@@ -7876,12 +8431,20 @@ fn q12_row_group_map_enabled() -> bool {
     std::env::var_os("DODAM_Q12_DISABLE_ROW_GROUP_MAP").is_none()
 }
 
+fn q12_lineitem_dictionary_shipmode_enabled() -> bool {
+    std::env::var_os("DODAM_Q12_DISABLE_LINEITEM_DICTIONARY_SHIPMODE").is_none()
+}
+
+fn q12_lineitem_row_filter_enabled() -> bool {
+    std::env::var_os("DODAM_Q12_ENABLE_LINEITEM_ROW_FILTER").is_some()
+}
+
 fn q12_row_group_map_chunk() -> usize {
     std::env::var("DODAM_Q12_ROW_GROUP_MAP_CHUNK")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(2)
+        .unwrap_or(1)
 }
 
 fn q12_late_materialized_enabled() -> bool {
@@ -7912,19 +8475,43 @@ fn q12_late_materialized_max_selector_run_ratio() -> f64 {
         .unwrap_or(0.50)
 }
 
-fn q12_filtered_lineitem_counts_batch(
+fn q12_late_materialized_max_runs_per_selected() -> f64 {
+    std::env::var("DODAM_Q12_LATE_MAX_RUNS_PER_SELECTED")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(1.25)
+}
+
+fn q12_receiptdate_pruning_predicates(start_days: i32, end_days: i32) -> Vec<Expr> {
+    vec![
+        Expr::Comparison(ComparisonExpr {
+            column: "l_receiptdate".to_string(),
+            op: ComparisonOp::GtEq,
+            value: LiteralValue::Int64(i64::from(start_days)),
+        }),
+        Expr::Comparison(ComparisonExpr {
+            column: "l_receiptdate".to_string(),
+            op: ComparisonOp::Lt,
+            value: LiteralValue::Int64(i64::from(end_days)),
+        }),
+    ]
+}
+
+fn q12_filtered_lineitem_counts_batch_into(
     batch: RecordBatch,
     shipmodes: &[String],
     start_days: i32,
     end_days: i32,
-) -> Result<HashMap<i64, Q12PendingOrder>> {
+    pending: &mut Q12PendingMap,
+) -> Result<()> {
     let orderkeys = batch_column(&batch, "l_orderkey")?;
     let modes = batch_string_column(&batch, "l_shipmode")?;
     let commitdates = batch_column(&batch, "l_commitdate")?;
     let receiptdates = batch_column(&batch, "l_receiptdate")?;
     let shipdates = batch_column(&batch, "l_shipdate")?;
     if q12_typed_loop_enabled()
-        && let Some(pending) = q12_filtered_lineitem_counts_batch_typed(
+        && q12_filtered_lineitem_counts_batch_typed_into(
             orderkeys,
             modes,
             commitdates,
@@ -7933,11 +8520,11 @@ fn q12_filtered_lineitem_counts_batch(
             shipmodes,
             start_days,
             end_days,
+            pending,
         )
     {
-        return Ok(pending);
+        return Ok(());
     }
-    let mut pending = HashMap::<i64, Q12PendingOrder>::new();
     for row in 0..batch.num_rows() {
         if modes.is_null(row) {
             continue;
@@ -7963,7 +8550,7 @@ fn q12_filtered_lineitem_counts_batch(
         }
         pending.entry(orderkey).or_default().counts[mode_index] += 1;
     }
-    Ok(pending)
+    Ok(())
 }
 
 fn q12_filtered_lineitem_counts_projected_batch(
@@ -7971,11 +8558,47 @@ fn q12_filtered_lineitem_counts_projected_batch(
     shipmodes: &[String],
     start_days: i32,
     end_days: i32,
-) -> Result<HashMap<i64, Q12PendingOrder>> {
+) -> Result<Q12PendingMap> {
+    let mut pending = q12_pending_map_new();
+    q12_filtered_lineitem_counts_projected_batch_into(
+        batch,
+        shipmodes,
+        start_days,
+        end_days,
+        &mut pending,
+    )?;
+    Ok(pending)
+}
+
+fn q12_filtered_lineitem_counts_projected_batch_into(
+    batch: RecordBatch,
+    shipmodes: &[String],
+    start_days: i32,
+    end_days: i32,
+    pending: &mut Q12PendingMap,
+) -> Result<()> {
+    if q12_typed_loop_enabled() {
+        let modes = batch_column(&batch, "l_shipmode")?;
+        if let Some(modes) = modes.as_any().downcast_ref::<DictionaryArray<Int32Type>>()
+            && q12_filtered_lineitem_counts_batch_dictionary_typed_into(
+                batch_column(&batch, "l_orderkey")?,
+                modes,
+                batch_column(&batch, "l_commitdate")?,
+                batch_column(&batch, "l_receiptdate")?,
+                batch_column(&batch, "l_shipdate")?,
+                shipmodes,
+                start_days,
+                end_days,
+                pending,
+            )
+        {
+            return Ok(());
+        }
+    }
     if batch.num_columns() == 5
         && let Some(modes) = batch.column(1).as_any().downcast_ref::<StringArray>()
         && q12_typed_loop_enabled()
-        && let Some(pending) = q12_filtered_lineitem_counts_batch_typed(
+        && q12_filtered_lineitem_counts_batch_typed_into(
             batch.column(0),
             modes,
             batch.column(2),
@@ -7984,15 +8607,157 @@ fn q12_filtered_lineitem_counts_projected_batch(
             shipmodes,
             start_days,
             end_days,
+            pending,
         )
     {
-        return Ok(pending);
+        return Ok(());
     }
-    q12_filtered_lineitem_counts_batch(batch, shipmodes, start_days, end_days)
+    q12_filtered_lineitem_counts_batch_into(batch, shipmodes, start_days, end_days, pending)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn q12_filtered_lineitem_counts_batch_typed(
+fn q12_filtered_lineitem_counts_batch_dictionary_typed_into(
+    orderkeys: &ArrayRef,
+    modes: &DictionaryArray<Int32Type>,
+    commitdates: &ArrayRef,
+    receiptdates: &ArrayRef,
+    shipdates: &ArrayRef,
+    shipmodes: &[String],
+    start_days: i32,
+    end_days: i32,
+    pending: &mut Q12PendingMap,
+) -> bool {
+    let (Some(orderkeys), Some(commitdates), Some(receiptdates), Some(shipdates)) = (
+        orderkeys.as_any().downcast_ref::<Int64Array>(),
+        commitdates.as_any().downcast_ref::<Date32Array>(),
+        receiptdates.as_any().downcast_ref::<Date32Array>(),
+        shipdates.as_any().downcast_ref::<Date32Array>(),
+    ) else {
+        return false;
+    };
+    let [left_mode, right_mode] = shipmodes else {
+        return false;
+    };
+    let Some(mode_values) = q12_dictionary_string_values(modes) else {
+        return false;
+    };
+    let left_key = q12_dictionary_key_for_value(&mode_values, left_mode.as_bytes());
+    let right_key = q12_dictionary_key_for_value(&mode_values, right_mode.as_bytes());
+    let mode_keys = modes.keys().values().as_ref();
+    if orderkeys.null_count() == 0
+        && modes.null_count() == 0
+        && commitdates.null_count() == 0
+        && receiptdates.null_count() == 0
+        && shipdates.null_count() == 0
+    {
+        let orderkey_values = orderkeys.values().as_ref();
+        let commitdate_values = commitdates.values().as_ref();
+        let receiptdate_values = receiptdates.values().as_ref();
+        let shipdate_values = shipdates.values().as_ref();
+        for row in 0..orderkeys.len() {
+            let commitdate = commitdate_values[row];
+            let receiptdate = receiptdate_values[row];
+            if commitdate >= receiptdate
+                || shipdate_values[row] >= commitdate
+                || receiptdate < start_days
+                || receiptdate >= end_days
+            {
+                continue;
+            }
+            let mode_index = if Some(mode_keys[row]) == left_key {
+                0
+            } else if Some(mode_keys[row]) == right_key {
+                1
+            } else {
+                continue;
+            };
+            pending.entry(orderkey_values[row]).or_default().counts[mode_index] += 1;
+        }
+        return true;
+    }
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row)
+            || modes.is_null(row)
+            || commitdates.is_null(row)
+            || receiptdates.is_null(row)
+            || shipdates.is_null(row)
+        {
+            continue;
+        }
+        let commitdate = commitdates.value(row);
+        let receiptdate = receiptdates.value(row);
+        if commitdate >= receiptdate
+            || shipdates.value(row) >= commitdate
+            || receiptdate < start_days
+            || receiptdate >= end_days
+        {
+            continue;
+        }
+        let mode_key = mode_keys[row];
+        let mode_index = if Some(mode_key) == left_key {
+            0
+        } else if Some(mode_key) == right_key {
+            1
+        } else {
+            continue;
+        };
+        pending.entry(orderkeys.value(row)).or_default().counts[mode_index] += 1;
+    }
+    true
+}
+
+enum Q12DictionaryStringValues<'a> {
+    Utf8(&'a StringArray),
+    LargeUtf8(&'a LargeStringArray),
+}
+
+impl Q12DictionaryStringValues<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Utf8(values) => values.len(),
+            Self::LargeUtf8(values) => values.len(),
+        }
+    }
+
+    fn value_bytes(&self, index: usize) -> &[u8] {
+        match self {
+            Self::Utf8(values) => {
+                bytes_string_parts(values.value_offsets(), values.value_data(), index)
+            }
+            Self::LargeUtf8(values) => {
+                bytes_large_string_parts(values.value_offsets(), values.value_data(), index)
+            }
+        }
+    }
+}
+
+fn q12_dictionary_string_values(
+    modes: &DictionaryArray<Int32Type>,
+) -> Option<Q12DictionaryStringValues<'_>> {
+    if let Some(values) = modes.values().as_any().downcast_ref::<StringArray>() {
+        return Some(Q12DictionaryStringValues::Utf8(values));
+    }
+    modes
+        .values()
+        .as_any()
+        .downcast_ref::<LargeStringArray>()
+        .map(Q12DictionaryStringValues::LargeUtf8)
+}
+
+fn q12_dictionary_key_for_value(
+    values: &Q12DictionaryStringValues<'_>,
+    target: &[u8],
+) -> Option<i32> {
+    for index in 0..values.len() {
+        if values.value_bytes(index) == target {
+            return i32::try_from(index).ok();
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q12_filtered_lineitem_counts_batch_typed_into(
     orderkeys: &ArrayRef,
     modes: &StringArray,
     commitdates: &ArrayRef,
@@ -8001,23 +8766,23 @@ fn q12_filtered_lineitem_counts_batch_typed(
     shipmodes: &[String],
     start_days: i32,
     end_days: i32,
-) -> Option<HashMap<i64, Q12PendingOrder>> {
+    pending: &mut Q12PendingMap,
+) -> bool {
     let (Some(orderkeys), Some(commitdates), Some(receiptdates), Some(shipdates)) = (
         orderkeys.as_any().downcast_ref::<Int64Array>(),
         commitdates.as_any().downcast_ref::<Date32Array>(),
         receiptdates.as_any().downcast_ref::<Date32Array>(),
         shipdates.as_any().downcast_ref::<Date32Array>(),
     ) else {
-        return None;
+        return false;
     };
     let [left_mode, right_mode] = shipmodes else {
-        return None;
+        return false;
     };
     let left_mode = left_mode.as_bytes();
     let right_mode = right_mode.as_bytes();
     let mode_offsets = modes.value_offsets();
     let mode_data = modes.value_data();
-    let mut pending = HashMap::<i64, Q12PendingOrder>::new();
     if orderkeys.null_count() == 0
         && modes.null_count() == 0
         && commitdates.null_count() == 0
@@ -8048,7 +8813,7 @@ fn q12_filtered_lineitem_counts_batch_typed(
             };
             pending.entry(orderkey_values[row]).or_default().counts[mode_index] += 1;
         }
-        return Some(pending);
+        return true;
     }
     for row in 0..orderkeys.len() {
         if orderkeys.is_null(row)
@@ -8078,7 +8843,7 @@ fn q12_filtered_lineitem_counts_batch_typed(
         };
         pending.entry(orderkeys.value(row)).or_default().counts[mode_index] += 1;
     }
-    Some(pending)
+    true
 }
 
 fn q12_shipmode_index(shipmodes: &[String], mode: &str) -> Option<usize> {
@@ -8099,7 +8864,7 @@ struct Q12LateState {
     end_days: i32,
     selected_modes: Vec<u8>,
     selected_offset: usize,
-    pending: HashMap<i64, Q12PendingOrder>,
+    pending: Q12PendingMap,
 }
 
 fn q12_late_build_selection_batch(
@@ -8210,10 +8975,7 @@ fn q12_log_late_materialized_profile(metrics: LateMaterializedMetrics, row_group
     );
 }
 
-fn q12_merge_pending_orders(
-    pending: &mut HashMap<i64, Q12PendingOrder>,
-    batch_pending: HashMap<i64, Q12PendingOrder>,
-) {
+fn q12_merge_pending_orders(pending: &mut Q12PendingMap, batch_pending: Q12PendingMap) {
     for (orderkey, order) in batch_pending {
         let target = pending.entry(orderkey).or_default();
         for index in 0..target.counts.len() {
@@ -8227,8 +8989,18 @@ async fn q12_shipping_mode_counts_from_orders(
     path: PathBuf,
     batch_size: usize,
     shipmodes: &[String],
-    pending: &HashMap<i64, Q12PendingOrder>,
+    pending: &Q12PendingMap,
 ) -> Result<Vec<Q12Row>> {
+    if q12_order_direct_column_reader_enabled()
+        && let Some(rows) = q12_shipping_mode_counts_from_orders_direct(
+            path.clone(),
+            batch_size,
+            shipmodes,
+            pending,
+        )?
+    {
+        return Ok(rows);
+    }
     if q12_order_late_materialized_enabled()
         && let Some(rows) = q12_shipping_mode_counts_from_orders_late(
             engine,
@@ -8240,6 +9012,12 @@ async fn q12_shipping_mode_counts_from_orders(
         .await?
     {
         return Ok(rows);
+    }
+    if q12_order_sorted_pending_lookup_enabled() {
+        return q12_shipping_mode_counts_from_orders_sorted(
+            engine, path, batch_size, shipmodes, pending,
+        )
+        .await;
     }
     if q12_order_fused_scan_enabled()
         && !q12_order_row_filter_enabled()
@@ -8279,6 +9057,15 @@ async fn q12_shipping_mode_counts_from_orders(
                 pending.keys().copied().collect(),
             )
             .await?
+    } else if q12_order_dictionary_priority_enabled() {
+        engine
+            .scan_parquet_batches_dictionary_columns(
+                path,
+                batch_size,
+                projection,
+                vec!["o_orderpriority".to_string()],
+            )
+            .await?
     } else {
         engine
             .scan_parquet_batches(path, batch_size, None, projection, None)
@@ -8286,10 +9073,22 @@ async fn q12_shipping_mode_counts_from_orders(
     };
     let pending = Arc::new(AdaptiveI64Map::from_hash((*pending).clone()));
     let collect_profile = tpch_profile_enabled();
-    let partial = parallel_batch_fold(
+    let partial = parallel_batch_fold_chunks(
         &mut stream,
-        move |batch| {
-            q12_shipping_mode_counts_projected_batch_partial(batch, &pending, collect_profile)
+        q12_order_chunk_size(),
+        move |batches| {
+            let mut partial = Q12OrdersPartial::default();
+            for batch in batches {
+                q12_merge_orders_partial(
+                    &mut partial,
+                    q12_shipping_mode_counts_projected_batch_partial(
+                        batch,
+                        &pending,
+                        collect_profile,
+                    )?,
+                );
+            }
+            Ok(partial)
         },
         Q12OrdersPartial::default(),
         q12_merge_orders_partial,
@@ -8309,38 +9108,100 @@ async fn q12_shipping_mode_counts_from_orders(
     Ok(rows)
 }
 
+async fn q12_shipping_mode_counts_from_orders_sorted(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    shipmodes: &[String],
+    pending: &Q12PendingMap,
+) -> Result<Vec<Q12Row>> {
+    let projection = Projection::Columns(vec![
+        "o_orderkey".to_string(),
+        "o_orderpriority".to_string(),
+    ]);
+    let mut stream = engine
+        .scan_parquet_batches(path, batch_size, None, projection, None)
+        .await?;
+    let pending = Arc::new(SortedI64Lookup::from_hash_map(pending));
+    let groups = parallel_batch_fold_chunks(
+        &mut stream,
+        q12_order_chunk_size(),
+        move |batches| {
+            let mut groups = [Q12State::default(); 2];
+            for batch in batches {
+                q12_merge_shipping_mode_counts(
+                    &mut groups,
+                    q12_shipping_mode_counts_projected_batch_sorted(batch, &pending)?,
+                );
+            }
+            Ok(groups)
+        },
+        [Q12State::default(); 2],
+        q12_merge_shipping_mode_counts,
+        "Q12 orders sorted aggregate",
+    )?;
+    Ok(groups
+        .into_iter()
+        .enumerate()
+        .map(|(index, state)| Q12Row {
+            shipmode: shipmodes[index].clone(),
+            high_line_count: state.high_line_count,
+            low_line_count: state.low_line_count,
+        })
+        .collect())
+}
+
 async fn q12_shipping_mode_counts_from_orders_fused(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
     shipmodes: &[String],
-    pending: &HashMap<i64, Q12PendingOrder>,
+    pending: &Q12PendingMap,
 ) -> Result<Option<Vec<Q12Row>>> {
     let pending = Arc::new(AdaptiveI64Map::from_hash((*pending).clone()));
-    let Some(partials) = engine
-        .parquet_row_group_map(
-            path,
-            batch_size,
-            Projection::Columns(vec![
-                "o_orderkey".to_string(),
-                "o_orderpriority".to_string(),
-            ]),
-            q12_order_fused_row_group_chunk(),
-            || [Q12State::default(); 2],
-            {
-                let pending = pending.clone();
-                move |batch, groups| {
-                    q12_merge_shipping_mode_counts(
-                        groups,
-                        q12_shipping_mode_counts_projected_batch(batch, &pending)?,
-                    );
-                    Ok(Some(()))
-                }
-            },
-            |groups| Ok(Some(groups)),
-        )
-        .await?
-    else {
+    let projection = Projection::Columns(vec![
+        "o_orderkey".to_string(),
+        "o_orderpriority".to_string(),
+    ]);
+    let build_state = || [Q12State::default(); 2];
+    let consume_batch = {
+        let pending = pending.clone();
+        move |batch, groups: &mut [Q12State; 2]| {
+            q12_merge_shipping_mode_counts(
+                groups,
+                q12_shipping_mode_counts_projected_batch(batch, &pending)?,
+            );
+            Ok(Some(()))
+        }
+    };
+    let finish = |groups| Ok(Some(groups));
+    let partials = if q12_order_dictionary_priority_enabled() {
+        engine
+            .parquet_row_group_map_dictionary_columns(
+                path,
+                batch_size,
+                projection,
+                vec!["o_orderpriority".to_string()],
+                q12_order_fused_row_group_chunk(),
+                build_state,
+                consume_batch,
+                finish,
+            )
+            .await?
+    } else {
+        engine
+            .parquet_row_group_map(
+                path,
+                batch_size,
+                projection,
+                q12_order_fused_row_group_chunk(),
+                build_state,
+                consume_batch,
+                finish,
+            )
+            .await?
+    };
+    let Some(partials) = partials else {
         return Ok(None);
     };
     let mut groups = [Q12State::default(); 2];
@@ -8360,12 +9221,390 @@ async fn q12_shipping_mode_counts_from_orders_fused(
     ))
 }
 
+fn q12_shipping_mode_counts_from_orders_direct(
+    path: PathBuf,
+    batch_size: usize,
+    shipmodes: &[String],
+    pending: &Q12PendingMap,
+) -> Result<Option<Vec<Q12Row>>> {
+    let started = tpch_profile_start();
+    let file = File::open(&path)?;
+    let reader = Arc::new(SerializedFileReader::new(file)?);
+    let Some((orderkey_column, priority_column)) = q12_order_direct_column_indices(&reader) else {
+        return Ok(None);
+    };
+    let row_groups = (0..reader.metadata().num_row_groups()).collect::<Vec<_>>();
+    let pending = Arc::new(AdaptiveI64Map::from_hash(pending.clone()));
+    let chunks = row_groups
+        .chunks(q12_order_direct_row_group_chunk())
+        .map(|chunk| chunk.to_vec())
+        .collect::<Vec<_>>();
+    let profile = tpch_profile_enabled();
+    let partials = chunks
+        .into_par_iter()
+        .map(|row_groups| {
+            q12_order_direct_row_group_chunk_scan(
+                path.clone(),
+                batch_size,
+                row_groups,
+                orderkey_column,
+                priority_column,
+                pending.clone(),
+                profile,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut groups = [Q12State::default(); 2];
+    let mut metrics = Q12OrderDirectMetrics::default();
+    for partial in partials {
+        let Some(partial) = partial else {
+            return Ok(None);
+        };
+        q12_merge_shipping_mode_counts(&mut groups, partial.groups);
+        metrics.add(partial.metrics);
+    }
+    if let Some(started) = started {
+        eprintln!(
+            "[dodam:tpch-profile] Q12 orders direct_column_reader: total={:.3} ms row_groups={} batches={} rows={} hits={} misses={} payload_runs={} selective_batches={} full_batches={} read={:.3} ms consume={:.3} ms",
+            started.elapsed().as_secs_f64() * 1000.0,
+            metrics.row_groups,
+            metrics.batches,
+            metrics.rows,
+            metrics.hits,
+            metrics.misses,
+            metrics.payload_runs,
+            metrics.selective_batches,
+            metrics.full_batches,
+            sql_nanos_to_millis(metrics.read_nanos),
+            sql_nanos_to_millis(metrics.consume_nanos),
+        );
+    }
+    Ok(Some(
+        groups
+            .into_iter()
+            .enumerate()
+            .map(|(index, state)| Q12Row {
+                shipmode: shipmodes[index].clone(),
+                high_line_count: state.high_line_count,
+                low_line_count: state.low_line_count,
+            })
+            .collect(),
+    ))
+}
+
+fn q12_order_direct_column_indices(reader: &SerializedFileReader<File>) -> Option<(usize, usize)> {
+    let columns = reader.metadata().file_metadata().schema_descr().columns();
+    let orderkey = columns
+        .iter()
+        .position(|column| column.name() == "o_orderkey")?;
+    let priority = columns
+        .iter()
+        .position(|column| column.name() == "o_orderpriority")?;
+    Some((orderkey, priority))
+}
+
+fn q12_order_direct_row_group_chunk() -> usize {
+    std::env::var("DODAM_Q12_ORDER_DIRECT_ROW_GROUP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4)
+}
+
+#[derive(Default)]
+struct Q12OrderDirectPartial {
+    groups: [Q12State; 2],
+    metrics: Q12OrderDirectMetrics,
+}
+
+#[derive(Default)]
+struct Q12OrderDirectMetrics {
+    row_groups: usize,
+    batches: usize,
+    rows: usize,
+    hits: usize,
+    misses: usize,
+    payload_runs: usize,
+    selective_batches: usize,
+    full_batches: usize,
+    read_nanos: u64,
+    consume_nanos: u64,
+}
+
+impl Q12OrderDirectMetrics {
+    fn add(&mut self, other: Self) {
+        self.row_groups = self.row_groups.saturating_add(other.row_groups);
+        self.batches = self.batches.saturating_add(other.batches);
+        self.rows = self.rows.saturating_add(other.rows);
+        self.hits = self.hits.saturating_add(other.hits);
+        self.misses = self.misses.saturating_add(other.misses);
+        self.payload_runs = self.payload_runs.saturating_add(other.payload_runs);
+        self.selective_batches = self
+            .selective_batches
+            .saturating_add(other.selective_batches);
+        self.full_batches = self.full_batches.saturating_add(other.full_batches);
+        self.read_nanos = self.read_nanos.saturating_add(other.read_nanos);
+        self.consume_nanos = self.consume_nanos.saturating_add(other.consume_nanos);
+    }
+}
+
+fn q12_order_direct_row_group_chunk_scan(
+    path: PathBuf,
+    batch_size: usize,
+    row_groups: Vec<usize>,
+    orderkey_column: usize,
+    priority_column: usize,
+    pending: Arc<AdaptiveI64Map<Q12PendingOrder>>,
+    profile: bool,
+) -> Result<Option<Q12OrderDirectPartial>> {
+    let started = profile.then(Instant::now);
+    let file = File::open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    let mut partial = Q12OrderDirectPartial::default();
+    partial.metrics.row_groups = row_groups.len();
+    for row_group_index in row_groups {
+        let row_group = reader.get_row_group(row_group_index)?;
+        let mut orderkey_reader = match row_group.get_column_reader(orderkey_column)? {
+            ColumnReader::Int64ColumnReader(reader) => reader,
+            _ => return Ok(None),
+        };
+        let mut priority_reader = match row_group.get_column_reader(priority_column)? {
+            ColumnReader::ByteArrayColumnReader(reader) => reader,
+            _ => return Ok(None),
+        };
+        let mut orderkeys = Vec::<i64>::with_capacity(batch_size);
+        let mut priorities = Vec::<parquet::data_type::ByteArray>::with_capacity(batch_size);
+        let mut orderkey_def_levels = Vec::<i16>::with_capacity(batch_size);
+        let mut priority_def_levels = Vec::<i16>::with_capacity(batch_size);
+        let mut hits = Vec::<(usize, Q12PendingOrder)>::with_capacity(batch_size.min(1024));
+        loop {
+            orderkeys.clear();
+            priorities.clear();
+            orderkey_def_levels.clear();
+            priority_def_levels.clear();
+            hits.clear();
+            let key_read_started = Instant::now();
+            let (order_records, order_values, _) = orderkey_reader.read_records(
+                batch_size,
+                Some(&mut orderkey_def_levels),
+                None,
+                &mut orderkeys,
+            )?;
+            partial.metrics.read_nanos = partial
+                .metrics
+                .read_nanos
+                .saturating_add(sql_elapsed_nanos(key_read_started));
+            if order_records == 0 {
+                break;
+            }
+            if order_values != order_records {
+                return Ok(None);
+            }
+            partial.metrics.batches += 1;
+            partial.metrics.rows = partial.metrics.rows.saturating_add(order_records);
+            let consume_started = Instant::now();
+            for row in 0..order_records {
+                let Some(order) = pending.get(orderkeys[row]) else {
+                    partial.metrics.misses += 1;
+                    continue;
+                };
+                partial.metrics.hits += 1;
+                hits.push((row, order));
+            }
+            partial.metrics.consume_nanos = partial
+                .metrics
+                .consume_nanos
+                .saturating_add(sql_elapsed_nanos(consume_started));
+            let payload_read_started = Instant::now();
+            if hits.is_empty() {
+                let skipped = priority_reader.skip_records(order_records)?;
+                if skipped != order_records {
+                    return Ok(None);
+                }
+                partial.metrics.read_nanos = partial
+                    .metrics
+                    .read_nanos
+                    .saturating_add(sql_elapsed_nanos(payload_read_started));
+                continue;
+            }
+            let payload_runs = q12_order_direct_payload_runs(&hits);
+            partial.metrics.payload_runs =
+                partial.metrics.payload_runs.saturating_add(payload_runs);
+            if payload_runs > q12_order_direct_max_selective_runs_per_batch() {
+                partial.metrics.full_batches = partial.metrics.full_batches.saturating_add(1);
+                priorities.clear();
+                priority_def_levels.clear();
+                let (priority_records, priority_values, priority_levels) = priority_reader
+                    .read_records(
+                        order_records,
+                        Some(&mut priority_def_levels),
+                        None,
+                        &mut priorities,
+                    )?;
+                if priority_records != order_records || priority_levels != order_records {
+                    return Ok(None);
+                }
+                partial.metrics.read_nanos = partial
+                    .metrics
+                    .read_nanos
+                    .saturating_add(sql_elapsed_nanos(payload_read_started));
+                let consume_started = Instant::now();
+                if priority_values == order_records {
+                    for &(row, order) in &hits {
+                        let is_high_priority = q12_is_high_priority_bytes(priorities[row].data());
+                        q12_apply_pending_order(&mut partial.groups, order, is_high_priority);
+                    }
+                } else {
+                    let mut value_row = vec![None; order_records];
+                    let mut value_index = 0usize;
+                    for row in 0..order_records {
+                        let Some(level) = priority_def_levels.get(row) else {
+                            return Ok(None);
+                        };
+                        if *level == 0 {
+                            continue;
+                        }
+                        value_row[row] = Some(value_index);
+                        value_index += 1;
+                    }
+                    if value_index != priority_values {
+                        return Ok(None);
+                    }
+                    for &(row, order) in &hits {
+                        let Some(value_index) = value_row[row] else {
+                            continue;
+                        };
+                        let Some(priority) = priorities.get(value_index) else {
+                            return Ok(None);
+                        };
+                        let is_high_priority = q12_is_high_priority_bytes(priority.data());
+                        q12_apply_pending_order(&mut partial.groups, order, is_high_priority);
+                    }
+                }
+                partial.metrics.consume_nanos = partial
+                    .metrics
+                    .consume_nanos
+                    .saturating_add(sql_elapsed_nanos(consume_started));
+                continue;
+            }
+            partial.metrics.selective_batches = partial.metrics.selective_batches.saturating_add(1);
+            let mut cursor = 0usize;
+            let mut hit_index = 0usize;
+            while hit_index < hits.len() {
+                let start = hits[hit_index].0;
+                let mut end_index = hit_index + 1;
+                while end_index < hits.len() && hits[end_index].0 == hits[end_index - 1].0 + 1 {
+                    end_index += 1;
+                }
+                let run_len = end_index - hit_index;
+                if start > cursor {
+                    let skipped = priority_reader.skip_records(start - cursor)?;
+                    if skipped != start - cursor {
+                        return Ok(None);
+                    }
+                }
+                priorities.clear();
+                priority_def_levels.clear();
+                let (priority_records, priority_values, priority_levels) = priority_reader
+                    .read_records(
+                        run_len,
+                        Some(&mut priority_def_levels),
+                        None,
+                        &mut priorities,
+                    )?;
+                if priority_records != run_len || priority_levels != run_len {
+                    return Ok(None);
+                }
+                let consume_started = Instant::now();
+                if priority_values == run_len {
+                    for (offset, hit) in hits[hit_index..end_index].iter().enumerate() {
+                        let is_high_priority =
+                            q12_is_high_priority_bytes(priorities[offset].data());
+                        q12_apply_pending_order(&mut partial.groups, hit.1, is_high_priority);
+                    }
+                } else {
+                    let mut value_index = 0usize;
+                    for hit in &hits[hit_index..end_index] {
+                        let Some(level) = priority_def_levels.get(hit.0 - start) else {
+                            return Ok(None);
+                        };
+                        if *level == 0 {
+                            continue;
+                        }
+                        let Some(priority) = priorities.get(value_index) else {
+                            return Ok(None);
+                        };
+                        value_index += 1;
+                        let is_high_priority = q12_is_high_priority_bytes(priority.data());
+                        q12_apply_pending_order(&mut partial.groups, hit.1, is_high_priority);
+                    }
+                    if value_index != priority_values {
+                        return Ok(None);
+                    }
+                }
+                partial.metrics.consume_nanos = partial
+                    .metrics
+                    .consume_nanos
+                    .saturating_add(sql_elapsed_nanos(consume_started));
+                cursor = start + run_len;
+                hit_index = end_index;
+            }
+            if cursor < order_records {
+                let skipped = priority_reader.skip_records(order_records - cursor)?;
+                if skipped != order_records - cursor {
+                    return Ok(None);
+                }
+            }
+            partial.metrics.read_nanos = partial
+                .metrics
+                .read_nanos
+                .saturating_add(sql_elapsed_nanos(payload_read_started));
+        }
+    }
+    if let Some(started) = started {
+        eprintln!(
+            "[dodam:tpch-profile] Q12 orders direct_column_chunk: row_groups={} rows={} hits={} misses={} payload_runs={} selective_batches={} full_batches={} elapsed={:.3} ms read={:.3} ms consume={:.3} ms",
+            partial.metrics.row_groups,
+            partial.metrics.rows,
+            partial.metrics.hits,
+            partial.metrics.misses,
+            partial.metrics.payload_runs,
+            partial.metrics.selective_batches,
+            partial.metrics.full_batches,
+            started.elapsed().as_secs_f64() * 1000.0,
+            sql_nanos_to_millis(partial.metrics.read_nanos),
+            sql_nanos_to_millis(partial.metrics.consume_nanos),
+        );
+    }
+    Ok(Some(partial))
+}
+
+fn q12_order_direct_payload_runs(hits: &[(usize, Q12PendingOrder)]) -> usize {
+    if hits.is_empty() {
+        return 0;
+    }
+    let mut runs = 1usize;
+    for index in 1..hits.len() {
+        if hits[index].0 != hits[index - 1].0 + 1 {
+            runs += 1;
+        }
+    }
+    runs
+}
+
+fn q12_order_direct_max_selective_runs_per_batch() -> usize {
+    std::env::var("DODAM_Q12_ORDER_DIRECT_MAX_SELECTIVE_RUNS_PER_BATCH")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(64)
+}
+
 async fn q12_shipping_mode_counts_from_orders_late(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
     shipmodes: &[String],
-    pending: &HashMap<i64, Q12PendingOrder>,
+    pending: &Q12PendingMap,
 ) -> Result<Option<Vec<Q12Row>>> {
     let pending = Arc::new(AdaptiveI64Map::from_hash((*pending).clone()));
     let Some(chunks) = engine
@@ -8420,10 +9659,6 @@ async fn q12_shipping_mode_counts_from_orders_late(
     ))
 }
 
-fn q12_order_row_filter_enabled() -> bool {
-    std::env::var_os("DODAM_Q12_ENABLE_ORDER_ROW_FILTER").is_some()
-}
-
 fn q12_order_bloom_filter_enabled() -> bool {
     std::env::var_os("DODAM_Q12_ENABLE_ORDER_BLOOM_FILTER").is_some()
 }
@@ -8432,12 +9667,32 @@ fn q12_order_fused_scan_enabled() -> bool {
     std::env::var_os("DODAM_Q12_ENABLE_ORDER_FUSED_SCAN").is_some()
 }
 
+fn q12_order_dictionary_priority_enabled() -> bool {
+    std::env::var_os("DODAM_Q12_ENABLE_ORDER_DICTIONARY_PRIORITY").is_some()
+}
+
+fn q12_order_sorted_pending_lookup_enabled() -> bool {
+    std::env::var_os("DODAM_Q12_DISABLE_SORTED_PENDING_LOOKUP").is_none()
+}
+
+fn q12_order_direct_column_reader_enabled() -> bool {
+    std::env::var_os("DODAM_Q12_ENABLE_ORDER_DIRECT_COLUMN_READER").is_some()
+}
+
+fn q12_order_chunk_size() -> usize {
+    std::env::var("DODAM_Q12_ORDER_CHUNK_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2)
+}
+
 fn q12_order_fused_row_group_chunk() -> usize {
     std::env::var("DODAM_Q12_ORDER_FUSED_ROW_GROUP_CHUNK")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(4)
+        .unwrap_or(2)
 }
 
 fn q12_order_late_materialized_enabled() -> bool {
@@ -8450,6 +9705,10 @@ fn q12_order_late_materialized_row_group_chunk() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(4)
+}
+
+fn q12_order_row_filter_enabled() -> bool {
+    std::env::var_os("DODAM_Q12_ENABLE_ORDER_ROW_FILTER").is_some()
 }
 
 struct Q12OrderLateState {
@@ -8514,10 +9773,18 @@ fn q12_order_late_consume_priority_batch(
             continue;
         }
         let priority = bytes_string_parts(priority_offsets, priority_data, row);
-        let is_high_priority = matches!(priority, b"1-URGENT" | b"2-HIGH");
+        let is_high_priority = q12_is_high_priority_bytes(priority);
         q12_apply_pending_order(&mut state.groups, order, is_high_priority);
     }
     Ok(Some(()))
+}
+
+fn q12_is_high_priority_str(priority: &str) -> bool {
+    q12_is_high_priority_bytes(priority.as_bytes())
+}
+
+fn q12_is_high_priority_bytes(priority: &[u8]) -> bool {
+    matches!(priority.first(), Some(b'1' | b'2')) && matches!(priority, b"1-URGENT" | b"2-HIGH")
 }
 
 fn q12_log_order_late_materialized_profile(
@@ -8561,7 +9828,7 @@ fn q12_shipping_mode_counts_batch(
         let Some(order) = pending.get(orderkey) else {
             continue;
         };
-        let is_high_priority = matches!(orderpriorities.value(row), "1-URGENT" | "2-HIGH");
+        let is_high_priority = q12_is_high_priority_str(orderpriorities.value(row));
         for (index, count) in order.counts.iter().copied().enumerate() {
             if count == 0 {
                 continue;
@@ -8589,7 +9856,52 @@ fn q12_shipping_mode_counts_projected_batch(
     {
         return Ok(groups);
     }
+    if batch.num_columns() == 2
+        && let Some(orderpriorities) = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+        && q12_typed_loop_enabled()
+        && let Some(groups) = q12_shipping_mode_counts_batch_dictionary_typed(
+            batch.column(0),
+            orderpriorities,
+            pending,
+        )
+    {
+        return Ok(groups);
+    }
     q12_shipping_mode_counts_batch(batch, pending)
+}
+
+fn q12_shipping_mode_counts_projected_batch_sorted(
+    batch: RecordBatch,
+    pending: &SortedI64Lookup<Q12PendingOrder>,
+) -> Result<[Q12State; 2]> {
+    if batch.num_columns() == 2
+        && let Some(orderpriorities) = batch.column(1).as_any().downcast_ref::<StringArray>()
+        && q12_typed_loop_enabled()
+        && let Some(groups) =
+            q12_shipping_mode_counts_batch_typed_sorted(batch.column(0), orderpriorities, pending)
+    {
+        return Ok(groups);
+    }
+    let orderkeys = batch_column(&batch, "o_orderkey")?;
+    let orderpriorities = batch_string_column(&batch, "o_orderpriority")?;
+    let mut groups = [Q12State::default(); 2];
+    for row in 0..batch.num_rows() {
+        if orderpriorities.is_null(row) {
+            continue;
+        }
+        let Some(orderkey) = numeric_i64_value(orderkeys, row)? else {
+            continue;
+        };
+        let Some(order) = pending.get(orderkey) else {
+            continue;
+        };
+        let is_high_priority = q12_is_high_priority_str(orderpriorities.value(row));
+        q12_apply_pending_order(&mut groups, order, is_high_priority);
+    }
+    Ok(groups)
 }
 
 fn q12_shipping_mode_counts_projected_batch_partial(
@@ -8613,6 +9925,29 @@ fn q12_shipping_mode_counts_projected_batch_partial(
     {
         partial.profile.total_nanos = sql_elapsed_nanos(started);
         return Ok(partial);
+    }
+    if batch.num_columns() == 2
+        && let Some(orderpriorities) = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+        && q12_typed_loop_enabled()
+        && let Some(groups) = q12_shipping_mode_counts_batch_dictionary_typed(
+            batch.column(0),
+            orderpriorities,
+            pending,
+        )
+    {
+        return Ok(Q12OrdersPartial {
+            groups,
+            profile: Q12OrdersProfile {
+                batches: 1,
+                typed_batches: 1,
+                rows,
+                total_nanos: sql_elapsed_nanos(started),
+                ..Default::default()
+            },
+        });
     }
     let groups = q12_shipping_mode_counts_batch(batch, pending)?;
     let profile = Q12OrdersProfile {
@@ -8682,7 +10017,7 @@ fn q12_profile_priority(
         profile.priority_samples += 1;
         let started = Instant::now();
         let priority = bytes_string_parts(priority_offsets, priority_data, row);
-        let is_high_priority = matches!(priority, b"1-URGENT" | b"2-HIGH");
+        let is_high_priority = q12_is_high_priority_bytes(priority);
         profile.priority_nanos = profile
             .priority_nanos
             .saturating_add(sql_elapsed_nanos(started));
@@ -8690,7 +10025,7 @@ fn q12_profile_priority(
         return is_high_priority;
     }
     let priority = bytes_string_parts(priority_offsets, priority_data, row);
-    let is_high_priority = matches!(priority, b"1-URGENT" | b"2-HIGH");
+    let is_high_priority = q12_is_high_priority_bytes(priority);
     profile.priority_rows += 1;
     is_high_priority
 }
@@ -8782,6 +10117,63 @@ fn q12_shipping_mode_counts_batch_typed_profile(
     Some(Q12OrdersPartial { groups, profile })
 }
 
+fn q12_shipping_mode_counts_batch_dictionary_typed(
+    orderkeys: &ArrayRef,
+    orderpriorities: &DictionaryArray<Int32Type>,
+    pending: &AdaptiveI64Map<Q12PendingOrder>,
+) -> Option<[Q12State; 2]> {
+    let orderkeys = orderkeys.as_any().downcast_ref::<Int64Array>()?;
+    let priority_values = orderpriorities
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()?;
+    let priority_offsets = priority_values.value_offsets();
+    let priority_data = priority_values.value_data();
+    let priority_keys = orderpriorities.keys().values().as_ref();
+    let mut groups = [Q12State::default(); 2];
+    if orderkeys.null_count() == 0 && orderpriorities.null_count() == 0 {
+        let orderkey_values = orderkeys.values().as_ref();
+        if let Some((pending_values, pending_present)) = pending.dense_slices() {
+            for row in 0..orderkey_values.len() {
+                let Ok(index) = usize::try_from(orderkey_values[row]) else {
+                    continue;
+                };
+                if index >= pending_present.len() || !pending_present[index] {
+                    continue;
+                }
+                let priority_index = usize::try_from(priority_keys[row]).ok()?;
+                let priority = bytes_string_parts(priority_offsets, priority_data, priority_index);
+                let is_high_priority = q12_is_high_priority_bytes(priority);
+                q12_apply_pending_order(&mut groups, pending_values[index], is_high_priority);
+            }
+            return Some(groups);
+        }
+        for row in 0..orderkey_values.len() {
+            let Some(order) = pending.get(orderkey_values[row]) else {
+                continue;
+            };
+            let priority_index = usize::try_from(priority_keys[row]).ok()?;
+            let priority = bytes_string_parts(priority_offsets, priority_data, priority_index);
+            let is_high_priority = q12_is_high_priority_bytes(priority);
+            q12_apply_pending_order(&mut groups, order, is_high_priority);
+        }
+        return Some(groups);
+    }
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || orderpriorities.is_null(row) {
+            continue;
+        }
+        let Some(order) = pending.get(orderkeys.value(row)) else {
+            continue;
+        };
+        let priority_index = usize::try_from(orderpriorities.key(row)?).ok()?;
+        let priority = bytes_string_parts(priority_offsets, priority_data, priority_index);
+        let is_high_priority = q12_is_high_priority_bytes(priority);
+        q12_apply_pending_order(&mut groups, order, is_high_priority);
+    }
+    Some(groups)
+}
+
 fn q12_shipping_mode_counts_batch_typed(
     orderkeys: &ArrayRef,
     orderpriorities: &StringArray,
@@ -8802,7 +10194,7 @@ fn q12_shipping_mode_counts_batch_typed(
                     continue;
                 }
                 let priority = bytes_string_parts(priority_offsets, priority_data, row);
-                let is_high_priority = matches!(priority, b"1-URGENT" | b"2-HIGH");
+                let is_high_priority = q12_is_high_priority_bytes(priority);
                 q12_apply_pending_order(&mut groups, pending_values[index], is_high_priority);
             }
             return Some(groups);
@@ -8812,7 +10204,7 @@ fn q12_shipping_mode_counts_batch_typed(
                 continue;
             };
             let priority = bytes_string_parts(priority_offsets, priority_data, row);
-            let is_high_priority = matches!(priority, b"1-URGENT" | b"2-HIGH");
+            let is_high_priority = q12_is_high_priority_bytes(priority);
             q12_apply_pending_order(&mut groups, order, is_high_priority);
         }
         return Some(groups);
@@ -8825,7 +10217,42 @@ fn q12_shipping_mode_counts_batch_typed(
             continue;
         };
         let priority = bytes_string_parts(priority_offsets, priority_data, row);
-        let is_high_priority = matches!(priority, b"1-URGENT" | b"2-HIGH");
+        let is_high_priority = q12_is_high_priority_bytes(priority);
+        q12_apply_pending_order(&mut groups, order, is_high_priority);
+    }
+    Some(groups)
+}
+
+fn q12_shipping_mode_counts_batch_typed_sorted(
+    orderkeys: &ArrayRef,
+    orderpriorities: &StringArray,
+    pending: &SortedI64Lookup<Q12PendingOrder>,
+) -> Option<[Q12State; 2]> {
+    let orderkeys = orderkeys.as_any().downcast_ref::<Int64Array>()?;
+    let priority_offsets = orderpriorities.value_offsets();
+    let priority_data = orderpriorities.value_data();
+    let mut groups = [Q12State::default(); 2];
+    if orderkeys.null_count() == 0 && orderpriorities.null_count() == 0 {
+        let orderkey_values = orderkeys.values().as_ref();
+        for row in 0..orderkey_values.len() {
+            let Some(order) = pending.get(orderkey_values[row]) else {
+                continue;
+            };
+            let priority = bytes_string_parts(priority_offsets, priority_data, row);
+            let is_high_priority = q12_is_high_priority_bytes(priority);
+            q12_apply_pending_order(&mut groups, order, is_high_priority);
+        }
+        return Some(groups);
+    }
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || orderpriorities.is_null(row) {
+            continue;
+        }
+        let Some(order) = pending.get(orderkeys.value(row)) else {
+            continue;
+        };
+        let priority = bytes_string_parts(priority_offsets, priority_data, row);
+        let is_high_priority = q12_is_high_priority_bytes(priority);
         q12_apply_pending_order(&mut groups, order, is_high_priority);
     }
     Some(groups)
@@ -9289,7 +10716,7 @@ async fn q15_revenue_by_supplier(
     end_days: i32,
 ) -> Result<HashMap<i64, f64>> {
     engine
-        .parquet_scan_fold_chunks(
+        .parquet_scan_accumulate_chunks(
             path,
             batch_size,
             Projection::Columns(vec![
@@ -9303,13 +10730,9 @@ async fn q15_revenue_by_supplier(
             scan_aggregate_fusion_enabled(),
             HashMap::<i64, f64>::new,
             HashMap::<i64, f64>::new,
-            move |batches| {
-                let mut revenues = HashMap::<i64, f64>::new();
-                merge_f64_groups(
-                    &mut revenues,
-                    q15_revenue_by_supplier_batch(batches, start_days, end_days)?,
-                );
-                Ok(revenues)
+            move |batch, revenues| {
+                q15_revenue_by_supplier_batch_into(batch, start_days, end_days, revenues)?;
+                Ok(Some(()))
             },
             merge_f64_groups,
             "Q15 revenue aggregate",
@@ -9317,16 +10740,16 @@ async fn q15_revenue_by_supplier(
         .await
 }
 
-fn q15_revenue_by_supplier_batch(
+fn q15_revenue_by_supplier_batch_into(
     batch: RecordBatch,
     start_days: i32,
     end_days: i32,
-) -> Result<HashMap<i64, f64>> {
+    revenues: &mut HashMap<i64, f64>,
+) -> Result<()> {
     let suppkeys = batch_column(&batch, "l_suppkey")?;
     let shipdates = batch_column(&batch, "l_shipdate")?;
     let extendedprices = batch_column(&batch, "l_extendedprice")?;
     let discounts = batch_column(&batch, "l_discount")?;
-    let mut revenues = HashMap::<i64, f64>::new();
     if let (Some(suppkeys), Some(shipdates), Some(extendedprices), Some(discounts)) = (
         suppkeys.as_any().downcast_ref::<Int64Array>(),
         shipdates.as_any().downcast_ref::<Date32Array>(),
@@ -9348,7 +10771,7 @@ fn q15_revenue_by_supplier_batch(
             *revenues.entry(suppkeys.value(row)).or_insert(0.0) +=
                 extendedprices.value(row) * (1.0 - discounts.value(row));
         }
-        return Ok(revenues);
+        return Ok(());
     }
     for row in 0..batch.num_rows() {
         let Some(shipdate) = date32_value(shipdates, row)? else {
@@ -9366,7 +10789,7 @@ fn q15_revenue_by_supplier_batch(
         };
         *revenues.entry(suppkey).or_insert(0.0) += extendedprice * (1.0 - discount);
     }
-    Ok(revenues)
+    Ok(())
 }
 
 struct Q15Row {
@@ -9634,32 +11057,6 @@ struct Q03Order {
     o_shippriority: i64,
 }
 
-#[derive(Clone)]
-struct SortedI64Lookup<V> {
-    entries: Vec<(i64, V)>,
-}
-
-impl<V: Copy> SortedI64Lookup<V> {
-    fn from_hash_map<S>(values: &HashMap<i64, V, S>) -> Self
-    where
-        S: BuildHasher,
-    {
-        let mut entries = values
-            .iter()
-            .map(|(&key, &value)| (key, value))
-            .collect::<Vec<_>>();
-        entries.sort_unstable_by_key(|(key, _)| *key);
-        Self { entries }
-    }
-
-    fn get(&self, key: i64) -> Option<V> {
-        self.entries
-            .binary_search_by_key(&key, |(entry_key, _)| *entry_key)
-            .ok()
-            .map(|index| self.entries[index].1)
-    }
-}
-
 async fn q03_order_rows(
     engine: &DodamEngine,
     path: PathBuf,
@@ -9898,13 +11295,39 @@ async fn q03_revenue_rows(
         "l_extendedprice".to_string(),
         "l_discount".to_string(),
     ]);
-    let pruning_predicates =
+    let mut pruning_predicates =
         if let Some((min_key, max_key)) = selective_i64_key_range(orders.keys().copied()) {
             i64_range_pruning_predicates("l_orderkey", min_key, max_key)
         } else {
             Vec::new()
         };
-    let revenues = if q03_row_group_map_enabled() {
+    pruning_predicates.push(Expr::Comparison(ComparisonExpr {
+        column: "l_shipdate".to_string(),
+        op: ComparisonOp::Gt,
+        value: LiteralValue::Int64(i64::from(ship_cutoff)),
+    }));
+    let revenues = if q03_revenue_vector_enabled()
+        && q03_row_group_map_enabled()
+        && q03_sorted_order_lookup_enabled()
+    {
+        let orders_for_scan = Arc::new(SortedI64Lookup::from_hash_map(orders));
+        q03_revenue_rows_vector_row_group_map(
+            engine,
+            path,
+            batch_size,
+            projection,
+            pruning_predicates,
+            move |batch, revenues| {
+                q03_revenue_projected_batch_sorted_into(
+                    batch,
+                    &orders_for_scan,
+                    ship_cutoff,
+                    revenues,
+                )
+            },
+        )
+        .await?
+    } else if q03_row_group_map_enabled() {
         if q03_sorted_order_lookup_enabled() {
             let orders_for_scan = Arc::new(SortedI64Lookup::from_hash_map(orders));
             q03_revenue_rows_row_group_map(
@@ -10075,6 +11498,10 @@ fn q03_row_group_map_chunk() -> usize {
         .unwrap_or(2)
 }
 
+fn q03_revenue_vector_enabled() -> bool {
+    std::env::var_os("DODAM_Q03_ENABLE_REVENUE_VECTOR").is_some()
+}
+
 fn q03_sorted_order_lookup_enabled() -> bool {
     match std::env::var("DODAM_Q03_DISABLE_SORTED_ORDER_LOOKUP") {
         Ok(value) => !matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"),
@@ -10088,6 +11515,86 @@ fn q03_row_ordering(left: &Q03Row, right: &Q03Row) -> std::cmp::Ordering {
         .partial_cmp(&left.revenue)
         .unwrap_or(std::cmp::Ordering::Equal)
         .then_with(|| left.o_orderdate.cmp(&right.o_orderdate))
+}
+
+async fn q03_revenue_rows_vector_row_group_map<Map>(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    projection: Projection,
+    pruning_predicates: Vec<Expr>,
+    map: Map,
+) -> Result<HashMap<i64, f64>>
+where
+    Map: Fn(RecordBatch, &mut Vec<(i64, f64)>) -> Result<()> + Clone + Send + Sync + 'static,
+{
+    let map_for_row_group = map.clone();
+    if let Some(partials) = engine
+        .parquet_row_group_map_pruned(
+            path.clone(),
+            batch_size,
+            projection.clone(),
+            pruning_predicates.clone(),
+            q03_row_group_map_chunk(),
+            Vec::<(i64, f64)>::new,
+            move |batch, revenues| {
+                map_for_row_group(batch, revenues)?;
+                Ok(Some(()))
+            },
+            |revenues| Ok(Some(revenues)),
+        )
+        .await?
+    {
+        let mut revenues = Vec::<(i64, f64)>::new();
+        for mut partial in partials {
+            revenues.append(&mut partial);
+        }
+        return Ok(q03_reduce_revenue_pairs(revenues));
+    }
+    let mut stream =
+        q03_revenue_stream(engine, path, batch_size, projection, pruning_predicates).await?;
+    let revenues = parallel_batch_fold_chunks(
+        &mut stream,
+        4,
+        move |batches| {
+            let mut revenues = Vec::<(i64, f64)>::new();
+            for batch in batches {
+                map(batch, &mut revenues)?;
+            }
+            Ok(revenues)
+        },
+        Vec::<(i64, f64)>::new(),
+        q03_merge_revenue_pairs,
+        "Q03 revenue aggregate",
+    )?;
+    Ok(q03_reduce_revenue_pairs(revenues))
+}
+
+fn q03_merge_revenue_pairs(output: &mut Vec<(i64, f64)>, mut batch: Vec<(i64, f64)>) {
+    output.append(&mut batch);
+}
+
+fn q03_reduce_revenue_pairs(mut pairs: Vec<(i64, f64)>) -> HashMap<i64, f64> {
+    if pairs.is_empty() {
+        return HashMap::new();
+    }
+    pairs.sort_unstable_by_key(|(key, _)| *key);
+    let mut revenues = HashMap::with_capacity(pairs.len());
+    let mut iter = pairs.into_iter();
+    let Some((mut current_key, mut current_value)) = iter.next() else {
+        return revenues;
+    };
+    for (key, value) in iter {
+        if key == current_key {
+            current_value += value;
+        } else {
+            revenues.insert(current_key, current_value);
+            current_key = key;
+            current_value = value;
+        }
+    }
+    revenues.insert(current_key, current_value);
+    revenues
 }
 
 fn q03_revenue_batch(
@@ -10209,6 +11716,98 @@ fn q03_revenue_batch_typed(
         }
     }
     Ok(Some(revenues))
+}
+
+fn q03_revenue_projected_batch_sorted_into(
+    batch: RecordBatch,
+    orders: &SortedI64Lookup<Q03Order>,
+    ship_cutoff: i32,
+    revenues: &mut Vec<(i64, f64)>,
+) -> Result<()> {
+    if batch.num_columns() == 4
+        && q03_revenue_batch_sorted_typed_into(
+            batch.column(0),
+            batch.column(1),
+            batch.column(2),
+            batch.column(3),
+            orders,
+            ship_cutoff,
+            revenues,
+        )?
+    {
+        return Ok(());
+    }
+    let orderkeys = batch_column(&batch, "l_orderkey")?;
+    let shipdates = batch_column(&batch, "l_shipdate")?;
+    let extendedprices = batch_column(&batch, "l_extendedprice")?;
+    let discounts = batch_column(&batch, "l_discount")?;
+    for row in 0..batch.num_rows() {
+        let (Some(orderkey), Some(shipdate)) = (
+            numeric_i64_value(orderkeys, row)?,
+            date32_value(shipdates, row)?,
+        ) else {
+            continue;
+        };
+        if shipdate <= ship_cutoff || orders.get(orderkey).is_none() {
+            continue;
+        }
+        let (Some(extendedprice), Some(discount)) = (
+            numeric_f64_value(extendedprices, row)?,
+            numeric_f64_value(discounts, row)?,
+        ) else {
+            continue;
+        };
+        revenues.push((orderkey, extendedprice * (1.0 - discount)));
+    }
+    Ok(())
+}
+
+fn q03_revenue_batch_sorted_typed_into(
+    orderkeys: &ArrayRef,
+    shipdates: &ArrayRef,
+    extendedprices: &ArrayRef,
+    discounts: &ArrayRef,
+    orders: &SortedI64Lookup<Q03Order>,
+    ship_cutoff: i32,
+    revenues: &mut Vec<(i64, f64)>,
+) -> Result<bool> {
+    let (Some(orderkeys), Some(shipdates), Some(extendedprices), Some(discounts)) = (
+        orderkeys.as_any().downcast_ref::<Int64Array>(),
+        shipdates.as_any().downcast_ref::<Date32Array>(),
+        decimal_input(extendedprices)?,
+        decimal_input(discounts)?,
+    ) else {
+        return Ok(false);
+    };
+    if orderkeys.null_count() != 0
+        || shipdates.null_count() != 0
+        || extendedprices.null_count() != 0
+        || discounts.null_count() != 0
+    {
+        return Ok(false);
+    }
+    let orderkey_values = orderkeys.values().as_ref();
+    let shipdate_values = shipdates.values().as_ref();
+    let extendedprice_values = extendedprices.raw_values();
+    let discount_values = discounts.raw_values();
+    let (discount_scale, revenue_scale) =
+        decimal_discounted_revenue_scales(extendedprices, discounts);
+    for row in 0..orderkeys.len() {
+        let shipdate = shipdate_values[row];
+        let orderkey = orderkey_values[row];
+        if shipdate > ship_cutoff && orders.get(orderkey).is_some() {
+            revenues.push((
+                orderkey,
+                decimal_discounted_revenue_raw(
+                    extendedprice_values[row],
+                    discount_values[row],
+                    discount_scale,
+                    revenue_scale,
+                ),
+            ));
+        }
+    }
+    Ok(true)
 }
 
 fn q03_revenue_batch_sorted(
@@ -11540,6 +13139,13 @@ async fn q05_revenue_by_nation(
         "l_extendedprice".to_string(),
         "l_discount".to_string(),
     ]);
+    let pruning_predicates = if let Some((min_key, max_key)) =
+        selective_i64_key_range(order_customer_nations.keys().copied())
+    {
+        i64_range_pruning_predicates("l_orderkey", min_key, max_key)
+    } else {
+        Vec::new()
+    };
     let order_customer_nations = Arc::new(
         order_customer_nations
             .iter()
@@ -11551,10 +13157,11 @@ async fn q05_revenue_by_nation(
         let order_customer_nations_for_scan = order_customer_nations.clone();
         let supplier_nations_for_scan = supplier_nations.clone();
         if let Some(partials) = engine
-            .parquet_row_group_map(
+            .parquet_row_group_map_pruned(
                 path.clone(),
                 batch_size,
                 projection.clone(),
+                pruning_predicates.clone(),
                 q05_row_group_map_chunk(),
                 HashMap::<i64, f64>::new,
                 move |batch, groups| {
@@ -11583,6 +13190,7 @@ async fn q05_revenue_by_nation(
                 path,
                 batch_size,
                 projection,
+                pruning_predicates,
                 order_customer_nations,
                 supplier_nations,
             )
@@ -11594,6 +13202,7 @@ async fn q05_revenue_by_nation(
             path,
             batch_size,
             projection,
+            pruning_predicates,
             order_customer_nations,
             supplier_nations,
         )
@@ -11622,12 +13231,19 @@ async fn q05_revenue_by_nation_stream(
     path: PathBuf,
     batch_size: usize,
     projection: Projection,
+    pruning_predicates: Vec<Expr>,
     order_customer_nations: Arc<FastHashMap<i64, i64>>,
     supplier_nations: Arc<AdaptiveI64Map<i64>>,
 ) -> Result<HashMap<i64, f64>> {
-    let mut stream = engine
-        .scan_parquet_batches(path, batch_size, None, projection, None)
-        .await?;
+    let mut stream = if pruning_predicates.is_empty() {
+        engine
+            .scan_parquet_batches(path, batch_size, None, projection, None)
+            .await?
+    } else {
+        engine
+            .scan_parquet_batches_pruned(path, batch_size, projection, pruning_predicates)
+            .await?
+    };
     parallel_batch_fold_chunks(
         &mut stream,
         join_aggregate_chunk_size(),
@@ -11999,7 +13615,7 @@ async fn q06_revenue_sum(
     };
     if !row_filter_enabled {
         return engine
-            .parquet_scan_fold_chunks(
+            .parquet_scan_accumulate_chunks(
                 path,
                 batch_size,
                 projection,
@@ -12008,15 +13624,22 @@ async fn q06_revenue_sum(
                 scan_aggregate_fusion_enabled(),
                 || Some((0.0, 0_u64)),
                 || Some((0.0, 0_u64)),
-                move |batch| {
-                    q06_revenue_sum_batch(
+                move |batch, total| {
+                    let batch = q06_revenue_sum_batch(
                         batch,
                         start_days,
                         end_days,
                         discount_low,
                         discount_high,
                         quantity_limit,
-                    )
+                    )?;
+                    if let (Some(total), Some(batch)) = (total.as_mut(), batch) {
+                        total.0 += batch.0;
+                        total.1 += batch.1;
+                    } else {
+                        *total = None;
+                    }
+                    Ok(Some(()))
                 },
                 |total, batch| {
                     if let (Some(total), Some(batch)) = (total.as_mut(), batch) {
@@ -12673,6 +14296,23 @@ async fn q07_volume_rows(
         "l_extendedprice".to_string(),
         "l_discount".to_string(),
     ]);
+    let mut pruning_predicates = if let Some((min_key, max_key)) =
+        selective_i64_key_range(order_customer_nations.keys().copied())
+    {
+        i64_range_pruning_predicates("l_orderkey", min_key, max_key)
+    } else {
+        Vec::new()
+    };
+    pruning_predicates.push(Expr::Comparison(ComparisonExpr {
+        column: "l_shipdate".to_string(),
+        op: ComparisonOp::GtEq,
+        value: LiteralValue::Int64(i64::from(start_days)),
+    }));
+    pruning_predicates.push(Expr::Comparison(ComparisonExpr {
+        column: "l_shipdate".to_string(),
+        op: ComparisonOp::LtEq,
+        value: LiteralValue::Int64(i64::from(end_days)),
+    }));
     let supplier_nations = Arc::new(AdaptiveI64Map::from_hash(supplier_nations.clone()));
     let order_customer_nations = Arc::new(
         order_customer_nations
@@ -12684,10 +14324,11 @@ async fn q07_volume_rows(
         let supplier_nations_for_scan = supplier_nations.clone();
         let order_customer_nations_for_scan = order_customer_nations.clone();
         if let Some(partials) = engine
-            .parquet_row_group_map(
+            .parquet_row_group_map_pruned(
                 path.clone(),
                 batch_size,
                 projection.clone(),
+                pruning_predicates.clone(),
                 q07_row_group_map_chunk(),
                 HashMap::<(i64, i64, i32), f64>::new,
                 move |batch, groups| {
@@ -12718,6 +14359,7 @@ async fn q07_volume_rows(
                 path,
                 batch_size,
                 projection,
+                pruning_predicates,
                 supplier_nations,
                 order_customer_nations,
                 start_days,
@@ -12731,6 +14373,7 @@ async fn q07_volume_rows(
             path,
             batch_size,
             projection,
+            pruning_predicates,
             supplier_nations,
             order_customer_nations,
             start_days,
@@ -12764,14 +14407,21 @@ async fn q07_volume_rows_stream(
     path: PathBuf,
     batch_size: usize,
     projection: Projection,
+    pruning_predicates: Vec<Expr>,
     supplier_nations: Arc<AdaptiveI64Map<i64>>,
     order_customer_nations: Arc<FastHashMap<i64, i64>>,
     start_days: i32,
     end_days: i32,
 ) -> Result<HashMap<(i64, i64, i32), f64>> {
-    let mut stream = engine
-        .scan_parquet_batches(path, batch_size, None, projection, None)
-        .await?;
+    let mut stream = if pruning_predicates.is_empty() {
+        engine
+            .scan_parquet_batches(path, batch_size, None, projection, None)
+            .await?
+    } else {
+        engine
+            .scan_parquet_batches_pruned(path, batch_size, projection, pruning_predicates)
+            .await?
+    };
     parallel_batch_fold_chunks(
         &mut stream,
         join_aggregate_chunk_size(),
@@ -13409,6 +15059,19 @@ async fn q08_market_share_rows(
     part_keys: &HashSet<i64>,
     supplier_is_brazil: &HashMap<i64, bool>,
 ) -> Result<Vec<Q08Row>> {
+    if q08_late_materialized_enabled()
+        && let Some(rows) = q08_market_share_rows_late_materialized(
+            engine,
+            path.clone(),
+            batch_size,
+            order_years,
+            part_keys,
+            supplier_is_brazil,
+        )
+        .await?
+    {
+        return Ok(rows);
+    }
     let projection = Projection::Columns(vec![
         "l_orderkey".to_string(),
         "l_partkey".to_string(),
@@ -13416,11 +15079,18 @@ async fn q08_market_share_rows(
         "l_extendedprice".to_string(),
         "l_discount".to_string(),
     ]);
-    let mut stream = if should_use_i64_set_row_filter(
+    let mut pruning_predicates = Vec::new();
+    if let Some((min_key, max_key)) = selective_i64_key_range(order_years.keys().copied()) {
+        pruning_predicates.extend(i64_range_pruning_predicates("l_orderkey", min_key, max_key));
+    }
+    if let Some((min_key, max_key)) = selective_i64_key_range(part_keys.iter().copied()) {
+        pruning_predicates.extend(i64_range_pruning_predicates("l_partkey", min_key, max_key));
+    }
+    let mut stream = if should_use_i64_set_row_filter_for_keys(
         true,
         "DODAM_Q08_DISABLE_PARTKEY_ROW_FILTER",
         None,
-        part_keys.len(),
+        part_keys,
         projection_column_count(&projection),
     ) {
         engine
@@ -13431,6 +15101,10 @@ async fn q08_market_share_rows(
                 "l_partkey",
                 part_keys.clone(),
             )
+            .await?
+    } else if !pruning_predicates.is_empty() {
+        engine
+            .scan_parquet_batches_pruned(path, batch_size, projection, pruning_predicates)
             .await?
     } else {
         engine
@@ -13466,6 +15140,215 @@ async fn q08_market_share_rows(
             })
         })
         .collect())
+}
+
+async fn q08_market_share_rows_late_materialized(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    order_years: &HashMap<i64, i32>,
+    part_keys: &HashSet<i64>,
+    supplier_is_brazil: &HashMap<i64, bool>,
+) -> Result<Option<Vec<Q08Row>>> {
+    let order_years = Arc::new(AdaptiveI64Map::from_hash(order_years.clone()));
+    let part_keys = Arc::new(AdaptiveI64Set::from_hash(part_keys.clone()));
+    let supplier_is_brazil = Arc::new(AdaptiveI64Map::from_hash(supplier_is_brazil.clone()));
+    let Some(chunks) = engine
+        .late_materialized_parquet_map_with_policy(
+            path,
+            batch_size,
+            Projection::Columns(vec!["l_partkey".to_string()]),
+            Projection::Columns(vec![
+                "l_orderkey".to_string(),
+                "l_suppkey".to_string(),
+                "l_extendedprice".to_string(),
+                "l_discount".to_string(),
+            ]),
+            q08_late_row_group_chunk(),
+            LateMaterializationPolicy::selective_with_selector_run_ratio(
+                q08_late_max_selected_ratio(),
+                q08_late_max_selector_run_ratio(),
+            ),
+            {
+                let order_years = order_years.clone();
+                let part_keys = part_keys.clone();
+                let supplier_is_brazil = supplier_is_brazil.clone();
+                move || Q08LateMarketState {
+                    order_years: order_years.clone(),
+                    part_keys: part_keys.clone(),
+                    supplier_is_brazil: supplier_is_brazil.clone(),
+                    groups: HashMap::new(),
+                }
+            },
+            q08_late_build_partkey_selection_batch,
+            q08_late_consume_market_payload_batch,
+            |state, _metrics| Ok(Some(state.groups)),
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let mut metrics = LateMaterializedMetrics::default();
+    let mut groups = HashMap::<i32, (f64, f64)>::new();
+    for chunk in chunks {
+        metrics.add(chunk.metrics);
+        q08_merge_market_share_groups(&mut groups, chunk.output);
+    }
+    q08_log_late_market_profile(metrics, q08_late_row_group_chunk());
+    Ok(Some(
+        groups
+            .into_iter()
+            .filter_map(|(o_year, (brazil_volume, total_volume))| {
+                (total_volume > 0.0).then_some(Q08Row {
+                    o_year,
+                    mkt_share: brazil_volume / total_volume,
+                })
+            })
+            .collect(),
+    ))
+}
+
+fn q08_late_materialized_enabled() -> bool {
+    std::env::var_os("DODAM_Q08_ENABLE_LATE").is_some()
+}
+
+fn q08_late_row_group_chunk() -> usize {
+    std::env::var("DODAM_Q08_LATE_ROW_GROUP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4)
+}
+
+fn q08_late_max_selected_ratio() -> f64 {
+    std::env::var("DODAM_Q08_LATE_MAX_SELECTED_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.05)
+}
+
+fn q08_late_max_selector_run_ratio() -> f64 {
+    std::env::var("DODAM_Q08_LATE_MAX_SELECTOR_RUN_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.05)
+}
+
+struct Q08LateMarketState {
+    order_years: Arc<AdaptiveI64Map<i32>>,
+    part_keys: Arc<AdaptiveI64Set>,
+    supplier_is_brazil: Arc<AdaptiveI64Map<bool>>,
+    groups: HashMap<i32, (f64, f64)>,
+}
+
+fn q08_late_build_partkey_selection_batch(
+    batch: RecordBatch,
+    selection: &mut LateSelectionBuilder,
+    state: &mut Q08LateMarketState,
+) -> Result<Option<()>> {
+    let partkeys = batch_column(&batch, "l_partkey")?;
+    let Some(partkeys) = partkeys.as_any().downcast_ref::<Int64Array>() else {
+        return Ok(None);
+    };
+    if partkeys.null_count() == 0 {
+        for &partkey in partkeys.values().as_ref() {
+            selection.push(state.part_keys.contains(partkey));
+        }
+        return Ok(Some(()));
+    }
+    for row in 0..partkeys.len() {
+        selection.push(partkeys.is_valid(row) && state.part_keys.contains(partkeys.value(row)));
+    }
+    Ok(Some(()))
+}
+
+fn q08_late_consume_market_payload_batch(
+    batch: RecordBatch,
+    state: &mut Q08LateMarketState,
+) -> Result<Option<()>> {
+    let orderkeys = batch_column(&batch, "l_orderkey")?;
+    let suppkeys = batch_column(&batch, "l_suppkey")?;
+    let extendedprices = batch_column(&batch, "l_extendedprice")?;
+    let discounts = batch_column(&batch, "l_discount")?;
+    let (Some(orderkeys), Some(suppkeys), Some(extendedprices), Some(discounts)) = (
+        orderkeys.as_any().downcast_ref::<Int64Array>(),
+        suppkeys.as_any().downcast_ref::<Int64Array>(),
+        decimal_input(extendedprices)?,
+        decimal_input(discounts)?,
+    ) else {
+        return Ok(None);
+    };
+    if orderkeys.null_count() == 0
+        && suppkeys.null_count() == 0
+        && extendedprices.null_count() == 0
+        && discounts.null_count() == 0
+    {
+        let orderkey_values = orderkeys.values().as_ref();
+        let suppkey_values = suppkeys.values().as_ref();
+        let extendedprice_values = extendedprices.raw_values();
+        let discount_values = discounts.raw_values();
+        let (discount_scale, revenue_scale) =
+            decimal_discounted_revenue_scales(extendedprices, discounts);
+        for row in 0..orderkey_values.len() {
+            let Some(o_year) = state.order_years.get(orderkey_values[row]) else {
+                continue;
+            };
+            let Some(is_brazil) = state.supplier_is_brazil.get(suppkey_values[row]) else {
+                continue;
+            };
+            let volume = decimal_discounted_revenue_raw(
+                extendedprice_values[row],
+                discount_values[row],
+                discount_scale,
+                revenue_scale,
+            );
+            let group = state.groups.entry(o_year).or_insert((0.0, 0.0));
+            if is_brazil {
+                group.0 += volume;
+            }
+            group.1 += volume;
+        }
+        return Ok(Some(()));
+    }
+    for row in 0..batch.num_rows() {
+        if orderkeys.is_null(row)
+            || suppkeys.is_null(row)
+            || extendedprices.is_null(row)
+            || discounts.is_null(row)
+        {
+            continue;
+        }
+        let Some(o_year) = state.order_years.get(orderkeys.value(row)) else {
+            continue;
+        };
+        let Some(is_brazil) = state.supplier_is_brazil.get(suppkeys.value(row)) else {
+            continue;
+        };
+        let volume = extendedprices.value(row) * (1.0 - discounts.value(row));
+        let group = state.groups.entry(o_year).or_insert((0.0, 0.0));
+        if is_brazil {
+            group.0 += volume;
+        }
+        group.1 += volume;
+    }
+    Ok(Some(()))
+}
+
+fn q08_log_late_market_profile(metrics: LateMaterializedMetrics, row_group_chunk: usize) {
+    if !tpch_profile_enabled() {
+        return;
+    }
+    let ratio = if metrics.total_rows == 0 {
+        0.0
+    } else {
+        metrics.selected_rows as f64 / metrics.total_rows as f64
+    };
+    eprintln!(
+        "[dodam:tpch-profile] Q08 market share: late_materialized rows={} selected={} ratio={:.6} selector_runs={} row_group_chunk={}",
+        metrics.total_rows, metrics.selected_rows, ratio, metrics.selector_runs, row_group_chunk
+    );
 }
 
 fn q08_market_share_batch(
@@ -14198,11 +16081,13 @@ fn q22_order_customer_keys_batch_into(
     let Some(custkeys) = custkeys.as_any().downcast_ref::<Int64Array>() else {
         return Ok(false);
     };
+    if custkeys.null_count() == 0 {
+        return Ok(keys.try_insert_dense_values(custkeys.values().as_ref()));
+    }
     for row in 0..custkeys.len() {
-        if custkeys.is_null(row) {
-            continue;
+        if custkeys.is_valid(row) {
+            keys.insert(custkeys.value(row));
         }
-        keys.insert(custkeys.value(row));
     }
     Ok(true)
 }
@@ -15744,6 +17629,12 @@ fn q19_raw_line_rules_cached<'a>(
 }
 
 fn bytes_string_parts<'a>(offsets: &[i32], data: &'a [u8], row: usize) -> &'a [u8] {
+    let start = offsets[row] as usize;
+    let end = offsets[row + 1] as usize;
+    &data[start..end]
+}
+
+fn bytes_large_string_parts<'a>(offsets: &[i64], data: &'a [u8], row: usize) -> &'a [u8] {
     let start = offsets[row] as usize;
     let end = offsets[row + 1] as usize;
     &data[start..end]
