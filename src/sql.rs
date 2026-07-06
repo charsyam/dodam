@@ -7656,6 +7656,53 @@ struct Q12PendingOrder {
     counts: [u64; 2],
 }
 
+#[derive(Default)]
+struct Q12OrdersPartial {
+    groups: [Q12State; 2],
+    profile: Q12OrdersProfile,
+}
+
+#[derive(Default)]
+struct Q12OrdersProfile {
+    batches: usize,
+    typed_batches: usize,
+    fallback_batches: usize,
+    rows: usize,
+    null_rows: usize,
+    lookup_hits: usize,
+    lookup_misses: usize,
+    priority_rows: usize,
+    apply_rows: usize,
+    lookup_samples: usize,
+    priority_samples: usize,
+    apply_samples: usize,
+    total_nanos: u64,
+    lookup_nanos: u64,
+    priority_nanos: u64,
+    apply_nanos: u64,
+}
+
+impl Q12OrdersProfile {
+    fn add(&mut self, other: Self) {
+        self.batches = self.batches.saturating_add(other.batches);
+        self.typed_batches = self.typed_batches.saturating_add(other.typed_batches);
+        self.fallback_batches = self.fallback_batches.saturating_add(other.fallback_batches);
+        self.rows = self.rows.saturating_add(other.rows);
+        self.null_rows = self.null_rows.saturating_add(other.null_rows);
+        self.lookup_hits = self.lookup_hits.saturating_add(other.lookup_hits);
+        self.lookup_misses = self.lookup_misses.saturating_add(other.lookup_misses);
+        self.priority_rows = self.priority_rows.saturating_add(other.priority_rows);
+        self.apply_rows = self.apply_rows.saturating_add(other.apply_rows);
+        self.lookup_samples = self.lookup_samples.saturating_add(other.lookup_samples);
+        self.priority_samples = self.priority_samples.saturating_add(other.priority_samples);
+        self.apply_samples = self.apply_samples.saturating_add(other.apply_samples);
+        self.total_nanos = self.total_nanos.saturating_add(other.total_nanos);
+        self.lookup_nanos = self.lookup_nanos.saturating_add(other.lookup_nanos);
+        self.priority_nanos = self.priority_nanos.saturating_add(other.priority_nanos);
+        self.apply_nanos = self.apply_nanos.saturating_add(other.apply_nanos);
+    }
+}
+
 async fn q12_filtered_lineitem_counts(
     engine: &DodamEngine,
     path: PathBuf,
@@ -8194,6 +8241,20 @@ async fn q12_shipping_mode_counts_from_orders(
     {
         return Ok(rows);
     }
+    if q12_order_fused_scan_enabled()
+        && !q12_order_row_filter_enabled()
+        && !q12_order_bloom_filter_enabled()
+        && let Some(rows) = q12_shipping_mode_counts_from_orders_fused(
+            engine,
+            path.clone(),
+            batch_size,
+            shipmodes,
+            pending,
+        )
+        .await?
+    {
+        return Ok(rows);
+    }
     let projection = Projection::Columns(vec![
         "o_orderkey".to_string(),
         "o_orderpriority".to_string(),
@@ -8208,19 +8269,34 @@ async fn q12_shipping_mode_counts_from_orders(
                 pending.keys().copied().collect(),
             )
             .await?
+    } else if q12_order_bloom_filter_enabled() {
+        engine
+            .scan_parquet_batches_i64_bloom_filtered(
+                path,
+                batch_size,
+                projection,
+                "o_orderkey",
+                pending.keys().copied().collect(),
+            )
+            .await?
     } else {
         engine
             .scan_parquet_batches(path, batch_size, None, projection, None)
             .await?
     };
     let pending = Arc::new(AdaptiveI64Map::from_hash((*pending).clone()));
-    let groups = parallel_batch_fold(
+    let collect_profile = tpch_profile_enabled();
+    let partial = parallel_batch_fold(
         &mut stream,
-        move |batch| q12_shipping_mode_counts_projected_batch(batch, &pending),
-        [Q12State::default(); 2],
-        q12_merge_shipping_mode_counts,
+        move |batch| {
+            q12_shipping_mode_counts_projected_batch_partial(batch, &pending, collect_profile)
+        },
+        Q12OrdersPartial::default(),
+        q12_merge_orders_partial,
         "Q12 orders aggregate",
     )?;
+    q12_log_orders_profile(&partial.profile);
+    let groups = partial.groups;
     let rows = groups
         .into_iter()
         .enumerate()
@@ -8231,6 +8307,57 @@ async fn q12_shipping_mode_counts_from_orders(
         })
         .collect::<Vec<_>>();
     Ok(rows)
+}
+
+async fn q12_shipping_mode_counts_from_orders_fused(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    shipmodes: &[String],
+    pending: &HashMap<i64, Q12PendingOrder>,
+) -> Result<Option<Vec<Q12Row>>> {
+    let pending = Arc::new(AdaptiveI64Map::from_hash((*pending).clone()));
+    let Some(partials) = engine
+        .parquet_row_group_map(
+            path,
+            batch_size,
+            Projection::Columns(vec![
+                "o_orderkey".to_string(),
+                "o_orderpriority".to_string(),
+            ]),
+            q12_order_fused_row_group_chunk(),
+            || [Q12State::default(); 2],
+            {
+                let pending = pending.clone();
+                move |batch, groups| {
+                    q12_merge_shipping_mode_counts(
+                        groups,
+                        q12_shipping_mode_counts_projected_batch(batch, &pending)?,
+                    );
+                    Ok(Some(()))
+                }
+            },
+            |groups| Ok(Some(groups)),
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let mut groups = [Q12State::default(); 2];
+    for partial in partials {
+        q12_merge_shipping_mode_counts(&mut groups, partial);
+    }
+    Ok(Some(
+        groups
+            .into_iter()
+            .enumerate()
+            .map(|(index, state)| Q12Row {
+                shipmode: shipmodes[index].clone(),
+                high_line_count: state.high_line_count,
+                low_line_count: state.low_line_count,
+            })
+            .collect(),
+    ))
 }
 
 async fn q12_shipping_mode_counts_from_orders_late(
@@ -8295,6 +8422,22 @@ async fn q12_shipping_mode_counts_from_orders_late(
 
 fn q12_order_row_filter_enabled() -> bool {
     std::env::var_os("DODAM_Q12_ENABLE_ORDER_ROW_FILTER").is_some()
+}
+
+fn q12_order_bloom_filter_enabled() -> bool {
+    std::env::var_os("DODAM_Q12_ENABLE_ORDER_BLOOM_FILTER").is_some()
+}
+
+fn q12_order_fused_scan_enabled() -> bool {
+    std::env::var_os("DODAM_Q12_ENABLE_ORDER_FUSED_SCAN").is_some()
+}
+
+fn q12_order_fused_row_group_chunk() -> usize {
+    std::env::var("DODAM_Q12_ORDER_FUSED_ROW_GROUP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4)
 }
 
 fn q12_order_late_materialized_enabled() -> bool {
@@ -8449,6 +8592,196 @@ fn q12_shipping_mode_counts_projected_batch(
     q12_shipping_mode_counts_batch(batch, pending)
 }
 
+fn q12_shipping_mode_counts_projected_batch_partial(
+    batch: RecordBatch,
+    pending: &AdaptiveI64Map<Q12PendingOrder>,
+    collect_profile: bool,
+) -> Result<Q12OrdersPartial> {
+    if !collect_profile {
+        return Ok(Q12OrdersPartial {
+            groups: q12_shipping_mode_counts_projected_batch(batch, pending)?,
+            profile: Q12OrdersProfile::default(),
+        });
+    }
+    let started = Instant::now();
+    let rows = batch.num_rows();
+    if batch.num_columns() == 2
+        && let Some(orderpriorities) = batch.column(1).as_any().downcast_ref::<StringArray>()
+        && q12_typed_loop_enabled()
+        && let Some(mut partial) =
+            q12_shipping_mode_counts_batch_typed_profile(batch.column(0), orderpriorities, pending)
+    {
+        partial.profile.total_nanos = sql_elapsed_nanos(started);
+        return Ok(partial);
+    }
+    let groups = q12_shipping_mode_counts_batch(batch, pending)?;
+    let profile = Q12OrdersProfile {
+        batches: 1,
+        fallback_batches: 1,
+        rows,
+        total_nanos: sql_elapsed_nanos(started),
+        ..Default::default()
+    };
+    Ok(Q12OrdersPartial { groups, profile })
+}
+
+fn q12_profile_sample(row: usize) -> bool {
+    row & 255 == 0
+}
+
+fn q12_profile_dense_lookup(
+    orderkey: i64,
+    pending_values: &[Q12PendingOrder],
+    pending_present: &[bool],
+    row: usize,
+    profile: &mut Q12OrdersProfile,
+) -> Option<Q12PendingOrder> {
+    if q12_profile_sample(row) {
+        profile.lookup_samples += 1;
+        let started = Instant::now();
+        let order = usize::try_from(orderkey)
+            .ok()
+            .filter(|index| *index < pending_present.len() && pending_present[*index])
+            .map(|index| pending_values[index]);
+        profile.lookup_nanos = profile
+            .lookup_nanos
+            .saturating_add(sql_elapsed_nanos(started));
+        return order;
+    }
+    usize::try_from(orderkey)
+        .ok()
+        .filter(|index| *index < pending_present.len() && pending_present[*index])
+        .map(|index| pending_values[index])
+}
+
+fn q12_profile_map_lookup(
+    pending: &AdaptiveI64Map<Q12PendingOrder>,
+    orderkey: i64,
+    row: usize,
+    profile: &mut Q12OrdersProfile,
+) -> Option<Q12PendingOrder> {
+    if q12_profile_sample(row) {
+        profile.lookup_samples += 1;
+        let started = Instant::now();
+        let order = pending.get(orderkey);
+        profile.lookup_nanos = profile
+            .lookup_nanos
+            .saturating_add(sql_elapsed_nanos(started));
+        return order;
+    }
+    pending.get(orderkey)
+}
+
+fn q12_profile_priority(
+    priority_offsets: &[i32],
+    priority_data: &[u8],
+    row: usize,
+    profile: &mut Q12OrdersProfile,
+) -> bool {
+    if q12_profile_sample(profile.priority_rows) {
+        profile.priority_samples += 1;
+        let started = Instant::now();
+        let priority = bytes_string_parts(priority_offsets, priority_data, row);
+        let is_high_priority = matches!(priority, b"1-URGENT" | b"2-HIGH");
+        profile.priority_nanos = profile
+            .priority_nanos
+            .saturating_add(sql_elapsed_nanos(started));
+        profile.priority_rows += 1;
+        return is_high_priority;
+    }
+    let priority = bytes_string_parts(priority_offsets, priority_data, row);
+    let is_high_priority = matches!(priority, b"1-URGENT" | b"2-HIGH");
+    profile.priority_rows += 1;
+    is_high_priority
+}
+
+fn q12_profile_apply(
+    groups: &mut [Q12State; 2],
+    order: Q12PendingOrder,
+    is_high_priority: bool,
+    profile: &mut Q12OrdersProfile,
+) {
+    if q12_profile_sample(profile.apply_rows) {
+        profile.apply_samples += 1;
+        let started = Instant::now();
+        q12_apply_pending_order(groups, order, is_high_priority);
+        profile.apply_nanos = profile
+            .apply_nanos
+            .saturating_add(sql_elapsed_nanos(started));
+    } else {
+        q12_apply_pending_order(groups, order, is_high_priority);
+    }
+    profile.apply_rows += 1;
+}
+
+fn q12_shipping_mode_counts_batch_typed_profile(
+    orderkeys: &ArrayRef,
+    orderpriorities: &StringArray,
+    pending: &AdaptiveI64Map<Q12PendingOrder>,
+) -> Option<Q12OrdersPartial> {
+    let orderkeys = orderkeys.as_any().downcast_ref::<Int64Array>()?;
+    let priority_offsets = orderpriorities.value_offsets();
+    let priority_data = orderpriorities.value_data();
+    let mut groups = [Q12State::default(); 2];
+    let mut profile = Q12OrdersProfile {
+        batches: 1,
+        typed_batches: 1,
+        rows: orderkeys.len(),
+        ..Default::default()
+    };
+    if orderkeys.null_count() == 0 && orderpriorities.null_count() == 0 {
+        let orderkey_values = orderkeys.values().as_ref();
+        if let Some((pending_values, pending_present)) = pending.dense_slices() {
+            for row in 0..orderkey_values.len() {
+                let order = q12_profile_dense_lookup(
+                    orderkey_values[row],
+                    pending_values,
+                    pending_present,
+                    row,
+                    &mut profile,
+                );
+                let Some(order) = order else {
+                    profile.lookup_misses += 1;
+                    continue;
+                };
+                profile.lookup_hits += 1;
+                let is_high_priority =
+                    q12_profile_priority(priority_offsets, priority_data, row, &mut profile);
+                q12_profile_apply(&mut groups, order, is_high_priority, &mut profile);
+            }
+            return Some(Q12OrdersPartial { groups, profile });
+        }
+        for row in 0..orderkey_values.len() {
+            let order = q12_profile_map_lookup(pending, orderkey_values[row], row, &mut profile);
+            let Some(order) = order else {
+                profile.lookup_misses += 1;
+                continue;
+            };
+            profile.lookup_hits += 1;
+            let is_high_priority =
+                q12_profile_priority(priority_offsets, priority_data, row, &mut profile);
+            q12_profile_apply(&mut groups, order, is_high_priority, &mut profile);
+        }
+        return Some(Q12OrdersPartial { groups, profile });
+    }
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || orderpriorities.is_null(row) {
+            profile.null_rows += 1;
+            continue;
+        }
+        let order = q12_profile_map_lookup(pending, orderkeys.value(row), row, &mut profile);
+        let Some(order) = order else {
+            profile.lookup_misses += 1;
+            continue;
+        };
+        profile.lookup_hits += 1;
+        let is_high_priority =
+            q12_profile_priority(priority_offsets, priority_data, row, &mut profile);
+        q12_profile_apply(&mut groups, order, is_high_priority, &mut profile);
+    }
+    Some(Q12OrdersPartial { groups, profile })
+}
+
 fn q12_shipping_mode_counts_batch_typed(
     orderkeys: &ArrayRef,
     orderpriorities: &StringArray,
@@ -8521,6 +8854,36 @@ fn q12_merge_shipping_mode_counts(groups: &mut [Q12State; 2], batch_groups: [Q12
         groups[index].high_line_count += batch_groups[index].high_line_count;
         groups[index].low_line_count += batch_groups[index].low_line_count;
     }
+}
+
+fn q12_merge_orders_partial(output: &mut Q12OrdersPartial, partial: Q12OrdersPartial) {
+    q12_merge_shipping_mode_counts(&mut output.groups, partial.groups);
+    output.profile.add(partial.profile);
+}
+
+fn q12_log_orders_profile(profile: &Q12OrdersProfile) {
+    if !tpch_profile_enabled() || profile.batches == 0 {
+        return;
+    }
+    eprintln!(
+        "[dodam:tpch-profile] Q12 orders detail: batches={} typed_batches={} fallback_batches={} rows={} null_rows={} lookup_hits={} lookup_misses={} priority_rows={} apply_rows={} total={:.3} ms lookup_sample={:.3} ms/{} priority_sample={:.3} ms/{} apply_sample={:.3} ms/{}",
+        profile.batches,
+        profile.typed_batches,
+        profile.fallback_batches,
+        profile.rows,
+        profile.null_rows,
+        profile.lookup_hits,
+        profile.lookup_misses,
+        profile.priority_rows,
+        profile.apply_rows,
+        sql_nanos_to_millis(profile.total_nanos),
+        sql_nanos_to_millis(profile.lookup_nanos),
+        profile.lookup_samples,
+        sql_nanos_to_millis(profile.priority_nanos),
+        profile.priority_samples,
+        sql_nanos_to_millis(profile.apply_nanos),
+        profile.apply_samples,
+    );
 }
 
 fn q12_output(rows: Vec<Q12Row>) -> Result<QueryOutput> {

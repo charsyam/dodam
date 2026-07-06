@@ -780,6 +780,49 @@ impl ParquetBatchReader {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_row_groups_i64_bloom_filter(
+        path: impl AsRef<Path>,
+        batch_size: usize,
+        projection: &Projection,
+        row_groups: Vec<usize>,
+        filter_column: &str,
+        bloom: Arc<I64BloomPredicate>,
+        metadata_cache: &ParquetMetadataCache,
+        file_cache: Arc<ParquetFileCache>,
+        store: &dyn ObjectStore,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let metadata_start = Instant::now();
+        let metadata = metadata_cache.get_with_store(path, store)?;
+        let metadata_nanos = elapsed_nanos(metadata_start);
+        if file_cache.enabled() {
+            let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
+            Self::build_i64_bloom_filter(
+                reader,
+                metadata,
+                metadata_nanos,
+                batch_size,
+                projection,
+                row_groups,
+                filter_column,
+                bloom,
+            )
+        } else {
+            let file = store.open(path)?;
+            Self::build_i64_bloom_filter(
+                file,
+                metadata,
+                metadata_nanos,
+                batch_size,
+                projection,
+                row_groups,
+                filter_column,
+                bloom,
+            )
+        }
+    }
+
     fn build<T: ChunkReader + 'static>(
         input: T,
         metadata: ArrowReaderMetadata,
@@ -877,6 +920,60 @@ impl ParquetBatchReader {
                 ));
             };
             Ok(keys.evaluate(values))
+        });
+        let builder = apply_projection(builder, projection)?
+            .with_row_groups(row_groups.clone())
+            .with_row_filter(RowFilter::new(vec![Box::new(filter)]));
+        let planning_nanos = elapsed_nanos(planning_start);
+        let inner = builder.build()?;
+        Ok(Self {
+            inner,
+            projected_columns,
+            row_groups_total,
+            row_groups_scanned: row_groups.len(),
+            compressed_bytes_total,
+            compressed_bytes_scanned,
+            metadata_nanos,
+            planning_nanos,
+            next_calls: 0,
+            eof_calls: 0,
+            output_batches: 0,
+            output_rows: 0,
+            next_nanos: 0,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_i64_bloom_filter<T: ChunkReader + 'static>(
+        input: T,
+        metadata: ArrowReaderMetadata,
+        metadata_nanos: u64,
+        batch_size: usize,
+        projection: &Projection,
+        row_groups: Vec<usize>,
+        filter_column: &str,
+        bloom: Arc<I64BloomPredicate>,
+    ) -> Result<Self> {
+        let planning_start = Instant::now();
+        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(input, metadata)
+            .with_batch_size(batch_size);
+        let projected_columns = projected_column_count(builder.schema(), projection);
+        let row_groups_total = builder.metadata().num_row_groups();
+        let column_indices = projection_indices_for_schema(builder.schema(), projection)?;
+        let all_row_groups = (0..row_groups_total).collect::<Vec<_>>();
+        let compressed_bytes_total =
+            compressed_bytes_for_row_groups(&builder, &column_indices, &all_row_groups);
+        let compressed_bytes_scanned =
+            compressed_bytes_for_row_groups(&builder, &column_indices, &row_groups);
+        let filter_index = projection_indices(builder.schema(), &[filter_column.to_string()])?[0];
+        let filter_mask = ProjectionMask::roots(builder.parquet_schema(), [filter_index]);
+        let filter = ArrowPredicateFn::new(filter_mask, move |batch: RecordBatch| {
+            let Some(values) = batch.column(0).as_any().downcast_ref::<Int64Array>() else {
+                return Err(ArrowError::ComputeError(
+                    "i64 bloom row filter requires Int64Array".to_string(),
+                ));
+            };
+            Ok(bloom.evaluate(values))
         });
         let builder = apply_projection(builder, projection)?
             .with_row_groups(row_groups.clone())
@@ -1045,6 +1142,88 @@ impl I64SetPredicate {
         }
         output.finish()
     }
+}
+
+pub struct I64BloomPredicate {
+    bits: Vec<u64>,
+    mask: u64,
+    min_key: i64,
+    max_key: i64,
+}
+
+impl I64BloomPredicate {
+    pub(crate) fn from_hash_set(keys: &HashSet<i64>) -> Self {
+        let expected_rows = keys.len().max(1);
+        let bit_count = expected_rows.saturating_mul(64).next_power_of_two().max(64);
+        let mut bloom = Self {
+            bits: vec![0; bit_count.div_ceil(64)],
+            mask: (bit_count - 1) as u64,
+            min_key: i64::MAX,
+            max_key: i64::MIN,
+        };
+        for key in keys.iter().copied() {
+            bloom.min_key = bloom.min_key.min(key);
+            bloom.max_key = bloom.max_key.max(key);
+            bloom.insert(key);
+        }
+        bloom
+    }
+
+    fn insert(&mut self, key: i64) {
+        for hash in i64_bloom_hashes(key) {
+            self.set(hash);
+        }
+    }
+
+    fn might_contain(&self, key: i64) -> bool {
+        key >= self.min_key
+            && key <= self.max_key
+            && i64_bloom_hashes(key).into_iter().all(|hash| self.get(hash))
+    }
+
+    fn set(&mut self, hash: u64) {
+        let bit = hash & self.mask;
+        let word = (bit / 64) as usize;
+        let offset = bit % 64;
+        self.bits[word] |= 1_u64 << offset;
+    }
+
+    fn get(&self, hash: u64) -> bool {
+        let bit = hash & self.mask;
+        let word = (bit / 64) as usize;
+        let offset = bit % 64;
+        (self.bits[word] & (1_u64 << offset)) != 0
+    }
+
+    fn evaluate(&self, values: &Int64Array) -> BooleanArray {
+        let mut output = BooleanBuilder::with_capacity(values.len());
+        if values.null_count() == 0 {
+            for row in 0..values.len() {
+                output.append_value(self.might_contain(values.value(row)));
+            }
+        } else {
+            for row in 0..values.len() {
+                output.append_value(!values.is_null(row) && self.might_contain(values.value(row)));
+            }
+        }
+        output.finish()
+    }
+}
+
+fn i64_bloom_hashes(value: i64) -> [u64; 3] {
+    let hash = splitmix64(value as u64);
+    [
+        hash,
+        splitmix64(hash ^ 0x9e37_79b9_7f4a_7c15),
+        splitmix64(hash ^ 0xc2b2_ae3d_27d4_eb4f),
+    ]
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
 pub fn plan_parquet_scan_tasks(

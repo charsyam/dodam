@@ -35,8 +35,8 @@ use crate::plan::{
     PhysicalJoinStrategy, PhysicalOperator, PhysicalPlanNode, PlanTableSource, TaskInput, TaskPlan,
 };
 use crate::storage::{
-    LocalFileSystemObjectStore, ObjectStore, ParquetBatchReader, ParquetFileCache,
-    ParquetFileCacheStats, ParquetMetadataCache, plan_parquet_scan_tasks,
+    I64BloomPredicate, LocalFileSystemObjectStore, ObjectStore, ParquetBatchReader,
+    ParquetFileCache, ParquetFileCacheStats, ParquetMetadataCache, plan_parquet_scan_tasks,
     read_parquet_file_statistics, read_parquet_i64_column_max,
 };
 
@@ -919,6 +919,83 @@ impl DodamEngine {
                     row_groups,
                     &filter_column,
                     keys,
+                    &metadata_cache,
+                    file_cache,
+                    object_store.as_ref(),
+                );
+                match result {
+                    Ok(batches) => {
+                        for batch in batches {
+                            if sender.send(Ok(batch)).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                    }
+                }
+            });
+        }
+        drop(sender);
+        Ok(SendableBatchStream::new(
+            Box::new(receiver.into_iter()),
+            Arc::default(),
+        ))
+    }
+
+    pub async fn scan_parquet_batches_i64_bloom_filtered(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        projection: Projection,
+        filter_column: &str,
+        keys: HashSet<i64>,
+    ) -> Result<SendableBatchStream> {
+        let source = self.plan_table_source(path.clone()).await?;
+        if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
+            return self
+                .scan_parquet_batches(path, batch_size, None, projection, None)
+                .await;
+        }
+        let plan = plan_parquet_scan_tasks(
+            source.fragments[0].parquet_local_path()?,
+            &projection,
+            &[],
+            &self.metadata_cache,
+            self.object_store.as_ref(),
+        )?;
+        let row_groups = plan
+            .tasks
+            .into_iter()
+            .map(|task| task.row_group)
+            .collect::<Vec<_>>();
+        if row_groups.is_empty() {
+            return Ok(SendableBatchStream::empty());
+        }
+        let chunks = row_groups
+            .chunks(parallel_i64_set_filter_row_group_chunk())
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
+        let bloom = Arc::new(I64BloomPredicate::from_hash_set(&keys));
+        let (sender, receiver) = mpsc::channel();
+        for row_groups in chunks {
+            let sender = sender.clone();
+            let path = path.clone();
+            let projection = projection.clone();
+            let filter_column = filter_column.to_string();
+            let bloom = bloom.clone();
+            let metadata_cache = self.metadata_cache.clone();
+            let file_cache = self.file_cache.clone();
+            let object_store = self.object_store.clone();
+            rayon::spawn(move || {
+                let result = scan_i64_bloom_filtered_row_groups(
+                    path,
+                    batch_size,
+                    &projection,
+                    row_groups,
+                    &filter_column,
+                    bloom,
                     &metadata_cache,
                     file_cache,
                     object_store.as_ref(),
@@ -4452,6 +4529,75 @@ fn scan_i64_set_filtered_row_groups(
     if let Some(label) = profile_label {
         eprintln!(
             "[dodam:scan-profile] i64_set_filter {label}: elapsed={:.3} ms setup={:.3} ms read_loop={:.3} ms row_groups={}/{} rows={} batches={} bytes={} metadata={:.3} ms planning={:.3} ms parquet_next={:.3} ms parquet_calls={} parquet_eof={} parquet_rows={} parquet_batches={} avg_batch_rows={:.1}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            nanos_to_millis(setup_nanos),
+            nanos_to_millis(read_loop_nanos),
+            row_group_count,
+            reader.row_groups_total(),
+            output_rows,
+            batches.len(),
+            reader.compressed_bytes_scanned(),
+            nanos_to_millis(reader.metadata_nanos()),
+            nanos_to_millis(reader.planning_nanos()),
+            nanos_to_millis(reader.next_nanos()),
+            reader.next_calls(),
+            reader.eof_calls(),
+            reader.output_rows(),
+            reader.output_batches(),
+            average_rows_per_batch(reader.output_rows(), reader.output_batches()),
+        );
+    }
+    Ok(batches)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_i64_bloom_filtered_row_groups(
+    path: PathBuf,
+    batch_size: usize,
+    projection: &Projection,
+    row_groups: Vec<usize>,
+    filter_column: &str,
+    bloom: Arc<I64BloomPredicate>,
+    metadata_cache: &ParquetMetadataCache,
+    file_cache: Arc<ParquetFileCache>,
+    object_store: &dyn ObjectStore,
+) -> Result<Vec<RecordBatch>> {
+    let profile_label =
+        scan_profile_enabled().then(|| parquet_map_profile_label(&path, projection));
+    let row_group_count = row_groups.len();
+    let started = Instant::now();
+    let setup_started = Instant::now();
+    let mut reader = ParquetBatchReader::try_new_with_row_groups_i64_bloom_filter(
+        path,
+        batch_size,
+        projection,
+        row_groups,
+        filter_column,
+        bloom,
+        metadata_cache,
+        file_cache,
+        object_store,
+    )?;
+    let setup_nanos = elapsed_nanos(setup_started.elapsed());
+    let mut batches = Vec::new();
+    let mut read_loop_nanos = 0_u64;
+    let mut output_rows = 0_usize;
+    loop {
+        let next_started = Instant::now();
+        let next = reader.next();
+        read_loop_nanos = read_loop_nanos.saturating_add(elapsed_nanos(next_started.elapsed()));
+        let Some(batch) = next else {
+            break;
+        };
+        let batch = batch?;
+        if batch.num_rows() > 0 {
+            output_rows = output_rows.saturating_add(batch.num_rows());
+            batches.push(batch);
+        }
+    }
+    if let Some(label) = profile_label {
+        eprintln!(
+            "[dodam:scan-profile] i64_bloom_filter {label}: elapsed={:.3} ms setup={:.3} ms read_loop={:.3} ms row_groups={}/{} rows={} batches={} bytes={} metadata={:.3} ms planning={:.3} ms parquet_next={:.3} ms parquet_calls={} parquet_eof={} parquet_rows={} parquet_batches={} avg_batch_rows={:.1}",
             started.elapsed().as_secs_f64() * 1000.0,
             nanos_to_millis(setup_nanos),
             nanos_to_millis(read_loop_nanos),
