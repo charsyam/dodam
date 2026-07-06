@@ -5368,6 +5368,11 @@ async fn q09_order_years(
     path: PathBuf,
     batch_size: usize,
 ) -> Result<Q09OrderYears> {
+    if q09_order_year_row_group_map_enabled()
+        && let Some(years) = q09_order_years_row_group_map(engine, path.clone(), batch_size).await?
+    {
+        return Ok(years);
+    }
     let mut stream = engine
         .scan_parquet_batches(
             path,
@@ -5387,6 +5392,147 @@ async fn q09_order_years(
 }
 
 type Q09OrderYears = DenseI64I32Map;
+
+struct Q09OrderYearPartial {
+    rows: Vec<(i64, i32)>,
+    min_key: i64,
+    max_key: i64,
+    fallback_required: bool,
+    year_cache: Date32YearCache,
+}
+
+impl Q09OrderYearPartial {
+    fn new() -> Self {
+        Self {
+            rows: Vec::new(),
+            min_key: i64::MAX,
+            max_key: i64::MIN,
+            fallback_required: false,
+            year_cache: Date32YearCache::default(),
+        }
+    }
+
+    fn push(&mut self, orderkey: i64, year: i32) {
+        if orderkey < 0 {
+            self.fallback_required = true;
+        } else {
+            self.min_key = self.min_key.min(orderkey);
+            self.max_key = self.max_key.max(orderkey);
+        }
+        self.rows.push((orderkey, year));
+    }
+}
+
+async fn q09_order_years_row_group_map(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+) -> Result<Option<Q09OrderYears>> {
+    let Some(partials) = engine
+        .parquet_row_group_map(
+            path,
+            batch_size,
+            Projection::Columns(vec!["o_orderkey".to_string(), "o_orderdate".to_string()]),
+            q09_order_year_row_group_map_chunk(),
+            Q09OrderYearPartial::new,
+            q09_order_years_partial_batch_into,
+            |partial| Ok(Some(partial)),
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(q09_order_years_from_partials(partials)))
+}
+
+fn q09_order_years_from_partials(partials: Vec<Q09OrderYearPartial>) -> Q09OrderYears {
+    let mut years = Q09OrderYears::new(0);
+    let mut min_key = i64::MAX;
+    let mut max_key = i64::MIN;
+    let mut fallback_required = false;
+    let row_count = partials
+        .iter()
+        .map(|partial| {
+            fallback_required |= partial.fallback_required;
+            if partial.min_key <= partial.max_key {
+                min_key = min_key.min(partial.min_key);
+                max_key = max_key.max(partial.max_key);
+            }
+            partial.rows.len()
+        })
+        .sum::<usize>();
+    if fallback_required
+        || min_key > max_key
+        || !years.reserve_dense_range(min_key, max_key, q09_order_year_max_dense_entries())
+    {
+        years.convert_to_fallback();
+        let fallback = years.fallback_mut().expect("converted q09 fallback");
+        for partial in partials {
+            for (orderkey, year) in partial.rows {
+                fallback.insert(orderkey, year);
+            }
+        }
+        return years;
+    }
+    for partial in partials {
+        for (orderkey, year) in partial.rows {
+            years.insert_dense_key(orderkey, year);
+        }
+    }
+    debug_assert!(row_count == 0 || years.dense_slice().is_some());
+    years
+}
+
+fn q09_order_years_partial_batch_into(
+    batch: RecordBatch,
+    partial: &mut Q09OrderYearPartial,
+) -> Result<Option<()>> {
+    let orderkeys = batch_column(&batch, "o_orderkey")?;
+    let orderdates = batch_column(&batch, "o_orderdate")?;
+    if let (Some(orderkeys), Some(orderdates)) = (
+        orderkeys.as_any().downcast_ref::<Int64Array>(),
+        orderdates.as_any().downcast_ref::<Date32Array>(),
+    ) {
+        if orderkeys.null_count() == 0 && orderdates.null_count() == 0 {
+            for (&orderkey, &orderdate) in orderkeys.values().iter().zip(orderdates.values()) {
+                let year = partial.year_cache.year(orderdate)?;
+                partial.push(orderkey, year);
+            }
+            return Ok(Some(()));
+        }
+        for row in 0..orderkeys.len() {
+            if orderkeys.is_null(row) || orderdates.is_null(row) {
+                continue;
+            }
+            let year = partial.year_cache.year(orderdates.value(row))?;
+            partial.push(orderkeys.value(row), year);
+        }
+        return Ok(Some(()));
+    }
+    for row in 0..batch.num_rows() {
+        let (Some(orderkey), Some(orderdate)) = (
+            numeric_i64_value(orderkeys, row)?,
+            date32_value(orderdates, row)?,
+        ) else {
+            continue;
+        };
+        let year = partial.year_cache.year(orderdate)?;
+        partial.push(orderkey, year);
+    }
+    Ok(Some(()))
+}
+
+fn q09_order_year_row_group_map_enabled() -> bool {
+    std::env::var_os("DODAM_Q09_DISABLE_ORDER_YEAR_ROW_GROUP_MAP").is_none()
+}
+
+fn q09_order_year_row_group_map_chunk() -> usize {
+    std::env::var("DODAM_Q09_ORDER_YEAR_ROW_GROUP_MAP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(8)
+}
 
 fn q09_order_year_max_dense_entries() -> usize {
     std::env::var("DODAM_Q09_ORDER_YEAR_DENSE_BYTES")
@@ -7886,20 +8032,26 @@ async fn q16_part_groups(
     excluded_type_prefix: &str,
     sizes: &AdaptiveI64Set,
 ) -> Result<Q16PartGroups> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec![
-                "p_partkey".to_string(),
-                "p_brand".to_string(),
-                "p_type".to_string(),
-                "p_size".to_string(),
-            ]),
-            None,
-        )
-        .await?;
+    let projection = Projection::Columns(vec![
+        "p_partkey".to_string(),
+        "p_brand".to_string(),
+        "p_type".to_string(),
+        "p_size".to_string(),
+    ]);
+    let mut stream = if q16_part_dictionary_strings_enabled() {
+        engine
+            .scan_parquet_batches_dictionary_columns(
+                path,
+                batch_size,
+                projection,
+                vec!["p_brand".to_string(), "p_type".to_string()],
+            )
+            .await?
+    } else {
+        engine
+            .scan_parquet_batches(path, batch_size, None, projection, None)
+            .await?
+    };
     let mut brand_ids = fast_hash_map::<String, usize>();
     let mut type_ids = fast_hash_map::<String, usize>();
     let mut brands_by_id = Vec::<String>::new();
@@ -7910,9 +8062,40 @@ async fn q16_part_groups(
     while let Some(batch) = stream.next() {
         let batch = batch?;
         let partkeys = batch_column(&batch, "p_partkey")?;
-        let brands = batch_string_column(&batch, "p_brand")?;
-        let types = batch_string_column(&batch, "p_type")?;
+        let brands = batch_column(&batch, "p_brand")?;
+        let types = batch_column(&batch, "p_type")?;
         let part_sizes = batch_column(&batch, "p_size")?;
+        if let (Some(brands), Some(types)) = (
+            brands.as_any().downcast_ref::<DictionaryArray<Int32Type>>(),
+            types.as_any().downcast_ref::<DictionaryArray<Int32Type>>(),
+        ) && q16_part_groups_dictionary_typed_batch(
+            partkeys,
+            brands,
+            types,
+            part_sizes,
+            excluded_brand,
+            excluded_type_prefix,
+            sizes,
+            &mut brand_ids,
+            &mut type_ids,
+            &mut brands_by_id,
+            &mut types_by_id,
+            &mut group_ids,
+            &mut groups,
+            &mut part_to_group,
+        )? {
+            continue;
+        }
+        let Some(brands) = brands.as_any().downcast_ref::<StringArray>() else {
+            return Err(DodamError::UnsupportedSql(
+                "p_brand must be Utf8".to_string(),
+            ));
+        };
+        let Some(types) = types.as_any().downcast_ref::<StringArray>() else {
+            return Err(DodamError::UnsupportedSql(
+                "p_type must be Utf8".to_string(),
+            ));
+        };
         if q16_part_groups_typed_batch(
             partkeys,
             brands,
@@ -7974,6 +8157,147 @@ async fn q16_part_groups(
         groups,
         part_to_group: AdaptiveI64Map::from_hash(part_to_group),
     })
+}
+
+fn q16_part_dictionary_strings_enabled() -> bool {
+    std::env::var_os("DODAM_Q16_DISABLE_PART_DICTIONARY_STRINGS").is_none()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q16_part_groups_dictionary_typed_batch(
+    partkeys: &ArrayRef,
+    brands: &DictionaryArray<Int32Type>,
+    types: &DictionaryArray<Int32Type>,
+    part_sizes: &ArrayRef,
+    excluded_brand: &str,
+    excluded_type_prefix: &str,
+    sizes: &AdaptiveI64Set,
+    brand_ids: &mut FastHashMap<String, usize>,
+    type_ids: &mut FastHashMap<String, usize>,
+    brands_by_id: &mut Vec<String>,
+    types_by_id: &mut Vec<String>,
+    group_ids: &mut FastHashMap<Q16GroupIdKey, usize>,
+    groups: &mut Vec<Q16GroupKey>,
+    part_to_group: &mut FastHashMap<i64, usize>,
+) -> Result<bool> {
+    let Some(partkeys) = partkeys.as_any().downcast_ref::<Int64Array>() else {
+        return Ok(false);
+    };
+    if partkeys.null_count() != 0 || brands.null_count() != 0 || types.null_count() != 0 {
+        return Ok(false);
+    }
+    let Some(brand_values) = q12_dictionary_string_values(brands) else {
+        return Ok(false);
+    };
+    let Some(type_values) = q12_dictionary_string_values(types) else {
+        return Ok(false);
+    };
+    let brand_lookup = q16_dictionary_group_string_ids(
+        &brand_values,
+        Some(excluded_brand.as_bytes()),
+        None,
+        brand_ids,
+        brands_by_id,
+    )?;
+    let type_lookup = q16_dictionary_group_string_ids(
+        &type_values,
+        None,
+        Some(excluded_type_prefix.as_bytes()),
+        type_ids,
+        types_by_id,
+    )?;
+    let brand_keys = brands.keys().values().as_ref();
+    let type_keys = types.keys().values().as_ref();
+    let partkey_values = partkeys.values().as_ref();
+    if let Some(part_sizes) = part_sizes.as_any().downcast_ref::<Int32Array>() {
+        if part_sizes.null_count() != 0 {
+            return Ok(false);
+        }
+        let size_values = part_sizes.values().as_ref();
+        for row in 0..partkey_values.len() {
+            let size = i64::from(size_values[row]);
+            if !sizes.contains(size) {
+                continue;
+            }
+            let (Some(brand_id), Some(type_id)) = (
+                q16_dictionary_lookup_id(&brand_lookup, brand_keys[row]),
+                q16_dictionary_lookup_id(&type_lookup, type_keys[row]),
+            ) else {
+                continue;
+            };
+            q16_insert_part_group_ids(
+                partkey_values[row],
+                size,
+                brand_id,
+                type_id,
+                brands_by_id,
+                types_by_id,
+                group_ids,
+                groups,
+                part_to_group,
+            );
+        }
+        return Ok(true);
+    }
+    if let Some(part_sizes) = part_sizes.as_any().downcast_ref::<Int64Array>() {
+        if part_sizes.null_count() != 0 {
+            return Ok(false);
+        }
+        let size_values = part_sizes.values().as_ref();
+        for row in 0..partkey_values.len() {
+            let size = size_values[row];
+            if !sizes.contains(size) {
+                continue;
+            }
+            let (Some(brand_id), Some(type_id)) = (
+                q16_dictionary_lookup_id(&brand_lookup, brand_keys[row]),
+                q16_dictionary_lookup_id(&type_lookup, type_keys[row]),
+            ) else {
+                continue;
+            };
+            q16_insert_part_group_ids(
+                partkey_values[row],
+                size,
+                brand_id,
+                type_id,
+                brands_by_id,
+                types_by_id,
+                group_ids,
+                groups,
+                part_to_group,
+            );
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn q16_dictionary_group_string_ids<S: BuildHasher>(
+    values: &Q12DictionaryStringValues<'_>,
+    excluded_exact: Option<&[u8]>,
+    excluded_prefix: Option<&[u8]>,
+    ids: &mut HashMap<String, usize, S>,
+    strings_by_id: &mut Vec<String>,
+) -> Result<Vec<Option<usize>>> {
+    let mut lookup = Vec::with_capacity(values.len());
+    for index in 0..values.len() {
+        let value = values.value_bytes(index);
+        if excluded_exact.is_some_and(|excluded| value == excluded)
+            || excluded_prefix.is_some_and(|prefix| value.starts_with(prefix))
+        {
+            lookup.push(None);
+            continue;
+        }
+        let value = std::str::from_utf8(value)
+            .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+        lookup.push(Some(q16_intern_string(ids, strings_by_id, value)));
+    }
+    Ok(lookup)
+}
+
+fn q16_dictionary_lookup_id(lookup: &[Option<usize>], key: i32) -> Option<usize> {
+    let key = usize::try_from(key).ok()?;
+    lookup.get(key).copied().flatten()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8081,6 +8405,31 @@ fn q16_insert_part_group_row(
     }
     let brand_id = q16_intern_string(brand_ids, brands_by_id, brand);
     let type_id = q16_intern_string(type_ids, types_by_id, type_name);
+    q16_insert_part_group_ids(
+        partkey,
+        size,
+        brand_id,
+        type_id,
+        brands_by_id,
+        types_by_id,
+        group_ids,
+        groups,
+        part_to_group,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q16_insert_part_group_ids(
+    partkey: i64,
+    size: i64,
+    brand_id: usize,
+    type_id: usize,
+    brands_by_id: &[String],
+    types_by_id: &[String],
+    group_ids: &mut FastHashMap<Q16GroupIdKey, usize>,
+    groups: &mut Vec<Q16GroupKey>,
+    part_to_group: &mut FastHashMap<i64, usize>,
+) {
     let key = Q16GroupIdKey {
         brand_id,
         type_id,
@@ -8373,6 +8722,29 @@ fn q16_supplier_counts_packed_batch_typed(
     if partkeys.null_count() == 0 && suppkeys.null_count() == 0 {
         let partkey_values = partkeys.values().as_ref();
         let suppkey_values = suppkeys.values().as_ref();
+        if let (Some((group_values, group_present)), Some(bad_present)) = (
+            part_to_group.dense_slices(),
+            bad_suppliers.dense_contains_slice(),
+        ) {
+            for row in 0..partkey_values.len() {
+                let suppkey = suppkey_values[row];
+                if let Ok(suppkey_index) = usize::try_from(suppkey)
+                    && bad_present.get(suppkey_index).copied().unwrap_or(false)
+                {
+                    continue;
+                }
+                let Ok(partkey_index) = usize::try_from(partkey_values[row]) else {
+                    continue;
+                };
+                if partkey_index >= group_present.len() || !group_present[partkey_index] {
+                    continue;
+                }
+                if !distinct_suppliers.push(group_values[partkey_index], suppkey) {
+                    return false;
+                }
+            }
+            return true;
+        }
         for row in 0..partkey_values.len() {
             let suppkey = suppkey_values[row];
             if bad_suppliers.contains(suppkey) {
@@ -9207,15 +9579,17 @@ fn q12_filtered_lineitem_counts_projected_batch_into(
     end_days: i32,
     pending: &mut Q12PendingMap,
 ) -> Result<()> {
-    if q12_typed_loop_enabled() {
-        let modes = batch_column(&batch, "l_shipmode")?;
-        if let Some(modes) = modes.as_any().downcast_ref::<DictionaryArray<Int32Type>>()
+    if batch.num_columns() == 5 && q12_typed_loop_enabled() {
+        if let Some(modes) = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
             && q12_filtered_lineitem_counts_batch_dictionary_typed_into(
-                batch_column(&batch, "l_orderkey")?,
+                batch.column(0),
                 modes,
-                batch_column(&batch, "l_commitdate")?,
-                batch_column(&batch, "l_receiptdate")?,
-                batch_column(&batch, "l_shipdate")?,
+                batch.column(2),
+                batch.column(3),
+                batch.column(4),
                 shipmodes,
                 start_days,
                 end_days,
@@ -9224,23 +9598,21 @@ fn q12_filtered_lineitem_counts_projected_batch_into(
         {
             return Ok(());
         }
-    }
-    if batch.num_columns() == 5
-        && let Some(modes) = batch.column(1).as_any().downcast_ref::<StringArray>()
-        && q12_typed_loop_enabled()
-        && q12_filtered_lineitem_counts_batch_typed_into(
-            batch.column(0),
-            modes,
-            batch.column(2),
-            batch.column(3),
-            batch.column(4),
-            shipmodes,
-            start_days,
-            end_days,
-            pending,
-        )
-    {
-        return Ok(());
+        if let Some(modes) = batch.column(1).as_any().downcast_ref::<StringArray>()
+            && q12_filtered_lineitem_counts_batch_typed_into(
+                batch.column(0),
+                modes,
+                batch.column(2),
+                batch.column(3),
+                batch.column(4),
+                shipmodes,
+                start_days,
+                end_days,
+                pending,
+            )
+        {
+            return Ok(());
+        }
     }
     q12_filtered_lineitem_counts_batch_into(batch, shipmodes, start_days, end_days, pending)
 }
@@ -10329,7 +10701,7 @@ fn q12_order_fused_row_group_chunk() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(2)
+        .unwrap_or(4)
 }
 
 fn q12_order_late_materialized_enabled() -> bool {
