@@ -36,12 +36,30 @@ impl<'a> BatchView<'a> {
         self.downcast(index)
     }
 
+    pub(crate) fn required_utf8(&self, index: usize) -> Result<&'a StringArray> {
+        self.utf8(index).ok_or_else(|| {
+            DodamError::UnsupportedSql(format!("projected column {index} is not Utf8"))
+        })
+    }
+
     pub(crate) fn i64(&self, index: usize) -> Option<&'a Int64Array> {
         self.downcast(index)
     }
 
+    pub(crate) fn required_i64(&self, index: usize) -> Result<&'a Int64Array> {
+        self.i64(index).ok_or_else(|| {
+            DodamError::UnsupportedSql(format!("projected column {index} is not Int64"))
+        })
+    }
+
     pub(crate) fn date32(&self, index: usize) -> Option<&'a Date32Array> {
         self.downcast(index)
+    }
+
+    pub(crate) fn required_date32(&self, index: usize) -> Result<&'a Date32Array> {
+        self.date32(index).ok_or_else(|| {
+            DodamError::UnsupportedSql(format!("projected column {index} is not Date32"))
+        })
     }
 
     pub(crate) fn dictionary_i32(&self, index: usize) -> Option<&'a DictionaryArray<Int32Type>> {

@@ -3939,7 +3939,7 @@ async fn q10_customer_rows_late_materialized(
     let customer_keys = Arc::new(customer_keys);
     let customer_key_filter = Arc::new(AdaptiveI64Set::from_hash(customer_key_filter));
     let Some(chunks) = engine
-        .late_materialized_parquet_map_with_policy(
+        .late_materialized_parquet_map_pruned_with_policy_view(
             path,
             batch_size,
             Projection::Columns(vec!["c_custkey".to_string()]),
@@ -3951,6 +3951,7 @@ async fn q10_customer_rows_late_materialized(
                 "c_phone".to_string(),
                 "c_comment".to_string(),
             ]),
+            Vec::new(),
             q10_customer_late_row_group_chunk(),
             LateMaterializationPolicy::selective_with_selector_run_ratio(
                 q10_customer_late_max_selected_ratio(),
@@ -3969,8 +3970,8 @@ async fn q10_customer_rows_late_materialized(
                     )
                 }
             },
-            q10_customer_late_build_selection_batch,
-            q10_customer_late_consume_payload_batch,
+            q10_customer_late_build_selection_view,
+            q10_customer_late_consume_payload_view,
             |state, _metrics| {
                 if !state.payload_consumed() {
                     return Err(DodamError::UnsupportedSql(
@@ -4070,6 +4071,42 @@ fn i64_set_late_build_selection_batch<T>(
     .map(|metrics| metrics.map(|_| ()))
 }
 
+fn i64_set_late_build_selection_view<T>(
+    view: BatchView<'_>,
+    key_index: usize,
+    selection: &mut LateSelectionBuilder,
+    state: &mut I64SetLateSelectionState<T>,
+) -> Result<Option<()>> {
+    let Some(keys) = view.i64(key_index) else {
+        return Ok(None);
+    };
+    let dense_key_filter = state.key_filter.dense_contains_slice();
+    if keys.null_count() == 0 {
+        for &key in keys.values().as_ref() {
+            let selected =
+                adaptive_i64_set_contains_cached(&state.key_filter, dense_key_filter, key);
+            selection.push(selected);
+            if selected {
+                state.selected_keys.push(key);
+            }
+        }
+        return Ok(Some(()));
+    }
+    for row in 0..keys.len() {
+        let selected = keys.is_valid(row)
+            && adaptive_i64_set_contains_cached(
+                &state.key_filter,
+                dense_key_filter,
+                keys.value(row),
+            );
+        selection.push(selected);
+        if selected {
+            state.selected_keys.push(keys.value(row));
+        }
+    }
+    Ok(Some(()))
+}
+
 fn i64_set_late_build_selection_batch_into(
     batch: RecordBatch,
     key_column: &str,
@@ -4139,6 +4176,17 @@ fn q10_customer_late_build_selection_batch(
     i64_set_late_build_selection_batch(batch, "c_custkey", selection, state)
 }
 
+fn q10_customer_late_build_selection_view(
+    view: BatchView<'_>,
+    selection: &mut LateSelectionBuilder,
+    state: &mut Q10CustomerLateState,
+) -> Result<Option<()>> {
+    if view.num_columns() == 1 {
+        return i64_set_late_build_selection_view(view, 0, selection, state);
+    }
+    q10_customer_late_build_selection_batch(view.record_batch().clone(), selection, state)
+}
+
 fn q10_customer_late_consume_payload_batch(
     batch: RecordBatch,
     state: &mut Q10CustomerLateState,
@@ -4182,6 +4230,58 @@ fn q10_customer_late_consume_payload_batch(
     Ok(Some(()))
 }
 
+fn q10_customer_late_consume_payload_view(
+    view: BatchView<'_>,
+    state: &mut Q10CustomerLateState,
+) -> Result<Option<()>> {
+    if view.num_columns() == 6 {
+        let (
+            Some(names),
+            Some(acctbals),
+            Some(nationkeys),
+            Some(addresses),
+            Some(phones),
+            Some(comments),
+        ) = (
+            view.utf8(0),
+            decimal_input(view.column(1)?)?,
+            view.i64(2),
+            view.utf8(3),
+            view.utf8(4),
+            view.utf8(5),
+        )
+        else {
+            return q10_customer_late_consume_payload_batch(view.record_batch().clone(), state);
+        };
+        for row in 0..view.num_rows() {
+            let custkey = state.next_payload_key("Q10 customer payload row overflow")?;
+            if !state.payload.customer_keys.contains(custkey)
+                || names.is_null(row)
+                || acctbals.is_null(row)
+                || nationkeys.is_null(row)
+                || addresses.is_null(row)
+                || phones.is_null(row)
+                || comments.is_null(row)
+            {
+                continue;
+            }
+            state.payload.customers.insert(
+                custkey,
+                Q10Customer {
+                    c_name: names.value(row).to_string(),
+                    c_acctbal: acctbals.value(row),
+                    c_nationkey: nationkeys.value(row),
+                    c_address: addresses.value(row).to_string(),
+                    c_phone: phones.value(row).to_string(),
+                    c_comment: comments.value(row).to_string(),
+                },
+            );
+        }
+        return Ok(Some(()));
+    }
+    q10_customer_late_consume_payload_batch(view.record_batch().clone(), state)
+}
+
 fn q10_log_customer_late_profile(metrics: LateMaterializedMetrics, row_group_chunk: usize) {
     if !tpch_profile_enabled() {
         return;
@@ -4217,9 +4317,18 @@ async fn q10_order_customers(
             None,
         )
         .await?;
-    parallel_batch_fold(
+    parallel_batch_fold_view_chunks(
         &mut stream,
-        move |batch| q10_order_customers_batch(batch, start_days, end_days),
+        4,
+        fast_hash_map::<i64, i64>,
+        move |view, orders| {
+            merge_maps(
+                orders,
+                q10_order_customers_view(view, start_days, end_days)?,
+            );
+            Ok(Some(()))
+        },
+        Ok,
         fast_hash_map::<i64, i64>(),
         merge_maps,
         "Q10 order customers",
@@ -4256,6 +4365,46 @@ fn q10_order_customers_batch(
         orders.insert(orderkey, custkey);
     }
     Ok(orders)
+}
+
+fn q10_order_customers_view(
+    view: BatchView<'_>,
+    start_days: i32,
+    end_days: i32,
+) -> Result<FastHashMap<i64, i64>> {
+    if view.num_columns() == 3
+        && let (Ok(orderkeys), Ok(custkeys), Ok(orderdates)) = (
+            view.required_i64(0),
+            view.required_i64(1),
+            view.required_date32(2),
+        )
+    {
+        let mut orders = fast_hash_map::<i64, i64>();
+        if orderkeys.null_count() == 0 && custkeys.null_count() == 0 && orderdates.null_count() == 0
+        {
+            let orderkey_values = orderkeys.values().as_ref();
+            let custkey_values = custkeys.values().as_ref();
+            let orderdate_values = orderdates.values().as_ref();
+            for row in 0..view.num_rows() {
+                let orderdate = orderdate_values[row];
+                if orderdate >= start_days && orderdate < end_days {
+                    orders.insert(orderkey_values[row], custkey_values[row]);
+                }
+            }
+            return Ok(orders);
+        }
+        for row in 0..view.num_rows() {
+            if orderkeys.is_null(row) || custkeys.is_null(row) || orderdates.is_null(row) {
+                continue;
+            }
+            let orderdate = orderdates.value(row);
+            if orderdate >= start_days && orderdate < end_days {
+                orders.insert(orderkeys.value(row), custkeys.value(row));
+            }
+        }
+        return Ok(orders);
+    }
+    q10_order_customers_batch(view.record_batch().clone(), start_days, end_days)
 }
 
 fn q10_order_customers_batch_typed(
@@ -4309,9 +4458,15 @@ async fn q10_returned_revenue_by_customer(
         )
         .await?;
     let order_customers = Arc::new(order_customers.clone());
-    parallel_batch_fold(
+    parallel_batch_fold_view_chunks(
         &mut stream,
-        move |batch| q10_returned_revenue_batch(batch, &order_customers),
+        4,
+        fast_hash_map::<i64, f64>,
+        move |view, revenues| {
+            merge_f64_groups(revenues, q10_returned_revenue_view(view, &order_customers)?);
+            Ok(Some(()))
+        },
+        Ok,
         fast_hash_map::<i64, f64>(),
         merge_f64_groups,
         "Q10 returned revenue aggregate",
@@ -4326,7 +4481,7 @@ async fn q10_returned_revenue_late(
 ) -> Result<Option<FastHashMap<i64, f64>>> {
     let order_customers = Arc::new(order_customers.clone());
     let Some(chunks) = engine
-        .late_materialized_parquet_map_with_policy(
+        .late_materialized_parquet_map_pruned_with_policy_view(
             path,
             batch_size,
             Projection::Columns(vec!["l_orderkey".to_string(), "l_returnflag".to_string()]),
@@ -4334,6 +4489,7 @@ async fn q10_returned_revenue_late(
                 "l_extendedprice".to_string(),
                 "l_discount".to_string(),
             ]),
+            Vec::new(),
             q10_returned_revenue_late_row_group_chunk(),
             late_materialization_policy_from_env(
                 "DODAM_Q10_RETURNED_LATE_MAX_SELECTED_RATIO",
@@ -4348,8 +4504,8 @@ async fn q10_returned_revenue_late(
                     revenues: fast_hash_map::<i64, f64>(),
                 }
             },
-            q10_returned_revenue_late_build_selection_batch,
-            q10_returned_revenue_late_consume_payload_batch,
+            q10_returned_revenue_late_build_selection_view,
+            q10_returned_revenue_late_consume_payload_view,
             |state, _metrics| {
                 if state.payload_offset != state.selected_custkeys.len() {
                     return Err(DodamError::UnsupportedSql(
@@ -4433,6 +4589,53 @@ fn q10_returned_revenue_late_build_selection_batch(
     Ok(Some(()))
 }
 
+fn q10_returned_revenue_late_build_selection_view(
+    view: BatchView<'_>,
+    selection: &mut LateSelectionBuilder,
+    state: &mut Q10ReturnedRevenueLateState,
+) -> Result<Option<()>> {
+    if view.num_columns() == 2 {
+        let (Some(orderkeys), Some(returnflags)) = (view.i64(0), view.utf8(1)) else {
+            return q10_returned_revenue_late_build_selection_batch(
+                view.record_batch().clone(),
+                selection,
+                state,
+            );
+        };
+        let returnflag_offsets = returnflags.value_offsets();
+        let returnflag_data = returnflags.value_data();
+        if orderkeys.null_count() == 0 && returnflags.null_count() == 0 {
+            let orderkey_values = orderkeys.values().as_ref();
+            for row in 0..orderkey_values.len() {
+                let selected =
+                    utf8_value_is_one_byte(returnflag_offsets, returnflag_data, row, b'R')
+                        && state
+                            .order_customers
+                            .get(&orderkey_values[row])
+                            .copied()
+                            .inspect(|custkey| state.selected_custkeys.push(*custkey))
+                            .is_some();
+                selection.push(selected);
+            }
+            return Ok(Some(()));
+        }
+        for row in 0..orderkeys.len() {
+            let selected = orderkeys.is_valid(row)
+                && returnflags.is_valid(row)
+                && utf8_value_is_one_byte(returnflag_offsets, returnflag_data, row, b'R')
+                && state
+                    .order_customers
+                    .get(&orderkeys.value(row))
+                    .copied()
+                    .inspect(|custkey| state.selected_custkeys.push(*custkey))
+                    .is_some();
+            selection.push(selected);
+        }
+        return Ok(Some(()));
+    }
+    q10_returned_revenue_late_build_selection_batch(view.record_batch().clone(), selection, state)
+}
+
 fn q10_returned_revenue_late_consume_payload_batch(
     batch: RecordBatch,
     state: &mut Q10ReturnedRevenueLateState,
@@ -4479,6 +4682,59 @@ fn q10_returned_revenue_late_consume_payload_batch(
             extendedprices.value(row) * (1.0 - discounts.value(row));
     }
     Ok(Some(()))
+}
+
+fn q10_returned_revenue_late_consume_payload_view(
+    view: BatchView<'_>,
+    state: &mut Q10ReturnedRevenueLateState,
+) -> Result<Option<()>> {
+    if view.num_columns() == 2 {
+        let (Some(extendedprices), Some(discounts)) = (
+            decimal_input(view.column(0)?)?,
+            decimal_input(view.column(1)?)?,
+        ) else {
+            return q10_returned_revenue_late_consume_payload_batch(
+                view.record_batch().clone(),
+                state,
+            );
+        };
+        if extendedprices.null_count() == 0 && discounts.null_count() == 0 {
+            let extendedprice_values = extendedprices.raw_values();
+            let discount_values = discounts.raw_values();
+            let (discount_scale, revenue_scale) =
+                decimal_discounted_revenue_scales(extendedprices, discounts);
+            for row in 0..view.num_rows() {
+                let Some(&custkey) = state.selected_custkeys.get(state.payload_offset) else {
+                    return Err(DodamError::UnsupportedSql(
+                        "Q10 returned revenue payload row overflow".to_string(),
+                    ));
+                };
+                state.payload_offset += 1;
+                *state.revenues.entry(custkey).or_insert(0.0) += decimal_discounted_revenue_raw(
+                    extendedprice_values[row],
+                    discount_values[row],
+                    discount_scale,
+                    revenue_scale,
+                );
+            }
+            return Ok(Some(()));
+        }
+        for row in 0..view.num_rows() {
+            let Some(&custkey) = state.selected_custkeys.get(state.payload_offset) else {
+                return Err(DodamError::UnsupportedSql(
+                    "Q10 returned revenue payload row overflow".to_string(),
+                ));
+            };
+            state.payload_offset += 1;
+            if extendedprices.is_null(row) || discounts.is_null(row) {
+                continue;
+            }
+            *state.revenues.entry(custkey).or_insert(0.0) +=
+                extendedprices.value(row) * (1.0 - discounts.value(row));
+        }
+        return Ok(Some(()));
+    }
+    q10_returned_revenue_late_consume_payload_batch(view.record_batch().clone(), state)
 }
 
 fn q10_log_returned_revenue_late_profile(metrics: LateMaterializedMetrics, row_group_chunk: usize) {
@@ -4579,6 +4835,69 @@ fn q10_returned_revenue_batch(
         *revenues.entry(custkey).or_insert(0.0) += extendedprice * (1.0 - discount);
     }
     Ok(revenues)
+}
+
+fn q10_returned_revenue_view(
+    view: BatchView<'_>,
+    order_customers: &FastHashMap<i64, i64>,
+) -> Result<FastHashMap<i64, f64>> {
+    if view.num_columns() == 4 {
+        let (Some(orderkeys), Some(returnflags), Some(extendedprices), Some(discounts)) = (
+            view.i64(0),
+            view.utf8(1),
+            decimal_input(view.column(2)?)?,
+            decimal_input(view.column(3)?)?,
+        ) else {
+            return q10_returned_revenue_batch(view.record_batch().clone(), order_customers);
+        };
+        let mut revenues = fast_hash_map::<i64, f64>();
+        let returnflag_offsets = returnflags.value_offsets();
+        let returnflag_data = returnflags.value_data();
+        if orderkeys.null_count() == 0
+            && extendedprices.null_count() == 0
+            && discounts.null_count() == 0
+        {
+            let orderkey_values = orderkeys.values().as_ref();
+            let extendedprice_values = extendedprices.raw_values();
+            let discount_values = discounts.raw_values();
+            let (discount_scale, revenue_scale) =
+                decimal_discounted_revenue_scales(extendedprices, discounts);
+            for row in 0..view.num_rows() {
+                if returnflags.is_null(row)
+                    || !utf8_value_is_one_byte(returnflag_offsets, returnflag_data, row, b'R')
+                {
+                    continue;
+                }
+                let Some(custkey) = order_customers.get(&orderkey_values[row]).copied() else {
+                    continue;
+                };
+                *revenues.entry(custkey).or_insert(0.0) += decimal_discounted_revenue_raw(
+                    extendedprice_values[row],
+                    discount_values[row],
+                    discount_scale,
+                    revenue_scale,
+                );
+            }
+            return Ok(revenues);
+        }
+        for row in 0..view.num_rows() {
+            if returnflags.is_null(row)
+                || !utf8_value_is_one_byte(returnflag_offsets, returnflag_data, row, b'R')
+                || orderkeys.is_null(row)
+                || extendedprices.is_null(row)
+                || discounts.is_null(row)
+            {
+                continue;
+            }
+            let Some(custkey) = order_customers.get(&orderkeys.value(row)).copied() else {
+                continue;
+            };
+            *revenues.entry(custkey).or_insert(0.0) +=
+                extendedprices.value(row) * (1.0 - discounts.value(row));
+        }
+        return Ok(revenues);
+    }
+    q10_returned_revenue_batch(view.record_batch().clone(), order_customers)
 }
 
 fn q10_output(rows: Vec<Q10Row>) -> Result<QueryOutput> {
@@ -19416,18 +19735,38 @@ async fn q08_part_keys(
     let mut keys = HashSet::new();
     while let Some(batch) = stream.next() {
         let batch = batch?;
-        let partkeys = batch_column(&batch, "p_partkey")?;
-        let types = batch_string_column(&batch, "p_type")?;
-        for row in 0..batch.num_rows() {
-            if types.is_valid(row)
-                && types.value(row) == part_type
-                && let Some(partkey) = numeric_i64_value(partkeys, row)?
-            {
-                keys.insert(partkey);
-            }
-        }
+        q08_part_keys_view_into(BatchView::new(&batch), part_type, &mut keys)?;
     }
     Ok(keys)
+}
+
+fn q08_part_keys_view_into(
+    view: BatchView<'_>,
+    part_type: &str,
+    keys: &mut HashSet<i64>,
+) -> Result<()> {
+    if view.num_columns() == 2
+        && let (Ok(partkeys), Ok(types)) = (view.required_i64(0), view.required_utf8(1))
+    {
+        for row in 0..view.num_rows() {
+            if partkeys.is_valid(row) && types.is_valid(row) && types.value(row) == part_type {
+                keys.insert(partkeys.value(row));
+            }
+        }
+        return Ok(());
+    }
+    let batch = view.record_batch();
+    let partkeys = batch_column(batch, "p_partkey")?;
+    let types = batch_string_column(batch, "p_type")?;
+    for row in 0..batch.num_rows() {
+        if types.is_valid(row)
+            && types.value(row) == part_type
+            && let Some(partkey) = numeric_i64_value(partkeys, row)?
+        {
+            keys.insert(partkey);
+        }
+    }
+    Ok(())
 }
 
 async fn q08_order_years(
@@ -19597,21 +19936,44 @@ async fn q08_supplier_is_brazil(
     let mut suppliers = HashMap::new();
     while let Some(batch) = stream.next() {
         let batch = batch?;
-        let suppkeys = batch_column(&batch, "s_suppkey")?;
-        let nationkeys = batch_column(&batch, "s_nationkey")?;
-        for row in 0..batch.num_rows() {
-            let (Some(suppkey), Some(nationkey)) = (
-                numeric_i64_value(suppkeys, row)?,
-                numeric_i64_value(nationkeys, row)?,
-            ) else {
-                continue;
-            };
-            if let Some(name) = nation_names.get(&nationkey) {
-                suppliers.insert(suppkey, name == "BRAZIL");
-            }
-        }
+        q08_supplier_is_brazil_view_into(BatchView::new(&batch), nation_names, &mut suppliers)?;
     }
     Ok(suppliers)
+}
+
+fn q08_supplier_is_brazil_view_into(
+    view: BatchView<'_>,
+    nation_names: &HashMap<i64, String>,
+    suppliers: &mut HashMap<i64, bool>,
+) -> Result<()> {
+    if view.num_columns() == 2
+        && let (Ok(suppkeys), Ok(nationkeys)) = (view.required_i64(0), view.required_i64(1))
+    {
+        for row in 0..view.num_rows() {
+            if suppkeys.is_null(row) || nationkeys.is_null(row) {
+                continue;
+            }
+            if let Some(name) = nation_names.get(&nationkeys.value(row)) {
+                suppliers.insert(suppkeys.value(row), name == "BRAZIL");
+            }
+        }
+        return Ok(());
+    }
+    let batch = view.record_batch();
+    let suppkeys = batch_column(batch, "s_suppkey")?;
+    let nationkeys = batch_column(batch, "s_nationkey")?;
+    for row in 0..batch.num_rows() {
+        let (Some(suppkey), Some(nationkey)) = (
+            numeric_i64_value(suppkeys, row)?,
+            numeric_i64_value(nationkeys, row)?,
+        ) else {
+            continue;
+        };
+        if let Some(name) = nation_names.get(&nationkey) {
+            suppliers.insert(suppkey, name == "BRAZIL");
+        }
+    }
+    Ok(())
 }
 
 struct Q08Row {

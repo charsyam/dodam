@@ -1591,3 +1591,9 @@ Tried and rejected or neutral:
         - Simple scan build: moved Q15 supplier output scan to fixed-projection `BatchView`.
         - BatchView API: added `num_rows`, `i64`, and `date32` typed accessors and applied them to several hot wrappers.
       - Validation after this pass: `cargo test -q` passed and release build passed. Focused SF=10 Q03/Q12/Q15 sampled Dodam `0.606s`, DuckDB `0.588s`, ratio `1.032x`; Q15 was faster while Q03/Q12 were slower in that focused sample. Full SF=10 single-process comparison sampled Dodam `4.839s`, DuckDB `5.838s`, ratio `0.829x`; only Q04 was slower (`~6.5ms`), while Q12 was effectively parity/faster in that full run (`~0.8ms` faster).
+      - Continued the 1-4 vector pipeline pass:
+        - Late materialization: moved Q10 customer late and Q10 returned-revenue late to the engine `BatchView` API; added a reusable `i64_set_late_build_selection_view` helper.
+        - Stream fold: moved Q10 order-customer build and returned-revenue fallback to `parallel_batch_fold_view_chunks`.
+        - Simple scan build: moved Q08 `part_keys` and `supplier_is_brazil` dimension scans to fixed-projection `BatchView`.
+        - BatchView API: added `required_i64`, `required_utf8`, and `required_date32` accessors and used them in Q08/Q10 view paths.
+      - Validation after Q10/Q08 view expansion: `cargo test -q` passed and release build passed. Focused SF=10 Q08/Q10 sampled Dodam `0.606s`, DuckDB `0.720s`, ratio `0.841x`, with no slower queries. Full SF=10 single-process comparison sampled Dodam `4.891s`, DuckDB `5.848s`, ratio `0.836x`; remaining slower queries were Q12 (`~14.5ms`) and Q04 (`~11.5ms`).
