@@ -1,4 +1,4 @@
-use arrow::array::{ArrayRef, DictionaryArray, StringArray};
+use arrow::array::{ArrayRef, Date32Array, DictionaryArray, Int64Array, StringArray};
 use arrow::datatypes::Int32Type;
 use arrow::record_batch::RecordBatch;
 
@@ -22,6 +22,10 @@ impl<'a> BatchView<'a> {
         self.batch.num_columns()
     }
 
+    pub(crate) fn num_rows(&self) -> usize {
+        self.batch.num_rows()
+    }
+
     pub(crate) fn column(&self, index: usize) -> Result<&'a ArrayRef> {
         self.batch.columns().get(index).ok_or_else(|| {
             DodamError::UnsupportedSql(format!("projected column index {index} missing"))
@@ -29,6 +33,14 @@ impl<'a> BatchView<'a> {
     }
 
     pub(crate) fn utf8(&self, index: usize) -> Option<&'a StringArray> {
+        self.downcast(index)
+    }
+
+    pub(crate) fn i64(&self, index: usize) -> Option<&'a Int64Array> {
+        self.downcast(index)
+    }
+
+    pub(crate) fn date32(&self, index: usize) -> Option<&'a Date32Array> {
         self.downcast(index)
     }
 

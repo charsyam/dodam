@@ -1585,3 +1585,9 @@ Tried and rejected or neutral:
         - Q06 row-filter fallback and Q08 order-year stream aggregation now use this helper.
         - New engine-level `parquet_scan_accumulate_chunks_view` plus stream fallback moves Q01/Q06/Q15 scan-aggregate consumers to `BatchView`.
       - Validation after stream/scan-aggregate view expansion: `cargo test -q` passed and release build passed. Focused SF=10 Q06/Q08/Q12 comparison sampled Dodam `0.644s`, DuckDB `0.650s`, ratio `0.991x`; Q06/Q08 were faster and Q12 remained slower. Focused Q01/Q06/Q15 sampled Dodam `0.478s`, DuckDB `0.533s`, ratio `0.897x`, with no slower queries. Full SF=10 single-process comparison sampled Dodam `4.826s`, DuckDB `5.847s`, ratio `0.825x`; remaining slower queries were Q04 (`~10.0ms`), Q12 (`~6.7ms`), and Q03 (`~0.2ms`, noise-level).
+      - Applied the next 1-4 vector pipeline pass:
+        - Late materialization: added engine-level `late_materialized_parquet_map_pruned_with_policy_view` plus view-based sample/chunk execution; moved Q03 revenue late/carry and Q12 lineitem late callbacks to `BatchView`.
+        - Stream fold: moved Q12 row-filter lineitem fallback and Q12 orders sorted/default stream fallback to `parallel_batch_fold_view_chunks`.
+        - Simple scan build: moved Q15 supplier output scan to fixed-projection `BatchView`.
+        - BatchView API: added `num_rows`, `i64`, and `date32` typed accessors and applied them to several hot wrappers.
+      - Validation after this pass: `cargo test -q` passed and release build passed. Focused SF=10 Q03/Q12/Q15 sampled Dodam `0.606s`, DuckDB `0.588s`, ratio `1.032x`; Q15 was faster while Q03/Q12 were slower in that focused sample. Full SF=10 single-process comparison sampled Dodam `4.839s`, DuckDB `5.838s`, ratio `0.829x`; only Q04 was slower (`~6.5ms`), while Q12 was effectively parity/faster in that full run (`~0.8ms` faster).
