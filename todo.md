@@ -1597,3 +1597,9 @@ Tried and rejected or neutral:
         - Simple scan build: moved Q08 `part_keys` and `supplier_is_brazil` dimension scans to fixed-projection `BatchView`.
         - BatchView API: added `required_i64`, `required_utf8`, and `required_date32` accessors and used them in Q08/Q10 view paths.
       - Validation after Q10/Q08 view expansion: `cargo test -q` passed and release build passed. Focused SF=10 Q08/Q10 sampled Dodam `0.606s`, DuckDB `0.720s`, ratio `0.841x`, with no slower queries. Full SF=10 single-process comparison sampled Dodam `4.891s`, DuckDB `5.848s`, ratio `0.836x`; remaining slower queries were Q12 (`~14.5ms`) and Q04 (`~11.5ms`).
+      - Continued with Q12/Q04/Q02 vector cleanup:
+        - Late materialization: moved Q12 order late and Q04 candidate late to `BatchView` callbacks.
+        - Stream/fallback scan: moved Q04 candidate fallback scan and Q04 lineitem fallback count loop through `BatchView` helpers.
+        - Simple dimension build: moved Q02 region-key and nation-name scans to fixed-projection `BatchView`.
+        - Typed layout: added small `Q12OrderPriorityView`, `Q04CandidatePredicateView`, and `Q04CandidatePayloadView` layout structs for late-materialized payload/predicate callbacks.
+      - Validation: `cargo test -q` passed and release build passed. Focused SF=10 Q02/Q04/Q12 sampled Dodam `0.386s`, DuckDB `0.330s`, ratio `1.171x` with all three slower in that focused run. Full SF=10 single-process comparison sampled Dodam `4.869s`, DuckDB `5.771s`, ratio `0.844x`; remaining slower queries were Q04 (`~28.7ms`), Q12 (`~12.0ms`), and Q03 (`~0.7ms`, noise-level). Q04's gap worsened in this sample, so the next performance pass should profile Q04 candidate/lineitem stages before further broad conversion.

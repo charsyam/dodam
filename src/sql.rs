@@ -5146,18 +5146,38 @@ async fn q02_region_keys(
     let mut keys = HashSet::new();
     while let Some(batch) = stream.next() {
         let batch = batch?;
-        let regionkeys = batch_column(&batch, "r_regionkey")?;
-        let names = batch_string_column(&batch, "r_name")?;
-        for row in 0..batch.num_rows() {
-            if names.is_valid(row)
-                && names.value(row) == region_name
-                && let Some(regionkey) = numeric_i64_value(regionkeys, row)?
-            {
-                keys.insert(regionkey);
-            }
-        }
+        q02_region_keys_view_into(BatchView::new(&batch), region_name, &mut keys)?;
     }
     Ok(keys)
+}
+
+fn q02_region_keys_view_into(
+    view: BatchView<'_>,
+    region_name: &str,
+    keys: &mut HashSet<i64>,
+) -> Result<()> {
+    if view.num_columns() == 2
+        && let (Ok(regionkeys), Ok(names)) = (view.required_i64(0), view.required_utf8(1))
+    {
+        for row in 0..view.num_rows() {
+            if regionkeys.is_valid(row) && names.is_valid(row) && names.value(row) == region_name {
+                keys.insert(regionkeys.value(row));
+            }
+        }
+        return Ok(());
+    }
+    let batch = view.record_batch();
+    let regionkeys = batch_column(batch, "r_regionkey")?;
+    let names = batch_string_column(batch, "r_name")?;
+    for row in 0..batch.num_rows() {
+        if names.is_valid(row)
+            && names.value(row) == region_name
+            && let Some(regionkey) = numeric_i64_value(regionkeys, row)?
+        {
+            keys.insert(regionkey);
+        }
+    }
+    Ok(())
 }
 
 async fn q02_nation_names(
@@ -5182,25 +5202,52 @@ async fn q02_nation_names(
     let mut nations = HashMap::new();
     while let Some(batch) = stream.next() {
         let batch = batch?;
-        let nationkeys = batch_column(&batch, "n_nationkey")?;
-        let names = batch_string_column(&batch, "n_name")?;
-        let regionkeys = batch_column(&batch, "n_regionkey")?;
-        for row in 0..batch.num_rows() {
-            if names.is_null(row) {
-                continue;
-            }
-            let (Some(nationkey), Some(regionkey)) = (
-                numeric_i64_value(nationkeys, row)?,
-                numeric_i64_value(regionkeys, row)?,
-            ) else {
-                continue;
-            };
-            if region_keys.contains(&regionkey) {
-                nations.insert(nationkey, names.value(row).to_string());
-            }
-        }
+        q02_nation_names_view_into(BatchView::new(&batch), region_keys, &mut nations)?;
     }
     Ok(nations)
+}
+
+fn q02_nation_names_view_into(
+    view: BatchView<'_>,
+    region_keys: &HashSet<i64>,
+    nations: &mut HashMap<i64, String>,
+) -> Result<()> {
+    if view.num_columns() == 3
+        && let (Ok(nationkeys), Ok(names), Ok(regionkeys)) = (
+            view.required_i64(0),
+            view.required_utf8(1),
+            view.required_i64(2),
+        )
+    {
+        for row in 0..view.num_rows() {
+            if nationkeys.is_null(row) || names.is_null(row) || regionkeys.is_null(row) {
+                continue;
+            }
+            if region_keys.contains(&regionkeys.value(row)) {
+                nations.insert(nationkeys.value(row), names.value(row).to_string());
+            }
+        }
+        return Ok(());
+    }
+    let batch = view.record_batch();
+    let nationkeys = batch_column(batch, "n_nationkey")?;
+    let names = batch_string_column(batch, "n_name")?;
+    let regionkeys = batch_column(batch, "n_regionkey")?;
+    for row in 0..batch.num_rows() {
+        if names.is_null(row) {
+            continue;
+        }
+        let (Some(nationkey), Some(regionkey)) = (
+            numeric_i64_value(nationkeys, row)?,
+            numeric_i64_value(regionkeys, row)?,
+        ) else {
+            continue;
+        };
+        if region_keys.contains(&regionkey) {
+            nations.insert(nationkey, names.value(row).to_string());
+        }
+    }
+    Ok(())
 }
 
 struct Q02Supplier {
@@ -11496,11 +11543,12 @@ async fn q12_shipping_mode_counts_from_orders_late(
 ) -> Result<Option<Vec<Q12Row>>> {
     let pending = Arc::new(AdaptiveI64Map::from_hash((*pending).clone()));
     let Some(chunks) = engine
-        .late_materialized_parquet_map_with_policy(
+        .late_materialized_parquet_map_pruned_with_policy_view(
             path,
             batch_size,
             Projection::Columns(vec!["o_orderkey".to_string()]),
             Projection::Columns(vec!["o_orderpriority".to_string()]),
+            Vec::new(),
             q12_order_late_materialized_row_group_chunk(),
             LateMaterializationPolicy::always(),
             {
@@ -11512,8 +11560,8 @@ async fn q12_shipping_mode_counts_from_orders_late(
                     groups: [Q12State::default(); 2],
                 }
             },
-            q12_order_late_build_selection_batch,
-            q12_order_late_consume_priority_batch,
+            q12_order_late_build_selection_view,
+            q12_order_late_consume_priority_view,
             |state, _metrics| {
                 if state.selected_offset != state.selected_orders.len() {
                     return Err(DodamError::UnsupportedSql(
@@ -11613,6 +11661,18 @@ struct Q12OrderLateState {
     groups: [Q12State; 2],
 }
 
+struct Q12OrderPriorityView<'a> {
+    priorities: &'a StringArray,
+}
+
+impl<'a> Q12OrderPriorityView<'a> {
+    fn try_new(view: BatchView<'a>) -> Option<Self> {
+        (view.num_columns() == 1).then_some(Self {
+            priorities: view.utf8(0)?,
+        })
+    }
+}
+
 fn q12_order_late_build_selection_batch(
     batch: RecordBatch,
     selection: &mut LateSelectionBuilder,
@@ -11650,6 +11710,47 @@ fn q12_order_late_build_selection_batch(
     Ok(Some(()))
 }
 
+fn q12_order_late_build_selection_view(
+    view: BatchView<'_>,
+    selection: &mut LateSelectionBuilder,
+    state: &mut Q12OrderLateState,
+) -> Result<Option<()>> {
+    if view.num_columns() == 1 {
+        let Some(orderkeys) = view.i64(0) else {
+            return q12_order_late_build_selection_batch(
+                view.record_batch().clone(),
+                selection,
+                state,
+            );
+        };
+        if orderkeys.null_count() == 0 {
+            for &orderkey in orderkeys.values() {
+                if let Some(order) = state.pending.get(orderkey) {
+                    state.selected_orders.push(order);
+                    selection.push(true);
+                } else {
+                    selection.push(false);
+                }
+            }
+            return Ok(Some(()));
+        }
+        for row in 0..orderkeys.len() {
+            if orderkeys.is_null(row) {
+                selection.push(false);
+                continue;
+            }
+            if let Some(order) = state.pending.get(orderkeys.value(row)) {
+                state.selected_orders.push(order);
+                selection.push(true);
+            } else {
+                selection.push(false);
+            }
+        }
+        return Ok(Some(()));
+    }
+    q12_order_late_build_selection_batch(view.record_batch().clone(), selection, state)
+}
+
 fn q12_order_late_consume_priority_batch(
     batch: RecordBatch,
     state: &mut Q12OrderLateState,
@@ -11672,6 +11773,33 @@ fn q12_order_late_consume_priority_batch(
         q12_apply_pending_order(&mut state.groups, order, is_high_priority);
     }
     Ok(Some(()))
+}
+
+fn q12_order_late_consume_priority_view(
+    view: BatchView<'_>,
+    state: &mut Q12OrderLateState,
+) -> Result<Option<()>> {
+    if let Some(layout) = Q12OrderPriorityView::try_new(view) {
+        let priorities = layout.priorities;
+        let priority_offsets = priorities.value_offsets();
+        let priority_data = priorities.value_data();
+        for row in 0..view.num_rows() {
+            let Some(&order) = state.selected_orders.get(state.selected_offset) else {
+                return Err(DodamError::UnsupportedSql(
+                    "Q12 order priority payload overflow".to_string(),
+                ));
+            };
+            state.selected_offset += 1;
+            if priorities.is_null(row) {
+                continue;
+            }
+            let priority = bytes_string_parts(priority_offsets, priority_data, row);
+            let is_high_priority = q12_is_high_priority_bytes(priority);
+            q12_apply_pending_order(&mut state.groups, order, is_high_priority);
+        }
+        return Ok(Some(()));
+    }
+    q12_order_late_consume_priority_batch(view.record_batch().clone(), state)
 }
 
 fn q12_is_high_priority_str(priority: &str) -> bool {
@@ -15408,54 +15536,15 @@ async fn q04_candidate_order_priorities(
     let mut candidate_count = 0usize;
     while let Some(batch) = stream.next() {
         let batch = batch?;
-        let orderkeys = batch_column(&batch, "o_orderkey")?;
-        let orderdates = batch_column(&batch, "o_orderdate")?;
-        let orderpriorities = batch_string_column(&batch, "o_orderpriority")?;
-        if q04_candidate_order_priorities_typed(
-            orderkeys,
-            orderdates,
-            orderpriorities,
+        q04_candidate_order_priorities_view_into(
+            BatchView::new(&batch),
             start_days,
             end_days,
             &mut priorities,
             &mut labels,
             &mut label_indices,
             &mut candidate_count,
-        )? {
-            continue;
-        }
-        for row in 0..batch.num_rows() {
-            if orderpriorities.is_null(row) {
-                continue;
-            }
-            let (Some(orderkey), Some(orderdate)) = (
-                numeric_i64_value(orderkeys, row)?,
-                date32_value(orderdates, row)?,
-            ) else {
-                continue;
-            };
-            if orderdate < start_days || orderdate >= end_days || orderkey < 0 {
-                continue;
-            }
-            let priority_index = if let Some(index) = label_indices.get(orderpriorities.value(row))
-            {
-                *index
-            } else {
-                let next_index = u8::try_from(labels.len()).map_err(|_| {
-                    DodamError::UnsupportedSql("too many Q04 order priorities".to_string())
-                })?;
-                labels.push(orderpriorities.value(row).to_string());
-                label_indices.insert(orderpriorities.value(row).to_string(), next_index);
-                next_index
-            };
-            let orderkey = usize::try_from(orderkey)
-                .map_err(|_| DodamError::UnsupportedSql("order key overflow".to_string()))?;
-            if orderkey >= priorities.len() {
-                priorities.resize(orderkey + 1, 0);
-            }
-            priorities[orderkey] = priority_index + 1;
-            candidate_count += 1;
-        }
+        )?;
     }
     Ok((priorities, labels, candidate_count))
 }
@@ -15548,7 +15637,7 @@ async fn q04_candidate_order_priorities_late(
     end_days: i32,
 ) -> Result<Option<(Vec<u8>, Vec<String>, usize)>> {
     let Some(chunks) = engine
-        .late_materialized_parquet_map_pruned_with_policy(
+        .late_materialized_parquet_map_pruned_with_policy_view(
             path,
             batch_size,
             Projection::Columns(vec!["o_orderkey".to_string(), "o_orderdate".to_string()]),
@@ -15565,8 +15654,8 @@ async fn q04_candidate_order_priorities_late(
                 label_indices: HashMap::new(),
                 rows: Vec::new(),
             },
-            q04_late_candidate_build_selection_batch,
-            q04_late_candidate_consume_priority_batch,
+            q04_late_candidate_build_selection_view,
+            q04_late_candidate_consume_priority_view,
             |state, _metrics| {
                 if state.priority_offset != state.selected_orderkeys.len() {
                     return Err(DodamError::UnsupportedSql(
@@ -15622,6 +15711,32 @@ struct Q04LateCandidateState {
     labels: Vec<String>,
     label_indices: HashMap<String, u8>,
     rows: Vec<(i64, u8)>,
+}
+
+struct Q04CandidatePredicateView<'a> {
+    orderkeys: &'a Int64Array,
+    orderdates: &'a Date32Array,
+}
+
+impl<'a> Q04CandidatePredicateView<'a> {
+    fn try_new(view: BatchView<'a>) -> Option<Self> {
+        (view.num_columns() == 2).then_some(Self {
+            orderkeys: view.i64(0)?,
+            orderdates: view.date32(1)?,
+        })
+    }
+}
+
+struct Q04CandidatePayloadView<'a> {
+    priorities: &'a StringArray,
+}
+
+impl<'a> Q04CandidatePayloadView<'a> {
+    fn try_new(view: BatchView<'a>) -> Option<Self> {
+        (view.num_columns() == 1).then_some(Self {
+            priorities: view.utf8(0)?,
+        })
+    }
 }
 
 struct Q04CandidatePartial {
@@ -15922,6 +16037,45 @@ fn q04_late_candidate_build_selection_batch(
     Ok(Some(()))
 }
 
+fn q04_late_candidate_build_selection_view(
+    view: BatchView<'_>,
+    selection: &mut LateSelectionBuilder,
+    state: &mut Q04LateCandidateState,
+) -> Result<Option<()>> {
+    if let Some(layout) = Q04CandidatePredicateView::try_new(view) {
+        let orderkeys = layout.orderkeys;
+        let orderdates = layout.orderdates;
+        if orderkeys.null_count() == 0 && orderdates.null_count() == 0 {
+            let orderkey_values = orderkeys.values().as_ref();
+            let orderdate_values = orderdates.values().as_ref();
+            for (&orderkey, &orderdate) in orderkey_values.iter().zip(orderdate_values) {
+                let selected =
+                    orderkey >= 0 && orderdate >= state.start_days && orderdate < state.end_days;
+                selection.push(selected);
+                if selected {
+                    state.selected_orderkeys.push(orderkey);
+                }
+            }
+            return Ok(Some(()));
+        }
+        for row in 0..view.num_rows() {
+            let selected = if orderkeys.is_null(row) || orderdates.is_null(row) {
+                false
+            } else {
+                let orderkey = orderkeys.value(row);
+                let orderdate = orderdates.value(row);
+                orderkey >= 0 && orderdate >= state.start_days && orderdate < state.end_days
+            };
+            selection.push(selected);
+            if selected {
+                state.selected_orderkeys.push(orderkeys.value(row));
+            }
+        }
+        return Ok(Some(()));
+    }
+    q04_late_candidate_build_selection_batch(view.record_batch().clone(), selection, state)
+}
+
 fn q04_late_candidate_consume_priority_batch(
     batch: RecordBatch,
     state: &mut Q04LateCandidateState,
@@ -15950,6 +16104,39 @@ fn q04_late_candidate_consume_priority_batch(
         }
     }
     Ok(Some(()))
+}
+
+fn q04_late_candidate_consume_priority_view(
+    view: BatchView<'_>,
+    state: &mut Q04LateCandidateState,
+) -> Result<Option<()>> {
+    if let Some(layout) = Q04CandidatePayloadView::try_new(view) {
+        let priorities = layout.priorities;
+        for row in 0..view.num_rows() {
+            let Some(&orderkey) = state.selected_orderkeys.get(state.priority_offset) else {
+                return Err(DodamError::UnsupportedSql(
+                    "Q04 candidate payload row overflow".to_string(),
+                ));
+            };
+            state.priority_offset += 1;
+            if priorities.is_valid(row) {
+                let priority = priorities.value(row);
+                let priority_index = if let Some(index) = state.label_indices.get(priority) {
+                    *index
+                } else {
+                    let next_index = u8::try_from(state.labels.len()).map_err(|_| {
+                        DodamError::UnsupportedSql("too many Q04 order priorities".to_string())
+                    })?;
+                    state.labels.push(priority.to_string());
+                    state.label_indices.insert(priority.to_string(), next_index);
+                    next_index
+                };
+                state.rows.push((orderkey, priority_index));
+            }
+        }
+        return Ok(Some(()));
+    }
+    q04_late_candidate_consume_priority_batch(view.record_batch().clone(), state)
 }
 
 fn q04_candidate_priorities_from_partials(
@@ -16048,6 +16235,76 @@ fn q04_candidate_order_priorities_typed(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn q04_candidate_order_priorities_view_into(
+    view: BatchView<'_>,
+    start_days: i32,
+    end_days: i32,
+    priorities: &mut Vec<u8>,
+    labels: &mut Vec<String>,
+    label_indices: &mut HashMap<String, u8>,
+    candidate_count: &mut usize,
+) -> Result<()> {
+    if view.num_columns() == 3
+        && let (Ok(orderkeys), Ok(orderdates), Ok(orderpriorities)) = (
+            view.required_i64(0),
+            view.required_date32(1),
+            view.required_utf8(2),
+        )
+    {
+        if q04_candidate_order_priorities_typed(
+            view.column(0)?,
+            view.column(1)?,
+            orderpriorities,
+            start_days,
+            end_days,
+            priorities,
+            labels,
+            label_indices,
+            candidate_count,
+        )? {
+            let _ = (orderkeys, orderdates);
+            return Ok(());
+        }
+    }
+    let batch = view.record_batch();
+    let orderkeys = batch_column(batch, "o_orderkey")?;
+    let orderdates = batch_column(batch, "o_orderdate")?;
+    let orderpriorities = batch_string_column(batch, "o_orderpriority")?;
+    for row in 0..batch.num_rows() {
+        if orderpriorities.is_null(row) {
+            continue;
+        }
+        let (Some(orderkey), Some(orderdate)) = (
+            numeric_i64_value(orderkeys, row)?,
+            date32_value(orderdates, row)?,
+        ) else {
+            continue;
+        };
+        if orderdate < start_days || orderdate >= end_days || orderkey < 0 {
+            continue;
+        }
+        let priority_index = if let Some(index) = label_indices.get(orderpriorities.value(row)) {
+            *index
+        } else {
+            let next_index = u8::try_from(labels.len()).map_err(|_| {
+                DodamError::UnsupportedSql("too many Q04 order priorities".to_string())
+            })?;
+            labels.push(orderpriorities.value(row).to_string());
+            label_indices.insert(orderpriorities.value(row).to_string(), next_index);
+            next_index
+        };
+        let orderkey = usize::try_from(orderkey)
+            .map_err(|_| DodamError::UnsupportedSql("order key overflow".to_string()))?;
+        if orderkey >= priorities.len() {
+            priorities.resize(orderkey + 1, 0);
+        }
+        priorities[orderkey] = priority_index + 1;
+        *candidate_count += 1;
+    }
+    Ok(())
+}
+
 async fn q04_count_late_candidate_priorities(
     engine: &DodamEngine,
     path: PathBuf,
@@ -16115,42 +16372,11 @@ async fn q04_count_late_candidate_priorities(
     let mut counts = vec![0_u64; priority_count];
     while let Some(batch) = stream.next() {
         let batch = batch?;
-        let orderkeys = batch_column(&batch, "l_orderkey")?;
-        let commitdates = batch_column(&batch, "l_commitdate")?;
-        let receiptdates = batch_column(&batch, "l_receiptdate")?;
-        if q04_count_late_candidate_priorities_typed(
-            orderkeys,
-            commitdates,
-            receiptdates,
+        q04_count_late_candidate_priorities_view_into(
+            BatchView::new(&batch),
             candidate_priorities,
             &mut counts,
-        )? {
-            continue;
-        }
-        for row in 0..batch.num_rows() {
-            let (Some(orderkey), Some(commitdate), Some(receiptdate)) = (
-                numeric_i64_value(orderkeys, row)?,
-                date32_value(commitdates, row)?,
-                date32_value(receiptdates, row)?,
-            ) else {
-                continue;
-            };
-            if commitdate >= receiptdate || orderkey < 0 {
-                continue;
-            }
-            let Ok(orderkey) = usize::try_from(orderkey) else {
-                continue;
-            };
-            let Some(priority_marker) = candidate_priorities.get_mut(orderkey) else {
-                continue;
-            };
-            if *priority_marker == 0 {
-                continue;
-            }
-            let priority_index = usize::from(*priority_marker - 1);
-            counts[priority_index] += 1;
-            *priority_marker = 0;
-        }
+        )?;
     }
     Ok(counts)
 }
@@ -16923,6 +17149,53 @@ fn q04_count_late_candidate_priorities_typed(
         *priority_marker = 0;
     }
     Ok(true)
+}
+
+fn q04_count_late_candidate_priorities_view_into(
+    view: BatchView<'_>,
+    candidate_priorities: &mut [u8],
+    counts: &mut [u64],
+) -> Result<()> {
+    if view.num_columns() == 3
+        && q04_count_late_candidate_priorities_typed(
+            view.column(0)?,
+            view.column(1)?,
+            view.column(2)?,
+            candidate_priorities,
+            counts,
+        )?
+    {
+        return Ok(());
+    }
+    let batch = view.record_batch();
+    let orderkeys = batch_column(batch, "l_orderkey")?;
+    let commitdates = batch_column(batch, "l_commitdate")?;
+    let receiptdates = batch_column(batch, "l_receiptdate")?;
+    for row in 0..batch.num_rows() {
+        let (Some(orderkey), Some(commitdate), Some(receiptdate)) = (
+            numeric_i64_value(orderkeys, row)?,
+            date32_value(commitdates, row)?,
+            date32_value(receiptdates, row)?,
+        ) else {
+            continue;
+        };
+        if commitdate >= receiptdate || orderkey < 0 {
+            continue;
+        }
+        let Ok(orderkey) = usize::try_from(orderkey) else {
+            continue;
+        };
+        let Some(priority_marker) = candidate_priorities.get_mut(orderkey) else {
+            continue;
+        };
+        if *priority_marker == 0 {
+            continue;
+        }
+        let priority_index = usize::from(*priority_marker - 1);
+        counts[priority_index] += 1;
+        *priority_marker = 0;
+    }
+    Ok(())
 }
 
 fn q04_priority_count_rows(priority_labels: Vec<String>, counts: Vec<u64>) -> Vec<Q04Row> {
