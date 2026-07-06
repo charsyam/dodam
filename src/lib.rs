@@ -11,3 +11,4 @@ pub mod output;
 pub mod plan;
 pub mod sql;
 pub mod storage;
+mod vector;

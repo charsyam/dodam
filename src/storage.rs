@@ -561,7 +561,7 @@ pub struct ParquetFileStatistics {
 
 pub struct ParquetBatchReader {
     inner: parquet::arrow::arrow_reader::ParquetRecordBatchReader,
-    projection_order: Option<Vec<String>>,
+    projection_order: Option<ProjectionOrderState>,
     projected_columns: usize,
     row_groups_total: usize,
     row_groups_scanned: usize,
@@ -576,6 +576,11 @@ pub struct ParquetBatchReader {
     zero_row_batches: usize,
     next_nanos: u64,
     max_next_nanos: u64,
+}
+
+enum ProjectionOrderState {
+    Pending(Vec<String>),
+    Ready(Option<Vec<usize>>),
 }
 
 impl ParquetBatchReader {
@@ -1584,7 +1589,7 @@ impl Iterator for ParquetBatchReader {
         self.max_next_nanos = self.max_next_nanos.max(next_nanos);
         match next {
             Some(Ok(batch)) => {
-                let batch = match enforce_projection_order(batch, self.projection_order.as_deref())
+                let batch = match enforce_projection_order_cached(batch, &mut self.projection_order)
                 {
                     Ok(batch) => batch,
                     Err(error) => return Some(Err(error)),
@@ -1618,41 +1623,59 @@ fn apply_projection<T: ChunkReader + 'static>(
     Ok(builder.with_projection(mask))
 }
 
-fn projection_order(projection: &Projection) -> Option<Vec<String>> {
+fn projection_order(projection: &Projection) -> Option<ProjectionOrderState> {
     match projection {
         Projection::All => None,
-        Projection::Columns(columns) => Some(columns.clone()),
+        Projection::Columns(columns) => Some(ProjectionOrderState::Pending(columns.clone())),
     }
 }
 
-fn enforce_projection_order(
+fn enforce_projection_order_cached(
     batch: RecordBatch,
-    projection_order: Option<&[String]>,
+    projection_order: &mut Option<ProjectionOrderState>,
 ) -> Result<RecordBatch> {
     let Some(projection_order) = projection_order else {
         return Ok(batch);
     };
+    if let ProjectionOrderState::Pending(columns) = projection_order {
+        let reorder = projection_reorder_indices(&batch, columns)?;
+        *projection_order = ProjectionOrderState::Ready(reorder);
+    }
+    let ProjectionOrderState::Ready(Some(indices)) = projection_order else {
+        return Ok(batch);
+    };
+    reorder_record_batch(batch, indices)
+}
+
+fn projection_reorder_indices(
+    batch: &RecordBatch,
+    projection_order: &[String],
+) -> Result<Option<Vec<usize>>> {
     if projection_order.len() != batch.num_columns() {
-        return Ok(batch);
+        return Ok(None);
     }
-    if batch
-        .schema()
-        .fields()
-        .iter()
-        .map(|field| field.name().as_str())
-        .eq(projection_order.iter().map(|column| column.as_str()))
-    {
-        return Ok(batch);
-    }
-    let mut columns = Vec::with_capacity(projection_order.len());
-    let mut fields = Vec::with_capacity(projection_order.len());
+    let mut indices = Vec::with_capacity(projection_order.len());
     for column in projection_order {
-        let index = batch
-            .schema()
-            .fields()
-            .iter()
-            .position(|field| field.name() == column)
-            .ok_or_else(|| DodamError::UnknownColumn(column.clone()))?;
+        indices.push(
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .position(|field| field.name() == column)
+                .ok_or_else(|| DodamError::UnknownColumn(column.clone()))?,
+        );
+    }
+    if indices.iter().copied().eq(0..indices.len()) {
+        Ok(None)
+    } else {
+        Ok(Some(indices))
+    }
+}
+
+fn reorder_record_batch(batch: RecordBatch, indices: &[usize]) -> Result<RecordBatch> {
+    let mut columns = Vec::with_capacity(indices.len());
+    let mut fields = Vec::with_capacity(indices.len());
+    for &index in indices {
         columns.push(batch.column(index).clone());
         fields.push(batch.schema().field(index).clone());
     }
