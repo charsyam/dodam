@@ -6615,9 +6615,12 @@ fn q09_order_year_get(
 }
 
 fn q09_matched_index_enabled() -> bool {
-    std::env::var("DODAM_Q09_ENABLE_MATCHED_INDEX")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
+    if std::env::var("DODAM_Q09_DISABLE_MATCHED_INDEX")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return false;
+    }
+    true
 }
 
 fn q09_profit_decimal_batch(
@@ -11773,19 +11776,17 @@ async fn q03_order_rows(
                 batch_size,
                 projection.clone(),
                 q03_order_row_group_map_chunk(),
-                fast_hash_map::<i64, Q03Order>,
+                || fast_hash_map_with_capacity(q03_order_row_group_map_initial_capacity()),
                 {
                     let customers = customers.clone();
                     move |batch, orders| {
-                        merge_maps(
+                        q03_order_rows_projected_batch_into(
+                            batch,
+                            &customers,
+                            order_cutoff,
+                            constant_shippriority,
                             orders,
-                            q03_order_rows_projected_batch(
-                                batch,
-                                &customers,
-                                order_cutoff,
-                                constant_shippriority,
-                            )?,
-                        );
+                        )?;
                         Ok(Some(()))
                     }
                 },
@@ -11793,7 +11794,8 @@ async fn q03_order_rows(
             )
             .await?
     {
-        let mut orders = fast_hash_map();
+        let capacity = partials.iter().map(|partial| partial.len()).sum();
+        let mut orders = fast_hash_map_with_capacity(capacity);
         for partial in partials {
             merge_maps(&mut orders, partial);
         }
@@ -11871,6 +11873,13 @@ fn q03_order_row_group_map_chunk() -> usize {
         .unwrap_or(16)
 }
 
+fn q03_order_row_group_map_initial_capacity() -> usize {
+    std::env::var("DODAM_Q03_ORDER_ROW_GROUP_MAP_INITIAL_CAPACITY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(131_072)
+}
+
 fn q03_order_rows_batch(
     batch: RecordBatch,
     customers: &AdaptiveI64Set,
@@ -11923,15 +11932,16 @@ fn q03_order_rows_batch(
     Ok(orders)
 }
 
-fn q03_order_rows_projected_batch(
+fn q03_order_rows_projected_batch_into(
     batch: RecordBatch,
     customers: &AdaptiveI64Set,
     order_cutoff: i32,
     constant_shippriority: Option<i64>,
-) -> Result<Q03OrderMap> {
+    orders: &mut Q03OrderMap,
+) -> Result<()> {
     if batch.num_columns() == 3
         && constant_shippriority.is_some()
-        && let Some(orders) = q03_order_rows_batch_typed(
+        && q03_order_rows_batch_typed_into(
             batch.column(0),
             batch.column(1),
             batch.column(2),
@@ -11939,12 +11949,13 @@ fn q03_order_rows_projected_batch(
             customers,
             order_cutoff,
             constant_shippriority,
+            orders,
         )?
     {
-        return Ok(orders);
+        return Ok(());
     }
     if batch.num_columns() == 4
-        && let Some(orders) = q03_order_rows_batch_typed(
+        && q03_order_rows_batch_typed_into(
             batch.column(0),
             batch.column(1),
             batch.column(2),
@@ -11952,11 +11963,105 @@ fn q03_order_rows_projected_batch(
             customers,
             order_cutoff,
             constant_shippriority,
+            orders,
         )?
     {
-        return Ok(orders);
+        return Ok(());
     }
-    q03_order_rows_batch(batch, customers, order_cutoff, constant_shippriority)
+    merge_maps(
+        orders,
+        q03_order_rows_batch(batch, customers, order_cutoff, constant_shippriority)?,
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q03_order_rows_batch_typed_into(
+    orderkeys: &ArrayRef,
+    custkeys: &ArrayRef,
+    orderdates: &ArrayRef,
+    priorities: Option<&ArrayRef>,
+    customers: &AdaptiveI64Set,
+    order_cutoff: i32,
+    constant_shippriority: Option<i64>,
+    orders: &mut Q03OrderMap,
+) -> Result<bool> {
+    let (Some(orderkeys), Some(custkeys), Some(orderdates)) = (
+        orderkeys.as_any().downcast_ref::<Int64Array>(),
+        custkeys.as_any().downcast_ref::<Int64Array>(),
+        orderdates.as_any().downcast_ref::<Date32Array>(),
+    ) else {
+        return Ok(false);
+    };
+    let priorities =
+        priorities.and_then(|priorities| priorities.as_any().downcast_ref::<Int64Array>());
+    if constant_shippriority.is_none() && priorities.is_none() {
+        return Ok(false);
+    }
+    if orderkeys.null_count() == 0
+        && custkeys.null_count() == 0
+        && orderdates.null_count() == 0
+        && priorities.is_none_or(|priorities| priorities.null_count() == 0)
+    {
+        let orderkey_values = orderkeys.values().as_ref();
+        let custkey_values = custkeys.values().as_ref();
+        let orderdate_values = orderdates.values().as_ref();
+        let priority_values = priorities.map(|priorities| priorities.values().as_ref());
+        if let Some(customer_contains) = customers.dense_contains_slice() {
+            for row in 0..orderkey_values.len() {
+                let custkey = custkey_values[row];
+                let customer_hit = usize::try_from(custkey)
+                    .ok()
+                    .and_then(|index| customer_contains.get(index))
+                    .copied()
+                    .unwrap_or(false);
+                if orderdate_values[row] < order_cutoff && customer_hit {
+                    orders.insert(
+                        orderkey_values[row],
+                        Q03Order {
+                            o_orderdate: orderdate_values[row],
+                            o_shippriority: constant_shippriority
+                                .unwrap_or_else(|| priority_values.expect("priority values")[row]),
+                        },
+                    );
+                }
+            }
+            return Ok(true);
+        }
+        for row in 0..orderkey_values.len() {
+            if orderdate_values[row] < order_cutoff && customers.contains(custkey_values[row]) {
+                orders.insert(
+                    orderkey_values[row],
+                    Q03Order {
+                        o_orderdate: orderdate_values[row],
+                        o_shippriority: constant_shippriority
+                            .unwrap_or_else(|| priority_values.expect("priority values")[row]),
+                    },
+                );
+            }
+        }
+        return Ok(true);
+    }
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row)
+            || custkeys.is_null(row)
+            || orderdates.is_null(row)
+            || priorities.is_some_and(|priorities| priorities.is_null(row))
+        {
+            continue;
+        }
+        if orderdates.value(row) < order_cutoff && customers.contains(custkeys.value(row)) {
+            orders.insert(
+                orderkeys.value(row),
+                Q03Order {
+                    o_orderdate: orderdates.value(row),
+                    o_shippriority: constant_shippriority
+                        .unwrap_or_else(|| priorities.expect("priority array").value(row)),
+                },
+            );
+        }
+    }
+    Ok(true)
 }
 
 fn q03_order_rows_batch_typed(
@@ -12522,9 +12627,11 @@ fn q03_revenue_late_carry_build_selection_batch(
         let shipdate_values = shipdates.values().as_ref();
         for row in 0..orderkey_values.len() {
             let orderkey = orderkey_values[row];
-            let selected_order = (shipdate_values[row] > state.ship_cutoff)
-                .then(|| state.orders.get(&orderkey).copied())
-                .flatten();
+            let selected_order = if shipdate_values[row] > state.ship_cutoff {
+                state.orders.get(&orderkey).copied()
+            } else {
+                None
+            };
             selection.push(selected_order.is_some());
             if let Some(order) = selected_order {
                 state.selected_orders.push((orderkey, order));
@@ -12533,14 +12640,20 @@ fn q03_revenue_late_carry_build_selection_batch(
         return Ok(Some(()));
     }
     for row in 0..orderkeys.len() {
-        let selected_order = (orderkeys.is_valid(row)
+        let orderkey = orderkeys.is_valid(row).then(|| orderkeys.value(row));
+        let selected_order = if let Some(orderkey) = orderkey
             && shipdates.is_valid(row)
-            && shipdates.value(row) > state.ship_cutoff)
-            .then(|| state.orders.get(&orderkeys.value(row)).copied())
-            .flatten();
+            && shipdates.value(row) > state.ship_cutoff
+        {
+            state.orders.get(&orderkey).copied()
+        } else {
+            None
+        };
         selection.push(selected_order.is_some());
         if let Some(order) = selected_order {
-            state.selected_orders.push((orderkeys.value(row), order));
+            state
+                .selected_orders
+                .push((orderkey.expect("validated orderkey"), order));
         }
     }
     Ok(Some(()))
@@ -13655,7 +13768,7 @@ fn q04_candidate_row_group_map_chunk() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(4)
+        .unwrap_or(2)
 }
 
 async fn q04_candidate_order_priorities_late(
