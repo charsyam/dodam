@@ -1380,8 +1380,55 @@ Tried and rejected or neutral:
   - `cargo test`
   - `cargo clippy --all-targets --all-features -- -D warnings`
 - Run before claiming performance:
+  - Run benchmark variants one at a time. Do not run Dodam/DuckDB comparison jobs or env-var A/B variants in parallel, especially on SF=10+, because Parquet IO, OS page cache, and Dodam file-cache activity interfere with each other and make the numbers unusable.
   - release build
   - Dodam CLI benchmark
   - DuckDB CLI benchmark
   - engine-level criterion benchmark
   - profile with `DODAM_PROFILE_COPY=1` for COPY-heavy queries
+
+### Benchmark Notes
+
+- SF=10 Q04/Q12 tuning note:
+  - A parallel A/B run of Q04 i64-set row-group chunk variants was discarded. Running the two benchmark processes concurrently caused IO/cache interference and produced worse, non-comparable numbers.
+  - Benchmark policy going forward: every performance variant must be measured as a separate process run, with no other benchmark process active.
+  - Q04 lineitem row-filter is now adaptive rather than always-on:
+    - SF=1 benefits from the row-filter path (`~19-20ms` focused), but SF=10 regresses because the candidate key set is large enough that row-filter setup/selection overhead dominates.
+    - Default rule: use Q04 lineitem row-filter only when candidate order keys are at or below `DODAM_Q04_LINEITEM_ROW_FILTER_MAX_KEYS` (default `100000`). `DODAM_Q04_ENABLE_LINEITEM_ROW_FILTER=1` and `DODAM_Q04_DISABLE_LINEITEM_ROW_FILTER=1` remain force knobs.
+  - Q04 lineitem probe was parallelized with row-group map:
+    - The old probe mutated the dense candidate-priority marker while scanning, which made the lineitem probe effectively sequential. The new default path collects matched orderkeys per row-group worker, then sort/dedups and counts priorities once at the end.
+    - Chunk sweep on SF=10 Q04: chunk `1` around `~228ms`, chunk `2` around `~223ms`, chunk `4` around `~222ms`, chunk `8` around `~227ms`; default chunk remains `4` via `DODAM_Q04_LINEITEM_ROW_GROUP_MAP_CHUNK`.
+    - SF=10 Q04 focused improved from current-default around `~294ms` to `~223ms`; SF=1 Q04 stayed around `~20ms`, so the row-group probe is now default with `DODAM_Q04_DISABLE_LINEITEM_ROW_GROUP_MAP=1` as rollback.
+    - Full SF=10 median-sum after the Q04 row-group probe: Dodam `6.072s` vs DuckDB `5.798s` (`1.047x`), with Q04 gap down to about `~71ms`.
+  - Q03 SF=10 retest:
+    - Rechecked old opt-in knobs under SF=10. `DODAM_Q03_ENABLE_ORDER_ROW_GROUP_MAP=1`, `DODAM_Q03_ENABLE_REVENUE_VECTOR=1`, and row-group chunk `1/4/8` were all neutral or slower than the retained chunk `2` default.
+    - Tried an opt-in orders `o_custkey` i64-set RowFilter (`DODAM_Q03_ENABLE_ORDER_ROW_FILTER=1`). It regressed Q03 focused from about `~402ms` to about `~419ms`; customer segment selectivity is not low enough to pay for Arrow RowFilter/setup overhead. Kept it opt-in only for diagnostics.
+    - Switched Q03 order/revenue partial maps to `FastHashMap`. This made the hash lookup path better than the old sorted binary-search lookup on SF=10:
+      - Q03 focused improved from about `~402ms` to `~366ms` with fast maps.
+      - Disabling sorted lookup after fast-map conversion improved further to about `~335ms`; made hash lookup the default and left `DODAM_Q03_ENABLE_SORTED_ORDER_LOOKUP=1` as a diagnostic knob.
+      - Latest Q03 focused default after the change is about `~326ms`; full SF=10 median-sum moved to Dodam `5.833s` vs DuckDB `5.778s` (`1.010x`), with Q03 gap about `~101ms`.
+    - Re-tested Q03 order row-group map after fast maps; still neutral/slower (`~330ms` focused), so it remains opt-in only.
+    - Tried a Q03 order stream-accumulate path to remove partial-map merge overhead. It regressed badly (`~731ms`) because it removed useful scan/batch parallelism. Kept it opt-in only for diagnostics via `DODAM_Q03_ENABLE_ORDER_STREAM_ACCUMULATE=1`.
+  - Q14 dense dimension-key lookup:
+    - Q14 was spending substantial CPU in the part dimension scan and lineitem promo lookup using `HashMap<i64,bool>` for dense TPC-H part keys.
+    - Added reusable `DenseI64BoolLookup` and rewired Q14 SQL plus engine late-materialization path to use dense present/value arrays.
+    - SF=10 Q14 focused improved from about `~344ms` in the previous full run to `~183ms`, now faster than DuckDB in the focused run (`~0.76x`). SF=1 Q14 also improved to about `~19ms` vs DuckDB `~27.5ms`.
+    - Full SF=10 median-sum after Q04 row-group probe and Q14 dense lookup: Dodam `5.919s` vs DuckDB `5.787s` (`1.023x`). Remaining largest slower gaps: Q03, Q08, Q13, Q07, Q04.
+  - Local Parquet file cache was a major SF=10 bottleneck:
+    - With the old default 512MB cache and 4MB chunks, Q12 projected about `~470MB` compressed lineitem columns but the file cache read several GB due chunk over-read. Q04 showed the same pattern.
+    - Q12 SF=10 focused: old default around `~500ms`, `DODAM_FILE_CACHE_CHUNK_BYTES=1048576` around `~323ms`, `524288` around `~242ms`, and `DODAM_FILE_CACHE_BYTES=0` around `~193ms`.
+    - Q04 SF=10 focused improved from around `~611ms` after adaptive row-filter to around `~321ms` with file cache off.
+    - Full SF=10 comparison improved from Dodam median-sum `12.206s` vs DuckDB `5.802s` (`2.104x`) to Dodam `6.185s` vs DuckDB `5.829s` (`1.061x`) with file cache disabled by default.
+    - 512KB cache was better for small SF=1 Q04/Q12 (`~39ms` combined vs `~45ms` cache-off), but SF=10 full regressed to `~8.098s`; keep local default cache disabled and allow opt-in via `DODAM_FILE_CACHE_BYTES`.
+  - SF=10 follow-up improvements after switching the comparison target to one benchmark process at a time:
+    - Q08: `DODAM_Q08_PARTKEY_ROW_FILTER_ROW_GROUP_CHUNK=8` was better than the global chunk setting without hurting Q04, so Q08 now has its own default chunk. More importantly, the existing Q08 late-materialized lineitem path was much better at SF=10: focused Q08 moved from about `~507ms` to `~413ms`; made it default with `DODAM_Q08_DISABLE_LATE=1` as rollback.
+    - Q13: moved LIKE-only dense count filtering to a hotter typed loop. Finder construction is now once per scan, not once per batch, and null-free Int64/StringArray batches avoid per-row schema/null checks. Focused Q13 improved from about `~382ms` to `~362ms`. Projection-index hints were retained but only moved another `~1ms`. Changing the dense count vector from `u64` to `u32` was neutral/noisy, not a clear win.
+    - Q07: row-group chunk sweep (`1/4/8`) did not help; larger chunks were worse. The real win was replacing integer-key default `HashMap` usage in the order/customer and volume group maps with the reusable `FastHashMap` integer hasher. Focused Q07 improved from about `~403ms` to `~366ms`.
+    - Q10: applied the same integer-key `FastHashMap` rule to orders and returned-revenue maps. Focused Q10 improved from about `~390ms` to `~370ms`.
+    - Q16: profile showed `part` group build, not partsupp distinct counting, was the dominant Rust-side cost. Reordered the part-group typed loop so numeric `p_size IN (...)` is checked before touching `p_brand`/`p_type`, and used fast maps for part/group intern state. Focused Q16 improved from about `~148ms` to `~112ms`; byte-finder supplier comment matching added a smaller follow-up win to about `~108ms`.
+    - Latest full SF=10 single-process DuckDB comparison after these changes: Dodam median-sum `5.583s`, DuckDB `5.845s`, ratio `0.955x`. Remaining slower gaps are led by Q04 (`~70ms`), Q13 (`~65ms`), Q03 (`~57ms`), Q07 (`~37ms`), Q05 (`~34ms`), Q12 (`~30ms`), and Q10 (`~25ms`). Q16 is no longer slower in the full run.
+  - Additional SF=10 follow-up:
+    - Q04: replaced the row-group probe's matched-orderkey Vec + global sort/dedup with a dense atomic marker consume path. This is a general dense-marker probe rule: each matching lineitem atomically swaps the candidate marker to zero and increments a worker-local priority count, so duplicates are suppressed without a final sort. Focused Q04 improved modestly to about `~200ms`; with the atomic path, row-group chunk `2` beat `1/4/8/16`, so Q04 default chunk changed from `4` to `2`. `DODAM_Q04_DISABLE_ATOMIC_LINEITEM_PROBE=1` remains a rollback.
+    - Q13: added a two-substring byte matcher for `LIKE '%x%y%'` / `NOT LIKE '%x%y%'`, avoiding the generic parts loop in the hot path. Focused Q13 improved to about `~354ms`, but full-run samples remain noisy and Q13 is still the largest positive gap.
+    - Q03: tried a dense order membership sidecar before probing the order `FastHashMap`. It regressed focused Q03 (`~340ms` in the checked run), likely because the dense sidecar's cache footprint outweighed saved hash misses. Kept it opt-in only with `DODAM_Q03_ENABLE_DENSE_ORDER_PROBE=1`.
+    - Latest full SF=10 single-process DuckDB comparison: Dodam median-sum `5.525s`, DuckDB `5.820s`, ratio `0.949x`. Remaining slower gaps: Q13 (`~73ms`), Q04 (`~64ms`), Q03 (`~42ms`), Q05 (`~38ms`), Q07 (`~29ms`), Q12 (`~21ms`), Q10 (`~19ms`).

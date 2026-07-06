@@ -205,6 +205,43 @@ fn unpack_u32_pair_first(key: u64) -> usize {
     (key >> 32) as usize
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct DenseI64BoolLookup {
+    present: Vec<bool>,
+    values: Vec<bool>,
+    len: usize,
+}
+
+impl DenseI64BoolLookup {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub(crate) fn insert(&mut self, key: i64, value: bool) {
+        let Some(index) = adaptive_dense_index(key, DEFAULT_MAX_DENSE_I64_KEY) else {
+            return;
+        };
+        if index >= self.present.len() {
+            self.present.resize(index + 1, false);
+            self.values.resize(index + 1, false);
+        }
+        if !self.present[index] {
+            self.present[index] = true;
+            self.len += 1;
+        }
+        self.values[index] = value;
+    }
+
+    pub(crate) fn get(&self, key: i64) -> Option<bool> {
+        let index = usize::try_from(key).ok()?;
+        if index < self.present.len() && self.present[index] {
+            Some(self.values[index])
+        } else {
+            None
+        }
+    }
+}
+
 fn adaptive_i64_set_dense_to_hash(contains: &[bool]) -> FastHashSet<i64> {
     contains
         .iter()

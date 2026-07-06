@@ -153,8 +153,8 @@ pub struct ParquetFileCache {
 }
 
 const PARQUET_FILE_CACHE_SHARDS: usize = 64;
-const DEFAULT_PARQUET_FILE_CACHE_BYTES: usize = 512 * 1024 * 1024;
-const DEFAULT_PARQUET_FILE_CACHE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_PARQUET_FILE_CACHE_BYTES: usize = 0;
+const DEFAULT_PARQUET_FILE_CACHE_CHUNK_BYTES: usize = 512 * 1024;
 
 impl Default for ParquetFileCache {
     fn default() -> Self {

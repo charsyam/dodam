@@ -19,6 +19,7 @@ use crate::catalog::{
     TableScanSource, TableStatistics,
 };
 use crate::cost::{JoinCostInput, choose_join_strategy};
+use crate::dense::DenseI64BoolLookup;
 use crate::error::{DodamError, Result};
 use crate::execution::metrics::ScanPlanMetricsCounter;
 use crate::execution::{
@@ -928,6 +929,26 @@ impl DodamEngine {
         filter_column: &str,
         keys: HashSet<i64>,
     ) -> Result<SendableBatchStream> {
+        self.scan_parquet_batches_i64_set_filtered_with_row_group_chunk(
+            path,
+            batch_size,
+            projection,
+            filter_column,
+            keys,
+            parallel_i64_set_filter_row_group_chunk(),
+        )
+        .await
+    }
+
+    pub(crate) async fn scan_parquet_batches_i64_set_filtered_with_row_group_chunk(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        projection: Projection,
+        filter_column: &str,
+        keys: HashSet<i64>,
+        row_group_chunk: usize,
+    ) -> Result<SendableBatchStream> {
         let source = self.plan_table_source(path.clone()).await?;
         if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
             return self
@@ -950,7 +971,7 @@ impl DodamEngine {
             return Ok(SendableBatchStream::empty());
         }
         let chunks = row_groups
-            .chunks(parallel_i64_set_filter_row_group_chunk())
+            .chunks(row_group_chunk.max(1))
             .map(|chunk| chunk.to_vec())
             .collect::<Vec<_>>();
         let keys = Arc::new(keys);
@@ -1242,13 +1263,13 @@ impl DodamEngine {
         Ok(Some((sum, count)))
     }
 
-    pub async fn q14_late_materialized_promo_revenue(
+    pub(crate) async fn q14_late_materialized_promo_revenue(
         &self,
         path: PathBuf,
         batch_size: usize,
         start_days: i32,
         end_days: i32,
-        promo_parts: Arc<HashMap<i64, bool>>,
+        promo_parts: Arc<DenseI64BoolLookup>,
     ) -> Result<Option<(f64, f64)>> {
         let source = self.plan_table_source(path.clone()).await?;
         if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
@@ -4862,7 +4883,7 @@ fn q14_late_materialized_promo_revenue_chunk(
     row_groups: Vec<usize>,
     start_days: i32,
     end_days: i32,
-    promo_parts: Arc<HashMap<i64, bool>>,
+    promo_parts: Arc<DenseI64BoolLookup>,
     metadata_cache: &ParquetMetadataCache,
     file_cache: Arc<ParquetFileCache>,
     object_store: &dyn ObjectStore,
@@ -4898,7 +4919,7 @@ fn q14_late_materialized_promo_revenue_chunk(
 }
 
 struct Q14LateState {
-    promo_parts: Arc<HashMap<i64, bool>>,
+    promo_parts: Arc<DenseI64BoolLookup>,
     promo: f64,
     total: f64,
 }
@@ -4964,7 +4985,7 @@ fn q14_consume_payload_batch(batch: RecordBatch, state: &mut Q14LateState) -> Re
     let discount_scale = decimal_scale_i64(discount_decimal_scale)?;
     let revenue_scale = 1.0 / ((price_scale as f64) * (discount_scale as f64));
     for row in 0..batch.num_rows() {
-        let Some(is_promo) = state.promo_parts.get(&partkeys.value(row)).copied() else {
+        let Some(is_promo) = state.promo_parts.get(partkeys.value(row)) else {
             continue;
         };
         let value = ((extendedprices.values()[row] as i64)
