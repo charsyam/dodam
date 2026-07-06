@@ -2723,7 +2723,7 @@ async fn q01_pricing_summary_rows(
     ]);
     if q01_row_group_map_enabled() && !q01_pruning_enabled() {
         let groups = engine
-            .parquet_scan_accumulate_chunks(
+            .parquet_scan_accumulate_chunks_view(
                 path.clone(),
                 batch_size,
                 projection.clone(),
@@ -2732,8 +2732,8 @@ async fn q01_pricing_summary_rows(
                 scan_aggregate_fusion_enabled(),
                 Q01GroupSlots::new,
                 Q01GroupSlots::new,
-                move |batch, groups| {
-                    q01_pricing_summary_projected_batch_into(batch, cutoff_days, groups)?;
+                move |view, groups| {
+                    q01_pricing_summary_projected_view_into(view, cutoff_days, groups)?;
                     Ok(Some(()))
                 },
                 |groups, rows| groups.merge_slots(rows),
@@ -2925,6 +2925,43 @@ fn q01_pricing_summary_projected_batch_into(
     q01_pricing_summary_batch_into(batch, cutoff_days, groups)
 }
 
+fn q01_pricing_summary_projected_view_into(
+    view: BatchView<'_>,
+    cutoff_days: i32,
+    groups: &mut Q01GroupSlots,
+) -> Result<()> {
+    if view.num_columns() == 7 {
+        let Some(returnflags) = view.column(0)?.as_any().downcast_ref::<StringArray>() else {
+            return q01_pricing_summary_batch_into(
+                view.record_batch().clone(),
+                cutoff_days,
+                groups,
+            );
+        };
+        let Some(linestatuses) = view.column(1)?.as_any().downcast_ref::<StringArray>() else {
+            return q01_pricing_summary_batch_into(
+                view.record_batch().clone(),
+                cutoff_days,
+                groups,
+            );
+        };
+        if q01_update_decimal_batch(
+            returnflags,
+            linestatuses,
+            view.column(2)?,
+            view.column(3)?,
+            view.column(4)?,
+            view.column(5)?,
+            view.column(6)?,
+            cutoff_days,
+            groups,
+        )? {
+            return Ok(());
+        }
+    }
+    q01_pricing_summary_batch_into(view.record_batch().clone(), cutoff_days, groups)
+}
+
 fn parallel_batch_fold<Partial, Output, Map, Merge>(
     stream: &mut SendableBatchStream,
     map: Map,
@@ -3033,6 +3070,103 @@ where
             .unwrap_or_default();
         eprintln!(
             "[dodam:tpch-profile] {label}: total={:.3} ms stream_read={:.3} ms worker_wait_merge={:.3} ms chunks={pending_chunks}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            stream_ms,
+            merge_ms
+        );
+    }
+    Ok(output)
+}
+
+fn parallel_batch_fold_view_chunks<State, Partial, Output, Build, Consume, Finish, Merge>(
+    stream: &mut SendableBatchStream,
+    chunk_size: usize,
+    build_state: Build,
+    consume_batch: Consume,
+    finish: Finish,
+    mut output: Output,
+    mut merge: Merge,
+    label: &str,
+) -> Result<Output>
+where
+    State: Send + 'static,
+    Partial: Send + 'static,
+    Build: Fn() -> State + Send + Sync + Clone + 'static,
+    Consume: for<'a> FnMut(BatchView<'a>, &mut State) -> Result<Option<()>>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    Finish: Fn(State) -> Result<Partial> + Send + Sync + Clone + 'static,
+    Merge: FnMut(&mut Output, Partial),
+{
+    let profile = tpch_profile_enabled();
+    let started = profile.then(Instant::now);
+    let (sender, receiver) = mpsc::channel();
+    let mut pending_chunks = 0_usize;
+    let chunk_size = chunk_size.max(1);
+    let mut chunk = Vec::with_capacity(chunk_size);
+    let stream_started = profile.then(Instant::now);
+    while let Some(batch) = stream.next() {
+        chunk.push(batch?);
+        if chunk.len() < chunk_size {
+            continue;
+        }
+        let sender = sender.clone();
+        let build_state = build_state.clone();
+        let mut consume_batch = consume_batch.clone();
+        let finish = finish.clone();
+        let task_chunk = std::mem::replace(&mut chunk, Vec::with_capacity(chunk_size));
+        pending_chunks += 1;
+        rayon::spawn(move || {
+            let result = (|| {
+                let mut state = build_state();
+                for batch in &task_chunk {
+                    if consume_batch(BatchView::new(batch), &mut state)?.is_none() {
+                        return finish(state);
+                    }
+                }
+                finish(state)
+            })();
+            let _ = sender.send(result);
+        });
+    }
+    if !chunk.is_empty() {
+        let sender = sender.clone();
+        let build_state = build_state.clone();
+        let mut consume_batch = consume_batch.clone();
+        let finish = finish.clone();
+        pending_chunks += 1;
+        rayon::spawn(move || {
+            let result = (|| {
+                let mut state = build_state();
+                for batch in &chunk {
+                    if consume_batch(BatchView::new(batch), &mut state)?.is_none() {
+                        return finish(state);
+                    }
+                }
+                finish(state)
+            })();
+            let _ = sender.send(result);
+        });
+    }
+    let stream_ms = stream_started
+        .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+        .unwrap_or_default();
+    drop(sender);
+    let merge_started = profile.then(Instant::now);
+    for _ in 0..pending_chunks {
+        let partial = receiver
+            .recv()
+            .map_err(|_| DodamError::UnsupportedSql(format!("{label} worker stopped")))??;
+        merge(&mut output, partial);
+    }
+    if let Some(started) = started {
+        let merge_ms = merge_started
+            .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or_default();
+        eprintln!(
+            "[dodam:tpch-profile] {label}: total={:.3} ms stream_read={:.3} ms worker_wait_merge={:.3} ms view_chunks={pending_chunks}",
             started.elapsed().as_secs_f64() * 1000.0,
             stream_ms,
             merge_ms
@@ -12109,7 +12243,7 @@ async fn q15_revenue_by_supplier(
     end_days: i32,
 ) -> Result<HashMap<i64, f64>> {
     engine
-        .parquet_scan_accumulate_chunks(
+        .parquet_scan_accumulate_chunks_view(
             path,
             batch_size,
             Projection::Columns(vec![
@@ -12123,8 +12257,8 @@ async fn q15_revenue_by_supplier(
             scan_aggregate_fusion_enabled(),
             HashMap::<i64, f64>::new,
             HashMap::<i64, f64>::new,
-            move |batch, revenues| {
-                q15_revenue_by_supplier_batch_into(batch, start_days, end_days, revenues)?;
+            move |view, revenues| {
+                q15_revenue_by_supplier_view_into(view, start_days, end_days, revenues)?;
                 Ok(Some(()))
             },
             merge_f64_groups,
@@ -12183,6 +12317,46 @@ fn q15_revenue_by_supplier_batch_into(
         *revenues.entry(suppkey).or_insert(0.0) += extendedprice * (1.0 - discount);
     }
     Ok(())
+}
+
+fn q15_revenue_by_supplier_view_into(
+    view: BatchView<'_>,
+    start_days: i32,
+    end_days: i32,
+    revenues: &mut HashMap<i64, f64>,
+) -> Result<()> {
+    if view.num_columns() == 4 {
+        let (Some(suppkeys), Some(shipdates), Some(extendedprices), Some(discounts)) = (
+            view.column(0)?.as_any().downcast_ref::<Int64Array>(),
+            view.column(1)?.as_any().downcast_ref::<Date32Array>(),
+            decimal_input(view.column(2)?)?,
+            decimal_input(view.column(3)?)?,
+        ) else {
+            return q15_revenue_by_supplier_batch_into(
+                view.record_batch().clone(),
+                start_days,
+                end_days,
+                revenues,
+            );
+        };
+        for row in 0..view.record_batch().num_rows() {
+            if suppkeys.is_null(row)
+                || shipdates.is_null(row)
+                || extendedprices.is_null(row)
+                || discounts.is_null(row)
+            {
+                continue;
+            }
+            let shipdate = shipdates.value(row);
+            if shipdate < start_days || shipdate >= end_days {
+                continue;
+            }
+            *revenues.entry(suppkeys.value(row)).or_insert(0.0) +=
+                extendedprices.value(row) * (1.0 - discounts.value(row));
+        }
+        return Ok(());
+    }
+    q15_revenue_by_supplier_batch_into(view.record_batch().clone(), start_days, end_days, revenues)
 }
 
 struct Q15Row {
@@ -17039,7 +17213,7 @@ async fn q06_revenue_sum(
     };
     if !row_filter_enabled {
         return engine
-            .parquet_scan_accumulate_chunks(
+            .parquet_scan_accumulate_chunks_view(
                 path,
                 batch_size,
                 projection,
@@ -17048,9 +17222,9 @@ async fn q06_revenue_sum(
                 scan_aggregate_fusion_enabled(),
                 || Some((0.0, 0_u64)),
                 || Some((0.0, 0_u64)),
-                move |batch, total| {
-                    let batch = q06_revenue_sum_batch(
-                        batch,
+                move |view, total| {
+                    let batch = q06_revenue_sum_view(
+                        view,
                         start_days,
                         end_days,
                         discount_low,
@@ -17094,33 +17268,32 @@ async fn q06_revenue_sum(
             )
             .await?
     };
-    parallel_batch_fold_chunks(
+    parallel_batch_fold_view_chunks(
         &mut stream,
         q06_revenue_chunk_size(),
-        move |batches| {
-            let mut sum = 0.0;
-            let mut count = 0_u64;
-            for batch in batches {
-                let batch_result = if row_filter_enabled {
-                    q06_filtered_revenue_sum_batch(batch)?
-                } else {
-                    q06_revenue_sum_batch(
-                        batch,
-                        start_days,
-                        end_days,
-                        discount_low,
-                        discount_high,
-                        quantity_limit,
-                    )?
-                };
-                let Some((batch_sum, batch_count)) = batch_result else {
-                    return Ok(None);
-                };
-                sum += batch_sum;
-                count += batch_count;
+        || Some((0.0, 0_u64)),
+        move |view, total: &mut Option<(f64, u64)>| {
+            let batch_result = if row_filter_enabled {
+                q06_filtered_revenue_sum_view(view)?
+            } else {
+                q06_revenue_sum_view(
+                    view,
+                    start_days,
+                    end_days,
+                    discount_low,
+                    discount_high,
+                    quantity_limit,
+                )?
+            };
+            if let (Some(total), Some(batch)) = (total.as_mut(), batch_result) {
+                total.0 += batch.0;
+                total.1 += batch.1;
+            } else {
+                *total = None;
             }
-            Ok(Some((sum, count)))
+            Ok(Some(()))
         },
+        Ok,
         Some((0.0, 0_u64)),
         |total, batch| {
             if let (Some(total), Some(batch)) = (total.as_mut(), batch) {
@@ -17239,6 +17412,62 @@ fn q06_filtered_revenue_sum_batch(batch: RecordBatch) -> Result<Option<(f64, u64
     Ok(Some((sum, count)))
 }
 
+fn q06_filtered_revenue_sum_view(view: BatchView<'_>) -> Result<Option<(f64, u64)>> {
+    if view.num_columns() == 2
+        && let (Some(discounts), Some(extendedprices)) = (
+            decimal_input(view.column(0)?)?,
+            decimal_input(view.column(1)?)?,
+        )
+    {
+        return q06_filtered_revenue_sum_arrays(
+            discounts,
+            extendedprices,
+            view.record_batch().num_rows(),
+        );
+    }
+    q06_filtered_revenue_sum_batch(view.record_batch().clone())
+}
+
+fn q06_filtered_revenue_sum_arrays(
+    discounts: DecimalInput<'_>,
+    extendedprices: DecimalInput<'_>,
+    row_count: usize,
+) -> Result<Option<(f64, u64)>> {
+    let mut sum = 0.0;
+    let mut count = 0_u64;
+    if discounts.null_count() == 0 && extendedprices.null_count() == 0 {
+        let revenue_scale = 1.0 / (extendedprices.scale * discounts.scale);
+        if discounts.precision <= 18 && extendedprices.precision <= 18 {
+            for (&discount, &extendedprice) in discounts
+                .raw_values()
+                .iter()
+                .zip(extendedprices.raw_values())
+            {
+                sum += (extendedprice as i64 * discount as i64) as f64 * revenue_scale;
+                count += 1;
+            }
+            return Ok(Some((sum, count)));
+        }
+        for (&discount, &extendedprice) in discounts
+            .raw_values()
+            .iter()
+            .zip(extendedprices.raw_values())
+        {
+            sum += (extendedprice * discount) as f64 * revenue_scale;
+            count += 1;
+        }
+        return Ok(Some((sum, count)));
+    }
+    for row in 0..row_count {
+        if discounts.is_null(row) || extendedprices.is_null(row) {
+            continue;
+        }
+        sum += extendedprices.value(row) * discounts.value(row);
+        count += 1;
+    }
+    Ok(Some((sum, count)))
+}
+
 fn q06_revenue_sum_batch(
     batch: RecordBatch,
     start_days: i32,
@@ -17335,6 +17564,141 @@ fn q06_revenue_sum_batch(
         return Ok(Some((sum, count)));
     }
     Ok(None)
+}
+
+fn q06_revenue_sum_view(
+    view: BatchView<'_>,
+    start_days: i32,
+    end_days: i32,
+    discount_low: f64,
+    discount_high: f64,
+    quantity_limit: f64,
+) -> Result<Option<(f64, u64)>> {
+    if view.num_columns() == 4 {
+        let (Some(shipdates), Some(discounts), Some(quantities), Some(extendedprices)) = (
+            view.column(0)?.as_any().downcast_ref::<Date32Array>(),
+            decimal_input(view.column(1)?)?,
+            decimal_input(view.column(2)?)?,
+            decimal_input(view.column(3)?)?,
+        ) else {
+            return q06_revenue_sum_batch(
+                view.record_batch().clone(),
+                start_days,
+                end_days,
+                discount_low,
+                discount_high,
+                quantity_limit,
+            );
+        };
+        return q06_revenue_sum_arrays(
+            shipdates,
+            discounts,
+            quantities,
+            extendedprices,
+            view.record_batch().num_rows(),
+            start_days,
+            end_days,
+            discount_low,
+            discount_high,
+            quantity_limit,
+        );
+    }
+    q06_revenue_sum_batch(
+        view.record_batch().clone(),
+        start_days,
+        end_days,
+        discount_low,
+        discount_high,
+        quantity_limit,
+    )
+}
+
+fn q06_revenue_sum_arrays(
+    shipdates: &Date32Array,
+    discounts: DecimalInput<'_>,
+    quantities: DecimalInput<'_>,
+    extendedprices: DecimalInput<'_>,
+    row_count: usize,
+    start_days: i32,
+    end_days: i32,
+    discount_low: f64,
+    discount_high: f64,
+    quantity_limit: f64,
+) -> Result<Option<(f64, u64)>> {
+    let mut sum = 0.0;
+    let mut count = 0_u64;
+    if shipdates.null_count() == 0
+        && discounts.null_count() == 0
+        && quantities.null_count() == 0
+        && extendedprices.null_count() == 0
+    {
+        let discount_low_raw = scaled_f64_to_i128(discount_low, discounts.scale);
+        let discount_high_raw = scaled_f64_to_i128(discount_high, discounts.scale);
+        let quantity_limit_raw = scaled_f64_to_i128(quantity_limit, quantities.scale);
+        let revenue_scale = 1.0 / (extendedprices.scale * discounts.scale);
+        let shipdate_values = shipdates.values().as_ref();
+        let discount_values = discounts.raw_values();
+        let quantity_values = quantities.raw_values();
+        let extendedprice_values = extendedprices.raw_values();
+        if discounts.precision <= 18 && quantities.precision <= 18 && extendedprices.precision <= 18
+        {
+            let discount_low_raw = discount_low_raw as i64;
+            let discount_high_raw = discount_high_raw as i64;
+            let quantity_limit_raw = quantity_limit_raw as i64;
+            for row in 0..shipdate_values.len() {
+                let shipdate = shipdate_values[row];
+                let discount = discount_values[row] as i64;
+                if shipdate < start_days
+                    || shipdate >= end_days
+                    || discount < discount_low_raw
+                    || discount > discount_high_raw
+                    || (quantity_values[row] as i64) >= quantity_limit_raw
+                {
+                    continue;
+                }
+                sum += ((extendedprice_values[row] as i64) * discount) as f64 * revenue_scale;
+                count += 1;
+            }
+            return Ok(Some((sum, count)));
+        }
+        for row in 0..shipdate_values.len() {
+            let shipdate = shipdate_values[row];
+            let discount = discount_values[row];
+            if shipdate < start_days
+                || shipdate >= end_days
+                || discount < discount_low_raw
+                || discount > discount_high_raw
+                || quantity_values[row] >= quantity_limit_raw
+            {
+                continue;
+            }
+            sum += (extendedprice_values[row] * discount) as f64 * revenue_scale;
+            count += 1;
+        }
+        return Ok(Some((sum, count)));
+    }
+    for row in 0..row_count {
+        if shipdates.is_null(row)
+            || discounts.is_null(row)
+            || quantities.is_null(row)
+            || extendedprices.is_null(row)
+        {
+            continue;
+        }
+        let shipdate = shipdates.value(row);
+        let discount = discounts.value(row);
+        if shipdate < start_days
+            || shipdate >= end_days
+            || discount < discount_low
+            || discount > discount_high
+            || quantities.value(row) >= quantity_limit
+        {
+            continue;
+        }
+        sum += extendedprices.value(row) * discount;
+        count += 1;
+    }
+    Ok(Some((sum, count)))
 }
 
 fn scaled_f64_to_i128(value: f64, scale: f64) -> i128 {
@@ -18689,19 +19053,18 @@ async fn q08_order_years(
         )
         .await?;
     let customer_nations = Arc::new(AdaptiveI64Map::from_hash(customer_nations.clone()));
-    parallel_batch_fold_chunks(
+    parallel_batch_fold_view_chunks(
         &mut stream,
         4,
-        move |batches| {
-            let mut orders = HashMap::<i64, i32>::new();
-            for batch in batches {
-                merge_maps(
-                    &mut orders,
-                    q08_order_years_batch(batch, &customer_nations, start_days, end_days)?,
-                );
-            }
-            Ok(orders)
+        HashMap::<i64, i32>::new,
+        move |view, orders| {
+            merge_maps(
+                orders,
+                q08_order_years_view(view, &customer_nations, start_days, end_days)?,
+            );
+            Ok(Some(()))
         },
+        Ok,
         HashMap::<i64, i32>::new(),
         merge_maps,
         "Q08 order years",
@@ -18745,6 +19108,32 @@ fn q08_order_years_batch(
         }
     }
     Ok(orders)
+}
+
+fn q08_order_years_view(
+    view: BatchView<'_>,
+    customer_nations: &AdaptiveI64Map<i64>,
+    start_days: i32,
+    end_days: i32,
+) -> Result<HashMap<i64, i32>> {
+    if view.num_columns() == 3
+        && let Some(orders) = q08_order_years_batch_typed(
+            view.column(0)?,
+            view.column(1)?,
+            view.column(2)?,
+            customer_nations,
+            start_days,
+            end_days,
+        )?
+    {
+        return Ok(orders);
+    }
+    q08_order_years_batch(
+        view.record_batch().clone(),
+        customer_nations,
+        start_days,
+        end_days,
+    )
 }
 
 fn q08_order_years_batch_typed(

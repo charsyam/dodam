@@ -1888,6 +1888,81 @@ impl DodamEngine {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn parquet_scan_accumulate_chunks_view<
+        Output,
+        BuildPartial,
+        BuildOutput,
+        Consume,
+        Merge,
+    >(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        projection: Projection,
+        row_group_chunk: usize,
+        stream_chunk: usize,
+        enable_row_group_map: bool,
+        build_partial: BuildPartial,
+        build_output: BuildOutput,
+        consume_batch: Consume,
+        mut merge: Merge,
+        label: &str,
+    ) -> Result<Output>
+    where
+        Output: Send + 'static,
+        BuildPartial: Fn() -> Output + Clone + Send + Sync + 'static,
+        BuildOutput: Fn() -> Output + Clone + Send + Sync + 'static,
+        Consume: for<'a> FnMut(BatchView<'a>, &mut Output) -> Result<Option<()>>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        Merge: FnMut(&mut Output, Output) + Clone + Send + Sync + 'static,
+    {
+        if enable_row_group_map
+            && let Some(partials) = self
+                .parquet_row_group_map_pruned_view(
+                    path.clone(),
+                    batch_size,
+                    projection.clone(),
+                    Vec::new(),
+                    row_group_chunk,
+                    build_partial.clone(),
+                    consume_batch.clone(),
+                    |output| Ok(Some(output)),
+                )
+                .await?
+        {
+            let profile = scan_profile_enabled();
+            let started = profile.then(Instant::now);
+            let mut output = build_output();
+            for partial in partials {
+                merge(&mut output, partial);
+            }
+            if let Some(started) = started {
+                eprintln!(
+                    "[dodam:scan-fold-profile] {label}: accumulate_view_merge={:.3} ms row_group_chunk={row_group_chunk}",
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+            return Ok(output);
+        }
+
+        let mut stream = self
+            .scan_parquet_batches(path, batch_size, None, projection, None)
+            .await?;
+        self.accumulate_scan_stream_view_chunks(
+            &mut stream,
+            stream_chunk,
+            build_partial,
+            build_output,
+            consume_batch,
+            merge,
+            label,
+        )
+    }
+
     fn fold_scan_stream_chunks<Output, BuildPartial, BuildOutput, Map, Merge>(
         &self,
         stream: &mut SendableBatchStream,
@@ -1973,6 +2048,108 @@ impl DodamEngine {
                 .unwrap_or_default();
             eprintln!(
                 "[dodam:scan-fold-profile] {label}: total={:.3} ms stream_read={:.3} ms worker_wait_merge={:.3} ms chunks={pending_chunks}",
+                started.elapsed().as_secs_f64() * 1000.0,
+                stream_ms,
+                merge_ms
+            );
+        }
+        Ok(output)
+    }
+
+    fn accumulate_scan_stream_view_chunks<Output, BuildPartial, BuildOutput, Consume, Merge>(
+        &self,
+        stream: &mut SendableBatchStream,
+        chunk_size: usize,
+        build_partial: BuildPartial,
+        build_output: BuildOutput,
+        consume_batch: Consume,
+        mut merge: Merge,
+        label: &str,
+    ) -> Result<Output>
+    where
+        Output: Send + 'static,
+        BuildPartial: Fn() -> Output + Clone + Send + Sync + 'static,
+        BuildOutput: Fn() -> Output + Clone + Send + Sync + 'static,
+        Consume: for<'a> FnMut(BatchView<'a>, &mut Output) -> Result<Option<()>>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        Merge: FnMut(&mut Output, Output) + Clone + Send + Sync + 'static,
+    {
+        let profile = scan_profile_enabled();
+        let started = profile.then(Instant::now);
+        let (sender, receiver) = mpsc::channel();
+        let mut pending_chunks = 0_usize;
+        let chunk_size = chunk_size.max(1);
+        let mut chunk = Vec::with_capacity(chunk_size);
+        let stream_started = profile.then(Instant::now);
+        while let Some(batch) = stream.next() {
+            chunk.push(batch?);
+            if chunk.len() < chunk_size {
+                continue;
+            }
+            let sender = sender.clone();
+            let build_partial = build_partial.clone();
+            let mut consume_batch = consume_batch.clone();
+            let task_chunk = std::mem::replace(&mut chunk, Vec::with_capacity(chunk_size));
+            pending_chunks += 1;
+            rayon::spawn(move || {
+                let mut output = build_partial();
+                let result = task_chunk
+                    .iter()
+                    .try_for_each(|batch| -> Result<()> {
+                        consume_batch(BatchView::new(batch), &mut output)?.ok_or_else(|| {
+                            DodamError::UnsupportedSql(
+                                "scan accumulate view worker stopped".to_string(),
+                            )
+                        })?;
+                        Ok(())
+                    })
+                    .map(|()| output);
+                let _ = sender.send(result);
+            });
+        }
+        if !chunk.is_empty() {
+            let sender = sender.clone();
+            let build_partial = build_partial.clone();
+            let mut consume_batch = consume_batch.clone();
+            pending_chunks += 1;
+            rayon::spawn(move || {
+                let mut output = build_partial();
+                let result = chunk
+                    .iter()
+                    .try_for_each(|batch| -> Result<()> {
+                        consume_batch(BatchView::new(batch), &mut output)?.ok_or_else(|| {
+                            DodamError::UnsupportedSql(
+                                "scan accumulate view worker stopped".to_string(),
+                            )
+                        })?;
+                        Ok(())
+                    })
+                    .map(|()| output);
+                let _ = sender.send(result);
+            });
+        }
+        let stream_ms = stream_started
+            .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or_default();
+        drop(sender);
+
+        let merge_started = profile.then(Instant::now);
+        let mut output = build_output();
+        for _ in 0..pending_chunks {
+            let partial = receiver.recv().map_err(|_| {
+                DodamError::UnsupportedSql(format!("{label} scan-accumulate view worker stopped"))
+            })??;
+            merge(&mut output, partial);
+        }
+        if let Some(started) = started {
+            let merge_ms = merge_started
+                .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or_default();
+            eprintln!(
+                "[dodam:scan-fold-profile] {label}: accumulate_view_total={:.3} ms stream_read={:.3} ms worker_wait_merge={:.3} ms chunks={pending_chunks}",
                 started.elapsed().as_secs_f64() * 1000.0,
                 stream_ms,
                 merge_ms
