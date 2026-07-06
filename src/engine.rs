@@ -38,7 +38,7 @@ use crate::plan::{
 use crate::storage::{
     I64BloomPredicate, LocalFileSystemObjectStore, ObjectStore, ParquetBatchReader,
     ParquetFileCache, ParquetFileCacheStats, ParquetMetadataCache, plan_parquet_scan_tasks,
-    read_parquet_file_statistics, read_parquet_i64_column_max,
+    read_parquet_file_statistics, read_parquet_i64_column_constant, read_parquet_i64_column_max,
 };
 
 const LOCAL_SHUFFLE_FILE_TARGET_BYTES: u64 = 64 * 1024 * 1024;
@@ -847,6 +847,23 @@ impl DodamEngine {
         )
     }
 
+    pub async fn parquet_i64_column_constant(
+        &self,
+        path: PathBuf,
+        column: &str,
+    ) -> Result<Option<i64>> {
+        let source = self.plan_table_source(path).await?;
+        if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
+            return Ok(None);
+        }
+        read_parquet_i64_column_constant(
+            source.fragments[0].parquet_local_path()?,
+            column,
+            &self.metadata_cache,
+            self.object_store.as_ref(),
+        )
+    }
+
     pub async fn ordered_i64_decimal_group_sum_above(
         &self,
         path: PathBuf,
@@ -1383,11 +1400,12 @@ impl DodamEngine {
             + Sync
             + 'static,
     {
-        self.late_materialized_parquet_map_with_policy(
+        self.late_materialized_parquet_map_pruned_with_policy(
             path,
             batch_size,
             predicate_projection,
             payload_projection,
+            Vec::new(),
             row_group_chunk,
             LateMaterializationPolicy::always(),
             build_state,
@@ -1436,6 +1454,61 @@ impl DodamEngine {
             + Sync
             + 'static,
     {
+        self.late_materialized_parquet_map_pruned_with_policy(
+            path,
+            batch_size,
+            predicate_projection,
+            payload_projection,
+            Vec::new(),
+            row_group_chunk,
+            policy,
+            build_state,
+            build_selection,
+            consume_payload,
+            finish,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn late_materialized_parquet_map_pruned_with_policy<
+        State,
+        Output,
+        BuildState,
+        BuildSelection,
+        ConsumePayload,
+        Finish,
+    >(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        predicate_projection: Projection,
+        payload_projection: Projection,
+        pruning_predicates: Vec<Expr>,
+        row_group_chunk: usize,
+        policy: LateMaterializationPolicy,
+        build_state: BuildState,
+        build_selection: BuildSelection,
+        consume_payload: ConsumePayload,
+        finish: Finish,
+    ) -> Result<Option<Vec<LateMaterializedChunkResult<Output>>>>
+    where
+        State: Send + 'static,
+        Output: Send + 'static,
+        BuildState: Fn() -> State + Clone + Send + Sync + 'static,
+        BuildSelection: Fn(RecordBatch, &mut LateSelectionBuilder, &mut State) -> Result<Option<()>>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        ConsumePayload:
+            Fn(RecordBatch, &mut State) -> Result<Option<()>> + Clone + Send + Sync + 'static,
+        Finish: Fn(State, LateMaterializedMetrics) -> Result<Option<Output>>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
         let source = self.plan_table_source(path.clone()).await?;
         if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
             return Ok(None);
@@ -1444,7 +1517,7 @@ impl DodamEngine {
         let plan = plan_parquet_scan_tasks(
             &local_path,
             &predicate_projection,
-            &[],
+            &pruning_predicates,
             &self.metadata_cache,
             self.object_store.as_ref(),
         )?;

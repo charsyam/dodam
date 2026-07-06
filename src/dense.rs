@@ -48,6 +48,21 @@ impl AdaptiveI64Set {
         }
     }
 
+    pub(crate) fn to_hash_set(&self) -> HashSet<i64> {
+        match self {
+            Self::Dense { contains, len } => {
+                let mut keys = HashSet::with_capacity(*len);
+                for (key, present) in contains.iter().copied().enumerate() {
+                    if present {
+                        keys.insert(key as i64);
+                    }
+                }
+                keys
+            }
+            Self::Hash(keys) => keys.iter().copied().collect(),
+        }
+    }
+
     pub(crate) fn selective_key_range(&self) -> Option<(i64, i64)> {
         let (min_key, max_key, len) = match self {
             Self::Dense { contains, len } => {

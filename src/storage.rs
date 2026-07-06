@@ -1510,6 +1510,68 @@ pub fn read_parquet_i64_column_max(
     Ok(max_value)
 }
 
+pub fn read_parquet_i64_column_constant(
+    path: impl AsRef<Path>,
+    column: &str,
+    metadata_cache: &ParquetMetadataCache,
+    store: &dyn ObjectStore,
+) -> Result<Option<i64>> {
+    let path = path.as_ref();
+    let file = store.open(path)?;
+    let metadata = metadata_cache.get_with_store(path, store)?;
+    let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata);
+    let Some(column_index) = builder.schema().fields().iter().position(|field| {
+        field.name() == column && matches!(field.data_type(), DataType::Int32 | DataType::Int64)
+    }) else {
+        return Ok(None);
+    };
+    let column_nullable = builder.schema().field(column_index).is_nullable();
+    let mut constant = None;
+    for row_group in builder.metadata().row_groups() {
+        let Some(column) = row_group.columns().get(column_index) else {
+            return Ok(None);
+        };
+        let Some(statistics) = column.statistics() else {
+            return Ok(None);
+        };
+        if statistics.is_min_max_deprecated()
+            || !statistics.min_is_exact()
+            || !statistics.max_is_exact()
+            || (column_nullable && statistics.null_count_opt() != Some(0))
+        {
+            return Ok(None);
+        }
+        let (min_value, max_value) = match statistics {
+            Statistics::Int64(statistics) => {
+                let (Some(min_value), Some(max_value)) =
+                    (statistics.min_opt().copied(), statistics.max_opt().copied())
+                else {
+                    return Ok(None);
+                };
+                (min_value, max_value)
+            }
+            Statistics::Int32(statistics) => {
+                let (Some(min_value), Some(max_value)) =
+                    (statistics.min_opt().copied(), statistics.max_opt().copied())
+                else {
+                    return Ok(None);
+                };
+                (i64::from(min_value), i64::from(max_value))
+            }
+            _ => return Ok(None),
+        };
+        if min_value != max_value {
+            return Ok(None);
+        }
+        match constant {
+            Some(value) if value != min_value => return Ok(None),
+            Some(_) => {}
+            None => constant = Some(min_value),
+        }
+    }
+    Ok(constant)
+}
+
 impl Iterator for ParquetBatchReader {
     type Item = Result<RecordBatch>;
 
