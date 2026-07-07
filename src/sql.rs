@@ -2756,16 +2756,15 @@ async fn q01_pricing_summary_rows(
             .scan_parquet_batches(path, batch_size, None, projection, None)
             .await?
     };
-    let groups = parallel_batch_fold_chunks(
+    let groups = parallel_batch_fold_view_chunks(
         &mut stream,
         q01_chunk_size(),
-        move |batches| {
-            let mut groups = Q01GroupSlots::new();
-            for batch in batches {
-                q01_pricing_summary_projected_batch_into(batch, cutoff_days, &mut groups)?;
-            }
-            Ok(groups)
+        Q01GroupSlots::new,
+        move |view, groups| {
+            q01_pricing_summary_projected_view_into(view, cutoff_days, groups)?;
+            Ok(Some(()))
         },
+        Ok,
         Q01GroupSlots::new(),
         |groups, rows| groups.merge_slots(rows),
         "Q01 aggregate",
@@ -2894,35 +2893,6 @@ fn q01_pricing_summary_batch_into(
         });
     }
     Ok(())
-}
-
-fn q01_pricing_summary_projected_batch_into(
-    batch: RecordBatch,
-    cutoff_days: i32,
-    groups: &mut Q01GroupSlots,
-) -> Result<()> {
-    if batch.num_columns() == 7 {
-        let Some(returnflags) = batch.column(0).as_any().downcast_ref::<StringArray>() else {
-            return q01_pricing_summary_batch_into(batch, cutoff_days, groups);
-        };
-        let Some(linestatuses) = batch.column(1).as_any().downcast_ref::<StringArray>() else {
-            return q01_pricing_summary_batch_into(batch, cutoff_days, groups);
-        };
-        if q01_update_decimal_batch(
-            returnflags,
-            linestatuses,
-            batch.column(2),
-            batch.column(3),
-            batch.column(4),
-            batch.column(5),
-            batch.column(6),
-            cutoff_days,
-            groups,
-        )? {
-            return Ok(());
-        }
-    }
-    q01_pricing_summary_batch_into(batch, cutoff_days, groups)
 }
 
 fn q01_pricing_summary_projected_view_into(
@@ -10182,21 +10152,28 @@ async fn q12_filtered_lineitem_counts_stream(
     let mut stream = engine
         .scan_parquet_batches(path, batch_size, None, projection, None)
         .await?;
-    parallel_batch_fold_chunks(
+    parallel_batch_fold_view_chunks(
         &mut stream,
         q12_lineitem_chunk_size(),
-        move |batches| {
-            let mut pending = q12_pending_map_new();
-            for batch in batches {
-                q12_merge_pending_orders(
-                    &mut pending,
-                    q12_filtered_lineitem_counts_projected_batch(
-                        batch, &shipmodes, start_days, end_days,
-                    )?,
-                );
+        q12_pending_map_new,
+        move |view, pending| {
+            if q12_filtered_lineitem_counts_projected_view_into(
+                view, &shipmodes, start_days, end_days, pending,
+            )? {
+                return Ok(Some(()));
             }
-            Ok(pending)
+            q12_merge_pending_orders(
+                pending,
+                q12_filtered_lineitem_counts_projected_batch(
+                    view.record_batch().clone(),
+                    &shipmodes,
+                    start_days,
+                    end_days,
+                )?,
+            );
+            Ok(Some(()))
         },
+        Ok,
         q12_pending_map_new(),
         q12_merge_pending_orders,
         "Q12 lineitem aggregate",
@@ -13369,19 +13346,21 @@ async fn q03_order_rows(
         }
         return Ok(orders);
     }
-    parallel_batch_fold_chunks(
+    parallel_batch_fold_view_chunks(
         &mut stream,
         build_map_chunk_size(),
-        move |batches| {
-            let mut orders = fast_hash_map::<i64, Q03Order>();
-            for batch in batches {
-                merge_maps(
-                    &mut orders,
-                    q03_order_rows_batch(batch, &customers, order_cutoff, constant_shippriority)?,
-                );
-            }
-            Ok(orders)
+        || fast_hash_map::<i64, Q03Order>(),
+        move |view, orders| {
+            q03_order_rows_projected_view_into(
+                view,
+                &customers,
+                order_cutoff,
+                constant_shippriority,
+                orders,
+            )?;
+            Ok(Some(()))
         },
+        Ok,
         fast_hash_map::<i64, Q03Order>(),
         merge_maps,
         "Q03 order rows",
