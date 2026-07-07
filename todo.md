@@ -239,6 +239,12 @@
 - Current subquery limitations:
   - `IN (SELECT ...)` currently requires a single result column
   - correlated subquery support is currently correctness-first and row-bound; it is not optimized for large outer inputs yet
+- Expanded the SQL compatibility safety net:
+  - Added row-wise list indexing support for expressions such as `tags[array_length(tags)]`, with DuckDB differential coverage for projection and filter use.
+  - Generalized JOIN `ORDER BY` resolution so a projected scalar expression alias can also be referenced by the original expression text, such as `ORDER BY COALESCE(...)`.
+  - Added DuckDB differential coverage for aggregate queries filtered by scalar aggregate subqueries and `NOT IN (SELECT ...)` with `NULL` RHS semantics.
+  - Added Parquet COPY schema fidelity coverage for decimal, date, timestamp, and boolean output, while keeping timestamp display normalization separate from raw schema checks.
+  - Added long randomized differential replay knobs: `DODAM_LONG_DIFF_SEED`, `DODAM_LONG_DIFF_SEEDS`, `DODAM_LONG_DIFF_CASES`, and `DODAM_LONG_DIFF_CASE`.
 
 ### Performance Work
 

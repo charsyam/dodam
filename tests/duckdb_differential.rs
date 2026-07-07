@@ -276,6 +276,21 @@ async fn duckdb_differential_join_matrix() {
 
     assert_same_as_duckdb(
         &format!(
+            "SELECT f.id, COALESCE(d.name, 'missing') AS dim_name FROM '{}' f LEFT JOIN '{}' d ON f.key = d.key WHERE f.id IN (1, 3) ORDER BY COALESCE(d.name, 'missing')",
+            facts_path.display(),
+            dim_path.display()
+        ),
+        &format!(
+            "SELECT f.id, COALESCE(d.name, 'missing') AS dim_name FROM read_parquet('{}') f LEFT JOIN read_parquet('{}') d ON f.key = d.key WHERE f.id IN (1, 3) ORDER BY COALESCE(d.name, 'missing')",
+            facts_path.display(),
+            dim_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
             "SELECT f.id, f.key FROM '{}' f LEFT SEMI JOIN '{}' d ON f.key = d.key ORDER BY f.id",
             facts_path.display(),
             dim_path.display()
@@ -1514,6 +1529,36 @@ async fn duckdb_differential_aggregate_with_subquery_predicate() {
         tempdir.path(),
     )
     .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT key, count(*), sum(value) FROM '{}' WHERE id <= (SELECT max(id) FROM '{}' WHERE key = 2) GROUP BY key ORDER BY key",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT key, count(*), sum(value) FROM read_parquet('{}') WHERE id <= (SELECT max(id) FROM read_parquet('{}') WHERE key = 2) GROUP BY key ORDER BY key",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT key, count(*), sum(value) FROM '{}' WHERE key NOT IN (SELECT key FROM '{}' WHERE key IS NULL OR key = 3) OR key IS NULL GROUP BY key ORDER BY key",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT key, count(*), sum(value) FROM read_parquet('{}') WHERE key NOT IN (SELECT key FROM read_parquet('{}') WHERE key IS NULL OR key = 3) OR key IS NULL GROUP BY key ORDER BY key",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1607,6 +1652,74 @@ async fn duckdb_differential_copy_parquet_interop_options() {
         tempdir.path(),
     )
     .await;
+}
+
+#[tokio::test]
+async fn duckdb_differential_copy_parquet_type_schema_fidelity() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let input_path = tempdir.path().join("types-input.parquet");
+    let output_path = tempdir.path().join("types-output.parquet");
+    write_types_parquet(&input_path);
+
+    let copy_sql = format!(
+        "COPY (SELECT id, amount, event_date, created_at, flag FROM '{}' ORDER BY id) TO '{}' (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 2)",
+        input_path.display(),
+        output_path.display()
+    );
+    run_dodam_copy(&copy_sql).await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, amount, event_date, flag FROM '{}' ORDER BY id",
+            output_path.display()
+        ),
+        &format!(
+            "SELECT id, amount, event_date, flag FROM read_parquet('{}') ORDER BY id",
+            output_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, CAST(created_at AS VARCHAR) FROM '{}' ORDER BY id",
+            output_path.display()
+        ),
+        &format!(
+            "SELECT id, CAST(created_at AS VARCHAR) FROM read_parquet('{}') ORDER BY id",
+            output_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    let QueryOutput::Scan { batches } = execute_sql(
+        &DodamEngine::default(),
+        &format!(
+            "SELECT id, amount, event_date, created_at, flag FROM '{}' ORDER BY id",
+            output_path.display()
+        ),
+        BATCH_SIZE,
+    )
+    .await
+    .expect("read typed parquet copy") else {
+        panic!("expected scan output");
+    };
+    let schema = batches.first().expect("typed output batch").schema();
+    assert!(matches!(
+        schema.field(1).data_type(),
+        DataType::Decimal128(10, 2)
+    ));
+    assert!(matches!(schema.field(2).data_type(), DataType::Date32));
+    assert!(matches!(
+        schema.field(3).data_type(),
+        DataType::Timestamp(TimeUnit::Millisecond, None)
+    ));
+    assert!(matches!(schema.field(4).data_type(), DataType::Boolean));
 }
 
 #[tokio::test]
@@ -1710,6 +1823,19 @@ async fn duckdb_differential_nested_struct_field_projection() {
         tempdir.path(),
     )
     .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, tags[array_length(tags)] AS last_tag FROM '{}' WHERE tags[array_length(tags)] = 2 OR attrs.rank > 30 ORDER BY id",
+            input_path.display()
+        ),
+        &format!(
+            "SELECT id, tags[array_length(tags)] AS last_tag FROM read_parquet('{}') WHERE tags[array_length(tags)] = 2 OR attrs.rank > 30 ORDER BY id",
+            input_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1733,14 +1859,12 @@ async fn duckdb_differential_long_run_seeded_randomized() {
     write_multi_left_parquet(&multi_left_path);
     write_multi_right_parquet(&multi_right_path);
 
-    for seed in [
-        0xD0DA_2026_1001,
-        0xD0DA_2026_1002,
-        0xD0DA_2026_1003,
-        0xD0DA_2026_1004,
-    ] {
+    let seeds = long_diff_seeds();
+    let case_count = long_diff_case_count();
+    let only_case = long_diff_only_case();
+    for seed in seeds {
         let mut rng = TestRng::new(seed);
-        for case_id in 0..192 {
+        for case_id in 0..case_count {
             let case = match rng.index(3) {
                 0 => random_facts_query(&mut rng, &facts_path, case_id),
                 1 => random_types_query(&mut rng, &types_path, case_id),
@@ -1757,6 +1881,9 @@ async fn duckdb_differential_long_run_seeded_randomized() {
                     }
                 }
             };
+            if only_case.is_some_and(|only_case| only_case != case_id) {
+                continue;
+            }
             assert_same_as_duckdb_unordered_case(
                 &format!("long_diff seed={seed:#x} case={case_id}"),
                 &case.dodam_sql,
@@ -1766,6 +1893,56 @@ async fn duckdb_differential_long_run_seeded_randomized() {
             .await;
         }
     }
+}
+
+fn long_diff_seeds() -> Vec<u64> {
+    if let Ok(seed) = std::env::var("DODAM_LONG_DIFF_SEED") {
+        return vec![parse_long_diff_seed(&seed)];
+    }
+    if let Ok(seeds) = std::env::var("DODAM_LONG_DIFF_SEEDS") {
+        let parsed = seeds
+            .split(',')
+            .filter(|seed| !seed.trim().is_empty())
+            .map(parse_long_diff_seed)
+            .collect::<Vec<_>>();
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    vec![
+        0xD0DA_2026_1001,
+        0xD0DA_2026_1002,
+        0xD0DA_2026_1003,
+        0xD0DA_2026_1004,
+    ]
+}
+
+fn parse_long_diff_seed(raw: &str) -> u64 {
+    let raw = raw.trim();
+    if let Some(hex) = raw.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16).expect("DODAM_LONG_DIFF_SEED must be a u64")
+    } else {
+        raw.parse::<u64>()
+            .expect("DODAM_LONG_DIFF_SEED must be a u64")
+    }
+}
+
+fn long_diff_case_count() -> usize {
+    std::env::var("DODAM_LONG_DIFF_CASES")
+        .ok()
+        .map(|raw| {
+            raw.parse::<usize>()
+                .expect("DODAM_LONG_DIFF_CASES must be a positive integer")
+        })
+        .filter(|cases| *cases > 0)
+        .unwrap_or(192)
+}
+
+fn long_diff_only_case() -> Option<usize> {
+    std::env::var("DODAM_LONG_DIFF_CASE").ok().map(|raw| {
+        raw.parse::<usize>()
+            .expect("DODAM_LONG_DIFF_CASE must be an integer")
+    })
 }
 
 #[tokio::test]

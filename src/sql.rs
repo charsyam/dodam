@@ -34515,6 +34515,7 @@ fn parse_join_projection(
                         for column in join_scalar_expression_columns(&expr.expr, table_aliases)? {
                             add_column_once(&mut columns, column);
                         }
+                        aliases.push((function.to_string(), alias.value.clone()));
                         aliases.push((alias.value.clone(), alias.value.clone()));
                         expressions.push(expr);
                     } else {
@@ -34565,6 +34566,7 @@ fn parse_join_projection(
                         for column in join_scalar_expression_columns(&parsed, table_aliases)? {
                             add_column_once(&mut columns, column);
                         }
+                        aliases.push((expr.to_string(), alias.value.clone()));
                         aliases.push((alias.value.clone(), alias.value.clone()));
                         expressions.push(ProjectionExpression {
                             output_name: alias.value.clone(),
@@ -34683,14 +34685,23 @@ fn parse_join_order_by(
                         .unwrap_or_else(|| join_column_name(&order.expr, table_aliases))?
                 }
                 SqlExpr::CompoundIdentifier(_) => join_column_name(&order.expr, table_aliases)?,
-                SqlExpr::Function(function) => resolve_alias(
-                    &parse_join_aggregate(function, table_aliases)?.to_string(),
-                    aliases,
-                ),
+                SqlExpr::Function(function) => {
+                    if let Some(column) = alias_target(&function.to_string(), aliases).cloned() {
+                        column
+                    } else {
+                        resolve_alias(
+                            &parse_join_aggregate(function, table_aliases)?.to_string(),
+                            aliases,
+                        )
+                    }
+                }
                 expr => {
-                    return Err(DodamError::UnsupportedSql(format!(
-                        "expected JOIN ORDER BY alias, qualified column, or aggregate expression, got {expr}"
-                    )));
+                    let Some(column) = alias_target(&expr.to_string(), aliases).cloned() else {
+                        return Err(DodamError::UnsupportedSql(format!(
+                            "expected JOIN ORDER BY alias, qualified column, aggregate expression, or projected scalar expression, got {expr}"
+                        )));
+                    };
+                    column
                 }
             };
             Ok(SortExpr {
@@ -35277,7 +35288,7 @@ enum ScalarSqlExpression {
     },
     ListIndex {
         column: String,
-        index: usize,
+        index: Box<ScalarSqlExpression>,
     },
     ListLength(String),
     Literal(LiteralValue),
@@ -35722,7 +35733,10 @@ fn parse_scalar_sql_expression(
                     "unsupported nested/list expression: {expr}"
                 )));
             };
-            Ok(ScalarSqlExpression::ListIndex { column, index })
+            Ok(ScalarSqlExpression::ListIndex {
+                column,
+                index: Box::new(index),
+            })
         }
         SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
             if let Some((column, field)) = parse_struct_field_access(expr, table_alias)? {
@@ -35951,7 +35965,7 @@ fn parse_struct_field_access(
 fn parse_list_index_access(
     expr: &SqlExpr,
     table_alias: Option<&str>,
-) -> Result<Option<(String, usize)>> {
+) -> Result<Option<(String, ScalarSqlExpression)>> {
     let SqlExpr::CompoundFieldAccess { root, access_chain } = expr else {
         return Ok(None);
     };
@@ -35959,26 +35973,7 @@ fn parse_list_index_access(
         return Ok(None);
     };
     let column = sql_column_name(root, table_alias)?;
-    let SqlExpr::Value(value) = index else {
-        return Err(DodamError::UnsupportedSql(format!(
-            "list index must be a positive integer literal, got {index}"
-        )));
-    };
-    let Value::Number(raw, _) = &value.value else {
-        return Err(DodamError::UnsupportedSql(format!(
-            "list index must be a positive integer literal, got {index}"
-        )));
-    };
-    let index = raw.parse::<usize>().map_err(|_| {
-        DodamError::UnsupportedSql(format!(
-            "list index must be a positive integer literal, got {index}"
-        ))
-    })?;
-    if index == 0 {
-        return Err(DodamError::UnsupportedSql(
-            "list indexes are 1-based and must be positive".to_string(),
-        ));
-    }
+    let index = parse_scalar_sql_expression(index, table_alias)?;
     Ok(Some((column, index)))
 }
 
@@ -36163,9 +36158,11 @@ fn collect_join_scalar_expression_columns(
     match expr {
         ScalarSqlExpression::Column(column) => add_column_once(columns, column.clone()),
         ScalarSqlExpression::StructField { column, .. } => add_column_once(columns, column.clone()),
-        ScalarSqlExpression::ListIndex { column, .. } | ScalarSqlExpression::ListLength(column) => {
-            add_column_once(columns, column.clone())
+        ScalarSqlExpression::ListIndex { column, index } => {
+            add_column_once(columns, column.clone());
+            collect_join_scalar_expression_columns(index, table_aliases, columns)?;
         }
+        ScalarSqlExpression::ListLength(column) => add_column_once(columns, column.clone()),
         ScalarSqlExpression::Literal(_) => {}
         ScalarSqlExpression::Binary { left, right, .. } => {
             collect_join_scalar_expression_columns(left, table_aliases, columns)?;
@@ -36248,9 +36245,11 @@ fn collect_scalar_expression_columns(expr: &ScalarSqlExpression, columns: &mut V
     match expr {
         ScalarSqlExpression::Column(column) => add_column_once(columns, column.clone()),
         ScalarSqlExpression::StructField { column, .. } => add_column_once(columns, column.clone()),
-        ScalarSqlExpression::ListIndex { column, .. } | ScalarSqlExpression::ListLength(column) => {
-            add_column_once(columns, column.clone())
+        ScalarSqlExpression::ListIndex { column, index } => {
+            add_column_once(columns, column.clone());
+            collect_scalar_expression_columns(index, columns);
         }
+        ScalarSqlExpression::ListLength(column) => add_column_once(columns, column.clone()),
         ScalarSqlExpression::Literal(_) => {}
         ScalarSqlExpression::Binary { left, right, .. } => {
             collect_scalar_expression_columns(left, columns);
@@ -38129,7 +38128,8 @@ fn evaluate_scalar_expression(
             evaluated_struct_field(batch, column, field)
         }
         ScalarSqlExpression::ListIndex { column, index } => {
-            evaluated_list_index(batch, column, *index)
+            let index = scalar_as_i64(evaluate_scalar_expression(batch, index)?)?;
+            evaluated_list_index(batch, column, &index)
         }
         ScalarSqlExpression::ListLength(column) => evaluated_list_length(batch, column),
         ScalarSqlExpression::Literal(value) => Ok(evaluated_literal(value, batch.num_rows())),
@@ -38887,15 +38887,22 @@ fn evaluated_list_length(batch: &RecordBatch, column: &str) -> Result<EvaluatedS
 fn evaluated_list_index(
     batch: &RecordBatch,
     column: &str,
-    index: usize,
+    indexes: &[Option<i64>],
 ) -> Result<EvaluatedScalar> {
     let list = list_array_column(batch, column)?;
+    if indexes.len() != list.len() {
+        return Err(DodamError::UnsupportedSql(format!(
+            "list index expression length {} does not match list length {}",
+            indexes.len(),
+            list.len()
+        )));
+    }
     let values = list.values();
     match values.data_type() {
         DataType::Int32 => {
             let values = values.as_any().downcast_ref::<Int32Array>().expect("Int32");
             Ok(EvaluatedScalar::Int64(
-                list_element_indices(list, index)
+                list_element_indices(list, indexes)
                     .into_iter()
                     .map(|value_index| {
                         value_index.and_then(|value_index| {
@@ -38910,7 +38917,7 @@ fn evaluated_list_index(
         DataType::Int64 => {
             let values = values.as_any().downcast_ref::<Int64Array>().expect("Int64");
             Ok(EvaluatedScalar::Int64(
-                list_element_indices(list, index)
+                list_element_indices(list, indexes)
                     .into_iter()
                     .map(|value_index| {
                         value_index.and_then(|value_index| {
@@ -38925,7 +38932,7 @@ fn evaluated_list_index(
         DataType::Utf8 => {
             let values = values.as_any().downcast_ref::<StringArray>().expect("Utf8");
             Ok(EvaluatedScalar::Utf8(
-                list_element_indices(list, index)
+                list_element_indices(list, indexes)
                     .into_iter()
                     .map(|value_index| {
                         value_index.and_then(|value_index| {
@@ -38957,12 +38964,17 @@ fn list_array_column<'a>(batch: &'a RecordBatch, column: &str) -> Result<&'a Lis
         .ok_or_else(|| DodamError::UnsupportedSql(format!("{column} requires a LIST column")))
 }
 
-fn list_element_indices(list: &ListArray, index: usize) -> Vec<Option<usize>> {
+fn list_element_indices(list: &ListArray, indexes: &[Option<i64>]) -> Vec<Option<usize>> {
     (0..list.len())
         .map(|row| {
             if list.is_null(row) {
                 return None;
             }
+            let index = indexes[row]?;
+            if index <= 0 {
+                return None;
+            }
+            let index = usize::try_from(index).ok()?;
             let len = usize::try_from(list.value_length(row)).ok()?;
             if index > len {
                 return None;
