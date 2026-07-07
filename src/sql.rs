@@ -57,6 +57,7 @@ use crate::vector::{
     BatchConsumer, BatchView, Date32VectorView, Decimal128VectorView, DictionaryI32View,
     DictionaryStringValues, I32VectorView, I64VectorView, SelectionVector, Utf8VectorView,
     consume_record_batch, dictionary_i32_view_match_flags,
+    store_i64_keys_matching_dictionary_target, store_i64_keys_matching_utf8_target,
 };
 
 fn tpch_profile_enabled() -> bool {
@@ -26350,43 +26351,8 @@ fn q21_final_orders_atomic_dictionary_view_into(
     statuses: DictionaryI32View<'_>,
     markers: &DenseAtomicU8,
 ) -> Result<()> {
-    if statuses.null_count() != 0 {
-        return Ok(());
-    }
-    let Some(match_flags) = dictionary_i32_view_match_flags(statuses, &[b"F"]) else {
-        return Ok(());
-    };
-    let status_keys = statuses.keys();
-    if let Some(orderkey_values) = orderkeys.values_if_null_free() {
-        for (row, orderkey) in orderkey_values.iter().copied().enumerate() {
-            if q21_status_is_final(status_keys, &match_flags, row)
-                && let Ok(index) = usize::try_from(orderkey)
-            {
-                markers.store_present(index);
-            }
-        }
-        return Ok(());
-    }
-    for row in 0..orderkeys.len() {
-        if orderkeys.is_null(row) || !q21_status_is_final(status_keys, &match_flags, row) {
-            continue;
-        }
-        if let Ok(index) = usize::try_from(orderkeys.value(row)) {
-            markers.store_present(index);
-        }
-    }
+    store_i64_keys_matching_dictionary_target(orderkeys, statuses, b"F", markers);
     Ok(())
-}
-
-fn q21_status_is_final(status_keys: &[i32], match_flags: &[Option<usize>], row: usize) -> bool {
-    let Some(key) = status_keys
-        .get(row)
-        .copied()
-        .and_then(|key| usize::try_from(key).ok())
-    else {
-        return false;
-    };
-    match_flags.get(key).copied().flatten().is_some()
 }
 
 fn q21_final_orders_atomic_utf8_view_into(
@@ -26394,28 +26360,7 @@ fn q21_final_orders_atomic_utf8_view_into(
     statuses: &StringArray,
     markers: &DenseAtomicU8,
 ) -> Result<()> {
-    if let Some(orderkey_values) = orderkeys.values_if_null_free()
-        && statuses.null_count() == 0
-    {
-        let offsets = statuses.value_offsets();
-        let data = statuses.value_data();
-        for (row, orderkey) in orderkey_values.iter().copied().enumerate() {
-            if bytes_string_parts(offsets, data, row) == b"F"
-                && let Ok(index) = usize::try_from(orderkey)
-            {
-                markers.store_present(index);
-            }
-        }
-        return Ok(());
-    }
-    for row in 0..orderkeys.len() {
-        if orderkeys.is_null(row) || statuses.is_null(row) || statuses.value(row) != "F" {
-            continue;
-        }
-        if let Ok(index) = usize::try_from(orderkeys.value(row)) {
-            markers.store_present(index);
-        }
-    }
+    store_i64_keys_matching_utf8_target(orderkeys, statuses, b"F", markers);
     Ok(())
 }
 

@@ -5,6 +5,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Int32Type};
 use arrow::record_batch::RecordBatch;
 
+use crate::dense::DenseAtomicU8;
 use crate::error::{DodamError, Result};
 
 #[derive(Clone, Copy)]
@@ -557,6 +558,93 @@ pub(crate) fn dictionary_i32_view_match_flags(
         }
     }
     Some(flags)
+}
+
+pub(crate) fn store_i64_keys_matching_dictionary_target(
+    keys: I64VectorView<'_>,
+    dictionary: DictionaryI32View<'_>,
+    target: &[u8],
+    markers: &DenseAtomicU8,
+) -> bool {
+    let Some(match_flags) = dictionary_i32_view_match_flags(dictionary, &[target]) else {
+        return false;
+    };
+    let dictionary_keys = dictionary.keys();
+    if dictionary.null_count() == 0
+        && let Some(key_values) = keys.values_if_null_free()
+    {
+        for (row, key) in key_values.iter().copied().enumerate() {
+            if dictionary_i32_row_matches(dictionary_keys, &match_flags, row)
+                && let Ok(index) = usize::try_from(key)
+            {
+                markers.store_present(index);
+            }
+        }
+        return true;
+    }
+    for row in 0..keys.len() {
+        if keys.is_null(row)
+            || dictionary.is_null(row)
+            || !dictionary_i32_row_matches(dictionary_keys, &match_flags, row)
+        {
+            continue;
+        }
+        if let Ok(index) = usize::try_from(keys.value(row)) {
+            markers.store_present(index);
+        }
+    }
+    true
+}
+
+pub(crate) fn store_i64_keys_matching_utf8_target(
+    keys: I64VectorView<'_>,
+    strings: &StringArray,
+    target: &[u8],
+    markers: &DenseAtomicU8,
+) {
+    if strings.null_count() == 0
+        && let Some(key_values) = keys.values_if_null_free()
+    {
+        let offsets = strings.value_offsets();
+        let data = strings.value_data();
+        for (row, key) in key_values.iter().copied().enumerate() {
+            if string_array_value_bytes(offsets, data, row) == target
+                && let Ok(index) = usize::try_from(key)
+            {
+                markers.store_present(index);
+            }
+        }
+        return;
+    }
+    for row in 0..keys.len() {
+        if keys.is_null(row) || strings.is_null(row) || strings.value(row).as_bytes() != target {
+            continue;
+        }
+        if let Ok(index) = usize::try_from(keys.value(row)) {
+            markers.store_present(index);
+        }
+    }
+}
+
+fn dictionary_i32_row_matches(
+    dictionary_keys: &[i32],
+    match_flags: &[Option<usize>],
+    row: usize,
+) -> bool {
+    let Some(key) = dictionary_keys
+        .get(row)
+        .copied()
+        .and_then(|key| usize::try_from(key).ok())
+    else {
+        return false;
+    };
+    match_flags.get(key).copied().flatten().is_some()
+}
+
+fn string_array_value_bytes<'a>(offsets: &[i32], data: &'a [u8], row: usize) -> &'a [u8] {
+    let start = offsets[row] as usize;
+    let end = offsets[row + 1] as usize;
+    &data[start..end]
 }
 
 impl DictionaryI32View<'_> {
