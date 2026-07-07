@@ -52,8 +52,8 @@ use crate::hash::{FastHashMap, FastHashSet, fast_hash_map, fast_hash_map_with_ca
 use crate::optimizer::plan_join_inputs;
 use crate::storage::{DirectColumnScanMetrics, DirectI64I32I32ScanMetrics};
 use crate::vector::{
-    BatchConsumer, BatchView, DictionaryI32View, DictionaryStringValues, SelectionVector,
-    consume_record_batch, dictionary_i32_view_match_flags,
+    BatchConsumer, BatchView, DictionaryI32View, DictionaryStringValues, I64VectorView,
+    SelectionVector, consume_record_batch, dictionary_i32_view_match_flags,
 };
 
 fn tpch_profile_enabled() -> bool {
@@ -9440,64 +9440,22 @@ fn q16_supplier_counts_packed_batch(
 
 #[derive(Clone, Copy)]
 struct Q16SupplierKeyView<'a> {
-    partkeys: Q16I64Vector<'a>,
-    suppkeys: Q16I64Vector<'a>,
-}
-
-#[derive(Clone, Copy)]
-enum Q16I64Vector<'a> {
-    Arrow(&'a Int64Array),
-    Raw(&'a [i64]),
-}
-
-impl<'a> Q16I64Vector<'a> {
-    fn len(&self) -> usize {
-        match self {
-            Self::Arrow(values) => values.len(),
-            Self::Raw(values) => values.len(),
-        }
-    }
-
-    fn is_null(&self, row: usize) -> bool {
-        match self {
-            Self::Arrow(values) => values.is_null(row),
-            Self::Raw(_) => false,
-        }
-    }
-
-    fn value(&self, row: usize) -> i64 {
-        match self {
-            Self::Arrow(values) => values.value(row),
-            Self::Raw(values) => values[row],
-        }
-    }
-
-    fn values_if_null_free(&self) -> Option<&'a [i64]> {
-        match self {
-            Self::Arrow(values) => (values.null_count() == 0).then(|| values.values().as_ref()),
-            Self::Raw(values) => Some(values),
-        }
-    }
+    partkeys: I64VectorView<'a>,
+    suppkeys: I64VectorView<'a>,
 }
 
 impl<'a> Q16SupplierKeyView<'a> {
     fn try_new(partkeys: &'a ArrayRef, suppkeys: &'a ArrayRef) -> Option<Self> {
         Some(Self {
-            partkeys: Q16I64Vector::Arrow(partkeys.as_any().downcast_ref::<Int64Array>()?),
-            suppkeys: Q16I64Vector::Arrow(suppkeys.as_any().downcast_ref::<Int64Array>()?),
+            partkeys: I64VectorView::Arrow(partkeys.as_any().downcast_ref::<Int64Array>()?),
+            suppkeys: I64VectorView::Arrow(suppkeys.as_any().downcast_ref::<Int64Array>()?),
         })
     }
 
     fn try_new_view(view: BatchView<'a>) -> Option<Self> {
-        if let (Some(partkeys), Some(suppkeys)) = (view.i64(0), view.i64(1)) {
-            return Some(Self {
-                partkeys: Q16I64Vector::Arrow(partkeys),
-                suppkeys: Q16I64Vector::Arrow(suppkeys),
-            });
-        }
         Some(Self {
-            partkeys: Q16I64Vector::Raw(view.raw_i64(0)?),
-            suppkeys: Q16I64Vector::Raw(view.raw_i64(1)?),
+            partkeys: view.i64_vector(0)?,
+            suppkeys: view.i64_vector(1)?,
         })
     }
 }

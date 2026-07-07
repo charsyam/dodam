@@ -39,6 +39,42 @@ pub(crate) enum DictionaryI32View<'a> {
     },
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum I64VectorView<'a> {
+    Arrow(&'a Int64Array),
+    Raw(&'a [i64]),
+}
+
+impl<'a> I64VectorView<'a> {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Arrow(values) => values.len(),
+            Self::Raw(values) => values.len(),
+        }
+    }
+
+    pub(crate) fn is_null(&self, row: usize) -> bool {
+        match self {
+            Self::Arrow(values) => values.is_null(row),
+            Self::Raw(_) => false,
+        }
+    }
+
+    pub(crate) fn value(&self, row: usize) -> i64 {
+        match self {
+            Self::Arrow(values) => values.value(row),
+            Self::Raw(values) => values[row],
+        }
+    }
+
+    pub(crate) fn values_if_null_free(&self) -> Option<&'a [i64]> {
+        match self {
+            Self::Arrow(values) => (values.null_count() == 0).then(|| values.values().as_ref()),
+            Self::Raw(values) => Some(values),
+        }
+    }
+}
+
 impl<'a> BatchView<'a> {
     pub(crate) fn new(batch: &'a RecordBatch) -> Self {
         Self {
@@ -150,6 +186,13 @@ impl<'a> BatchView<'a> {
 
     pub(crate) fn i64(&self, index: usize) -> Option<&'a Int64Array> {
         self.downcast(index)
+    }
+
+    pub(crate) fn i64_vector(&self, index: usize) -> Option<I64VectorView<'a>> {
+        match self.inner {
+            BatchViewInner::RecordBatch(_) => self.i64(index).map(I64VectorView::Arrow),
+            BatchViewInner::RawColumns(_) => self.raw_i64(index).map(I64VectorView::Raw),
+        }
     }
 
     pub(crate) fn required_i64(&self, index: usize) -> Result<&'a Int64Array> {
