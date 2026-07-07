@@ -2192,6 +2192,21 @@ async fn duckdb_differential_nested_struct_field_projection() {
         tempdir.path(),
     )
     .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT n.attrs.rank AS rank, n.attrs.more_tags[1] AS first_nested_tag FROM '{}' f JOIN '{}' n ON f.id = n.id WHERE n.attrs.more_tags[1] = 9 OR array_length(n.attrs.more_tags) > 1 ORDER BY rank",
+            facts_path.display(),
+            input_path.display()
+        ),
+        &format!(
+            "SELECT n.attrs.rank AS rank, n.attrs.more_tags[1] AS first_nested_tag FROM read_parquet('{}') f JOIN read_parquet('{}') n ON f.id = n.id WHERE n.attrs.more_tags[1] = 9 OR array_length(n.attrs.more_tags) > 1 ORDER BY rank",
+            facts_path.display(),
+            input_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -2622,6 +2637,7 @@ fn random_facts_predicate(
     ];
     let subquery_predicates = [
         "id IN (SELECT id FROM facts_sub WHERE key = 3)",
+        "id IN (SELECT id FROM facts_sub f2 WHERE f2.key = outer_key AND f2.id > 2)",
         "id = (SELECT key FROM facts_sub WHERE key = 3 ORDER BY id LIMIT 1)",
         "EXISTS (SELECT 1 FROM facts_sub f2 WHERE f2.key = outer_key AND f2.value IS NOT NULL)",
     ];
@@ -2735,6 +2751,7 @@ fn random_types_query(rng: &mut TestRng, types_path: &Path, case_id: usize) -> G
         "flag = true OR flag IS NULL",
         "score >= -1.0",
         "amount >= '-7.0000' AND amount <= '123.4500'",
+        "amount = amount3 OR amount3 > amount",
         "created_at >= '2024-01-02 00:00:00' OR created_at IS NULL",
         "created_at_utc = '1970-01-01 09:00:00+09:00' OR id = 1",
         "event_date < '2024-01-02' OR event_date IS NULL",
@@ -2747,6 +2764,7 @@ fn random_types_query(rng: &mut TestRng, types_path: &Path, case_id: usize) -> G
         "id, id + 10 AS plus_ten, CAST(id AS VARCHAR) AS id_text",
         "id, lower(note) AS lower_note, upper(note) AS upper_note, length(note) AS note_len",
         "id, CASE WHEN amount IS NULL THEN 'missing' WHEN amount < 0 THEN 'negative' ELSE 'nonnegative' END AS amount_class",
+        "id, CAST(CAST(amount3 AS DECIMAL(10,2)) AS VARCHAR) AS amount3_2, CAST(amount * amount3 AS VARCHAR) AS product_text",
     ]);
     GeneratedSql {
         case_id,

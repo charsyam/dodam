@@ -137,6 +137,7 @@ pub struct SqlQuery {
     join: Option<SqlJoin>,
     projection: Projection,
     filter: Option<FilterExpr>,
+    expression_filter: Option<SqlExpr>,
     having: Option<FilterExpr>,
     order_by: Option<SortKey>,
     limit: Option<usize>,
@@ -339,7 +340,11 @@ pub async fn execute_sql(
         let is_aggregate = query.is_aggregate();
         let aggregates = query.aggregates.clone();
         let group_by = query.group_by.clone();
-        let join_input_projection = &query.projection;
+        let join_input_projection = if query.expression_filter.is_some() {
+            &Projection::All
+        } else {
+            &query.projection
+        };
         let projection_requires_expression =
             projection_requires_expression_path(&query.expressions);
         let input_order_by = if projection_requires_expression {
@@ -365,8 +370,8 @@ pub async fn execute_sql(
                 batch_size,
                 left_keys: join.left_keys,
                 right_keys: join.right_keys,
-                left_prefix: join.left_alias,
-                right_prefix: join.right_alias,
+                left_prefix: join.left_alias.clone(),
+                right_prefix: join.right_alias.clone(),
                 left_projection: join_plan.left_projection,
                 right_projection: join_plan.right_projection,
                 left_filter: join_plan.left_filter,
@@ -382,11 +387,25 @@ pub async fn execute_sql(
             .await?;
         if is_aggregate {
             let stream = apply_output_filter_stream(stream, query.filter.clone());
-            let stream: SendableBatchStream = if query.aggregate_expressions.is_empty() {
-                stream
-            } else {
-                append_aggregate_expression_stream(stream, query.aggregate_expressions.clone())
-            };
+            let stream: SendableBatchStream =
+                if let Some(expression_filter) = query.expression_filter.as_ref() {
+                    Box::new(MemoryExec::new(apply_output_join_expression_filter(
+                        collect_batches(stream)?,
+                        expression_filter,
+                        &[join.left_alias.as_str(), join.right_alias.as_str()],
+                    )?))
+                    .execute()?
+                } else if query.aggregate_expressions.is_empty() {
+                    stream
+                } else {
+                    append_aggregate_expression_stream(stream, query.aggregate_expressions.clone())
+                };
+            let stream: SendableBatchStream =
+                if query.expression_filter.is_some() && !query.aggregate_expressions.is_empty() {
+                    append_aggregate_expression_stream(stream, query.aggregate_expressions.clone())
+                } else {
+                    stream
+                };
             let metrics = if group_by.is_empty() {
                 collect_aggregates(stream, 2, &aggregates)?
             } else {
@@ -406,6 +425,13 @@ pub async fn execute_sql(
         }
         let mut batches = collect_batches(stream)?;
         batches = apply_output_filter(batches, query.filter.as_ref())?;
+        if let Some(expression_filter) = query.expression_filter.as_ref() {
+            batches = apply_output_join_expression_filter(
+                batches,
+                expression_filter,
+                &[join.left_alias.as_str(), join.right_alias.as_str()],
+            )?;
+        }
         if projection_requires_expression {
             batches = apply_output_expression_projection(batches, &query.expressions)?;
             batches = apply_output_order_limit(batches, query.order_by.as_ref(), query.limit)?;
@@ -30386,10 +30412,8 @@ async fn try_execute_with_cte_sql(
         &projection.aggregates,
         None,
     )?;
-    let filter = residual
-        .as_ref()
-        .map(|expr| parse_join_filter(expr, &projection.aliases, &alias_refs, false))
-        .transpose()?;
+    let (filter, expression_filter) =
+        parse_join_filter_plan(residual.as_ref(), &projection.aliases, &alias_refs, false)?;
     let having = select
         .having
         .as_ref()
@@ -30411,6 +30435,9 @@ async fn try_execute_with_cte_sql(
     ))
     .execute()?;
     let mut batches = apply_output_filter(collect_batches(stream)?, filter.as_ref())?;
+    if let Some(expression_filter) = expression_filter.as_ref() {
+        batches = apply_output_join_expression_filter(batches, expression_filter, &alias_refs)?;
+    }
     if !projection.aggregates.is_empty() {
         batches = append_aggregate_expression_columns(batches, &projection.aggregate_expressions)?;
         let stream = Box::new(MemoryExec::new(batches)).execute()?;
@@ -30626,11 +30653,12 @@ async fn try_execute_derived_join_sql(
     };
     let group_by = parse_join_group_by(select, &output_aliases)?;
     let projection = parse_join_projection(select, &output_aliases, &group_by)?;
-    let filter = select
-        .selection
-        .as_ref()
-        .map(|expr| parse_join_filter(expr, &projection.aliases, &output_aliases, false))
-        .transpose()?;
+    let (filter, expression_filter) = parse_join_filter_plan(
+        select.selection.as_ref(),
+        &projection.aliases,
+        &output_aliases,
+        false,
+    )?;
     let order_by = parse_join_order_by(query, &projection.aliases, &output_aliases)?;
     let limit = parse_limit(query)?;
     validate_distinct(
@@ -30657,6 +30685,9 @@ async fn try_execute_derived_join_sql(
     .execute()?;
     let mut batches = collect_batches(stream)?;
     batches = apply_output_filter(batches, filter.as_ref())?;
+    if let Some(expression_filter) = expression_filter.as_ref() {
+        batches = apply_output_join_expression_filter(batches, expression_filter, &output_aliases)?;
+    }
     if !projection.aggregates.is_empty() {
         let batches =
             append_aggregate_expression_columns(batches, &projection.aggregate_expressions)?;
@@ -30776,7 +30807,11 @@ async fn execute_parsed_join_query(
     let is_aggregate = query.is_aggregate();
     let aggregates = query.aggregates.clone();
     let group_by = query.group_by.clone();
-    let join_input_projection = &query.projection;
+    let join_input_projection = if query.expression_filter.is_some() {
+        &Projection::All
+    } else {
+        &query.projection
+    };
     let join_plan = plan_join_inputs(
         join_input_projection,
         query.filter.as_ref(),
@@ -30795,8 +30830,8 @@ async fn execute_parsed_join_query(
             batch_size,
             left_keys: join.left_keys,
             right_keys: join.right_keys,
-            left_prefix: join.left_alias,
-            right_prefix: join.right_alias,
+            left_prefix: join.left_alias.clone(),
+            right_prefix: join.right_alias.clone(),
             left_projection: join_plan.left_projection,
             right_projection: join_plan.right_projection,
             left_filter: join_plan.left_filter,
@@ -30809,6 +30844,17 @@ async fn execute_parsed_join_query(
         .await?;
     if is_aggregate {
         let stream = apply_output_filter_stream(stream, query.filter.clone());
+        let stream: SendableBatchStream =
+            if let Some(expression_filter) = query.expression_filter.as_ref() {
+                Box::new(MemoryExec::new(apply_output_join_expression_filter(
+                    collect_batches(stream)?,
+                    expression_filter,
+                    &[join.left_alias.as_str(), join.right_alias.as_str()],
+                )?))
+                .execute()?
+            } else {
+                stream
+            };
         let stream: SendableBatchStream = if query.aggregate_expressions.is_empty() {
             stream
         } else {
@@ -30837,6 +30883,13 @@ async fn execute_parsed_join_query(
     }
     let mut batches = collect_batches(stream)?;
     batches = apply_output_filter(batches, query.filter.as_ref())?;
+    if let Some(expression_filter) = query.expression_filter.as_ref() {
+        batches = apply_output_join_expression_filter(
+            batches,
+            expression_filter,
+            &[join.left_alias.as_str(), join.right_alias.as_str()],
+        )?;
+    }
     let projection_requires_expression = projection_requires_expression_path(&query.expressions);
     if projection_requires_expression {
         batches = apply_output_expression_projection(batches, &query.expressions)?;
@@ -32206,12 +32259,17 @@ async fn try_execute_multi_comma_join_sql(
         .collect::<Vec<_>>();
     let residual = combine_sql_and_conjuncts(residual);
     let (filter_residual, subquery_residual) = split_subquery_residual(residual);
-    let filter = filter_residual
-        .as_ref()
-        .map(|expr| parse_join_filter(expr, &projection.aliases, &alias_refs, false))
-        .transpose()?;
+    let (filter, expression_filter) = parse_join_filter_plan(
+        filter_residual.as_ref(),
+        &projection.aliases,
+        &alias_refs,
+        false,
+    )?;
 
     let mut batches = apply_output_filter(current, filter.as_ref())?;
+    if let Some(expression_filter) = expression_filter.as_ref() {
+        batches = apply_output_join_expression_filter(batches, expression_filter, &alias_refs)?;
+    }
     if let Some(residual) = subquery_residual.as_ref() {
         if let Some(optimized) =
             try_apply_correlated_min_equality_filter(engine, batches.clone(), residual, batch_size)
@@ -32827,7 +32885,20 @@ fn collect_join_column_candidates(
             collect_join_column_candidates(expr, table_aliases, columns)?;
         }
         SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
-            add_column_once(columns, join_column_name(expr, table_aliases)?);
+            for column in join_scalar_expression_columns(
+                &parse_join_scalar_sql_expression(expr, table_aliases)?,
+                table_aliases,
+            )? {
+                add_column_once(columns, column);
+            }
+        }
+        SqlExpr::CompoundFieldAccess { .. } => {
+            for column in join_scalar_expression_columns(
+                &parse_join_scalar_sql_expression(expr, table_aliases)?,
+                table_aliases,
+            )? {
+                add_column_once(columns, column);
+            }
         }
         SqlExpr::Function(function) => {
             for arg in function_arg_exprs(function) {
@@ -33362,6 +33433,7 @@ fn query_allows_direct_join_sink(query: &SqlQuery) -> bool {
         && query.having.is_none()
         && !query.distinct
         && query.filter.is_none()
+        && query.expression_filter.is_none()
         && query.order_by.is_none()
         && query.aliases.is_empty()
 }
@@ -33412,8 +33484,13 @@ async fn explain_query(engine: &DodamEngine, query: SqlQuery, batch_size: usize)
                 "JOIN with aggregates, HAVING, or DISTINCT is not supported".to_string(),
             ));
         }
+        let join_input_projection = if query.expression_filter.is_some() {
+            &Projection::All
+        } else {
+            &query.projection
+        };
         let join_plan = plan_join_inputs(
-            &query.projection,
+            join_input_projection,
             query.filter.as_ref(),
             query.order_by.as_ref(),
             &join.left_alias,
@@ -33494,6 +33571,7 @@ fn pushed_join_output_projection(query: &SqlQuery) -> Projection {
         return Projection::All;
     }
     if projection_requires_expression_path(&query.expressions)
+        || query.expression_filter.is_some()
         || query.filter.is_some()
         || query.order_by.is_some()
     {
@@ -33585,6 +33663,7 @@ fn parse_select(query: &Query, select: &Select) -> Result<SqlQuery> {
         join: None,
         projection: parsed_projection.projection,
         filter,
+        expression_filter: None,
         having,
         order_by,
         limit,
@@ -33620,10 +33699,12 @@ fn parse_comma_join_select(query: &Query, select: &Select) -> Result<SqlQuery> {
         &right_alias,
         &output_aliases,
     )?;
-    let filter = residual
-        .as_ref()
-        .map(|expr| parse_join_filter(expr, &projection.aliases, &output_aliases, false))
-        .transpose()?;
+    let (filter, expression_filter) = parse_join_filter_plan(
+        residual.as_ref(),
+        &projection.aliases,
+        &output_aliases,
+        false,
+    )?;
     let having = select
         .having
         .as_ref()
@@ -33645,6 +33726,7 @@ fn parse_comma_join_select(query: &Query, select: &Select) -> Result<SqlQuery> {
         }),
         projection: projection.projection,
         filter,
+        expression_filter,
         having,
         order_by,
         limit,
@@ -33683,11 +33765,12 @@ fn parse_join_select(query: &Query, select: &Select) -> Result<SqlQuery> {
     let group_by = parse_join_group_by(select, &output_aliases)?;
     let projection = parse_join_projection(select, &output_aliases, &group_by)?;
     let distinct = parse_distinct(select)?;
-    let filter = select
-        .selection
-        .as_ref()
-        .map(|expr| parse_join_filter(expr, &projection.aliases, &output_aliases, false))
-        .transpose()?;
+    let (filter, expression_filter) = parse_join_filter_plan(
+        select.selection.as_ref(),
+        &projection.aliases,
+        &output_aliases,
+        false,
+    )?;
     let having = select
         .having
         .as_ref()
@@ -33709,6 +33792,7 @@ fn parse_join_select(query: &Query, select: &Select) -> Result<SqlQuery> {
         }),
         projection: projection.projection,
         filter,
+        expression_filter,
         having,
         order_by,
         limit,
@@ -35094,6 +35178,97 @@ fn parse_join_filter(
         table_aliases,
         allow_aggregates,
     )?))
+}
+
+fn parse_join_filter_plan(
+    expr: Option<&SqlExpr>,
+    aliases: &[(String, String)],
+    table_aliases: &[&str],
+    allow_aggregates: bool,
+) -> Result<(Option<FilterExpr>, Option<SqlExpr>)> {
+    let Some(expr) = expr else {
+        return Ok((None, None));
+    };
+    if join_predicate_requires_expression_path(expr, table_aliases)? {
+        return Ok((None, Some(expr.clone())));
+    }
+    Ok((
+        Some(parse_join_filter(
+            expr,
+            aliases,
+            table_aliases,
+            allow_aggregates,
+        )?),
+        None,
+    ))
+}
+
+fn join_predicate_requires_expression_path(expr: &SqlExpr, table_aliases: &[&str]) -> Result<bool> {
+    match expr {
+        SqlExpr::BinaryOp { left, op, right }
+            if matches!(op, BinaryOperator::And | BinaryOperator::Or) =>
+        {
+            Ok(
+                join_predicate_requires_expression_path(left, table_aliases)?
+                    || join_predicate_requires_expression_path(right, table_aliases)?,
+            )
+        }
+        SqlExpr::UnaryOp { op, expr } if *op == UnaryOperator::Not => {
+            join_predicate_requires_expression_path(expr, table_aliases)
+        }
+        SqlExpr::Nested(expr) => join_predicate_requires_expression_path(expr, table_aliases),
+        SqlExpr::BinaryOp { left, op, right }
+            if matches!(
+                op,
+                BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+            ) =>
+        {
+            Ok(
+                join_scalar_predicate_side_requires_expression(left, table_aliases)?
+                    || join_scalar_predicate_side_requires_expression(right, table_aliases)?,
+            )
+        }
+        SqlExpr::IsNull(expr) | SqlExpr::IsNotNull(expr) => {
+            join_scalar_predicate_side_requires_expression(expr, table_aliases)
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            if join_scalar_predicate_side_requires_expression(expr, table_aliases)? {
+                return Ok(true);
+            }
+            list.iter().try_fold(false, |found, expr| {
+                Ok(found || join_scalar_predicate_side_requires_expression(expr, table_aliases)?)
+            })
+        }
+        SqlExpr::Like { expr, pattern, .. } => Ok(join_scalar_predicate_side_requires_expression(
+            expr,
+            table_aliases,
+        )?
+            || join_scalar_predicate_side_requires_expression(pattern, table_aliases)?),
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => Ok(
+            join_scalar_predicate_side_requires_expression(expr, table_aliases)?
+                || join_scalar_predicate_side_requires_expression(low, table_aliases)?
+                || join_scalar_predicate_side_requires_expression(high, table_aliases)?,
+        ),
+        _ => Ok(false),
+    }
+}
+
+fn join_scalar_predicate_side_requires_expression(
+    expr: &SqlExpr,
+    table_aliases: &[&str],
+) -> Result<bool> {
+    let expression = parse_join_scalar_sql_expression(expr, table_aliases)?;
+    Ok(!matches!(
+        expression,
+        ScalarSqlExpression::Column(_) | ScalarSqlExpression::Literal(_)
+    ))
 }
 
 fn join_expr_to_filter_expr(
@@ -38361,6 +38536,138 @@ fn apply_output_expression_filter(
         }
     }
     Ok(filtered)
+}
+
+fn apply_output_join_expression_filter(
+    batches: Vec<RecordBatch>,
+    predicate: &SqlExpr,
+    table_aliases: &[&str],
+) -> Result<Vec<RecordBatch>> {
+    let mut filtered = Vec::new();
+    for batch in batches {
+        let mask = evaluate_join_scalar_predicate(&batch, predicate, table_aliases)?;
+        let batch = filter_record_batch(&batch, &mask)?;
+        if batch.num_rows() > 0 {
+            filtered.push(batch);
+        }
+    }
+    Ok(filtered)
+}
+
+fn evaluate_join_scalar_predicate(
+    batch: &RecordBatch,
+    predicate: &SqlExpr,
+    table_aliases: &[&str],
+) -> Result<BooleanArray> {
+    match predicate {
+        SqlExpr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
+            let left = evaluate_join_scalar_predicate(batch, left, table_aliases)?;
+            let right = evaluate_join_scalar_predicate(batch, right, table_aliases)?;
+            Ok(boolean_and(&left, &right))
+        }
+        SqlExpr::BinaryOp { left, op, right } if *op == BinaryOperator::Or => {
+            let left = evaluate_join_scalar_predicate(batch, left, table_aliases)?;
+            let right = evaluate_join_scalar_predicate(batch, right, table_aliases)?;
+            Ok(boolean_or(&left, &right))
+        }
+        SqlExpr::UnaryOp { op, expr } if *op == UnaryOperator::Not => {
+            let mask = evaluate_join_scalar_predicate(batch, expr, table_aliases)?;
+            Ok(boolean_not(&mask))
+        }
+        SqlExpr::Nested(expr) => evaluate_join_scalar_predicate(batch, expr, table_aliases),
+        SqlExpr::BinaryOp { left, op, right }
+            if matches!(
+                op,
+                BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+            ) =>
+        {
+            let left = evaluate_scalar_expression(
+                batch,
+                &parse_join_scalar_sql_expression(left, table_aliases)?,
+            )?;
+            let right = evaluate_scalar_expression(
+                batch,
+                &parse_join_scalar_sql_expression(right, table_aliases)?,
+            )?;
+            Ok(BooleanArray::from(compare_evaluated_scalars(
+                left, op, right,
+            )?))
+        }
+        SqlExpr::IsNull(expr) | SqlExpr::IsNotNull(expr) => {
+            let value = evaluate_scalar_expression(
+                batch,
+                &parse_join_scalar_sql_expression(expr, table_aliases)?,
+            )?;
+            let is_not_null = matches!(predicate, SqlExpr::IsNotNull(_));
+            Ok(BooleanArray::from(
+                scalar_null_mask(value)
+                    .into_iter()
+                    .map(|is_null| Some(if is_not_null { !is_null } else { is_null }))
+                    .collect::<Vec<_>>(),
+            ))
+        }
+        SqlExpr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let value = evaluate_scalar_expression(
+                batch,
+                &parse_join_scalar_sql_expression(expr, table_aliases)?,
+            )?;
+            let values = list
+                .iter()
+                .map(|expr| {
+                    evaluate_scalar_expression(
+                        batch,
+                        &parse_join_scalar_sql_expression(expr, table_aliases)?,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(BooleanArray::from(evaluate_scalar_in_list(
+                value, &values, *negated,
+            )?))
+        }
+        SqlExpr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => {
+            if *any {
+                return Err(DodamError::UnsupportedSql(
+                    "LIKE ANY is not supported".to_string(),
+                ));
+            }
+            let value = scalar_as_utf8(evaluate_scalar_expression(
+                batch,
+                &parse_join_scalar_sql_expression(expr, table_aliases)?,
+            )?)?;
+            let pattern = sql_like_pattern(pattern)?;
+            let escape = sql_like_escape(escape_char)?;
+            let tokens = scalar_like_pattern_tokens(&pattern, escape)?;
+            Ok(BooleanArray::from(
+                value
+                    .into_iter()
+                    .map(|value| {
+                        value.map(|value| {
+                            let matched = scalar_like_matches(&value, &tokens);
+                            if *negated { !matched } else { matched }
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            ))
+        }
+        _ => Err(DodamError::UnsupportedSql(format!(
+            "unsupported JOIN expression WHERE predicate: {predicate}"
+        ))),
+    }
 }
 
 fn evaluate_scalar_predicate(
