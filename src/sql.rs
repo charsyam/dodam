@@ -23192,23 +23192,83 @@ fn q08_order_years_view(
     end_days: i32,
 ) -> Result<HashMap<i64, i32>> {
     if view.num_columns() == 3
-        && let Some(orders) = q08_order_years_batch_typed(
-            view.column(0)?,
-            view.column(1)?,
-            view.column(2)?,
+        && let (Some(orderkeys), Some(custkeys), Some(orderdates)) = (
+            view.i64_vector(0),
+            view.i64_vector(1),
+            view.date32_vector(2),
+        )
+    {
+        return q08_order_years_vector(
+            orderkeys,
+            custkeys,
+            orderdates,
             customer_nations,
             start_days,
             end_days,
-        )?
-    {
+        );
+    }
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "Q08 order year raw vector columns have unsupported types".to_string(),
+        ));
+    };
+    q08_order_years_batch(batch.clone(), customer_nations, start_days, end_days)
+}
+
+fn q08_order_years_vector(
+    orderkeys: I64VectorView<'_>,
+    custkeys: I64VectorView<'_>,
+    orderdates: Date32VectorView<'_>,
+    customer_nations: &AdaptiveI64Map<i64>,
+    start_days: i32,
+    end_days: i32,
+) -> Result<HashMap<i64, i32>> {
+    let mut orders = HashMap::new();
+    let mut year_cache = Date32YearCache::default();
+    if let (Some(orderkey_values), Some(custkey_values), Some(orderdate_values)) = (
+        orderkeys.values_if_null_free(),
+        custkeys.values_if_null_free(),
+        orderdates.values_if_null_free(),
+    ) {
+        if let Some((_nation_values, nation_present)) = customer_nations.dense_slices() {
+            for row in 0..orderkey_values.len() {
+                let orderdate = orderdate_values[row];
+                if orderdate < start_days || orderdate > end_days {
+                    continue;
+                }
+                let Ok(custkey) = usize::try_from(custkey_values[row]) else {
+                    continue;
+                };
+                if nation_present.get(custkey).copied().unwrap_or(false) {
+                    orders.insert(orderkey_values[row], year_cache.year(orderdate)?);
+                }
+            }
+            return Ok(orders);
+        }
+        for row in 0..orderkey_values.len() {
+            let orderdate = orderdate_values[row];
+            if orderdate >= start_days
+                && orderdate <= end_days
+                && customer_nations.get(custkey_values[row]).is_some()
+            {
+                orders.insert(orderkey_values[row], year_cache.year(orderdate)?);
+            }
+        }
         return Ok(orders);
     }
-    q08_order_years_batch(
-        view.record_batch().clone(),
-        customer_nations,
-        start_days,
-        end_days,
-    )
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || custkeys.is_null(row) || orderdates.is_null(row) {
+            continue;
+        }
+        let orderdate = orderdates.value(row);
+        if orderdate >= start_days
+            && orderdate <= end_days
+            && customer_nations.get(custkeys.value(row)).is_some()
+        {
+            orders.insert(orderkeys.value(row), year_cache.year(orderdate)?);
+        }
+    }
+    Ok(orders)
 }
 
 fn q08_order_years_batch_typed(
