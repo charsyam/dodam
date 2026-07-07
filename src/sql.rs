@@ -22592,27 +22592,161 @@ fn q07_volume_projected_view(
     end_days: i32,
 ) -> Result<FastHashMap<(i64, i64, i32), f64>> {
     if view.num_columns() == 5
-        && let Some(groups) = q07_volume_batch_typed(
-            view.column(0)?,
-            view.column(1)?,
-            view.column(2)?,
-            view.column(3)?,
-            view.column(4)?,
+        && let (
+            Some(orderkeys),
+            Some(suppkeys),
+            Some(shipdates),
+            Some(extendedprices),
+            Some(discounts),
+        ) = (
+            view.i64_vector(0),
+            view.i64_vector(1),
+            view.date32_vector(2),
+            view.decimal128_vector(3),
+            view.decimal128_vector(4),
+        )
+    {
+        return q07_volume_vector(
+            orderkeys,
+            suppkeys,
+            shipdates,
+            extendedprices,
+            discounts,
             supplier_nations,
             order_customer_nations,
             start_days,
             end_days,
-        )?
-    {
-        return Ok(groups);
+        );
     }
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "Q07 volume raw vector columns have unsupported types".to_string(),
+        ));
+    };
     q07_volume_batch(
-        view.record_batch().clone(),
+        batch.clone(),
         supplier_nations,
         order_customer_nations,
         start_days,
         end_days,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q07_volume_vector(
+    orderkeys: I64VectorView<'_>,
+    suppkeys: I64VectorView<'_>,
+    shipdates: Date32VectorView<'_>,
+    extendedprices: Decimal128VectorView<'_>,
+    discounts: Decimal128VectorView<'_>,
+    supplier_nations: &AdaptiveI64Map<i64>,
+    order_customer_nations: &FastHashMap<i64, i64>,
+    start_days: i32,
+    end_days: i32,
+) -> Result<FastHashMap<(i64, i64, i32), f64>> {
+    let mut groups = fast_hash_map::<(i64, i64, i32), f64>();
+    let mut year_cache = Date32YearCache::default();
+    if let (Some(orderkey_values), Some(suppkey_values), Some(shipdate_values)) = (
+        orderkeys.values_if_null_free(),
+        suppkeys.values_if_null_free(),
+        shipdates.values_if_null_free(),
+    ) && extendedprices.null_count() == 0
+        && discounts.null_count() == 0
+    {
+        let extendedprice_values = extendedprices.raw_values();
+        let discount_values = discounts.raw_values();
+        let discount_scale = discounts.scale();
+        let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
+        if let Some((supplier_nation_values, supplier_nation_present)) =
+            supplier_nations.dense_slices()
+        {
+            for row in 0..orderkey_values.len() {
+                let shipdate = shipdate_values[row];
+                if shipdate < start_days || shipdate > end_days {
+                    continue;
+                }
+                let Ok(suppkey) = usize::try_from(suppkey_values[row]) else {
+                    continue;
+                };
+                if !supplier_nation_present
+                    .get(suppkey)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let Some(cust_nation_key) =
+                    order_customer_nations.get(&orderkey_values[row]).copied()
+                else {
+                    continue;
+                };
+                let supp_nation_key = supplier_nation_values[suppkey];
+                if supp_nation_key == cust_nation_key {
+                    continue;
+                }
+                *groups
+                    .entry((supp_nation_key, cust_nation_key, year_cache.year(shipdate)?))
+                    .or_insert(0.0) += decimal_discounted_revenue_raw(
+                    extendedprice_values[row],
+                    discount_values[row],
+                    discount_scale,
+                    revenue_scale,
+                );
+            }
+            return Ok(groups);
+        }
+        for row in 0..orderkey_values.len() {
+            let shipdate = shipdate_values[row];
+            if shipdate < start_days || shipdate > end_days {
+                continue;
+            }
+            let (Some(supp_nation_key), Some(cust_nation_key)) = (
+                supplier_nations.get(suppkey_values[row]),
+                order_customer_nations.get(&orderkey_values[row]).copied(),
+            ) else {
+                continue;
+            };
+            if supp_nation_key == cust_nation_key {
+                continue;
+            }
+            *groups
+                .entry((supp_nation_key, cust_nation_key, year_cache.year(shipdate)?))
+                .or_insert(0.0) += decimal_discounted_revenue_raw(
+                extendedprice_values[row],
+                discount_values[row],
+                discount_scale,
+                revenue_scale,
+            );
+        }
+        return Ok(groups);
+    }
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row)
+            || suppkeys.is_null(row)
+            || shipdates.is_null(row)
+            || extendedprices.is_null(row)
+            || discounts.is_null(row)
+        {
+            continue;
+        }
+        let shipdate = shipdates.value(row);
+        if shipdate < start_days || shipdate > end_days {
+            continue;
+        }
+        let (Some(supp_nation_key), Some(cust_nation_key)) = (
+            supplier_nations.get(suppkeys.value(row)),
+            order_customer_nations.get(&orderkeys.value(row)).copied(),
+        ) else {
+            continue;
+        };
+        if supp_nation_key == cust_nation_key {
+            continue;
+        }
+        *groups
+            .entry((supp_nation_key, cust_nation_key, year_cache.year(shipdate)?))
+            .or_insert(0.0) += extendedprices.value(row) * (1.0 - discounts.value(row));
+    }
+    Ok(groups)
 }
 
 fn q07_volume_batch_typed(
