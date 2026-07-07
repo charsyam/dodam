@@ -16122,27 +16122,27 @@ struct Q04LateCandidateState {
 }
 
 struct Q04CandidatePredicateView<'a> {
-    orderkeys: &'a Int64Array,
-    orderdates: &'a Date32Array,
+    orderkeys: I64VectorView<'a>,
+    orderdates: Date32VectorView<'a>,
 }
 
 impl<'a> Q04CandidatePredicateView<'a> {
     fn try_new(view: BatchView<'a>) -> Option<Self> {
         (view.num_columns() == 2).then_some(Self {
-            orderkeys: view.i64(0)?,
-            orderdates: view.date32(1)?,
+            orderkeys: view.i64_vector(0)?,
+            orderdates: view.date32_vector(1)?,
         })
     }
 }
 
 struct Q04CandidatePayloadView<'a> {
-    priorities: &'a StringArray,
+    priorities: Utf8VectorView<'a>,
 }
 
 impl<'a> Q04CandidatePayloadView<'a> {
     fn try_new(view: BatchView<'a>) -> Option<Self> {
         (view.num_columns() == 1).then_some(Self {
-            priorities: view.utf8(0)?,
+            priorities: view.utf8_vector(0)?,
         })
     }
 }
@@ -16266,38 +16266,37 @@ fn q04_candidate_order_priorities_partial_view(
         };
         label_indices.insert(label.clone(), index);
     }
-    if let (Some(orderkeys), Some(orderdates), Some(orderpriorities)) = (
-        view.column(0)?.as_any().downcast_ref::<Int64Array>(),
-        view.column(1)?.as_any().downcast_ref::<Date32Array>(),
-        view.dictionary_i32_view(2),
-    ) && q04_candidate_order_priorities_dictionary_typed(
-        orderkeys,
-        orderdates,
-        orderpriorities,
-        start_days,
-        end_days,
-        partial,
-        &mut label_indices,
-    )? {
+    if let (Some(orderkeys), Some(orderdates), Some(orderpriorities)) =
+        (view.i64(0), view.date32(1), view.dictionary_i32_view(2))
+        && q04_candidate_order_priorities_dictionary_typed(
+            orderkeys,
+            orderdates,
+            orderpriorities,
+            start_days,
+            end_days,
+            partial,
+            &mut label_indices,
+        )?
+    {
         return Ok(Some(()));
     }
     if let (Some(orderkeys), Some(orderdates), Some(orderpriorities)) = (
-        view.column(0)?.as_any().downcast_ref::<Int64Array>(),
-        view.column(1)?.as_any().downcast_ref::<Date32Array>(),
-        view.utf8(2),
-    ) && orderkeys.null_count() == 0
-        && orderdates.null_count() == 0
-        && orderpriorities.null_count() == 0
+        view.i64_vector(0),
+        view.date32_vector(1),
+        view.utf8_vector(2),
+    ) && let (Some(orderkey_values), Some(orderdate_values)) = (
+        orderkeys.values_if_null_free(),
+        orderdates.values_if_null_free(),
+    ) && orderpriorities.null_count() == 0
     {
-        let orderkey_values = orderkeys.values().as_ref();
-        let orderdate_values = orderdates.values().as_ref();
         for row in 0..orderkey_values.len() {
             let orderdate = orderdate_values[row];
             let orderkey = orderkey_values[row];
             if orderdate < start_days || orderdate >= end_days || orderkey < 0 {
                 continue;
             }
-            let priority = orderpriorities.value(row);
+            let priority = std::str::from_utf8(orderpriorities.value_bytes(row))
+                .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
             let priority_index = if let Some(index) = label_indices.get(priority) {
                 *index
             } else {
@@ -16313,12 +16312,10 @@ fn q04_candidate_order_priorities_partial_view(
         }
         return Ok(Some(()));
     }
-    q04_candidate_order_priorities_partial_batch(
-        view.record_batch().clone(),
-        start_days,
-        end_days,
-        partial,
-    )
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    q04_candidate_order_priorities_partial_batch(batch.clone(), start_days, end_days, partial)
 }
 
 fn q04_candidate_order_priorities_dictionary_typed(
@@ -16453,9 +16450,10 @@ fn q04_late_candidate_build_selection_view(
     if let Some(layout) = Q04CandidatePredicateView::try_new(view) {
         let orderkeys = layout.orderkeys;
         let orderdates = layout.orderdates;
-        if orderkeys.null_count() == 0 && orderdates.null_count() == 0 {
-            let orderkey_values = orderkeys.values().as_ref();
-            let orderdate_values = orderdates.values().as_ref();
+        if let (Some(orderkey_values), Some(orderdate_values)) = (
+            orderkeys.values_if_null_free(),
+            orderdates.values_if_null_free(),
+        ) {
             for (&orderkey, &orderdate) in orderkey_values.iter().zip(orderdate_values) {
                 let selected =
                     orderkey >= 0 && orderdate >= state.start_days && orderdate < state.end_days;
@@ -16481,7 +16479,10 @@ fn q04_late_candidate_build_selection_view(
         }
         return Ok(Some(()));
     }
-    q04_late_candidate_build_selection_batch(view.record_batch().clone(), selection, state)
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    q04_late_candidate_build_selection_batch(batch.clone(), selection, state)
 }
 
 fn q04_late_candidate_consume_priority_batch(
@@ -16528,7 +16529,8 @@ fn q04_late_candidate_consume_priority_view(
             };
             state.priority_offset += 1;
             if priorities.is_valid(row) {
-                let priority = priorities.value(row);
+                let priority = std::str::from_utf8(priorities.value_bytes(row))
+                    .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
                 let priority_index = if let Some(index) = state.label_indices.get(priority) {
                     *index
                 } else {
@@ -16544,7 +16546,10 @@ fn q04_late_candidate_consume_priority_view(
         }
         return Ok(Some(()));
     }
-    q04_late_candidate_consume_priority_batch(view.record_batch().clone(), state)
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    q04_late_candidate_consume_priority_batch(batch.clone(), state)
 }
 
 fn q04_candidate_priorities_from_partials(
