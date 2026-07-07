@@ -4291,18 +4291,18 @@ fn q10_order_customers_view(
     end_days: i32,
 ) -> Result<FastHashMap<i64, i64>> {
     if view.num_columns() == 3
-        && let (Ok(orderkeys), Ok(custkeys), Ok(orderdates)) = (
-            view.required_i64(0),
-            view.required_i64(1),
-            view.required_date32(2),
+        && let (Some(orderkeys), Some(custkeys), Some(orderdates)) = (
+            view.i64_vector(0),
+            view.i64_vector(1),
+            view.date32_vector(2),
         )
     {
         let mut orders = fast_hash_map::<i64, i64>();
-        if orderkeys.null_count() == 0 && custkeys.null_count() == 0 && orderdates.null_count() == 0
-        {
-            let orderkey_values = orderkeys.values().as_ref();
-            let custkey_values = custkeys.values().as_ref();
-            let orderdate_values = orderdates.values().as_ref();
+        if let (Some(orderkey_values), Some(custkey_values), Some(orderdate_values)) = (
+            orderkeys.values_if_null_free(),
+            custkeys.values_if_null_free(),
+            orderdates.values_if_null_free(),
+        ) {
             for row in 0..view.num_rows() {
                 let orderdate = orderdate_values[row];
                 if orderdate >= start_days && orderdate < end_days {
