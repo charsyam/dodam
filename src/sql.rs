@@ -16399,6 +16399,7 @@ fn q04_count_late_candidate_priorities_direct_column_reader(
 ) -> Result<Option<Vec<u64>>> {
     let started = tpch_profile_start();
     let row_groups = (0..engine.parquet_row_group_count(&path)?).collect::<Vec<_>>();
+    let candidate_bloom = Arc::new(q04_candidate_bloom(candidate_priorities));
     let candidate_priorities = Arc::new(
         candidate_priorities
             .iter()
@@ -16420,6 +16421,7 @@ fn q04_count_late_candidate_priorities_direct_column_reader(
                 batch_size,
                 row_groups,
                 candidate_priorities.clone(),
+                candidate_bloom.clone(),
                 priority_count,
                 profile,
             )
@@ -16507,6 +16509,7 @@ fn q04_lineitem_direct_column_chunk_scan(
     batch_size: usize,
     row_groups: Vec<usize>,
     candidate_priorities: Arc<Vec<AtomicU8>>,
+    candidate_bloom: Arc<Option<Q04CandidateBloom>>,
     priority_count: usize,
     profile: bool,
 ) -> Result<Option<Q04LineitemDirectPartial>> {
@@ -16527,6 +16530,7 @@ fn q04_lineitem_direct_column_chunk_scan(
                 let batch_hits = q04_count_late_candidate_priorities_atomic_view_hits(
                     view,
                     &candidate_priorities,
+                    candidate_bloom.as_ref().as_ref(),
                     &mut partial.counts,
                 )?;
                 hits = hits.saturating_add(batch_hits);
@@ -16536,6 +16540,7 @@ fn q04_lineitem_direct_column_chunk_scan(
             q04_count_late_candidate_priorities_atomic_view(
                 view,
                 &candidate_priorities,
+                candidate_bloom.as_ref().as_ref(),
                 &mut partial.counts,
             )?;
             Ok(())
@@ -16980,6 +16985,7 @@ async fn q04_count_late_candidate_priorities_atomic_row_group_map(
     candidate_priorities: &[u8],
     priority_count: usize,
 ) -> Result<Option<Vec<u64>>> {
+    let candidate_bloom = Arc::new(q04_candidate_bloom(candidate_priorities));
     let candidate_priorities = Arc::new(
         candidate_priorities
             .iter()
@@ -16997,10 +17003,12 @@ async fn q04_count_late_candidate_priorities_atomic_row_group_map(
             move || vec![0_u64; priority_count],
             {
                 let candidate_priorities = candidate_priorities.clone();
+                let candidate_bloom = candidate_bloom.clone();
                 move |view, counts: &mut Vec<u64>| {
                     q04_count_late_candidate_priorities_atomic_view(
                         view,
                         &candidate_priorities,
+                        candidate_bloom.as_ref().as_ref(),
                         counts,
                     )
                 }
@@ -17023,15 +17031,22 @@ async fn q04_count_late_candidate_priorities_atomic_row_group_map(
 fn q04_count_late_candidate_priorities_atomic_view(
     view: BatchView<'_>,
     candidate_priorities: &[AtomicU8],
+    candidate_bloom: Option<&Q04CandidateBloom>,
     counts: &mut [u64],
 ) -> Result<Option<()>> {
-    q04_count_late_candidate_priorities_atomic_view_hits(view, candidate_priorities, counts)?;
+    q04_count_late_candidate_priorities_atomic_view_hits(
+        view,
+        candidate_priorities,
+        candidate_bloom,
+        counts,
+    )?;
     Ok(Some(()))
 }
 
 fn q04_count_late_candidate_priorities_atomic_view_hits(
     view: BatchView<'_>,
     candidate_priorities: &[AtomicU8],
+    candidate_bloom: Option<&Q04CandidateBloom>,
     counts: &mut [u64],
 ) -> Result<usize> {
     if let Some((orderkeys, commitdates, receiptdates)) = view.raw_i64_i32_i32() {
@@ -17040,6 +17055,7 @@ fn q04_count_late_candidate_priorities_atomic_view_hits(
             commitdates,
             receiptdates,
             candidate_priorities,
+            candidate_bloom,
             counts,
         ));
     }
@@ -17049,6 +17065,7 @@ fn q04_count_late_candidate_priorities_atomic_view_hits(
             view.column(1)?,
             view.column(2)?,
             candidate_priorities,
+            candidate_bloom,
             counts,
         )?
     {
@@ -17057,6 +17074,7 @@ fn q04_count_late_candidate_priorities_atomic_view_hits(
     let _ = q04_count_late_candidate_priorities_atomic_batch(
         view.record_batch().clone(),
         candidate_priorities,
+        candidate_bloom,
         counts,
     )?;
     Ok(0)
@@ -17104,6 +17122,79 @@ fn q04_lineitem_row_group_map_chunk() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(2)
+}
+
+#[derive(Clone)]
+struct Q04CandidateBloom {
+    bits: Vec<u64>,
+    mask: u64,
+}
+
+impl Q04CandidateBloom {
+    fn with_candidate_count(candidate_count: usize) -> Self {
+        let bit_count = candidate_count
+            .saturating_mul(16)
+            .max(64 * 1024)
+            .next_power_of_two();
+        let words = bit_count / 64;
+        Self {
+            bits: vec![0; words],
+            mask: bit_count as u64 - 1,
+        }
+    }
+
+    fn insert(&mut self, key: usize) {
+        let (first, second) = self.indexes(key);
+        self.set(first);
+        self.set(second);
+    }
+
+    fn might_contain(&self, key: usize) -> bool {
+        let (first, second) = self.indexes(key);
+        self.get(first) && self.get(second)
+    }
+
+    fn indexes(&self, key: usize) -> (u64, u64) {
+        let key = key as u64;
+        let first = key.wrapping_mul(0x9E37_79B1_85EB_CA87) & self.mask;
+        let mixed = key ^ key.rotate_left(32) ^ 0xC2B2_AE3D_27D4_EB4F;
+        let second = mixed.wrapping_mul(0x1656_67B1_9E37_79F9) & self.mask;
+        (first, second)
+    }
+
+    fn set(&mut self, bit: u64) {
+        let word = (bit >> 6) as usize;
+        let mask = 1_u64 << (bit & 63);
+        self.bits[word] |= mask;
+    }
+
+    fn get(&self, bit: u64) -> bool {
+        let word = (bit >> 6) as usize;
+        let mask = 1_u64 << (bit & 63);
+        self.bits[word] & mask != 0
+    }
+}
+
+fn q04_candidate_bloom(candidate_priorities: &[u8]) -> Option<Q04CandidateBloom> {
+    if !std::env::var("DODAM_Q04_ENABLE_CANDIDATE_BLOOM")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return None;
+    }
+    let candidate_count = candidate_priorities
+        .iter()
+        .filter(|&&priority| priority != 0)
+        .count();
+    if candidate_count < 1024 {
+        return None;
+    }
+    let mut bloom = Q04CandidateBloom::with_candidate_count(candidate_count);
+    for (key, priority) in candidate_priorities.iter().copied().enumerate() {
+        if priority != 0 {
+            bloom.insert(key);
+        }
+    }
+    Some(bloom)
 }
 
 fn q04_collect_late_candidate_orderkeys_batch(
@@ -17170,6 +17261,7 @@ fn q04_collect_late_candidate_orderkeys_view(
 fn q04_count_late_candidate_priorities_atomic_batch(
     batch: RecordBatch,
     candidate_priorities: &[AtomicU8],
+    candidate_bloom: Option<&Q04CandidateBloom>,
     counts: &mut [u64],
 ) -> Result<Option<()>> {
     if batch.num_columns() == 3
@@ -17178,6 +17270,7 @@ fn q04_count_late_candidate_priorities_atomic_batch(
             batch.column(1),
             batch.column(2),
             candidate_priorities,
+            candidate_bloom,
             counts,
         )?
     {
@@ -17191,6 +17284,7 @@ fn q04_count_late_candidate_priorities_atomic_batch(
         commitdates,
         receiptdates,
         candidate_priorities,
+        candidate_bloom,
         counts,
     )? {
         return Ok(Some(()));
@@ -17214,6 +17308,9 @@ fn q04_count_late_candidate_priorities_atomic_batch(
         let Ok(orderkey) = usize::try_from(orderkey) else {
             continue;
         };
+        if candidate_bloom.is_some_and(|bloom| !bloom.might_contain(orderkey)) {
+            continue;
+        }
         let Some(marker) = candidate_priorities.get(orderkey) else {
             continue;
         };
@@ -17235,6 +17332,7 @@ fn q04_count_late_candidate_priorities_atomic_typed(
     commitdates: &ArrayRef,
     receiptdates: &ArrayRef,
     candidate_priorities: &[AtomicU8],
+    candidate_bloom: Option<&Q04CandidateBloom>,
     counts: &mut [u64],
 ) -> Result<bool> {
     let (Some(orderkeys), Some(commitdates), Some(receiptdates)) = (
@@ -17263,6 +17361,7 @@ fn q04_count_late_candidate_priorities_atomic_typed(
                     selected.as_slice(),
                     orderkey_values,
                     candidate_priorities,
+                    candidate_bloom,
                     counts,
                 );
                 return Ok(true);
@@ -17279,6 +17378,9 @@ fn q04_count_late_candidate_priorities_atomic_typed(
             let Ok(orderkey) = usize::try_from(orderkey) else {
                 continue;
             };
+            if candidate_bloom.is_some_and(|bloom| !bloom.might_contain(orderkey)) {
+                continue;
+            }
             let Some(marker) = candidate_priorities.get(orderkey) else {
                 continue;
             };
@@ -17308,6 +17410,9 @@ fn q04_count_late_candidate_priorities_atomic_typed(
         let Ok(orderkey) = usize::try_from(orderkey) else {
             continue;
         };
+        if candidate_bloom.is_some_and(|bloom| !bloom.might_contain(orderkey)) {
+            continue;
+        }
         let Some(marker) = candidate_priorities.get(orderkey) else {
             continue;
         };
@@ -17329,6 +17434,7 @@ fn q04_count_late_candidate_priorities_atomic_raw(
     commitdates: &[i32],
     receiptdates: &[i32],
     candidate_priorities: &[AtomicU8],
+    candidate_bloom: Option<&Q04CandidateBloom>,
     counts: &mut [u64],
 ) -> usize {
     let mut hits = 0usize;
@@ -17343,6 +17449,9 @@ fn q04_count_late_candidate_priorities_atomic_raw(
         let Ok(orderkey) = usize::try_from(orderkey) else {
             continue;
         };
+        if candidate_bloom.is_some_and(|bloom| !bloom.might_contain(orderkey)) {
+            continue;
+        }
         let Some(marker) = candidate_priorities.get(orderkey) else {
             continue;
         };
@@ -17384,6 +17493,7 @@ fn q04_count_late_candidate_priorities_atomic_selected_rows(
     selected_rows: &[u32],
     orderkey_values: &[i64],
     candidate_priorities: &[AtomicU8],
+    candidate_bloom: Option<&Q04CandidateBloom>,
     counts: &mut [u64],
 ) {
     for &row in selected_rows {
@@ -17394,6 +17504,9 @@ fn q04_count_late_candidate_priorities_atomic_selected_rows(
         let Ok(orderkey) = usize::try_from(orderkey) else {
             continue;
         };
+        if candidate_bloom.is_some_and(|bloom| !bloom.might_contain(orderkey)) {
+            continue;
+        }
         let Some(marker) = candidate_priorities.get(orderkey) else {
             continue;
         };
