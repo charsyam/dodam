@@ -20005,23 +20005,82 @@ fn q05_order_customer_nations_view(
     end_days: i32,
 ) -> Result<FastHashMap<i64, i64>> {
     if view.num_columns() == 3
-        && let Some(orders) = q05_order_customer_nations_batch_typed(
-            view.column(0)?,
-            view.column(1)?,
-            view.column(2)?,
+        && let (Some(orderkeys), Some(custkeys), Some(orderdates)) = (
+            view.i64_vector(0),
+            view.i64_vector(1),
+            view.date32_vector(2),
+        )
+    {
+        return Ok(q05_order_customer_nations_vectors(
+            orderkeys,
+            custkeys,
+            orderdates,
             customer_nations,
             start_days,
             end_days,
-        )
-    {
-        return Ok(orders);
+        ));
     }
-    q05_order_customer_nations_batch(
-        view.record_batch().clone(),
-        customer_nations,
-        start_days,
-        end_days,
-    )
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "Q05 order customer nation raw vector columns have unsupported types".to_string(),
+        ));
+    };
+    q05_order_customer_nations_batch(batch.clone(), customer_nations, start_days, end_days)
+}
+
+fn q05_order_customer_nations_vectors(
+    orderkeys: I64VectorView<'_>,
+    custkeys: I64VectorView<'_>,
+    orderdates: Date32VectorView<'_>,
+    customer_nations: &AdaptiveI64Map<i64>,
+    start_days: i32,
+    end_days: i32,
+) -> FastHashMap<i64, i64> {
+    let mut orders = fast_hash_map::<i64, i64>();
+    if let (Some(orderkey_values), Some(custkey_values), Some(orderdate_values)) = (
+        orderkeys.values_if_null_free(),
+        custkeys.values_if_null_free(),
+        orderdates.values_if_null_free(),
+    ) {
+        if let Some((nation_values, nation_present)) = customer_nations.dense_slices() {
+            for row in 0..orderkey_values.len() {
+                let orderdate = orderdate_values[row];
+                if orderdate < start_days || orderdate >= end_days {
+                    continue;
+                }
+                let Ok(custkey) = usize::try_from(custkey_values[row]) else {
+                    continue;
+                };
+                if nation_present.get(custkey).copied().unwrap_or(false) {
+                    orders.insert(orderkey_values[row], nation_values[custkey]);
+                }
+            }
+            return orders;
+        }
+        for row in 0..orderkey_values.len() {
+            let orderdate = orderdate_values[row];
+            if orderdate < start_days || orderdate >= end_days {
+                continue;
+            }
+            if let Some(nationkey) = customer_nations.get(custkey_values[row]) {
+                orders.insert(orderkey_values[row], nationkey);
+            }
+        }
+        return orders;
+    }
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || custkeys.is_null(row) || orderdates.is_null(row) {
+            continue;
+        }
+        let orderdate = orderdates.value(row);
+        if orderdate < start_days || orderdate >= end_days {
+            continue;
+        }
+        if let Some(nationkey) = customer_nations.get(custkeys.value(row)) {
+            orders.insert(orderkeys.value(row), nationkey);
+        }
+    }
+    orders
 }
 
 fn q05_order_customer_nations_batch_typed(
