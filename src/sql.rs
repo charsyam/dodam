@@ -18367,19 +18367,29 @@ fn q04_count_late_candidate_priorities_atomic_view_hits(
         ));
     }
     if view.num_columns() == 3
-        && q04_count_late_candidate_priorities_atomic_typed(
-            view.column(0)?,
-            view.column(1)?,
-            view.column(2)?,
+        && let (Some(orderkeys), Some(commitdates), Some(receiptdates)) = (
+            view.i64_vector(0),
+            view.date32_vector(1),
+            view.date32_vector(2),
+        )
+    {
+        q04_count_late_candidate_priorities_atomic_vector(
+            orderkeys,
+            commitdates,
+            receiptdates,
             candidate_priorities,
             candidate_bloom,
             counts,
-        )?
-    {
+        );
         return Ok(0);
     }
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "Q04 atomic lineitem raw vector columns have unsupported types".to_string(),
+        ));
+    };
     let _ = q04_count_late_candidate_priorities_atomic_batch(
-        view.record_batch().clone(),
+        batch.clone(),
         candidate_priorities,
         candidate_bloom,
         counts,
@@ -18548,18 +18558,26 @@ fn q04_collect_late_candidate_orderkeys_view(
     matched_orderkeys: &mut Vec<i64>,
 ) -> Result<Option<()>> {
     if view.num_columns() == 3
-        && q04_collect_late_candidate_orderkeys_typed(
-            view.column(0)?,
-            view.column(1)?,
-            view.column(2)?,
+        && let (Some(orderkeys), Some(commitdates), Some(receiptdates)) = (
+            view.i64_vector(0),
+            view.date32_vector(1),
+            view.date32_vector(2),
+        )
+    {
+        q04_collect_late_candidate_orderkeys_vector(
+            orderkeys,
+            commitdates,
+            receiptdates,
             candidate_priorities,
             matched_orderkeys,
-        )?
-    {
+        );
         return Ok(Some(()));
     }
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
     q04_collect_late_candidate_orderkeys_batch(
-        view.record_batch().clone(),
+        batch.clone(),
         candidate_priorities,
         matched_orderkeys,
     )
@@ -18708,6 +18726,73 @@ fn q04_count_late_candidate_priorities_atomic_typed(
         count_dense_atomic_marker(orderkey, candidate_priorities, counts);
     }
     Ok(true)
+}
+
+fn q04_count_late_candidate_priorities_atomic_vector(
+    orderkeys: I64VectorView<'_>,
+    commitdates: Date32VectorView<'_>,
+    receiptdates: Date32VectorView<'_>,
+    candidate_priorities: &[AtomicU8],
+    candidate_bloom: Option<&Q04CandidateBloom>,
+    counts: &mut [u64],
+) {
+    if let (Some(orderkey_values), Some(commitdate_values), Some(receiptdate_values)) = (
+        orderkeys.values_if_null_free(),
+        commitdates.values_if_null_free(),
+        receiptdates.values_if_null_free(),
+    ) {
+        if q04_lineitem_selection_vector_enabled() {
+            let mut selected = SelectionVector::with_capacity(orderkey_values.len().min(4096));
+            for row in 0..orderkey_values.len() {
+                if commitdate_values[row] < receiptdate_values[row] {
+                    selected.push(row);
+                }
+            }
+            if q04_should_use_lineitem_selection_vector(selected.len(), orderkey_values.len()) {
+                q04_count_late_candidate_priorities_atomic_selected_rows(
+                    selected.as_slice(),
+                    orderkey_values,
+                    candidate_priorities,
+                    candidate_bloom,
+                    counts,
+                );
+                return;
+            }
+        }
+        for row in 0..orderkey_values.len() {
+            if commitdate_values[row] >= receiptdate_values[row] {
+                continue;
+            }
+            let Some(orderkey) =
+                dense_marker_index_i64(orderkey_values[row], candidate_priorities.len())
+            else {
+                continue;
+            };
+            if candidate_bloom.is_some_and(|bloom| !bloom.might_contain(orderkey)) {
+                continue;
+            }
+            count_dense_atomic_marker(orderkey, candidate_priorities, counts);
+        }
+        return;
+    }
+
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || commitdates.is_null(row) || receiptdates.is_null(row) {
+            continue;
+        }
+        if commitdates.value(row) >= receiptdates.value(row) {
+            continue;
+        }
+        let Some(orderkey) =
+            dense_marker_index_i64(orderkeys.value(row), candidate_priorities.len())
+        else {
+            continue;
+        };
+        if candidate_bloom.is_some_and(|bloom| !bloom.might_contain(orderkey)) {
+            continue;
+        }
+        count_dense_atomic_marker(orderkey, candidate_priorities, counts);
+    }
 }
 
 fn q04_count_late_candidate_priorities_atomic_raw(
@@ -18863,6 +18948,56 @@ fn q04_collect_late_candidate_orderkeys_typed(
         }
     }
     Ok(true)
+}
+
+fn q04_collect_late_candidate_orderkeys_vector(
+    orderkeys: I64VectorView<'_>,
+    commitdates: Date32VectorView<'_>,
+    receiptdates: Date32VectorView<'_>,
+    candidate_priorities: &[u8],
+    matched_orderkeys: &mut Vec<i64>,
+) {
+    if let (Some(orderkey_values), Some(commitdate_values), Some(receiptdate_values)) = (
+        orderkeys.values_if_null_free(),
+        commitdates.values_if_null_free(),
+        receiptdates.values_if_null_free(),
+    ) {
+        for row in 0..orderkey_values.len() {
+            if commitdate_values[row] >= receiptdate_values[row] {
+                continue;
+            }
+            let orderkey = orderkey_values[row];
+            if orderkey < 0 {
+                continue;
+            }
+            let Ok(index) = usize::try_from(orderkey) else {
+                continue;
+            };
+            if candidate_priorities.get(index).copied().unwrap_or_default() != 0 {
+                matched_orderkeys.push(orderkey);
+            }
+        }
+        return;
+    }
+
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || commitdates.is_null(row) || receiptdates.is_null(row) {
+            continue;
+        }
+        if commitdates.value(row) >= receiptdates.value(row) {
+            continue;
+        }
+        let orderkey = orderkeys.value(row);
+        if orderkey < 0 {
+            continue;
+        }
+        let Ok(index) = usize::try_from(orderkey) else {
+            continue;
+        };
+        if candidate_priorities.get(index).copied().unwrap_or_default() != 0 {
+            matched_orderkeys.push(orderkey);
+        }
+    }
 }
 
 fn q04_count_late_candidate_priorities_typed(
