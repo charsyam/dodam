@@ -9918,6 +9918,21 @@ fn q12_pending_map_initial_capacity() -> usize {
         .unwrap_or(4096)
 }
 
+#[inline(always)]
+fn q12_pending_increment(pending: &mut Q12PendingMap, orderkey: i64, mode_index: usize) {
+    pending.entry(orderkey).or_default().counts[mode_index] += 1;
+}
+
+#[inline(always)]
+fn q12_pending_add_order(pending: &mut Q12PendingMap, orderkey: i64, order: Q12PendingOrder) {
+    if let Some(target) = pending.get_mut(&orderkey) {
+        target.counts[0] += order.counts[0];
+        target.counts[1] += order.counts[1];
+        return;
+    }
+    pending.insert(orderkey, order);
+}
+
 #[derive(Default)]
 struct Q12OrdersPartial {
     groups: [Q12State; 2],
@@ -10292,6 +10307,20 @@ fn q12_receiptdate_pruning_predicates(start_days: i32, end_days: i32) -> Vec<Exp
     date_range_pruning_predicates("l_receiptdate", start_days, end_days)
 }
 
+#[inline(always)]
+fn q12_lineitem_dates_match(
+    commitdate: i32,
+    receiptdate: i32,
+    shipdate: i32,
+    start_days: i32,
+    end_days: i32,
+) -> bool {
+    commitdate < receiptdate
+        && shipdate < commitdate
+        && receiptdate >= start_days
+        && receiptdate < end_days
+}
+
 fn date_range_pruning_predicates(column: &str, start_days: i32, end_days: i32) -> Vec<Expr> {
     vec![
         Expr::Comparison(ComparisonExpr {
@@ -10350,14 +10379,10 @@ fn q12_filtered_lineitem_counts_batch_into(
         ) else {
             continue;
         };
-        if commitdate >= receiptdate
-            || shipdate >= commitdate
-            || receiptdate < start_days
-            || receiptdate >= end_days
-        {
+        if !q12_lineitem_dates_match(commitdate, receiptdate, shipdate, start_days, end_days) {
             continue;
         }
-        pending.entry(orderkey).or_default().counts[mode_index] += 1;
+        q12_pending_increment(pending, orderkey, mode_index);
     }
     Ok(())
 }
@@ -10538,11 +10563,13 @@ fn q12_filtered_lineitem_counts_batch_dictionary_typed_into(
             for row in 0..orderkeys.len() {
                 let commitdate = commitdate_values[row];
                 let receiptdate = receiptdate_values[row];
-                if commitdate < receiptdate
-                    && shipdate_values[row] < commitdate
-                    && receiptdate >= start_days
-                    && receiptdate < end_days
-                {
+                if q12_lineitem_dates_match(
+                    commitdate,
+                    receiptdate,
+                    shipdate_values[row],
+                    start_days,
+                    end_days,
+                ) {
                     selected.push(row);
                 }
             }
@@ -10555,7 +10582,7 @@ fn q12_filtered_lineitem_counts_batch_dictionary_typed_into(
                     let Some(Some(mode_index)) = mode_flags.get(mode_key) else {
                         continue;
                     };
-                    pending.entry(orderkey_values[row]).or_default().counts[*mode_index] += 1;
+                    q12_pending_increment(pending, orderkey_values[row], *mode_index);
                 }
                 return true;
             }
@@ -10563,11 +10590,13 @@ fn q12_filtered_lineitem_counts_batch_dictionary_typed_into(
         for row in 0..orderkeys.len() {
             let commitdate = commitdate_values[row];
             let receiptdate = receiptdate_values[row];
-            if commitdate >= receiptdate
-                || shipdate_values[row] >= commitdate
-                || receiptdate < start_days
-                || receiptdate >= end_days
-            {
+            if !q12_lineitem_dates_match(
+                commitdate,
+                receiptdate,
+                shipdate_values[row],
+                start_days,
+                end_days,
+            ) {
                 continue;
             }
             let Ok(mode_key) = usize::try_from(mode_keys[row]) else {
@@ -10576,7 +10605,7 @@ fn q12_filtered_lineitem_counts_batch_dictionary_typed_into(
             let Some(Some(mode_index)) = mode_flags.get(mode_key) else {
                 continue;
             };
-            pending.entry(orderkey_values[row]).or_default().counts[*mode_index] += 1;
+            q12_pending_increment(pending, orderkey_values[row], *mode_index);
         }
         return true;
     }
@@ -10591,11 +10620,13 @@ fn q12_filtered_lineitem_counts_batch_dictionary_typed_into(
         }
         let commitdate = commitdates.value(row);
         let receiptdate = receiptdates.value(row);
-        if commitdate >= receiptdate
-            || shipdates.value(row) >= commitdate
-            || receiptdate < start_days
-            || receiptdate >= end_days
-        {
+        if !q12_lineitem_dates_match(
+            commitdate,
+            receiptdate,
+            shipdates.value(row),
+            start_days,
+            end_days,
+        ) {
             continue;
         }
         let Ok(mode_key) = usize::try_from(mode_keys[row]) else {
@@ -10604,7 +10635,7 @@ fn q12_filtered_lineitem_counts_batch_dictionary_typed_into(
         let Some(Some(mode_index)) = mode_flags.get(mode_key) else {
             continue;
         };
-        pending.entry(orderkeys.value(row)).or_default().counts[*mode_index] += 1;
+        q12_pending_increment(pending, orderkeys.value(row), *mode_index);
     }
     true
 }
@@ -10677,11 +10708,13 @@ fn q12_filtered_lineitem_counts_string_view_into(
             for row in 0..view.orderkeys.len() {
                 let commitdate = commitdate_values[row];
                 let receiptdate = receiptdate_values[row];
-                if commitdate < receiptdate
-                    && shipdate_values[row] < commitdate
-                    && receiptdate >= start_days
-                    && receiptdate < end_days
-                {
+                if q12_lineitem_dates_match(
+                    commitdate,
+                    receiptdate,
+                    shipdate_values[row],
+                    start_days,
+                    end_days,
+                ) {
                     selected.push(row);
                 }
             }
@@ -10696,7 +10729,7 @@ fn q12_filtered_lineitem_counts_string_view_into(
                     } else {
                         continue;
                     };
-                    pending.entry(orderkey_values[row]).or_default().counts[mode_index] += 1;
+                    q12_pending_increment(pending, orderkey_values[row], mode_index);
                 }
                 return true;
             }
@@ -10704,11 +10737,13 @@ fn q12_filtered_lineitem_counts_string_view_into(
         for row in 0..view.orderkeys.len() {
             let commitdate = commitdate_values[row];
             let receiptdate = receiptdate_values[row];
-            if commitdate >= receiptdate
-                || shipdate_values[row] >= commitdate
-                || receiptdate < start_days
-                || receiptdate >= end_days
-            {
+            if !q12_lineitem_dates_match(
+                commitdate,
+                receiptdate,
+                shipdate_values[row],
+                start_days,
+                end_days,
+            ) {
                 continue;
             }
             let mode = bytes_string_parts(mode_offsets, mode_data, row);
@@ -10719,7 +10754,7 @@ fn q12_filtered_lineitem_counts_string_view_into(
             } else {
                 continue;
             };
-            pending.entry(orderkey_values[row]).or_default().counts[mode_index] += 1;
+            q12_pending_increment(pending, orderkey_values[row], mode_index);
         }
         return true;
     }
@@ -10734,11 +10769,13 @@ fn q12_filtered_lineitem_counts_string_view_into(
         }
         let commitdate = view.commitdates.value(row);
         let receiptdate = view.receiptdates.value(row);
-        if commitdate >= receiptdate
-            || view.shipdates.value(row) >= commitdate
-            || receiptdate < start_days
-            || receiptdate >= end_days
-        {
+        if !q12_lineitem_dates_match(
+            commitdate,
+            receiptdate,
+            view.shipdates.value(row),
+            start_days,
+            end_days,
+        ) {
             continue;
         }
         let mode = bytes_string_parts(mode_offsets, mode_data, row);
@@ -10749,7 +10786,7 @@ fn q12_filtered_lineitem_counts_string_view_into(
         } else {
             continue;
         };
-        pending.entry(view.orderkeys.value(row)).or_default().counts[mode_index] += 1;
+        q12_pending_increment(pending, view.orderkeys.value(row), mode_index);
     }
     true
 }
@@ -10839,11 +10876,13 @@ fn q12_late_build_selection_batch(
     for row in 0..batch.num_rows() {
         let commitdate = commitdate_values[row];
         let receiptdate = receiptdate_values[row];
-        if commitdate >= receiptdate
-            || shipdate_values[row] >= commitdate
-            || receiptdate < state.start_days
-            || receiptdate >= state.end_days
-        {
+        if !q12_lineitem_dates_match(
+            commitdate,
+            receiptdate,
+            shipdate_values[row],
+            state.start_days,
+            state.end_days,
+        ) {
             selection.push(false);
             continue;
         }
@@ -10896,11 +10935,13 @@ fn q12_late_build_selection_view(
         for row in 0..view.num_rows() {
             let commitdate = commitdate_values[row];
             let receiptdate = receiptdate_values[row];
-            if commitdate >= receiptdate
-                || shipdate_values[row] >= commitdate
-                || receiptdate < state.start_days
-                || receiptdate >= state.end_days
-            {
+            if !q12_lineitem_dates_match(
+                commitdate,
+                receiptdate,
+                shipdate_values[row],
+                state.start_days,
+                state.end_days,
+            ) {
                 selection.push(false);
                 continue;
             }
@@ -10941,7 +10982,7 @@ fn q12_late_consume_orderkey_payload_batch(
             .ok_or_else(|| {
                 DodamError::UnsupportedSql("Q12 row selection payload mismatch".to_string())
             })? as usize;
-        state.pending.entry(orderkey).or_default().counts[mode_index] += 1;
+        q12_pending_increment(&mut state.pending, orderkey, mode_index);
         state.selected_offset += 1;
     }
     Ok(Some(()))
@@ -10965,7 +11006,7 @@ fn q12_late_consume_orderkey_payload_view(
                 .ok_or_else(|| {
                     DodamError::UnsupportedSql("Q12 row selection payload mismatch".to_string())
                 })? as usize;
-            state.pending.entry(orderkey).or_default().counts[mode_index] += 1;
+            q12_pending_increment(&mut state.pending, orderkey, mode_index);
             state.selected_offset += 1;
         }
         return Ok(Some(()));
@@ -10990,10 +11031,7 @@ fn q12_log_late_materialized_profile(metrics: LateMaterializedMetrics, row_group
 
 fn q12_merge_pending_orders(pending: &mut Q12PendingMap, batch_pending: Q12PendingMap) {
     for (orderkey, order) in batch_pending {
-        let target = pending.entry(orderkey).or_default();
-        for index in 0..target.counts.len() {
-            target.counts[index] += order.counts[index];
-        }
+        q12_pending_add_order(pending, orderkey, order);
     }
 }
 
