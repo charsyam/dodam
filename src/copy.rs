@@ -298,6 +298,7 @@ fn clean_copy_option_value(value: &str) -> &str {
 fn parse_parquet_compression(value: &str) -> Result<Compression> {
     match clean_copy_option_value(value).to_ascii_uppercase().as_str() {
         "SNAPPY" => Ok(Compression::SNAPPY),
+        "ZSTD" => Ok(Compression::ZSTD(Default::default())),
         "UNCOMPRESSED" | "NONE" => Ok(Compression::UNCOMPRESSED),
         other => Err(DodamError::UnsupportedSql(format!(
             "COPY PARQUET COMPRESSION {other} is not supported"

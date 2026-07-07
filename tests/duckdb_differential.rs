@@ -1296,6 +1296,141 @@ async fn duckdb_differential_seeded_randomized_smoke() {
 }
 
 #[tokio::test]
+async fn duckdb_differential_seeded_randomized_join_smoke() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let facts_path = tempdir.path().join("facts.parquet");
+    let dim_path = tempdir.path().join("dim.parquet");
+    let multi_left_path = tempdir.path().join("multi-left.parquet");
+    let multi_right_path = tempdir.path().join("multi-right.parquet");
+    write_facts_parquet(&facts_path);
+    write_dim_parquet(&dim_path);
+    write_multi_left_parquet(&multi_left_path);
+    write_multi_right_parquet(&multi_right_path);
+
+    const SEED: u64 = 0xD0DA_2026_0002;
+    let mut rng = TestRng::new(SEED);
+    let cases = (0..72)
+        .map(|case_id| {
+            if rng.chance(2, 3) {
+                random_single_key_join_query(&mut rng, &facts_path, &dim_path, case_id)
+            } else {
+                random_multi_key_join_query(&mut rng, &multi_left_path, &multi_right_path, case_id)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for case in cases {
+        assert_same_as_duckdb_unordered_case(
+            &format!("seed={SEED:#x} case={}", case.case_id),
+            &case.dodam_sql,
+            &case.duckdb_sql,
+            tempdir.path(),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn duckdb_differential_error_semantics_matrix() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let facts_path = tempdir.path().join("facts.parquet");
+    let dim_path = tempdir.path().join("dim.parquet");
+    write_facts_parquet(&facts_path);
+    write_dim_parquet(&dim_path);
+
+    let cases = [
+        (
+            format!("SELECT missing FROM '{}'", facts_path.display()),
+            format!(
+                "SELECT missing FROM read_parquet('{}')",
+                facts_path.display()
+            ),
+        ),
+        (
+            format!(
+                "SELECT id FROM '{}' WHERE id = (SELECT id FROM '{}' WHERE key = 2)",
+                facts_path.display(),
+                facts_path.display()
+            ),
+            format!(
+                "SELECT id FROM read_parquet('{}') WHERE id = (SELECT id FROM read_parquet('{}') WHERE key = 2)",
+                facts_path.display(),
+                facts_path.display()
+            ),
+        ),
+        (
+            format!(
+                "SELECT key FROM '{}' f JOIN '{}' d ON f.key = d.key",
+                facts_path.display(),
+                dim_path.display()
+            ),
+            format!(
+                "SELECT key FROM read_parquet('{}') f JOIN read_parquet('{}') d ON f.key = d.key",
+                facts_path.display(),
+                dim_path.display()
+            ),
+        ),
+    ];
+    for (dodam_sql, duckdb_sql) in cases {
+        assert_both_error(&dodam_sql, &duckdb_sql, tempdir.path()).await;
+    }
+}
+
+#[tokio::test]
+async fn duckdb_differential_extended_type_matrix() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let types_path = tempdir.path().join("types.parquet");
+    write_types_parquet(&types_path);
+
+    let cases = [
+        (
+            "SELECT id, amount FROM types_table WHERE amount = '123.4500'",
+            "SELECT id, amount FROM types_table WHERE amount = '123.4500'",
+        ),
+        (
+            "SELECT id, amount FROM types_table WHERE amount <> '0.0000' OR amount IS NULL",
+            "SELECT id, amount FROM types_table WHERE amount <> '0.0000' OR amount IS NULL",
+        ),
+        (
+            "SELECT id FROM types_table WHERE created_at < '2024-01-02 12:00:00' OR created_at IS NULL",
+            "SELECT id FROM types_table WHERE created_at < '2024-01-02 12:00:00' OR created_at IS NULL",
+        ),
+        (
+            "SELECT event_date, count(*) FROM types_table GROUP BY event_date",
+            "SELECT event_date, count(*) FROM types_table GROUP BY event_date",
+        ),
+        (
+            "SELECT id, CASE WHEN flag = true THEN 'yes' WHEN flag = false THEN 'no' ELSE 'unknown' END FROM types_table",
+            "SELECT id, CASE WHEN flag = true THEN 'yes' WHEN flag = false THEN 'no' ELSE 'unknown' END FROM types_table",
+        ),
+    ];
+    for (case_id, (dodam_template, duckdb_template)) in cases.into_iter().enumerate() {
+        let dodam_sql =
+            dodam_template.replace("types_table", &format!("'{}'", types_path.display()));
+        let duckdb_sql = duckdb_template.replace(
+            "types_table",
+            &format!("read_parquet('{}')", types_path.display()),
+        );
+        assert_same_as_duckdb_unordered_case(
+            &format!("type_matrix case={case_id}"),
+            &dodam_sql,
+            &duckdb_sql,
+            tempdir.path(),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
 async fn duckdb_differential_copy_parquet_readback() {
     let Some(_duckdb) = DuckDbGuard::new() else {
         return;
@@ -1317,6 +1452,95 @@ async fn duckdb_differential_copy_parquet_readback() {
         &format!(
             "SELECT * FROM read_parquet('{}') ORDER BY key",
             output_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn duckdb_differential_copy_parquet_interop_options() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let facts_path = tempdir.path().join("facts.parquet");
+    write_facts_parquet(&facts_path);
+
+    let options = [
+        (
+            "snappy_dict",
+            "COMPRESSION snappy, ROW_GROUP_SIZE 2, DICTIONARY true",
+        ),
+        (
+            "uncompressed_plain",
+            "COMPRESSION uncompressed, ROW_GROUP_SIZE 4, DICTIONARY false",
+        ),
+        (
+            "zstd_dict",
+            "COMPRESSION zstd, ROW_GROUP_SIZE 2, DICTIONARY true, WRITE_BATCH_SIZE 2, DATA_PAGE_ROW_COUNT_LIMIT 2",
+        ),
+    ];
+    for (name, options) in options {
+        let dodam_output = tempdir.path().join(format!("dodam-{name}.parquet"));
+        let copy_sql = format!(
+            "COPY (SELECT id, key, value, payload FROM '{}' ORDER BY id) TO '{}' (FORMAT parquet, {options})",
+            facts_path.display(),
+            dodam_output.display()
+        );
+        run_dodam_copy(&copy_sql).await;
+        assert_same_as_duckdb(
+            &format!(
+                "SELECT id, key, value, payload FROM '{}' ORDER BY id",
+                dodam_output.display()
+            ),
+            &format!(
+                "SELECT id, key, value, payload FROM read_parquet('{}') ORDER BY id",
+                dodam_output.display()
+            ),
+            tempdir.path(),
+        )
+        .await;
+    }
+
+    let duckdb_output = tempdir.path().join("duckdb-zstd.parquet");
+    run_duckdb_command(&format!(
+        "COPY (SELECT id, key, value, payload FROM read_parquet('{}') ORDER BY id) TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD)",
+        facts_path.display(),
+        duckdb_output.display()
+    ));
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, key, value, payload FROM '{}' ORDER BY id",
+            duckdb_output.display()
+        ),
+        &format!(
+            "SELECT id, key, value, payload FROM read_parquet('{}') ORDER BY id",
+            duckdb_output.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn duckdb_differential_unordered_result_policy() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let facts_path = tempdir.path().join("facts.parquet");
+    write_facts_parquet(&facts_path);
+
+    assert_same_as_duckdb_unordered_case(
+        "unordered aggregate result uses sorted multiset comparison",
+        &format!(
+            "SELECT key, count(*), sum(value) FROM '{}' GROUP BY key",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT key, count(*), sum(value) FROM read_parquet('{}') GROUP BY key",
+            facts_path.display()
         ),
         tempdir.path(),
     )
@@ -1405,6 +1629,22 @@ async fn assert_same_as_duckdb_case(
     );
 }
 
+async fn assert_same_as_duckdb_unordered_case(
+    case_name: &str,
+    dodam_sql: &str,
+    duckdb_sql: &str,
+    tempdir: &Path,
+) {
+    let mut dodam_rows = run_dodam(dodam_sql).await;
+    let mut duckdb_rows = run_duckdb(duckdb_sql, tempdir);
+    dodam_rows.sort();
+    duckdb_rows.sort();
+    assert_eq!(
+        dodam_rows, duckdb_rows,
+        "\nCase:\n{case_name}\n\nDodam SQL:\n{dodam_sql}\n\nDuckDB SQL:\n{duckdb_sql}"
+    );
+}
+
 async fn assert_both_error(dodam_sql: &str, duckdb_sql: &str, tempdir: &Path) {
     let dodam_error = run_dodam_result(dodam_sql)
         .await
@@ -1457,6 +1697,18 @@ fn run_duckdb_result(sql: &str, tempdir: &Path) -> std::result::Result<Vec<Strin
         .lines()
         .map(|line| line.split('|').collect::<Vec<_>>().join("|"))
         .collect())
+}
+
+fn run_duckdb_command(sql: &str) {
+    let output = Command::new("duckdb")
+        .args(["-c", sql])
+        .output()
+        .expect("run duckdb command");
+    assert!(
+        output.status.success(),
+        "duckdb command failed:\n{sql}\n\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 async fn run_dodam_copy(sql: &str) {
@@ -1608,6 +1860,85 @@ fn random_facts_predicate(
             .replace("facts_sub", &duckdb_table)
             .replace("outer_key", &format!("{outer_alias}.key")),
     )
+}
+
+fn random_single_key_join_query(
+    rng: &mut TestRng,
+    facts_path: &Path,
+    dim_path: &Path,
+    case_id: usize,
+) -> GeneratedSql {
+    let dodam_left = format!("'{}'", facts_path.display());
+    let dodam_right = format!("'{}'", dim_path.display());
+    let duckdb_left = format!("read_parquet('{}')", facts_path.display());
+    let duckdb_right = format!("read_parquet('{}')", dim_path.display());
+    let join = rng.choose(&["JOIN", "INNER JOIN", "LEFT JOIN", "FULL OUTER JOIN"]);
+    let predicate = rng.choose(&[
+        "true",
+        "f.payload IS NOT NULL",
+        "d.name IS NULL OR d.name <> 'four'",
+        "f.value IS NULL OR f.value >= 0",
+        "f.key IS NULL OR d.key IS NOT NULL",
+    ]);
+    let aggregate = rng.chance(1, 3);
+    let (dodam_sql, duckdb_sql) = if aggregate {
+        (
+            format!(
+                "SELECT d.name, count(*), count(f.value), sum(f.value) FROM {dodam_left} f {join} {dodam_right} d ON f.key = d.key WHERE {predicate} GROUP BY d.name"
+            ),
+            format!(
+                "SELECT d.name, count(*), count(f.value), sum(f.value) FROM {duckdb_left} f {join} {duckdb_right} d ON f.key = d.key WHERE {predicate} GROUP BY d.name"
+            ),
+        )
+    } else {
+        let projection = rng.choose(&[
+            "f.id, f.key, d.name",
+            "f.id, f.payload, d.name",
+            "f.id, f.value, d.name",
+        ]);
+        (
+            format!(
+                "SELECT {projection} FROM {dodam_left} f {join} {dodam_right} d ON f.key = d.key WHERE {predicate}"
+            ),
+            format!(
+                "SELECT {projection} FROM {duckdb_left} f {join} {duckdb_right} d ON f.key = d.key WHERE {predicate}"
+            ),
+        )
+    };
+    GeneratedSql {
+        case_id,
+        dodam_sql,
+        duckdb_sql,
+    }
+}
+
+fn random_multi_key_join_query(
+    rng: &mut TestRng,
+    left_path: &Path,
+    right_path: &Path,
+    case_id: usize,
+) -> GeneratedSql {
+    let dodam_left = format!("'{}'", left_path.display());
+    let dodam_right = format!("'{}'", right_path.display());
+    let duckdb_left = format!("read_parquet('{}')", left_path.display());
+    let duckdb_right = format!("read_parquet('{}')", right_path.display());
+    let join = rng.choose(&["JOIN", "INNER JOIN", "LEFT JOIN"]);
+    let predicate = rng.choose(&[
+        "true",
+        "l.k2 IS NOT NULL",
+        "r.label IS NULL OR r.label <> 'null-k2'",
+        "l.k1 IS NULL OR r.k1 IS NOT NULL",
+    ]);
+    let projection = rng.choose(&["l.id, l.k1, l.k2, r.label", "l.id, r.label"]);
+    GeneratedSql {
+        case_id,
+        dodam_sql: format!(
+            "SELECT {projection} FROM {dodam_left} l {join} {dodam_right} r ON l.k1 = r.k1 AND l.k2 = r.k2 WHERE {predicate}"
+        ),
+        duckdb_sql: format!(
+            "SELECT {projection} FROM {duckdb_left} l {join} {duckdb_right} r ON l.k1 = r.k1 AND l.k2 = r.k2 WHERE {predicate}"
+        ),
+    }
 }
 
 fn random_types_query(rng: &mut TestRng, types_path: &Path, case_id: usize) -> GeneratedSql {
