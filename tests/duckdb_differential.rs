@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use arrow::array::{
     ArrayRef, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float64Array, Int32Array,
-    Int64Array, StringArray, TimestampMillisecondArray,
+    Int64Array, ListArray, StringArray, StructArray, TimestampMillisecondArray,
 };
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::datatypes::{DataType, Field, Int32Type, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use arrow_cast::display::array_value_to_string;
 use dodam::copy::{CopyFileQuerySink, parse_copy_to_select};
@@ -1198,6 +1198,70 @@ async fn duckdb_differential_scalar_subquery_errors() {
 }
 
 #[tokio::test]
+async fn duckdb_differential_scalar_subquery_edge_matrix() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let facts_path = tempdir.path().join("facts.parquet");
+    write_facts_parquet(&facts_path);
+
+    let cases = [
+        (
+            format!(
+                "SELECT id FROM '{}' WHERE id = (SELECT id FROM '{}' WHERE payload = 'missing') ORDER BY id",
+                facts_path.display(),
+                facts_path.display()
+            ),
+            format!(
+                "SELECT id FROM read_parquet('{}') WHERE id = (SELECT id FROM read_parquet('{}') WHERE payload = 'missing') ORDER BY id",
+                facts_path.display(),
+                facts_path.display()
+            ),
+        ),
+        (
+            format!(
+                "SELECT id FROM '{}' WHERE id <> (SELECT key FROM '{}' WHERE key IS NULL) OR id = 1 ORDER BY id",
+                facts_path.display(),
+                facts_path.display()
+            ),
+            format!(
+                "SELECT id FROM read_parquet('{}') WHERE id <> (SELECT key FROM read_parquet('{}') WHERE key IS NULL) OR id = 1 ORDER BY id",
+                facts_path.display(),
+                facts_path.display()
+            ),
+        ),
+        (
+            format!(
+                "SELECT id FROM '{}' WHERE id = (SELECT key FROM '{}' WHERE key = 3 ORDER BY id LIMIT 1) ORDER BY id",
+                facts_path.display(),
+                facts_path.display()
+            ),
+            format!(
+                "SELECT id FROM read_parquet('{}') WHERE id = (SELECT key FROM read_parquet('{}') WHERE key = 3 ORDER BY id LIMIT 1) ORDER BY id",
+                facts_path.display(),
+                facts_path.display()
+            ),
+        ),
+        (
+            format!(
+                "SELECT id FROM '{}' WHERE key NOT IN (SELECT key FROM '{}' WHERE key IS NULL OR key = 3) OR id = 1 ORDER BY id",
+                facts_path.display(),
+                facts_path.display()
+            ),
+            format!(
+                "SELECT id FROM read_parquet('{}') WHERE key NOT IN (SELECT key FROM read_parquet('{}') WHERE key IS NULL OR key = 3) OR id = 1 ORDER BY id",
+                facts_path.display(),
+                facts_path.display()
+            ),
+        ),
+    ];
+    for (dodam_sql, duckdb_sql) in cases {
+        assert_same_as_duckdb(&dodam_sql, &duckdb_sql, tempdir.path()).await;
+    }
+}
+
+#[tokio::test]
 async fn duckdb_differential_copy_parquet_readback() {
     let Some(_duckdb) = DuckDbGuard::new() else {
         return;
@@ -1223,6 +1287,49 @@ async fn duckdb_differential_copy_parquet_readback() {
         tempdir.path(),
     )
     .await;
+}
+
+#[tokio::test]
+async fn dodam_copy_parquet_nested_roundtrip() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let input_path = tempdir.path().join("nested-input.parquet");
+    let output_path = tempdir.path().join("nested-output.parquet");
+    write_nested_values_parquet(&input_path);
+
+    let copy_sql = format!(
+        "COPY (SELECT id, tags, attrs FROM '{}' ORDER BY id) TO '{}' (FORMAT parquet, COMPRESSION snappy, ROW_GROUP_SIZE 2)",
+        input_path.display(),
+        output_path.display()
+    );
+    run_dodam_copy(&copy_sql).await;
+
+    let output = run_dodam(&format!(
+        "SELECT id, tags, attrs FROM '{}' ORDER BY id",
+        output_path.display()
+    ))
+    .await;
+    let input = run_dodam(&format!(
+        "SELECT id, tags, attrs FROM '{}' ORDER BY id",
+        input_path.display()
+    ))
+    .await;
+    assert_eq!(output, input);
+
+    let QueryOutput::Scan { batches } = execute_sql(
+        &DodamEngine::default(),
+        &format!(
+            "SELECT id, tags, attrs FROM '{}' ORDER BY id",
+            output_path.display()
+        ),
+        BATCH_SIZE,
+    )
+    .await
+    .expect("read nested parquet copy") else {
+        panic!("expected scan output");
+    };
+    let schema = batches.first().expect("nested output batch").schema();
+    assert!(matches!(schema.field(1).data_type(), DataType::List(_)));
+    assert!(matches!(schema.field(2).data_type(), DataType::Struct(_)));
 }
 
 #[tokio::test]
@@ -1538,6 +1645,48 @@ fn write_csv_values_parquet(path: &Path) {
         None,
     ]);
     write_parquet(path, schema, vec![Arc::new(ids), Arc::new(text)]);
+}
+
+fn write_nested_values_parquet(path: &Path) {
+    let list_field = Arc::new(Field::new("item", DataType::Int32, true));
+    let attrs_fields = vec![
+        Field::new("rank", DataType::Int32, true),
+        Field::new("label", DataType::Utf8, true),
+    ]
+    .into();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("tags", DataType::List(list_field), true),
+        Field::new("attrs", DataType::Struct(attrs_fields), true),
+    ]));
+    let ids = Int32Array::from_iter_values([1, 2, 3, 4]);
+    let tags = ListArray::from_iter_primitive::<Int32Type, _, _>([
+        Some(vec![Some(1), Some(2)]),
+        None,
+        Some(vec![None, Some(4)]),
+        Some(vec![]),
+    ]);
+    let attrs = StructArray::from(vec![
+        (
+            Arc::new(Field::new("rank", DataType::Int32, true)),
+            Arc::new(Int32Array::from(vec![Some(10), None, Some(30), Some(40)]))
+                as Arc<dyn arrow::array::Array>,
+        ),
+        (
+            Arc::new(Field::new("label", DataType::Utf8, true)),
+            Arc::new(StringArray::from(vec![
+                Some("hot"),
+                Some("cold"),
+                None,
+                Some("flat"),
+            ])) as Arc<dyn arrow::array::Array>,
+        ),
+    ]);
+    write_parquet(
+        path,
+        schema,
+        vec![Arc::new(ids), Arc::new(tags), Arc::new(attrs)],
+    );
 }
 
 fn write_tpch_lineitem_parquet(path: &Path) {
