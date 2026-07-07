@@ -52,8 +52,8 @@ use crate::hash::{FastHashMap, FastHashSet, fast_hash_map, fast_hash_map_with_ca
 use crate::optimizer::plan_join_inputs;
 use crate::storage::{DirectColumnScanMetrics, DirectI64I32I32ScanMetrics};
 use crate::vector::{
-    BatchConsumer, BatchView, Date32VectorView, DictionaryI32View, DictionaryStringValues,
-    I32VectorView, I64VectorView, SelectionVector, consume_record_batch,
+    BatchConsumer, BatchView, Date32VectorView, Decimal128VectorView, DictionaryI32View,
+    DictionaryStringValues, I32VectorView, I64VectorView, SelectionVector, consume_record_batch,
     dictionary_i32_view_match_flags,
 };
 
@@ -18962,26 +18962,27 @@ fn q06_filtered_revenue_sum_batch(batch: RecordBatch) -> Result<Option<(f64, u64
 
 fn q06_filtered_revenue_sum_view(view: BatchView<'_>) -> Result<Option<(f64, u64)>> {
     if view.num_columns() == 2
-        && let (Some(discounts), Some(extendedprices)) = (
-            decimal_input(view.column(0)?)?,
-            decimal_input(view.column(1)?)?,
-        )
+        && let (Some(discounts), Some(extendedprices)) =
+            (view.decimal128_vector(0), view.decimal128_vector(1))
     {
-        return q06_filtered_revenue_sum_arrays(discounts, extendedprices, view.num_rows());
+        return q06_filtered_revenue_sum_vectors(discounts, extendedprices, view.num_rows());
     }
-    q06_filtered_revenue_sum_batch(view.record_batch().clone())
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    q06_filtered_revenue_sum_batch(batch.clone())
 }
 
-fn q06_filtered_revenue_sum_arrays(
-    discounts: DecimalInput<'_>,
-    extendedprices: DecimalInput<'_>,
+fn q06_filtered_revenue_sum_vectors(
+    discounts: Decimal128VectorView<'_>,
+    extendedprices: Decimal128VectorView<'_>,
     row_count: usize,
 ) -> Result<Option<(f64, u64)>> {
     let mut sum = 0.0;
     let mut count = 0_u64;
     if discounts.null_count() == 0 && extendedprices.null_count() == 0 {
-        let revenue_scale = 1.0 / (extendedprices.scale * discounts.scale);
-        if discounts.precision <= 18 && extendedprices.precision <= 18 {
+        let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
+        if discounts.precision() <= 18 && extendedprices.precision() <= 18 {
             for (&discount, &extendedprice) in discounts
                 .raw_values()
                 .iter()
@@ -19120,13 +19121,16 @@ fn q06_revenue_sum_view(
 ) -> Result<Option<(f64, u64)>> {
     if view.num_columns() == 4 {
         let (Some(shipdates), Some(discounts), Some(quantities), Some(extendedprices)) = (
-            view.column(0)?.as_any().downcast_ref::<Date32Array>(),
-            decimal_input(view.column(1)?)?,
-            decimal_input(view.column(2)?)?,
-            decimal_input(view.column(3)?)?,
+            view.date32_vector(0),
+            view.decimal128_vector(1),
+            view.decimal128_vector(2),
+            view.decimal128_vector(3),
         ) else {
+            let Some(batch) = view.try_record_batch() else {
+                return Ok(None);
+            };
             return q06_revenue_sum_batch(
-                view.record_batch().clone(),
+                batch.clone(),
                 start_days,
                 end_days,
                 discount_low,
@@ -19134,7 +19138,7 @@ fn q06_revenue_sum_view(
                 quantity_limit,
             );
         };
-        return q06_revenue_sum_arrays(
+        return q06_revenue_sum_vector_views(
             shipdates,
             discounts,
             quantities,
@@ -19147,8 +19151,11 @@ fn q06_revenue_sum_view(
             quantity_limit,
         );
     }
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
     q06_revenue_sum_batch(
-        view.record_batch().clone(),
+        batch.clone(),
         start_days,
         end_days,
         discount_low,
@@ -19157,11 +19164,12 @@ fn q06_revenue_sum_view(
     )
 }
 
-fn q06_revenue_sum_arrays(
-    shipdates: &Date32Array,
-    discounts: DecimalInput<'_>,
-    quantities: DecimalInput<'_>,
-    extendedprices: DecimalInput<'_>,
+#[allow(clippy::too_many_arguments)]
+fn q06_revenue_sum_vector_views(
+    shipdates: Date32VectorView<'_>,
+    discounts: Decimal128VectorView<'_>,
+    quantities: Decimal128VectorView<'_>,
+    extendedprices: Decimal128VectorView<'_>,
     row_count: usize,
     start_days: i32,
     end_days: i32,
@@ -19169,20 +19177,21 @@ fn q06_revenue_sum_arrays(
     discount_high: f64,
     quantity_limit: f64,
 ) -> Result<Option<(f64, u64)>> {
-    if shipdates.null_count() == 0
+    if let Some(shipdate_values) = shipdates.values_if_null_free()
         && discounts.null_count() == 0
         && quantities.null_count() == 0
         && extendedprices.null_count() == 0
     {
-        let discount_low_raw = scaled_f64_to_i128(discount_low, discounts.scale);
-        let discount_high_raw = scaled_f64_to_i128(discount_high, discounts.scale);
-        let quantity_limit_raw = scaled_f64_to_i128(quantity_limit, quantities.scale);
-        let revenue_scale = 1.0 / (extendedprices.scale * discounts.scale);
-        let shipdate_values = shipdates.values().as_ref();
+        let discount_low_raw = scaled_f64_to_i128(discount_low, discounts.scale());
+        let discount_high_raw = scaled_f64_to_i128(discount_high, discounts.scale());
+        let quantity_limit_raw = scaled_f64_to_i128(quantity_limit, quantities.scale());
+        let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
         let discount_values = discounts.raw_values();
         let quantity_values = quantities.raw_values();
         let extendedprice_values = extendedprices.raw_values();
-        if discounts.precision <= 18 && quantities.precision <= 18 && extendedprices.precision <= 18
+        if discounts.precision() <= 18
+            && quantities.precision() <= 18
+            && extendedprices.precision() <= 18
         {
             return Ok(Some(vector_q06_revenue_sum_i64(
                 shipdate_values,

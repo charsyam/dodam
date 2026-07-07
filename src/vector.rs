@@ -2,7 +2,7 @@ use arrow::array::{
     Array, ArrayRef, Date32Array, Decimal128Array, DictionaryArray, Int32Array, Int64Array,
     LargeStringArray, StringArray,
 };
-use arrow::datatypes::Int32Type;
+use arrow::datatypes::{DataType, Int32Type};
 use arrow::record_batch::RecordBatch;
 
 use crate::error::{DodamError, Result};
@@ -23,6 +23,12 @@ pub(crate) enum RawColumnView<'a> {
     I64(&'a [i64]),
     I32(&'a [i32]),
     Date32(&'a [i32]),
+    #[allow(dead_code)]
+    Decimal128 {
+        values: &'a [i128],
+        precision: u8,
+        scale: i8,
+    },
     #[allow(dead_code)]
     DictionaryI32 {
         keys: &'a [i32],
@@ -104,10 +110,91 @@ pub(crate) enum Date32VectorView<'a> {
 }
 
 impl<'a> Date32VectorView<'a> {
+    pub(crate) fn is_null(&self, row: usize) -> bool {
+        match self {
+            Self::Arrow(values) => values.is_null(row),
+            Self::Raw(_) => false,
+        }
+    }
+
+    pub(crate) fn value(&self, row: usize) -> i32 {
+        match self {
+            Self::Arrow(values) => values.value(row),
+            Self::Raw(values) => values[row],
+        }
+    }
+
     pub(crate) fn values_if_null_free(&self) -> Option<&'a [i32]> {
         match self {
             Self::Arrow(values) => (values.null_count() == 0).then(|| values.values().as_ref()),
             Self::Raw(values) => Some(values),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Decimal128VectorView<'a> {
+    Arrow {
+        values: &'a Decimal128Array,
+        precision: u8,
+        scale: f64,
+    },
+    Raw {
+        values: &'a [i128],
+        precision: u8,
+        scale: f64,
+    },
+}
+
+impl<'a> Decimal128VectorView<'a> {
+    pub(crate) fn try_new_arrow(values: &'a Decimal128Array) -> Option<Self> {
+        let DataType::Decimal128(precision, scale) = values.data_type() else {
+            return None;
+        };
+        Some(Self::Arrow {
+            values,
+            precision: *precision,
+            scale: decimal_scale_factor(*scale),
+        })
+    }
+
+    pub(crate) fn precision(&self) -> u8 {
+        match self {
+            Self::Arrow { precision, .. } | Self::Raw { precision, .. } => *precision,
+        }
+    }
+
+    pub(crate) fn scale(&self) -> f64 {
+        match self {
+            Self::Arrow { scale, .. } | Self::Raw { scale, .. } => *scale,
+        }
+    }
+
+    pub(crate) fn null_count(&self) -> usize {
+        match self {
+            Self::Arrow { values, .. } => values.null_count(),
+            Self::Raw { .. } => 0,
+        }
+    }
+
+    pub(crate) fn is_null(&self, row: usize) -> bool {
+        match self {
+            Self::Arrow { values, .. } => values.is_null(row),
+            Self::Raw { .. } => false,
+        }
+    }
+
+    pub(crate) fn value(&self, row: usize) -> f64 {
+        match self {
+            Self::Arrow { values, scale, .. } => values.value(row) as f64 / *scale,
+            Self::Raw { values, scale, .. } => values[row] as f64 / *scale,
+        }
+    }
+
+    pub(crate) fn raw_values(&self) -> &'a [i128] {
+        match self {
+            Self::Arrow { values, .. } => values.values().as_ref(),
+            Self::Raw { values, .. } => values,
         }
     }
 }
@@ -282,6 +369,26 @@ impl<'a> BatchView<'a> {
         self.downcast(index)
     }
 
+    pub(crate) fn decimal128_vector(&self, index: usize) -> Option<Decimal128VectorView<'a>> {
+        match self.inner {
+            BatchViewInner::RecordBatch(_) => {
+                Decimal128VectorView::try_new_arrow(self.decimal128(index)?)
+            }
+            BatchViewInner::RawColumns(_) => match self.raw_column(index)? {
+                RawColumnView::Decimal128 {
+                    values,
+                    precision,
+                    scale,
+                } => Some(Decimal128VectorView::Raw {
+                    values,
+                    precision,
+                    scale: decimal_scale_factor(scale),
+                }),
+                _ => None,
+            },
+        }
+    }
+
     pub(crate) fn dictionary_i32(&self, index: usize) -> Option<&'a DictionaryArray<Int32Type>> {
         self.downcast(index)
     }
@@ -315,9 +422,15 @@ impl RawColumnView<'_> {
         match self {
             Self::I64(values) => values.len(),
             Self::I32(values) | Self::Date32(values) => values.len(),
+            Self::Decimal128 { values, .. } => values.len(),
             Self::DictionaryI32 { keys, .. } => keys.len(),
         }
     }
+}
+
+#[inline]
+fn decimal_scale_factor(scale: i8) -> f64 {
+    10_f64.powi(i32::from(scale))
 }
 
 pub(crate) trait BatchConsumer {
