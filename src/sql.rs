@@ -11474,7 +11474,7 @@ fn q12_row_group_map_chunk() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(2)
+        .unwrap_or(4)
 }
 
 fn q12_late_materialized_enabled() -> bool {
@@ -12890,7 +12890,7 @@ fn q12_order_fused_row_group_chunk() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(4)
+        .unwrap_or(1)
 }
 
 fn q12_order_late_materialized_enabled() -> bool {
