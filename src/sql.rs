@@ -9401,6 +9401,41 @@ async fn q16_part_groups(
         "p_type".to_string(),
         "p_size".to_string(),
     ]);
+    if q16_part_dictionary_strings_enabled() {
+        let excluded_brand_owned = Arc::new(excluded_brand.to_string());
+        let excluded_type_prefix_owned = Arc::new(excluded_type_prefix.to_string());
+        let sizes = Arc::new(sizes.clone());
+        if let Some(partials) = engine
+            .parquet_row_group_map_dictionary_columns_pruned_view(
+                path.clone(),
+                batch_size,
+                projection.clone(),
+                vec!["p_brand".to_string(), "p_type".to_string()],
+                Vec::new(),
+                q16_part_group_chunk_size(),
+                Q16PartGroupPartial::default,
+                {
+                    let excluded_brand = excluded_brand_owned.clone();
+                    let excluded_type_prefix = excluded_type_prefix_owned.clone();
+                    let sizes = sizes.clone();
+                    move |view, partial| {
+                        q16_part_groups_partial_view(
+                            view,
+                            &excluded_brand,
+                            &excluded_type_prefix,
+                            &sizes,
+                            partial,
+                        )?;
+                        Ok(Some(()))
+                    }
+                },
+                |partial| Ok(Some(partial)),
+            )
+            .await?
+        {
+            return q16_merge_part_group_partials(partials);
+        }
+    }
     let mut stream = if q16_part_dictionary_strings_enabled() {
         engine
             .scan_parquet_batches_dictionary_columns(
@@ -9521,6 +9556,52 @@ fn q16_part_dictionary_strings_enabled() -> bool {
     std::env::var_os("DODAM_Q16_DISABLE_PART_DICTIONARY_STRINGS").is_none()
 }
 
+fn q16_part_group_chunk_size() -> usize {
+    std::env::var("DODAM_Q16_PART_GROUP_CHUNK_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4)
+}
+
+struct Q16PartGroupPartialRow {
+    partkey: i64,
+    size: i64,
+    brand_id: usize,
+    type_id: usize,
+}
+
+#[derive(Default)]
+struct Q16PartGroupPartial {
+    brand_ids: FastHashMap<String, usize>,
+    type_ids: FastHashMap<String, usize>,
+    brands_by_id: Vec<String>,
+    types_by_id: Vec<String>,
+    rows: Vec<Q16PartGroupPartialRow>,
+}
+
+impl Q16PartGroupPartial {
+    fn push_row(&mut self, partkey: i64, size: i64, brand: &str, type_name: &str) {
+        let brand_id = q16_intern_string(&mut self.brand_ids, &mut self.brands_by_id, brand);
+        let type_id = q16_intern_string(&mut self.type_ids, &mut self.types_by_id, type_name);
+        self.rows.push(Q16PartGroupPartialRow {
+            partkey,
+            size,
+            brand_id,
+            type_id,
+        });
+    }
+
+    fn push_ids(&mut self, partkey: i64, size: i64, brand_id: usize, type_id: usize) {
+        self.rows.push(Q16PartGroupPartialRow {
+            partkey,
+            size,
+            brand_id,
+            type_id,
+        });
+    }
+}
+
 enum Q16PartSizeView<'a> {
     I32(I32VectorView<'a>),
     I64(I64VectorView<'a>),
@@ -9633,6 +9714,222 @@ fn q16_part_groups_dictionary_typed_batch(
         );
     }
     Ok(true)
+}
+
+fn q16_part_groups_partial_view(
+    view: BatchView<'_>,
+    excluded_brand: &str,
+    excluded_type_prefix: &str,
+    sizes: &AdaptiveI64Set,
+    partial: &mut Q16PartGroupPartial,
+) -> Result<()> {
+    if let Some(layout) = Q16PartDictionaryView::try_new(view)
+        && q16_part_groups_dictionary_partial_batch(
+            layout,
+            excluded_brand,
+            excluded_type_prefix,
+            sizes,
+            partial,
+        )?
+    {
+        return Ok(());
+    }
+    let Some(partkeys) = view.i64_vector(0) else {
+        return Err(DodamError::UnsupportedSql(
+            "Q16 part-group partkey raw vector has unsupported type".to_string(),
+        ));
+    };
+    let Some(brands) = view.utf8(1) else {
+        return Err(DodamError::UnsupportedSql(
+            "Q16 part-group brand raw vector has unsupported type".to_string(),
+        ));
+    };
+    let Some(types) = view.utf8(2) else {
+        return Err(DodamError::UnsupportedSql(
+            "Q16 part-group type raw vector has unsupported type".to_string(),
+        ));
+    };
+    let size_view = if let Some(values) = view.i32_vector(3) {
+        Q16PartSizeView::I32(values)
+    } else {
+        let Some(values) = view.i64_vector(3) else {
+            return Err(DodamError::UnsupportedSql(
+                "Q16 part-group size raw vector has unsupported type".to_string(),
+            ));
+        };
+        Q16PartSizeView::I64(values)
+    };
+    if partkeys.values_if_null_free().is_none()
+        || brands.null_count() != 0
+        || types.null_count() != 0
+        || size_view.null_count() != 0
+    {
+        let Some(batch) = view.try_record_batch() else {
+            return Err(DodamError::UnsupportedSql(
+                "Q16 nullable raw part-group vectors are unsupported".to_string(),
+            ));
+        };
+        return q16_part_groups_partial_batch(
+            batch,
+            excluded_brand,
+            excluded_type_prefix,
+            sizes,
+            partial,
+        );
+    }
+    for row in 0..partkeys.len() {
+        let size = size_view.value_i64(row);
+        if !sizes.contains(size) {
+            continue;
+        }
+        let brand = brands.value(row);
+        let type_name = types.value(row);
+        if brand == excluded_brand || type_name.starts_with(excluded_type_prefix) {
+            continue;
+        }
+        partial.push_row(partkeys.value(row), size, brand, type_name);
+    }
+    Ok(())
+}
+
+fn q16_part_groups_dictionary_partial_batch(
+    view: Q16PartDictionaryView<'_>,
+    excluded_brand: &str,
+    excluded_type_prefix: &str,
+    sizes: &AdaptiveI64Set,
+    partial: &mut Q16PartGroupPartial,
+) -> Result<bool> {
+    if view.partkeys.null_count() != 0
+        || view.brands.null_count() != 0
+        || view.types.null_count() != 0
+        || view.sizes.null_count() != 0
+    {
+        return Ok(false);
+    }
+    let Some(brand_values) = view.brands.string_values() else {
+        return Ok(false);
+    };
+    let Some(type_values) = view.types.string_values() else {
+        return Ok(false);
+    };
+    let brand_lookup = q16_dictionary_group_string_ids(
+        &brand_values,
+        Some(excluded_brand.as_bytes()),
+        None,
+        &mut partial.brand_ids,
+        &mut partial.brands_by_id,
+    )?;
+    let type_lookup = q16_dictionary_group_string_ids(
+        &type_values,
+        None,
+        Some(excluded_type_prefix.as_bytes()),
+        &mut partial.type_ids,
+        &mut partial.types_by_id,
+    )?;
+    let brand_keys = view.brands.keys();
+    let type_keys = view.types.keys();
+    let partkey_values = view.partkeys.values().as_ref();
+    for row in 0..partkey_values.len() {
+        let size = view.sizes.value_i64(row);
+        if !sizes.contains(size) {
+            continue;
+        }
+        let (Some(brand_id), Some(type_id)) = (
+            q16_dictionary_lookup_id(&brand_lookup, brand_keys[row]),
+            q16_dictionary_lookup_id(&type_lookup, type_keys[row]),
+        ) else {
+            continue;
+        };
+        partial.push_ids(partkey_values[row], size, brand_id, type_id);
+    }
+    Ok(true)
+}
+
+fn q16_part_groups_partial_batch(
+    batch: &RecordBatch,
+    excluded_brand: &str,
+    excluded_type_prefix: &str,
+    sizes: &AdaptiveI64Set,
+    partial: &mut Q16PartGroupPartial,
+) -> Result<()> {
+    let partkeys = batch_column(batch, "p_partkey")?;
+    let part_sizes = batch_column(batch, "p_size")?;
+    let Some(brands) = batch_string_column(batch, "p_brand").ok() else {
+        return Err(DodamError::UnsupportedSql(
+            "p_brand must be Utf8".to_string(),
+        ));
+    };
+    let Some(types) = batch_string_column(batch, "p_type").ok() else {
+        return Err(DodamError::UnsupportedSql(
+            "p_type must be Utf8".to_string(),
+        ));
+    };
+    for row in 0..batch.num_rows() {
+        let (Some(partkey), Some(size)) = (
+            numeric_i64_value(partkeys, row)?,
+            numeric_i64_value(part_sizes, row)?,
+        ) else {
+            continue;
+        };
+        if !sizes.contains(size) {
+            continue;
+        }
+        if brands.is_null(row) || types.is_null(row) {
+            continue;
+        }
+        let brand = brands.value(row);
+        let type_name = types.value(row);
+        if brand == excluded_brand || type_name.starts_with(excluded_type_prefix) {
+            continue;
+        }
+        partial.push_row(partkey, size, brand, type_name);
+    }
+    Ok(())
+}
+
+fn q16_merge_part_group_partials(partials: Vec<Q16PartGroupPartial>) -> Result<Q16PartGroups> {
+    let mut brand_ids = fast_hash_map::<String, usize>();
+    let mut type_ids = fast_hash_map::<String, usize>();
+    let mut brands_by_id = Vec::<String>::new();
+    let mut types_by_id = Vec::<String>::new();
+    let mut group_ids = FastHashMap::<Q16GroupIdKey, usize>::default();
+    let mut groups = Vec::<Q16GroupKey>::new();
+    let mut part_to_group = fast_hash_map::<i64, usize>();
+    for partial in partials {
+        let brand_remap = partial
+            .brands_by_id
+            .iter()
+            .map(|value| q16_intern_string(&mut brand_ids, &mut brands_by_id, value))
+            .collect::<Vec<_>>();
+        let type_remap = partial
+            .types_by_id
+            .iter()
+            .map(|value| q16_intern_string(&mut type_ids, &mut types_by_id, value))
+            .collect::<Vec<_>>();
+        for row in partial.rows {
+            let Some(&brand_id) = brand_remap.get(row.brand_id) else {
+                continue;
+            };
+            let Some(&type_id) = type_remap.get(row.type_id) else {
+                continue;
+            };
+            q16_insert_part_group_ids(
+                row.partkey,
+                row.size,
+                brand_id,
+                type_id,
+                &brands_by_id,
+                &types_by_id,
+                &mut group_ids,
+                &mut groups,
+                &mut part_to_group,
+            );
+        }
+    }
+    Ok(Q16PartGroups {
+        groups,
+        part_to_group: AdaptiveI64Map::from_hash(part_to_group),
+    })
 }
 
 fn q16_dictionary_group_string_ids<S: BuildHasher>(
