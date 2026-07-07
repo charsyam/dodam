@@ -1934,5 +1934,10 @@ Tried and rejected or neutral:
           - Correlated subquery differential coverage now includes a correlated `IN` predicate inside an outer boolean combination, and the row-bound fallback treats unknown outer qualifiers from the new resolver error type as bind-later correlated references.
           - SQL diagnostics now has dedicated `AmbiguousColumn`, `UnknownTableQualifier`, `InvalidCast`, and `TypeMismatch` error variants; existing user-facing ambiguous-column text was preserved for compatibility.
           - Validation: full `cargo test -q` passed.
+        - Continued the decimal/nested correctness pass:
+          - General `Decimal128 * Decimal128` scalar expressions now preserve decimal output instead of being intercepted by the old generic `f64` product fast path; `Decimal128 / Decimal128` intentionally remains `DOUBLE` to match DuckDB.
+          - Single-table `WHERE amount = amount3 OR amount3 > amount` now works for mixed-scale Decimal128 column-to-column predicates by aligning raw decimal scales in the physical filter path.
+          - Nested list indexing now supports struct list fields such as `attrs.more_tags[1]`, not only top-level `tags[1]`.
+          - Validation: full `cargo fmt && cargo check -q && cargo test -q` passed.
         - Retuned Q12 defaults: `DODAM_Q12_ROW_GROUP_MAP_CHUNK` from `2` to `4`, and `DODAM_Q12_ORDER_FUSED_ROW_GROUP_CHUNK` from `4` to `1`. Sequential sweeps: lineitem chunk `4` was best in the sampled run (`~129.0ms` vs default area `~129.8-133.5ms`), while order fused chunk `1` was clearly best (`~125.3ms` vs `~132-139ms` for larger chunks). Combined explicit setting sampled Dodam `~123.0ms` vs DuckDB `~125.5ms`.
         - Validation after making these Q12 defaults: `cargo fmt --all --check`, `cargo check -q`, `cargo test -q`, and release build passed. Individual SF=10 Q12 sampled Dodam `~123.8ms` vs DuckDB `~127.5ms`, moving Q12 back to faster in this run.

@@ -35300,6 +35300,7 @@ enum ScalarSqlExpression {
     },
     ListIndex {
         column: String,
+        field: Option<String>,
         index: Box<ScalarSqlExpression>,
     },
     ListLength {
@@ -35749,13 +35750,14 @@ fn parse_scalar_sql_expression(
 ) -> Result<ScalarSqlExpression> {
     match expr {
         SqlExpr::CompoundFieldAccess { .. } => {
-            let Some((column, index)) = parse_list_index_access(expr, table_alias)? else {
+            let Some((column, field, index)) = parse_list_index_access(expr, table_alias)? else {
                 return Err(DodamError::UnsupportedSql(format!(
                     "unsupported nested/list expression: {expr}"
                 )));
             };
             Ok(ScalarSqlExpression::ListIndex {
                 column,
+                field,
                 index: Box::new(index),
             })
         }
@@ -36008,16 +36010,46 @@ fn parse_struct_field_access(
 fn parse_list_index_access(
     expr: &SqlExpr,
     table_alias: Option<&str>,
-) -> Result<Option<(String, ScalarSqlExpression)>> {
+) -> Result<Option<(String, Option<String>, ScalarSqlExpression)>> {
     let SqlExpr::CompoundFieldAccess { root, access_chain } = expr else {
         return Ok(None);
     };
-    let [AccessExpr::Subscript(Subscript::Index { index })] = access_chain.as_slice() else {
+    let Some(AccessExpr::Subscript(Subscript::Index { index })) = access_chain.last() else {
         return Ok(None);
     };
-    let column = sql_column_name(root, table_alias)?;
+    let prefix = &access_chain[..access_chain.len().saturating_sub(1)];
+    let (column, field) = if prefix.is_empty() {
+        if let Some((column, field)) = parse_struct_field_access(root, table_alias)? {
+            (column, Some(field))
+        } else {
+            (sql_column_name(root, table_alias)?, None)
+        }
+    } else if let Some((column, mut field)) = parse_struct_field_access(root, table_alias)? {
+        for access in prefix {
+            let AccessExpr::Dot(SqlExpr::Identifier(ident)) = access else {
+                return Ok(None);
+            };
+            field.push('.');
+            field.push_str(&ident.value);
+        }
+        (column, Some(field))
+    } else {
+        let column = sql_column_name(root, table_alias)?;
+        let mut fields = Vec::with_capacity(prefix.len());
+        for access in prefix {
+            let AccessExpr::Dot(SqlExpr::Identifier(ident)) = access else {
+                return Ok(None);
+            };
+            fields.push(ident.value.as_str());
+        }
+        if fields.is_empty() {
+            (column, None)
+        } else {
+            (column, Some(fields.join(".")))
+        }
+    };
     let index = parse_scalar_sql_expression(index, table_alias)?;
-    Ok(Some((column, index)))
+    Ok(Some((column, field, index)))
 }
 
 fn typed_string_scalar_expression(
@@ -36218,7 +36250,7 @@ fn collect_join_scalar_expression_columns(
     match expr {
         ScalarSqlExpression::Column(column) => add_column_once(columns, column.clone()),
         ScalarSqlExpression::StructField { column, .. } => add_column_once(columns, column.clone()),
-        ScalarSqlExpression::ListIndex { column, index } => {
+        ScalarSqlExpression::ListIndex { column, index, .. } => {
             add_column_once(columns, column.clone());
             collect_join_scalar_expression_columns(index, table_aliases, columns)?;
         }
@@ -36305,7 +36337,7 @@ fn collect_scalar_expression_columns(expr: &ScalarSqlExpression, columns: &mut V
     match expr {
         ScalarSqlExpression::Column(column) => add_column_once(columns, column.clone()),
         ScalarSqlExpression::StructField { column, .. } => add_column_once(columns, column.clone()),
-        ScalarSqlExpression::ListIndex { column, index } => {
+        ScalarSqlExpression::ListIndex { column, index, .. } => {
             add_column_once(columns, column.clone());
             collect_scalar_expression_columns(index, columns);
         }
@@ -38206,9 +38238,13 @@ fn evaluate_scalar_expression(
         ScalarSqlExpression::StructField { column, field } => {
             evaluated_struct_field(batch, column, field)
         }
-        ScalarSqlExpression::ListIndex { column, index } => {
+        ScalarSqlExpression::ListIndex {
+            column,
+            field,
+            index,
+        } => {
             let index = scalar_as_i64(evaluate_scalar_expression(batch, index)?)?;
-            evaluated_list_index(batch, column, &index)
+            evaluated_list_index(batch, column, field.as_deref(), &index)
         }
         ScalarSqlExpression::ListLength { column, field } => {
             evaluated_list_length(batch, column, field.as_deref())
@@ -38340,12 +38376,6 @@ fn evaluate_decimal_product_expression(
     }
     if let Some((value, complement)) = decimal_discount_product_operands(batch, right, left)? {
         return Ok(Some(decimal_complement_product(value, complement)));
-    }
-    if let (Some(left), Some(right)) = (
-        decimal_scalar_column(batch, left)?,
-        decimal_scalar_column(batch, right)?,
-    ) {
-        return Ok(Some(decimal_product(left, right)));
     }
     Ok(None)
 }
@@ -38497,33 +38527,6 @@ fn decimal_complement_product(
                     (value_raw[row] as f64 / value.scale)
                         * (1.0 - complement_raw[row] as f64 / complement.scale),
                 )
-            }
-        })
-        .collect()
-}
-
-fn decimal_product(
-    left: DecimalScalarColumn<'_>,
-    right: DecimalScalarColumn<'_>,
-) -> Vec<Option<f64>> {
-    let left_raw = left.values.values();
-    let right_raw = right.values.values();
-    if left.values.null_count() == 0 && right.values.null_count() == 0 {
-        return left_raw
-            .iter()
-            .copied()
-            .zip(right_raw.iter().copied())
-            .map(|(left_value, right_value)| {
-                Some((left_value as f64 / left.scale) * (right_value as f64 / right.scale))
-            })
-            .collect();
-    }
-    (0..left.values.len())
-        .map(|row| {
-            if left.values.is_null(row) || right.values.is_null(row) {
-                None
-            } else {
-                Some((left_raw[row] as f64 / left.scale) * (right_raw[row] as f64 / right.scale))
             }
         })
         .collect()
@@ -39110,9 +39113,10 @@ fn evaluated_list_length(
 fn evaluated_list_index(
     batch: &RecordBatch,
     column: &str,
+    field: Option<&str>,
     indexes: &[Option<i64>],
 ) -> Result<EvaluatedScalar> {
-    let list = list_array_column(batch, column, None)?;
+    let list = list_array_column(batch, column, field)?;
     if indexes.len() != list.len() {
         return Err(DodamError::UnsupportedSql(format!(
             "list index expression length {} does not match list length {}",
@@ -39495,6 +39499,42 @@ fn evaluate_binary_scalar(
                                 )
                             })?,
                         )
+                    }
+                    _ => None,
+                };
+                values.push(value);
+            }
+            Ok(EvaluatedScalar::Decimal128 {
+                values,
+                precision,
+                scale,
+            })
+        }
+        (
+            EvaluatedScalar::Decimal128 {
+                values: left,
+                precision: left_precision,
+                scale: left_scale,
+            },
+            EvaluatedScalar::Decimal128 {
+                values: right,
+                precision: right_precision,
+                scale: right_scale,
+            },
+        ) if *op == BinaryOperator::Multiply => {
+            let scale = left_scale.checked_add(*right_scale).ok_or_else(|| {
+                DodamError::UnsupportedSql("decimal multiply scale overflow".to_string())
+            })?;
+            let precision = left_precision
+                .saturating_add(*right_precision)
+                .clamp(18, 38);
+            let mut values = Vec::with_capacity(left.len());
+            for (left, right) in left.iter().copied().zip(right.iter().copied()) {
+                let value = match (left, right) {
+                    (Some(left), Some(right)) => {
+                        Some(left.checked_mul(right).ok_or_else(|| {
+                            DodamError::UnsupportedSql("decimal multiply overflow".to_string())
+                        })?)
                     }
                     _ => None,
                 };

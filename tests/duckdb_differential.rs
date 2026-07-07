@@ -1690,6 +1690,45 @@ async fn duckdb_differential_extended_type_matrix() {
 
     assert_same_as_duckdb(
         &format!(
+            "SELECT id, CAST(amount * amount3 AS VARCHAR) FROM '{}' ORDER BY id",
+            types_path.display()
+        ),
+        &format!(
+            "SELECT id, CAST(amount * amount3 AS VARCHAR) FROM read_parquet('{}') ORDER BY id",
+            types_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id FROM '{}' WHERE amount / amount3 > 0 ORDER BY id",
+            types_path.display()
+        ),
+        &format!(
+            "SELECT id FROM read_parquet('{}') WHERE amount / amount3 > 0 ORDER BY id",
+            types_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id FROM '{}' WHERE amount = amount3 OR amount3 > amount ORDER BY id",
+            types_path.display()
+        ),
+        &format!(
+            "SELECT id FROM read_parquet('{}') WHERE amount = amount3 OR amount3 > amount ORDER BY id",
+            types_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
             "SELECT id, CASE WHEN amount = amount3 THEN 'eq' WHEN amount3 > amount THEN 'gt' ELSE 'no' END FROM '{}' ORDER BY id",
             types_path.display()
         ),
@@ -2092,6 +2131,19 @@ async fn duckdb_differential_nested_struct_field_projection() {
         ),
         &format!(
             "SELECT id, array_length(attrs.more_tags) AS nested_tag_count FROM read_parquet('{}') WHERE array_length(attrs.more_tags) > 1 OR attrs.detail.score >= 40 ORDER BY id",
+            input_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, attrs.more_tags[1] AS first_nested_tag FROM '{}' WHERE attrs.more_tags[1] = 9 OR attrs.detail.score >= 40 ORDER BY id",
+            input_path.display()
+        ),
+        &format!(
+            "SELECT id, attrs.more_tags[1] AS first_nested_tag FROM read_parquet('{}') WHERE attrs.more_tags[1] = 9 OR attrs.detail.score >= 40 ORDER BY id",
             input_path.display()
         ),
         tempdir.path(),

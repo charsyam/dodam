@@ -8701,6 +8701,12 @@ fn evaluate_column_comparison(
     let right_index = column_index(batch, right)?;
     let left_column = batch.column(left_index);
     let right_column = batch.column(right_index);
+    if matches!(left_column.data_type(), DataType::Decimal128(_, _))
+        && matches!(right_column.data_type(), DataType::Decimal128(_, _))
+    {
+        return compare_decimal128_columns(left_column, right_column, op)
+            .map_err(|_| DodamError::InvalidFilter(format!("{left} {op:?} {right}")));
+    }
     if left_column.data_type() != right_column.data_type() {
         return Err(DodamError::InvalidFilter(format!("{left} {op:?} {right}")));
     }
@@ -9186,6 +9192,69 @@ fn compare_columns(
         ComparisonOp::LtEq => lt_eq(left, right),
         ComparisonOp::Gt => gt(left, right),
         ComparisonOp::GtEq => gt_eq(left, right),
+    }
+}
+
+fn compare_decimal128_columns(
+    left: &ArrayRef,
+    right: &ArrayRef,
+    op: ComparisonOp,
+) -> Result<BooleanArray> {
+    let DataType::Decimal128(_, left_scale) = left.data_type() else {
+        unreachable!("validated decimal left column");
+    };
+    let DataType::Decimal128(_, right_scale) = right.data_type() else {
+        unreachable!("validated decimal right column");
+    };
+    let left = left
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("Decimal128 left column");
+    let right = right
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("Decimal128 right column");
+    if left.len() != right.len() {
+        return Err(DodamError::InvalidFilter(
+            "decimal column length mismatch".to_string(),
+        ));
+    }
+    let scale = (*left_scale).max(*right_scale);
+    let left_factor = decimal_align_factor(*left_scale, scale)?;
+    let right_factor = decimal_align_factor(*right_scale, scale)?;
+    Ok(BooleanArray::from(
+        (0..left.len())
+            .map(|row| {
+                if left.is_null(row) || right.is_null(row) {
+                    return None;
+                }
+                let left = left.value(row).checked_mul(left_factor)?;
+                let right = right.value(row).checked_mul(right_factor)?;
+                Some(compare_i128_values(left, op, right))
+            })
+            .collect::<Vec<_>>(),
+    ))
+}
+
+fn decimal_align_factor(from_scale: i8, to_scale: i8) -> Result<i128> {
+    if to_scale < from_scale {
+        return Err(DodamError::InvalidFilter(format!(
+            "cannot align decimal scale {from_scale} to {to_scale}"
+        )));
+    }
+    let scale = usize::try_from(to_scale - from_scale)
+        .map_err(|_| DodamError::InvalidFilter("decimal scale is too large".to_string()))?;
+    decimal_scale_factor(scale)
+}
+
+fn compare_i128_values(left: i128, op: ComparisonOp, right: i128) -> bool {
+    match op {
+        ComparisonOp::Eq => left == right,
+        ComparisonOp::NotEq => left != right,
+        ComparisonOp::Lt => left < right,
+        ComparisonOp::LtEq => left <= right,
+        ComparisonOp::Gt => left > right,
+        ComparisonOp::GtEq => left >= right,
     }
 }
 
