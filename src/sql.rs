@@ -4144,8 +4144,7 @@ fn i64_set_late_build_selection_view<T>(
     let dense_key_filter = state.key_filter.dense_contains_slice();
     if keys.null_count() == 0 {
         for &key in keys.values().as_ref() {
-            let selected =
-                adaptive_i64_set_contains_cached(&state.key_filter, dense_key_filter, key);
+            let selected = state.key_filter.contains_cached(dense_key_filter, key);
             selection.push(selected);
             if selected {
                 state.selected_keys.push(key);
@@ -4155,11 +4154,9 @@ fn i64_set_late_build_selection_view<T>(
     }
     for row in 0..keys.len() {
         let selected = keys.is_valid(row)
-            && adaptive_i64_set_contains_cached(
-                &state.key_filter,
-                dense_key_filter,
-                keys.value(row),
-            );
+            && state
+                .key_filter
+                .contains_cached(dense_key_filter, keys.value(row));
         selection.push(selected);
         if selected {
             state.selected_keys.push(keys.value(row));
@@ -4186,7 +4183,7 @@ fn i64_set_late_build_selection_batch_into(
     };
     if keys.null_count() == 0 {
         for &key in keys.values().as_ref() {
-            let selected = adaptive_i64_set_contains_cached(key_filter, dense_key_filter, key);
+            let selected = key_filter.contains_cached(dense_key_filter, key);
             selection.push(selected);
             if selected {
                 selected_keys.push(key);
@@ -4196,8 +4193,8 @@ fn i64_set_late_build_selection_batch_into(
         return Ok(Some(metrics));
     }
     for row in 0..keys.len() {
-        let selected = keys.is_valid(row)
-            && adaptive_i64_set_contains_cached(key_filter, dense_key_filter, keys.value(row));
+        let selected =
+            keys.is_valid(row) && key_filter.contains_cached(dense_key_filter, keys.value(row));
         selection.push(selected);
         if selected {
             selected_keys.push(keys.value(row));
@@ -4205,21 +4202,6 @@ fn i64_set_late_build_selection_batch_into(
         }
     }
     Ok(Some(metrics))
-}
-
-fn adaptive_i64_set_contains_cached(
-    keys: &AdaptiveI64Set,
-    dense_keys: Option<&[bool]>,
-    key: i64,
-) -> bool {
-    if let Some(dense_keys) = dense_keys {
-        return usize::try_from(key)
-            .ok()
-            .and_then(|index| dense_keys.get(index))
-            .copied()
-            .unwrap_or(false);
-    }
-    keys.contains(key)
 }
 
 struct Q10CustomerLatePayload {
@@ -7173,8 +7155,7 @@ fn q09_late_build_partkey_selection_view(
         state.partial.profile.rows += partkeys.len();
         if let Some(partkey_values) = partkeys.values_if_null_free() {
             for &partkey in partkey_values {
-                let selected =
-                    adaptive_i64_set_contains_cached(&state.part_keys, dense_part_keys, partkey);
+                let selected = state.part_keys.contains_cached(dense_part_keys, partkey);
                 selection.push(selected);
                 if selected {
                     state.selected_partkeys.push(partkey);
@@ -7185,11 +7166,9 @@ fn q09_late_build_partkey_selection_view(
         }
         for row in 0..partkeys.len() {
             let selected = !partkeys.is_null(row)
-                && adaptive_i64_set_contains_cached(
-                    &state.part_keys,
-                    dense_part_keys,
-                    partkeys.value(row),
-                );
+                && state
+                    .part_keys
+                    .contains_cached(dense_part_keys, partkeys.value(row));
             selection.push(selected);
             if selected {
                 state.selected_partkeys.push(partkeys.value(row));
@@ -7803,7 +7782,7 @@ fn q09_part_key_contains(
     dense_part_keys: Option<&[bool]>,
     partkey: i64,
 ) -> bool {
-    adaptive_i64_set_contains_cached(part_keys, dense_part_keys, partkey)
+    part_keys.contains_cached(dense_part_keys, partkey)
 }
 
 fn q09_order_year_get(
@@ -8740,21 +8719,19 @@ fn q11_late_build_suppkey_selection_batch(
     let dense_supplier_keys = state.supplier_keys.dense_contains_slice();
     if suppkeys.null_count() == 0 {
         for &suppkey in suppkeys.values() {
-            selection.push(adaptive_i64_set_contains_cached(
-                &state.supplier_keys,
-                dense_supplier_keys,
-                suppkey,
-            ));
+            selection.push(
+                state
+                    .supplier_keys
+                    .contains_cached(dense_supplier_keys, suppkey),
+            );
         }
         return Ok(Some(()));
     }
     for row in 0..suppkeys.len() {
         let selected = suppkeys.is_valid(row)
-            && adaptive_i64_set_contains_cached(
-                &state.supplier_keys,
-                dense_supplier_keys,
-                suppkeys.value(row),
-            );
+            && state
+                .supplier_keys
+                .contains_cached(dense_supplier_keys, suppkeys.value(row));
         selection.push(selected);
     }
     Ok(Some(()))
@@ -8772,21 +8749,19 @@ fn q11_late_build_suppkey_selection_view(
         let dense_supplier_keys = state.supplier_keys.dense_contains_slice();
         if let Some(suppkey_values) = suppkeys.values_if_null_free() {
             for &suppkey in suppkey_values {
-                selection.push(adaptive_i64_set_contains_cached(
-                    &state.supplier_keys,
-                    dense_supplier_keys,
-                    suppkey,
-                ));
+                selection.push(
+                    state
+                        .supplier_keys
+                        .contains_cached(dense_supplier_keys, suppkey),
+                );
             }
             return Ok(Some(()));
         }
         for row in 0..suppkeys.len() {
             let selected = !suppkeys.is_null(row)
-                && adaptive_i64_set_contains_cached(
-                    &state.supplier_keys,
-                    dense_supplier_keys,
-                    suppkeys.value(row),
-                );
+                && state
+                    .supplier_keys
+                    .contains_cached(dense_supplier_keys, suppkeys.value(row));
             selection.push(selected);
         }
         return Ok(Some(()));
@@ -8980,7 +8955,7 @@ fn q11_important_stock_batch_typed(
             .zip(supplycost_values)
             .zip(availqtys.values())
         {
-            if !adaptive_i64_set_contains_cached(supplier_keys, dense_supplier_keys, suppkey) {
+            if !supplier_keys.contains_cached(dense_supplier_keys, suppkey) {
                 continue;
             }
             let value = (supplycost as f64 / supplycost_scale) * f64::from(availqty);
@@ -8998,7 +8973,7 @@ fn q11_important_stock_batch_typed(
             continue;
         }
         let suppkey = suppkeys.value(row);
-        if !adaptive_i64_set_contains_cached(supplier_keys, dense_supplier_keys, suppkey) {
+        if !supplier_keys.contains_cached(dense_supplier_keys, suppkey) {
             continue;
         }
         let value =
@@ -23139,22 +23114,16 @@ fn q08_late_build_partkey_selection_view(
         let dense_part_keys = state.part_keys.dense_contains_slice();
         if let Some(partkey_values) = partkeys.values_if_null_free() {
             for &partkey in partkey_values {
-                selection.push(adaptive_i64_set_contains_cached(
-                    &state.part_keys,
-                    dense_part_keys,
-                    partkey,
-                ));
+                selection.push(state.part_keys.contains_cached(dense_part_keys, partkey));
             }
             return Ok(Some(()));
         }
         for row in 0..partkeys.len() {
             selection.push(
                 !partkeys.is_null(row)
-                    && adaptive_i64_set_contains_cached(
-                        &state.part_keys,
-                        dense_part_keys,
-                        partkeys.value(row),
-                    ),
+                    && state
+                        .part_keys
+                        .contains_cached(dense_part_keys, partkeys.value(row)),
             );
         }
         return Ok(Some(()));

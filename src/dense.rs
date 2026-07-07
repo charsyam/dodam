@@ -92,6 +92,17 @@ impl AdaptiveI64Set {
         }
     }
 
+    pub(crate) fn contains_cached(&self, dense_contains: Option<&[bool]>, key: i64) -> bool {
+        if let Some(dense_contains) = dense_contains {
+            return usize::try_from(key)
+                .ok()
+                .and_then(|index| dense_contains.get(index))
+                .copied()
+                .unwrap_or(false);
+        }
+        self.contains(key)
+    }
+
     pub(crate) fn to_hash_set(&self) -> HashSet<i64> {
         match self {
             Self::Dense { contains, len } => {
