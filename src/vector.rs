@@ -170,6 +170,11 @@ impl<'a> Decimal128VectorView<'a> {
         }
     }
 
+    pub(crate) fn scale_i64(&self) -> Option<i64> {
+        let scale = self.scale();
+        (scale <= i64::MAX as f64).then_some(scale as i64)
+    }
+
     pub(crate) fn null_count(&self) -> usize {
         match self {
             Self::Arrow { values, .. } => values.null_count(),

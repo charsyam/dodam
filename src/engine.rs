@@ -45,7 +45,7 @@ use crate::storage::{
     scan_parquet_i64_byte_array_payload_columns_with_store,
     scan_parquet_primitive_columns_with_store,
 };
-use crate::vector::BatchView;
+use crate::vector::{BatchView, Date32VectorView, Decimal128VectorView, I64VectorView};
 
 const LOCAL_SHUFFLE_FILE_TARGET_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -5911,18 +5911,21 @@ fn q14_build_date_selection_view(
     selection: &mut LateSelectionBuilder,
 ) -> Result<Option<()>> {
     if view.num_columns() == 1 {
-        let Some(shipdates) = view.date32(0) else {
+        let Some(shipdates) = view.date32_vector(0) else {
             return Ok(None);
         };
-        if shipdates.null_count() != 0 {
+        let Some(shipdate_values) = shipdates.values_if_null_free() else {
             return Ok(None);
-        }
-        for &shipdate in shipdates.values().as_ref() {
+        };
+        for &shipdate in shipdate_values {
             selection.push(shipdate >= start_days && shipdate < end_days);
         }
         return Ok(Some(()));
     }
-    q14_build_date_selection_batch(view.record_batch().clone(), start_days, end_days, selection)
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    q14_build_date_selection_batch(batch.clone(), start_days, end_days, selection)
 }
 
 fn q14_consume_payload_batch(batch: RecordBatch, state: &mut Q14LateState) -> Result<Option<()>> {
@@ -5959,14 +5962,57 @@ fn q14_consume_payload_batch(batch: RecordBatch, state: &mut Q14LateState) -> Re
 
 fn q14_consume_payload_view(view: BatchView<'_>, state: &mut Q14LateState) -> Result<Option<()>> {
     if view.num_columns() == 3 {
-        let (Some(partkeys), Some(extendedprices), Some(discounts)) =
-            (view.i64(0), view.decimal128(1), view.decimal128(2))
-        else {
+        let (Some(partkeys), Some(extendedprices), Some(discounts)) = (
+            view.i64_vector(0),
+            view.decimal128_vector(1),
+            view.decimal128_vector(2),
+        ) else {
             return Ok(None);
         };
-        return q14_consume_payload_arrays(partkeys, extendedprices, discounts, state);
+        return q14_consume_payload_vectors(partkeys, extendedprices, discounts, state);
     }
-    q14_consume_payload_batch(view.record_batch().clone(), state)
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    q14_consume_payload_batch(batch.clone(), state)
+}
+
+fn q14_consume_payload_vectors(
+    partkeys: I64VectorView<'_>,
+    extendedprices: Decimal128VectorView<'_>,
+    discounts: Decimal128VectorView<'_>,
+    state: &mut Q14LateState,
+) -> Result<Option<()>> {
+    let (Some(partkey_values), Some(price_scale), Some(discount_scale)) = (
+        partkeys.values_if_null_free(),
+        extendedprices.scale_i64(),
+        discounts.scale_i64(),
+    ) else {
+        return Ok(None);
+    };
+    if extendedprices.null_count() != 0
+        || discounts.null_count() != 0
+        || extendedprices.precision() > 18
+        || discounts.precision() > 18
+    {
+        return Ok(None);
+    }
+    let revenue_scale = 1.0 / ((price_scale as f64) * (discount_scale as f64));
+    let extendedprice_values = extendedprices.raw_values();
+    let discount_values = discounts.raw_values();
+    for row in 0..partkey_values.len() {
+        let Some(is_promo) = state.promo_parts.get(partkey_values[row]) else {
+            continue;
+        };
+        let value = ((extendedprice_values[row] as i64)
+            * (discount_scale - discount_values[row] as i64)) as f64
+            * revenue_scale;
+        if is_promo {
+            state.promo += value;
+        }
+        state.total += value;
+    }
+    Ok(Some(()))
 }
 
 fn q14_consume_payload_arrays(
@@ -6041,8 +6087,8 @@ fn q06_late_materialized_revenue_sum_chunk(
         LateMaterializationPolicy::always(),
         state,
         |view, selection, state| {
-            q06_build_selection_batch(
-                view.record_batch().clone(),
+            q06_build_selection_view(
+                view,
                 start_days,
                 end_days,
                 discount_low,
@@ -6052,7 +6098,7 @@ fn q06_late_materialized_revenue_sum_chunk(
                 state,
             )
         },
-        |view, state| q06_consume_payload_batch(view.record_batch().clone(), state),
+        q06_consume_payload_view,
         |state, _metrics| {
             if state.discount_offset != state.selected_discounts.len() {
                 return Err(DodamError::UnsupportedSql(
@@ -6146,6 +6192,108 @@ fn q06_build_selection_batch(
     Ok(Some(()))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn q06_build_selection_view(
+    view: BatchView<'_>,
+    start_days: i32,
+    end_days: i32,
+    discount_low: f64,
+    discount_high: f64,
+    quantity_limit: f64,
+    selection: &mut LateSelectionBuilder,
+    state: &mut Q06LateState,
+) -> Result<Option<()>> {
+    if view.num_columns() == 3 {
+        let (Some(shipdates), Some(discounts), Some(quantities)) = (
+            view.date32_vector(0),
+            view.decimal128_vector(1),
+            view.decimal128_vector(2),
+        ) else {
+            return Ok(None);
+        };
+        return q06_build_selection_vectors(
+            shipdates,
+            discounts,
+            quantities,
+            start_days,
+            end_days,
+            discount_low,
+            discount_high,
+            quantity_limit,
+            selection,
+            state,
+        );
+    }
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    q06_build_selection_batch(
+        batch.clone(),
+        start_days,
+        end_days,
+        discount_low,
+        discount_high,
+        quantity_limit,
+        selection,
+        state,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q06_build_selection_vectors(
+    shipdates: Date32VectorView<'_>,
+    discounts: Decimal128VectorView<'_>,
+    quantities: Decimal128VectorView<'_>,
+    start_days: i32,
+    end_days: i32,
+    discount_low: f64,
+    discount_high: f64,
+    quantity_limit: f64,
+    selection: &mut LateSelectionBuilder,
+    state: &mut Q06LateState,
+) -> Result<Option<()>> {
+    let (Some(shipdate_values), Some(discount_scale_value), Some(quantity_scale_value)) = (
+        shipdates.values_if_null_free(),
+        discounts.scale_i64(),
+        quantities.scale_i64(),
+    ) else {
+        return Ok(None);
+    };
+    if discounts.null_count() != 0
+        || quantities.null_count() != 0
+        || discounts.precision() > 18
+        || quantities.precision() > 18
+    {
+        return Ok(None);
+    }
+    if let Some(existing) = state.discount_scale {
+        if existing != discount_scale_value {
+            return Ok(None);
+        }
+    } else {
+        state.discount_scale = Some(discount_scale_value);
+    }
+    let discount_low_raw = scaled_f64_to_i64(discount_low, discount_scale_value);
+    let discount_high_raw = scaled_f64_to_i64(discount_high, discount_scale_value);
+    let quantity_limit_raw = scaled_f64_to_i64(quantity_limit, quantity_scale_value);
+    let discount_values = discounts.raw_values();
+    let quantity_values = quantities.raw_values();
+    for row in 0..shipdate_values.len() {
+        let shipdate = shipdate_values[row];
+        let discount = discount_values[row] as i64;
+        let selected = shipdate >= start_days
+            && shipdate < end_days
+            && discount >= discount_low_raw
+            && discount <= discount_high_raw
+            && (quantity_values[row] as i64) < quantity_limit_raw;
+        if selected {
+            state.selected_discounts.push(discount);
+        }
+        selection.push(selected);
+    }
+    Ok(Some(()))
+}
+
 fn q06_consume_payload_batch(batch: RecordBatch, state: &mut Q06LateState) -> Result<Option<()>> {
     let extendedprice_index = physical_batch_column_index(&batch, "l_extendedprice")?;
     let Some(extendedprices) = batch
@@ -6175,6 +6323,53 @@ fn q06_consume_payload_batch(batch: RecordBatch, state: &mut Q06LateState) -> Re
         .ok_or_else(|| DodamError::UnsupportedSql("Q06 missing discount scale".to_string()))?;
     let revenue_scale = 1.0 / ((price_scale as f64) * (discount_scale as f64));
     for &extendedprice in extendedprices.values() {
+        let discount = *state
+            .selected_discounts
+            .get(state.discount_offset)
+            .ok_or_else(|| {
+                DodamError::UnsupportedSql("Q06 row selection payload mismatch".to_string())
+            })?;
+        state.sum += ((extendedprice as i64) * discount) as f64 * revenue_scale;
+        state.discount_offset += 1;
+    }
+    Ok(Some(()))
+}
+
+fn q06_consume_payload_view(view: BatchView<'_>, state: &mut Q06LateState) -> Result<Option<()>> {
+    if view.num_columns() == 1 {
+        let Some(extendedprices) = view.decimal128_vector(0) else {
+            return Ok(None);
+        };
+        return q06_consume_payload_vectors(extendedprices, state);
+    }
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    q06_consume_payload_batch(batch.clone(), state)
+}
+
+fn q06_consume_payload_vectors(
+    extendedprices: Decimal128VectorView<'_>,
+    state: &mut Q06LateState,
+) -> Result<Option<()>> {
+    if extendedprices.null_count() != 0 || extendedprices.precision() > 18 {
+        return Ok(None);
+    }
+    let Some(price_scale) = extendedprices.scale_i64() else {
+        return Ok(None);
+    };
+    if let Some(existing) = state.extendedprice_scale {
+        if existing != price_scale {
+            return Ok(None);
+        }
+    } else {
+        state.extendedprice_scale = Some(price_scale);
+    }
+    let discount_scale = state
+        .discount_scale
+        .ok_or_else(|| DodamError::UnsupportedSql("Q06 missing discount scale".to_string()))?;
+    let revenue_scale = 1.0 / ((price_scale as f64) * (discount_scale as f64));
+    for &extendedprice in extendedprices.raw_values() {
         let discount = *state
             .selected_discounts
             .get(state.discount_offset)
