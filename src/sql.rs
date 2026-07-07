@@ -8593,6 +8593,10 @@ async fn q11_important_stock_rows_late(
     supplier_keys: &AdaptiveI64Set,
 ) -> Result<Option<Vec<Q11Row>>> {
     let supplier_keys = Arc::new(supplier_keys.clone());
+    let max_dense_partkey = engine
+        .parquet_i64_column_max(path.clone(), "ps_partkey")
+        .await?
+        .and_then(|max_key| adaptive_dense_index(max_key, DEFAULT_MAX_DENSE_I64_KEY));
     let Some(chunks) = engine
         .late_materialized_parquet_map_pruned_with_policy_view(
             path,
@@ -8613,7 +8617,7 @@ async fn q11_important_stock_rows_late(
                 let supplier_keys = supplier_keys.clone();
                 move || Q11LateStockState {
                     supplier_keys: supplier_keys.clone(),
-                    values: fast_hash_map(),
+                    values: Vec::new(),
                     total: 0.0,
                 }
             },
@@ -8625,7 +8629,11 @@ async fn q11_important_stock_rows_late(
     else {
         return Ok(None);
     };
-    let mut values = fast_hash_map::<i64, f64>();
+    let mut dense_values = DenseI64F64Sum::new();
+    if let Some(max_partkey) = max_dense_partkey {
+        dense_values.reserve_dense_to(max_partkey);
+    }
+    let mut fallback_values = max_dense_partkey.is_none().then(fast_hash_map::<i64, f64>);
     let mut total = 0.0_f64;
     let mut metrics = LateMaterializedMetrics::default();
     for chunk in chunks {
@@ -8633,11 +8641,32 @@ async fn q11_important_stock_rows_late(
         let (chunk_values, chunk_total) = chunk.output;
         total += chunk_total;
         for (partkey, value) in chunk_values {
-            *values.entry(partkey).or_insert(0.0) += value;
+            if let Some(values) = fallback_values.as_mut() {
+                *values.entry(partkey).or_insert(0.0) += value;
+                continue;
+            }
+            let Some(index) = adaptive_dense_index(partkey, DEFAULT_MAX_DENSE_I64_KEY) else {
+                let mut values = fast_hash_map::<i64, f64>();
+                for (key, value) in std::mem::replace(&mut dense_values, DenseI64F64Sum::new())
+                    .into_filtered_hash(|_| true)
+                {
+                    values.insert(key, value);
+                }
+                fallback_values = Some(values);
+                let values = fallback_values.get_or_insert_with(fast_hash_map);
+                *values.entry(partkey).or_insert(0.0) += value;
+                continue;
+            };
+            dense_values.add_dense_index(index, value);
         }
     }
     q11_log_late_materialized_profile(metrics, q11_late_materialized_row_group_chunk());
-    Ok(Some(q11_rows_from_values(values, total)))
+    let rows = if let Some(values) = fallback_values {
+        q11_rows_from_values(values, total)
+    } else {
+        q11_rows_from_dense_values(dense_values, total)
+    };
+    Ok(Some(rows))
 }
 
 fn q11_rows_from_values(values: FastHashMap<i64, f64>, total: f64) -> Vec<Q11Row> {
@@ -8647,6 +8676,23 @@ fn q11_rows_from_values(values: FastHashMap<i64, f64>, total: f64) -> Vec<Q11Row
         .filter_map(|(ps_partkey, value)| {
             (value > threshold).then_some(Q11Row { ps_partkey, value })
         })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .value
+            .partial_cmp(&left.value)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.ps_partkey.cmp(&right.ps_partkey))
+    });
+    rows
+}
+
+fn q11_rows_from_dense_values(values: DenseI64F64Sum, total: f64) -> Vec<Q11Row> {
+    let threshold = total * 0.0001;
+    let mut rows = values
+        .into_filtered_hash(|value| value > threshold)
+        .into_iter()
+        .map(|(ps_partkey, value)| Q11Row { ps_partkey, value })
         .collect::<Vec<_>>();
     rows.sort_by(|left, right| {
         right
@@ -8703,7 +8749,7 @@ fn q11_log_late_materialized_profile(metrics: LateMaterializedMetrics, row_group
 
 struct Q11LateStockState {
     supplier_keys: Arc<AdaptiveI64Set>,
-    values: FastHashMap<i64, f64>,
+    values: Vec<(i64, f64)>,
     total: f64,
 }
 
@@ -8797,7 +8843,7 @@ fn q11_late_consume_stock_payload_batch(
         };
         let value = supplycost * availqty;
         state.total += value;
-        *state.values.entry(partkey).or_insert(0.0) += value;
+        state.values.push((partkey, value));
     }
     Ok(Some(()))
 }
@@ -8842,7 +8888,7 @@ fn q11_late_consume_stock_payload_vector_typed(
         {
             let value = (supplycost as f64 / supplycost_scale) * f64::from(availqty);
             state.total += value;
-            *state.values.entry(partkey).or_insert(0.0) += value;
+            state.values.push((partkey, value));
         }
         return;
     }
@@ -8853,7 +8899,7 @@ fn q11_late_consume_stock_payload_vector_typed(
         let value =
             (supplycost_values[row] as f64 / supplycost_scale) * f64::from(availqtys.value(row));
         state.total += value;
-        *state.values.entry(partkeys.value(row)).or_insert(0.0) += value;
+        state.values.push((partkeys.value(row), value));
     }
 }
 
@@ -8874,7 +8920,7 @@ fn q11_late_consume_stock_payload_typed(
         {
             let value = (supplycost as f64 / supplycost_scale) * f64::from(availqty);
             state.total += value;
-            *state.values.entry(partkey).or_insert(0.0) += value;
+            state.values.push((partkey, value));
         }
         return;
     }
@@ -8885,7 +8931,7 @@ fn q11_late_consume_stock_payload_typed(
         let value =
             (supplycost_values[row] as f64 / supplycost_scale) * f64::from(availqtys.value(row));
         state.total += value;
-        *state.values.entry(partkeys.value(row)).or_insert(0.0) += value;
+        state.values.push((partkeys.value(row), value));
     }
 }
 
