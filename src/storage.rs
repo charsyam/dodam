@@ -20,6 +20,7 @@ use parquet::arrow::arrow_reader::{
 use parquet::column::reader::{ColumnReader, ColumnReaderImpl};
 use parquet::data_type::{ByteArray, ByteArrayType, FixedLenByteArray};
 use parquet::errors::{ParquetError, Result as ParquetResult};
+use parquet::file::metadata::PageIndexPolicy;
 use parquet::file::reader::{ChunkReader, FileReader as ParquetFileReader, Length};
 use parquet::file::serialized_reader::SerializedFileReader;
 use parquet::file::statistics::Statistics;
@@ -63,6 +64,7 @@ impl ObjectStore for LocalFileSystemObjectStore {
 struct CachedMetadata {
     len: u64,
     modified: Option<SystemTime>,
+    page_index: bool,
     metadata: ArrowReaderMetadata,
 }
 
@@ -85,25 +87,28 @@ impl ParquetMetadataCache {
         let object_metadata = store.metadata(path)?;
         let len = object_metadata.len;
         let modified = object_metadata.modified;
+        let page_index = parquet_page_index_enabled();
 
         {
             let entries = self.entries.lock().expect("metadata cache lock");
             if let Some(entry) = entries.get(path)
                 && entry.len == len
                 && entry.modified == modified
+                && entry.page_index == page_index
             {
                 return Ok(entry.metadata.clone());
             }
         }
 
         let file = store.open(path)?;
-        let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
+        let metadata = ArrowReaderMetadata::load(&file, arrow_reader_options())?;
         let mut entries = self.entries.lock().expect("metadata cache lock");
         entries.insert(
             path.to_path_buf(),
             CachedMetadata {
                 len,
                 modified,
+                page_index,
                 metadata: metadata.clone(),
             },
         );
@@ -116,6 +121,19 @@ impl ParquetMetadataCache {
 
     pub fn is_empty(&self) -> bool {
         self.entries.lock().expect("metadata cache lock").is_empty()
+    }
+}
+
+fn parquet_page_index_enabled() -> bool {
+    !std::env::var("DODAM_PARQUET_PAGE_INDEX")
+        .is_ok_and(|value| matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
+}
+
+fn arrow_reader_options() -> ArrowReaderOptions {
+    if parquet_page_index_enabled() {
+        ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional)
+    } else {
+        ArrowReaderOptions::new()
     }
 }
 
@@ -2095,7 +2113,7 @@ fn metadata_with_dictionary_columns(
         })
         .collect::<Vec<_>>();
     let schema = Arc::new(Schema::new(fields));
-    let options = ArrowReaderOptions::new().with_schema(schema);
+    let options = arrow_reader_options().with_schema(schema);
     Ok(ArrowReaderMetadata::try_new(
         metadata.metadata().clone(),
         options,
