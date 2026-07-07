@@ -12,6 +12,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_cast::display::array_value_to_string;
 use dodam::copy::{CopyFileQuerySink, parse_copy_to_select};
 use dodam::engine::DodamEngine;
+use dodam::error::DodamError;
 use dodam::execution::RecordBatchSink;
 use dodam::sql::{QueryOutput, SqlSinkExecutionOptions, execute_sql, execute_sql_to_result_sink};
 use parquet::arrow::ArrowWriter;
@@ -1429,6 +1430,92 @@ async fn duckdb_differential_error_semantics_matrix() {
 }
 
 #[tokio::test]
+async fn dodam_sql_error_contract_matrix() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let facts_path = tempdir.path().join("facts.parquet");
+    let dim_path = tempdir.path().join("dim.parquet");
+    write_facts_parquet(&facts_path);
+    write_dim_parquet(&dim_path);
+
+    assert_dodam_unknown_column(
+        &format!("SELECT missing FROM '{}'", facts_path.display()),
+        "missing",
+    )
+    .await;
+    assert_dodam_unknown_column(
+        &format!(
+            "SELECT id FROM '{}' WHERE missing = 1",
+            facts_path.display()
+        ),
+        "missing",
+    )
+    .await;
+    assert_dodam_unknown_column(
+        &format!("SELECT id FROM '{}' ORDER BY missing", facts_path.display()),
+        "missing",
+    )
+    .await;
+    assert_dodam_error_contains(
+        &format!(
+            "SELECT key FROM '{}' f JOIN '{}' d ON f.key = d.key",
+            facts_path.display(),
+            dim_path.display()
+        ),
+        "ambiguous column key",
+    )
+    .await;
+    assert_dodam_error_contains(
+        &format!("SELECT z.id FROM '{}' f", facts_path.display()),
+        "unknown table qualifier: z",
+    )
+    .await;
+    assert_dodam_error_contains(
+        &format!(
+            "SELECT id FROM '{}' WHERE id = (SELECT id FROM '{}' WHERE key = 2)",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        "scalar subquery must return at most one row",
+    )
+    .await;
+    assert_dodam_error_contains(
+        &format!(
+            "SELECT key, count(*) FROM '{}' GROUP BY ALL",
+            facts_path.display()
+        ),
+        "GROUP BY ALL",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn dodam_copy_error_contract_matrix() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let facts_path = tempdir.path().join("facts.parquet");
+    let output_path = tempdir.path().join("bad.parquet");
+    write_facts_parquet(&facts_path);
+
+    assert_dodam_copy_error_contains(
+        &format!(
+            "COPY (SELECT id FROM '{}') TO '{}' (FORMAT parquet, COMPRESSION brotli)",
+            facts_path.display(),
+            output_path.display()
+        ),
+        "COPY PARQUET COMPRESSION BROTLI is not supported",
+    )
+    .await;
+    assert_dodam_copy_error_contains(
+        &format!(
+            "COPY (SELECT id FROM '{}') TO '{}' (FORMAT parquet, ROW_GROUP_SIZE 0)",
+            facts_path.display(),
+            output_path.display()
+        ),
+        "ROW_GROUP_SIZE expects a positive integer",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn duckdb_differential_extended_type_matrix() {
     let Some(_duckdb) = DuckDbGuard::new() else {
         return;
@@ -2012,10 +2099,43 @@ async fn assert_both_error(dodam_sql: &str, duckdb_sql: &str, tempdir: &Path) {
     );
 }
 
+async fn assert_dodam_unknown_column(sql: &str, expected_column: &str) {
+    let error = run_dodam_error(sql).await;
+    match error {
+        DodamError::UnknownColumn(column) => assert_eq!(column, expected_column, "\nSQL:\n{sql}"),
+        other => panic!("expected UnknownColumn({expected_column}), got {other}\n\nSQL:\n{sql}"),
+    }
+}
+
+async fn assert_dodam_error_contains(sql: &str, expected: &str) {
+    let error = run_dodam_error(sql).await.to_string();
+    assert!(
+        error.contains(expected),
+        "expected Dodam error to contain {expected:?}, got {error:?}\n\nSQL:\n{sql}"
+    );
+}
+
+async fn assert_dodam_copy_error_contains(sql: &str, expected: &str) {
+    let error = run_dodam_copy_result(sql)
+        .await
+        .expect_err("Dodam COPY should fail");
+    assert!(
+        error.contains(expected),
+        "expected Dodam COPY error to contain {expected:?}, got {error:?}\n\nSQL:\n{sql}"
+    );
+}
+
 async fn run_dodam(sql: &str) -> Vec<String> {
     run_dodam_result(sql)
         .await
         .unwrap_or_else(|error| panic!("execute dodam sql failed:\n{sql}\n\n{error}"))
+}
+
+async fn run_dodam_error(sql: &str) -> DodamError {
+    match execute_sql(&DodamEngine::default(), sql, BATCH_SIZE).await {
+        Ok(_) => panic!("Dodam query should fail:\n{sql}"),
+        Err(error) => error,
+    }
 }
 
 async fn run_dodam_result(sql: &str) -> std::result::Result<Vec<String>, String> {
@@ -2089,6 +2209,31 @@ async fn run_dodam_copy(sql: &str) {
     .await
     .expect("execute COPY query");
     sink.finish().expect("finish COPY sink");
+}
+
+async fn run_dodam_copy_result(sql: &str) -> std::result::Result<(), String> {
+    let Some(copy) = parse_copy_to_select(sql).map_err(|error| error.to_string())? else {
+        return Err("expected COPY statement".to_string());
+    };
+    let mut sink = CopyFileQuerySink::new(
+        &copy.path,
+        copy.format,
+        copy.header,
+        copy.parquet_options,
+        None,
+        false,
+    )
+    .map_err(|error| error.to_string())?;
+    execute_sql_to_result_sink(
+        &DodamEngine::default(),
+        &copy.sql,
+        BATCH_SIZE,
+        &mut sink,
+        SqlSinkExecutionOptions::default(),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    sink.finish().map_err(|error| error.to_string())
 }
 
 fn canonical_rows(batches: &[RecordBatch]) -> Vec<String> {

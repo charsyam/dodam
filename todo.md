@@ -245,6 +245,12 @@
   - Added DuckDB differential coverage for aggregate queries filtered by scalar aggregate subqueries and `NOT IN (SELECT ...)` with `NULL` RHS semantics.
   - Added Parquet COPY schema fidelity coverage for decimal, date, timestamp, and boolean output, while keeping timestamp display normalization separate from raw schema checks.
   - Added long randomized differential replay knobs: `DODAM_LONG_DIFF_SEED`, `DODAM_LONG_DIFF_SEEDS`, `DODAM_LONG_DIFF_CASES`, and `DODAM_LONG_DIFF_CASE`.
+- Added explicit negative/error contract coverage:
+  - unknown projection/filter/order columns must return `UnknownColumn`
+  - ambiguous unqualified join columns must explain ambiguity
+  - unknown join/table qualifiers must be reported clearly
+  - scalar subqueries returning multiple rows must fail with a SQL-compatible error
+  - invalid COPY Parquet options must return Dodam errors instead of panicking inside the Parquet writer
 
 ### Performance Work
 

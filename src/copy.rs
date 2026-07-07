@@ -317,11 +317,17 @@ fn parse_copy_bool(value: &str) -> Result<bool> {
 }
 
 fn parse_copy_usize(value: &str, option_name: &str) -> Result<usize> {
-    clean_copy_option_value(value)
+    let value = clean_copy_option_value(value)
         .parse::<usize>()
         .map_err(|_| {
             DodamError::UnsupportedSql(format!("{option_name} expects a positive integer"))
-        })
+        })?;
+    if value == 0 {
+        return Err(DodamError::UnsupportedSql(format!(
+            "{option_name} expects a positive integer"
+        )));
+    }
+    Ok(value)
 }
 
 fn ident_eq(ident: &Ident, expected: &str) -> bool {

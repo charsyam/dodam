@@ -35165,9 +35165,7 @@ impl<'a> ColumnResolver<'a> {
 
     fn infer_unqualified_join_bound(&self, column: &str) -> Result<BoundColumn> {
         let Some((prefix, _)) = column.split_once('_') else {
-            return Err(DodamError::UnsupportedSql(format!(
-                "expected qualified column, got {column}"
-            )));
+            return Err(ambiguous_column(column));
         };
         if matches!(prefix.to_ascii_lowercase().as_str(), "supplier" | "total")
             && self
