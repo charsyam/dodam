@@ -5215,6 +5215,49 @@ impl LateSelectionBuilder {
         );
     }
 
+    pub fn push_selected_offsets<I>(&mut self, row_count: usize, selected_offsets: I)
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        let mut consumed = 0usize;
+        let mut appended_selected = 0usize;
+        for selected_offset in selected_offsets {
+            if selected_offset >= row_count || selected_offset < consumed {
+                continue;
+            }
+            let skipped = selected_offset - consumed;
+            if skipped > 0 {
+                append_late_selector_run(
+                    &mut self.selectors,
+                    &mut self.current_selected,
+                    &mut self.run_len,
+                    false,
+                    skipped,
+                );
+            }
+            append_late_selector_run(
+                &mut self.selectors,
+                &mut self.current_selected,
+                &mut self.run_len,
+                true,
+                1,
+            );
+            consumed = selected_offset + 1;
+            appended_selected += 1;
+        }
+        if consumed < row_count {
+            append_late_selector_run(
+                &mut self.selectors,
+                &mut self.current_selected,
+                &mut self.run_len,
+                false,
+                row_count - consumed,
+            );
+        }
+        self.total_rows += row_count;
+        self.selected_rows += appended_selected;
+    }
+
     fn finish(mut self) -> (Option<RowSelection>, LateMaterializedMetrics) {
         finish_late_selector_run(&mut self.selectors, self.current_selected, self.run_len);
         let metrics = LateMaterializedMetrics {
@@ -6402,8 +6445,21 @@ fn push_late_selector_run(
     run_len: &mut usize,
     selected: bool,
 ) {
+    append_late_selector_run(selectors, current_selected, run_len, selected, 1);
+}
+
+fn append_late_selector_run(
+    selectors: &mut Vec<RowSelector>,
+    current_selected: &mut Option<bool>,
+    run_len: &mut usize,
+    selected: bool,
+    len: usize,
+) {
+    if len == 0 {
+        return;
+    }
     match *current_selected {
-        Some(current) if current == selected => *run_len += 1,
+        Some(current) if current == selected => *run_len += len,
         Some(current) => {
             selectors.push(if current {
                 RowSelector::select(*run_len)
@@ -6411,11 +6467,11 @@ fn push_late_selector_run(
                 RowSelector::skip(*run_len)
             });
             *current_selected = Some(selected);
-            *run_len = 1;
+            *run_len = len;
         }
         None => {
             *current_selected = Some(selected);
-            *run_len = 1;
+            *run_len = len;
         }
     }
 }

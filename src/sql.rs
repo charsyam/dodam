@@ -18508,7 +18508,12 @@ async fn q04_count_late_candidate_priorities_late_materialized(
 }
 
 fn q04_lineitem_late_materialized_enabled() -> bool {
-    std::env::var_os("DODAM_Q04_ENABLE_LINEITEM_LATE_MATERIALIZE").is_some()
+    if std::env::var("DODAM_Q04_DISABLE_LINEITEM_LATE_MATERIALIZE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return false;
+    }
+    true
 }
 
 fn q04_lineitem_late_materialized_row_group_chunk() -> usize {
@@ -18554,7 +18559,8 @@ fn q04_lineitem_late_build_selection_batch(
         return Ok(None);
     };
     if orderkeys.null_count() == 0 {
-        for &orderkey in orderkeys.values() {
+        let mut selected_offsets = Vec::new();
+        for (row, &orderkey) in orderkeys.values().iter().enumerate() {
             let selected = usize::try_from(orderkey)
                 .ok()
                 .and_then(|index| {
@@ -18565,12 +18571,11 @@ fn q04_lineitem_late_build_selection_batch(
                 })
                 .filter(|(_, marker)| marker.load(Ordering::Relaxed) != 0);
             if let Some((index, _)) = selected {
-                selection.push(true);
+                selected_offsets.push(row);
                 state.selected_orderkeys.push(index);
-            } else {
-                selection.push(false);
             }
         }
+        selection.push_selected_offsets(orderkeys.len(), selected_offsets);
         return Ok(Some(()));
     }
     for row in 0..orderkeys.len() {
@@ -18607,7 +18612,8 @@ fn q04_lineitem_late_build_selection_view(
             return Ok(None);
         };
         if let Some(orderkey_values) = orderkeys.values_if_null_free() {
-            for &orderkey in orderkey_values {
+            let mut selected_offsets = Vec::new();
+            for (row, &orderkey) in orderkey_values.iter().enumerate() {
                 let selected = usize::try_from(orderkey)
                     .ok()
                     .and_then(|index| {
@@ -18618,12 +18624,11 @@ fn q04_lineitem_late_build_selection_view(
                     })
                     .filter(|(_, marker)| marker.load(Ordering::Relaxed) != 0);
                 if let Some((index, _)) = selected {
-                    selection.push(true);
+                    selected_offsets.push(row);
                     state.selected_orderkeys.push(index);
-                } else {
-                    selection.push(false);
                 }
             }
+            selection.push_selected_offsets(orderkey_values.len(), selected_offsets);
             return Ok(Some(()));
         }
         for row in 0..orderkeys.len() {
@@ -18666,13 +18671,15 @@ fn q04_lineitem_late_consume_dates_batch(
         receiptdates.as_any().downcast_ref::<Date32Array>(),
     ) {
         if commitdates.null_count() == 0 && receiptdates.null_count() == 0 {
-            for row in 0..commitdates.len() {
-                let Some(&orderkey) = state.selected_orderkeys.get(state.payload_offset) else {
-                    return Err(DodamError::UnsupportedSql(
-                        "Q04 lineitem payload row overflow".to_string(),
-                    ));
-                };
-                state.payload_offset += 1;
+            let end = state.payload_offset.saturating_add(commitdates.len());
+            if end > state.selected_orderkeys.len() {
+                return Err(DodamError::UnsupportedSql(
+                    "Q04 lineitem payload row overflow".to_string(),
+                ));
+            }
+            let orderkeys = &state.selected_orderkeys[state.payload_offset..end];
+            state.payload_offset = end;
+            for (row, &orderkey) in orderkeys.iter().enumerate() {
                 if commitdates.value(row) >= receiptdates.value(row) {
                     continue;
                 }
@@ -18743,14 +18750,20 @@ fn q04_lineitem_late_consume_date_vectors(
     ) else {
         return Ok(false);
     };
-    for row in 0..commit_values.len() {
-        let Some(&orderkey) = state.selected_orderkeys.get(state.payload_offset) else {
-            return Err(DodamError::UnsupportedSql(
-                "Q04 lineitem payload row overflow".to_string(),
-            ));
-        };
-        state.payload_offset += 1;
-        if commit_values[row] >= receipt_values[row] {
+    let end = state.payload_offset.saturating_add(commit_values.len());
+    if end > state.selected_orderkeys.len() {
+        return Err(DodamError::UnsupportedSql(
+            "Q04 lineitem payload row overflow".to_string(),
+        ));
+    }
+    let orderkeys = &state.selected_orderkeys[state.payload_offset..end];
+    state.payload_offset = end;
+    for ((&commit_value, &receipt_value), &orderkey) in commit_values
+        .iter()
+        .zip(receipt_values.iter())
+        .zip(orderkeys.iter())
+    {
+        if commit_value >= receipt_value {
             continue;
         }
         let Some(marker) = state.candidate_priorities.get(orderkey) else {
