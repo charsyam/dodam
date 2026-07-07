@@ -10019,8 +10019,13 @@ fn q16_supplier_counts_packed_view(
     {
         return Ok(());
     }
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "Q16 packed supplier-count raw vector columns have unsupported types".to_string(),
+        ));
+    };
     q16_supplier_counts_packed_batch(
-        view.record_batch().clone(),
+        batch.clone(),
         part_to_group,
         bad_suppliers,
         distinct_suppliers,
@@ -10144,8 +10149,13 @@ fn q16_supplier_counts_bitset_view(
     {
         return Ok(());
     }
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "Q16 bitset supplier-count raw vector columns have unsupported types".to_string(),
+        ));
+    };
     q16_supplier_counts_bitset_batch(
-        view.record_batch().clone(),
+        batch.clone(),
         part_to_group,
         bad_suppliers,
         distinct_suppliers,
@@ -10234,7 +10244,12 @@ fn q16_supplier_counts_view(
     {
         return Ok(groups);
     }
-    q16_supplier_counts_batch(view.record_batch().clone(), part_to_group, bad_suppliers)
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "Q16 supplier-count raw vector columns have unsupported types".to_string(),
+        ));
+    };
+    q16_supplier_counts_batch(batch.clone(), part_to_group, bad_suppliers)
 }
 
 fn q16_supplier_counts_typed(
