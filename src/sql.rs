@@ -5611,8 +5611,12 @@ async fn q02_min_cost_rows(
             None,
         )
         .await?;
-    let part_keys = Arc::new(parts.keys().copied().collect::<HashSet<_>>());
-    let supplier_keys = Arc::new(suppliers.keys().copied().collect::<HashSet<_>>());
+    let part_keys = Arc::new(AdaptiveI64Set::from_hash(
+        parts.keys().copied().collect::<HashSet<_>>(),
+    ));
+    let supplier_keys = Arc::new(AdaptiveI64Set::from_hash(
+        suppliers.keys().copied().collect::<HashSet<_>>(),
+    ));
     let (min_costs, candidates) = parallel_batch_fold_view_chunks(
         &mut stream,
         4,
@@ -5680,8 +5684,8 @@ impl Q02PartsuppPartial {
 
 fn q02_partsupp_min_cost_batch(
     batch: RecordBatch,
-    part_keys: &HashSet<i64>,
-    supplier_keys: &HashSet<i64>,
+    part_keys: &AdaptiveI64Set,
+    supplier_keys: &AdaptiveI64Set,
 ) -> Result<Q02PartsuppPartial> {
     let partkeys = batch_column(&batch, "ps_partkey")?;
     let suppkeys = batch_column(&batch, "ps_suppkey")?;
@@ -5704,7 +5708,7 @@ fn q02_partsupp_min_cost_batch(
         ) else {
             continue;
         };
-        if !part_keys.contains(&partkey) || !supplier_keys.contains(&suppkey) {
+        if !part_keys.contains(partkey) || !supplier_keys.contains(suppkey) {
             continue;
         }
         q02_push_partsupp_candidate(&mut partial, partkey, suppkey, supplycost);
@@ -5714,8 +5718,8 @@ fn q02_partsupp_min_cost_batch(
 
 fn q02_partsupp_min_cost_view(
     view: BatchView<'_>,
-    part_keys: &HashSet<i64>,
-    supplier_keys: &HashSet<i64>,
+    part_keys: &AdaptiveI64Set,
+    supplier_keys: &AdaptiveI64Set,
 ) -> Result<Q02PartsuppPartial> {
     if view.num_columns() == 3
         && let (Some(partkeys), Some(suppkeys), Some(supplycosts)) = (
@@ -5735,7 +5739,7 @@ fn q02_partsupp_min_cost_view(
             for row in 0..partkey_values.len() {
                 let partkey = partkey_values[row];
                 let suppkey = suppkey_values[row];
-                if !part_keys.contains(&partkey) || !supplier_keys.contains(&suppkey) {
+                if !part_keys.contains(partkey) || !supplier_keys.contains(suppkey) {
                     continue;
                 }
                 q02_push_partsupp_candidate(
@@ -5753,7 +5757,7 @@ fn q02_partsupp_min_cost_view(
             }
             let partkey = partkeys.value(row);
             let suppkey = suppkeys.value(row);
-            if !part_keys.contains(&partkey) || !supplier_keys.contains(&suppkey) {
+            if !part_keys.contains(partkey) || !supplier_keys.contains(suppkey) {
                 continue;
             }
             q02_push_partsupp_candidate(&mut partial, partkey, suppkey, supplycosts.value(row));
@@ -5772,8 +5776,8 @@ fn q02_partsupp_min_cost_batch_typed(
     partkeys: &ArrayRef,
     suppkeys: &ArrayRef,
     supplycosts: &ArrayRef,
-    part_keys: &HashSet<i64>,
-    supplier_keys: &HashSet<i64>,
+    part_keys: &AdaptiveI64Set,
+    supplier_keys: &AdaptiveI64Set,
 ) -> Result<Option<Q02PartsuppPartial>> {
     let (Some(partkeys), Some(suppkeys), Some(supplycosts)) = (
         partkeys.as_any().downcast_ref::<Int64Array>(),
@@ -5789,7 +5793,7 @@ fn q02_partsupp_min_cost_batch_typed(
         }
         let partkey = partkeys.value(row);
         let suppkey = suppkeys.value(row);
-        if !part_keys.contains(&partkey) || !supplier_keys.contains(&suppkey) {
+        if !part_keys.contains(partkey) || !supplier_keys.contains(suppkey) {
             continue;
         }
         q02_push_partsupp_candidate(&mut partial, partkey, suppkey, supplycosts.value(row));
