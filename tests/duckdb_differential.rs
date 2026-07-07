@@ -1262,6 +1262,40 @@ async fn duckdb_differential_scalar_subquery_edge_matrix() {
 }
 
 #[tokio::test]
+async fn duckdb_differential_seeded_randomized_smoke() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let facts_path = tempdir.path().join("facts.parquet");
+    let types_path = tempdir.path().join("types.parquet");
+    write_facts_parquet(&facts_path);
+    write_types_parquet(&types_path);
+
+    const SEED: u64 = 0xD0DA_2026_0001;
+    let mut rng = TestRng::new(SEED);
+    let cases = (0..96)
+        .map(|case_id| {
+            if rng.chance(3, 5) {
+                random_facts_query(&mut rng, &facts_path, case_id)
+            } else {
+                random_types_query(&mut rng, &types_path, case_id)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for case in cases {
+        assert_same_as_duckdb_case(
+            &format!("seed={SEED:#x} case={}", case.case_id),
+            &case.dodam_sql,
+            &case.duckdb_sql,
+            tempdir.path(),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
 async fn duckdb_differential_copy_parquet_readback() {
     let Some(_duckdb) = DuckDbGuard::new() else {
         return;
@@ -1354,11 +1388,20 @@ async fn dodam_copy_csv_header_and_escaping() {
 }
 
 async fn assert_same_as_duckdb(dodam_sql: &str, duckdb_sql: &str, tempdir: &Path) {
+    assert_same_as_duckdb_case("", dodam_sql, duckdb_sql, tempdir).await;
+}
+
+async fn assert_same_as_duckdb_case(
+    case_name: &str,
+    dodam_sql: &str,
+    duckdb_sql: &str,
+    tempdir: &Path,
+) {
     let dodam_rows = run_dodam(dodam_sql).await;
     let duckdb_rows = run_duckdb(duckdb_sql, tempdir);
     assert_eq!(
         dodam_rows, duckdb_rows,
-        "\nDodam SQL:\n{dodam_sql}\n\nDuckDB SQL:\n{duckdb_sql}"
+        "\nCase:\n{case_name}\n\nDodam SQL:\n{dodam_sql}\n\nDuckDB SQL:\n{duckdb_sql}"
     );
 }
 
@@ -1460,6 +1503,141 @@ fn canonical_rows(batches: &[RecordBatch]) -> Vec<String> {
         }
     }
     rows
+}
+
+struct GeneratedSql {
+    case_id: usize,
+    dodam_sql: String,
+    duckdb_sql: String,
+}
+
+struct TestRng {
+    state: u64,
+}
+
+impl TestRng {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self
+            .state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        self.state
+    }
+
+    fn index(&mut self, len: usize) -> usize {
+        (self.next_u64() as usize) % len
+    }
+
+    fn chance(&mut self, numerator: u64, denominator: u64) -> bool {
+        self.next_u64() % denominator < numerator
+    }
+
+    fn choose<'a>(&mut self, values: &'a [&'a str]) -> &'a str {
+        values[self.index(values.len())]
+    }
+}
+
+fn random_facts_query(rng: &mut TestRng, facts_path: &Path, case_id: usize) -> GeneratedSql {
+    let dodam_table = format!("'{}'", facts_path.display());
+    let duckdb_table = format!("read_parquet('{}')", facts_path.display());
+    let (dodam_predicate, duckdb_predicate) = random_facts_predicate(rng, facts_path, "f");
+
+    let (dodam_sql, duckdb_sql) = if rng.chance(1, 4) {
+        (
+            format!(
+                "SELECT key, count(*), count(value), sum(value), avg(value), min(payload), max(payload) FROM {dodam_table} f WHERE {dodam_predicate} GROUP BY key ORDER BY key"
+            ),
+            format!(
+                "SELECT key, count(*), count(value), sum(value), avg(value), min(payload), max(payload) FROM {duckdb_table} f WHERE {duckdb_predicate} GROUP BY key ORDER BY key"
+            ),
+        )
+    } else {
+        let projection = rng.choose(&[
+            "id, key, value, payload",
+            "id, key, COALESCE(payload, 'missing') AS payload_text",
+            "id, id + 1 AS id_plus, value",
+            "id, value * 2 AS doubled_value, payload",
+            "id, CASE WHEN key IS NULL THEN 'null-key' WHEN key = 2 THEN 'two' ELSE 'other' END AS key_class",
+        ]);
+        (
+            format!("SELECT {projection} FROM {dodam_table} f WHERE {dodam_predicate} ORDER BY id"),
+            format!(
+                "SELECT {projection} FROM {duckdb_table} f WHERE {duckdb_predicate} ORDER BY id"
+            ),
+        )
+    };
+
+    GeneratedSql {
+        case_id,
+        dodam_sql,
+        duckdb_sql,
+    }
+}
+
+fn random_facts_predicate(
+    rng: &mut TestRng,
+    facts_path: &Path,
+    outer_alias: &str,
+) -> (String, String) {
+    let dodam_table = format!("'{}'", facts_path.display());
+    let duckdb_table = format!("read_parquet('{}')", facts_path.display());
+    let predicate = rng.choose(&[
+        "true",
+        "key IS NULL",
+        "key IS NOT NULL",
+        "value IS NULL OR key = 2",
+        "payload IS NOT NULL AND NOT (key = 2)",
+        "key IN (1, 3)",
+        "key IN (2, NULL) OR id = 1",
+        "key NOT IN (1, NULL) OR id = 1",
+        "id >= 2 AND id <= 5",
+        "COALESCE(payload, 'missing') <> 'missing'",
+        "id IN (SELECT id FROM facts_sub WHERE key = 3)",
+        "id = (SELECT key FROM facts_sub WHERE key = 3 ORDER BY id LIMIT 1)",
+        "EXISTS (SELECT 1 FROM facts_sub f2 WHERE f2.key = outer_key AND f2.value IS NOT NULL)",
+    ]);
+    (
+        predicate
+            .replace("facts_sub", &dodam_table)
+            .replace("outer_key", &format!("{outer_alias}.key")),
+        predicate
+            .replace("facts_sub", &duckdb_table)
+            .replace("outer_key", &format!("{outer_alias}.key")),
+    )
+}
+
+fn random_types_query(rng: &mut TestRng, types_path: &Path, case_id: usize) -> GeneratedSql {
+    let dodam_table = format!("'{}'", types_path.display());
+    let duckdb_table = format!("read_parquet('{}')", types_path.display());
+    let predicate = rng.choose(&[
+        "true",
+        "flag = true OR flag IS NULL",
+        "score >= -1.0",
+        "amount >= '-7.0000' AND amount <= '123.4500'",
+        "created_at >= '2024-01-02 00:00:00' OR created_at IS NULL",
+        "created_at_utc = '1970-01-01 09:00:00+09:00' OR id = 1",
+        "event_date < '2024-01-02' OR event_date IS NULL",
+        "substring(note FROM 1 FOR 1) IN ('a', 'g') OR id = 4",
+        "COALESCE(note, 'fallback') <> 'fallback'",
+    ]);
+    let projection = rng.choose(&[
+        "id, flag, score, note, amount, event_date",
+        "id, COALESCE(note, 'fallback') AS note_text",
+        "id, id + 10 AS plus_ten, CAST(id AS VARCHAR) AS id_text",
+        "id, lower(note) AS lower_note, upper(note) AS upper_note, length(note) AS note_len",
+        "id, CASE WHEN amount IS NULL THEN 'missing' WHEN amount < 0 THEN 'negative' ELSE 'nonnegative' END AS amount_class",
+    ]);
+    GeneratedSql {
+        case_id,
+        dodam_sql: format!("SELECT {projection} FROM {dodam_table} WHERE {predicate} ORDER BY id"),
+        duckdb_sql: format!(
+            "SELECT {projection} FROM {duckdb_table} WHERE {predicate} ORDER BY id"
+        ),
+    }
 }
 
 fn write_facts_parquet(path: &Path) {
