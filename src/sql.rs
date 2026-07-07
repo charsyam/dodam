@@ -6938,13 +6938,13 @@ fn q09_late_build_partkey_selection_view(
     state: &mut Q09LateProfitState,
 ) -> Result<Option<()>> {
     if view.num_columns() == 1 {
-        let Some(partkeys) = view.i64(0) else {
+        let Some(partkeys) = view.i64_vector(0) else {
             return Ok(None);
         };
         let dense_part_keys = state.part_keys.dense_contains_slice();
         state.partial.profile.rows += partkeys.len();
-        if partkeys.null_count() == 0 {
-            for &partkey in partkeys.values() {
+        if let Some(partkey_values) = partkeys.values_if_null_free() {
+            for &partkey in partkey_values {
                 let selected =
                     adaptive_i64_set_contains_cached(&state.part_keys, dense_part_keys, partkey);
                 selection.push(selected);
@@ -6956,7 +6956,7 @@ fn q09_late_build_partkey_selection_view(
             return Ok(Some(()));
         }
         for row in 0..partkeys.len() {
-            let selected = partkeys.is_valid(row)
+            let selected = !partkeys.is_null(row)
                 && adaptive_i64_set_contains_cached(
                     &state.part_keys,
                     dense_part_keys,
@@ -6970,7 +6970,10 @@ fn q09_late_build_partkey_selection_view(
         }
         return Ok(Some(()));
     }
-    q09_late_build_partkey_selection_batch(view.record_batch().clone(), selection, state)
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    q09_late_build_partkey_selection_batch(batch.clone(), selection, state)
 }
 
 fn q09_late_consume_profit_payload_batch(
@@ -7049,14 +7052,21 @@ fn q09_late_consume_profit_payload_view(
     state: &mut Q09LateProfitState,
 ) -> Result<Option<()>> {
     if view.num_columns() == 5
-        && let (Ok(orderkeys), Ok(suppkeys)) = (view.required_i64(0), view.required_i64(1))
-        && let (Some(quantities), Some(extendedprices), Some(discounts)) = (
-            decimal_input(view.column(2)?)?,
-            decimal_input(view.column(3)?)?,
-            decimal_input(view.column(4)?)?,
+        && let (
+            Some(orderkeys),
+            Some(suppkeys),
+            Some(quantities),
+            Some(extendedprices),
+            Some(discounts),
+        ) = (
+            view.i64_vector(0),
+            view.i64_vector(1),
+            view.decimal128_vector(2),
+            view.decimal128_vector(3),
+            view.decimal128_vector(4),
         )
     {
-        q09_late_consume_profit_decimal_batch(
+        q09_late_consume_profit_decimal_view(
             orderkeys,
             suppkeys,
             quantities,
@@ -7066,7 +7076,10 @@ fn q09_late_consume_profit_payload_view(
         )?;
         return Ok(Some(()));
     }
-    q09_late_consume_profit_payload_batch(view.record_batch().clone(), state)
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    q09_late_consume_profit_payload_batch(batch.clone(), state)
 }
 
 fn q09_late_consume_profit_decimal_batch(
@@ -7157,6 +7170,97 @@ fn q09_late_consume_profit_decimal_batch(
             * (discount_scale - discount_values[row] as f64)
             * revenue_scale
             - supplycost * (quantity_values[row] as f64) * quantity_scale;
+        state.partial.profile.amount_rows += 1;
+        state.partial.groups.add(nationkey, o_year, amount);
+    }
+    Ok(())
+}
+
+fn q09_late_consume_profit_decimal_view(
+    orderkeys: I64VectorView<'_>,
+    suppkeys: I64VectorView<'_>,
+    quantities: Decimal128VectorView<'_>,
+    extendedprices: Decimal128VectorView<'_>,
+    discounts: Decimal128VectorView<'_>,
+    state: &mut Q09LateProfitState,
+) -> Result<()> {
+    let dense_order_years = state.order_years.dense_slice();
+    let quantity_values = quantities.raw_values();
+    let extendedprice_values = extendedprices.raw_values();
+    let discount_values = discounts.raw_values();
+    let discount_scale = discounts.scale();
+    let revenue_scale = 1.0 / (extendedprices.scale() * discount_scale);
+    let quantity_scale = 1.0 / quantities.scale();
+    if let (Some(orderkey_values), Some(suppkey_values)) = (
+        orderkeys.values_if_null_free(),
+        suppkeys.values_if_null_free(),
+    ) && quantities.null_count() == 0
+        && extendedprices.null_count() == 0
+        && discounts.null_count() == 0
+    {
+        for row in 0..orderkey_values.len() {
+            let Some(&partkey) = state.selected_partkeys.get(state.partkey_offset) else {
+                return Err(DodamError::UnsupportedSql(
+                    "Q09 row selection payload overflow".to_string(),
+                ));
+            };
+            state.partkey_offset += 1;
+            let orderkey = orderkey_values[row];
+            let suppkey = suppkey_values[row];
+            let Some(o_year) = q09_order_year_get(&state.order_years, dense_order_years, orderkey)
+            else {
+                continue;
+            };
+            state.partial.profile.order_hits += 1;
+            let Some(nationkey) = state.supplier_nations.get(suppkey) else {
+                continue;
+            };
+            state.partial.profile.supplier_hits += 1;
+            let Some(supplycost) = state.supply_costs.get(partkey, suppkey) else {
+                continue;
+            };
+            state.partial.profile.supply_hits += 1;
+            let amount = (extendedprice_values[row] as f64)
+                * (discount_scale - discount_values[row] as f64)
+                * revenue_scale
+                - supplycost * (quantity_values[row] as f64) * quantity_scale;
+            state.partial.profile.amount_rows += 1;
+            state.partial.groups.add(nationkey, o_year, amount);
+        }
+        return Ok(());
+    }
+    for row in 0..orderkeys.len() {
+        let Some(&partkey) = state.selected_partkeys.get(state.partkey_offset) else {
+            return Err(DodamError::UnsupportedSql(
+                "Q09 row selection payload overflow".to_string(),
+            ));
+        };
+        state.partkey_offset += 1;
+        if orderkeys.is_null(row)
+            || suppkeys.is_null(row)
+            || quantities.is_null(row)
+            || extendedprices.is_null(row)
+            || discounts.is_null(row)
+        {
+            continue;
+        }
+        let orderkey = orderkeys.value(row);
+        let suppkey = suppkeys.value(row);
+        let Some(o_year) = q09_order_year_get(&state.order_years, dense_order_years, orderkey)
+        else {
+            continue;
+        };
+        state.partial.profile.order_hits += 1;
+        let Some(nationkey) = state.supplier_nations.get(suppkey) else {
+            continue;
+        };
+        state.partial.profile.supplier_hits += 1;
+        let Some(supplycost) = state.supply_costs.get(partkey, suppkey) else {
+            continue;
+        };
+        state.partial.profile.supply_hits += 1;
+        let amount = extendedprices.value(row) * (1.0 - discounts.value(row))
+            - supplycost * quantities.value(row);
         state.partial.profile.amount_rows += 1;
         state.partial.groups.add(nationkey, o_year, amount);
     }
