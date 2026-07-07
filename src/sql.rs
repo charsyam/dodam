@@ -21106,17 +21106,17 @@ fn q07_late_build_selection_view(
     end_days: i32,
 ) -> Result<Option<()>> {
     if view.num_columns() == 3
-        && let (Ok(orderkeys), Ok(suppkeys), Ok(shipdates)) = (
-            view.required_i64(0),
-            view.required_i64(1),
-            view.required_date32(2),
+        && let (Some(orderkeys), Some(suppkeys), Some(shipdates)) = (
+            view.i64_vector(0),
+            view.i64_vector(1),
+            view.date32_vector(2),
         )
     {
-        if orderkeys.null_count() == 0 && suppkeys.null_count() == 0 && shipdates.null_count() == 0
-        {
-            let orderkey_values = orderkeys.values().as_ref();
-            let suppkey_values = suppkeys.values().as_ref();
-            let shipdate_values = shipdates.values().as_ref();
+        if let (Some(orderkey_values), Some(suppkey_values), Some(shipdate_values)) = (
+            orderkeys.values_if_null_free(),
+            suppkeys.values_if_null_free(),
+            shipdates.values_if_null_free(),
+        ) {
             for row in 0..orderkey_values.len() {
                 let selected = q07_late_selected_row(
                     orderkey_values[row],
@@ -21135,14 +21135,33 @@ fn q07_late_build_selection_view(
             }
             return Ok(Some(()));
         }
+        for row in 0..orderkeys.len() {
+            let selected =
+                if orderkeys.is_null(row) || suppkeys.is_null(row) || shipdates.is_null(row) {
+                    None
+                } else {
+                    q07_late_selected_row(
+                        orderkeys.value(row),
+                        suppkeys.value(row),
+                        shipdates.value(row),
+                        state,
+                        start_days,
+                        end_days,
+                    )
+                };
+            if let Some(row) = selected {
+                selection.push(true);
+                state.selected_rows.push(row);
+            } else {
+                selection.push(false);
+            }
+        }
+        return Ok(Some(()));
     }
-    q07_late_build_selection_batch(
-        view.record_batch().clone(),
-        selection,
-        state,
-        start_days,
-        end_days,
-    )
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    q07_late_build_selection_batch(batch.clone(), selection, state, start_days, end_days)
 }
 
 fn q07_late_selected_row(
@@ -21233,27 +21252,28 @@ fn q07_late_consume_payload_view(
     state: &mut Q07LateState,
 ) -> Result<Option<()>> {
     if view.num_columns() == 2
-        && let (Some(extendedprices), Some(discounts)) = (
-            decimal_input(view.column(0)?)?,
-            decimal_input(view.column(1)?)?,
-        )
+        && let (Some(extendedprices), Some(discounts)) =
+            (view.decimal128_vector(0), view.decimal128_vector(1))
     {
-        q07_late_consume_payload_typed(extendedprices, discounts, state)?;
+        q07_late_consume_payload_vector(extendedprices, discounts, state)?;
         return Ok(Some(()));
     }
-    q07_late_consume_payload_batch(view.record_batch().clone(), state)
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    q07_late_consume_payload_batch(batch.clone(), state)
 }
 
-fn q07_late_consume_payload_typed(
-    extendedprices: DecimalInput<'_>,
-    discounts: DecimalInput<'_>,
+fn q07_late_consume_payload_vector(
+    extendedprices: Decimal128VectorView<'_>,
+    discounts: Decimal128VectorView<'_>,
     state: &mut Q07LateState,
 ) -> Result<()> {
     if extendedprices.null_count() == 0 && discounts.null_count() == 0 {
         let extendedprice_values = extendedprices.raw_values();
         let discount_values = discounts.raw_values();
-        let (discount_scale, revenue_scale) =
-            decimal_discounted_revenue_scales(extendedprices, discounts);
+        let discount_scale = discounts.scale();
+        let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
         for row in 0..extendedprice_values.len() {
             let Some(selected) = state.selected_rows.get(state.payload_offset).copied() else {
                 return Err(DodamError::UnsupportedSql(
