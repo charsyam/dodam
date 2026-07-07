@@ -22928,17 +22928,27 @@ fn q17_lineitem_revenue_view_into(
     partial: &mut Q17LineitemPartial,
 ) -> Result<()> {
     if view.num_columns() == 3
-        && q17_lineitem_revenue_batch_typed_into(
-            view.column(0)?,
-            view.column(1)?,
-            view.column(2)?,
+        && let (Some(partkeys), Some(quantities), Some(extendedprices)) = (
+            view.i64_vector(0),
+            view.decimal128_vector(1),
+            view.decimal128_vector(2),
+        )
+    {
+        q17_lineitem_revenue_vector_typed_into(
+            partkeys,
+            quantities,
+            extendedprices,
             part_keys,
             partial,
-        )?
-    {
+        );
         return Ok(());
     }
-    q17_lineitem_revenue_batch_into(view.record_batch().clone(), part_keys, partial)
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "q17 lineitem revenue raw vector columns have unsupported types".to_string(),
+        ));
+    };
+    q17_lineitem_revenue_batch_into(batch.clone(), part_keys, partial)
 }
 
 fn q17_lineitem_revenue_batch_typed_into(
@@ -22971,6 +22981,53 @@ fn q17_lineitem_revenue_batch_typed_into(
         partial.1.push((partkey, quantity, extendedprice));
     }
     Ok(true)
+}
+
+fn q17_lineitem_revenue_vector_typed_into(
+    partkeys: I64VectorView<'_>,
+    quantities: Decimal128VectorView<'_>,
+    extendedprices: Decimal128VectorView<'_>,
+    part_keys: &AdaptiveI64Set,
+    partial: &mut Q17LineitemPartial,
+) {
+    if let Some(partkey_values) = partkeys.values_if_null_free()
+        && quantities.null_count() == 0
+        && extendedprices.null_count() == 0
+    {
+        let quantity_values = quantities.raw_values();
+        let extendedprice_values = extendedprices.raw_values();
+        let quantity_scale = 1.0 / quantities.scale();
+        let extendedprice_scale = 1.0 / extendedprices.scale();
+        for row in 0..partkey_values.len() {
+            let partkey = partkey_values[row];
+            if !part_keys.contains(partkey) {
+                continue;
+            }
+            let quantity = quantity_values[row] as f64 * quantity_scale;
+            let extendedprice = extendedprice_values[row] as f64 * extendedprice_scale;
+            let state = partial.0.entry(partkey).or_insert((0.0, 0));
+            state.0 += quantity;
+            state.1 += 1;
+            partial.1.push((partkey, quantity, extendedprice));
+        }
+        return;
+    }
+
+    for row in 0..partkeys.len() {
+        if partkeys.is_null(row) || quantities.is_null(row) || extendedprices.is_null(row) {
+            continue;
+        }
+        let partkey = partkeys.value(row);
+        if !part_keys.contains(partkey) {
+            continue;
+        }
+        let quantity = quantities.value(row);
+        let extendedprice = extendedprices.value(row);
+        let state = partial.0.entry(partkey).or_insert((0.0, 0));
+        state.0 += quantity;
+        state.1 += 1;
+        partial.1.push((partkey, quantity, extendedprice));
+    }
 }
 
 fn q17_merge_lineitem_revenue_batch(output: &mut Q17LineitemPartial, batch: Q17LineitemPartial) {
