@@ -1622,3 +1622,7 @@ Tried and rejected or neutral:
       - Q12/Q04 retest:
         - Q12 lineitem remains best on the one-pass full-decode path. Re-tested lineitem late materialization (`~234.6ms`) and Arrow RowFilter (`~253.7ms`), both much worse than default focused samples around `~147-169ms`. Q12 orders direct/late/fused-on/off samples were noisy; no default change.
         - Q04 profiling still points at lineitem scan/decode. Q04 lineitem late materialization has attractive selectivity (`~3.8%`) but very fragmented selectors (`~1.1M` runs on SF=10). Same-binary focused A/B was effectively tied: late default candidate `~151.9ms`, late disabled `~151.8ms`, so the opt-in default was not changed.
+      - Vector pipeline common primitive pass:
+        - Added a shared dictionary `Int32` match-flag helper and moved Q12 lineitem shipmode and orders priority dictionary paths to use dictionary-key flags instead of query-local dictionary value scans in the row loop.
+        - Added a reusable Q06 null-free Decimal128/i64 revenue vector loop and moved Q14 late materialization callbacks from `RecordBatch` to `BatchView`, including a `BatchView::decimal128` accessor and shared Q14 payload array kernel.
+        - Validation: `cargo test -q` and release build passed. Individual SF=10 samples: Q06 `~100.0ms` vs DuckDB `~123.0ms`, Q12 `~147.9ms` vs DuckDB `~125.0ms`, Q14 `~168.6ms` vs DuckDB `~238.0ms`. Full SF=10 single-process comparison sampled Dodam `4.813s`, DuckDB `5.766s`, ratio `0.835x`; remaining slower queries were Q04 (`~21.9ms`) and Q12 (`~6.3ms`).

@@ -1,5 +1,6 @@
 use arrow::array::{
-    Array, ArrayRef, Date32Array, DictionaryArray, Int64Array, LargeStringArray, StringArray,
+    Array, ArrayRef, Date32Array, Decimal128Array, DictionaryArray, Int64Array, LargeStringArray,
+    StringArray,
 };
 use arrow::datatypes::Int32Type;
 use arrow::record_batch::RecordBatch;
@@ -62,6 +63,10 @@ impl<'a> BatchView<'a> {
         self.date32(index).ok_or_else(|| {
             DodamError::UnsupportedSql(format!("projected column {index} is not Date32"))
         })
+    }
+
+    pub(crate) fn decimal128(&self, index: usize) -> Option<&'a Decimal128Array> {
+        self.downcast(index)
     }
 
     pub(crate) fn dictionary_i32(&self, index: usize) -> Option<&'a DictionaryArray<Int32Type>> {
@@ -149,6 +154,26 @@ pub(crate) fn dictionary_string_key_for_value(
         }
     }
     None
+}
+
+pub(crate) fn dictionary_i32_match_flags(
+    dictionary: &DictionaryArray<Int32Type>,
+    targets: &[&[u8]],
+) -> Option<Vec<Option<usize>>> {
+    let values = dictionary_i32_string_values(dictionary)?;
+    let mut flags = vec![None; values.len()];
+    for (target_index, target) in targets.iter().enumerate() {
+        let Some(key) = dictionary_string_key_for_value(&values, target) else {
+            continue;
+        };
+        let Ok(key) = usize::try_from(key) else {
+            continue;
+        };
+        if let Some(flag) = flags.get_mut(key) {
+            *flag = Some(target_index);
+        }
+    }
+    Some(flags)
 }
 
 #[allow(dead_code)]

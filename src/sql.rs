@@ -55,7 +55,7 @@ use crate::hash::{FastHashMap, FastHashSet, fast_hash_map, fast_hash_map_with_ca
 use crate::optimizer::plan_join_inputs;
 use crate::vector::{
     BatchConsumer, BatchView, DictionaryStringValues, consume_record_batch,
-    dictionary_i32_string_values, dictionary_string_key_for_value,
+    dictionary_i32_match_flags, dictionary_i32_string_values,
 };
 
 fn tpch_profile_enabled() -> bool {
@@ -10490,11 +10490,11 @@ fn q12_filtered_lineitem_counts_batch_dictionary_typed_into(
     let [left_mode, right_mode] = shipmodes else {
         return false;
     };
-    let Some(mode_values) = dictionary_i32_string_values(modes) else {
+    let Some(mode_flags) =
+        dictionary_i32_match_flags(modes, &[left_mode.as_bytes(), right_mode.as_bytes()])
+    else {
         return false;
     };
-    let left_key = dictionary_string_key_for_value(&mode_values, left_mode.as_bytes());
-    let right_key = dictionary_string_key_for_value(&mode_values, right_mode.as_bytes());
     let mode_keys = modes.keys().values().as_ref();
     if orderkeys.null_count() == 0
         && modes.null_count() == 0
@@ -10516,14 +10516,13 @@ fn q12_filtered_lineitem_counts_batch_dictionary_typed_into(
             {
                 continue;
             }
-            let mode_index = if Some(mode_keys[row]) == left_key {
-                0
-            } else if Some(mode_keys[row]) == right_key {
-                1
-            } else {
+            let Ok(mode_key) = usize::try_from(mode_keys[row]) else {
                 continue;
             };
-            pending.entry(orderkey_values[row]).or_default().counts[mode_index] += 1;
+            let Some(Some(mode_index)) = mode_flags.get(mode_key) else {
+                continue;
+            };
+            pending.entry(orderkey_values[row]).or_default().counts[*mode_index] += 1;
         }
         return true;
     }
@@ -10545,15 +10544,13 @@ fn q12_filtered_lineitem_counts_batch_dictionary_typed_into(
         {
             continue;
         }
-        let mode_key = mode_keys[row];
-        let mode_index = if Some(mode_key) == left_key {
-            0
-        } else if Some(mode_key) == right_key {
-            1
-        } else {
+        let Ok(mode_key) = usize::try_from(mode_keys[row]) else {
             continue;
         };
-        pending.entry(orderkeys.value(row)).or_default().counts[mode_index] += 1;
+        let Some(Some(mode_index)) = mode_flags.get(mode_key) else {
+            continue;
+        };
+        pending.entry(orderkeys.value(row)).or_default().counts[*mode_index] += 1;
     }
     true
 }
@@ -12223,12 +12220,7 @@ fn q12_shipping_mode_counts_batch_dictionary_typed(
     pending: &AdaptiveI64Map<Q12PendingOrder>,
 ) -> Option<[Q12State; 2]> {
     let orderkeys = orderkeys.as_any().downcast_ref::<Int64Array>()?;
-    let priority_values = orderpriorities
-        .values()
-        .as_any()
-        .downcast_ref::<StringArray>()?;
-    let priority_offsets = priority_values.value_offsets();
-    let priority_data = priority_values.value_data();
+    let priority_flags = dictionary_i32_match_flags(orderpriorities, &[b"1-URGENT", b"2-HIGH"])?;
     let priority_keys = orderpriorities.keys().values().as_ref();
     let mut groups = [Q12State::default(); 2];
     if orderkeys.null_count() == 0 && orderpriorities.null_count() == 0 {
@@ -12242,8 +12234,11 @@ fn q12_shipping_mode_counts_batch_dictionary_typed(
                     continue;
                 }
                 let priority_index = usize::try_from(priority_keys[row]).ok()?;
-                let priority = bytes_string_parts(priority_offsets, priority_data, priority_index);
-                let is_high_priority = q12_is_high_priority_bytes(priority);
+                let is_high_priority = priority_flags
+                    .get(priority_index)
+                    .copied()
+                    .flatten()
+                    .is_some();
                 q12_apply_pending_order(&mut groups, pending_values[index], is_high_priority);
             }
             return Some(groups);
@@ -12253,8 +12248,11 @@ fn q12_shipping_mode_counts_batch_dictionary_typed(
                 continue;
             };
             let priority_index = usize::try_from(priority_keys[row]).ok()?;
-            let priority = bytes_string_parts(priority_offsets, priority_data, priority_index);
-            let is_high_priority = q12_is_high_priority_bytes(priority);
+            let is_high_priority = priority_flags
+                .get(priority_index)
+                .copied()
+                .flatten()
+                .is_some();
             q12_apply_pending_order(&mut groups, order, is_high_priority);
         }
         return Some(groups);
@@ -12267,8 +12265,11 @@ fn q12_shipping_mode_counts_batch_dictionary_typed(
             continue;
         };
         let priority_index = usize::try_from(orderpriorities.key(row)?).ok()?;
-        let priority = bytes_string_parts(priority_offsets, priority_data, priority_index);
-        let is_high_priority = q12_is_high_priority_bytes(priority);
+        let is_high_priority = priority_flags
+            .get(priority_index)
+            .copied()
+            .flatten()
+            .is_some();
         q12_apply_pending_order(&mut groups, order, is_high_priority);
     }
     Some(groups)
@@ -18574,8 +18575,6 @@ fn q06_revenue_sum_arrays(
     discount_high: f64,
     quantity_limit: f64,
 ) -> Result<Option<(f64, u64)>> {
-    let mut sum = 0.0;
-    let mut count = 0_u64;
     if shipdates.null_count() == 0
         && discounts.null_count() == 0
         && quantities.null_count() == 0
@@ -18591,25 +18590,21 @@ fn q06_revenue_sum_arrays(
         let extendedprice_values = extendedprices.raw_values();
         if discounts.precision <= 18 && quantities.precision <= 18 && extendedprices.precision <= 18
         {
-            let discount_low_raw = discount_low_raw as i64;
-            let discount_high_raw = discount_high_raw as i64;
-            let quantity_limit_raw = quantity_limit_raw as i64;
-            for row in 0..shipdate_values.len() {
-                let shipdate = shipdate_values[row];
-                let discount = discount_values[row] as i64;
-                if shipdate < start_days
-                    || shipdate >= end_days
-                    || discount < discount_low_raw
-                    || discount > discount_high_raw
-                    || (quantity_values[row] as i64) >= quantity_limit_raw
-                {
-                    continue;
-                }
-                sum += ((extendedprice_values[row] as i64) * discount) as f64 * revenue_scale;
-                count += 1;
-            }
-            return Ok(Some((sum, count)));
+            return Ok(Some(vector_q06_revenue_sum_i64(
+                shipdate_values,
+                discount_values,
+                quantity_values,
+                extendedprice_values,
+                start_days,
+                end_days,
+                discount_low_raw as i64,
+                discount_high_raw as i64,
+                quantity_limit_raw as i64,
+                revenue_scale,
+            )));
         }
+        let mut sum = 0.0;
+        let mut count = 0_u64;
         for row in 0..shipdate_values.len() {
             let shipdate = shipdate_values[row];
             let discount = discount_values[row];
@@ -18626,6 +18621,8 @@ fn q06_revenue_sum_arrays(
         }
         return Ok(Some((sum, count)));
     }
+    let mut sum = 0.0;
+    let mut count = 0_u64;
     for row in 0..row_count {
         if shipdates.is_null(row)
             || discounts.is_null(row)
@@ -18648,6 +18645,38 @@ fn q06_revenue_sum_arrays(
         count += 1;
     }
     Ok(Some((sum, count)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn vector_q06_revenue_sum_i64(
+    shipdates: &[i32],
+    discounts: &[i128],
+    quantities: &[i128],
+    extendedprices: &[i128],
+    start_days: i32,
+    end_days: i32,
+    discount_low_raw: i64,
+    discount_high_raw: i64,
+    quantity_limit_raw: i64,
+    revenue_scale: f64,
+) -> (f64, u64) {
+    let mut sum = 0.0;
+    let mut count = 0_u64;
+    for row in 0..shipdates.len() {
+        let shipdate = shipdates[row];
+        let discount = discounts[row] as i64;
+        if shipdate < start_days
+            || shipdate >= end_days
+            || discount < discount_low_raw
+            || discount > discount_high_raw
+            || (quantities[row] as i64) >= quantity_limit_raw
+        {
+            continue;
+        }
+        sum += ((extendedprices[row] as i64) * discount) as f64 * revenue_scale;
+        count += 1;
+    }
+    (sum, count)
 }
 
 fn scaled_f64_to_i128(value: f64, scale: f64) -> i128 {

@@ -5955,7 +5955,7 @@ fn q14_late_materialized_promo_revenue_chunk(
         promo: 0.0,
         total: 0.0,
     };
-    late_materialized_chunk(
+    late_materialized_chunk_view(
         path,
         batch_size,
         row_groups,
@@ -5966,10 +5966,10 @@ fn q14_late_materialized_promo_revenue_chunk(
         object_store,
         LateMaterializationPolicy::always(),
         state,
-        |batch, selection, _state| {
-            q14_build_date_selection_batch(batch, start_days, end_days, selection)
+        |view, selection, _state| {
+            q14_build_date_selection_view(view, start_days, end_days, selection)
         },
-        q14_consume_payload_batch,
+        q14_consume_payload_view,
         |state, _metrics| Ok(Some((state.promo, state.total))),
     )
 }
@@ -6003,6 +6003,27 @@ fn q14_build_date_selection_batch(
     Ok(Some(()))
 }
 
+fn q14_build_date_selection_view(
+    view: BatchView<'_>,
+    start_days: i32,
+    end_days: i32,
+    selection: &mut LateSelectionBuilder,
+) -> Result<Option<()>> {
+    if view.num_columns() == 1 {
+        let Some(shipdates) = view.date32(0) else {
+            return Ok(None);
+        };
+        if shipdates.null_count() != 0 {
+            return Ok(None);
+        }
+        for &shipdate in shipdates.values().as_ref() {
+            selection.push(shipdate >= start_days && shipdate < end_days);
+        }
+        return Ok(Some(()));
+    }
+    q14_build_date_selection_batch(view.record_batch().clone(), start_days, end_days, selection)
+}
+
 fn q14_consume_payload_batch(batch: RecordBatch, state: &mut Q14LateState) -> Result<Option<()>> {
     let partkey_index = physical_batch_column_index(&batch, "l_partkey")?;
     let extendedprice_index = physical_batch_column_index(&batch, "l_extendedprice")?;
@@ -6032,6 +6053,31 @@ fn q14_consume_payload_batch(batch: RecordBatch, state: &mut Q14LateState) -> Re
     {
         return Ok(None);
     }
+    q14_consume_payload_arrays(partkeys, extendedprices, discounts, state)
+}
+
+fn q14_consume_payload_view(view: BatchView<'_>, state: &mut Q14LateState) -> Result<Option<()>> {
+    if view.num_columns() == 3 {
+        let (Some(partkeys), Some(extendedprices), Some(discounts)) =
+            (view.i64(0), view.decimal128(1), view.decimal128(2))
+        else {
+            return Ok(None);
+        };
+        return q14_consume_payload_arrays(partkeys, extendedprices, discounts, state);
+    }
+    q14_consume_payload_batch(view.record_batch().clone(), state)
+}
+
+fn q14_consume_payload_arrays(
+    partkeys: &Int64Array,
+    extendedprices: &Decimal128Array,
+    discounts: &Decimal128Array,
+    state: &mut Q14LateState,
+) -> Result<Option<()>> {
+    if partkeys.null_count() != 0 || extendedprices.null_count() != 0 || discounts.null_count() != 0
+    {
+        return Ok(None);
+    }
     let (price_precision, price_decimal_scale) = decimal128_precision_scale(extendedprices)?;
     let (discount_precision, discount_decimal_scale) = decimal128_precision_scale(discounts)?;
     if price_precision > 18 || discount_precision > 18 {
@@ -6040,7 +6086,7 @@ fn q14_consume_payload_batch(batch: RecordBatch, state: &mut Q14LateState) -> Re
     let price_scale = decimal_scale_i64(price_decimal_scale)?;
     let discount_scale = decimal_scale_i64(discount_decimal_scale)?;
     let revenue_scale = 1.0 / ((price_scale as f64) * (discount_scale as f64));
-    for row in 0..batch.num_rows() {
+    for row in 0..partkeys.len() {
         let Some(is_promo) = state.promo_parts.get(partkeys.value(row)) else {
             continue;
         };
