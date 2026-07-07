@@ -2905,35 +2905,40 @@ fn q01_pricing_summary_projected_view_into(
     groups: &mut Q01GroupSlots,
 ) -> Result<()> {
     if view.num_columns() == 7 {
-        let Some(returnflags) = view.column(0)?.as_any().downcast_ref::<StringArray>() else {
-            return q01_pricing_summary_batch_into(
-                view.record_batch().clone(),
-                cutoff_days,
-                groups,
-            );
-        };
-        let Some(linestatuses) = view.column(1)?.as_any().downcast_ref::<StringArray>() else {
-            return q01_pricing_summary_batch_into(
-                view.record_batch().clone(),
-                cutoff_days,
-                groups,
-            );
-        };
-        if q01_update_decimal_batch(
+        if let (
+            Some(returnflags),
+            Some(linestatuses),
+            Some(quantities),
+            Some(extendedprices),
+            Some(discounts),
+            Some(taxes),
+            Some(shipdates),
+        ) = (
+            view.utf8_vector(0),
+            view.utf8_vector(1),
+            view.decimal128_vector(2),
+            view.decimal128_vector(3),
+            view.decimal128_vector(4),
+            view.decimal128_vector(5),
+            view.date32_vector(6),
+        ) && q01_update_decimal_view(
             returnflags,
             linestatuses,
-            view.column(2)?,
-            view.column(3)?,
-            view.column(4)?,
-            view.column(5)?,
-            view.column(6)?,
+            quantities,
+            extendedprices,
+            discounts,
+            taxes,
+            shipdates,
             cutoff_days,
             groups,
         )? {
             return Ok(());
         }
     }
-    q01_pricing_summary_batch_into(view.record_batch().clone(), cutoff_days, groups)
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(());
+    };
+    q01_pricing_summary_batch_into(batch.clone(), cutoff_days, groups)
 }
 
 fn parallel_batch_fold<Partial, Output, Map, Merge>(
@@ -3275,6 +3280,147 @@ fn q01_update_decimal_batch(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn q01_update_decimal_view(
+    returnflags: Utf8VectorView<'_>,
+    linestatuses: Utf8VectorView<'_>,
+    quantities: Decimal128VectorView<'_>,
+    extendedprices: Decimal128VectorView<'_>,
+    discounts: Decimal128VectorView<'_>,
+    taxes: Decimal128VectorView<'_>,
+    shipdates: Date32VectorView<'_>,
+    cutoff_days: i32,
+    groups: &mut Q01GroupSlots,
+) -> Result<bool> {
+    if shipdates.values_if_null_free().is_some()
+        && returnflags.null_count() == 0
+        && linestatuses.null_count() == 0
+        && quantities.null_count() == 0
+        && extendedprices.null_count() == 0
+        && discounts.null_count() == 0
+        && taxes.null_count() == 0
+    {
+        let quantity_values = quantities.raw_values();
+        let extendedprice_values = extendedprices.raw_values();
+        let discount_values = discounts.raw_values();
+        let tax_values = taxes.raw_values();
+        let quantity_scale = 1.0 / quantities.scale();
+        let extendedprice_scale = 1.0 / extendedprices.scale();
+        let discount_scale = 1.0 / discounts.scale();
+        let tax_scale = 1.0 / taxes.scale();
+        let Some(shipdate_values) = shipdates.values_if_null_free() else {
+            return Ok(false);
+        };
+        if let (Some(returnflag_bytes), Some(linestatus_bytes)) = (
+            contiguous_single_byte_utf8_view(returnflags),
+            contiguous_single_byte_utf8_view(linestatuses),
+        ) {
+            if quantities.precision() <= 18
+                && extendedprices.precision() <= 18
+                && discounts.precision() <= 18
+                && taxes.precision() <= 18
+            {
+                if q01_raw_complement_enabled()
+                    && let (Some(discount_one), Some(tax_one)) =
+                        (discounts.scale_i64(), taxes.scale_i64())
+                {
+                    q01_update_raw_complement_batch(
+                        groups,
+                        cutoff_days,
+                        shipdate_values,
+                        quantity_values,
+                        extendedprice_values,
+                        discount_values,
+                        tax_values,
+                        returnflag_bytes,
+                        linestatus_bytes,
+                        quantity_scale,
+                        extendedprice_scale,
+                        discount_scale,
+                        tax_scale,
+                        discount_one,
+                        tax_one,
+                    );
+                    return Ok(true);
+                }
+                for row in 0..shipdate_values.len() {
+                    let shipdate = shipdate_values[row];
+                    if shipdate > cutoff_days {
+                        continue;
+                    }
+                    groups.update_key_values(
+                        returnflag_bytes[row],
+                        linestatus_bytes[row],
+                        quantity_values[row] as i64 as f64 * quantity_scale,
+                        extendedprice_values[row] as i64 as f64 * extendedprice_scale,
+                        discount_values[row] as i64 as f64 * discount_scale,
+                        tax_values[row] as i64 as f64 * tax_scale,
+                    );
+                }
+                return Ok(true);
+            }
+            for row in 0..shipdate_values.len() {
+                if shipdate_values[row] > cutoff_days {
+                    continue;
+                }
+                groups.update_key_values(
+                    returnflag_bytes[row],
+                    linestatus_bytes[row],
+                    quantity_values[row] as f64 * quantity_scale,
+                    extendedprice_values[row] as f64 * extendedprice_scale,
+                    discount_values[row] as f64 * discount_scale,
+                    tax_values[row] as f64 * tax_scale,
+                );
+            }
+            return Ok(true);
+        }
+        for row in 0..shipdate_values.len() {
+            if shipdate_values[row] > cutoff_days {
+                continue;
+            }
+            let returnflag = std::str::from_utf8(returnflags.value_bytes(row))
+                .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+            let linestatus = std::str::from_utf8(linestatuses.value_bytes(row))
+                .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+            groups.update(returnflag, linestatus, |state| {
+                state.update(
+                    quantity_values[row] as f64 * quantity_scale,
+                    extendedprice_values[row] as f64 * extendedprice_scale,
+                    discount_values[row] as f64 * discount_scale,
+                    tax_values[row] as f64 * tax_scale,
+                );
+            });
+        }
+        return Ok(true);
+    }
+    for row in 0..quantities.raw_values().len() {
+        if shipdates.is_null(row)
+            || shipdates.value(row) > cutoff_days
+            || returnflags.is_null(row)
+            || linestatuses.is_null(row)
+            || quantities.is_null(row)
+            || extendedprices.is_null(row)
+            || discounts.is_null(row)
+            || taxes.is_null(row)
+        {
+            continue;
+        }
+        let returnflag = std::str::from_utf8(returnflags.value_bytes(row))
+            .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+        let linestatus = std::str::from_utf8(linestatuses.value_bytes(row))
+            .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+        groups.update(returnflag, linestatus, |state| {
+            state.update(
+                quantities.value(row),
+                extendedprices.value(row),
+                discounts.value(row),
+                taxes.value(row),
+            );
+        });
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn q01_update_raw_complement_batch(
     groups: &mut Q01GroupSlots,
     cutoff_days: i32,
@@ -3390,6 +3536,12 @@ fn contiguous_single_byte_utf8_data(values: &StringArray) -> Option<&[u8]> {
         }
     }
     Some(values.value_data())
+}
+
+fn contiguous_single_byte_utf8_view(values: Utf8VectorView<'_>) -> Option<&[u8]> {
+    match values {
+        Utf8VectorView::Arrow(values) => contiguous_single_byte_utf8_data(values),
+    }
 }
 
 fn q01_output(rows: Vec<Q01Row>) -> Result<QueryOutput> {
