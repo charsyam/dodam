@@ -1807,3 +1807,5 @@ Tried and rejected or neutral:
         - Validation: `cargo fmt --all --check`, `cargo check -q`, `cargo test -q`, and release build passed. Individual SF=10 Q02 improved from the previous `~69.8ms` vs DuckDB `~52.5ms` to Dodam `~64.9ms` vs DuckDB `~52.0ms`, reducing the gap from about `17.3ms` to `12.9ms`.
         - Changed Q02 partsupp part/supplier membership filters from `HashSet<i64>` to `AdaptiveI64Set`, allowing dense membership checks for SF=10 key ranges instead of two hash probes per candidate row.
         - Validation: `cargo fmt --all --check`, `cargo check -q`, `cargo test -q`, and release build passed. Individual SF=10 Q02 improved again to Dodam `~59.7ms` vs DuckDB `~52.0ms`, reducing the remaining gap to about `7.7ms`.
+        - Switched Q02's nation/supplier/part/min-cost maps to the project `FastHashMap` hasher. This keeps Q02 consistent with other hash-heavy paths, but the measured speed effect was neutral.
+        - Validation: `cargo fmt --all --check`, `cargo check -q`, `cargo test -q`, and release build passed. Individual SF=10 Q02 sampled Dodam `~59.4ms` vs DuckDB `~51.5ms`, effectively unchanged from the adaptive-set result.

@@ -5284,7 +5284,7 @@ async fn q02_nation_names(
     path: PathBuf,
     batch_size: usize,
     region_keys: &HashSet<i64>,
-) -> Result<HashMap<i64, String>> {
+) -> Result<FastHashMap<i64, String>> {
     let mut stream = engine
         .scan_parquet_batches(
             path,
@@ -5298,7 +5298,7 @@ async fn q02_nation_names(
             None,
         )
         .await?;
-    let mut nations = HashMap::new();
+    let mut nations = fast_hash_map::<i64, String>();
     while let Some(batch) = stream.next() {
         let batch = batch?;
         q02_nation_names_view_into(BatchView::new(&batch), region_keys, &mut nations)?;
@@ -5309,7 +5309,7 @@ async fn q02_nation_names(
 fn q02_nation_names_view_into(
     view: BatchView<'_>,
     region_keys: &HashSet<i64>,
-    nations: &mut HashMap<i64, String>,
+    nations: &mut FastHashMap<i64, String>,
 ) -> Result<()> {
     if view.num_columns() == 3
         && let (Some(nationkeys), Some(names), Some(regionkeys)) =
@@ -5365,8 +5365,8 @@ async fn q02_suppliers(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-    nation_names: &HashMap<i64, String>,
-) -> Result<HashMap<i64, Q02Supplier>> {
+    nation_names: &FastHashMap<i64, String>,
+) -> Result<FastHashMap<i64, Q02Supplier>> {
     let mut stream = engine
         .scan_parquet_batches(
             path,
@@ -5384,7 +5384,7 @@ async fn q02_suppliers(
             None,
         )
         .await?;
-    let mut suppliers = HashMap::new();
+    let mut suppliers = fast_hash_map::<i64, Q02Supplier>();
     while let Some(batch) = stream.next() {
         let batch = batch?;
         q02_suppliers_view_into(BatchView::new(&batch), nation_names, &mut suppliers)?;
@@ -5394,8 +5394,8 @@ async fn q02_suppliers(
 
 fn q02_suppliers_view_into(
     view: BatchView<'_>,
-    nation_names: &HashMap<i64, String>,
-    suppliers: &mut HashMap<i64, Q02Supplier>,
+    nation_names: &FastHashMap<i64, String>,
+    suppliers: &mut FastHashMap<i64, Q02Supplier>,
 ) -> Result<()> {
     if view.num_columns() == 7
         && let (
@@ -5495,7 +5495,7 @@ async fn q02_matching_parts(
     batch_size: usize,
     part_size: f64,
     type_suffix: &str,
-) -> Result<HashMap<i64, String>> {
+) -> Result<FastHashMap<i64, String>> {
     let mut stream = engine
         .scan_parquet_batches(
             path,
@@ -5510,7 +5510,7 @@ async fn q02_matching_parts(
             None,
         )
         .await?;
-    let mut parts = HashMap::new();
+    let mut parts = fast_hash_map::<i64, String>();
     while let Some(batch) = stream.next() {
         let batch = batch?;
         q02_matching_parts_view_into(BatchView::new(&batch), part_size, type_suffix, &mut parts)?;
@@ -5522,7 +5522,7 @@ fn q02_matching_parts_view_into(
     view: BatchView<'_>,
     part_size: f64,
     type_suffix: &str,
-    parts: &mut HashMap<i64, String>,
+    parts: &mut FastHashMap<i64, String>,
 ) -> Result<()> {
     if view.num_columns() == 4
         && let (Some(partkeys), Some(mfgrs), Some(sizes), Some(types)) = (
@@ -5595,8 +5595,8 @@ async fn q02_min_cost_rows(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-    parts: &HashMap<i64, String>,
-    suppliers: &HashMap<i64, Q02Supplier>,
+    parts: &FastHashMap<i64, String>,
+    suppliers: &FastHashMap<i64, Q02Supplier>,
 ) -> Result<Vec<Q02Row>> {
     let mut stream = engine
         .scan_parquet_batches(
@@ -5672,12 +5672,12 @@ async fn q02_min_cost_rows(
 
 #[derive(Default)]
 struct Q02PartsuppPartial {
-    min_costs: HashMap<i64, f64>,
+    min_costs: FastHashMap<i64, f64>,
     candidates: Vec<(i64, i64, f64)>,
 }
 
 impl Q02PartsuppPartial {
-    fn into_parts(self) -> (HashMap<i64, f64>, Vec<(i64, i64, f64)>) {
+    fn into_parts(self) -> (FastHashMap<i64, f64>, Vec<(i64, i64, f64)>) {
         (self.min_costs, self.candidates)
     }
 }
