@@ -5249,16 +5249,23 @@ fn q02_region_keys_view_into(
     keys: &mut HashSet<i64>,
 ) -> Result<()> {
     if view.num_columns() == 2
-        && let (Ok(regionkeys), Ok(names)) = (view.required_i64(0), view.required_utf8(1))
+        && let (Some(regionkeys), Some(names)) = (view.i64_vector(0), view.utf8_vector(1))
     {
         for row in 0..view.num_rows() {
-            if regionkeys.is_valid(row) && names.is_valid(row) && names.value(row) == region_name {
+            if !regionkeys.is_null(row)
+                && names.is_valid(row)
+                && names.value_bytes(row) == region_name.as_bytes()
+            {
                 keys.insert(regionkeys.value(row));
             }
         }
         return Ok(());
     }
-    let batch = view.record_batch();
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "Q02 region raw vector columns have unsupported types".to_string(),
+        ));
+    };
     let regionkeys = batch_column(batch, "r_regionkey")?;
     let names = batch_string_column(batch, "r_name")?;
     for row in 0..batch.num_rows() {
@@ -5305,23 +5312,26 @@ fn q02_nation_names_view_into(
     nations: &mut HashMap<i64, String>,
 ) -> Result<()> {
     if view.num_columns() == 3
-        && let (Ok(nationkeys), Ok(names), Ok(regionkeys)) = (
-            view.required_i64(0),
-            view.required_utf8(1),
-            view.required_i64(2),
-        )
+        && let (Some(nationkeys), Some(names), Some(regionkeys)) =
+            (view.i64_vector(0), view.utf8_vector(1), view.i64_vector(2))
     {
         for row in 0..view.num_rows() {
             if nationkeys.is_null(row) || names.is_null(row) || regionkeys.is_null(row) {
                 continue;
             }
             if region_keys.contains(&regionkeys.value(row)) {
-                nations.insert(nationkeys.value(row), names.value(row).to_string());
+                let name = std::str::from_utf8(names.value_bytes(row))
+                    .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+                nations.insert(nationkeys.value(row), name.to_string());
             }
         }
         return Ok(());
     }
-    let batch = view.record_batch();
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "Q02 nation raw vector columns have unsupported types".to_string(),
+        ));
+    };
     let nationkeys = batch_column(batch, "n_nationkey")?;
     let names = batch_string_column(batch, "n_name")?;
     let regionkeys = batch_column(batch, "n_regionkey")?;
