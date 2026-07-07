@@ -23,6 +23,20 @@ pub(crate) enum RawColumnView<'a> {
     I64(&'a [i64]),
     I32(&'a [i32]),
     Date32(&'a [i32]),
+    #[allow(dead_code)]
+    DictionaryI32 {
+        keys: &'a [i32],
+        values: DictionaryStringValues<'a>,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum DictionaryI32View<'a> {
+    Arrow(&'a DictionaryArray<Int32Type>),
+    Raw {
+        keys: &'a [i32],
+        values: DictionaryStringValues<'a>,
+    },
 }
 
 impl<'a> BatchView<'a> {
@@ -155,13 +169,18 @@ impl<'a> BatchView<'a> {
         self.downcast(index)
     }
 
-    pub(crate) fn required_dictionary_i32(
-        &self,
-        index: usize,
-    ) -> Result<&'a DictionaryArray<Int32Type>> {
-        self.dictionary_i32(index).ok_or_else(|| {
-            DodamError::UnsupportedSql(format!("projected column {index} is not Dictionary<Int32>"))
-        })
+    pub(crate) fn dictionary_i32_view(&self, index: usize) -> Option<DictionaryI32View<'a>> {
+        match self.inner {
+            BatchViewInner::RecordBatch(_) => {
+                self.dictionary_i32(index).map(DictionaryI32View::Arrow)
+            }
+            BatchViewInner::RawColumns(_) => match self.raw_column(index)? {
+                RawColumnView::DictionaryI32 { keys, values } => {
+                    Some(DictionaryI32View::Raw { keys, values })
+                }
+                _ => None,
+            },
+        }
     }
 
     fn downcast<T: 'static>(&self, index: usize) -> Option<&'a T> {
@@ -179,6 +198,7 @@ impl RawColumnView<'_> {
         match self {
             Self::I64(values) => values.len(),
             Self::I32(values) | Self::Date32(values) => values.len(),
+            Self::DictionaryI32 { keys, .. } => keys.len(),
         }
     }
 }
@@ -194,6 +214,7 @@ pub(crate) fn consume_record_batch<C: BatchConsumer>(
     consumer.consume(BatchView::new(batch))
 }
 
+#[derive(Clone, Copy)]
 pub(crate) enum DictionaryStringValues<'a> {
     Utf8(&'a StringArray),
     LargeUtf8(&'a LargeStringArray),
@@ -248,11 +269,11 @@ pub(crate) fn dictionary_string_key_for_value(
     None
 }
 
-pub(crate) fn dictionary_i32_match_flags(
-    dictionary: &DictionaryArray<Int32Type>,
+pub(crate) fn dictionary_i32_view_match_flags(
+    dictionary: DictionaryI32View<'_>,
     targets: &[&[u8]],
 ) -> Option<Vec<Option<usize>>> {
-    let values = dictionary_i32_string_values(dictionary)?;
+    let values = dictionary.string_values()?;
     let mut flags = vec![None; values.len()];
     for (target_index, target) in targets.iter().enumerate() {
         let Some(key) = dictionary_string_key_for_value(&values, target) else {
@@ -266,6 +287,36 @@ pub(crate) fn dictionary_i32_match_flags(
         }
     }
     Some(flags)
+}
+
+impl DictionaryI32View<'_> {
+    pub(crate) fn keys(&self) -> &[i32] {
+        match self {
+            Self::Arrow(dictionary) => dictionary.keys().values().as_ref(),
+            Self::Raw { keys, .. } => keys,
+        }
+    }
+
+    pub(crate) fn null_count(&self) -> usize {
+        match self {
+            Self::Arrow(dictionary) => dictionary.null_count(),
+            Self::Raw { .. } => 0,
+        }
+    }
+
+    pub(crate) fn is_null(&self, index: usize) -> bool {
+        match self {
+            Self::Arrow(dictionary) => dictionary.is_null(index),
+            Self::Raw { .. } => false,
+        }
+    }
+
+    fn string_values(&self) -> Option<DictionaryStringValues<'_>> {
+        match self {
+            Self::Arrow(dictionary) => dictionary_i32_string_values(dictionary),
+            Self::Raw { values, .. } => Some(*values),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone)]

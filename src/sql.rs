@@ -52,8 +52,8 @@ use crate::hash::{FastHashMap, FastHashSet, fast_hash_map, fast_hash_map_with_ca
 use crate::optimizer::plan_join_inputs;
 use crate::storage::{DirectColumnScanMetrics, DirectI64I32I32ScanMetrics};
 use crate::vector::{
-    BatchConsumer, BatchView, DictionaryStringValues, SelectionVector, consume_record_batch,
-    dictionary_i32_match_flags, dictionary_i32_string_values,
+    BatchConsumer, BatchView, DictionaryI32View, DictionaryStringValues, SelectionVector,
+    consume_record_batch, dictionary_i32_string_values, dictionary_i32_view_match_flags,
 };
 
 fn tpch_profile_enabled() -> bool {
@@ -10459,17 +10459,9 @@ fn q12_filtered_lineitem_counts_projected_view_into(
         return Ok(false);
     }
     if view.num_columns() == 5
-        && let Ok(modes) = view.required_dictionary_i32(1)
+        && let Some(layout) = Q12LineitemDictionaryView::try_new(view)
         && q12_filtered_lineitem_counts_batch_dictionary_typed_into(
-            view.column(0)?,
-            modes,
-            view.column(2)?,
-            view.column(3)?,
-            view.column(4)?,
-            shipmodes,
-            start_days,
-            end_days,
-            pending,
+            layout, shipmodes, start_days, end_days, pending,
         )
     {
         return Ok(true);
@@ -10519,48 +10511,56 @@ impl<'a> Q12LineitemStringView<'a> {
     }
 }
 
+struct Q12LineitemDictionaryView<'a> {
+    orderkeys: &'a Int64Array,
+    modes: DictionaryI32View<'a>,
+    commitdates: &'a Date32Array,
+    receiptdates: &'a Date32Array,
+    shipdates: &'a Date32Array,
+}
+
+impl<'a> Q12LineitemDictionaryView<'a> {
+    fn try_new(view: BatchView<'a>) -> Option<Self> {
+        (view.num_columns() == 5).then_some(Self {
+            orderkeys: view.i64(0)?,
+            modes: view.dictionary_i32_view(1)?,
+            commitdates: view.date32(2)?,
+            receiptdates: view.date32(3)?,
+            shipdates: view.date32(4)?,
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn q12_filtered_lineitem_counts_batch_dictionary_typed_into(
-    orderkeys: &ArrayRef,
-    modes: &DictionaryArray<Int32Type>,
-    commitdates: &ArrayRef,
-    receiptdates: &ArrayRef,
-    shipdates: &ArrayRef,
+    view: Q12LineitemDictionaryView<'_>,
     shipmodes: &[String],
     start_days: i32,
     end_days: i32,
     pending: &mut Q12PendingMap,
 ) -> bool {
-    let (Some(orderkeys), Some(commitdates), Some(receiptdates), Some(shipdates)) = (
-        orderkeys.as_any().downcast_ref::<Int64Array>(),
-        commitdates.as_any().downcast_ref::<Date32Array>(),
-        receiptdates.as_any().downcast_ref::<Date32Array>(),
-        shipdates.as_any().downcast_ref::<Date32Array>(),
-    ) else {
-        return false;
-    };
     let [left_mode, right_mode] = shipmodes else {
         return false;
     };
     let Some(mode_flags) =
-        dictionary_i32_match_flags(modes, &[left_mode.as_bytes(), right_mode.as_bytes()])
+        dictionary_i32_view_match_flags(view.modes, &[left_mode.as_bytes(), right_mode.as_bytes()])
     else {
         return false;
     };
-    let mode_keys = modes.keys().values().as_ref();
-    if orderkeys.null_count() == 0
-        && modes.null_count() == 0
-        && commitdates.null_count() == 0
-        && receiptdates.null_count() == 0
-        && shipdates.null_count() == 0
+    let mode_keys = view.modes.keys();
+    if view.orderkeys.null_count() == 0
+        && view.modes.null_count() == 0
+        && view.commitdates.null_count() == 0
+        && view.receiptdates.null_count() == 0
+        && view.shipdates.null_count() == 0
     {
-        let orderkey_values = orderkeys.values().as_ref();
-        let commitdate_values = commitdates.values().as_ref();
-        let receiptdate_values = receiptdates.values().as_ref();
-        let shipdate_values = shipdates.values().as_ref();
+        let orderkey_values = view.orderkeys.values().as_ref();
+        let commitdate_values = view.commitdates.values().as_ref();
+        let receiptdate_values = view.receiptdates.values().as_ref();
+        let shipdate_values = view.shipdates.values().as_ref();
         if q12_lineitem_selection_vector_enabled() {
             let mut selected = SelectionVector::with_capacity(orderkey_values.len().min(4096));
-            for row in 0..orderkeys.len() {
+            for row in 0..view.orderkeys.len() {
                 let commitdate = commitdate_values[row];
                 let receiptdate = receiptdate_values[row];
                 if q12_lineitem_dates_match(
@@ -10573,7 +10573,7 @@ fn q12_filtered_lineitem_counts_batch_dictionary_typed_into(
                     selected.push(row);
                 }
             }
-            if q12_should_use_lineitem_selection_vector(selected.len(), orderkeys.len()) {
+            if q12_should_use_lineitem_selection_vector(selected.len(), view.orderkeys.len()) {
                 for &row in selected.as_slice() {
                     let row = row as usize;
                     let Ok(mode_key) = usize::try_from(mode_keys[row]) else {
@@ -10587,7 +10587,7 @@ fn q12_filtered_lineitem_counts_batch_dictionary_typed_into(
                 return true;
             }
         }
-        for row in 0..orderkeys.len() {
+        for row in 0..view.orderkeys.len() {
             let commitdate = commitdate_values[row];
             let receiptdate = receiptdate_values[row];
             if !q12_lineitem_dates_match(
@@ -10609,21 +10609,21 @@ fn q12_filtered_lineitem_counts_batch_dictionary_typed_into(
         }
         return true;
     }
-    for row in 0..orderkeys.len() {
-        if orderkeys.is_null(row)
-            || modes.is_null(row)
-            || commitdates.is_null(row)
-            || receiptdates.is_null(row)
-            || shipdates.is_null(row)
+    for row in 0..view.orderkeys.len() {
+        if view.orderkeys.is_null(row)
+            || view.modes.is_null(row)
+            || view.commitdates.is_null(row)
+            || view.receiptdates.is_null(row)
+            || view.shipdates.is_null(row)
         {
             continue;
         }
-        let commitdate = commitdates.value(row);
-        let receiptdate = receiptdates.value(row);
+        let commitdate = view.commitdates.value(row);
+        let receiptdate = view.receiptdates.value(row);
         if !q12_lineitem_dates_match(
             commitdate,
             receiptdate,
-            shipdates.value(row),
+            view.shipdates.value(row),
             start_days,
             end_days,
         ) {
@@ -10635,7 +10635,7 @@ fn q12_filtered_lineitem_counts_batch_dictionary_typed_into(
         let Some(Some(mode_index)) = mode_flags.get(mode_key) else {
             continue;
         };
-        q12_pending_increment(pending, orderkeys.value(row), *mode_index);
+        q12_pending_increment(pending, view.orderkeys.value(row), *mode_index);
     }
     true
 }
@@ -11936,7 +11936,7 @@ fn q12_shipping_mode_counts_projected_batch(
         && q12_typed_loop_enabled()
         && let Some(groups) = q12_shipping_mode_counts_batch_dictionary_typed(
             batch.column(0),
-            orderpriorities,
+            DictionaryI32View::Arrow(orderpriorities),
             pending,
         )
     {
@@ -11958,7 +11958,7 @@ fn q12_shipping_mode_counts_projected_view(
         return Ok(groups);
     }
     if view.num_columns() == 2
-        && let Some(orderpriorities) = view.dictionary_i32(1)
+        && let Some(orderpriorities) = view.dictionary_i32_view(1)
         && q12_typed_loop_enabled()
         && let Some(groups) = q12_shipping_mode_counts_batch_dictionary_typed(
             view.column(0)?,
@@ -12048,7 +12048,7 @@ fn q12_shipping_mode_counts_projected_batch_partial(
         && q12_typed_loop_enabled()
         && let Some(groups) = q12_shipping_mode_counts_batch_dictionary_typed(
             batch.column(0),
-            orderpriorities,
+            DictionaryI32View::Arrow(orderpriorities),
             pending,
         )
     {
@@ -12097,7 +12097,7 @@ fn q12_shipping_mode_counts_projected_view_partial(
         return Ok(partial);
     }
     if view.num_columns() == 2
-        && let Some(orderpriorities) = view.dictionary_i32(1)
+        && let Some(orderpriorities) = view.dictionary_i32_view(1)
         && q12_typed_loop_enabled()
         && let Some(groups) = q12_shipping_mode_counts_batch_dictionary_typed(
             view.column(0)?,
@@ -12286,12 +12286,13 @@ fn q12_shipping_mode_counts_batch_typed_profile(
 
 fn q12_shipping_mode_counts_batch_dictionary_typed(
     orderkeys: &ArrayRef,
-    orderpriorities: &DictionaryArray<Int32Type>,
+    orderpriorities: DictionaryI32View<'_>,
     pending: &AdaptiveI64Map<Q12PendingOrder>,
 ) -> Option<[Q12State; 2]> {
     let orderkeys = orderkeys.as_any().downcast_ref::<Int64Array>()?;
-    let priority_flags = dictionary_i32_match_flags(orderpriorities, &[b"1-URGENT", b"2-HIGH"])?;
-    let priority_keys = orderpriorities.keys().values().as_ref();
+    let priority_flags =
+        dictionary_i32_view_match_flags(orderpriorities, &[b"1-URGENT", b"2-HIGH"])?;
+    let priority_keys = orderpriorities.keys();
     let mut groups = [Q12State::default(); 2];
     if orderkeys.null_count() == 0 && orderpriorities.null_count() == 0 {
         let orderkey_values = orderkeys.values().as_ref();
@@ -12334,7 +12335,7 @@ fn q12_shipping_mode_counts_batch_dictionary_typed(
         let Some(order) = pending.get(orderkeys.value(row)) else {
             continue;
         };
-        let priority_index = usize::try_from(orderpriorities.key(row)?).ok()?;
+        let priority_index = usize::try_from(priority_keys[row]).ok()?;
         let is_high_priority = priority_flags
             .get(priority_index)
             .copied()
