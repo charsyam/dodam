@@ -1239,8 +1239,8 @@ impl DirectI64I32I32ScanMetrics {
     }
 }
 
-pub(crate) fn parquet_column_indices_by_name(
-    reader: &SerializedFileReader<File>,
+pub(crate) fn parquet_column_indices_by_name<R: ChunkReader + 'static>(
+    reader: &SerializedFileReader<R>,
     names: &[&str],
 ) -> Option<Vec<usize>> {
     let columns = reader.metadata().file_metadata().schema_descr().columns();
@@ -1250,8 +1250,17 @@ pub(crate) fn parquet_column_indices_by_name(
         .collect()
 }
 
-pub(crate) fn parquet_row_group_count(path: &Path) -> Result<usize> {
-    let file = File::open(path)?;
+pub(crate) fn parquet_row_group_count_with_store(
+    path: &Path,
+    file_cache: Arc<ParquetFileCache>,
+    store: &dyn ObjectStore,
+) -> Result<usize> {
+    if file_cache.enabled() {
+        let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
+        let reader = SerializedFileReader::new(reader)?;
+        return Ok(reader.metadata().num_row_groups());
+    }
+    let file = store.open(path)?;
     let reader = SerializedFileReader::new(file)?;
     Ok(reader.metadata().num_row_groups())
 }
@@ -1316,18 +1325,44 @@ impl<'a> DirectByteArrayPayloadReader<'a> {
     }
 }
 
-pub(crate) fn scan_parquet_i64_byte_array_payload_columns<F>(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scan_parquet_i64_byte_array_payload_columns_with_store<F>(
     path: &Path,
+    batch_size: usize,
+    row_groups: &[usize],
+    columns: [&str; 2],
+    file_cache: Arc<ParquetFileCache>,
+    store: &dyn ObjectStore,
+    consume: F,
+) -> Result<Option<DirectColumnScanMetrics>>
+where
+    F: for<'a> FnMut(&[i64], &mut DirectByteArrayPayloadReader<'a>) -> Result<Option<()>>,
+{
+    if file_cache.enabled() {
+        let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
+        let reader = SerializedFileReader::new(reader)?;
+        return scan_parquet_i64_byte_array_payload_columns_reader(
+            reader, batch_size, row_groups, columns, consume,
+        );
+    }
+    let file = store.open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    scan_parquet_i64_byte_array_payload_columns_reader(
+        reader, batch_size, row_groups, columns, consume,
+    )
+}
+
+fn scan_parquet_i64_byte_array_payload_columns_reader<R, F>(
+    reader: SerializedFileReader<R>,
     batch_size: usize,
     row_groups: &[usize],
     columns: [&str; 2],
     mut consume: F,
 ) -> Result<Option<DirectColumnScanMetrics>>
 where
+    R: ChunkReader + 'static,
     F: for<'a> FnMut(&[i64], &mut DirectByteArrayPayloadReader<'a>) -> Result<Option<()>>,
 {
-    let file = File::open(path)?;
-    let reader = SerializedFileReader::new(file)?;
     let Some(column_indices) = parquet_column_indices_by_name(&reader, &columns) else {
         return Ok(None);
     };
@@ -1383,18 +1418,42 @@ where
     Ok(Some(metrics))
 }
 
-pub(crate) fn scan_parquet_i64_i32_i32_columns<F>(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scan_parquet_i64_i32_i32_columns_with_store<F>(
     path: &Path,
+    batch_size: usize,
+    row_groups: &[usize],
+    columns: [&str; 3],
+    file_cache: Arc<ParquetFileCache>,
+    store: &dyn ObjectStore,
+    consume: F,
+) -> Result<Option<DirectI64I32I32ScanMetrics>>
+where
+    F: FnMut(&[i64], &[i32], &[i32]) -> Result<()>,
+{
+    if file_cache.enabled() {
+        let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
+        let reader = SerializedFileReader::new(reader)?;
+        return scan_parquet_i64_i32_i32_columns_reader(
+            reader, batch_size, row_groups, columns, consume,
+        );
+    }
+    let file = store.open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    scan_parquet_i64_i32_i32_columns_reader(reader, batch_size, row_groups, columns, consume)
+}
+
+fn scan_parquet_i64_i32_i32_columns_reader<R, F>(
+    reader: SerializedFileReader<R>,
     batch_size: usize,
     row_groups: &[usize],
     columns: [&str; 3],
     mut consume: F,
 ) -> Result<Option<DirectI64I32I32ScanMetrics>>
 where
+    R: ChunkReader + 'static,
     F: FnMut(&[i64], &[i32], &[i32]) -> Result<()>,
 {
-    let file = File::open(path)?;
-    let reader = SerializedFileReader::new(file)?;
     let Some(column_indices) = parquet_column_indices_by_name(&reader, &columns) else {
         return Ok(None);
     };

@@ -36,9 +36,13 @@ use crate::plan::{
     PhysicalJoinStrategy, PhysicalOperator, PhysicalPlanNode, PlanTableSource, TaskInput, TaskPlan,
 };
 use crate::storage::{
+    DirectByteArrayPayloadReader, DirectColumnScanMetrics, DirectI64I32I32ScanMetrics,
     I64BloomPredicate, LocalFileSystemObjectStore, ObjectStore, ParquetBatchReader,
-    ParquetFileCache, ParquetFileCacheStats, ParquetMetadataCache, plan_parquet_scan_tasks,
-    read_parquet_file_statistics, read_parquet_i64_column_constant, read_parquet_i64_column_max,
+    ParquetFileCache, ParquetFileCacheStats, ParquetMetadataCache,
+    parquet_row_group_count_with_store, plan_parquet_scan_tasks, read_parquet_file_statistics,
+    read_parquet_i64_column_constant, read_parquet_i64_column_max,
+    scan_parquet_i64_byte_array_payload_columns_with_store,
+    scan_parquet_i64_i32_i32_columns_with_store,
 };
 use crate::vector::BatchView;
 
@@ -656,6 +660,58 @@ impl DodamEngine {
 
     pub fn file_cache_stats(&self) -> ParquetFileCacheStats {
         self.file_cache.stats()
+    }
+
+    pub(crate) fn parquet_row_group_count(&self, path: impl AsRef<Path>) -> Result<usize> {
+        parquet_row_group_count_with_store(
+            path.as_ref(),
+            self.file_cache.clone(),
+            self.object_store.as_ref(),
+        )
+    }
+
+    pub(crate) fn scan_parquet_i64_i32_i32_columns<F>(
+        &self,
+        path: impl AsRef<Path>,
+        batch_size: usize,
+        row_groups: &[usize],
+        columns: [&str; 3],
+        consume: F,
+    ) -> Result<Option<DirectI64I32I32ScanMetrics>>
+    where
+        F: FnMut(&[i64], &[i32], &[i32]) -> Result<()>,
+    {
+        scan_parquet_i64_i32_i32_columns_with_store(
+            path.as_ref(),
+            batch_size,
+            row_groups,
+            columns,
+            self.file_cache.clone(),
+            self.object_store.as_ref(),
+            consume,
+        )
+    }
+
+    pub(crate) fn scan_parquet_i64_byte_array_payload_columns<F>(
+        &self,
+        path: impl AsRef<Path>,
+        batch_size: usize,
+        row_groups: &[usize],
+        columns: [&str; 2],
+        consume: F,
+    ) -> Result<Option<DirectColumnScanMetrics>>
+    where
+        F: for<'a> FnMut(&[i64], &mut DirectByteArrayPayloadReader<'a>) -> Result<Option<()>>,
+    {
+        scan_parquet_i64_byte_array_payload_columns_with_store(
+            path.as_ref(),
+            batch_size,
+            row_groups,
+            columns,
+            self.file_cache.clone(),
+            self.object_store.as_ref(),
+            consume,
+        )
     }
 
     pub async fn scan_parquet(

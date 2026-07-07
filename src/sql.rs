@@ -50,10 +50,7 @@ use crate::execution::{
 };
 use crate::hash::{FastHashMap, FastHashSet, fast_hash_map, fast_hash_map_with_capacity};
 use crate::optimizer::plan_join_inputs;
-use crate::storage::{
-    DirectColumnScanMetrics, DirectI64I32I32ScanMetrics, parquet_row_group_count,
-    scan_parquet_i64_byte_array_payload_columns, scan_parquet_i64_i32_i32_columns,
-};
+use crate::storage::{DirectColumnScanMetrics, DirectI64I32I32ScanMetrics};
 use crate::vector::{
     BatchConsumer, BatchView, DictionaryStringValues, SelectionVector, consume_record_batch,
     dictionary_i32_match_flags, dictionary_i32_string_values,
@@ -10980,6 +10977,7 @@ async fn q12_shipping_mode_counts_from_orders(
 ) -> Result<Vec<Q12Row>> {
     if q12_order_direct_column_reader_enabled()
         && let Some(rows) = q12_shipping_mode_counts_from_orders_direct(
+            engine,
             path.clone(),
             batch_size,
             shipmodes,
@@ -11212,13 +11210,14 @@ async fn q12_shipping_mode_counts_from_orders_fused(
 }
 
 fn q12_shipping_mode_counts_from_orders_direct(
+    engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
     shipmodes: &[String],
     pending: &Q12PendingMap,
 ) -> Result<Option<Vec<Q12Row>>> {
     let started = tpch_profile_start();
-    let row_groups = (0..parquet_row_group_count(&path)?).collect::<Vec<_>>();
+    let row_groups = (0..engine.parquet_row_group_count(&path)?).collect::<Vec<_>>();
     let pending = Arc::new(AdaptiveI64Map::from_hash(pending.clone()));
     let chunks = row_groups
         .chunks(q12_order_direct_row_group_chunk())
@@ -11229,6 +11228,7 @@ fn q12_shipping_mode_counts_from_orders_direct(
         .into_par_iter()
         .map(|row_groups| {
             q12_order_direct_row_group_chunk_scan(
+                engine,
                 path.clone(),
                 batch_size,
                 row_groups,
@@ -11329,6 +11329,7 @@ impl Q12OrderDirectMetrics {
 }
 
 fn q12_order_direct_row_group_chunk_scan(
+    engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
     row_groups: Vec<usize>,
@@ -11340,7 +11341,7 @@ fn q12_order_direct_row_group_chunk_scan(
     let mut priorities = Vec::<parquet::data_type::ByteArray>::with_capacity(batch_size);
     let mut priority_def_levels = Vec::<i16>::with_capacity(batch_size);
     let mut hits = Vec::<(usize, Q12PendingOrder)>::with_capacity(batch_size.min(1024));
-    let Some(scan_metrics) = scan_parquet_i64_byte_array_payload_columns(
+    let Some(scan_metrics) = engine.scan_parquet_i64_byte_array_payload_columns(
         &path,
         batch_size,
         &row_groups,
@@ -16276,6 +16277,7 @@ async fn q04_count_late_candidate_priorities(
 ) -> Result<Vec<u64>> {
     if q04_lineitem_direct_column_reader_enabled()
         && let Some(counts) = q04_count_late_candidate_priorities_direct_column_reader(
+            engine,
             path.clone(),
             batch_size,
             candidate_priorities,
@@ -16358,13 +16360,14 @@ fn q04_lineitem_direct_column_reader_enabled() -> bool {
 }
 
 fn q04_count_late_candidate_priorities_direct_column_reader(
+    engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
     candidate_priorities: &[u8],
     priority_count: usize,
 ) -> Result<Option<Vec<u64>>> {
     let started = tpch_profile_start();
-    let row_groups = (0..parquet_row_group_count(&path)?).collect::<Vec<_>>();
+    let row_groups = (0..engine.parquet_row_group_count(&path)?).collect::<Vec<_>>();
     let candidate_priorities = Arc::new(
         candidate_priorities
             .iter()
@@ -16381,6 +16384,7 @@ fn q04_count_late_candidate_priorities_direct_column_reader(
         .into_par_iter()
         .map(|row_groups| {
             q04_lineitem_direct_column_chunk_scan(
+                engine,
                 path.clone(),
                 batch_size,
                 row_groups,
@@ -16467,6 +16471,7 @@ impl Q04LineitemDirectMetrics {
 
 #[allow(clippy::too_many_arguments)]
 fn q04_lineitem_direct_column_chunk_scan(
+    engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
     row_groups: Vec<usize>,
@@ -16481,7 +16486,7 @@ fn q04_lineitem_direct_column_chunk_scan(
     };
     let mut hits = 0usize;
     let mut misses = 0usize;
-    let Some(scan_metrics) = scan_parquet_i64_i32_i32_columns(
+    let Some(scan_metrics) = engine.scan_parquet_i64_i32_i32_columns(
         &path,
         batch_size,
         &row_groups,
