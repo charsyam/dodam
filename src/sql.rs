@@ -16910,6 +16910,15 @@ fn q04_count_late_candidate_priorities_atomic_batch(
         return Ok(Some(()));
     }
     for row in 0..batch.num_rows() {
+        let (Some(commitdate), Some(receiptdate)) = (
+            date32_value(commitdates, row)?,
+            date32_value(receiptdates, row)?,
+        ) else {
+            continue;
+        };
+        if commitdate >= receiptdate {
+            continue;
+        }
         let Some(orderkey) = numeric_i64_value(orderkeys, row)? else {
             continue;
         };
@@ -16924,15 +16933,6 @@ fn q04_count_late_candidate_priorities_atomic_batch(
         };
         let priority_marker = marker.load(Ordering::Relaxed);
         if priority_marker == 0 {
-            continue;
-        }
-        let (Some(commitdate), Some(receiptdate)) = (
-            date32_value(commitdates, row)?,
-            date32_value(receiptdates, row)?,
-        ) else {
-            continue;
-        };
-        if commitdate >= receiptdate {
             continue;
         }
         let priority_marker = marker.swap(0, Ordering::Relaxed);
@@ -16966,6 +16966,9 @@ fn q04_count_late_candidate_priorities_atomic_typed(
         let commitdate_values = commitdates.values().as_ref();
         let receiptdate_values = receiptdates.values().as_ref();
         for row in 0..orderkey_values.len() {
+            if commitdate_values[row] >= receiptdate_values[row] {
+                continue;
+            }
             let orderkey = orderkey_values[row];
             if orderkey < 0 {
                 continue;
@@ -16980,9 +16983,6 @@ fn q04_count_late_candidate_priorities_atomic_typed(
             if priority_marker == 0 {
                 continue;
             }
-            if commitdate_values[row] >= receiptdate_values[row] {
-                continue;
-            }
             let priority_marker = marker.swap(0, Ordering::Relaxed);
             if priority_marker == 0 {
                 continue;
@@ -16993,6 +16993,9 @@ fn q04_count_late_candidate_priorities_atomic_typed(
     }
     for row in 0..orderkeys.len() {
         if orderkeys.is_null(row) || commitdates.is_null(row) || receiptdates.is_null(row) {
+            continue;
+        }
+        if commitdates.value(row) >= receiptdates.value(row) {
             continue;
         }
         let orderkey = orderkeys.value(row);
@@ -17007,9 +17010,6 @@ fn q04_count_late_candidate_priorities_atomic_typed(
         };
         let priority_marker = marker.load(Ordering::Relaxed);
         if priority_marker == 0 {
-            continue;
-        }
-        if commitdates.value(row) >= receiptdates.value(row) {
             continue;
         }
         let priority_marker = marker.swap(0, Ordering::Relaxed);
