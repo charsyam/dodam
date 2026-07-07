@@ -75,6 +75,43 @@ impl<'a> I64VectorView<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum I32VectorView<'a> {
+    Arrow(&'a Int32Array),
+    Raw(&'a [i32]),
+}
+
+impl<'a> I32VectorView<'a> {
+    pub(crate) fn value(&self, row: usize) -> i32 {
+        match self {
+            Self::Arrow(values) => values.value(row),
+            Self::Raw(values) => values[row],
+        }
+    }
+
+    pub(crate) fn values_if_null_free(&self) -> Option<&'a [i32]> {
+        match self {
+            Self::Arrow(values) => (values.null_count() == 0).then(|| values.values().as_ref()),
+            Self::Raw(values) => Some(values),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Date32VectorView<'a> {
+    Arrow(&'a Date32Array),
+    Raw(&'a [i32]),
+}
+
+impl<'a> Date32VectorView<'a> {
+    pub(crate) fn values_if_null_free(&self) -> Option<&'a [i32]> {
+        match self {
+            Self::Arrow(values) => (values.null_count() == 0).then(|| values.values().as_ref()),
+            Self::Raw(values) => Some(values),
+        }
+    }
+}
+
 impl<'a> BatchView<'a> {
     pub(crate) fn new(batch: &'a RecordBatch) -> Self {
         Self {
@@ -205,6 +242,16 @@ impl<'a> BatchView<'a> {
         self.downcast(index)
     }
 
+    pub(crate) fn i32_vector(&self, index: usize) -> Option<I32VectorView<'a>> {
+        match self.inner {
+            BatchViewInner::RecordBatch(_) => self.i32(index).map(I32VectorView::Arrow),
+            BatchViewInner::RawColumns(_) => match self.raw_column(index)? {
+                RawColumnView::I32(values) => Some(I32VectorView::Raw(values)),
+                _ => None,
+            },
+        }
+    }
+
     pub(crate) fn required_i32(&self, index: usize) -> Result<&'a Int32Array> {
         self.i32(index).ok_or_else(|| {
             DodamError::UnsupportedSql(format!("projected column {index} is not Int32"))
@@ -213,6 +260,16 @@ impl<'a> BatchView<'a> {
 
     pub(crate) fn date32(&self, index: usize) -> Option<&'a Date32Array> {
         self.downcast(index)
+    }
+
+    pub(crate) fn date32_vector(&self, index: usize) -> Option<Date32VectorView<'a>> {
+        match self.inner {
+            BatchViewInner::RecordBatch(_) => self.date32(index).map(Date32VectorView::Arrow),
+            BatchViewInner::RawColumns(_) => match self.raw_column(index)? {
+                RawColumnView::Date32(values) => Some(Date32VectorView::Raw(values)),
+                _ => None,
+            },
+        }
     }
 
     pub(crate) fn required_date32(&self, index: usize) -> Result<&'a Date32Array> {
