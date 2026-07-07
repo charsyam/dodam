@@ -9405,13 +9405,9 @@ fn q16_supplier_counts_packed_batch(
 ) -> Result<()> {
     let partkeys = batch_column(&batch, "ps_partkey")?;
     let suppkeys = batch_column(&batch, "ps_suppkey")?;
-    if q16_supplier_counts_packed_batch_typed(
-        partkeys,
-        suppkeys,
-        part_to_group,
-        bad_suppliers,
-        distinct_suppliers,
-    ) {
+    if let Some(keys) = Q16SupplierKeyView::try_new(partkeys, suppkeys)
+        && q16_supplier_counts_packed_typed(keys, part_to_group, bad_suppliers, distinct_suppliers)
+    {
         return Ok(());
     }
     for row in 0..batch.num_rows() {
@@ -9436,6 +9432,28 @@ fn q16_supplier_counts_packed_batch(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct Q16SupplierKeyView<'a> {
+    partkeys: &'a Int64Array,
+    suppkeys: &'a Int64Array,
+}
+
+impl<'a> Q16SupplierKeyView<'a> {
+    fn try_new(partkeys: &'a ArrayRef, suppkeys: &'a ArrayRef) -> Option<Self> {
+        Some(Self {
+            partkeys: partkeys.as_any().downcast_ref::<Int64Array>()?,
+            suppkeys: suppkeys.as_any().downcast_ref::<Int64Array>()?,
+        })
+    }
+
+    fn try_new_view(view: BatchView<'a>) -> Option<Self> {
+        Some(Self {
+            partkeys: view.i64(0)?,
+            suppkeys: view.i64(1)?,
+        })
+    }
+}
+
 fn q16_supplier_counts_packed_view(
     view: BatchView<'_>,
     part_to_group: &AdaptiveI64Map<usize>,
@@ -9443,13 +9461,8 @@ fn q16_supplier_counts_packed_view(
     distinct_suppliers: &mut PackedU32PairDistinct,
 ) -> Result<()> {
     if view.num_columns() == 2
-        && q16_supplier_counts_packed_batch_typed(
-            view.column(0)?,
-            view.column(1)?,
-            part_to_group,
-            bad_suppliers,
-            distinct_suppliers,
-        )
+        && let Some(keys) = Q16SupplierKeyView::try_new_view(view)
+        && q16_supplier_counts_packed_typed(keys, part_to_group, bad_suppliers, distinct_suppliers)
     {
         return Ok(());
     }
@@ -9461,19 +9474,14 @@ fn q16_supplier_counts_packed_view(
     )
 }
 
-fn q16_supplier_counts_packed_batch_typed(
-    partkeys: &ArrayRef,
-    suppkeys: &ArrayRef,
+fn q16_supplier_counts_packed_typed(
+    keys: Q16SupplierKeyView<'_>,
     part_to_group: &AdaptiveI64Map<usize>,
     bad_suppliers: &AdaptiveI64Set,
     distinct_suppliers: &mut PackedU32PairDistinct,
 ) -> bool {
-    let (Some(partkeys), Some(suppkeys)) = (
-        partkeys.as_any().downcast_ref::<Int64Array>(),
-        suppkeys.as_any().downcast_ref::<Int64Array>(),
-    ) else {
-        return false;
-    };
+    let partkeys = keys.partkeys;
+    let suppkeys = keys.suppkeys;
     if partkeys.null_count() == 0 && suppkeys.null_count() == 0 {
         let partkey_values = partkeys.values().as_ref();
         let suppkey_values = suppkeys.values().as_ref();
@@ -9547,13 +9555,9 @@ fn q16_supplier_counts_bitset_batch(
 ) -> Result<()> {
     let partkeys = batch_column(&batch, "ps_partkey")?;
     let suppkeys = batch_column(&batch, "ps_suppkey")?;
-    if q16_supplier_counts_bitset_batch_typed(
-        partkeys,
-        suppkeys,
-        part_to_group,
-        bad_suppliers,
-        distinct_suppliers,
-    ) {
+    if let Some(keys) = Q16SupplierKeyView::try_new(partkeys, suppkeys)
+        && q16_supplier_counts_bitset_typed(keys, part_to_group, bad_suppliers, distinct_suppliers)
+    {
         return Ok(());
     }
     for row in 0..batch.num_rows() {
@@ -9581,13 +9585,8 @@ fn q16_supplier_counts_bitset_view(
     distinct_suppliers: &mut Q16GroupSupplierBitset,
 ) -> Result<()> {
     if view.num_columns() == 2
-        && q16_supplier_counts_bitset_batch_typed(
-            view.column(0)?,
-            view.column(1)?,
-            part_to_group,
-            bad_suppliers,
-            distinct_suppliers,
-        )
+        && let Some(keys) = Q16SupplierKeyView::try_new_view(view)
+        && q16_supplier_counts_bitset_typed(keys, part_to_group, bad_suppliers, distinct_suppliers)
     {
         return Ok(());
     }
@@ -9599,19 +9598,14 @@ fn q16_supplier_counts_bitset_view(
     )
 }
 
-fn q16_supplier_counts_bitset_batch_typed(
-    partkeys: &ArrayRef,
-    suppkeys: &ArrayRef,
+fn q16_supplier_counts_bitset_typed(
+    keys: Q16SupplierKeyView<'_>,
     part_to_group: &AdaptiveI64Map<usize>,
     bad_suppliers: &AdaptiveI64Set,
     distinct_suppliers: &mut Q16GroupSupplierBitset,
 ) -> bool {
-    let (Some(partkeys), Some(suppkeys)) = (
-        partkeys.as_any().downcast_ref::<Int64Array>(),
-        suppkeys.as_any().downcast_ref::<Int64Array>(),
-    ) else {
-        return false;
-    };
+    let partkeys = keys.partkeys;
+    let suppkeys = keys.suppkeys;
     if partkeys.null_count() == 0 && suppkeys.null_count() == 0 {
         let partkey_values = partkeys.values().as_ref();
         let suppkey_values = suppkeys.values().as_ref();
@@ -9650,8 +9644,8 @@ fn q16_supplier_counts_batch(
 ) -> Result<FastHashSet<(usize, i64)>> {
     let partkeys = batch_column(&batch, "ps_partkey")?;
     let suppkeys = batch_column(&batch, "ps_suppkey")?;
-    if let Some(groups) =
-        q16_supplier_counts_batch_typed(partkeys, suppkeys, part_to_group, bad_suppliers)?
+    if let Some(keys) = Q16SupplierKeyView::try_new(partkeys, suppkeys)
+        && let Some(groups) = q16_supplier_counts_typed(keys, part_to_group, bad_suppliers)?
     {
         return Ok(groups);
     }
@@ -9680,30 +9674,21 @@ fn q16_supplier_counts_view(
     bad_suppliers: &AdaptiveI64Set,
 ) -> Result<FastHashSet<(usize, i64)>> {
     if view.num_columns() == 2
-        && let Some(groups) = q16_supplier_counts_batch_typed(
-            view.column(0)?,
-            view.column(1)?,
-            part_to_group,
-            bad_suppliers,
-        )?
+        && let Some(keys) = Q16SupplierKeyView::try_new_view(view)
+        && let Some(groups) = q16_supplier_counts_typed(keys, part_to_group, bad_suppliers)?
     {
         return Ok(groups);
     }
     q16_supplier_counts_batch(view.record_batch().clone(), part_to_group, bad_suppliers)
 }
 
-fn q16_supplier_counts_batch_typed(
-    partkeys: &ArrayRef,
-    suppkeys: &ArrayRef,
+fn q16_supplier_counts_typed(
+    keys: Q16SupplierKeyView<'_>,
     part_to_group: &AdaptiveI64Map<usize>,
     bad_suppliers: &AdaptiveI64Set,
 ) -> Result<Option<FastHashSet<(usize, i64)>>> {
-    let (Some(partkeys), Some(suppkeys)) = (
-        partkeys.as_any().downcast_ref::<Int64Array>(),
-        suppkeys.as_any().downcast_ref::<Int64Array>(),
-    ) else {
-        return Ok(None);
-    };
+    let partkeys = keys.partkeys;
+    let suppkeys = keys.suppkeys;
     let mut distinct_suppliers = FastHashSet::default();
     for row in 0..partkeys.len() {
         if partkeys.is_null(row) || suppkeys.is_null(row) {
