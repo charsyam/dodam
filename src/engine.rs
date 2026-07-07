@@ -691,11 +691,11 @@ impl DodamEngine {
             },
             DirectPrimitiveColumnSpec {
                 name: columns[1],
-                column_type: DirectPrimitiveColumnType::I32,
+                column_type: DirectPrimitiveColumnType::Date32,
             },
             DirectPrimitiveColumnSpec {
                 name: columns[2],
-                column_type: DirectPrimitiveColumnType::I32,
+                column_type: DirectPrimitiveColumnType::Date32,
             },
         ];
         self.scan_parquet_primitive_columns_view(path, batch_size, row_groups, &specs, consume)

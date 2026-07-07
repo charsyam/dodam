@@ -22,6 +22,7 @@ enum BatchViewInner<'a> {
 pub(crate) enum RawColumnView<'a> {
     I64(&'a [i64]),
     I32(&'a [i32]),
+    Date32(&'a [i32]),
 }
 
 impl<'a> BatchView<'a> {
@@ -86,6 +87,7 @@ impl<'a> BatchView<'a> {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn raw_i32(&self, index: usize) -> Option<&'a [i32]> {
         match self.raw_column(index)? {
             RawColumnView::I32(values) => Some(values),
@@ -94,13 +96,24 @@ impl<'a> BatchView<'a> {
     }
 
     pub(crate) fn raw_i64_i32_i32(&self) -> Option<(&'a [i64], &'a [i32], &'a [i32])> {
-        Some((self.raw_i64(0)?, self.raw_i32(1)?, self.raw_i32(2)?))
+        Some((
+            self.raw_i64(0)?,
+            self.raw_i32_physical(1)?,
+            self.raw_i32_physical(2)?,
+        ))
     }
 
     fn raw_column(&self, index: usize) -> Option<RawColumnView<'a>> {
         match self.inner {
             BatchViewInner::RecordBatch(_) => None,
             BatchViewInner::RawColumns(columns) => columns.get(index).copied(),
+        }
+    }
+
+    fn raw_i32_physical(&self, index: usize) -> Option<&'a [i32]> {
+        match self.raw_column(index)? {
+            RawColumnView::I32(values) | RawColumnView::Date32(values) => Some(values),
+            _ => None,
         }
     }
 
@@ -165,7 +178,7 @@ impl RawColumnView<'_> {
     fn len(&self) -> usize {
         match self {
             Self::I64(values) => values.len(),
-            Self::I32(values) => values.len(),
+            Self::I32(values) | Self::Date32(values) => values.len(),
         }
     }
 }

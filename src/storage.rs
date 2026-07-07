@@ -1291,7 +1291,9 @@ impl DirectPrimitiveColumnScanMetrics {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum DirectPrimitiveColumnType {
     I64,
+    #[allow(dead_code)]
     I32,
+    Date32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1518,7 +1520,9 @@ impl DirectPrimitiveColumnValues {
     fn new(column_type: DirectPrimitiveColumnType, capacity: usize) -> Self {
         match column_type {
             DirectPrimitiveColumnType::I64 => Self::I64(Vec::with_capacity(capacity)),
-            DirectPrimitiveColumnType::I32 => Self::I32(Vec::with_capacity(capacity)),
+            DirectPrimitiveColumnType::I32 | DirectPrimitiveColumnType::Date32 => {
+                Self::I32(Vec::with_capacity(capacity))
+            }
         }
     }
 
@@ -1529,10 +1533,12 @@ impl DirectPrimitiveColumnValues {
         }
     }
 
-    fn as_view(&self) -> RawColumnView<'_> {
-        match self {
-            Self::I64(values) => RawColumnView::I64(values),
-            Self::I32(values) => RawColumnView::I32(values),
+    fn as_view(&self, column_type: DirectPrimitiveColumnType) -> RawColumnView<'_> {
+        match (self, column_type) {
+            (Self::I64(values), DirectPrimitiveColumnType::I64) => RawColumnView::I64(values),
+            (Self::I32(values), DirectPrimitiveColumnType::I32) => RawColumnView::I32(values),
+            (Self::I32(values), DirectPrimitiveColumnType::Date32) => RawColumnView::Date32(values),
+            _ => unreachable!("direct primitive values match their column spec"),
         }
     }
 }
@@ -1604,6 +1610,9 @@ where
                 (DirectPrimitiveColumnType::I32, ColumnReader::Int32ColumnReader(reader)) => {
                     DirectPrimitiveColumnReader::I32(reader)
                 }
+                (DirectPrimitiveColumnType::Date32, ColumnReader::Int32ColumnReader(reader)) => {
+                    DirectPrimitiveColumnReader::I32(reader)
+                }
                 _ => return Ok(None),
             };
             readers.push(reader);
@@ -1657,12 +1666,46 @@ where
             metrics.add_read_nanos(elapsed_nanos(read_started));
             metrics.batches += 1;
             metrics.rows = metrics.rows.saturating_add(record_count);
-            let views: Vec<RawColumnView<'_>> = values
-                .iter()
-                .map(DirectPrimitiveColumnValues::as_view)
-                .collect();
             let consume_started = Instant::now();
-            consume(&views)?;
+            match values.len() {
+                0 => consume(&[])?,
+                1 => {
+                    let views = [values[0].as_view(columns[0].column_type)];
+                    consume(&views)?;
+                }
+                2 => {
+                    let views = [
+                        values[0].as_view(columns[0].column_type),
+                        values[1].as_view(columns[1].column_type),
+                    ];
+                    consume(&views)?;
+                }
+                3 => {
+                    let views = [
+                        values[0].as_view(columns[0].column_type),
+                        values[1].as_view(columns[1].column_type),
+                        values[2].as_view(columns[2].column_type),
+                    ];
+                    consume(&views)?;
+                }
+                4 => {
+                    let views = [
+                        values[0].as_view(columns[0].column_type),
+                        values[1].as_view(columns[1].column_type),
+                        values[2].as_view(columns[2].column_type),
+                        values[3].as_view(columns[3].column_type),
+                    ];
+                    consume(&views)?;
+                }
+                _ => {
+                    let views: Vec<RawColumnView<'_>> = values
+                        .iter()
+                        .zip(columns.iter())
+                        .map(|(values, column)| values.as_view(column.column_type))
+                        .collect();
+                    consume(&views)?;
+                }
+            }
             metrics.add_consume_nanos(elapsed_nanos(consume_started));
         }
     }
