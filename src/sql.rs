@@ -7818,12 +7818,12 @@ fn q09_order_year_get(
 }
 
 fn q09_matched_index_enabled() -> bool {
-    if std::env::var("DODAM_Q09_DISABLE_MATCHED_INDEX")
+    if std::env::var("DODAM_Q09_ENABLE_MATCHED_INDEX")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
     {
-        return false;
+        return true;
     }
-    true
+    false
 }
 
 fn q09_profit_decimal_batch(
