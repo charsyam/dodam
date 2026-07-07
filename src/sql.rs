@@ -9905,17 +9905,17 @@ struct Q12PendingOrder {
     counts: [u64; 2],
 }
 
-type Q12PendingMap = HashMap<i64, Q12PendingOrder>;
+type Q12PendingMap = FastHashMap<i64, Q12PendingOrder>;
 
 fn q12_pending_map_new() -> Q12PendingMap {
-    HashMap::with_capacity(q12_pending_map_initial_capacity())
+    fast_hash_map_with_capacity(q12_pending_map_initial_capacity())
 }
 
 fn q12_pending_map_initial_capacity() -> usize {
     std::env::var("DODAM_Q12_PENDING_MAP_INITIAL_CAPACITY")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(2048)
+        .unwrap_or(4096)
 }
 
 #[derive(Default)]
@@ -17371,28 +17371,15 @@ fn q04_count_late_candidate_priorities_atomic_typed(
             if commitdate_values[row] >= receiptdate_values[row] {
                 continue;
             }
-            let orderkey = orderkey_values[row];
-            if orderkey < 0 {
-                continue;
-            }
-            let Ok(orderkey) = usize::try_from(orderkey) else {
+            let Some(orderkey) =
+                dense_marker_index_i64(orderkey_values[row], candidate_priorities.len())
+            else {
                 continue;
             };
             if candidate_bloom.is_some_and(|bloom| !bloom.might_contain(orderkey)) {
                 continue;
             }
-            let Some(marker) = candidate_priorities.get(orderkey) else {
-                continue;
-            };
-            let priority_marker = marker.load(Ordering::Relaxed);
-            if priority_marker == 0 {
-                continue;
-            }
-            let priority_marker = marker.swap(0, Ordering::Relaxed);
-            if priority_marker == 0 {
-                continue;
-            }
-            counts[usize::from(priority_marker - 1)] += 1;
+            count_dense_atomic_marker(orderkey, candidate_priorities, counts);
         }
         return Ok(true);
     }
@@ -17403,28 +17390,15 @@ fn q04_count_late_candidate_priorities_atomic_typed(
         if commitdates.value(row) >= receiptdates.value(row) {
             continue;
         }
-        let orderkey = orderkeys.value(row);
-        if orderkey < 0 {
-            continue;
-        }
-        let Ok(orderkey) = usize::try_from(orderkey) else {
+        let Some(orderkey) =
+            dense_marker_index_i64(orderkeys.value(row), candidate_priorities.len())
+        else {
             continue;
         };
         if candidate_bloom.is_some_and(|bloom| !bloom.might_contain(orderkey)) {
             continue;
         }
-        let Some(marker) = candidate_priorities.get(orderkey) else {
-            continue;
-        };
-        let priority_marker = marker.load(Ordering::Relaxed);
-        if priority_marker == 0 {
-            continue;
-        }
-        let priority_marker = marker.swap(0, Ordering::Relaxed);
-        if priority_marker == 0 {
-            continue;
-        }
-        counts[usize::from(priority_marker - 1)] += 1;
+        count_dense_atomic_marker(orderkey, candidate_priorities, counts);
     }
     Ok(true)
 }
@@ -17442,29 +17416,16 @@ fn q04_count_late_candidate_priorities_atomic_raw(
         if commitdates[row] >= receiptdates[row] {
             continue;
         }
-        let orderkey = orderkeys[row];
-        if orderkey < 0 {
-            continue;
-        }
-        let Ok(orderkey) = usize::try_from(orderkey) else {
+        let Some(orderkey) = dense_marker_index_i64(orderkeys[row], candidate_priorities.len())
+        else {
             continue;
         };
         if candidate_bloom.is_some_and(|bloom| !bloom.might_contain(orderkey)) {
             continue;
         }
-        let Some(marker) = candidate_priorities.get(orderkey) else {
-            continue;
-        };
-        let priority_marker = marker.load(Ordering::Relaxed);
-        if priority_marker == 0 {
-            continue;
+        if count_dense_atomic_marker(orderkey, candidate_priorities, counts) {
+            hits += 1;
         }
-        let priority_marker = marker.swap(0, Ordering::Relaxed);
-        if priority_marker == 0 {
-            continue;
-        }
-        counts[usize::from(priority_marker - 1)] += 1;
-        hits += 1;
     }
     hits
 }
@@ -17497,29 +17458,45 @@ fn q04_count_late_candidate_priorities_atomic_selected_rows(
     counts: &mut [u64],
 ) {
     for &row in selected_rows {
-        let orderkey = orderkey_values[row as usize];
-        if orderkey < 0 {
-            continue;
-        }
-        let Ok(orderkey) = usize::try_from(orderkey) else {
+        let Some(orderkey) =
+            dense_marker_index_i64(orderkey_values[row as usize], candidate_priorities.len())
+        else {
             continue;
         };
         if candidate_bloom.is_some_and(|bloom| !bloom.might_contain(orderkey)) {
             continue;
         }
-        let Some(marker) = candidate_priorities.get(orderkey) else {
-            continue;
-        };
-        let priority_marker = marker.load(Ordering::Relaxed);
-        if priority_marker == 0 {
-            continue;
-        }
-        let priority_marker = marker.swap(0, Ordering::Relaxed);
-        if priority_marker == 0 {
-            continue;
-        }
-        counts[usize::from(priority_marker - 1)] += 1;
+        count_dense_atomic_marker(orderkey, candidate_priorities, counts);
     }
+}
+
+#[inline(always)]
+fn dense_marker_index_i64(key: i64, len: usize) -> Option<usize> {
+    if key < 0 {
+        return None;
+    }
+    let key = key as u64;
+    if key >= len as u64 {
+        return None;
+    }
+    Some(key as usize)
+}
+
+#[inline(always)]
+fn count_dense_atomic_marker(index: usize, markers: &[AtomicU8], counts: &mut [u64]) -> bool {
+    debug_assert!(index < markers.len());
+    // The explicit range check is done by dense_marker_index_i64 at the call site.
+    let marker = unsafe { markers.get_unchecked(index) };
+    let priority_marker = marker.load(Ordering::Relaxed);
+    if priority_marker == 0 {
+        return false;
+    }
+    let priority_marker = marker.swap(0, Ordering::Relaxed);
+    if priority_marker == 0 {
+        return false;
+    }
+    counts[usize::from(priority_marker - 1)] += 1;
+    true
 }
 
 fn q04_collect_late_candidate_orderkeys_typed(
