@@ -311,7 +311,7 @@ impl DictionaryI32View<'_> {
         }
     }
 
-    fn string_values(&self) -> Option<DictionaryStringValues<'_>> {
+    pub(crate) fn string_values(&self) -> Option<DictionaryStringValues<'_>> {
         match self {
             Self::Arrow(dictionary) => dictionary_i32_string_values(dictionary),
             Self::Raw { values, .. } => Some(*values),

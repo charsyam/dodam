@@ -53,7 +53,7 @@ use crate::optimizer::plan_join_inputs;
 use crate::storage::{DirectColumnScanMetrics, DirectI64I32I32ScanMetrics};
 use crate::vector::{
     BatchConsumer, BatchView, DictionaryI32View, DictionaryStringValues, SelectionVector,
-    consume_record_batch, dictionary_i32_string_values, dictionary_i32_view_match_flags,
+    consume_record_batch, dictionary_i32_view_match_flags,
 };
 
 fn tpch_profile_enabled() -> bool {
@@ -8646,7 +8646,8 @@ async fn q16_part_groups(
         let view = BatchView::new(&batch);
         let partkeys = view.column(0)?;
         let part_sizes = view.column(3)?;
-        if let (Some(brands), Some(types)) = (view.dictionary_i32(1), view.dictionary_i32(2))
+        if let (Some(brands), Some(types)) =
+            (view.dictionary_i32_view(1), view.dictionary_i32_view(2))
             && q16_part_groups_dictionary_typed_batch(
                 partkeys,
                 brands,
@@ -8746,8 +8747,8 @@ fn q16_part_dictionary_strings_enabled() -> bool {
 #[allow(clippy::too_many_arguments)]
 fn q16_part_groups_dictionary_typed_batch(
     partkeys: &ArrayRef,
-    brands: &DictionaryArray<Int32Type>,
-    types: &DictionaryArray<Int32Type>,
+    brands: DictionaryI32View<'_>,
+    types: DictionaryI32View<'_>,
     part_sizes: &ArrayRef,
     excluded_brand: &str,
     excluded_type_prefix: &str,
@@ -8766,10 +8767,10 @@ fn q16_part_groups_dictionary_typed_batch(
     if partkeys.null_count() != 0 || brands.null_count() != 0 || types.null_count() != 0 {
         return Ok(false);
     }
-    let Some(brand_values) = dictionary_i32_string_values(brands) else {
+    let Some(brand_values) = brands.string_values() else {
         return Ok(false);
     };
-    let Some(type_values) = dictionary_i32_string_values(types) else {
+    let Some(type_values) = types.string_values() else {
         return Ok(false);
     };
     let brand_lookup = q16_dictionary_group_string_ids(
@@ -8786,8 +8787,8 @@ fn q16_part_groups_dictionary_typed_batch(
         type_ids,
         types_by_id,
     )?;
-    let brand_keys = brands.keys().values().as_ref();
-    let type_keys = types.keys().values().as_ref();
+    let brand_keys = brands.keys();
+    let type_keys = types.keys();
     let partkey_values = partkeys.values().as_ref();
     if let Some(part_sizes) = part_sizes.as_any().downcast_ref::<Int32Array>() {
         if part_sizes.null_count() != 0 {
@@ -15803,7 +15804,7 @@ fn q04_candidate_order_priorities_partial_batch(
     ) && q04_candidate_order_priorities_dictionary_typed(
         orderkeys,
         orderdates,
-        orderpriorities,
+        DictionaryI32View::Arrow(orderpriorities),
         start_days,
         end_days,
         partial,
@@ -15893,7 +15894,7 @@ fn q04_candidate_order_priorities_partial_view(
     if let (Some(orderkeys), Some(orderdates), Some(orderpriorities)) = (
         view.column(0)?.as_any().downcast_ref::<Int64Array>(),
         view.column(1)?.as_any().downcast_ref::<Date32Array>(),
-        view.dictionary_i32(2),
+        view.dictionary_i32_view(2),
     ) && q04_candidate_order_priorities_dictionary_typed(
         orderkeys,
         orderdates,
@@ -15948,16 +15949,16 @@ fn q04_candidate_order_priorities_partial_view(
 fn q04_candidate_order_priorities_dictionary_typed(
     orderkeys: &Int64Array,
     orderdates: &Date32Array,
-    orderpriorities: &DictionaryArray<Int32Type>,
+    orderpriorities: DictionaryI32View<'_>,
     start_days: i32,
     end_days: i32,
     partial: &mut Q04CandidatePartial,
     label_indices: &mut HashMap<String, u8>,
 ) -> Result<bool> {
-    let Some(priority_values) = dictionary_i32_string_values(orderpriorities) else {
+    let Some(priority_values) = orderpriorities.string_values() else {
         return Ok(false);
     };
-    let priority_keys = orderpriorities.keys().values().as_ref();
+    let priority_keys = orderpriorities.keys();
     let mut priority_label_indices = Vec::<Option<u8>>::with_capacity(priority_values.len());
     for index in 0..priority_values.len() {
         let priority = priority_values.value_bytes(index);
