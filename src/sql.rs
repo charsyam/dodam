@@ -14934,43 +14934,192 @@ fn q03_order_rows_projected_view_into(
 ) -> Result<()> {
     if view.num_columns() == 3
         && constant_shippriority.is_some()
-        && q03_order_rows_batch_typed_into(
-            view.column(0)?,
-            view.column(1)?,
-            view.column(2)?,
+        && q03_order_rows_vectors_into(
+            view.i64_vector(0),
+            view.i64_vector(1),
+            view.date32_vector(2),
             None,
             customers,
             order_cutoff,
             constant_shippriority,
             orders,
-        )?
+        )
     {
         return Ok(());
     }
     if view.num_columns() == 4
-        && q03_order_rows_batch_typed_into(
-            view.column(0)?,
-            view.column(1)?,
-            view.column(2)?,
-            Some(view.column(3)?),
+        && q03_order_rows_vectors_into(
+            view.i64_vector(0),
+            view.i64_vector(1),
+            view.date32_vector(2),
+            view.i64_vector(3),
             customers,
             order_cutoff,
             constant_shippriority,
             orders,
-        )?
+        )
     {
         return Ok(());
     }
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "Q03 order raw vector columns have unsupported types".to_string(),
+        ));
+    };
     merge_maps(
         orders,
         q03_order_rows_batch(
-            view.record_batch().clone(),
+            batch.clone(),
             customers,
             order_cutoff,
             constant_shippriority,
         )?,
     );
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q03_order_rows_vectors_into(
+    orderkeys: Option<I64VectorView<'_>>,
+    custkeys: Option<I64VectorView<'_>>,
+    orderdates: Option<Date32VectorView<'_>>,
+    priorities: Option<I64VectorView<'_>>,
+    customers: &AdaptiveI64Set,
+    order_cutoff: i32,
+    constant_shippriority: Option<i64>,
+    orders: &mut Q03OrderMap,
+) -> bool {
+    let (Some(orderkeys), Some(custkeys), Some(orderdates)) = (orderkeys, custkeys, orderdates)
+    else {
+        return false;
+    };
+    if constant_shippriority.is_none() && priorities.is_none() {
+        return false;
+    }
+    let Some(orderkey_values) = orderkeys.values_if_null_free() else {
+        return q03_order_rows_vectors_nullable_into(
+            orderkeys,
+            custkeys,
+            orderdates,
+            priorities,
+            customers,
+            order_cutoff,
+            constant_shippriority,
+            orders,
+        );
+    };
+    let Some(custkey_values) = custkeys.values_if_null_free() else {
+        return q03_order_rows_vectors_nullable_into(
+            orderkeys,
+            custkeys,
+            orderdates,
+            priorities,
+            customers,
+            order_cutoff,
+            constant_shippriority,
+            orders,
+        );
+    };
+    let Some(orderdate_values) = orderdates.values_if_null_free() else {
+        return q03_order_rows_vectors_nullable_into(
+            orderkeys,
+            custkeys,
+            orderdates,
+            priorities,
+            customers,
+            order_cutoff,
+            constant_shippriority,
+            orders,
+        );
+    };
+    let priority_values = match priorities {
+        Some(priorities) => match priorities.values_if_null_free() {
+            Some(values) => Some(values),
+            None => {
+                return q03_order_rows_vectors_nullable_into(
+                    orderkeys,
+                    custkeys,
+                    orderdates,
+                    Some(priorities),
+                    customers,
+                    order_cutoff,
+                    constant_shippriority,
+                    orders,
+                );
+            }
+        },
+        None => None,
+    };
+    if let Some(customer_contains) = customers.dense_contains_slice() {
+        for row in 0..orderkey_values.len() {
+            if orderdate_values[row] >= order_cutoff {
+                continue;
+            }
+            let custkey = custkey_values[row];
+            let customer_hit = usize::try_from(custkey)
+                .ok()
+                .and_then(|index| customer_contains.get(index))
+                .copied()
+                .unwrap_or(false);
+            if customer_hit {
+                orders.insert(
+                    orderkey_values[row],
+                    Q03Order {
+                        o_orderdate: orderdate_values[row],
+                        o_shippriority: constant_shippriority
+                            .unwrap_or_else(|| priority_values.expect("priority values")[row]),
+                    },
+                );
+            }
+        }
+        return true;
+    }
+    for row in 0..orderkey_values.len() {
+        if orderdate_values[row] < order_cutoff && customers.contains(custkey_values[row]) {
+            orders.insert(
+                orderkey_values[row],
+                Q03Order {
+                    o_orderdate: orderdate_values[row],
+                    o_shippriority: constant_shippriority
+                        .unwrap_or_else(|| priority_values.expect("priority values")[row]),
+                },
+            );
+        }
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q03_order_rows_vectors_nullable_into(
+    orderkeys: I64VectorView<'_>,
+    custkeys: I64VectorView<'_>,
+    orderdates: Date32VectorView<'_>,
+    priorities: Option<I64VectorView<'_>>,
+    customers: &AdaptiveI64Set,
+    order_cutoff: i32,
+    constant_shippriority: Option<i64>,
+    orders: &mut Q03OrderMap,
+) -> bool {
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row)
+            || custkeys.is_null(row)
+            || orderdates.is_null(row)
+            || priorities.is_some_and(|priorities| priorities.is_null(row))
+        {
+            continue;
+        }
+        if orderdates.value(row) < order_cutoff && customers.contains(custkeys.value(row)) {
+            orders.insert(
+                orderkeys.value(row),
+                Q03Order {
+                    o_orderdate: orderdates.value(row),
+                    o_shippriority: constant_shippriority
+                        .unwrap_or_else(|| priorities.expect("priority vector").value(row)),
+                },
+            );
+        }
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
