@@ -29751,6 +29751,38 @@ async fn parse_filter_with_subqueries(
                 allow_aggregates,
             )?))
         }
+        SqlExpr::UnaryOp { op, expr } if *op == UnaryOperator::Not => {
+            let Some(expr) = Box::pin(parse_filter_with_subqueries(
+                engine,
+                expr,
+                aliases,
+                table_alias,
+                allow_aggregates,
+                batch_size,
+            ))
+            .await?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(Expr::Not(Box::new(expr))))
+        }
+        SqlExpr::IsNull(inner) | SqlExpr::IsNotNull(inner) => {
+            if let Ok(value) = sql_literal_value(inner) {
+                let is_null = matches!(value, LiteralValue::Null);
+                let is_not_null = matches!(expr, SqlExpr::IsNotNull(_));
+                return Ok(Some(Expr::Boolean(Some(if is_not_null {
+                    !is_null
+                } else {
+                    is_null
+                }))));
+            }
+            Ok(Some(sql_expr_to_filter_expr(
+                expr,
+                aliases,
+                table_alias,
+                allow_aggregates,
+            )?))
+        }
         SqlExpr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
             let left = Box::pin(parse_filter_with_subqueries(
                 engine,

@@ -468,6 +468,61 @@ async fn duckdb_differential_scalar_type_filters() {
 }
 
 #[tokio::test]
+async fn duckdb_differential_decimal_timestamp_boundary_filters() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let types_path = tempdir.path().join("types.parquet");
+    write_types_parquet(&types_path);
+
+    let cases = [
+        "amount < '0.00' OR amount = '-7.000'",
+        "amount >= '-7.0000' AND amount <= '123.4500'",
+        "created_at < '1970-01-01 00:00:01'",
+        "created_at_utc = '1970-01-01 09:00:00+09:00'",
+        "event_date < '2024-01-02' OR event_date IS NULL",
+    ];
+    for predicate in cases {
+        assert_same_as_duckdb(
+            &format!(
+                "SELECT id FROM '{}' WHERE {predicate} ORDER BY id",
+                types_path.display()
+            ),
+            &format!(
+                "SELECT id FROM read_parquet('{}') WHERE {predicate} ORDER BY id",
+                types_path.display()
+            ),
+            tempdir.path(),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn duckdb_differential_all_null_aggregate_groups() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let path = tempdir.path().join("aggregate-nulls.parquet");
+    write_aggregate_nulls_parquet(&path);
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT grp, count(*), count(value), sum(value), avg(value), min(value), max(value), min(label), max(label) FROM '{}' GROUP BY grp ORDER BY grp",
+            path.display()
+        ),
+        &format!(
+            "SELECT grp, count(*), count(value), sum(value), avg(value), min(value), max(value), min(label), max(label) FROM read_parquet('{}') GROUP BY grp ORDER BY grp",
+            path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn duckdb_differential_type_projection_matrix() {
     let Some(_duckdb) = DuckDbGuard::new() else {
         return;
@@ -1026,6 +1081,58 @@ async fn duckdb_differential_exists_subquery() {
 }
 
 #[tokio::test]
+async fn duckdb_differential_correlated_subquery_boolean_combinations() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let facts_path = tempdir.path().join("facts.parquet");
+    write_facts_parquet(&facts_path);
+
+    let cases = [
+        (
+            format!(
+                "SELECT f.id FROM '{}' f WHERE f.payload IS NOT NULL AND EXISTS (SELECT id FROM '{}' g WHERE g.key = f.key AND g.id > 4) ORDER BY id",
+                facts_path.display(),
+                facts_path.display()
+            ),
+            format!(
+                "SELECT f.id FROM read_parquet('{}') f WHERE f.payload IS NOT NULL AND EXISTS (SELECT id FROM read_parquet('{}') g WHERE g.key = f.key AND g.id > 4) ORDER BY id",
+                facts_path.display(),
+                facts_path.display()
+            ),
+        ),
+        (
+            format!(
+                "SELECT f.id FROM '{}' f WHERE f.key IS NULL OR NOT EXISTS (SELECT id FROM '{}' g WHERE g.key = f.key AND g.id > 4) ORDER BY id",
+                facts_path.display(),
+                facts_path.display()
+            ),
+            format!(
+                "SELECT f.id FROM read_parquet('{}') f WHERE f.key IS NULL OR NOT EXISTS (SELECT id FROM read_parquet('{}') g WHERE g.key = f.key AND g.id > 4) ORDER BY id",
+                facts_path.display(),
+                facts_path.display()
+            ),
+        ),
+        (
+            format!(
+                "SELECT f.id FROM '{}' f WHERE f.key IN (SELECT g.key FROM '{}' g WHERE g.key = f.key OR g.key IS NULL) ORDER BY id",
+                facts_path.display(),
+                facts_path.display()
+            ),
+            format!(
+                "SELECT f.id FROM read_parquet('{}') f WHERE f.key IN (SELECT g.key FROM read_parquet('{}') g WHERE g.key = f.key OR g.key IS NULL) ORDER BY id",
+                facts_path.display(),
+                facts_path.display()
+            ),
+        ),
+    ];
+    for (dodam_sql, duckdb_sql) in cases {
+        assert_same_as_duckdb(&dodam_sql, &duckdb_sql, tempdir.path()).await;
+    }
+}
+
+#[tokio::test]
 async fn duckdb_differential_correlated_in_and_scalar_subquery() {
     let Some(_duckdb) = DuckDbGuard::new() else {
         return;
@@ -1118,6 +1225,27 @@ async fn duckdb_differential_copy_parquet_readback() {
     .await;
 }
 
+#[tokio::test]
+async fn dodam_copy_csv_header_and_escaping() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let input_path = tempdir.path().join("csv-values.parquet");
+    let output_path = tempdir.path().join("copy-output.csv");
+    write_csv_values_parquet(&input_path);
+
+    let copy_sql = format!(
+        "COPY (SELECT id, text FROM '{}' ORDER BY id) TO '{}' (FORMAT csv, HEADER true)",
+        input_path.display(),
+        output_path.display()
+    );
+    run_dodam_copy(&copy_sql).await;
+
+    let contents = std::fs::read_to_string(output_path).expect("read csv output");
+    assert_eq!(
+        contents,
+        "id,text\n1,plain\n2,\"comma,value\"\n3,\"quote \"\"value\"\"\"\n4,\"line\nbreak\"\n5,\n"
+    );
+}
+
 async fn assert_same_as_duckdb(dodam_sql: &str, duckdb_sql: &str, tempdir: &Path) {
     let dodam_rows = run_dodam(dodam_sql).await;
     let duckdb_rows = run_duckdb(duckdb_sql, tempdir);
@@ -1140,7 +1268,9 @@ async fn assert_both_error(dodam_sql: &str, duckdb_sql: &str, tempdir: &Path) {
 }
 
 async fn run_dodam(sql: &str) -> Vec<String> {
-    run_dodam_result(sql).await.expect("execute dodam sql")
+    run_dodam_result(sql)
+        .await
+        .unwrap_or_else(|error| panic!("execute dodam sql failed:\n{sql}\n\n{error}"))
 }
 
 async fn run_dodam_result(sql: &str) -> std::result::Result<Vec<String>, String> {
@@ -1376,6 +1506,38 @@ fn write_types_parquet(path: &Path) {
             Arc::new(event_date64),
         ],
     );
+}
+
+fn write_aggregate_nulls_parquet(path: &Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("grp", DataType::Int32, false),
+        Field::new("value", DataType::Int64, true),
+        Field::new("label", DataType::Utf8, true),
+    ]));
+    let groups = Int32Array::from_iter_values([1, 1, 2, 2, 3]);
+    let values = Int64Array::from(vec![None, None, Some(10), None, Some(-5)]);
+    let labels = StringArray::from(vec![None, None, Some("b"), Some("a"), None]);
+    write_parquet(
+        path,
+        schema,
+        vec![Arc::new(groups), Arc::new(values), Arc::new(labels)],
+    );
+}
+
+fn write_csv_values_parquet(path: &Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("text", DataType::Utf8, true),
+    ]));
+    let ids = Int32Array::from_iter_values([1, 2, 3, 4, 5]);
+    let text = StringArray::from(vec![
+        Some("plain"),
+        Some("comma,value"),
+        Some("quote \"value\""),
+        Some("line\nbreak"),
+        None,
+    ]);
+    write_parquet(path, schema, vec![Arc::new(ids), Arc::new(text)]);
 }
 
 fn write_tpch_lineitem_parquet(path: &Path) {
