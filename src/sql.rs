@@ -5350,6 +5350,12 @@ async fn q02_suppliers(
     batch_size: usize,
     nation_names: &FastHashMap<i64, String>,
 ) -> Result<FastHashMap<i64, Q02Supplier>> {
+    if q02_supplier_late_materialized_enabled()
+        && let Some(suppliers) =
+            q02_suppliers_late_materialized(engine, path.clone(), batch_size, nation_names).await?
+    {
+        return Ok(suppliers);
+    }
     let mut stream = engine
         .scan_parquet_batches(
             path,
@@ -5373,6 +5379,290 @@ async fn q02_suppliers(
         q02_suppliers_view_into(BatchView::new(&batch), nation_names, &mut suppliers)?;
     }
     Ok(suppliers)
+}
+
+async fn q02_suppliers_late_materialized(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    nation_names: &FastHashMap<i64, String>,
+) -> Result<Option<FastHashMap<i64, Q02Supplier>>> {
+    let nation_names = Arc::new(nation_names.clone());
+    let Some(chunks) = engine
+        .late_materialized_parquet_map_pruned_with_policy_view(
+            path,
+            batch_size,
+            Projection::Columns(vec![
+                "s_suppkey".to_string(),
+                "s_acctbal".to_string(),
+                "s_nationkey".to_string(),
+            ]),
+            Projection::Columns(vec![
+                "s_name".to_string(),
+                "s_address".to_string(),
+                "s_phone".to_string(),
+                "s_comment".to_string(),
+            ]),
+            Vec::new(),
+            q02_supplier_late_materialized_row_group_chunk(),
+            LateMaterializationPolicy::selective_with_selector_run_ratio(
+                q02_supplier_late_materialized_max_selected_ratio(),
+                q02_supplier_late_materialized_max_selector_run_ratio(),
+            ),
+            {
+                let nation_names = nation_names.clone();
+                move || Q02SupplierLateState {
+                    nation_names: nation_names.clone(),
+                    selected: Vec::new(),
+                    payload_offset: 0,
+                    suppliers: fast_hash_map(),
+                }
+            },
+            q02_supplier_late_build_selection_view,
+            q02_supplier_late_consume_payload_view,
+            |state, metrics| {
+                if state.payload_offset != state.selected.len() {
+                    return Err(DodamError::UnsupportedSql(
+                        "Q02 supplier payload row mismatch".to_string(),
+                    ));
+                }
+                Ok(Some((state.suppliers, metrics)))
+            },
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let mut suppliers = fast_hash_map::<i64, Q02Supplier>();
+    let mut metrics = LateMaterializedMetrics::default();
+    for chunk in chunks {
+        let (chunk_suppliers, chunk_metrics) = chunk.output;
+        metrics.add(chunk_metrics);
+        suppliers.extend(chunk_suppliers);
+    }
+    q02_log_supplier_late_materialized_profile(
+        metrics,
+        q02_supplier_late_materialized_row_group_chunk(),
+    );
+    Ok(Some(suppliers))
+}
+
+fn q02_supplier_late_materialized_enabled() -> bool {
+    std::env::var("DODAM_Q02_DISABLE_SUPPLIER_LATE_MATERIALIZE")
+        .map(|value| !matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(true)
+}
+
+fn q02_supplier_late_materialized_row_group_chunk() -> usize {
+    std::env::var("DODAM_Q02_SUPPLIER_LATE_ROW_GROUP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1)
+}
+
+fn q02_supplier_late_materialized_max_selected_ratio() -> f64 {
+    std::env::var("DODAM_Q02_SUPPLIER_LATE_MAX_SELECTED_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.35)
+}
+
+fn q02_supplier_late_materialized_max_selector_run_ratio() -> f64 {
+    std::env::var("DODAM_Q02_SUPPLIER_LATE_MAX_SELECTOR_RUN_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.75)
+}
+
+fn q02_log_supplier_late_materialized_profile(
+    metrics: LateMaterializedMetrics,
+    row_group_chunk: usize,
+) {
+    if !tpch_profile_enabled() {
+        return;
+    }
+    let ratio = if metrics.total_rows == 0 {
+        0.0
+    } else {
+        metrics.selected_rows as f64 / metrics.total_rows as f64
+    };
+    eprintln!(
+        "[dodam:tpch-profile] Q02 suppliers: late_materialized rows={} selected={} ratio={:.6} selector_runs={} row_group_chunk={}",
+        metrics.total_rows, metrics.selected_rows, ratio, metrics.selector_runs, row_group_chunk
+    );
+}
+
+struct Q02SupplierLateSelection {
+    suppkey: i64,
+    acctbal: f64,
+    nation_name: String,
+}
+
+struct Q02SupplierLateState {
+    nation_names: Arc<FastHashMap<i64, String>>,
+    selected: Vec<Q02SupplierLateSelection>,
+    payload_offset: usize,
+    suppliers: FastHashMap<i64, Q02Supplier>,
+}
+
+fn q02_supplier_late_build_selection_view(
+    view: BatchView<'_>,
+    selection: &mut LateSelectionBuilder,
+    state: &mut Q02SupplierLateState,
+) -> Result<Option<()>> {
+    if view.num_columns() == 3
+        && let (Some(suppkeys), Some(acctbals), Some(nationkeys)) = (
+            view.i64_vector(0),
+            view.decimal128_vector(1),
+            view.i64_vector(2),
+        )
+    {
+        if let (Some(suppkey_values), Some(nationkey_values)) = (
+            suppkeys.values_if_null_free(),
+            nationkeys.values_if_null_free(),
+        ) && acctbals.null_count() == 0
+        {
+            let mut selected_offsets = Vec::new();
+            for row in 0..suppkey_values.len() {
+                let Some(nation_name) = state.nation_names.get(&nationkey_values[row]) else {
+                    continue;
+                };
+                selected_offsets.push(row);
+                state.selected.push(Q02SupplierLateSelection {
+                    suppkey: suppkey_values[row],
+                    acctbal: acctbals.value(row),
+                    nation_name: nation_name.clone(),
+                });
+            }
+            selection.push_selected_offsets(suppkey_values.len(), selected_offsets);
+            return Ok(Some(()));
+        }
+        for row in 0..view.num_rows() {
+            if suppkeys.is_null(row) || acctbals.is_null(row) || nationkeys.is_null(row) {
+                selection.push(false);
+                continue;
+            }
+            let Some(nation_name) = state.nation_names.get(&nationkeys.value(row)) else {
+                selection.push(false);
+                continue;
+            };
+            selection.push(true);
+            state.selected.push(Q02SupplierLateSelection {
+                suppkey: suppkeys.value(row),
+                acctbal: acctbals.value(row),
+                nation_name: nation_name.clone(),
+            });
+        }
+        return Ok(Some(()));
+    }
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    let suppkeys = batch_column(batch, "s_suppkey")?;
+    let acctbals = batch_column(batch, "s_acctbal")?;
+    let nationkeys = batch_column(batch, "s_nationkey")?;
+    for row in 0..batch.num_rows() {
+        let (Some(suppkey), Some(acctbal), Some(nationkey)) = (
+            numeric_i64_value(suppkeys, row)?,
+            numeric_f64_value(acctbals, row)?,
+            numeric_i64_value(nationkeys, row)?,
+        ) else {
+            selection.push(false);
+            continue;
+        };
+        let Some(nation_name) = state.nation_names.get(&nationkey) else {
+            selection.push(false);
+            continue;
+        };
+        selection.push(true);
+        state.selected.push(Q02SupplierLateSelection {
+            suppkey,
+            acctbal,
+            nation_name: nation_name.clone(),
+        });
+    }
+    Ok(Some(()))
+}
+
+fn q02_supplier_late_consume_payload_view(
+    view: BatchView<'_>,
+    state: &mut Q02SupplierLateState,
+) -> Result<Option<()>> {
+    if view.num_columns() == 4
+        && let (Some(names), Some(addresses), Some(phones), Some(comments)) = (
+            view.utf8_vector(0),
+            view.utf8_vector(1),
+            view.utf8_vector(2),
+            view.utf8_vector(3),
+        )
+    {
+        for row in 0..view.num_rows() {
+            if names.is_null(row)
+                || addresses.is_null(row)
+                || phones.is_null(row)
+                || comments.is_null(row)
+            {
+                state.payload_offset += 1;
+                continue;
+            }
+            let Some(selected) = state.selected.get(state.payload_offset) else {
+                return Err(DodamError::UnsupportedSql(
+                    "Q02 supplier payload row overflow".to_string(),
+                ));
+            };
+            state.payload_offset += 1;
+            state.suppliers.insert(
+                selected.suppkey,
+                Q02Supplier {
+                    acctbal: selected.acctbal,
+                    name: utf8_vector_value_string(names, row)?,
+                    nation_name: selected.nation_name.clone(),
+                    address: utf8_vector_value_string(addresses, row)?,
+                    phone: utf8_vector_value_string(phones, row)?,
+                    comment: utf8_vector_value_string(comments, row)?,
+                },
+            );
+        }
+        return Ok(Some(()));
+    }
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    let names = batch_string_column(batch, "s_name")?;
+    let addresses = batch_string_column(batch, "s_address")?;
+    let phones = batch_string_column(batch, "s_phone")?;
+    let comments = batch_string_column(batch, "s_comment")?;
+    for row in 0..batch.num_rows() {
+        if names.is_null(row)
+            || addresses.is_null(row)
+            || phones.is_null(row)
+            || comments.is_null(row)
+        {
+            state.payload_offset += 1;
+            continue;
+        }
+        let Some(selected) = state.selected.get(state.payload_offset) else {
+            return Err(DodamError::UnsupportedSql(
+                "Q02 supplier payload row overflow".to_string(),
+            ));
+        };
+        state.payload_offset += 1;
+        state.suppliers.insert(
+            selected.suppkey,
+            Q02Supplier {
+                acctbal: selected.acctbal,
+                name: names.value(row).to_string(),
+                nation_name: selected.nation_name.clone(),
+                address: addresses.value(row).to_string(),
+                phone: phones.value(row).to_string(),
+                comment: comments.value(row).to_string(),
+            },
+        );
+    }
+    Ok(Some(()))
 }
 
 fn q02_suppliers_view_into(
