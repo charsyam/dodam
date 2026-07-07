@@ -4090,7 +4090,10 @@ fn q10_customer_late_build_selection_view(
     if view.num_columns() == 1 {
         return i64_set_late_build_selection_view(view, 0, selection, state);
     }
-    q10_customer_late_build_selection_batch(view.record_batch().clone(), selection, state)
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    q10_customer_late_build_selection_batch(batch.clone(), selection, state)
 }
 
 fn q10_customer_late_consume_payload_batch(
@@ -4157,7 +4160,10 @@ fn q10_customer_late_consume_payload_view(
             view.utf8(5),
         )
         else {
-            return q10_customer_late_consume_payload_batch(view.record_batch().clone(), state);
+            let Some(batch) = view.try_record_batch() else {
+                return Ok(None);
+            };
+            return q10_customer_late_consume_payload_batch(batch.clone(), state);
         };
         for row in 0..view.num_rows() {
             let custkey = state.next_payload_key("Q10 customer payload row overflow")?;
@@ -4185,7 +4191,10 @@ fn q10_customer_late_consume_payload_view(
         }
         return Ok(Some(()));
     }
-    q10_customer_late_consume_payload_batch(view.record_batch().clone(), state)
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    q10_customer_late_consume_payload_batch(batch.clone(), state)
 }
 
 fn q10_log_customer_late_profile(metrics: LateMaterializedMetrics, row_group_chunk: usize) {
@@ -4501,17 +4510,21 @@ fn q10_returned_revenue_late_build_selection_view(
     state: &mut Q10ReturnedRevenueLateState,
 ) -> Result<Option<()>> {
     if view.num_columns() == 2 {
-        let (Some(orderkeys), Some(returnflags)) = (view.i64(0), view.utf8(1)) else {
+        let (Some(orderkeys), Some(returnflags)) = (view.i64_vector(0), view.utf8(1)) else {
+            let Some(batch) = view.try_record_batch() else {
+                return Ok(None);
+            };
             return q10_returned_revenue_late_build_selection_batch(
-                view.record_batch().clone(),
+                batch.clone(),
                 selection,
                 state,
             );
         };
         let returnflag_offsets = returnflags.value_offsets();
         let returnflag_data = returnflags.value_data();
-        if orderkeys.null_count() == 0 && returnflags.null_count() == 0 {
-            let orderkey_values = orderkeys.values().as_ref();
+        if let Some(orderkey_values) = orderkeys.values_if_null_free()
+            && returnflags.null_count() == 0
+        {
             for row in 0..orderkey_values.len() {
                 let selected =
                     utf8_value_is_one_byte(returnflag_offsets, returnflag_data, row, b'R')
@@ -4526,7 +4539,7 @@ fn q10_returned_revenue_late_build_selection_view(
             return Ok(Some(()));
         }
         for row in 0..orderkeys.len() {
-            let selected = orderkeys.is_valid(row)
+            let selected = !orderkeys.is_null(row)
                 && returnflags.is_valid(row)
                 && utf8_value_is_one_byte(returnflag_offsets, returnflag_data, row, b'R')
                 && state
@@ -4539,7 +4552,10 @@ fn q10_returned_revenue_late_build_selection_view(
         }
         return Ok(Some(()));
     }
-    q10_returned_revenue_late_build_selection_batch(view.record_batch().clone(), selection, state)
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    q10_returned_revenue_late_build_selection_batch(batch.clone(), selection, state)
 }
 
 fn q10_returned_revenue_late_consume_payload_batch(
@@ -4595,20 +4611,19 @@ fn q10_returned_revenue_late_consume_payload_view(
     state: &mut Q10ReturnedRevenueLateState,
 ) -> Result<Option<()>> {
     if view.num_columns() == 2 {
-        let (Some(extendedprices), Some(discounts)) = (
-            decimal_input(view.column(0)?)?,
-            decimal_input(view.column(1)?)?,
-        ) else {
-            return q10_returned_revenue_late_consume_payload_batch(
-                view.record_batch().clone(),
-                state,
-            );
+        let (Some(extendedprices), Some(discounts)) =
+            (view.decimal128_vector(0), view.decimal128_vector(1))
+        else {
+            let Some(batch) = view.try_record_batch() else {
+                return Ok(None);
+            };
+            return q10_returned_revenue_late_consume_payload_batch(batch.clone(), state);
         };
         if extendedprices.null_count() == 0 && discounts.null_count() == 0 {
             let extendedprice_values = extendedprices.raw_values();
             let discount_values = discounts.raw_values();
-            let (discount_scale, revenue_scale) =
-                decimal_discounted_revenue_scales(extendedprices, discounts);
+            let discount_scale = discounts.scale();
+            let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
             for row in 0..view.num_rows() {
                 let Some(&custkey) = state.selected_custkeys.get(state.payload_offset) else {
                     return Err(DodamError::UnsupportedSql(
@@ -4640,7 +4655,10 @@ fn q10_returned_revenue_late_consume_payload_view(
         }
         return Ok(Some(()));
     }
-    q10_returned_revenue_late_consume_payload_batch(view.record_batch().clone(), state)
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    q10_returned_revenue_late_consume_payload_batch(batch.clone(), state)
 }
 
 fn q10_log_returned_revenue_late_profile(metrics: LateMaterializedMetrics, row_group_chunk: usize) {
@@ -23553,7 +23571,10 @@ fn q19_late_build_selection_view(
             state,
         );
     }
-    q19_late_build_selection_batch(view.record_batch().clone(), selection, state)
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    q19_late_build_selection_batch(batch.clone(), selection, state)
 }
 
 fn q19_late_build_selection_typed(
@@ -23653,21 +23674,26 @@ fn q19_late_consume_payload_view(
     state: &mut Q19LateState,
 ) -> Result<Option<()>> {
     if view.num_columns() == 1
-        && let Some(extendedprices) = decimal_input(view.column(0)?)?
+        && let Some(extendedprices) = view.decimal128_vector(0)
     {
-        return q19_late_consume_payload_typed(extendedprices, state);
+        return q19_late_consume_payload_vector(extendedprices, state);
     }
-    q19_late_consume_payload_batch(view.record_batch().clone(), state)
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    q19_late_consume_payload_batch(batch.clone(), state)
 }
 
-fn q19_late_consume_payload_typed(
-    extendedprices: DecimalInput<'_>,
+fn q19_late_consume_payload_vector(
+    extendedprices: Decimal128VectorView<'_>,
     state: &mut Q19LateState,
 ) -> Result<Option<()>> {
-    if extendedprices.null_count() != 0 || extendedprices.precision > 18 {
+    if extendedprices.null_count() != 0 || extendedprices.precision() > 18 {
         return Ok(None);
     }
-    let price_scale = extendedprices.scale as i64;
+    let Some(price_scale) = extendedprices.scale_i64() else {
+        return Ok(None);
+    };
     if let Some(existing) = state.extendedprice_scale {
         if existing != price_scale {
             return Ok(None);
