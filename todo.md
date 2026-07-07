@@ -223,9 +223,9 @@
   - full outer join filtering around `NULL` join keys
   - direct projection and filtering of boolean, float, decimal, `Utf8`, and `Date32` values
   - Parquet `COPY` readback by writing Dodam COPY output and comparing the generated Parquet through Dodam and DuckDB
-- Recorded a known compatibility gap as an ignored differential test:
-  - `CAST(Date32/Timestamp/Decimal/Float64 AS VARCHAR)` display semantics differ from DuckDB
-  - Dodam currently lowers several expression scalar types to numeric/string forms too early, so fixing this properly requires preserving typed scalar variants through the expression evaluator
+- Closed the previous scalar display compatibility gap:
+  - `EvaluatedScalar` now preserves `Decimal128(precision, scale)` through scalar expression projection instead of immediately lowering it to `Float64`.
+  - `CAST(Date32/Timestamp/Decimal/Float64 AS VARCHAR)` now has active DuckDB differential coverage, including fixed-scale decimal output and `.0` preservation for whole `Float64` values.
 - Moved several TPC-H fast-path building blocks toward reusable optimizer/execution rules:
   - moved sorted `i64` lookup from Q-specific SQL code into a reusable `SortedI64Lookup`
   - moved packed `u32,u32` pair distinct counting into reusable `PackedU32PairDistinct`

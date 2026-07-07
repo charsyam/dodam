@@ -606,8 +606,7 @@ async fn duckdb_differential_type_projection_matrix() {
 }
 
 #[tokio::test]
-#[ignore = "known gap: CAST(Date32/Timestamp/Decimal/Float64 AS VARCHAR) display semantics differ from DuckDB"]
-async fn duckdb_differential_known_gap_cast_display_semantics() {
+async fn duckdb_differential_cast_display_semantics() {
     let Some(_duckdb) = DuckDbGuard::new() else {
         return;
     };
@@ -1586,6 +1585,19 @@ async fn duckdb_differential_extended_type_matrix() {
         ),
         &format!(
             "SELECT id, CAST(event_date AS VARCHAR), CAST(created_at AS VARCHAR) FROM read_parquet('{}') ORDER BY id",
+            types_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, CAST(amount AS VARCHAR), COALESCE(CAST(amount AS VARCHAR), 'missing') FROM '{}' ORDER BY id",
+            types_path.display()
+        ),
+        &format!(
+            "SELECT id, CAST(amount AS VARCHAR), COALESCE(CAST(amount AS VARCHAR), 'missing') FROM read_parquet('{}') ORDER BY id",
             types_path.display()
         ),
         tempdir.path(),

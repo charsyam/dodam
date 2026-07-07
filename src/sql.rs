@@ -38062,6 +38062,11 @@ fn append_aggregate_expression_batch(
 enum EvaluatedScalar {
     Int64(Vec<Option<i64>>),
     Float64(Vec<Option<f64>>),
+    Decimal128 {
+        values: Vec<Option<i128>>,
+        precision: u8,
+        scale: i8,
+    },
     Utf8(Vec<Option<String>>),
     Boolean(Vec<Option<bool>>),
     Date32(Vec<Option<i32>>),
@@ -38073,6 +38078,7 @@ impl EvaluatedScalar {
         match self {
             Self::Int64(values) => values.len(),
             Self::Float64(values) => values.len(),
+            Self::Decimal128 { values, .. } => values.len(),
             Self::Utf8(values) => values.len(),
             Self::Boolean(values) => values.len(),
             Self::Date32(values) => values.len(),
@@ -38084,6 +38090,9 @@ impl EvaluatedScalar {
         match self {
             Self::Int64(_) => DataType::Int64,
             Self::Float64(_) => DataType::Float64,
+            Self::Decimal128 {
+                precision, scale, ..
+            } => DataType::Decimal128(*precision, *scale),
             Self::Utf8(_) => DataType::Utf8,
             Self::Boolean(_) => DataType::Boolean,
             Self::Date32(_) => DataType::Date32,
@@ -38095,6 +38104,7 @@ impl EvaluatedScalar {
         match self {
             Self::Int64(values) => values.iter().any(Option::is_none),
             Self::Float64(values) => values.iter().any(Option::is_none),
+            Self::Decimal128 { values, .. } => values.iter().any(Option::is_none),
             Self::Utf8(values) => values.iter().any(Option::is_none),
             Self::Boolean(values) => values.iter().any(Option::is_none),
             Self::Date32(values) => values.iter().any(Option::is_none),
@@ -38106,6 +38116,15 @@ impl EvaluatedScalar {
         match self {
             Self::Int64(values) => Arc::new(Int64Array::from(values)) as ArrayRef,
             Self::Float64(values) => Arc::new(Float64Array::from(values)) as ArrayRef,
+            Self::Decimal128 {
+                values,
+                precision,
+                scale,
+            } => Arc::new(
+                Decimal128Array::from(values)
+                    .with_precision_and_scale(precision, scale)
+                    .expect("valid Decimal128 scalar expression"),
+            ) as ArrayRef,
             Self::Utf8(values) => Arc::new(StringArray::from(values)) as ArrayRef,
             Self::Boolean(values) => Arc::new(BooleanArray::from(values)) as ArrayRef,
             Self::Date32(values) => Arc::new(Date32Array::from(values)) as ArrayRef,
@@ -38339,6 +38358,37 @@ fn decimal_scale_i128(scale: i8) -> Option<i128> {
     Some(10_i128.checked_pow(scale)?)
 }
 
+fn decimal_scale_f64(scale: i8) -> Result<f64> {
+    let scale = decimal_scale_i128(scale)
+        .ok_or_else(|| DodamError::UnsupportedSql(format!("decimal scale {scale} overflows")))?;
+    Ok(scale as f64)
+}
+
+fn format_decimal128_value(value: i128, scale: i8) -> String {
+    if scale <= 0 {
+        return (value * 10_i128.pow(u32::from(scale.unsigned_abs()))).to_string();
+    }
+    let scale_u32 = u32::try_from(scale).unwrap_or(0);
+    let divisor = 10_i128.pow(scale_u32);
+    let negative = value < 0;
+    let absolute = value.abs();
+    let whole = absolute / divisor;
+    let fraction = absolute % divisor;
+    let sign = if negative { "-" } else { "" };
+    format!(
+        "{sign}{whole}.{fraction:0width$}",
+        width = usize::try_from(scale_u32).unwrap_or(0)
+    )
+}
+
+fn format_f64_for_sql_varchar(value: f64) -> String {
+    if value.is_finite() && value.fract() == 0.0 {
+        format!("{value:.1}")
+    } else {
+        value.to_string()
+    }
+}
+
 fn decimal_complement_product(
     value: DecimalScalarColumn<'_>,
     complement: DecimalScalarColumn<'_>,
@@ -38562,6 +38612,7 @@ fn substring_value(
 enum ScalarValue {
     Int64(i64),
     Float64(f64),
+    Decimal128(i128, u8, i8),
     Utf8(String),
     Boolean(bool),
     Date32(i32),
@@ -38572,6 +38623,11 @@ fn scalar_value_at(value: &EvaluatedScalar, row: usize) -> Result<Option<ScalarV
     Ok(match value {
         EvaluatedScalar::Int64(values) => values[row].map(ScalarValue::Int64),
         EvaluatedScalar::Float64(values) => values[row].map(ScalarValue::Float64),
+        EvaluatedScalar::Decimal128 {
+            values,
+            precision,
+            scale,
+        } => values[row].map(|value| ScalarValue::Decimal128(value, *precision, *scale)),
         EvaluatedScalar::Utf8(values) => values[row].clone().map(ScalarValue::Utf8),
         EvaluatedScalar::Boolean(values) => values[row].map(ScalarValue::Boolean),
         EvaluatedScalar::Date32(values) => values[row].map(ScalarValue::Date32),
@@ -38588,6 +38644,23 @@ fn cast_scalar_for_kind(
     match kind {
         EvaluatedScalarKind::Int64 => Ok(EvaluatedScalar::Int64(scalar_as_i64(value)?)),
         EvaluatedScalarKind::Float64 => Ok(EvaluatedScalar::Float64(scalar_as_f64(value)?)),
+        EvaluatedScalarKind::Decimal128 { precision, scale } => match value {
+            EvaluatedScalar::Decimal128 {
+                values,
+                precision: value_precision,
+                scale: value_scale,
+            } if value_precision == precision && value_scale == scale => {
+                Ok(EvaluatedScalar::Decimal128 {
+                    values,
+                    precision,
+                    scale,
+                })
+            }
+            other => Err(DodamError::UnsupportedSql(format!(
+                "cannot use {} in decimal IN list",
+                other.data_type()
+            ))),
+        },
         EvaluatedScalarKind::Utf8 => Ok(EvaluatedScalar::Utf8(scalar_as_utf8(value)?)),
         EvaluatedScalarKind::Date32 => match value {
             EvaluatedScalar::Date32(_) => Ok(value),
@@ -38617,6 +38690,7 @@ fn cast_scalar_for_kind(
 enum EvaluatedScalarKind {
     Int64,
     Float64,
+    Decimal128 { precision: u8, scale: i8 },
     Utf8,
     Boolean,
     Date32,
@@ -38627,6 +38701,12 @@ fn evaluated_scalar_kind(value: &EvaluatedScalar) -> Option<EvaluatedScalarKind>
     Some(match value {
         EvaluatedScalar::Int64(_) => EvaluatedScalarKind::Int64,
         EvaluatedScalar::Float64(_) => EvaluatedScalarKind::Float64,
+        EvaluatedScalar::Decimal128 {
+            precision, scale, ..
+        } => EvaluatedScalarKind::Decimal128 {
+            precision: *precision,
+            scale: *scale,
+        },
         EvaluatedScalar::Utf8(_) => EvaluatedScalarKind::Utf8,
         EvaluatedScalar::Boolean(_) => EvaluatedScalarKind::Boolean,
         EvaluatedScalar::Date32(_) => EvaluatedScalarKind::Date32,
@@ -38638,6 +38718,11 @@ fn empty_scalar_values(kind: EvaluatedScalarKind, rows: usize) -> EvaluatedScala
     match kind {
         EvaluatedScalarKind::Int64 => EvaluatedScalar::Int64(vec![None; rows]),
         EvaluatedScalarKind::Float64 => EvaluatedScalar::Float64(vec![None; rows]),
+        EvaluatedScalarKind::Decimal128 { precision, scale } => EvaluatedScalar::Decimal128 {
+            values: vec![None; rows],
+            precision,
+            scale,
+        },
         EvaluatedScalarKind::Utf8 => EvaluatedScalar::Utf8(vec![None; rows]),
         EvaluatedScalarKind::Boolean => EvaluatedScalar::Boolean(vec![None; rows]),
         EvaluatedScalarKind::Date32 => EvaluatedScalar::Date32(vec![None; rows]),
@@ -38662,6 +38747,16 @@ fn set_scalar_value_from(
         EvaluatedScalar::Float64(values) => {
             values[row] = source
                 .map(|source| scalar_value_as_f64(source, row))
+                .transpose()?
+                .flatten();
+        }
+        EvaluatedScalar::Decimal128 {
+            values,
+            precision,
+            scale,
+        } => {
+            values[row] = source
+                .map(|source| scalar_value_as_decimal128(source, row, *precision, *scale))
                 .transpose()?
                 .flatten();
         }
@@ -38706,6 +38801,28 @@ fn scalar_value_as_f64(value: &EvaluatedScalar, row: usize) -> Result<Option<f64
     match value {
         EvaluatedScalar::Int64(values) => Ok(values[row].map(|value| value as f64)),
         EvaluatedScalar::Float64(values) => Ok(values[row]),
+        EvaluatedScalar::Decimal128 { values, scale, .. } => {
+            let scale = decimal_scale_f64(*scale)?;
+            Ok(values[row].map(|value| value as f64 / scale))
+        }
+        _ => Err(DodamError::UnsupportedSql(
+            "CASE result type mismatch".to_string(),
+        )),
+    }
+}
+
+fn scalar_value_as_decimal128(
+    value: &EvaluatedScalar,
+    row: usize,
+    precision: u8,
+    scale: i8,
+) -> Result<Option<i128>> {
+    match value {
+        EvaluatedScalar::Decimal128 {
+            values,
+            precision: value_precision,
+            scale: value_scale,
+        } if *value_precision == precision && *value_scale == scale => Ok(values[row]),
         _ => Err(DodamError::UnsupportedSql(
             "CASE result type mismatch".to_string(),
         )),
@@ -38715,7 +38832,10 @@ fn scalar_value_as_f64(value: &EvaluatedScalar, row: usize) -> Result<Option<f64
 fn scalar_value_as_utf8(value: &EvaluatedScalar, row: usize) -> Result<Option<String>> {
     match value {
         EvaluatedScalar::Int64(values) => Ok(values[row].map(|value| value.to_string())),
-        EvaluatedScalar::Float64(values) => Ok(values[row].map(|value| value.to_string())),
+        EvaluatedScalar::Float64(values) => Ok(values[row].map(format_f64_for_sql_varchar)),
+        EvaluatedScalar::Decimal128 { values, scale, .. } => {
+            Ok(values[row].map(|value| format_decimal128_value(value, *scale)))
+        }
         EvaluatedScalar::Utf8(values) => Ok(values[row].clone()),
         EvaluatedScalar::Boolean(values) => Ok(values[row].map(|value| value.to_string())),
         EvaluatedScalar::Date32(values) => Ok(values[row].map(format_date32_days)),
@@ -38778,18 +38898,16 @@ fn evaluated_column(batch: &RecordBatch, column: &str) -> Result<EvaluatedScalar
                 .expect("Float64");
             Ok(EvaluatedScalar::Float64(values.iter().collect()))
         }
-        DataType::Decimal128(_, scale) => {
+        DataType::Decimal128(precision, scale) => {
             let values = array
                 .as_any()
                 .downcast_ref::<Decimal128Array>()
                 .expect("Decimal128");
-            let scale = 10_f64.powi(i32::from(*scale));
-            Ok(EvaluatedScalar::Float64(
-                values
-                    .iter()
-                    .map(|value| value.map(|value| value as f64 / scale))
-                    .collect(),
-            ))
+            Ok(EvaluatedScalar::Decimal128 {
+                values: values.iter().collect(),
+                precision: *precision,
+                scale: *scale,
+            })
         }
         DataType::Utf8 => {
             let values = array.as_any().downcast_ref::<StringArray>().expect("Utf8");
@@ -39075,6 +39193,15 @@ fn compare_evaluated_scalars(
                 .map(|(left, right)| compare_optional_f64(left, op, right))
                 .collect())
         }
+        (EvaluatedScalar::Decimal128 { .. }, _) | (_, EvaluatedScalar::Decimal128 { .. }) => {
+            let left = scalar_as_f64(left)?;
+            let right = scalar_as_f64(right)?;
+            Ok(left
+                .into_iter()
+                .zip(right)
+                .map(|(left, right)| compare_optional_f64(left, op, right))
+                .collect())
+        }
         _ => {
             let left = scalar_as_i64(left)?;
             let right = scalar_as_i64(right)?;
@@ -39131,6 +39258,9 @@ fn scalar_null_mask(value: EvaluatedScalar) -> Vec<bool> {
         EvaluatedScalar::Float64(values) => {
             values.into_iter().map(|value| value.is_none()).collect()
         }
+        EvaluatedScalar::Decimal128 { values, .. } => {
+            values.into_iter().map(|value| value.is_none()).collect()
+        }
         EvaluatedScalar::Utf8(values) => values.into_iter().map(|value| value.is_none()).collect(),
         EvaluatedScalar::Boolean(values) => {
             values.into_iter().map(|value| value.is_none()).collect()
@@ -39150,7 +39280,10 @@ fn evaluate_binary_scalar(
     right: EvaluatedScalar,
 ) -> Result<EvaluatedScalar> {
     match (&left, &right) {
-        (EvaluatedScalar::Float64(_), _) | (_, EvaluatedScalar::Float64(_)) => {
+        (EvaluatedScalar::Float64(_), _)
+        | (_, EvaluatedScalar::Float64(_))
+        | (EvaluatedScalar::Decimal128 { .. }, _)
+        | (_, EvaluatedScalar::Decimal128 { .. }) => {
             let left = scalar_as_f64(left)?;
             let right = scalar_as_f64(right)?;
             Ok(EvaluatedScalar::Float64(
@@ -39214,6 +39347,13 @@ fn scalar_as_f64(value: EvaluatedScalar) -> Result<Vec<Option<f64>>> {
             .map(|value| value.map(|value| value as f64))
             .collect()),
         EvaluatedScalar::Float64(values) => Ok(values),
+        EvaluatedScalar::Decimal128 { values, scale, .. } => {
+            let scale = decimal_scale_f64(scale)?;
+            Ok(values
+                .into_iter()
+                .map(|value| value.map(|value| value as f64 / scale))
+                .collect())
+        }
         EvaluatedScalar::Date32(values) => Ok(values
             .into_iter()
             .map(|value| value.map(f64::from))
@@ -39242,7 +39382,11 @@ fn cast_evaluated_scalar(value: EvaluatedScalar, target: &str) -> Result<Evaluat
                 .collect(),
             EvaluatedScalar::Float64(values) => values
                 .into_iter()
-                .map(|value| value.map(|value| value.to_string()))
+                .map(|value| value.map(format_f64_for_sql_varchar))
+                .collect(),
+            EvaluatedScalar::Decimal128 { values, scale, .. } => values
+                .into_iter()
+                .map(|value| value.map(|value| format_decimal128_value(value, scale)))
                 .collect(),
             EvaluatedScalar::Utf8(values) => values,
             EvaluatedScalar::Boolean(values) => values
@@ -39266,6 +39410,15 @@ fn cast_evaluated_scalar(value: EvaluatedScalar, target: &str) -> Result<Evaluat
                 .into_iter()
                 .map(|value| value.map(|value| value as i64))
                 .collect(),
+            EvaluatedScalar::Decimal128 { values, scale, .. } => {
+                let scale = decimal_scale_i128(scale).ok_or_else(|| {
+                    DodamError::UnsupportedSql(format!("decimal scale {scale} overflows i128"))
+                })?;
+                values
+                    .into_iter()
+                    .map(|value| value.map(|value| (value / scale) as i64))
+                    .collect()
+            }
             EvaluatedScalar::Utf8(values) => values
                 .into_iter()
                 .map(|value| {
@@ -39298,6 +39451,13 @@ fn cast_evaluated_scalar(value: EvaluatedScalar, target: &str) -> Result<Evaluat
                 .map(|value| value.map(|value| value as f64))
                 .collect(),
             EvaluatedScalar::Float64(values) => values,
+            EvaluatedScalar::Decimal128 { values, scale, .. } => {
+                let scale = decimal_scale_f64(scale)?;
+                values
+                    .into_iter()
+                    .map(|value| value.map(|value| value as f64 / scale))
+                    .collect()
+            }
             EvaluatedScalar::Utf8(values) => values
                 .into_iter()
                 .map(|value| {
@@ -39352,6 +39512,24 @@ fn coalesce_evaluated_scalar(
             let left = scalar_as_f64(left)?;
             Ok(EvaluatedScalar::Float64(coalesce_options(left, right)))
         }
+        (
+            EvaluatedScalar::Decimal128 {
+                values: left,
+                precision,
+                scale,
+            },
+            EvaluatedScalar::Decimal128 {
+                values: right,
+                precision: right_precision,
+                scale: right_scale,
+            },
+        ) if precision == right_precision && scale == right_scale => {
+            Ok(EvaluatedScalar::Decimal128 {
+                values: coalesce_options(left, right),
+                precision,
+                scale,
+            })
+        }
         (EvaluatedScalar::Int64(left), EvaluatedScalar::Int64(right)) => {
             Ok(EvaluatedScalar::Int64(coalesce_options(left, right)))
         }
@@ -39384,7 +39562,11 @@ fn scalar_as_utf8(value: EvaluatedScalar) -> Result<Vec<Option<String>>> {
             .collect(),
         EvaluatedScalar::Float64(values) => values
             .into_iter()
-            .map(|value| value.map(|value| value.to_string()))
+            .map(|value| value.map(format_f64_for_sql_varchar))
+            .collect(),
+        EvaluatedScalar::Decimal128 { values, scale, .. } => values
+            .into_iter()
+            .map(|value| value.map(|value| format_decimal128_value(value, scale)))
             .collect(),
         EvaluatedScalar::Boolean(values) => values
             .into_iter()
