@@ -5617,7 +5617,7 @@ async fn q02_min_cost_rows(
     let supplier_keys = Arc::new(AdaptiveI64Set::from_hash(
         suppliers.keys().copied().collect::<HashSet<_>>(),
     ));
-    let (min_costs, candidates) = parallel_batch_fold_view_chunks(
+    let candidates = parallel_batch_fold_view_chunks(
         &mut stream,
         4,
         Q02PartsuppPartial::default,
@@ -5633,13 +5633,10 @@ async fn q02_min_cost_rows(
         q02_merge_partsupp_min_cost,
         "Q02 partsupp partials",
     )?
-    .into_parts();
+    .into_candidates();
 
     let mut rows = Vec::new();
-    for (partkey, suppkey, supplycost) in candidates {
-        if min_costs.get(&partkey).copied() != Some(supplycost) {
-            continue;
-        }
+    for (partkey, suppkey) in candidates {
         let Some(supplier) = suppliers.get(&suppkey) else {
             continue;
         };
@@ -5672,14 +5669,27 @@ async fn q02_min_cost_rows(
 
 #[derive(Default)]
 struct Q02PartsuppPartial {
-    min_costs: FastHashMap<i64, f64>,
-    candidates: Vec<(i64, i64, f64)>,
+    part_mins: FastHashMap<i64, Q02PartMin>,
 }
 
 impl Q02PartsuppPartial {
-    fn into_parts(self) -> (FastHashMap<i64, f64>, Vec<(i64, i64, f64)>) {
-        (self.min_costs, self.candidates)
+    fn into_candidates(self) -> Vec<(i64, i64)> {
+        let mut candidates = Vec::new();
+        for (partkey, part_min) in self.part_mins {
+            candidates.extend(
+                part_min
+                    .suppkeys
+                    .into_iter()
+                    .map(|suppkey| (partkey, suppkey)),
+            );
+        }
+        candidates
     }
+}
+
+struct Q02PartMin {
+    min_cost: f64,
+    suppkeys: Vec<i64>,
 }
 
 fn q02_partsupp_min_cost_batch(
@@ -5807,23 +5817,39 @@ fn q02_push_partsupp_candidate(
     suppkey: i64,
     supplycost: f64,
 ) {
-    partial.candidates.push((partkey, suppkey, supplycost));
     partial
-        .min_costs
+        .part_mins
         .entry(partkey)
-        .and_modify(|min_cost| *min_cost = min_cost.min(supplycost))
-        .or_insert(supplycost);
+        .and_modify(|part_min| {
+            if supplycost < part_min.min_cost {
+                part_min.min_cost = supplycost;
+                part_min.suppkeys.clear();
+                part_min.suppkeys.push(suppkey);
+            } else if supplycost == part_min.min_cost {
+                part_min.suppkeys.push(suppkey);
+            }
+        })
+        .or_insert_with(|| Q02PartMin {
+            min_cost: supplycost,
+            suppkeys: vec![suppkey],
+        });
 }
 
 fn q02_merge_partsupp_min_cost(output: &mut Q02PartsuppPartial, batch: Q02PartsuppPartial) {
-    for (partkey, min_cost) in batch.min_costs {
+    for (partkey, mut batch_min) in batch.part_mins {
         output
-            .min_costs
+            .part_mins
             .entry(partkey)
-            .and_modify(|current| *current = current.min(min_cost))
-            .or_insert(min_cost);
+            .and_modify(|current| {
+                if batch_min.min_cost < current.min_cost {
+                    current.min_cost = batch_min.min_cost;
+                    current.suppkeys = std::mem::take(&mut batch_min.suppkeys);
+                } else if batch_min.min_cost == current.min_cost {
+                    current.suppkeys.append(&mut batch_min.suppkeys);
+                }
+            })
+            .or_insert(batch_min);
     }
-    output.candidates.extend(batch.candidates);
 }
 
 fn q02_output(rows: Vec<Q02Row>) -> Result<QueryOutput> {
