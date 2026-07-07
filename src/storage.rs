@@ -17,9 +17,11 @@ use parquet::arrow::arrow_reader::{
     ArrowPredicate, ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions,
     ParquetRecordBatchReaderBuilder, RowFilter, RowSelection,
 };
+use parquet::column::reader::ColumnReader;
 use parquet::data_type::{ByteArray, FixedLenByteArray};
 use parquet::errors::{ParquetError, Result as ParquetResult};
-use parquet::file::reader::{ChunkReader, Length};
+use parquet::file::reader::{ChunkReader, FileReader as ParquetFileReader, Length};
+use parquet::file::serialized_reader::SerializedFileReader;
 use parquet::file::statistics::Statistics;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -1216,6 +1218,137 @@ impl ParquetBatchReader {
     pub fn max_next_nanos(&self) -> u64 {
         self.max_next_nanos
     }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct DirectI64I32I32ScanMetrics {
+    pub row_groups: usize,
+    pub batches: usize,
+    pub rows: usize,
+    pub read_nanos: u64,
+    pub consume_nanos: u64,
+}
+
+impl DirectI64I32I32ScanMetrics {
+    fn add_read_nanos(&mut self, nanos: u64) {
+        self.read_nanos = self.read_nanos.saturating_add(nanos);
+    }
+
+    fn add_consume_nanos(&mut self, nanos: u64) {
+        self.consume_nanos = self.consume_nanos.saturating_add(nanos);
+    }
+}
+
+pub(crate) fn parquet_column_indices_by_name(
+    reader: &SerializedFileReader<File>,
+    names: &[&str],
+) -> Option<Vec<usize>> {
+    let columns = reader.metadata().file_metadata().schema_descr().columns();
+    names
+        .iter()
+        .map(|name| columns.iter().position(|column| column.name() == *name))
+        .collect()
+}
+
+pub(crate) fn parquet_row_group_count(path: &Path) -> Result<usize> {
+    let file = File::open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    Ok(reader.metadata().num_row_groups())
+}
+
+pub(crate) fn scan_parquet_i64_i32_i32_columns<F>(
+    path: &Path,
+    batch_size: usize,
+    row_groups: &[usize],
+    columns: [&str; 3],
+    mut consume: F,
+) -> Result<Option<DirectI64I32I32ScanMetrics>>
+where
+    F: FnMut(&[i64], &[i32], &[i32]) -> Result<()>,
+{
+    let file = File::open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    let Some(column_indices) = parquet_column_indices_by_name(&reader, &columns) else {
+        return Ok(None);
+    };
+    let [first_column, second_column, third_column] = <[usize; 3]>::try_from(column_indices)
+        .map_err(|_| {
+            DodamError::UnsupportedSql("direct parquet column index shape mismatch".to_string())
+        })?;
+    let mut metrics = DirectI64I32I32ScanMetrics {
+        row_groups: row_groups.len(),
+        ..DirectI64I32I32ScanMetrics::default()
+    };
+    for &row_group_index in row_groups {
+        let row_group = reader.get_row_group(row_group_index)?;
+        let mut first_reader = match row_group.get_column_reader(first_column)? {
+            ColumnReader::Int64ColumnReader(reader) => reader,
+            _ => return Ok(None),
+        };
+        let mut second_reader = match row_group.get_column_reader(second_column)? {
+            ColumnReader::Int32ColumnReader(reader) => reader,
+            _ => return Ok(None),
+        };
+        let mut third_reader = match row_group.get_column_reader(third_column)? {
+            ColumnReader::Int32ColumnReader(reader) => reader,
+            _ => return Ok(None),
+        };
+        let mut first_values = Vec::<i64>::with_capacity(batch_size);
+        let mut second_values = Vec::<i32>::with_capacity(batch_size);
+        let mut third_values = Vec::<i32>::with_capacity(batch_size);
+        let mut first_def_levels = Vec::<i16>::with_capacity(batch_size);
+        let mut second_def_levels = Vec::<i16>::with_capacity(batch_size);
+        let mut third_def_levels = Vec::<i16>::with_capacity(batch_size);
+        loop {
+            first_values.clear();
+            second_values.clear();
+            third_values.clear();
+            first_def_levels.clear();
+            second_def_levels.clear();
+            third_def_levels.clear();
+            let read_started = Instant::now();
+            let (first_records, first_value_count, first_levels) = first_reader.read_records(
+                batch_size,
+                Some(&mut first_def_levels),
+                None,
+                &mut first_values,
+            )?;
+            if first_records == 0 {
+                metrics.add_read_nanos(elapsed_nanos(read_started));
+                break;
+            }
+            let (second_records, second_value_count, second_levels) = second_reader.read_records(
+                first_records,
+                Some(&mut second_def_levels),
+                None,
+                &mut second_values,
+            )?;
+            let (third_records, third_value_count, third_levels) = third_reader.read_records(
+                first_records,
+                Some(&mut third_def_levels),
+                None,
+                &mut third_values,
+            )?;
+            metrics.add_read_nanos(elapsed_nanos(read_started));
+            if first_value_count != first_records
+                || first_levels != first_records
+                || second_records != first_records
+                || second_value_count != first_records
+                || second_levels != first_records
+                || third_records != first_records
+                || third_value_count != first_records
+                || third_levels != first_records
+            {
+                return Ok(None);
+            }
+            metrics.batches += 1;
+            metrics.rows = metrics.rows.saturating_add(first_records);
+            let consume_started = Instant::now();
+            consume(&first_values, &second_values, &third_values)?;
+            metrics.add_consume_nanos(elapsed_nanos(consume_started));
+        }
+    }
+    Ok(Some(metrics))
 }
 
 enum I64SetPredicate {
