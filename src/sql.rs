@@ -305,6 +305,11 @@ pub async fn execute_sql(
         return Ok(output);
     }
     if let Some(output) =
+        try_execute_correlated_in_pair_semijoin_sql(engine, sql, batch_size).await?
+    {
+        return Ok(output);
+    }
+    if let Some(output) =
         try_execute_correlated_subquery_filter_sql(engine, sql, batch_size).await?
     {
         return Ok(output);
@@ -795,6 +800,252 @@ async fn try_execute_correlated_exists_semijoin_sql(
     Ok(Some(QueryOutput::Scan { batches }))
 }
 
+async fn try_execute_correlated_in_pair_semijoin_sql(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let Some(selection) = select.selection.as_ref() else {
+        return Ok(None);
+    };
+    reject_query_features(query)?;
+    reject_select_features(select)?;
+    if select.from.len() != 1
+        || select
+            .from
+            .first()
+            .is_some_and(|table| !table.joins.is_empty())
+    {
+        return Ok(None);
+    }
+
+    let outer_path = parse_from(select)?;
+    let outer_alias = table_ref_alias_or_name(&outer_path);
+    let mut outer_conjuncts = Vec::new();
+    collect_sql_and_conjuncts(selection, &mut outer_conjuncts);
+    let Some((in_index, outer_value, in_subquery)) =
+        outer_conjuncts
+            .iter()
+            .enumerate()
+            .find_map(|(index, expr)| match expr {
+                SqlExpr::InSubquery {
+                    expr,
+                    subquery,
+                    negated: false,
+                } => Some((index, expr.as_ref(), subquery.as_ref())),
+                SqlExpr::Nested(expr) => match expr.as_ref() {
+                    SqlExpr::InSubquery {
+                        expr,
+                        subquery,
+                        negated: false,
+                    } => Some((index, expr.as_ref(), subquery.as_ref())),
+                    _ => None,
+                },
+                _ => None,
+            })
+    else {
+        return Ok(None);
+    };
+    let Some(outer_value_column) = semijoin_column_name(outer_value)? else {
+        return Ok(None);
+    };
+    if semijoin_column_owner(&outer_value_column, "", &outer_alias)
+        != Some(SemijoinColumnOwner::Outer)
+    {
+        return Ok(None);
+    }
+    let outer_value_column = unqualified_semijoin_column(&outer_value_column);
+
+    let SetExpr::Select(inner_select) = in_subquery.body.as_ref() else {
+        return Ok(None);
+    };
+    reject_query_features(in_subquery)?;
+    reject_select_features(inner_select)?;
+    if inner_select.from.len() != 1
+        || inner_select
+            .from
+            .first()
+            .is_some_and(|table| !table.joins.is_empty())
+        || parse_distinct(inner_select)?
+        || inner_select.having.is_some()
+        || !parse_group_by(inner_select, None)?.is_empty()
+    {
+        return Ok(None);
+    }
+    let [SelectItem::UnnamedExpr(inner_value_expr)] = inner_select.projection.as_slice() else {
+        return Ok(None);
+    };
+    let Some(inner_value_column) = semijoin_column_name(inner_value_expr)? else {
+        return Ok(None);
+    };
+    let inner_path = parse_from(inner_select)?;
+    let inner_alias = table_ref_alias_or_name(&inner_path);
+    if semijoin_column_owner(&inner_value_column, &inner_alias, &outer_alias)
+        != Some(SemijoinColumnOwner::Inner)
+    {
+        return Ok(None);
+    }
+    let inner_value_column = unqualified_semijoin_column(&inner_value_column);
+
+    let Some(inner_selection) = inner_select.selection.as_ref() else {
+        return Ok(None);
+    };
+    let mut inner_conjuncts = Vec::new();
+    collect_sql_and_conjuncts(inner_selection, &mut inner_conjuncts);
+    let Some((join_index, inner_corr_key, outer_corr_key)) =
+        semijoin_exists_key_pair(&inner_conjuncts, &inner_alias, &outer_alias)?
+    else {
+        return Ok(None);
+    };
+    let inner_residual = inner_conjuncts
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, conjunct)| (index != join_index).then_some(conjunct))
+        .collect::<Vec<_>>();
+    let inner_filter = combine_sql_and_conjuncts(inner_residual)
+        .as_ref()
+        .map(|expr| parse_filter(expr, &[], inner_path.alias.as_deref(), false))
+        .transpose()?;
+    let inner_pairs = match collect_semijoin_i64_pair_set(
+        engine,
+        inner_path.path,
+        &inner_corr_key,
+        &inner_value_column,
+        inner_filter,
+        batch_size,
+    )
+    .await
+    {
+        Ok(values) => values,
+        Err(DodamError::UnsupportedSql(message)) if message.contains("integer semijoin key") => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+
+    let outer_residual = outer_conjuncts
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, conjunct)| (index != in_index).then_some(conjunct))
+        .collect::<Vec<_>>();
+    let outer_filter = combine_sql_and_conjuncts(outer_residual)
+        .as_ref()
+        .map(|expr| parse_filter(expr, &[], outer_path.alias.as_deref(), false))
+        .transpose()?;
+    let group_by = parse_group_by(select, outer_path.alias.as_deref())?;
+    let parsed_projection = parse_projection(select, &group_by, outer_path.alias.as_deref())?;
+    let distinct = parse_distinct(select)?;
+    let having = select
+        .having
+        .as_ref()
+        .map(|expr| parse_filter(expr, &parsed_projection.aliases, None, true))
+        .transpose()?;
+    let order_by = parse_order_by(
+        query,
+        &parsed_projection.aliases,
+        outer_path.alias.as_deref(),
+    )?;
+    let limit = parse_limit(query)?;
+    validate_distinct(
+        distinct,
+        &parsed_projection.projection,
+        &parsed_projection.aggregates,
+        order_by.as_ref(),
+    )?;
+
+    let mut outer_projection = match semijoin_outer_projection(
+        &parsed_projection,
+        &group_by,
+        order_by.as_ref(),
+        &outer_corr_key,
+        outer_filter.as_ref(),
+    ) {
+        Projection::All => Projection::All,
+        Projection::Columns(mut columns) => {
+            add_column_once(&mut columns, outer_value_column.clone());
+            Projection::Columns(columns)
+        }
+    };
+    if matches!(parsed_projection.projection, Projection::All) {
+        outer_projection = Projection::All;
+    }
+    let stream = engine
+        .scan_parquet_batches(
+            outer_path.path,
+            batch_size,
+            None,
+            outer_projection,
+            outer_filter,
+        )
+        .await?;
+    let outer_batches = collect_batches(stream)?;
+    let mut filtered = Vec::new();
+    for batch in outer_batches {
+        let mask = match semijoin_i64_pair_membership_mask(
+            &batch,
+            &outer_corr_key,
+            &outer_value_column,
+            &inner_pairs,
+        ) {
+            Ok(mask) => mask,
+            Err(DodamError::UnsupportedSql(message))
+                if message.contains("integer semijoin key") =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let batch = filter_record_batch(&batch, &mask)?;
+        if batch.num_rows() > 0 {
+            filtered.push(batch);
+        }
+    }
+
+    if !parsed_projection.aggregates.is_empty() {
+        let stream = Box::new(MemoryExec::new(filtered)).execute()?;
+        let metrics = if group_by.is_empty() {
+            collect_aggregates(stream, 1, &parsed_projection.aggregates)?
+        } else {
+            collect_grouped_aggregates(stream, 1, &group_by, &parsed_projection.aggregates)?
+        };
+        let mut batches =
+            aggregate_metrics_to_batches(&metrics, &group_by, &parsed_projection.aggregates)?;
+        batches = apply_output_filter(batches, having.as_ref())?;
+        let has_output_expressions =
+            projection_requires_expression_path(&parsed_projection.expressions);
+        if has_output_expressions {
+            batches = apply_output_expression_projection(batches, &parsed_projection.expressions)?;
+        }
+        batches = apply_output_order_limit(batches, order_by.as_ref(), limit)?;
+        if !has_output_expressions {
+            batches = rename_output_batches(batches, &parsed_projection.aliases)?;
+        }
+        return Ok(Some(QueryOutput::Aggregate { metrics, batches }));
+    }
+
+    let mut batches = apply_output_order_limit(filtered, order_by.as_ref(), limit)?;
+    let projection_requires_expression =
+        projection_requires_expression_path(&parsed_projection.expressions);
+    batches = if projection_requires_expression {
+        apply_output_expression_projection(batches, &parsed_projection.expressions)?
+    } else {
+        apply_output_projection(batches, &parsed_projection.projection)?
+    };
+    if !projection_requires_expression {
+        batches = rename_output_batches(batches, &parsed_projection.aliases)?;
+    }
+    Ok(Some(QueryOutput::Scan { batches }))
+}
+
 fn semijoin_exists_key_pair(
     conjuncts: &[SqlExpr],
     inner_alias: &str,
@@ -937,6 +1188,85 @@ fn semijoin_membership_mask(
     let column = batch.column(column_index);
     let values = (0..batch.num_rows())
         .map(|row| keys.contains_column_value(column, row))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(BooleanArray::from(values))
+}
+
+async fn collect_semijoin_i64_pair_set(
+    engine: &DodamEngine,
+    path: PathBuf,
+    left_column: &str,
+    right_column: &str,
+    filter: Option<FilterExpr>,
+    batch_size: usize,
+) -> Result<HashSet<(i64, i64)>> {
+    let mut projection = vec![left_column.to_string(), right_column.to_string()];
+    if let Some(filter) = &filter {
+        for column in filter.referenced_columns() {
+            add_column_once(&mut projection, column);
+        }
+    }
+    let stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(projection),
+            filter,
+        )
+        .await?;
+    let batches = collect_batches(stream)?;
+    let mut values = HashSet::new();
+    for batch in &batches {
+        let left_index = batch
+            .schema()
+            .index_of(left_column)
+            .map_err(|_| DodamError::UnknownColumn(left_column.to_string()))?;
+        let right_index = batch
+            .schema()
+            .index_of(right_column)
+            .map_err(|_| DodamError::UnknownColumn(right_column.to_string()))?;
+        let left = batch.column(left_index);
+        let right = batch.column(right_index);
+        for row in 0..batch.num_rows() {
+            let Some(left) = semijoin_i64_key_at(left, row)? else {
+                continue;
+            };
+            let Some(right) = semijoin_i64_key_at(right, row)? else {
+                continue;
+            };
+            values.insert((left, right));
+        }
+    }
+    Ok(values)
+}
+
+fn semijoin_i64_pair_membership_mask(
+    batch: &RecordBatch,
+    left_column: &str,
+    right_column: &str,
+    keys: &HashSet<(i64, i64)>,
+) -> Result<BooleanArray> {
+    let left_index = batch
+        .schema()
+        .index_of(left_column)
+        .map_err(|_| DodamError::UnknownColumn(left_column.to_string()))?;
+    let right_index = batch
+        .schema()
+        .index_of(right_column)
+        .map_err(|_| DodamError::UnknownColumn(right_column.to_string()))?;
+    let left = batch.column(left_index);
+    let right = batch.column(right_index);
+    let values = (0..batch.num_rows())
+        .map(|row| {
+            let Some(left) = semijoin_i64_key_at(left, row)? else {
+                return Ok(Some(false));
+            };
+            let Some(right) = semijoin_i64_key_at(right, row)? else {
+                return Ok(Some(false));
+            };
+            Ok(Some(keys.contains(&(left, right))))
+        })
         .collect::<Result<Vec<_>>>()?;
     Ok(BooleanArray::from(values))
 }
@@ -34443,12 +34773,21 @@ fn parse_join_projection(
             SelectItem::UnnamedExpr(
                 expr @ (SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_)),
             ) => {
-                let column = join_column_name(expr, table_aliases)?;
-                columns.push(column.clone());
-                expressions.push(ProjectionExpression {
-                    output_name: column_output_name(expr),
-                    expr: ScalarSqlExpression::Column(column),
-                });
+                if let Some((column, field)) = parse_join_struct_field_access(expr, table_aliases)?
+                {
+                    add_column_once(&mut columns, column.clone());
+                    expressions.push(ProjectionExpression {
+                        output_name: column_output_name(expr),
+                        expr: ScalarSqlExpression::StructField { column, field },
+                    });
+                } else {
+                    let column = join_column_name(expr, table_aliases)?;
+                    columns.push(column.clone());
+                    expressions.push(ProjectionExpression {
+                        output_name: column_output_name(expr),
+                        expr: ScalarSqlExpression::Column(column),
+                    });
+                }
             }
             SelectItem::UnnamedExpr(SqlExpr::Function(function)) => {
                 if let Some(expr) =
@@ -34515,15 +34854,26 @@ fn parse_join_projection(
             }
             SelectItem::ExprWithAlias { expr, alias } => match expr {
                 SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
-                    let column = join_column_name(expr, table_aliases)?;
-                    aliases.push((alias.value.clone(), column.clone()));
-                    columns.push(column);
-                    expressions.push(ProjectionExpression {
-                        output_name: alias.value.clone(),
-                        expr: ScalarSqlExpression::Column(
-                            aliases.last().expect("alias just pushed").1.clone(),
-                        ),
-                    });
+                    if let Some((column, field)) =
+                        parse_join_struct_field_access(expr, table_aliases)?
+                    {
+                        add_column_once(&mut columns, column.clone());
+                        aliases.push((alias.value.clone(), alias.value.clone()));
+                        expressions.push(ProjectionExpression {
+                            output_name: alias.value.clone(),
+                            expr: ScalarSqlExpression::StructField { column, field },
+                        });
+                    } else {
+                        let column = join_column_name(expr, table_aliases)?;
+                        aliases.push((alias.value.clone(), column.clone()));
+                        columns.push(column);
+                        expressions.push(ProjectionExpression {
+                            output_name: alias.value.clone(),
+                            expr: ScalarSqlExpression::Column(
+                                aliases.last().expect("alias just pushed").1.clone(),
+                            ),
+                        });
+                    }
                 }
                 SqlExpr::Function(function) => {
                     if let Some(expr) = parse_join_scalar_function_projection(
@@ -35675,7 +36025,7 @@ fn parse_join_scalar_function_projection(
     let lowercase_name = name.to_ascii_lowercase();
     if !matches!(
         lowercase_name.as_str(),
-        "coalesce" | "lower" | "upper" | "length"
+        "coalesce" | "lower" | "upper" | "length" | "array_length" | "list_length"
     ) {
         return Ok(None);
     }
@@ -35723,7 +36073,7 @@ fn parse_join_scalar_function_projection(
             }
             ScalarSqlExpression::Coalesce(values)
         }
-        "lower" | "upper" | "length" => {
+        "lower" | "upper" | "length" | "array_length" | "list_length" => {
             let [value] = values.as_slice() else {
                 return Err(DodamError::UnsupportedSql(format!(
                     "{name} requires exactly one argument"
@@ -35733,6 +36083,20 @@ fn parse_join_scalar_function_projection(
                 "lower" => ScalarSqlExpression::Lower(Box::new(value.clone())),
                 "upper" => ScalarSqlExpression::Upper(Box::new(value.clone())),
                 "length" => ScalarSqlExpression::Length(Box::new(value.clone())),
+                "array_length" | "list_length" => {
+                    let (column, field) = match value {
+                        ScalarSqlExpression::Column(column) => (column.clone(), None),
+                        ScalarSqlExpression::StructField { column, field } => {
+                            (column.clone(), Some(field.clone()))
+                        }
+                        _ => {
+                            return Err(DodamError::UnsupportedSql(format!(
+                                "{name} currently requires a list column or struct list field"
+                            )));
+                        }
+                    };
+                    ScalarSqlExpression::ListLength { column, field }
+                }
                 _ => unreachable!("validated scalar function"),
             }
         }
@@ -35877,9 +36241,29 @@ fn parse_join_scalar_sql_expression(
     table_aliases: &[&str],
 ) -> Result<ScalarSqlExpression> {
     match expr {
-        SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => Ok(ScalarSqlExpression::Column(
-            join_column_name(expr, table_aliases)?,
-        )),
+        SqlExpr::CompoundFieldAccess { .. } => {
+            let Some((column, field, index)) = parse_join_list_index_access(expr, table_aliases)?
+            else {
+                return Err(DodamError::UnsupportedSql(format!(
+                    "unsupported JOIN nested/list expression: {expr}"
+                )));
+            };
+            Ok(ScalarSqlExpression::ListIndex {
+                column,
+                field,
+                index: Box::new(index),
+            })
+        }
+        SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
+            if let Some((column, field)) = parse_join_struct_field_access(expr, table_aliases)? {
+                Ok(ScalarSqlExpression::StructField { column, field })
+            } else {
+                Ok(ScalarSqlExpression::Column(join_column_name(
+                    expr,
+                    table_aliases,
+                )?))
+            }
+        }
         SqlExpr::Value(_) => Ok(ScalarSqlExpression::Literal(sql_literal_value(expr)?)),
         SqlExpr::TypedString(typed) => typed_string_scalar_expression(typed),
         SqlExpr::Nested(expr) => parse_join_scalar_sql_expression(expr, table_aliases),
@@ -35969,6 +36353,100 @@ fn parse_join_scalar_sql_expression(
             "unsupported JOIN scalar expression: {expr}"
         ))),
     }
+}
+
+fn parse_join_struct_field_access(
+    expr: &SqlExpr,
+    table_aliases: &[&str],
+) -> Result<Option<(String, String)>> {
+    let SqlExpr::CompoundIdentifier(parts) = expr else {
+        return Ok(None);
+    };
+    match parts.as_slice() {
+        [qualifier, column, fields @ ..]
+            if !fields.is_empty()
+                && table_aliases
+                    .iter()
+                    .any(|alias| alias.eq_ignore_ascii_case(&qualifier.value)) =>
+        {
+            Ok(Some((
+                format!("{}.{}", qualifier.value, column.value),
+                fields
+                    .iter()
+                    .map(|field| field.value.as_str())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            )))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn parse_join_list_index_access(
+    expr: &SqlExpr,
+    table_aliases: &[&str],
+) -> Result<Option<(String, Option<String>, ScalarSqlExpression)>> {
+    let SqlExpr::CompoundFieldAccess { root, access_chain } = expr else {
+        return Ok(None);
+    };
+    let Some(AccessExpr::Subscript(Subscript::Index { index })) = access_chain.last() else {
+        return Ok(None);
+    };
+    let prefix = &access_chain[..access_chain.len().saturating_sub(1)];
+    let (column, field) = if prefix.is_empty() {
+        if let Some((column, field)) = parse_join_struct_field_access(root, table_aliases)? {
+            (column, Some(field))
+        } else {
+            (join_column_name(root, table_aliases)?, None)
+        }
+    } else if let Some((column, mut field)) = parse_join_struct_field_access(root, table_aliases)? {
+        for access in prefix {
+            let AccessExpr::Dot(SqlExpr::Identifier(ident)) = access else {
+                return Ok(None);
+            };
+            field.push('.');
+            field.push_str(&ident.value);
+        }
+        (column, Some(field))
+    } else {
+        if let SqlExpr::Identifier(alias) = root.as_ref()
+            && table_aliases
+                .iter()
+                .any(|table_alias| table_alias.eq_ignore_ascii_case(&alias.value))
+            && let Some((first, rest)) = prefix.split_first()
+        {
+            let AccessExpr::Dot(SqlExpr::Identifier(column)) = first else {
+                return Ok(None);
+            };
+            let mut fields = Vec::with_capacity(rest.len());
+            for access in rest {
+                let AccessExpr::Dot(SqlExpr::Identifier(ident)) = access else {
+                    return Ok(None);
+                };
+                fields.push(ident.value.as_str());
+            }
+            return Ok(Some((
+                format!("{}.{}", alias.value, column.value),
+                (!fields.is_empty()).then(|| fields.join(".")),
+                parse_join_scalar_sql_expression(index, table_aliases)?,
+            )));
+        }
+        let column = join_column_name(root, table_aliases)?;
+        let mut fields = Vec::with_capacity(prefix.len());
+        for access in prefix {
+            let AccessExpr::Dot(SqlExpr::Identifier(ident)) = access else {
+                return Ok(None);
+            };
+            fields.push(ident.value.as_str());
+        }
+        if fields.is_empty() {
+            (column, None)
+        } else {
+            (column, Some(fields.join(".")))
+        }
+    };
+    let index = parse_join_scalar_sql_expression(index, table_aliases)?;
+    Ok(Some((column, field, index)))
 }
 
 fn parse_struct_field_access(
@@ -39599,7 +40077,7 @@ fn scalar_as_i64(value: EvaluatedScalar) -> Result<Vec<Option<i64>>> {
             .map(|value| value.map(i64::from))
             .collect()),
         EvaluatedScalar::TimestampMillisecond(values) => Ok(values),
-        other => Err(DodamError::UnsupportedSql(format!(
+        other => Err(DodamError::TypeMismatch(format!(
             "cannot use {} in integer arithmetic",
             other.data_type()
         ))),
@@ -39628,7 +40106,7 @@ fn scalar_as_f64(value: EvaluatedScalar) -> Result<Vec<Option<f64>>> {
             .into_iter()
             .map(|value| value.map(|value| value as f64))
             .collect()),
-        other => Err(DodamError::UnsupportedSql(format!(
+        other => Err(DodamError::TypeMismatch(format!(
             "cannot use {} in floating point arithmetic",
             other.data_type()
         ))),
@@ -39668,6 +40146,9 @@ fn cast_evaluated_scalar(value: EvaluatedScalar, target: &str) -> Result<Evaluat
                 .map(|value| value.map(format_timestamp_millis))
                 .collect(),
         }));
+    }
+    if let Some((precision, scale)) = parse_decimal_cast_target(&target)? {
+        return cast_evaluated_scalar_to_decimal(value, precision, scale);
     }
     if matches!(target.as_str(), "bigint" | "int8" | "integer" | "int") {
         return Ok(EvaluatedScalar::Int64(match value {
@@ -39796,6 +40277,199 @@ fn cast_evaluated_scalar(value: EvaluatedScalar, target: &str) -> Result<Evaluat
     Err(DodamError::UnsupportedSql(format!(
         "unsupported CAST target: {target}"
     )))
+}
+
+fn parse_decimal_cast_target(target: &str) -> Result<Option<(u8, i8)>> {
+    let target = target.trim();
+    let Some(args) = target
+        .strip_prefix("decimal")
+        .or_else(|| target.strip_prefix("numeric"))
+    else {
+        return Ok(None);
+    };
+    let args = args.trim();
+    if args.is_empty() {
+        return Ok(Some((18, 3)));
+    }
+    let Some(args) = args
+        .strip_prefix('(')
+        .and_then(|args| args.strip_suffix(')'))
+    else {
+        return Err(DodamError::InvalidCast(format!(
+            "invalid DECIMAL target: {target}"
+        )));
+    };
+    let parts = args.split(',').map(str::trim).collect::<Vec<_>>();
+    let [precision, scale] = parts.as_slice() else {
+        return Err(DodamError::InvalidCast(format!(
+            "invalid DECIMAL target: {target}"
+        )));
+    };
+    let precision = precision
+        .parse::<u8>()
+        .map_err(|_| DodamError::InvalidCast(format!("invalid DECIMAL precision: {target}")))?;
+    let scale = scale
+        .parse::<i8>()
+        .map_err(|_| DodamError::InvalidCast(format!("invalid DECIMAL scale: {target}")))?;
+    if precision == 0 || precision > 38 || scale < 0 || scale > precision as i8 {
+        return Err(DodamError::InvalidCast(format!(
+            "invalid DECIMAL target: {target}"
+        )));
+    }
+    Ok(Some((precision, scale)))
+}
+
+fn cast_evaluated_scalar_to_decimal(
+    value: EvaluatedScalar,
+    precision: u8,
+    scale: i8,
+) -> Result<EvaluatedScalar> {
+    let values = match value {
+        EvaluatedScalar::Decimal128 {
+            values,
+            scale: input_scale,
+            ..
+        } => values
+            .into_iter()
+            .map(|value| {
+                value
+                    .map(|value| rescale_decimal_value(value, input_scale, scale, precision))
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?,
+        EvaluatedScalar::Int64(values) => {
+            let factor = decimal_scale_i128(scale).ok_or_else(|| {
+                DodamError::InvalidCast(format!("decimal scale {scale} overflows"))
+            })?;
+            values
+                .into_iter()
+                .map(|value| {
+                    value
+                        .map(|value| {
+                            let value = i128::from(value).checked_mul(factor).ok_or_else(|| {
+                                DodamError::InvalidCast("decimal cast overflow".to_string())
+                            })?;
+                            validate_decimal_precision(value, precision)
+                        })
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
+        EvaluatedScalar::Float64(values) => values
+            .into_iter()
+            .map(|value| {
+                value
+                    .map(|value| {
+                        parse_decimal_literal_to_scaled(&value.to_string(), scale, precision)
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?,
+        EvaluatedScalar::Utf8(values) => values
+            .into_iter()
+            .map(|value| {
+                value
+                    .map(|value| parse_decimal_literal_to_scaled(&value, scale, precision))
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?,
+        other => {
+            return Err(DodamError::InvalidCast(format!(
+                "cannot cast {} to DECIMAL({precision},{scale})",
+                other.data_type()
+            )));
+        }
+    };
+    Ok(EvaluatedScalar::Decimal128 {
+        values,
+        precision,
+        scale,
+    })
+}
+
+fn rescale_decimal_value(value: i128, from_scale: i8, to_scale: i8, precision: u8) -> Result<i128> {
+    let value = if to_scale >= from_scale {
+        align_decimal_value(value, from_scale, to_scale)?
+    } else {
+        round_decimal_to_lower_scale(value, from_scale, to_scale)?
+    };
+    validate_decimal_precision(value, precision)
+}
+
+fn round_decimal_to_lower_scale(value: i128, from_scale: i8, to_scale: i8) -> Result<i128> {
+    let factor = decimal_align_factor(to_scale, from_scale)?;
+    let quotient = value / factor;
+    let remainder = value % factor;
+    let should_round = remainder.abs().checked_mul(2).is_some_and(|v| v >= factor);
+    if should_round {
+        quotient
+            .checked_add(if value.is_negative() { -1 } else { 1 })
+            .ok_or_else(|| DodamError::InvalidCast("decimal cast overflow".to_string()))
+    } else {
+        Ok(quotient)
+    }
+}
+
+fn parse_decimal_literal_to_scaled(value: &str, scale: i8, precision: u8) -> Result<i128> {
+    let scale_usize = usize::try_from(scale)
+        .map_err(|_| DodamError::InvalidCast(format!("invalid decimal scale {scale}")))?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(DodamError::InvalidCast(
+            "cannot cast empty string to DECIMAL".to_string(),
+        ));
+    }
+    let negative = value.starts_with('-');
+    let unsigned = value.strip_prefix(['-', '+']).unwrap_or(value);
+    let (whole, fractional) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    if whole.is_empty()
+        || !whole.chars().all(|ch| ch.is_ascii_digit())
+        || !fractional.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return Err(DodamError::InvalidCast(format!(
+            "cannot cast '{value}' to DECIMAL"
+        )));
+    }
+    let scale_factor = decimal_scale_i128(scale)
+        .ok_or_else(|| DodamError::InvalidCast(format!("decimal scale {scale} overflows")))?;
+    let mut raw = whole
+        .parse::<i128>()
+        .map_err(|_| DodamError::InvalidCast(format!("cannot cast '{value}' to DECIMAL")))?
+        .checked_mul(scale_factor)
+        .ok_or_else(|| DodamError::InvalidCast("decimal cast overflow".to_string()))?;
+    let kept = &fractional[..fractional.len().min(scale_usize)];
+    let mut kept_value = kept.parse::<i128>().unwrap_or(0);
+    for _ in kept.len()..scale_usize {
+        kept_value = kept_value
+            .checked_mul(10)
+            .ok_or_else(|| DodamError::InvalidCast("decimal cast overflow".to_string()))?;
+    }
+    raw = raw
+        .checked_add(kept_value)
+        .ok_or_else(|| DodamError::InvalidCast("decimal cast overflow".to_string()))?;
+    if fractional.len() > scale_usize {
+        let next_digit = fractional.as_bytes()[scale_usize];
+        if next_digit >= b'5' {
+            raw = raw
+                .checked_add(1)
+                .ok_or_else(|| DodamError::InvalidCast("decimal cast overflow".to_string()))?;
+        }
+    }
+    if negative {
+        raw = -raw;
+    }
+    validate_decimal_precision(raw, precision)
+}
+
+fn validate_decimal_precision(value: i128, precision: u8) -> Result<i128> {
+    let limit = decimal_scale_i128(precision as i8)
+        .ok_or_else(|| DodamError::InvalidCast("decimal precision overflows".to_string()))?;
+    if value.abs() >= limit {
+        return Err(DodamError::InvalidCast(format!(
+            "decimal value {value} is out of range for precision {precision}"
+        )));
+    }
+    Ok(value)
 }
 
 fn coalesce_evaluated_scalar(

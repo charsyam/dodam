@@ -1939,5 +1939,11 @@ Tried and rejected or neutral:
           - Single-table `WHERE amount = amount3 OR amount3 > amount` now works for mixed-scale Decimal128 column-to-column predicates by aligning raw decimal scales in the physical filter path.
           - Nested list indexing now supports struct list fields such as `attrs.more_tags[1]`, not only top-level `tags[1]`.
           - Validation: full `cargo fmt && cargo check -q && cargo test -q` passed.
+        - Implemented the next 1-4 correctness/generalization pass:
+          - Added `CAST(... AS DECIMAL(p,s))` scalar support with DuckDB-compatible scale rounding and precision overflow errors.
+          - Extended nested/list scalar projection into JOIN output expressions for alias-qualified struct fields and struct-list operations such as `n.attrs.rank`, `n.attrs.more_tags[1]`, and `array_length(n.attrs.more_tags)`.
+          - Added a narrow optimized correlated `IN` rewrite for integer/date pair keys of the shape `outer_value IN (SELECT inner_value WHERE inner_corr = outer_corr AND ...)`; unsupported key types fall back to the correctness-first row-bound path.
+          - Routed arithmetic type mismatches through the dedicated `TypeMismatch` error variant instead of generic `UnsupportedSql`.
+          - Validation: full `cargo fmt && cargo check -q && cargo test -q` passed.
         - Retuned Q12 defaults: `DODAM_Q12_ROW_GROUP_MAP_CHUNK` from `2` to `4`, and `DODAM_Q12_ORDER_FUSED_ROW_GROUP_CHUNK` from `4` to `1`. Sequential sweeps: lineitem chunk `4` was best in the sampled run (`~129.0ms` vs default area `~129.8-133.5ms`), while order fused chunk `1` was clearly best (`~125.3ms` vs `~132-139ms` for larger chunks). Combined explicit setting sampled Dodam `~123.0ms` vs DuckDB `~125.5ms`.
         - Validation after making these Q12 defaults: `cargo fmt --all --check`, `cargo check -q`, `cargo test -q`, and release build passed. Individual SF=10 Q12 sampled Dodam `~123.8ms` vs DuckDB `~127.5ms`, moving Q12 back to faster in this run.
