@@ -1,4 +1,6 @@
-use arrow::array::{ArrayRef, Date32Array, DictionaryArray, Int64Array, StringArray};
+use arrow::array::{
+    Array, ArrayRef, Date32Array, DictionaryArray, Int64Array, LargeStringArray, StringArray,
+};
 use arrow::datatypes::Int32Type;
 use arrow::record_batch::RecordBatch;
 
@@ -66,6 +68,15 @@ impl<'a> BatchView<'a> {
         self.downcast(index)
     }
 
+    pub(crate) fn required_dictionary_i32(
+        &self,
+        index: usize,
+    ) -> Result<&'a DictionaryArray<Int32Type>> {
+        self.dictionary_i32(index).ok_or_else(|| {
+            DodamError::UnsupportedSql(format!("projected column {index} is not Dictionary<Int32>"))
+        })
+    }
+
     fn downcast<T: 'static>(&self, index: usize) -> Option<&'a T> {
         self.batch
             .columns()
@@ -84,6 +95,60 @@ pub(crate) fn consume_record_batch<C: BatchConsumer>(
     batch: &RecordBatch,
 ) -> Result<()> {
     consumer.consume(BatchView::new(batch))
+}
+
+pub(crate) enum DictionaryStringValues<'a> {
+    Utf8(&'a StringArray),
+    LargeUtf8(&'a LargeStringArray),
+}
+
+impl DictionaryStringValues<'_> {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Utf8(values) => values.len(),
+            Self::LargeUtf8(values) => values.len(),
+        }
+    }
+
+    pub(crate) fn value_bytes(&self, index: usize) -> &[u8] {
+        match self {
+            Self::Utf8(values) => {
+                let offsets = values.value_offsets();
+                let data = values.value_data();
+                &data[offsets[index] as usize..offsets[index + 1] as usize]
+            }
+            Self::LargeUtf8(values) => {
+                let offsets = values.value_offsets();
+                let data = values.value_data();
+                &data[offsets[index] as usize..offsets[index + 1] as usize]
+            }
+        }
+    }
+}
+
+pub(crate) fn dictionary_i32_string_values(
+    dictionary: &DictionaryArray<Int32Type>,
+) -> Option<DictionaryStringValues<'_>> {
+    if let Some(values) = dictionary.values().as_any().downcast_ref::<StringArray>() {
+        return Some(DictionaryStringValues::Utf8(values));
+    }
+    dictionary
+        .values()
+        .as_any()
+        .downcast_ref::<LargeStringArray>()
+        .map(DictionaryStringValues::LargeUtf8)
+}
+
+pub(crate) fn dictionary_string_key_for_value(
+    values: &DictionaryStringValues<'_>,
+    target: &[u8],
+) -> Option<i32> {
+    for index in 0..values.len() {
+        if values.value_bytes(index) == target {
+            return i32::try_from(index).ok();
+        }
+    }
+    None
 }
 
 #[allow(dead_code)]

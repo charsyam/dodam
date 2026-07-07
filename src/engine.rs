@@ -2562,6 +2562,64 @@ impl DodamEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn parquet_row_group_map_scan_view<
+        State,
+        Output,
+        BuildState,
+        ConsumeBatch,
+        Finish,
+    >(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        projection: Projection,
+        dictionary_columns: Vec<String>,
+        pruning_predicates: Vec<Expr>,
+        row_group_chunk: usize,
+        build_state: BuildState,
+        consume_batch: ConsumeBatch,
+        finish: Finish,
+    ) -> Result<Option<Vec<Output>>>
+    where
+        State: Send + 'static,
+        Output: Send + 'static,
+        BuildState: Fn() -> State + Clone + Send + Sync + 'static,
+        ConsumeBatch: for<'a> FnMut(BatchView<'a>, &mut State) -> Result<Option<()>>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        Finish: Fn(State) -> Result<Option<Output>> + Clone + Send + Sync + 'static,
+    {
+        if dictionary_columns.is_empty() {
+            return self
+                .parquet_row_group_map_pruned_view(
+                    path,
+                    batch_size,
+                    projection,
+                    pruning_predicates,
+                    row_group_chunk,
+                    build_state,
+                    consume_batch,
+                    finish,
+                )
+                .await;
+        }
+        self.parquet_row_group_map_dictionary_columns_pruned_view(
+            path,
+            batch_size,
+            projection,
+            dictionary_columns,
+            pruning_predicates,
+            row_group_chunk,
+            build_state,
+            consume_batch,
+            finish,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn parquet_row_group_map_pruned_results<State, Output, BuildState, ConsumeBatch, Finish>(
         &self,
         profile_kind: &str,
