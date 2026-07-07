@@ -50,7 +50,10 @@ use crate::execution::{
 };
 use crate::hash::{FastHashMap, FastHashSet, fast_hash_map, fast_hash_map_with_capacity};
 use crate::optimizer::plan_join_inputs;
-use crate::storage::{DirectColumnScanMetrics, DirectI64I32I32ScanMetrics};
+use crate::storage::{
+    DirectColumnScanMetrics, DirectI64I32I32ScanMetrics, DirectPrimitiveColumnScanMetrics,
+    DirectPrimitiveColumnSpec, DirectPrimitiveColumnType,
+};
 use crate::vector::{
     BatchConsumer, BatchView, Date32VectorView, Decimal128VectorView, DictionaryI32View,
     DictionaryStringValues, I32VectorView, I64VectorView, SelectionVector, consume_record_batch,
@@ -18796,6 +18799,20 @@ async fn q06_revenue_sum(
             return Ok(Some(result));
         }
     }
+    if q06_direct_primitive_enabled()
+        && let Some(result) = q06_revenue_sum_direct_primitive(
+            engine,
+            path.clone(),
+            batch_size,
+            start_days,
+            end_days,
+            discount_low,
+            discount_high,
+            quantity_limit,
+        )?
+    {
+        return Ok(Some(result));
+    }
     let row_filter_enabled = q06_row_filter_enabled();
     let projection = if row_filter_enabled {
         Projection::Columns(vec![
@@ -18904,6 +18921,155 @@ async fn q06_revenue_sum(
         },
         "Q06 revenue sum",
     )
+}
+
+fn q06_direct_primitive_enabled() -> bool {
+    std::env::var("DODAM_Q06_ENABLE_DIRECT_PRIMITIVE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn q06_direct_primitive_row_group_chunk() -> usize {
+    std::env::var("DODAM_Q06_DIRECT_ROW_GROUP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q06_revenue_sum_direct_primitive(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    start_days: i32,
+    end_days: i32,
+    discount_low: f64,
+    discount_high: f64,
+    quantity_limit: f64,
+) -> Result<Option<(f64, u64)>> {
+    let started = tpch_profile_start();
+    let row_groups = (0..engine.parquet_row_group_count(&path)?).collect::<Vec<_>>();
+    let chunks = row_groups
+        .chunks(q06_direct_primitive_row_group_chunk())
+        .map(|chunk| chunk.to_vec())
+        .collect::<Vec<_>>();
+    let partials = chunks
+        .into_par_iter()
+        .map(|row_groups| {
+            q06_revenue_sum_direct_primitive_chunk(
+                engine,
+                path.clone(),
+                batch_size,
+                row_groups,
+                start_days,
+                end_days,
+                discount_low,
+                discount_high,
+                quantity_limit,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut total = (0.0, 0_u64);
+    let mut metrics = DirectPrimitiveColumnScanMetrics::default();
+    for partial in partials {
+        let Some((partial, partial_metrics)) = partial else {
+            return Ok(None);
+        };
+        total.0 += partial.0;
+        total.1 += partial.1;
+        metrics.row_groups = metrics
+            .row_groups
+            .saturating_add(partial_metrics.row_groups);
+        metrics.batches = metrics.batches.saturating_add(partial_metrics.batches);
+        metrics.rows = metrics.rows.saturating_add(partial_metrics.rows);
+        metrics.read_nanos = metrics
+            .read_nanos
+            .saturating_add(partial_metrics.read_nanos);
+        metrics.consume_nanos = metrics
+            .consume_nanos
+            .saturating_add(partial_metrics.consume_nanos);
+    }
+    if let Some(started) = started {
+        eprintln!(
+            "[dodam:tpch-profile] Q06 direct_primitive: total={:.3} ms row_groups={} batches={} rows={} read={:.3} ms consume={:.3} ms",
+            started.elapsed().as_secs_f64() * 1000.0,
+            metrics.row_groups,
+            metrics.batches,
+            metrics.rows,
+            sql_nanos_to_millis(metrics.read_nanos),
+            sql_nanos_to_millis(metrics.consume_nanos),
+        );
+    }
+    Ok(Some(total))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q06_revenue_sum_direct_primitive_chunk(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    row_groups: Vec<usize>,
+    start_days: i32,
+    end_days: i32,
+    discount_low: f64,
+    discount_high: f64,
+    quantity_limit: f64,
+) -> Result<Option<((f64, u64), DirectPrimitiveColumnScanMetrics)>> {
+    let specs = [
+        DirectPrimitiveColumnSpec {
+            name: "l_shipdate",
+            column_type: DirectPrimitiveColumnType::Date32,
+        },
+        DirectPrimitiveColumnSpec {
+            name: "l_discount",
+            column_type: DirectPrimitiveColumnType::Decimal128Int64 {
+                precision: 15,
+                scale: 2,
+            },
+        },
+        DirectPrimitiveColumnSpec {
+            name: "l_quantity",
+            column_type: DirectPrimitiveColumnType::Decimal128Int64 {
+                precision: 15,
+                scale: 2,
+            },
+        },
+        DirectPrimitiveColumnSpec {
+            name: "l_extendedprice",
+            column_type: DirectPrimitiveColumnType::Decimal128Int64 {
+                precision: 15,
+                scale: 2,
+            },
+        },
+    ];
+    let mut total = Some((0.0, 0_u64));
+    let Some(metrics) = engine.scan_parquet_primitive_columns_view(
+        &path,
+        batch_size,
+        &row_groups,
+        &specs,
+        |view| {
+            let batch = q06_revenue_sum_view(
+                view,
+                start_days,
+                end_days,
+                discount_low,
+                discount_high,
+                quantity_limit,
+            )?;
+            if let (Some(total), Some(batch)) = (total.as_mut(), batch) {
+                total.0 += batch.0;
+                total.1 += batch.1;
+            } else {
+                total = None;
+            }
+            Ok(())
+        },
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(total.map(|total| (total, metrics)))
 }
 
 fn q06_row_filter_enabled() -> bool {

@@ -1294,6 +1294,10 @@ pub(crate) enum DirectPrimitiveColumnType {
     #[allow(dead_code)]
     I32,
     Date32,
+    Decimal128Int64 {
+        precision: u8,
+        scale: i8,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1514,6 +1518,7 @@ enum DirectPrimitiveColumnReader {
 enum DirectPrimitiveColumnValues {
     I64(Vec<i64>),
     I32(Vec<i32>),
+    Decimal128(Vec<i128>),
 }
 
 impl DirectPrimitiveColumnValues {
@@ -1523,6 +1528,9 @@ impl DirectPrimitiveColumnValues {
             DirectPrimitiveColumnType::I32 | DirectPrimitiveColumnType::Date32 => {
                 Self::I32(Vec::with_capacity(capacity))
             }
+            DirectPrimitiveColumnType::Decimal128Int64 { .. } => {
+                Self::Decimal128(Vec::with_capacity(capacity))
+            }
         }
     }
 
@@ -1530,6 +1538,7 @@ impl DirectPrimitiveColumnValues {
         match self {
             Self::I64(values) => values.clear(),
             Self::I32(values) => values.clear(),
+            Self::Decimal128(values) => values.clear(),
         }
     }
 
@@ -1538,6 +1547,14 @@ impl DirectPrimitiveColumnValues {
             (Self::I64(values), DirectPrimitiveColumnType::I64) => RawColumnView::I64(values),
             (Self::I32(values), DirectPrimitiveColumnType::I32) => RawColumnView::I32(values),
             (Self::I32(values), DirectPrimitiveColumnType::Date32) => RawColumnView::Date32(values),
+            (
+                Self::Decimal128(values),
+                DirectPrimitiveColumnType::Decimal128Int64 { precision, scale },
+            ) => RawColumnView::Decimal128 {
+                values,
+                precision,
+                scale,
+            },
             _ => unreachable!("direct primitive values match their column spec"),
         }
     }
@@ -1564,6 +1581,19 @@ fn read_direct_primitive_records(
             } else {
                 Ok(reader.read_records(records, Some(def_levels), None, values)?)
             }
+        }
+        (
+            DirectPrimitiveColumnReader::I64(reader),
+            DirectPrimitiveColumnValues::Decimal128(values),
+        ) => {
+            let mut raw = Vec::<i64>::with_capacity(records);
+            let result = if required {
+                reader.read_records(records, None, None, &mut raw)?
+            } else {
+                reader.read_records(records, Some(def_levels), None, &mut raw)?
+            };
+            values.extend(raw.into_iter().map(i128::from));
+            Ok(result)
         }
         _ => Err(DodamError::UnsupportedSql(
             "direct primitive column reader/value type mismatch".to_string(),
@@ -1613,6 +1643,10 @@ where
                 (DirectPrimitiveColumnType::Date32, ColumnReader::Int32ColumnReader(reader)) => {
                     DirectPrimitiveColumnReader::I32(reader)
                 }
+                (
+                    DirectPrimitiveColumnType::Decimal128Int64 { .. },
+                    ColumnReader::Int64ColumnReader(reader),
+                ) => DirectPrimitiveColumnReader::I64(reader),
                 _ => return Ok(None),
             };
             readers.push(reader);
