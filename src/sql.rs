@@ -25929,20 +25929,29 @@ fn q20_lineitem_quantity_sums_view_into(
     sums: &mut HashMap<(i64, i64), f64>,
 ) -> Result<()> {
     if view.num_columns() == 4
-        && let Some(batch_sums) = q20_lineitem_quantity_sums_typed(
-            view.column(0)?,
-            view.column(1)?,
-            view.column(2)?,
-            view.column(3)?,
+        && let (Some(partkeys), Some(suppkeys), Some(quantities), Some(shipdates)) = (
+            view.i64_vector(0),
+            view.i64_vector(1),
+            view.decimal128_vector(2),
+            view.date32_vector(3),
+        )
+        && let Some(batch_sums) = q20_lineitem_quantity_sums_vector_typed(
+            partkeys,
+            suppkeys,
+            quantities,
+            shipdates,
             forest_parts,
-        )?
+        )
     {
         merge_f64_groups(sums, batch_sums);
         return Ok(());
     }
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(());
+    };
     merge_f64_groups(
         sums,
-        q20_lineitem_quantity_sums_batch(view.record_batch().clone(), forest_parts)?,
+        q20_lineitem_quantity_sums_batch(batch.clone(), forest_parts)?,
     );
     Ok(())
 }
@@ -26033,6 +26042,55 @@ fn q20_lineitem_quantity_sums_typed(
         }
     }
     Ok(Some(sums))
+}
+
+fn q20_lineitem_quantity_sums_vector_typed(
+    partkeys: I64VectorView<'_>,
+    suppkeys: I64VectorView<'_>,
+    quantities: Decimal128VectorView<'_>,
+    shipdates: Date32VectorView<'_>,
+    forest_parts: &AdaptiveI64Set,
+) -> Option<HashMap<(i64, i64), f64>> {
+    let mut sums = HashMap::<(i64, i64), f64>::new();
+    if let (Some(partkey_values), Some(suppkey_values), Some(shipdate_values)) = (
+        partkeys.values_if_null_free(),
+        suppkeys.values_if_null_free(),
+        shipdates.values_if_null_free(),
+    ) && quantities.null_count() == 0
+    {
+        let quantity_values = quantities.raw_values();
+        let quantity_scale = quantities.scale();
+        for row in 0..partkey_values.len() {
+            let shipdate = shipdate_values[row];
+            if !(8_766..9_131).contains(&shipdate) {
+                continue;
+            }
+            let partkey = partkey_values[row];
+            if forest_parts.contains(partkey) {
+                *sums.entry((partkey, suppkey_values[row])).or_insert(0.0) +=
+                    quantity_values[row] as f64 / quantity_scale;
+            }
+        }
+        return Some(sums);
+    }
+    for row in 0..partkeys.len() {
+        if partkeys.is_null(row)
+            || suppkeys.is_null(row)
+            || quantities.is_null(row)
+            || shipdates.is_null(row)
+        {
+            continue;
+        }
+        let shipdate = shipdates.value(row);
+        if !(8_766..9_131).contains(&shipdate) {
+            continue;
+        }
+        let partkey = partkeys.value(row);
+        if forest_parts.contains(partkey) {
+            *sums.entry((partkey, suppkeys.value(row))).or_insert(0.0) += quantities.value(row);
+        }
+    }
+    Some(sums)
 }
 
 async fn q20_eligible_supplier_keys(
