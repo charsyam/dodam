@@ -15188,24 +15188,28 @@ fn q03_revenue_projected_view(
     ship_cutoff: i32,
 ) -> Result<Q03RevenueMap> {
     if view.num_columns() == 4
-        && let Some(revenues) = q03_revenue_batch_typed(
-            view.column(0)?,
-            view.column(1)?,
-            view.column(2)?,
-            view.column(3)?,
+        && let (Some(orderkeys), Some(shipdates), Some(extendedprices), Some(discounts)) = (
+            view.i64_vector(0),
+            view.date32_vector(1),
+            view.decimal128_vector(2),
+            view.decimal128_vector(3),
+        )
+        && let Some(revenues) = q03_revenue_vector_typed(
+            orderkeys,
+            shipdates,
+            extendedprices,
+            discounts,
             orders,
             order_probe,
             ship_cutoff,
-        )?
+        )
     {
         return Ok(revenues);
     }
-    q03_revenue_batch(
-        view.record_batch().clone(),
-        orders,
-        order_probe,
-        ship_cutoff,
-    )
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(fast_hash_map::<i64, f64>());
+    };
+    q03_revenue_batch(batch.clone(), orders, order_probe, ship_cutoff)
 }
 
 fn q03_revenue_batch_typed(
@@ -15269,6 +15273,58 @@ fn q03_revenue_batch_typed(
     Ok(Some(revenues))
 }
 
+fn q03_revenue_vector_typed(
+    orderkeys: I64VectorView<'_>,
+    shipdates: Date32VectorView<'_>,
+    extendedprices: Decimal128VectorView<'_>,
+    discounts: Decimal128VectorView<'_>,
+    orders: &Q03OrderMap,
+    order_probe: Option<&[bool]>,
+    ship_cutoff: i32,
+) -> Option<Q03RevenueMap> {
+    let mut revenues = fast_hash_map::<i64, f64>();
+    if let (Some(orderkey_values), Some(shipdate_values)) = (
+        orderkeys.values_if_null_free(),
+        shipdates.values_if_null_free(),
+    ) && extendedprices.null_count() == 0
+        && discounts.null_count() == 0
+    {
+        let extendedprice_values = extendedprices.raw_values();
+        let discount_values = discounts.raw_values();
+        let discount_scale = discounts.scale();
+        let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
+        for row in 0..orderkey_values.len() {
+            let shipdate = shipdate_values[row];
+            let orderkey = orderkey_values[row];
+            if shipdate > ship_cutoff && q03_order_probe_contains(orders, order_probe, orderkey) {
+                *revenues.entry(orderkey).or_insert(0.0) += decimal_discounted_revenue_raw(
+                    extendedprice_values[row],
+                    discount_values[row],
+                    discount_scale,
+                    revenue_scale,
+                );
+            }
+        }
+        return Some(revenues);
+    }
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row)
+            || shipdates.is_null(row)
+            || extendedprices.is_null(row)
+            || discounts.is_null(row)
+        {
+            continue;
+        }
+        let shipdate = shipdates.value(row);
+        let orderkey = orderkeys.value(row);
+        if shipdate > ship_cutoff && q03_order_probe_contains(orders, order_probe, orderkey) {
+            *revenues.entry(orderkey).or_insert(0.0) +=
+                extendedprices.value(row) * (1.0 - discounts.value(row));
+        }
+    }
+    Some(revenues)
+}
+
 fn q03_revenue_projected_batch_sorted_into(
     batch: RecordBatch,
     orders: &SortedI64Lookup<Q03Order>,
@@ -15320,24 +15376,28 @@ fn q03_revenue_projected_view_sorted_into(
     revenues: &mut Vec<(i64, f64)>,
 ) -> Result<()> {
     if view.num_columns() == 4
-        && q03_revenue_batch_sorted_typed_into(
-            view.column(0)?,
-            view.column(1)?,
-            view.column(2)?,
-            view.column(3)?,
+        && let (Some(orderkeys), Some(shipdates), Some(extendedprices), Some(discounts)) = (
+            view.i64_vector(0),
+            view.date32_vector(1),
+            view.decimal128_vector(2),
+            view.decimal128_vector(3),
+        )
+        && q03_revenue_vector_sorted_typed_into(
+            orderkeys,
+            shipdates,
+            extendedprices,
+            discounts,
             orders,
             ship_cutoff,
             revenues,
-        )?
+        )
     {
         return Ok(());
     }
-    q03_revenue_projected_batch_sorted_into(
-        view.record_batch().clone(),
-        orders,
-        ship_cutoff,
-        revenues,
-    )
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(());
+    };
+    q03_revenue_projected_batch_sorted_into(batch.clone(), orders, ship_cutoff, revenues)
 }
 
 fn q03_revenue_batch_sorted_typed_into(
@@ -15386,6 +15446,46 @@ fn q03_revenue_batch_sorted_typed_into(
         }
     }
     Ok(true)
+}
+
+fn q03_revenue_vector_sorted_typed_into(
+    orderkeys: I64VectorView<'_>,
+    shipdates: Date32VectorView<'_>,
+    extendedprices: Decimal128VectorView<'_>,
+    discounts: Decimal128VectorView<'_>,
+    orders: &SortedI64Lookup<Q03Order>,
+    ship_cutoff: i32,
+    revenues: &mut Vec<(i64, f64)>,
+) -> bool {
+    let (Some(orderkey_values), Some(shipdate_values)) = (
+        orderkeys.values_if_null_free(),
+        shipdates.values_if_null_free(),
+    ) else {
+        return false;
+    };
+    if extendedprices.null_count() != 0 || discounts.null_count() != 0 {
+        return false;
+    }
+    let extendedprice_values = extendedprices.raw_values();
+    let discount_values = discounts.raw_values();
+    let discount_scale = discounts.scale();
+    let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
+    for row in 0..orderkey_values.len() {
+        let shipdate = shipdate_values[row];
+        let orderkey = orderkey_values[row];
+        if shipdate > ship_cutoff && orders.get(orderkey).is_some() {
+            revenues.push((
+                orderkey,
+                decimal_discounted_revenue_raw(
+                    extendedprice_values[row],
+                    discount_values[row],
+                    discount_scale,
+                    revenue_scale,
+                ),
+            ));
+        }
+    }
+    true
 }
 
 fn q03_revenue_batch_sorted(
@@ -15456,18 +15556,27 @@ fn q03_revenue_projected_view_sorted(
     ship_cutoff: i32,
 ) -> Result<Q03RevenueMap> {
     if view.num_columns() == 4
-        && let Some(revenues) = q03_revenue_batch_sorted_typed(
-            view.column(0)?,
-            view.column(1)?,
-            view.column(2)?,
-            view.column(3)?,
+        && let (Some(orderkeys), Some(shipdates), Some(extendedprices), Some(discounts)) = (
+            view.i64_vector(0),
+            view.date32_vector(1),
+            view.decimal128_vector(2),
+            view.decimal128_vector(3),
+        )
+        && let Some(revenues) = q03_revenue_vector_sorted_typed(
+            orderkeys,
+            shipdates,
+            extendedprices,
+            discounts,
             orders,
             ship_cutoff,
-        )?
+        )
     {
         return Ok(revenues);
     }
-    q03_revenue_batch_sorted(view.record_batch().clone(), orders, ship_cutoff)
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(fast_hash_map::<i64, f64>());
+    };
+    q03_revenue_batch_sorted(batch.clone(), orders, ship_cutoff)
 }
 
 fn q03_revenue_batch_sorted_typed(
@@ -15513,6 +15622,43 @@ fn q03_revenue_batch_sorted_typed(
         }
     }
     Ok(Some(revenues))
+}
+
+fn q03_revenue_vector_sorted_typed(
+    orderkeys: I64VectorView<'_>,
+    shipdates: Date32VectorView<'_>,
+    extendedprices: Decimal128VectorView<'_>,
+    discounts: Decimal128VectorView<'_>,
+    orders: &SortedI64Lookup<Q03Order>,
+    ship_cutoff: i32,
+) -> Option<Q03RevenueMap> {
+    let (Some(orderkey_values), Some(shipdate_values)) = (
+        orderkeys.values_if_null_free(),
+        shipdates.values_if_null_free(),
+    ) else {
+        return None;
+    };
+    if extendedprices.null_count() != 0 || discounts.null_count() != 0 {
+        return None;
+    }
+    let mut revenues = fast_hash_map::<i64, f64>();
+    let extendedprice_values = extendedprices.raw_values();
+    let discount_values = discounts.raw_values();
+    let discount_scale = discounts.scale();
+    let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
+    for row in 0..orderkey_values.len() {
+        let shipdate = shipdate_values[row];
+        let orderkey = orderkey_values[row];
+        if shipdate > ship_cutoff && orders.get(orderkey).is_some() {
+            *revenues.entry(orderkey).or_insert(0.0) += decimal_discounted_revenue_raw(
+                extendedprice_values[row],
+                discount_values[row],
+                discount_scale,
+                revenue_scale,
+            );
+        }
+    }
+    Some(revenues)
 }
 
 fn merge_f64_groups<K, S>(groups: &mut HashMap<K, f64, S>, batch: HashMap<K, f64, S>)
