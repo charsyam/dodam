@@ -13169,18 +13169,45 @@ fn q15_revenue_by_supplier_view_into(
 ) -> Result<()> {
     if view.num_columns() == 4 {
         let (Some(suppkeys), Some(shipdates), Some(extendedprices), Some(discounts)) = (
-            view.i64(0),
-            view.date32(1),
-            decimal_input(view.column(2)?)?,
-            decimal_input(view.column(3)?)?,
+            view.i64_vector(0),
+            view.date32_vector(1),
+            view.decimal128_vector(2),
+            view.decimal128_vector(3),
         ) else {
+            let Some(batch) = view.try_record_batch() else {
+                return Ok(());
+            };
             return q15_revenue_by_supplier_batch_into(
-                view.record_batch().clone(),
+                batch.clone(),
                 start_days,
                 end_days,
                 revenues,
             );
         };
+        if let (Some(suppkey_values), Some(shipdate_values)) = (
+            suppkeys.values_if_null_free(),
+            shipdates.values_if_null_free(),
+        ) && extendedprices.null_count() == 0
+            && discounts.null_count() == 0
+        {
+            let extendedprice_values = extendedprices.raw_values();
+            let discount_values = discounts.raw_values();
+            let discount_scale = discounts.scale();
+            let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
+            for row in 0..view.num_rows() {
+                let shipdate = shipdate_values[row];
+                if shipdate >= start_days && shipdate < end_days {
+                    *revenues.entry(suppkey_values[row]).or_insert(0.0) +=
+                        decimal_discounted_revenue_raw(
+                            extendedprice_values[row],
+                            discount_values[row],
+                            discount_scale,
+                            revenue_scale,
+                        );
+                }
+            }
+            return Ok(());
+        }
         for row in 0..view.num_rows() {
             if suppkeys.is_null(row)
                 || shipdates.is_null(row)
@@ -13198,7 +13225,10 @@ fn q15_revenue_by_supplier_view_into(
         }
         return Ok(());
     }
-    q15_revenue_by_supplier_batch_into(view.record_batch().clone(), start_days, end_days, revenues)
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(());
+    };
+    q15_revenue_by_supplier_batch_into(batch.clone(), start_days, end_days, revenues)
 }
 
 struct Q15Row {
