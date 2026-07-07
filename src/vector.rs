@@ -15,6 +15,11 @@ pub(crate) struct BatchView<'a> {
 #[derive(Clone, Copy)]
 enum BatchViewInner<'a> {
     RecordBatch(&'a RecordBatch),
+    I64I32I32 {
+        first: &'a [i64],
+        second: &'a [i32],
+        third: &'a [i32],
+    },
 }
 
 impl<'a> BatchView<'a> {
@@ -24,21 +29,36 @@ impl<'a> BatchView<'a> {
         }
     }
 
+    pub(crate) fn from_i64_i32_i32(first: &'a [i64], second: &'a [i32], third: &'a [i32]) -> Self {
+        Self {
+            inner: BatchViewInner::I64I32I32 {
+                first,
+                second,
+                third,
+            },
+        }
+    }
+
     pub(crate) fn record_batch(&self) -> &'a RecordBatch {
         match self.inner {
             BatchViewInner::RecordBatch(batch) => batch,
+            BatchViewInner::I64I32I32 { .. } => {
+                panic!("raw vector BatchView does not expose a RecordBatch")
+            }
         }
     }
 
     pub(crate) fn num_columns(&self) -> usize {
         match self.inner {
             BatchViewInner::RecordBatch(batch) => batch.num_columns(),
+            BatchViewInner::I64I32I32 { .. } => 3,
         }
     }
 
     pub(crate) fn num_rows(&self) -> usize {
         match self.inner {
             BatchViewInner::RecordBatch(batch) => batch.num_rows(),
+            BatchViewInner::I64I32I32 { first, .. } => first.len(),
         }
     }
 
@@ -47,6 +67,20 @@ impl<'a> BatchView<'a> {
             BatchViewInner::RecordBatch(batch) => batch.columns().get(index).ok_or_else(|| {
                 DodamError::UnsupportedSql(format!("projected column index {index} missing"))
             }),
+            BatchViewInner::I64I32I32 { .. } => Err(DodamError::UnsupportedSql(format!(
+                "raw vector BatchView column {index} is not an Arrow array"
+            ))),
+        }
+    }
+
+    pub(crate) fn raw_i64_i32_i32(&self) -> Option<(&'a [i64], &'a [i32], &'a [i32])> {
+        match self.inner {
+            BatchViewInner::RecordBatch(_) => None,
+            BatchViewInner::I64I32I32 {
+                first,
+                second,
+                third,
+            } => Some((first, second, third)),
         }
     }
 
@@ -102,6 +136,7 @@ impl<'a> BatchView<'a> {
             BatchViewInner::RecordBatch(batch) => {
                 batch.columns().get(index)?.as_any().downcast_ref::<T>()
             }
+            BatchViewInner::I64I32I32 { .. } => None,
         }
     }
 }

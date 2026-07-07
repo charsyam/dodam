@@ -692,6 +692,26 @@ impl DodamEngine {
         )
     }
 
+    pub(crate) fn scan_parquet_i64_i32_i32_columns_view<F>(
+        &self,
+        path: impl AsRef<Path>,
+        batch_size: usize,
+        row_groups: &[usize],
+        columns: [&str; 3],
+        mut consume: F,
+    ) -> Result<Option<DirectI64I32I32ScanMetrics>>
+    where
+        F: for<'a> FnMut(BatchView<'a>) -> Result<()>,
+    {
+        self.scan_parquet_i64_i32_i32_columns(
+            path,
+            batch_size,
+            row_groups,
+            columns,
+            move |first, second, third| consume(BatchView::from_i64_i32_i32(first, second, third)),
+        )
+    }
+
     pub(crate) fn scan_parquet_i64_byte_array_payload_columns<F>(
         &self,
         path: impl AsRef<Path>,

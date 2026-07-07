@@ -16517,39 +16517,23 @@ fn q04_lineitem_direct_column_chunk_scan(
     };
     let mut hits = 0usize;
     let mut misses = 0usize;
-    let Some(scan_metrics) = engine.scan_parquet_i64_i32_i32_columns(
+    let Some(scan_metrics) = engine.scan_parquet_i64_i32_i32_columns_view(
         &path,
         batch_size,
         &row_groups,
         ["l_orderkey", "l_commitdate", "l_receiptdate"],
-        |orderkeys, commitdates, receiptdates| {
-            for row in 0..orderkeys.len() {
-                if commitdates[row] >= receiptdates[row] {
-                    continue;
-                }
-                let orderkey = orderkeys[row];
-                if orderkey < 0 {
-                    continue;
-                }
-                let Ok(orderkey) = usize::try_from(orderkey) else {
-                    continue;
-                };
-                let Some(marker) = candidate_priorities.get(orderkey) else {
-                    misses += 1;
-                    continue;
-                };
-                let priority_marker = marker.load(Ordering::Relaxed);
-                if priority_marker == 0 {
-                    misses += 1;
-                    continue;
-                }
-                let priority_marker = marker.swap(0, Ordering::Relaxed);
-                if priority_marker == 0 {
-                    misses += 1;
-                    continue;
-                }
-                hits += 1;
-                partial.counts[usize::from(priority_marker - 1)] += 1;
+        |view| {
+            let before = partial.counts.iter().copied().sum::<u64>();
+            q04_count_late_candidate_priorities_atomic_view(
+                view,
+                &candidate_priorities,
+                &mut partial.counts,
+            )?;
+            let after = partial.counts.iter().copied().sum::<u64>();
+            let batch_hits = usize::try_from(after.saturating_sub(before)).unwrap_or(usize::MAX);
+            hits = hits.saturating_add(batch_hits);
+            if let Some((orderkeys, _, _)) = view.raw_i64_i32_i32() {
+                misses = misses.saturating_add(orderkeys.len().saturating_sub(batch_hits));
             }
             Ok(())
         },
@@ -17038,6 +17022,16 @@ fn q04_count_late_candidate_priorities_atomic_view(
     candidate_priorities: &[AtomicU8],
     counts: &mut [u64],
 ) -> Result<Option<()>> {
+    if let Some((orderkeys, commitdates, receiptdates)) = view.raw_i64_i32_i32() {
+        q04_count_late_candidate_priorities_atomic_raw(
+            orderkeys,
+            commitdates,
+            receiptdates,
+            candidate_priorities,
+            counts,
+        );
+        return Ok(Some(()));
+    }
     if view.num_columns() == 3
         && q04_count_late_candidate_priorities_atomic_typed(
             view.column(0)?,
@@ -17316,6 +17310,39 @@ fn q04_count_late_candidate_priorities_atomic_typed(
         counts[usize::from(priority_marker - 1)] += 1;
     }
     Ok(true)
+}
+
+fn q04_count_late_candidate_priorities_atomic_raw(
+    orderkeys: &[i64],
+    commitdates: &[i32],
+    receiptdates: &[i32],
+    candidate_priorities: &[AtomicU8],
+    counts: &mut [u64],
+) {
+    for row in 0..orderkeys.len() {
+        if commitdates[row] >= receiptdates[row] {
+            continue;
+        }
+        let orderkey = orderkeys[row];
+        if orderkey < 0 {
+            continue;
+        }
+        let Ok(orderkey) = usize::try_from(orderkey) else {
+            continue;
+        };
+        let Some(marker) = candidate_priorities.get(orderkey) else {
+            continue;
+        };
+        let priority_marker = marker.load(Ordering::Relaxed);
+        if priority_marker == 0 {
+            continue;
+        }
+        let priority_marker = marker.swap(0, Ordering::Relaxed);
+        if priority_marker == 0 {
+            continue;
+        }
+        counts[usize::from(priority_marker - 1)] += 1;
+    }
 }
 
 fn q04_lineitem_selection_vector_enabled() -> bool {
