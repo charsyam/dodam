@@ -22311,12 +22311,12 @@ fn q08_late_build_partkey_selection_view(
     state: &mut Q08LateMarketState,
 ) -> Result<Option<()>> {
     if view.num_columns() == 1 {
-        let Some(partkeys) = view.i64(0) else {
+        let Some(partkeys) = view.i64_vector(0) else {
             return Ok(None);
         };
         let dense_part_keys = state.part_keys.dense_contains_slice();
-        if partkeys.null_count() == 0 {
-            for &partkey in partkeys.values().as_ref() {
+        if let Some(partkey_values) = partkeys.values_if_null_free() {
+            for &partkey in partkey_values {
                 selection.push(adaptive_i64_set_contains_cached(
                     &state.part_keys,
                     dense_part_keys,
@@ -22327,7 +22327,7 @@ fn q08_late_build_partkey_selection_view(
         }
         for row in 0..partkeys.len() {
             selection.push(
-                partkeys.is_valid(row)
+                !partkeys.is_null(row)
                     && adaptive_i64_set_contains_cached(
                         &state.part_keys,
                         dense_part_keys,
@@ -22337,7 +22337,10 @@ fn q08_late_build_partkey_selection_view(
         }
         return Ok(Some(()));
     }
-    q08_late_build_partkey_selection_batch(view.record_batch().clone(), selection, state)
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    q08_late_build_partkey_selection_batch(batch.clone(), selection, state)
 }
 
 fn q08_late_consume_market_payload_batch(
@@ -22417,13 +22420,14 @@ fn q08_late_consume_market_payload_view(
     state: &mut Q08LateMarketState,
 ) -> Result<Option<()>> {
     if view.num_columns() == 4
-        && let (Ok(orderkeys), Ok(suppkeys)) = (view.required_i64(0), view.required_i64(1))
-        && let (Some(extendedprices), Some(discounts)) = (
-            decimal_input(view.column(2)?)?,
-            decimal_input(view.column(3)?)?,
+        && let (Some(orderkeys), Some(suppkeys), Some(extendedprices), Some(discounts)) = (
+            view.i64_vector(0),
+            view.i64_vector(1),
+            view.decimal128_vector(2),
+            view.decimal128_vector(3),
         )
     {
-        q08_late_consume_market_payload_typed(
+        q08_late_consume_market_payload_vector(
             orderkeys,
             suppkeys,
             extendedprices,
@@ -22432,27 +22436,29 @@ fn q08_late_consume_market_payload_view(
         );
         return Ok(Some(()));
     }
-    q08_late_consume_market_payload_batch(view.record_batch().clone(), state)
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    q08_late_consume_market_payload_batch(batch.clone(), state)
 }
 
-fn q08_late_consume_market_payload_typed(
-    orderkeys: &Int64Array,
-    suppkeys: &Int64Array,
-    extendedprices: DecimalInput<'_>,
-    discounts: DecimalInput<'_>,
+fn q08_late_consume_market_payload_vector(
+    orderkeys: I64VectorView<'_>,
+    suppkeys: I64VectorView<'_>,
+    extendedprices: Decimal128VectorView<'_>,
+    discounts: Decimal128VectorView<'_>,
     state: &mut Q08LateMarketState,
 ) {
-    if orderkeys.null_count() == 0
-        && suppkeys.null_count() == 0
-        && extendedprices.null_count() == 0
+    if let (Some(orderkey_values), Some(suppkey_values)) = (
+        orderkeys.values_if_null_free(),
+        suppkeys.values_if_null_free(),
+    ) && extendedprices.null_count() == 0
         && discounts.null_count() == 0
     {
-        let orderkey_values = orderkeys.values().as_ref();
-        let suppkey_values = suppkeys.values().as_ref();
         let extendedprice_values = extendedprices.raw_values();
         let discount_values = discounts.raw_values();
-        let (discount_scale, revenue_scale) =
-            decimal_discounted_revenue_scales(extendedprices, discounts);
+        let discount_scale = discounts.scale();
+        let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
         for row in 0..orderkey_values.len() {
             let Some(o_year) = state.order_years.get(orderkey_values[row]) else {
                 continue;
