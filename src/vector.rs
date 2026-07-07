@@ -9,30 +9,45 @@ use crate::error::{DodamError, Result};
 
 #[derive(Clone, Copy)]
 pub(crate) struct BatchView<'a> {
-    batch: &'a RecordBatch,
+    inner: BatchViewInner<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum BatchViewInner<'a> {
+    RecordBatch(&'a RecordBatch),
 }
 
 impl<'a> BatchView<'a> {
     pub(crate) fn new(batch: &'a RecordBatch) -> Self {
-        Self { batch }
+        Self {
+            inner: BatchViewInner::RecordBatch(batch),
+        }
     }
 
     pub(crate) fn record_batch(&self) -> &'a RecordBatch {
-        self.batch
+        match self.inner {
+            BatchViewInner::RecordBatch(batch) => batch,
+        }
     }
 
     pub(crate) fn num_columns(&self) -> usize {
-        self.batch.num_columns()
+        match self.inner {
+            BatchViewInner::RecordBatch(batch) => batch.num_columns(),
+        }
     }
 
     pub(crate) fn num_rows(&self) -> usize {
-        self.batch.num_rows()
+        match self.inner {
+            BatchViewInner::RecordBatch(batch) => batch.num_rows(),
+        }
     }
 
     pub(crate) fn column(&self, index: usize) -> Result<&'a ArrayRef> {
-        self.batch.columns().get(index).ok_or_else(|| {
-            DodamError::UnsupportedSql(format!("projected column index {index} missing"))
-        })
+        match self.inner {
+            BatchViewInner::RecordBatch(batch) => batch.columns().get(index).ok_or_else(|| {
+                DodamError::UnsupportedSql(format!("projected column index {index} missing"))
+            }),
+        }
     }
 
     pub(crate) fn utf8(&self, index: usize) -> Option<&'a StringArray> {
@@ -83,11 +98,11 @@ impl<'a> BatchView<'a> {
     }
 
     fn downcast<T: 'static>(&self, index: usize) -> Option<&'a T> {
-        self.batch
-            .columns()
-            .get(index)?
-            .as_any()
-            .downcast_ref::<T>()
+        match self.inner {
+            BatchViewInner::RecordBatch(batch) => {
+                batch.columns().get(index)?.as_any().downcast_ref::<T>()
+            }
+        }
     }
 }
 

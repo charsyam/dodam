@@ -2983,71 +2983,6 @@ where
     Ok(output)
 }
 
-fn parallel_batch_fold_chunks<Partial, Output, Map, Merge>(
-    stream: &mut SendableBatchStream,
-    chunk_size: usize,
-    map: Map,
-    mut output: Output,
-    mut merge: Merge,
-    label: &str,
-) -> Result<Output>
-where
-    Partial: Send + 'static,
-    Map: Fn(Vec<RecordBatch>) -> Result<Partial> + Send + Sync + Clone + 'static,
-    Merge: FnMut(&mut Output, Partial),
-{
-    let profile = tpch_profile_enabled();
-    let started = profile.then(Instant::now);
-    let (sender, receiver) = mpsc::channel();
-    let mut pending_chunks = 0_usize;
-    let mut chunk = Vec::with_capacity(chunk_size.max(1));
-    let stream_started = profile.then(Instant::now);
-    while let Some(batch) = stream.next() {
-        chunk.push(batch?);
-        if chunk.len() < chunk_size.max(1) {
-            continue;
-        }
-        let sender = sender.clone();
-        let map = map.clone();
-        let task_chunk = std::mem::replace(&mut chunk, Vec::with_capacity(chunk_size.max(1)));
-        pending_chunks += 1;
-        rayon::spawn(move || {
-            let _ = sender.send(map(task_chunk));
-        });
-    }
-    if !chunk.is_empty() {
-        let sender = sender.clone();
-        let map = map.clone();
-        pending_chunks += 1;
-        rayon::spawn(move || {
-            let _ = sender.send(map(chunk));
-        });
-    }
-    let stream_ms = stream_started
-        .map(|started| started.elapsed().as_secs_f64() * 1000.0)
-        .unwrap_or_default();
-    drop(sender);
-    let merge_started = profile.then(Instant::now);
-    for _ in 0..pending_chunks {
-        let partial = receiver
-            .recv()
-            .map_err(|_| DodamError::UnsupportedSql(format!("{label} worker stopped")))??;
-        merge(&mut output, partial);
-    }
-    if let Some(started) = started {
-        let merge_ms = merge_started
-            .map(|started| started.elapsed().as_secs_f64() * 1000.0)
-            .unwrap_or_default();
-        eprintln!(
-            "[dodam:tpch-profile] {label}: total={:.3} ms stream_read={:.3} ms worker_wait_merge={:.3} ms chunks={pending_chunks}",
-            started.elapsed().as_secs_f64() * 1000.0,
-            stream_ms,
-            merge_ms
-        );
-    }
-    Ok(output)
-}
-
 fn parallel_batch_fold_view_chunks<State, Partial, Output, Build, Consume, Finish, Merge>(
     stream: &mut SendableBatchStream,
     chunk_size: usize,
@@ -6701,11 +6636,12 @@ async fn q09_late_materialized_profit_partial(
         "l_discount".to_string(),
     ]);
     let Some(chunks) = engine
-        .late_materialized_parquet_map_with_policy(
+        .late_materialized_parquet_map_pruned_with_policy_view(
             path,
             batch_size,
             predicate_projection,
             payload_projection,
+            Vec::new(),
             q09_late_materialized_row_group_chunk(),
             LateMaterializationPolicy::selective_with_selector_run_ratio(
                 q09_late_materialized_max_selected_ratio(),
@@ -6726,8 +6662,8 @@ async fn q09_late_materialized_profit_partial(
                     partial: Q09ProfitPartial::default(),
                 }
             },
-            q09_late_build_partkey_selection_batch,
-            q09_late_consume_profit_payload_batch,
+            q09_late_build_partkey_selection_view,
+            q09_late_consume_profit_payload_view,
             |state, _metrics| {
                 if state.partkey_offset != state.selected_partkeys.len() {
                     return Err(DodamError::UnsupportedSql(
@@ -6820,6 +6756,47 @@ fn q09_late_build_partkey_selection_batch(
     Ok(Some(()))
 }
 
+fn q09_late_build_partkey_selection_view(
+    view: BatchView<'_>,
+    selection: &mut LateSelectionBuilder,
+    state: &mut Q09LateProfitState,
+) -> Result<Option<()>> {
+    if view.num_columns() == 1 {
+        let Some(partkeys) = view.i64(0) else {
+            return Ok(None);
+        };
+        let dense_part_keys = state.part_keys.dense_contains_slice();
+        state.partial.profile.rows += partkeys.len();
+        if partkeys.null_count() == 0 {
+            for &partkey in partkeys.values() {
+                let selected =
+                    adaptive_i64_set_contains_cached(&state.part_keys, dense_part_keys, partkey);
+                selection.push(selected);
+                if selected {
+                    state.selected_partkeys.push(partkey);
+                    state.partial.profile.part_hits += 1;
+                }
+            }
+            return Ok(Some(()));
+        }
+        for row in 0..partkeys.len() {
+            let selected = partkeys.is_valid(row)
+                && adaptive_i64_set_contains_cached(
+                    &state.part_keys,
+                    dense_part_keys,
+                    partkeys.value(row),
+                );
+            selection.push(selected);
+            if selected {
+                state.selected_partkeys.push(partkeys.value(row));
+                state.partial.profile.part_hits += 1;
+            }
+        }
+        return Ok(Some(()));
+    }
+    q09_late_build_partkey_selection_batch(view.record_batch().clone(), selection, state)
+}
+
 fn q09_late_consume_profit_payload_batch(
     batch: RecordBatch,
     state: &mut Q09LateProfitState,
@@ -6889,6 +6866,31 @@ fn q09_late_consume_profit_payload_batch(
         state.partial.groups.add(nationkey, o_year, amount);
     }
     Ok(Some(()))
+}
+
+fn q09_late_consume_profit_payload_view(
+    view: BatchView<'_>,
+    state: &mut Q09LateProfitState,
+) -> Result<Option<()>> {
+    if view.num_columns() == 5
+        && let (Ok(orderkeys), Ok(suppkeys)) = (view.required_i64(0), view.required_i64(1))
+        && let (Some(quantities), Some(extendedprices), Some(discounts)) = (
+            decimal_input(view.column(2)?)?,
+            decimal_input(view.column(3)?)?,
+            decimal_input(view.column(4)?)?,
+        )
+    {
+        q09_late_consume_profit_decimal_batch(
+            orderkeys,
+            suppkeys,
+            quantities,
+            extendedprices,
+            discounts,
+            state,
+        )?;
+        return Ok(Some(()));
+    }
+    q09_late_consume_profit_payload_batch(view.record_batch().clone(), state)
 }
 
 fn q09_late_consume_profit_decimal_batch(
@@ -7874,7 +7876,7 @@ async fn q11_important_stock_rows_late(
 ) -> Result<Option<Vec<Q11Row>>> {
     let supplier_keys = Arc::new(supplier_keys.clone());
     let Some(chunks) = engine
-        .late_materialized_parquet_map_with_policy(
+        .late_materialized_parquet_map_pruned_with_policy_view(
             path,
             batch_size,
             Projection::Columns(vec!["ps_suppkey".to_string()]),
@@ -7883,6 +7885,7 @@ async fn q11_important_stock_rows_late(
                 "ps_supplycost".to_string(),
                 "ps_availqty".to_string(),
             ]),
+            Vec::new(),
             q11_late_materialized_row_group_chunk(),
             LateMaterializationPolicy::selective_with_selector_run_ratio(
                 q11_late_materialized_max_selected_ratio(),
@@ -7896,8 +7899,8 @@ async fn q11_important_stock_rows_late(
                     total: 0.0,
                 }
             },
-            q11_late_build_suppkey_selection_batch,
-            q11_late_consume_stock_payload_batch,
+            q11_late_build_suppkey_selection_view,
+            q11_late_consume_stock_payload_view,
             |state, _metrics| Ok(Some((state.values, state.total))),
         )
         .await?
@@ -8018,6 +8021,40 @@ fn q11_late_build_suppkey_selection_batch(
     Ok(Some(()))
 }
 
+fn q11_late_build_suppkey_selection_view(
+    view: BatchView<'_>,
+    selection: &mut LateSelectionBuilder,
+    state: &mut Q11LateStockState,
+) -> Result<Option<()>> {
+    if view.num_columns() == 1 {
+        let Some(suppkeys) = view.i64(0) else {
+            return Ok(None);
+        };
+        let dense_supplier_keys = state.supplier_keys.dense_contains_slice();
+        if suppkeys.null_count() == 0 {
+            for &suppkey in suppkeys.values() {
+                selection.push(adaptive_i64_set_contains_cached(
+                    &state.supplier_keys,
+                    dense_supplier_keys,
+                    suppkey,
+                ));
+            }
+            return Ok(Some(()));
+        }
+        for row in 0..suppkeys.len() {
+            let selected = suppkeys.is_valid(row)
+                && adaptive_i64_set_contains_cached(
+                    &state.supplier_keys,
+                    dense_supplier_keys,
+                    suppkeys.value(row),
+                );
+            selection.push(selected);
+        }
+        return Ok(Some(()));
+    }
+    q11_late_build_suppkey_selection_batch(view.record_batch().clone(), selection, state)
+}
+
 fn q11_late_consume_stock_payload_batch(
     batch: RecordBatch,
     state: &mut Q11LateStockState,
@@ -8046,6 +8083,21 @@ fn q11_late_consume_stock_payload_batch(
         *state.values.entry(partkey).or_insert(0.0) += value;
     }
     Ok(Some(()))
+}
+
+fn q11_late_consume_stock_payload_view(
+    view: BatchView<'_>,
+    state: &mut Q11LateStockState,
+) -> Result<Option<()>> {
+    if view.num_columns() == 3
+        && let Ok(partkeys) = view.required_i64(0)
+        && let Some(supplycosts) = decimal_input(view.column(1)?)?
+        && let Some(availqtys) = view.column(2)?.as_any().downcast_ref::<Int32Array>()
+    {
+        q11_late_consume_stock_payload_typed(partkeys, supplycosts, availqtys, state);
+        return Ok(Some(()));
+    }
+    q11_late_consume_stock_payload_batch(view.record_batch().clone(), state)
 }
 
 fn q11_late_consume_stock_payload_typed(
@@ -9168,21 +9220,20 @@ async fn q16_supplier_counts_stream(
         )
         .await?;
     let supplier_counts = if q16_packed_distinct_enabled(groups.len(), max_suppkey) {
-        let packed = parallel_batch_fold_chunks(
+        let packed = parallel_batch_fold_view_chunks(
             &mut stream,
             q16_supplier_count_chunk_size(),
-            move |batches| {
-                let mut distinct_suppliers = PackedU32PairDistinct::new();
-                for batch in batches {
-                    q16_supplier_counts_packed_batch(
-                        batch,
-                        &part_to_group,
-                        &bad_supplier_keys,
-                        &mut distinct_suppliers,
-                    )?;
-                }
-                Ok(distinct_suppliers)
+            PackedU32PairDistinct::new,
+            move |view, distinct_suppliers| {
+                q16_supplier_counts_packed_view(
+                    view,
+                    &part_to_group,
+                    &bad_supplier_keys,
+                    distinct_suppliers,
+                )?;
+                Ok(Some(()))
             },
+            Ok,
             PackedU32PairDistinct::new(),
             q16_merge_supplier_counts_packed,
             "Q16 partsupp supplier counts",
@@ -9190,22 +9241,23 @@ async fn q16_supplier_counts_stream(
         packed.counts_by_first(groups.len())
     } else if let Some(layout) = q16_supplier_bitset_layout(groups.len(), max_suppkey) {
         let layout_for_scan = Arc::new(layout.clone());
-        let partial = parallel_batch_fold_chunks(
+        let partial = parallel_batch_fold_view_chunks(
             &mut stream,
             q16_supplier_count_chunk_size(),
-            move |batches| {
-                let mut distinct_suppliers =
-                    Q16GroupSupplierBitset::new((*layout_for_scan).clone());
-                for batch in batches {
-                    q16_supplier_counts_bitset_batch(
-                        batch,
-                        &part_to_group,
-                        &bad_supplier_keys,
-                        &mut distinct_suppliers,
-                    )?;
-                }
-                Ok(distinct_suppliers)
+            {
+                let layout_for_scan = layout_for_scan.clone();
+                move || Q16GroupSupplierBitset::new((*layout_for_scan).clone())
             },
+            move |view, distinct_suppliers| {
+                q16_supplier_counts_bitset_view(
+                    view,
+                    &part_to_group,
+                    &bad_supplier_keys,
+                    distinct_suppliers,
+                )?;
+                Ok(Some(()))
+            },
+            Ok,
             Q16GroupSupplierBitset::new(layout),
             q16_merge_supplier_bitsets,
             "Q16 partsupp supplier counts",
@@ -13854,19 +13906,22 @@ async fn q03_revenue_rows(
         let mut stream =
             q03_revenue_stream(engine, path, batch_size, projection, pruning_predicates).await?;
         let orders_for_scan = Arc::new(SortedI64Lookup::from_hash_map(orders));
-        parallel_batch_fold_chunks(
+        parallel_batch_fold_view_chunks(
             &mut stream,
             4,
-            move |batches| {
-                let mut revenues = fast_hash_map::<i64, f64>();
-                for batch in batches {
-                    merge_f64_groups(
-                        &mut revenues,
-                        q03_revenue_batch_sorted(batch, &orders_for_scan, ship_cutoff)?,
-                    );
-                }
-                Ok(revenues)
+            fast_hash_map::<i64, f64>,
+            move |view, revenues| {
+                merge_f64_groups(
+                    revenues,
+                    q03_revenue_batch_sorted(
+                        view.record_batch().clone(),
+                        &orders_for_scan,
+                        ship_cutoff,
+                    )?,
+                );
+                Ok(Some(()))
             },
+            Ok,
             fast_hash_map::<i64, f64>(),
             merge_f64_groups,
             "Q03 revenue aggregate",
@@ -13876,24 +13931,23 @@ async fn q03_revenue_rows(
             q03_revenue_stream(engine, path, batch_size, projection, pruning_predicates).await?;
         let orders_for_scan = Arc::new(orders.clone());
         let order_probe = Arc::new(q03_dense_order_probe(orders));
-        parallel_batch_fold_chunks(
+        parallel_batch_fold_view_chunks(
             &mut stream,
             4,
-            move |batches| {
-                let mut revenues = fast_hash_map::<i64, f64>();
-                for batch in batches {
-                    merge_f64_groups(
-                        &mut revenues,
-                        q03_revenue_batch(
-                            batch,
-                            &orders_for_scan,
-                            order_probe.as_deref(),
-                            ship_cutoff,
-                        )?,
-                    );
-                }
-                Ok(revenues)
+            fast_hash_map::<i64, f64>,
+            move |view, revenues| {
+                merge_f64_groups(
+                    revenues,
+                    q03_revenue_batch(
+                        view.record_batch().clone(),
+                        &orders_for_scan,
+                        order_probe.as_deref(),
+                        ship_cutoff,
+                    )?,
+                );
+                Ok(Some(()))
             },
+            Ok,
             fast_hash_map::<i64, f64>(),
             merge_f64_groups,
             "Q03 revenue aggregate",
@@ -13976,16 +14030,15 @@ where
     } else {
         let mut stream =
             q03_revenue_stream(engine, path, batch_size, projection, pruning_predicates).await?;
-        parallel_batch_fold_chunks(
+        parallel_batch_fold_view_chunks(
             &mut stream,
             4,
-            move |batches| {
-                let mut revenues = fast_hash_map::<i64, f64>();
-                for batch in batches {
-                    merge_f64_groups(&mut revenues, map(BatchView::new(&batch))?);
-                }
-                Ok(revenues)
+            fast_hash_map::<i64, f64>,
+            move |view, revenues| {
+                merge_f64_groups(revenues, map(view)?);
+                Ok(Some(()))
             },
+            Ok,
             fast_hash_map::<i64, f64>(),
             merge_f64_groups,
             "Q03 revenue aggregate",
@@ -14750,16 +14803,15 @@ where
     }
     let mut stream =
         q03_revenue_stream(engine, path, batch_size, projection, pruning_predicates).await?;
-    let revenues = parallel_batch_fold_chunks(
+    let revenues = parallel_batch_fold_view_chunks(
         &mut stream,
         4,
-        move |batches| {
-            let mut revenues = Vec::<(i64, f64)>::new();
-            for batch in batches {
-                map(BatchView::new(&batch), &mut revenues)?;
-            }
-            Ok(revenues)
+        Vec::<(i64, f64)>::new,
+        move |view, revenues| {
+            map(view, revenues)?;
+            Ok(Some(()))
         },
+        Ok,
         Vec::<(i64, f64)>::new(),
         q03_merge_revenue_pairs,
         "Q03 revenue aggregate",

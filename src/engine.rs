@@ -1566,117 +1566,22 @@ impl DodamEngine {
             + Sync
             + 'static,
     {
-        let source = self.plan_table_source(path.clone()).await?;
-        if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
-            return Ok(None);
-        }
-        let local_path = source.fragments[0].parquet_local_path()?.to_path_buf();
-        let plan = plan_parquet_scan_tasks(
-            &local_path,
-            &predicate_projection,
-            &pruning_predicates,
-            &self.metadata_cache,
-            self.object_store.as_ref(),
-        )?;
-        let row_groups = plan
-            .tasks
-            .into_iter()
-            .map(|task| task.row_group)
-            .collect::<Vec<_>>();
-        if row_groups.is_empty() {
-            return Ok(Some(Vec::new()));
-        }
-        let payload_columns = match &payload_projection {
-            Projection::All => source
-                .schema
-                .as_ref()
-                .map_or(plan.schema_columns, |schema| schema.fields().len()),
-            Projection::Columns(columns) => columns.len(),
-        };
-        if late_materialization_sample_enabled(policy, plan.projected_columns, payload_columns) {
-            let sample_row_groups = row_groups
-                .iter()
-                .copied()
-                .take(late_materialization_sample_row_groups())
-                .collect::<Vec<_>>();
-            let Some(sample_metrics) = sample_late_materialized_selection(
-                local_path.clone(),
-                batch_size,
-                sample_row_groups,
-                &predicate_projection,
-                &self.metadata_cache,
-                self.file_cache.clone(),
-                self.object_store.as_ref(),
-                build_state.clone()(),
-                build_selection.clone(),
-            )?
-            else {
-                return Ok(None);
-            };
-            if !policy.accepts(&sample_metrics) {
-                return Ok(None);
-            }
-        }
-        let chunks = row_groups
-            .chunks(row_group_chunk.max(1))
-            .map(|chunk| chunk.to_vec())
-            .collect::<Vec<_>>();
-        let (sender, receiver) = mpsc::channel();
-        for (index, row_groups) in chunks.iter().cloned().enumerate() {
-            let sender = sender.clone();
-            let path = local_path.clone();
-            let predicate_projection = predicate_projection.clone();
-            let payload_projection = payload_projection.clone();
-            let metadata_cache = self.metadata_cache.clone();
-            let file_cache = self.file_cache.clone();
-            let object_store = self.object_store.clone();
-            let build_state = build_state.clone();
-            let build_selection = build_selection.clone();
-            let consume_payload = consume_payload.clone();
-            let finish = finish.clone();
-            rayon::spawn(move || {
-                let result = late_materialized_chunk(
-                    path,
-                    batch_size,
-                    row_groups,
-                    &predicate_projection,
-                    &payload_projection,
-                    &metadata_cache,
-                    file_cache,
-                    object_store.as_ref(),
-                    policy,
-                    build_state(),
-                    build_selection,
-                    consume_payload,
-                    finish,
-                );
-                let _ = sender.send((index, result));
-            });
-        }
-        drop(sender);
-
-        let mut outputs = (0..chunks.len())
-            .map(|_| None)
-            .collect::<Vec<Option<Option<LateMaterializedChunkResult<Output>>>>>();
-        for _ in 0..chunks.len() {
-            let (index, result) = receiver.recv().map_err(|_| {
-                DodamError::UnsupportedSql("late materialized worker stopped".to_string())
-            })?;
-            outputs[index] = Some(result?);
-        }
-        let mut results = Vec::with_capacity(outputs.len());
-        for output in outputs {
-            let Some(output) = output else {
-                return Err(DodamError::UnsupportedSql(
-                    "late materialized worker result missing".to_string(),
-                ));
-            };
-            let Some(output) = output else {
-                return Ok(None);
-            };
-            results.push(output);
-        }
-        Ok(Some(results))
+        self.late_materialized_parquet_map_pruned_with_policy_view(
+            path,
+            batch_size,
+            predicate_projection,
+            payload_projection,
+            pruning_predicates,
+            row_group_chunk,
+            policy,
+            build_state,
+            move |view, selection, state| {
+                build_selection(view.record_batch().clone(), selection, state)
+            },
+            move |view, state| consume_payload(view.record_batch().clone(), state),
+            finish,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5331,41 +5236,6 @@ fn late_materialization_sample_enabled(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn sample_late_materialized_selection<State, BuildSelection>(
-    path: PathBuf,
-    batch_size: usize,
-    row_groups: Vec<usize>,
-    predicate_projection: &Projection,
-    metadata_cache: &ParquetMetadataCache,
-    file_cache: Arc<ParquetFileCache>,
-    object_store: &dyn ObjectStore,
-    mut state: State,
-    mut build_selection: BuildSelection,
-) -> Result<Option<LateMaterializedMetrics>>
-where
-    BuildSelection: FnMut(RecordBatch, &mut LateSelectionBuilder, &mut State) -> Result<Option<()>>,
-{
-    let mut predicate_reader = ParquetBatchReader::try_new_with_row_groups(
-        path,
-        batch_size,
-        predicate_projection,
-        row_groups,
-        metadata_cache,
-        file_cache,
-        object_store,
-    )?;
-    let mut selection_builder = LateSelectionBuilder::default();
-    while let Some(batch) = predicate_reader.next() {
-        let batch = batch?;
-        if build_selection(batch, &mut selection_builder, &mut state)?.is_none() {
-            return Ok(None);
-        }
-    }
-    let (_, metrics) = selection_builder.finish();
-    Ok(Some(metrics))
-}
-
-#[allow(clippy::too_many_arguments)]
 fn sample_late_materialized_selection_view<State, BuildSelection>(
     path: PathBuf,
     batch_size: usize,
@@ -5399,71 +5269,6 @@ where
     }
     let (_, metrics) = selection_builder.finish();
     Ok(Some(metrics))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn late_materialized_chunk<State, Output, BuildSelection, ConsumePayload, Finish>(
-    path: PathBuf,
-    batch_size: usize,
-    row_groups: Vec<usize>,
-    predicate_projection: &Projection,
-    payload_projection: &Projection,
-    metadata_cache: &ParquetMetadataCache,
-    file_cache: Arc<ParquetFileCache>,
-    object_store: &dyn ObjectStore,
-    policy: LateMaterializationPolicy,
-    mut state: State,
-    mut build_selection: BuildSelection,
-    mut consume_payload: ConsumePayload,
-    finish: Finish,
-) -> Result<Option<LateMaterializedChunkResult<Output>>>
-where
-    BuildSelection: FnMut(RecordBatch, &mut LateSelectionBuilder, &mut State) -> Result<Option<()>>,
-    ConsumePayload: FnMut(RecordBatch, &mut State) -> Result<Option<()>>,
-    Finish: FnOnce(State, LateMaterializedMetrics) -> Result<Option<Output>>,
-{
-    let mut predicate_reader = ParquetBatchReader::try_new_with_row_groups(
-        path.clone(),
-        batch_size,
-        predicate_projection,
-        row_groups.clone(),
-        metadata_cache,
-        file_cache.clone(),
-        object_store,
-    )?;
-    let mut selection_builder = LateSelectionBuilder::default();
-    while let Some(batch) = predicate_reader.next() {
-        let batch = batch?;
-        if build_selection(batch, &mut selection_builder, &mut state)?.is_none() {
-            return Ok(None);
-        }
-    }
-    let (row_selection, metrics) = selection_builder.finish();
-    if !policy.accepts(&metrics) {
-        return Ok(None);
-    }
-    if let Some(row_selection) = row_selection {
-        let mut payload_reader = ParquetBatchReader::try_new_with_row_groups_selection(
-            path,
-            batch_size,
-            payload_projection,
-            row_groups,
-            row_selection,
-            metadata_cache,
-            file_cache,
-            object_store,
-        )?;
-        while let Some(batch) = payload_reader.next() {
-            let batch = batch?;
-            if consume_payload(batch, &mut state)?.is_none() {
-                return Ok(None);
-            }
-        }
-    }
-    let Some(output) = finish(state, metrics)? else {
-        return Ok(None);
-    };
-    Ok(Some(LateMaterializedChunkResult { output, metrics }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6184,7 +5989,7 @@ fn q06_late_materialized_revenue_sum_chunk(
         discount_offset: 0,
         sum: 0.0,
     };
-    late_materialized_chunk(
+    late_materialized_chunk_view(
         path,
         batch_size,
         row_groups,
@@ -6195,9 +6000,9 @@ fn q06_late_materialized_revenue_sum_chunk(
         object_store,
         LateMaterializationPolicy::always(),
         state,
-        |batch, selection, state| {
+        |view, selection, state| {
             q06_build_selection_batch(
-                batch,
+                view.record_batch().clone(),
                 start_days,
                 end_days,
                 discount_low,
@@ -6207,7 +6012,7 @@ fn q06_late_materialized_revenue_sum_chunk(
                 state,
             )
         },
-        q06_consume_payload_batch,
+        |view, state| q06_consume_payload_batch(view.record_batch().clone(), state),
         |state, _metrics| {
             if state.discount_offset != state.selected_discounts.len() {
                 return Err(DodamError::UnsupportedSql(
