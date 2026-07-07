@@ -176,13 +176,11 @@ pub(crate) fn dictionary_i32_match_flags(
     Some(flags)
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Default, Clone)]
 pub(crate) struct SelectionVector {
     rows: Vec<u32>,
 }
 
-#[allow(dead_code)]
 impl SelectionVector {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
@@ -192,10 +190,6 @@ impl SelectionVector {
 
     pub(crate) fn push(&mut self, row: usize) {
         self.rows.push(row as u32);
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.rows.is_empty()
     }
 
     pub(crate) fn len(&self) -> usize {

@@ -54,7 +54,7 @@ use crate::execution::{
 use crate::hash::{FastHashMap, FastHashSet, fast_hash_map, fast_hash_map_with_capacity};
 use crate::optimizer::plan_join_inputs;
 use crate::vector::{
-    BatchConsumer, BatchView, DictionaryStringValues, consume_record_batch,
+    BatchConsumer, BatchView, DictionaryStringValues, SelectionVector, consume_record_batch,
     dictionary_i32_match_flags, dictionary_i32_string_values,
 };
 
@@ -10506,6 +10506,33 @@ fn q12_filtered_lineitem_counts_batch_dictionary_typed_into(
         let commitdate_values = commitdates.values().as_ref();
         let receiptdate_values = receiptdates.values().as_ref();
         let shipdate_values = shipdates.values().as_ref();
+        if q12_lineitem_selection_vector_enabled() {
+            let mut selected = SelectionVector::with_capacity(orderkey_values.len().min(4096));
+            for row in 0..orderkeys.len() {
+                let commitdate = commitdate_values[row];
+                let receiptdate = receiptdate_values[row];
+                if commitdate < receiptdate
+                    && shipdate_values[row] < commitdate
+                    && receiptdate >= start_days
+                    && receiptdate < end_days
+                {
+                    selected.push(row);
+                }
+            }
+            if q12_should_use_lineitem_selection_vector(selected.len(), orderkeys.len()) {
+                for &row in selected.as_slice() {
+                    let row = row as usize;
+                    let Ok(mode_key) = usize::try_from(mode_keys[row]) else {
+                        continue;
+                    };
+                    let Some(Some(mode_index)) = mode_flags.get(mode_key) else {
+                        continue;
+                    };
+                    pending.entry(orderkey_values[row]).or_default().counts[*mode_index] += 1;
+                }
+                return true;
+            }
+        }
         for row in 0..orderkeys.len() {
             let commitdate = commitdate_values[row];
             let receiptdate = receiptdate_values[row];
@@ -10618,6 +10645,35 @@ fn q12_filtered_lineitem_counts_string_view_into(
         let commitdate_values = view.commitdates.values().as_ref();
         let receiptdate_values = view.receiptdates.values().as_ref();
         let shipdate_values = view.shipdates.values().as_ref();
+        if q12_lineitem_selection_vector_enabled() {
+            let mut selected = SelectionVector::with_capacity(orderkey_values.len().min(4096));
+            for row in 0..view.orderkeys.len() {
+                let commitdate = commitdate_values[row];
+                let receiptdate = receiptdate_values[row];
+                if commitdate < receiptdate
+                    && shipdate_values[row] < commitdate
+                    && receiptdate >= start_days
+                    && receiptdate < end_days
+                {
+                    selected.push(row);
+                }
+            }
+            if q12_should_use_lineitem_selection_vector(selected.len(), view.orderkeys.len()) {
+                for &row in selected.as_slice() {
+                    let row = row as usize;
+                    let mode = bytes_string_parts(mode_offsets, mode_data, row);
+                    let mode_index = if mode == left_mode {
+                        0
+                    } else if mode == right_mode {
+                        1
+                    } else {
+                        continue;
+                    };
+                    pending.entry(orderkey_values[row]).or_default().counts[mode_index] += 1;
+                }
+                return true;
+            }
+        }
         for row in 0..view.orderkeys.len() {
             let commitdate = commitdate_values[row];
             let receiptdate = receiptdate_values[row];
@@ -10669,6 +10725,26 @@ fn q12_filtered_lineitem_counts_string_view_into(
         pending.entry(view.orderkeys.value(row)).or_default().counts[mode_index] += 1;
     }
     true
+}
+
+fn q12_lineitem_selection_vector_enabled() -> bool {
+    std::env::var("DODAM_Q12_ENABLE_LINEITEM_SELECTION_VECTOR")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn q12_lineitem_selection_vector_max_ratio() -> f64 {
+    std::env::var("DODAM_Q12_LINEITEM_SELECTION_VECTOR_MAX_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.50)
+}
+
+fn q12_should_use_lineitem_selection_vector(selected_rows: usize, total_rows: usize) -> bool {
+    if selected_rows == 0 || total_rows == 0 {
+        return selected_rows == 0;
+    }
+    (selected_rows as f64 / total_rows as f64) <= q12_lineitem_selection_vector_max_ratio()
 }
 
 fn q12_shipmode_index(shipmodes: &[String], mode: &str) -> Option<usize> {
@@ -16924,6 +17000,23 @@ fn q04_count_late_candidate_priorities_atomic_typed(
         let orderkey_values = orderkeys.values().as_ref();
         let commitdate_values = commitdates.values().as_ref();
         let receiptdate_values = receiptdates.values().as_ref();
+        if q04_lineitem_selection_vector_enabled() {
+            let mut selected = SelectionVector::with_capacity(orderkey_values.len().min(4096));
+            for row in 0..orderkey_values.len() {
+                if commitdate_values[row] < receiptdate_values[row] {
+                    selected.push(row);
+                }
+            }
+            if q04_should_use_lineitem_selection_vector(selected.len(), orderkey_values.len()) {
+                q04_count_late_candidate_priorities_atomic_selected_rows(
+                    selected.as_slice(),
+                    orderkey_values,
+                    candidate_priorities,
+                    counts,
+                );
+                return Ok(true);
+            }
+        }
         for row in 0..orderkey_values.len() {
             if commitdate_values[row] >= receiptdate_values[row] {
                 continue;
@@ -16978,6 +17071,55 @@ fn q04_count_late_candidate_priorities_atomic_typed(
         counts[usize::from(priority_marker - 1)] += 1;
     }
     Ok(true)
+}
+
+fn q04_lineitem_selection_vector_enabled() -> bool {
+    std::env::var("DODAM_Q04_ENABLE_LINEITEM_SELECTION_VECTOR")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn q04_lineitem_selection_vector_max_ratio() -> f64 {
+    std::env::var("DODAM_Q04_LINEITEM_SELECTION_VECTOR_MAX_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.70)
+}
+
+fn q04_should_use_lineitem_selection_vector(selected_rows: usize, total_rows: usize) -> bool {
+    if selected_rows == 0 || total_rows == 0 {
+        return selected_rows == 0;
+    }
+    (selected_rows as f64 / total_rows as f64) <= q04_lineitem_selection_vector_max_ratio()
+}
+
+fn q04_count_late_candidate_priorities_atomic_selected_rows(
+    selected_rows: &[u32],
+    orderkey_values: &[i64],
+    candidate_priorities: &[AtomicU8],
+    counts: &mut [u64],
+) {
+    for &row in selected_rows {
+        let orderkey = orderkey_values[row as usize];
+        if orderkey < 0 {
+            continue;
+        }
+        let Ok(orderkey) = usize::try_from(orderkey) else {
+            continue;
+        };
+        let Some(marker) = candidate_priorities.get(orderkey) else {
+            continue;
+        };
+        let priority_marker = marker.load(Ordering::Relaxed);
+        if priority_marker == 0 {
+            continue;
+        }
+        let priority_marker = marker.swap(0, Ordering::Relaxed);
+        if priority_marker == 0 {
+            continue;
+        }
+        counts[usize::from(priority_marker - 1)] += 1;
+    }
 }
 
 fn q04_collect_late_candidate_orderkeys_typed(
