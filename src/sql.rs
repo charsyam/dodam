@@ -16348,6 +16348,16 @@ async fn q04_count_late_candidate_priorities(
     candidate_count: usize,
     priority_count: usize,
 ) -> Result<Vec<u64>> {
+    if q04_lineitem_direct_column_reader_enabled()
+        && let Some(counts) = q04_count_late_candidate_priorities_direct_column_reader(
+            path.clone(),
+            batch_size,
+            candidate_priorities,
+            priority_count,
+        )?
+    {
+        return Ok(counts);
+    }
     if q04_lineitem_late_materialized_enabled()
         && let Some(counts) = q04_count_late_candidate_priorities_late_materialized(
             engine,
@@ -16414,6 +16424,276 @@ async fn q04_count_late_candidate_priorities(
         )?;
     }
     Ok(counts)
+}
+
+fn q04_lineitem_direct_column_reader_enabled() -> bool {
+    std::env::var("DODAM_Q04_ENABLE_LINEITEM_DIRECT_COLUMN_READER")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn q04_count_late_candidate_priorities_direct_column_reader(
+    path: PathBuf,
+    batch_size: usize,
+    candidate_priorities: &[u8],
+    priority_count: usize,
+) -> Result<Option<Vec<u64>>> {
+    let started = tpch_profile_start();
+    let file = File::open(&path)?;
+    let reader = Arc::new(SerializedFileReader::new(file)?);
+    let Some((orderkey_column, commitdate_column, receiptdate_column)) =
+        q04_lineitem_direct_column_indices(&reader)
+    else {
+        return Ok(None);
+    };
+    let row_groups = (0..reader.metadata().num_row_groups()).collect::<Vec<_>>();
+    let candidate_priorities = Arc::new(
+        candidate_priorities
+            .iter()
+            .copied()
+            .map(AtomicU8::new)
+            .collect::<Vec<_>>(),
+    );
+    let chunks = row_groups
+        .chunks(q04_lineitem_direct_row_group_chunk())
+        .map(|chunk| chunk.to_vec())
+        .collect::<Vec<_>>();
+    let profile = tpch_profile_enabled();
+    let partials = chunks
+        .into_par_iter()
+        .map(|row_groups| {
+            q04_lineitem_direct_column_chunk_scan(
+                path.clone(),
+                batch_size,
+                row_groups,
+                orderkey_column,
+                commitdate_column,
+                receiptdate_column,
+                candidate_priorities.clone(),
+                priority_count,
+                profile,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut counts = vec![0_u64; priority_count];
+    let mut metrics = Q04LineitemDirectMetrics::default();
+    for partial in partials {
+        let Some(partial) = partial else {
+            return Ok(None);
+        };
+        for (index, count) in partial.counts.into_iter().enumerate() {
+            counts[index] += count;
+        }
+        metrics.add(partial.metrics);
+    }
+    if let Some(started) = started {
+        eprintln!(
+            "[dodam:tpch-profile] Q04 lineitem direct_column_reader: total={:.3} ms row_groups={} batches={} rows={} hits={} misses={} read={:.3} ms consume={:.3} ms",
+            started.elapsed().as_secs_f64() * 1000.0,
+            metrics.row_groups,
+            metrics.batches,
+            metrics.rows,
+            metrics.hits,
+            metrics.misses,
+            sql_nanos_to_millis(metrics.read_nanos),
+            sql_nanos_to_millis(metrics.consume_nanos),
+        );
+    }
+    Ok(Some(counts))
+}
+
+fn q04_lineitem_direct_column_indices(
+    reader: &SerializedFileReader<File>,
+) -> Option<(usize, usize, usize)> {
+    let columns = reader.metadata().file_metadata().schema_descr().columns();
+    let orderkey = columns
+        .iter()
+        .position(|column| column.name() == "l_orderkey")?;
+    let commitdate = columns
+        .iter()
+        .position(|column| column.name() == "l_commitdate")?;
+    let receiptdate = columns
+        .iter()
+        .position(|column| column.name() == "l_receiptdate")?;
+    Some((orderkey, commitdate, receiptdate))
+}
+
+fn q04_lineitem_direct_row_group_chunk() -> usize {
+    std::env::var("DODAM_Q04_LINEITEM_DIRECT_ROW_GROUP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2)
+}
+
+struct Q04LineitemDirectPartial {
+    counts: Vec<u64>,
+    metrics: Q04LineitemDirectMetrics,
+}
+
+#[derive(Default)]
+struct Q04LineitemDirectMetrics {
+    row_groups: usize,
+    batches: usize,
+    rows: usize,
+    hits: usize,
+    misses: usize,
+    read_nanos: u64,
+    consume_nanos: u64,
+}
+
+impl Q04LineitemDirectMetrics {
+    fn add(&mut self, other: Self) {
+        self.row_groups = self.row_groups.saturating_add(other.row_groups);
+        self.batches = self.batches.saturating_add(other.batches);
+        self.rows = self.rows.saturating_add(other.rows);
+        self.hits = self.hits.saturating_add(other.hits);
+        self.misses = self.misses.saturating_add(other.misses);
+        self.read_nanos = self.read_nanos.saturating_add(other.read_nanos);
+        self.consume_nanos = self.consume_nanos.saturating_add(other.consume_nanos);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q04_lineitem_direct_column_chunk_scan(
+    path: PathBuf,
+    batch_size: usize,
+    row_groups: Vec<usize>,
+    orderkey_column: usize,
+    commitdate_column: usize,
+    receiptdate_column: usize,
+    candidate_priorities: Arc<Vec<AtomicU8>>,
+    priority_count: usize,
+    profile: bool,
+) -> Result<Option<Q04LineitemDirectPartial>> {
+    let started = profile.then(Instant::now);
+    let file = File::open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    let mut partial = Q04LineitemDirectPartial {
+        counts: vec![0_u64; priority_count],
+        metrics: Q04LineitemDirectMetrics {
+            row_groups: row_groups.len(),
+            ..Q04LineitemDirectMetrics::default()
+        },
+    };
+    for row_group_index in row_groups {
+        let row_group = reader.get_row_group(row_group_index)?;
+        let mut orderkey_reader = match row_group.get_column_reader(orderkey_column)? {
+            ColumnReader::Int64ColumnReader(reader) => reader,
+            _ => return Ok(None),
+        };
+        let mut commitdate_reader = match row_group.get_column_reader(commitdate_column)? {
+            ColumnReader::Int32ColumnReader(reader) => reader,
+            _ => return Ok(None),
+        };
+        let mut receiptdate_reader = match row_group.get_column_reader(receiptdate_column)? {
+            ColumnReader::Int32ColumnReader(reader) => reader,
+            _ => return Ok(None),
+        };
+        let mut orderkeys = Vec::<i64>::with_capacity(batch_size);
+        let mut commitdates = Vec::<i32>::with_capacity(batch_size);
+        let mut receiptdates = Vec::<i32>::with_capacity(batch_size);
+        let mut orderkey_def_levels = Vec::<i16>::with_capacity(batch_size);
+        let mut commitdate_def_levels = Vec::<i16>::with_capacity(batch_size);
+        let mut receiptdate_def_levels = Vec::<i16>::with_capacity(batch_size);
+        loop {
+            orderkeys.clear();
+            commitdates.clear();
+            receiptdates.clear();
+            orderkey_def_levels.clear();
+            commitdate_def_levels.clear();
+            receiptdate_def_levels.clear();
+            let read_started = Instant::now();
+            let (order_records, order_values, order_levels) = orderkey_reader.read_records(
+                batch_size,
+                Some(&mut orderkey_def_levels),
+                None,
+                &mut orderkeys,
+            )?;
+            if order_records == 0 {
+                partial.metrics.read_nanos = partial
+                    .metrics
+                    .read_nanos
+                    .saturating_add(sql_elapsed_nanos(read_started));
+                break;
+            }
+            let (commit_records, commit_values, commit_levels) = commitdate_reader.read_records(
+                order_records,
+                Some(&mut commitdate_def_levels),
+                None,
+                &mut commitdates,
+            )?;
+            let (receipt_records, receipt_values, receipt_levels) = receiptdate_reader
+                .read_records(
+                    order_records,
+                    Some(&mut receiptdate_def_levels),
+                    None,
+                    &mut receiptdates,
+                )?;
+            partial.metrics.read_nanos = partial
+                .metrics
+                .read_nanos
+                .saturating_add(sql_elapsed_nanos(read_started));
+            if order_values != order_records
+                || order_levels != order_records
+                || commit_records != order_records
+                || commit_values != order_records
+                || commit_levels != order_records
+                || receipt_records != order_records
+                || receipt_values != order_records
+                || receipt_levels != order_records
+            {
+                return Ok(None);
+            }
+            partial.metrics.batches += 1;
+            partial.metrics.rows = partial.metrics.rows.saturating_add(order_records);
+            let consume_started = Instant::now();
+            for row in 0..order_records {
+                if commitdates[row] >= receiptdates[row] {
+                    continue;
+                }
+                let orderkey = orderkeys[row];
+                if orderkey < 0 {
+                    continue;
+                }
+                let Ok(orderkey) = usize::try_from(orderkey) else {
+                    continue;
+                };
+                let Some(marker) = candidate_priorities.get(orderkey) else {
+                    partial.metrics.misses += 1;
+                    continue;
+                };
+                let priority_marker = marker.load(Ordering::Relaxed);
+                if priority_marker == 0 {
+                    partial.metrics.misses += 1;
+                    continue;
+                }
+                let priority_marker = marker.swap(0, Ordering::Relaxed);
+                if priority_marker == 0 {
+                    partial.metrics.misses += 1;
+                    continue;
+                }
+                partial.metrics.hits += 1;
+                partial.counts[usize::from(priority_marker - 1)] += 1;
+            }
+            partial.metrics.consume_nanos = partial
+                .metrics
+                .consume_nanos
+                .saturating_add(sql_elapsed_nanos(consume_started));
+        }
+    }
+    if let Some(started) = started {
+        eprintln!(
+            "[dodam:tpch-profile] Q04 lineitem direct_column_chunk: row_groups={} rows={} hits={} misses={} elapsed={:.3} ms read={:.3} ms consume={:.3} ms",
+            partial.metrics.row_groups,
+            partial.metrics.rows,
+            partial.metrics.hits,
+            partial.metrics.misses,
+            started.elapsed().as_secs_f64() * 1000.0,
+            sql_nanos_to_millis(partial.metrics.read_nanos),
+            sql_nanos_to_millis(partial.metrics.consume_nanos),
+        );
+    }
+    Ok(Some(partial))
 }
 
 async fn q04_count_late_candidate_priorities_late_materialized(
