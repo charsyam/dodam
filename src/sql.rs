@@ -30552,26 +30552,27 @@ fn collect_dense_right_counts_fast_like_view(
     filter: &FastLikeSubstrings,
     counts: &mut Vec<u32>,
 ) -> Result<Option<()>> {
-    let key_index = view
-        .record_batch()
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    let key_index = batch
         .schema()
         .index_of(key_column)
         .map_err(|_| DodamError::UnknownColumn(key_column.to_string()))?;
-    let Some(keys) = view
-        .column(key_index)?
+    let Some(keys) = batch
+        .column(key_index)
         .as_any()
         .downcast_ref::<Int64Array>()
     else {
         return Ok(None);
     };
-    let string_index = view
-        .record_batch()
+    let string_index = batch
         .schema()
         .index_of(&filter.column)
         .map_err(|_| DodamError::UnknownColumn(filter.column.clone()))?;
     let Some(strings) = view.utf8(string_index) else {
         return collect_dense_right_counts_fast_like_batch(
-            view.record_batch().clone(),
+            batch.clone(),
             key_column,
             filter,
             counts,

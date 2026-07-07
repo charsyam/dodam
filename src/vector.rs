@@ -1,6 +1,6 @@
 use arrow::array::{
-    Array, ArrayRef, Date32Array, Decimal128Array, DictionaryArray, Int32Array, Int64Array,
-    LargeStringArray, StringArray,
+    Array, Date32Array, Decimal128Array, DictionaryArray, Int32Array, Int64Array, LargeStringArray,
+    StringArray,
 };
 use arrow::datatypes::{DataType, Int32Type};
 use arrow::record_batch::RecordBatch;
@@ -264,15 +264,6 @@ impl<'a> BatchView<'a> {
         }
     }
 
-    pub(crate) fn record_batch(&self) -> &'a RecordBatch {
-        match self.inner {
-            BatchViewInner::RecordBatch(batch) => batch,
-            BatchViewInner::RawColumns(_) => {
-                panic!("raw vector BatchView does not expose a RecordBatch")
-            }
-        }
-    }
-
     pub(crate) fn try_record_batch(&self) -> Option<&'a RecordBatch> {
         match self.inner {
             BatchViewInner::RecordBatch(batch) => Some(batch),
@@ -293,17 +284,6 @@ impl<'a> BatchView<'a> {
             BatchViewInner::RawColumns(columns) => {
                 columns.first().map(RawColumnView::len).unwrap_or_default()
             }
-        }
-    }
-
-    pub(crate) fn column(&self, index: usize) -> Result<&'a ArrayRef> {
-        match self.inner {
-            BatchViewInner::RecordBatch(batch) => batch.columns().get(index).ok_or_else(|| {
-                DodamError::UnsupportedSql(format!("projected column index {index} missing"))
-            }),
-            BatchViewInner::RawColumns(_) => Err(DodamError::UnsupportedSql(format!(
-                "raw vector BatchView column {index} is not an Arrow array"
-            ))),
         }
     }
 

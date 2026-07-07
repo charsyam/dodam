@@ -1607,9 +1607,23 @@ impl DodamEngine {
             policy,
             build_state,
             move |view, selection, state| {
-                build_selection(view.record_batch().clone(), selection, state)
+                let Some(batch) = view.try_record_batch() else {
+                    return Err(DodamError::UnsupportedSql(
+                        "late materialized selection raw vector fallback requires RecordBatch"
+                            .to_string(),
+                    ));
+                };
+                build_selection(batch.clone(), selection, state)
             },
-            move |view, state| consume_payload(view.record_batch().clone(), state),
+            move |view, state| {
+                let Some(batch) = view.try_record_batch() else {
+                    return Err(DodamError::UnsupportedSql(
+                        "late materialized payload raw vector fallback requires RecordBatch"
+                            .to_string(),
+                    ));
+                };
+                consume_payload(batch.clone(), state)
+            },
             finish,
         )
         .await
