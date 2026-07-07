@@ -9365,7 +9365,7 @@ fn q16_supplier_count_chunk_size() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(8)
+        .unwrap_or(4)
 }
 
 fn q16_packed_distinct_enabled(group_count: usize, max_suppkey: Option<i64>) -> bool {
