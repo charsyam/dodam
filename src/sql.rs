@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Decimal128Array, DictionaryArray,
-    Float64Array, Int32Array, Int64Array, StringArray, TimestampMillisecondArray, UInt64Array,
+    Float64Array, Int32Array, Int64Array, StringArray, StructArray, TimestampMillisecondArray,
+    UInt64Array,
 };
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Int32Type, Schema, TimeUnit};
@@ -34370,50 +34371,67 @@ fn parse_join_projection(
                 });
             }
             SelectItem::UnnamedExpr(SqlExpr::Function(function)) => {
-                let (aggregate, expression) = parse_join_aggregate_with_input_expression(
-                    function,
-                    table_aliases,
-                    aggregate_expressions.len(),
-                )?;
-                if let Some(expression) = expression {
-                    for column in join_scalar_expression_columns(&expression.expr, table_aliases)? {
-                        add_column_once(&mut aggregate_expression_columns, column);
+                if let Some(expr) =
+                    parse_join_scalar_function_projection(function, None, table_aliases)?
+                {
+                    for column in join_scalar_expression_columns(&expr.expr, table_aliases)? {
+                        add_column_once(&mut columns, column);
                     }
-                    for column in join_sql_expression_columns(
-                        &SqlExpr::Function(function.clone()),
+                    expressions.push(expr);
+                } else {
+                    let (aggregate, expression) = parse_join_aggregate_with_input_expression(
+                        function,
                         table_aliases,
-                    )? {
-                        add_column_once(&mut aggregate_expression_columns, column);
+                        aggregate_expressions.len(),
+                    )?;
+                    if let Some(expression) = expression {
+                        for column in
+                            join_scalar_expression_columns(&expression.expr, table_aliases)?
+                        {
+                            add_column_once(&mut aggregate_expression_columns, column);
+                        }
+                        for column in join_sql_expression_columns(
+                            &SqlExpr::Function(function.clone()),
+                            table_aliases,
+                        )? {
+                            add_column_once(&mut aggregate_expression_columns, column);
+                        }
+                        aggregate_expressions.push(expression);
                     }
-                    aggregate_expressions.push(expression);
+                    aliases.push((function.to_string(), aggregate.to_string()));
+                    aggregates.push(aggregate);
                 }
-                aliases.push((function.to_string(), aggregate.to_string()));
-                aggregates.push(aggregate);
             }
             SelectItem::UnnamedExpr(expr) => {
                 let mut expression_columns = Vec::new();
                 let mut found_aggregate = false;
-                let expression = ProjectionExpression {
-                    output_name: expr.to_string(),
-                    expr: parse_join_aggregate_output_expression(
-                        expr,
-                        table_aliases,
-                        &mut aggregates,
-                        &mut aggregate_expressions,
-                        &mut aggregate_expression_columns,
-                        &mut expression_columns,
-                        &mut found_aggregate,
-                    )?,
-                };
-                if !found_aggregate {
-                    return Err(DodamError::UnsupportedSql(format!(
-                        "unsupported JOIN SELECT item: {item}"
-                    )));
+                if let Ok(parsed) = parse_join_aggregate_output_expression(
+                    expr,
+                    table_aliases,
+                    &mut aggregates,
+                    &mut aggregate_expressions,
+                    &mut aggregate_expression_columns,
+                    &mut expression_columns,
+                    &mut found_aggregate,
+                ) && found_aggregate
+                {
+                    for column in expression_columns {
+                        add_column_once(&mut columns, column);
+                    }
+                    expressions.push(ProjectionExpression {
+                        output_name: expr.to_string(),
+                        expr: parsed,
+                    });
+                } else {
+                    let parsed = parse_join_scalar_sql_expression(expr, table_aliases)?;
+                    for column in join_scalar_expression_columns(&parsed, table_aliases)? {
+                        add_column_once(&mut columns, column);
+                    }
+                    expressions.push(ProjectionExpression {
+                        output_name: expr.to_string(),
+                        expr: parsed,
+                    });
                 }
-                for column in expression_columns {
-                    add_column_once(&mut columns, column);
-                }
-                expressions.push(expression);
             }
             SelectItem::ExprWithAlias { expr, alias } => match expr {
                 SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
@@ -34428,30 +34446,41 @@ fn parse_join_projection(
                     });
                 }
                 SqlExpr::Function(function) => {
-                    let (aggregate, expression) = parse_join_aggregate_with_input_expression(
+                    if let Some(expr) = parse_join_scalar_function_projection(
                         function,
+                        Some(&alias.value),
                         table_aliases,
-                        aggregate_expressions.len(),
-                    )?;
-                    if let Some(expression) = expression {
-                        for column in
-                            join_scalar_expression_columns(&expression.expr, table_aliases)?
-                        {
-                            add_column_once(&mut aggregate_expression_columns, column);
+                    )? {
+                        for column in join_scalar_expression_columns(&expr.expr, table_aliases)? {
+                            add_column_once(&mut columns, column);
                         }
-                        for column in join_sql_expression_columns(expr, table_aliases)? {
-                            add_column_once(&mut aggregate_expression_columns, column);
+                        expressions.push(expr);
+                    } else {
+                        let (aggregate, expression) = parse_join_aggregate_with_input_expression(
+                            function,
+                            table_aliases,
+                            aggregate_expressions.len(),
+                        )?;
+                        if let Some(expression) = expression {
+                            for column in
+                                join_scalar_expression_columns(&expression.expr, table_aliases)?
+                            {
+                                add_column_once(&mut aggregate_expression_columns, column);
+                            }
+                            for column in join_sql_expression_columns(expr, table_aliases)? {
+                                add_column_once(&mut aggregate_expression_columns, column);
+                            }
+                            aggregate_expressions.push(expression);
                         }
-                        aggregate_expressions.push(expression);
+                        aliases.push((function.to_string(), aggregate.to_string()));
+                        aliases.push((alias.value.clone(), aggregate.to_string()));
+                        aggregates.push(aggregate);
                     }
-                    aliases.push((function.to_string(), aggregate.to_string()));
-                    aliases.push((alias.value.clone(), aggregate.to_string()));
-                    aggregates.push(aggregate);
                 }
                 _ => {
                     let mut expression_columns = Vec::new();
                     let mut found_aggregate = false;
-                    let parsed = parse_join_aggregate_output_expression(
+                    if let Ok(parsed) = parse_join_aggregate_output_expression(
                         expr,
                         table_aliases,
                         &mut aggregates,
@@ -34459,8 +34488,17 @@ fn parse_join_projection(
                         &mut aggregate_expression_columns,
                         &mut expression_columns,
                         &mut found_aggregate,
-                    )?;
-                    if !found_aggregate {
+                    ) && found_aggregate
+                    {
+                        for column in expression_columns {
+                            add_column_once(&mut columns, column);
+                        }
+                        aliases.push((alias.value.clone(), alias.value.clone()));
+                        expressions.push(ProjectionExpression {
+                            output_name: alias.value.clone(),
+                            expr: parsed,
+                        });
+                    } else {
                         let parsed = parse_join_scalar_sql_expression(expr, table_aliases)?;
                         for column in join_scalar_expression_columns(&parsed, table_aliases)? {
                             add_column_once(&mut columns, column);
@@ -34470,16 +34508,7 @@ fn parse_join_projection(
                             output_name: alias.value.clone(),
                             expr: parsed,
                         });
-                        continue;
                     }
-                    for column in expression_columns {
-                        add_column_once(&mut columns, column);
-                    }
-                    aliases.push((alias.value.clone(), alias.value.clone()));
-                    expressions.push(ProjectionExpression {
-                        output_name: alias.value.clone(),
-                        expr: parsed,
-                    });
                 }
             },
             SelectItem::QualifiedWildcard(_, _) => {
@@ -35186,6 +35215,10 @@ struct ProjectionExpression {
 #[derive(Debug, Clone, PartialEq)]
 enum ScalarSqlExpression {
     Column(String),
+    StructField {
+        column: String,
+        field: String,
+    },
     Literal(LiteralValue),
     Binary {
         left: Box<ScalarSqlExpression>,
@@ -35232,12 +35265,20 @@ fn parse_projection(
             SelectItem::UnnamedExpr(
                 expr @ (SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_)),
             ) => {
-                let column = sql_column_name(expr, table_alias)?;
-                add_column_once(&mut columns, column.clone());
-                expressions.push(ProjectionExpression {
-                    output_name: column.clone(),
-                    expr: ScalarSqlExpression::Column(column),
-                });
+                if let Some((column, field)) = parse_struct_field_access(expr, table_alias)? {
+                    add_column_once(&mut columns, column.clone());
+                    expressions.push(ProjectionExpression {
+                        output_name: field.clone(),
+                        expr: ScalarSqlExpression::StructField { column, field },
+                    });
+                } else {
+                    let column = sql_column_name(expr, table_alias)?;
+                    add_column_once(&mut columns, column.clone());
+                    expressions.push(ProjectionExpression {
+                        output_name: column.clone(),
+                        expr: ScalarSqlExpression::Column(column),
+                    });
+                }
             }
             SelectItem::UnnamedExpr(SqlExpr::Function(function)) => {
                 if let Some(expr) = parse_scalar_function_projection(function, None, table_alias)? {
@@ -35290,13 +35331,22 @@ fn parse_projection(
             }
             SelectItem::ExprWithAlias { expr, alias } => match expr {
                 SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
-                    let column = sql_column_name(expr, table_alias)?;
-                    add_column_once(&mut columns, column.clone());
-                    expressions.push(ProjectionExpression {
-                        output_name: alias.value.clone(),
-                        expr: ScalarSqlExpression::Column(column.clone()),
-                    });
-                    aliases.push((alias.value.clone(), column));
+                    if let Some((column, field)) = parse_struct_field_access(expr, table_alias)? {
+                        add_column_once(&mut columns, column.clone());
+                        expressions.push(ProjectionExpression {
+                            output_name: alias.value.clone(),
+                            expr: ScalarSqlExpression::StructField { column, field },
+                        });
+                        aliases.push((alias.value.clone(), alias.value.clone()));
+                    } else {
+                        let column = sql_column_name(expr, table_alias)?;
+                        add_column_once(&mut columns, column.clone());
+                        expressions.push(ProjectionExpression {
+                            output_name: alias.value.clone(),
+                            expr: ScalarSqlExpression::Column(column.clone()),
+                        });
+                        aliases.push((alias.value.clone(), column));
+                    }
                 }
                 SqlExpr::Function(function) => {
                     if let Some(expr) =
@@ -35514,14 +35564,99 @@ fn parse_scalar_function_projection(
     }))
 }
 
+fn parse_join_scalar_function_projection(
+    function: &sqlparser::ast::Function,
+    alias: Option<&str>,
+    table_aliases: &[&str],
+) -> Result<Option<ProjectionExpression>> {
+    let name = object_name_to_string(&function.name)?;
+    let lowercase_name = name.to_ascii_lowercase();
+    if !matches!(
+        lowercase_name.as_str(),
+        "coalesce" | "lower" | "upper" | "length"
+    ) {
+        return Ok(None);
+    }
+    if function.filter.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+        || function.null_treatment.is_some()
+        || !matches!(function.parameters, FunctionArguments::None)
+    {
+        return Err(DodamError::UnsupportedSql(
+            "scalar function filters, windows, within group, null treatment, and parameters are not supported"
+                .to_string(),
+        ));
+    }
+    let FunctionArguments::List(args) = &function.args else {
+        return Err(DodamError::UnsupportedSql(format!(
+            "unsupported scalar function arguments: {}",
+            function.args
+        )));
+    };
+    if !args.clauses.is_empty() || args.duplicate_treatment.is_some() {
+        return Err(DodamError::UnsupportedSql(format!(
+            "unsupported scalar function arguments: {}",
+            function.args
+        )));
+    }
+    let values = args
+        .args
+        .iter()
+        .map(|arg| match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
+                parse_join_scalar_sql_expression(expr, table_aliases)
+            }
+            _ => Err(DodamError::UnsupportedSql(format!(
+                "unsupported scalar function argument: {arg}"
+            ))),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let expr = match lowercase_name.as_str() {
+        "coalesce" => {
+            if values.is_empty() {
+                return Err(DodamError::UnsupportedSql(
+                    "COALESCE requires at least one argument".to_string(),
+                ));
+            }
+            ScalarSqlExpression::Coalesce(values)
+        }
+        "lower" | "upper" | "length" => {
+            let [value] = values.as_slice() else {
+                return Err(DodamError::UnsupportedSql(format!(
+                    "{name} requires exactly one argument"
+                )));
+            };
+            match lowercase_name.as_str() {
+                "lower" => ScalarSqlExpression::Lower(Box::new(value.clone())),
+                "upper" => ScalarSqlExpression::Upper(Box::new(value.clone())),
+                "length" => ScalarSqlExpression::Length(Box::new(value.clone())),
+                _ => unreachable!("validated scalar function"),
+            }
+        }
+        _ => unreachable!("validated scalar function"),
+    };
+    Ok(Some(ProjectionExpression {
+        output_name: alias.map_or_else(|| function.to_string(), ToString::to_string),
+        expr,
+    }))
+}
+
 fn parse_scalar_sql_expression(
     expr: &SqlExpr,
     table_alias: Option<&str>,
 ) -> Result<ScalarSqlExpression> {
     match expr {
-        SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => Ok(ScalarSqlExpression::Column(
-            sql_column_name(expr, table_alias)?,
-        )),
+        SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
+            if let Some((column, field)) = parse_struct_field_access(expr, table_alias)? {
+                Ok(ScalarSqlExpression::StructField { column, field })
+            } else {
+                Ok(ScalarSqlExpression::Column(sql_column_name(
+                    expr,
+                    table_alias,
+                )?))
+            }
+        }
         SqlExpr::Value(_) => Ok(ScalarSqlExpression::Literal(sql_literal_value(expr)?)),
         SqlExpr::UnaryOp { op, expr }
             if matches!(op, UnaryOperator::Minus | UnaryOperator::Plus)
@@ -35653,6 +35788,36 @@ fn parse_join_scalar_sql_expression(
             expr: Box::new(parse_join_scalar_sql_expression(expr, table_aliases)?),
             target: data_type.to_string(),
         }),
+        SqlExpr::Function(function) => {
+            let Some(projection) =
+                parse_join_scalar_function_projection(function, None, table_aliases)?
+            else {
+                return Err(DodamError::UnsupportedSql(format!(
+                    "unsupported JOIN scalar function: {function}"
+                )));
+            };
+            Ok(projection.expr)
+        }
+        SqlExpr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            let Some(start) = substring_from else {
+                return Err(DodamError::UnsupportedSql(
+                    "SUBSTRING requires a FROM/start expression".to_string(),
+                ));
+            };
+            Ok(ScalarSqlExpression::Substring {
+                expr: Box::new(parse_join_scalar_sql_expression(expr, table_aliases)?),
+                start: Box::new(parse_join_scalar_sql_expression(start, table_aliases)?),
+                length: substring_for
+                    .as_ref()
+                    .map(|expr| parse_join_scalar_sql_expression(expr, table_aliases).map(Box::new))
+                    .transpose()?,
+            })
+        }
         SqlExpr::Extract { field, expr, .. } if *field == DateTimeField::Year => {
             Ok(ScalarSqlExpression::ExtractYear(Box::new(
                 parse_join_scalar_sql_expression(expr, table_aliases)?,
@@ -35687,6 +35852,22 @@ fn parse_join_scalar_sql_expression(
         _ => Err(DodamError::UnsupportedSql(format!(
             "unsupported JOIN scalar expression: {expr}"
         ))),
+    }
+}
+
+fn parse_struct_field_access(
+    expr: &SqlExpr,
+    table_alias: Option<&str>,
+) -> Result<Option<(String, String)>> {
+    let SqlExpr::CompoundIdentifier(parts) = expr else {
+        return Ok(None);
+    };
+    match (table_alias, parts.as_slice()) {
+        (None, [column, field]) => Ok(Some((column.value.clone(), field.value.clone()))),
+        (Some(alias), [qualifier, column, field]) if qualifier.value == alias => {
+            Ok(Some((column.value.clone(), field.value.clone())))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -35870,6 +36051,7 @@ fn collect_join_scalar_expression_columns(
 ) -> Result<()> {
     match expr {
         ScalarSqlExpression::Column(column) => add_column_once(columns, column.clone()),
+        ScalarSqlExpression::StructField { column, .. } => add_column_once(columns, column.clone()),
         ScalarSqlExpression::Literal(_) => {}
         ScalarSqlExpression::Binary { left, right, .. } => {
             collect_join_scalar_expression_columns(left, table_aliases, columns)?;
@@ -35951,6 +36133,7 @@ fn collect_join_predicate_columns(
 fn collect_scalar_expression_columns(expr: &ScalarSqlExpression, columns: &mut Vec<String>) {
     match expr {
         ScalarSqlExpression::Column(column) => add_column_once(columns, column.clone()),
+        ScalarSqlExpression::StructField { column, .. } => add_column_once(columns, column.clone()),
         ScalarSqlExpression::Literal(_) => {}
         ScalarSqlExpression::Binary { left, right, .. } => {
             collect_scalar_expression_columns(left, columns);
@@ -36005,6 +36188,7 @@ fn scalar_expression_references_aggregate(
         ScalarSqlExpression::Column(column) => aggregates
             .iter()
             .any(|aggregate| column == &aggregate.to_string()),
+        ScalarSqlExpression::StructField { .. } => false,
         ScalarSqlExpression::Literal(_) => false,
         ScalarSqlExpression::Binary { left, right, .. } => {
             scalar_expression_references_aggregate(left, aggregates)
@@ -37805,6 +37989,9 @@ fn evaluate_scalar_expression(
 ) -> Result<EvaluatedScalar> {
     match expr {
         ScalarSqlExpression::Column(column) => evaluated_column(batch, column),
+        ScalarSqlExpression::StructField { column, field } => {
+            evaluated_struct_field(batch, column, field)
+        }
         ScalarSqlExpression::Literal(value) => Ok(evaluated_literal(value, batch.num_rows())),
         ScalarSqlExpression::Binary { left, op, right } => {
             if decimal_expression_fast_enabled()
@@ -38459,6 +38646,76 @@ fn evaluated_column(batch: &RecordBatch, column: &str) -> Result<EvaluatedScalar
     }
 }
 
+fn evaluated_struct_field(
+    batch: &RecordBatch,
+    column: &str,
+    field: &str,
+) -> Result<EvaluatedScalar> {
+    let index = batch
+        .schema()
+        .fields()
+        .iter()
+        .position(|schema_field| schema_field.name() == column)
+        .ok_or_else(|| DodamError::UnknownColumn(column.to_string()))?;
+    let array = batch.column(index);
+    let struct_array = array
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| {
+            DodamError::UnsupportedSql(format!("{column}.{field} requires a STRUCT column"))
+        })?;
+    let Some((field_index, _)) = struct_array
+        .fields()
+        .iter()
+        .enumerate()
+        .find(|(_, schema_field)| schema_field.name() == field)
+    else {
+        return Err(DodamError::UnknownColumn(format!("{column}.{field}")));
+    };
+    evaluated_array(struct_array.column(field_index).as_ref())
+}
+
+fn evaluated_array(array: &dyn Array) -> Result<EvaluatedScalar> {
+    match array.data_type() {
+        DataType::Int32 => {
+            let values = array.as_any().downcast_ref::<Int32Array>().expect("Int32");
+            Ok(EvaluatedScalar::Int64(
+                values.iter().map(|value| value.map(i64::from)).collect(),
+            ))
+        }
+        DataType::Int64 => {
+            let values = array.as_any().downcast_ref::<Int64Array>().expect("Int64");
+            Ok(EvaluatedScalar::Int64(values.iter().collect()))
+        }
+        DataType::Float64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("Float64");
+            Ok(EvaluatedScalar::Float64(values.iter().collect()))
+        }
+        DataType::Utf8 => {
+            let values = array.as_any().downcast_ref::<StringArray>().expect("Utf8");
+            Ok(EvaluatedScalar::Utf8(
+                values
+                    .iter()
+                    .map(|value| value.map(str::to_string))
+                    .collect(),
+            ))
+        }
+        DataType::Boolean => {
+            let values = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("Boolean");
+            Ok(EvaluatedScalar::Boolean(values.iter().collect()))
+        }
+        data_type => Err(DodamError::UnsupportedSql(format!(
+            "projection expression column type {data_type} is not supported yet"
+        ))),
+    }
+}
+
 fn evaluated_literal(value: &LiteralValue, rows: usize) -> EvaluatedScalar {
     match value {
         LiteralValue::Null => EvaluatedScalar::Utf8(vec![None; rows]),
@@ -38676,8 +38933,18 @@ fn cast_evaluated_scalar(value: EvaluatedScalar, target: &str) -> Result<Evaluat
                 .collect(),
             EvaluatedScalar::Utf8(values) => values
                 .into_iter()
-                .map(|value| value.and_then(|value| value.parse::<i64>().ok()))
-                .collect(),
+                .map(|value| {
+                    value
+                        .map(|value| {
+                            value.parse::<i64>().map_err(|_| {
+                                DodamError::UnsupportedSql(format!(
+                                    "cannot cast '{value}' to integer"
+                                ))
+                            })
+                        })
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?,
             EvaluatedScalar::Boolean(values) => values
                 .into_iter()
                 .map(|value| value.map(i64::from))
@@ -38693,8 +38960,18 @@ fn cast_evaluated_scalar(value: EvaluatedScalar, target: &str) -> Result<Evaluat
             EvaluatedScalar::Float64(values) => values,
             EvaluatedScalar::Utf8(values) => values
                 .into_iter()
-                .map(|value| value.and_then(|value| value.parse::<f64>().ok()))
-                .collect(),
+                .map(|value| {
+                    value
+                        .map(|value| {
+                            value.parse::<f64>().map_err(|_| {
+                                DodamError::UnsupportedSql(format!(
+                                    "cannot cast '{value}' to double"
+                                ))
+                            })
+                        })
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?,
             EvaluatedScalar::Boolean(values) => values
                 .into_iter()
                 .map(|value| value.map(|value| if value { 1.0 } else { 0.0 }))

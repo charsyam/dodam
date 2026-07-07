@@ -243,6 +243,22 @@ async fn duckdb_differential_join_matrix() {
     )
     .await;
 
+    assert_same_as_duckdb_unordered_case(
+        "join scalar projection expressions",
+        &format!(
+            "SELECT f.id, COALESCE(d.name, 'missing') AS dim_name, f.value * 2 AS doubled_value, CASE WHEN d.name IS NULL THEN 'unmatched' ELSE 'matched' END AS match_state FROM '{}' f LEFT JOIN '{}' d ON f.key = d.key",
+            facts_path.display(),
+            dim_path.display()
+        ),
+        &format!(
+            "SELECT f.id, COALESCE(d.name, 'missing') AS dim_name, f.value * 2 AS doubled_value, CASE WHEN d.name IS NULL THEN 'unmatched' ELSE 'matched' END AS match_state FROM read_parquet('{}') f LEFT JOIN read_parquet('{}') d ON f.key = d.key",
+            facts_path.display(),
+            dim_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
     assert_same_as_duckdb(
         &format!(
             "SELECT f.id, f.key FROM '{}' f LEFT SEMI JOIN '{}' d ON f.key = d.key ORDER BY f.id",
@@ -1412,6 +1428,10 @@ async fn duckdb_differential_extended_type_matrix() {
             "SELECT id, CASE WHEN flag = true THEN 'yes' WHEN flag = false THEN 'no' ELSE 'unknown' END FROM types_table",
             "SELECT id, CASE WHEN flag = true THEN 'yes' WHEN flag = false THEN 'no' ELSE 'unknown' END FROM types_table",
         ),
+        (
+            "SELECT id, CAST(id AS DOUBLE), CAST(flag AS INTEGER), CAST(flag AS VARCHAR) FROM types_table",
+            "SELECT id, CAST(id AS DOUBLE), CAST(flag AS INTEGER), CAST(flag AS VARCHAR) FROM types_table",
+        ),
     ];
     for (case_id, (dodam_template, duckdb_template)) in cases.into_iter().enumerate() {
         let dodam_sql =
@@ -1428,6 +1448,19 @@ async fn duckdb_differential_extended_type_matrix() {
         )
         .await;
     }
+
+    assert_both_error(
+        &format!(
+            "SELECT CAST(note AS INTEGER) FROM '{}' WHERE note IS NOT NULL",
+            types_path.display()
+        ),
+        &format!(
+            "SELECT CAST(note AS INTEGER) FROM read_parquet('{}') WHERE note IS NOT NULL",
+            types_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1588,6 +1621,85 @@ async fn dodam_copy_parquet_nested_roundtrip() {
     let schema = batches.first().expect("nested output batch").schema();
     assert!(matches!(schema.field(1).data_type(), DataType::List(_)));
     assert!(matches!(schema.field(2).data_type(), DataType::Struct(_)));
+}
+
+#[tokio::test]
+async fn duckdb_differential_nested_struct_field_projection() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let input_path = tempdir.path().join("nested-input.parquet");
+    write_nested_values_parquet(&input_path);
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, attrs.rank AS rank, attrs.label AS label FROM '{}' ORDER BY id",
+            input_path.display()
+        ),
+        &format!(
+            "SELECT id, attrs.rank AS rank, attrs.label AS label FROM read_parquet('{}') ORDER BY id",
+            input_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn duckdb_differential_long_run_seeded_randomized() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    if std::env::var("DODAM_LONG_DIFF").ok().as_deref() != Some("1") {
+        eprintln!("set DODAM_LONG_DIFF=1 to run the long randomized differential suite");
+        return;
+    }
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let facts_path = tempdir.path().join("facts.parquet");
+    let dim_path = tempdir.path().join("dim.parquet");
+    let types_path = tempdir.path().join("types.parquet");
+    let multi_left_path = tempdir.path().join("multi-left.parquet");
+    let multi_right_path = tempdir.path().join("multi-right.parquet");
+    write_facts_parquet(&facts_path);
+    write_dim_parquet(&dim_path);
+    write_types_parquet(&types_path);
+    write_multi_left_parquet(&multi_left_path);
+    write_multi_right_parquet(&multi_right_path);
+
+    for seed in [
+        0xD0DA_2026_1001,
+        0xD0DA_2026_1002,
+        0xD0DA_2026_1003,
+        0xD0DA_2026_1004,
+    ] {
+        let mut rng = TestRng::new(seed);
+        for case_id in 0..192 {
+            let case = match rng.index(3) {
+                0 => random_facts_query(&mut rng, &facts_path, case_id),
+                1 => random_types_query(&mut rng, &types_path, case_id),
+                _ => {
+                    if rng.chance(2, 3) {
+                        random_single_key_join_query(&mut rng, &facts_path, &dim_path, case_id)
+                    } else {
+                        random_multi_key_join_query(
+                            &mut rng,
+                            &multi_left_path,
+                            &multi_right_path,
+                            case_id,
+                        )
+                    }
+                }
+            };
+            assert_same_as_duckdb_unordered_case(
+                &format!("long_diff seed={seed:#x} case={case_id}"),
+                &case.dodam_sql,
+                &case.duckdb_sql,
+                tempdir.path(),
+            )
+            .await;
+        }
+    }
 }
 
 #[tokio::test]
@@ -1796,9 +1908,11 @@ impl TestRng {
 fn random_facts_query(rng: &mut TestRng, facts_path: &Path, case_id: usize) -> GeneratedSql {
     let dodam_table = format!("'{}'", facts_path.display());
     let duckdb_table = format!("read_parquet('{}')", facts_path.display());
-    let (dodam_predicate, duckdb_predicate) = random_facts_predicate(rng, facts_path, "f");
 
-    let (dodam_sql, duckdb_sql) = if rng.chance(1, 4) {
+    let aggregate = rng.chance(1, 4);
+    let (dodam_predicate, duckdb_predicate) =
+        random_facts_predicate(rng, facts_path, "f", !aggregate);
+    let (dodam_sql, duckdb_sql) = if aggregate {
         (
             format!(
                 "SELECT key, count(*), count(value), sum(value), avg(value), min(payload), max(payload) FROM {dodam_table} f WHERE {dodam_predicate} GROUP BY key ORDER BY key"
@@ -1834,10 +1948,11 @@ fn random_facts_predicate(
     rng: &mut TestRng,
     facts_path: &Path,
     outer_alias: &str,
+    allow_subquery: bool,
 ) -> (String, String) {
     let dodam_table = format!("'{}'", facts_path.display());
     let duckdb_table = format!("read_parquet('{}')", facts_path.display());
-    let predicate = rng.choose(&[
+    let base_predicates = [
         "true",
         "key IS NULL",
         "key IS NOT NULL",
@@ -1848,10 +1963,17 @@ fn random_facts_predicate(
         "key NOT IN (1, NULL) OR id = 1",
         "id >= 2 AND id <= 5",
         "COALESCE(payload, 'missing') <> 'missing'",
+    ];
+    let subquery_predicates = [
         "id IN (SELECT id FROM facts_sub WHERE key = 3)",
         "id = (SELECT key FROM facts_sub WHERE key = 3 ORDER BY id LIMIT 1)",
         "EXISTS (SELECT 1 FROM facts_sub f2 WHERE f2.key = outer_key AND f2.value IS NOT NULL)",
-    ]);
+    ];
+    let predicate = if allow_subquery && rng.chance(1, 3) {
+        rng.choose(&subquery_predicates)
+    } else {
+        rng.choose(&base_predicates)
+    };
     (
         predicate
             .replace("facts_sub", &dodam_table)
@@ -1895,6 +2017,9 @@ fn random_single_key_join_query(
             "f.id, f.key, d.name",
             "f.id, f.payload, d.name",
             "f.id, f.value, d.name",
+            "f.id, COALESCE(d.name, 'missing') AS dim_name, f.payload",
+            "f.id, f.value * 2 AS doubled_value, d.name",
+            "f.id, CASE WHEN d.name IS NULL THEN 'unmatched' ELSE 'matched' END AS match_state",
         ]);
         (
             format!(
@@ -1929,7 +2054,12 @@ fn random_multi_key_join_query(
         "r.label IS NULL OR r.label <> 'null-k2'",
         "l.k1 IS NULL OR r.k1 IS NOT NULL",
     ]);
-    let projection = rng.choose(&["l.id, l.k1, l.k2, r.label", "l.id, r.label"]);
+    let projection = rng.choose(&[
+        "l.id, l.k1, l.k2, r.label",
+        "l.id, r.label",
+        "l.id, COALESCE(r.label, 'missing') AS label_text",
+        "l.id, CASE WHEN r.label IS NULL THEN 'unmatched' ELSE 'matched' END AS match_state",
+    ]);
     GeneratedSql {
         case_id,
         dodam_sql: format!(
