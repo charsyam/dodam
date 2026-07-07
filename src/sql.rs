@@ -29,8 +29,8 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::dense::{
-    AdaptiveI64Map, AdaptiveI64Set, DenseI64BoolLookup, DenseI64F64Sum, DenseI64I32Map,
-    PackedU32PairDistinct, SortedI64Lookup, adaptive_dense_index,
+    AdaptiveI64Map, AdaptiveI64Set, DenseAtomicU8, DenseI64BoolLookup, DenseI64F64Sum,
+    DenseI64I32Map, PackedU32PairDistinct, SortedI64Lookup, adaptive_dense_index,
 };
 use crate::engine::{
     DodamEngine, JoinAlgorithm, JoinParquetRequest, LateMaterializationPolicy,
@@ -18730,13 +18730,7 @@ fn q04_atomic_lineitem_probe_enabled() -> bool {
 }
 
 fn q04_atomic_candidate_priorities(candidate_priorities: &[u8]) -> Arc<Vec<AtomicU8>> {
-    Arc::new(
-        candidate_priorities
-            .par_iter()
-            .copied()
-            .map(AtomicU8::new)
-            .collect::<Vec<_>>(),
-    )
+    Arc::new(DenseAtomicU8::from_values_parallel(candidate_priorities).into_markers())
 }
 
 fn q04_lineitem_row_group_map_enabled() -> bool {
@@ -26295,7 +26289,7 @@ async fn q21_final_order_keys_atomic(
     else {
         return Ok(None);
     };
-    let markers = Arc::new((0..=max_key).map(|_| AtomicU8::new(0)).collect::<Vec<_>>());
+    let markers = Arc::new(DenseAtomicU8::zeroed(max_key + 1));
     let Some(_) = engine
         .parquet_row_group_map_dictionary_columns_pruned_view(
             path.clone(),
@@ -26321,12 +26315,7 @@ async fn q21_final_order_keys_atomic(
     let markers = Arc::try_unwrap(markers).map_err(|_| {
         DodamError::UnsupportedSql("Q21 atomic final-order marker still shared".to_string())
     })?;
-    let contains = markers
-        .into_par_iter()
-        .map(|marker| marker.load(Ordering::Relaxed) != 0)
-        .collect::<Vec<_>>();
-    let len = contains.par_iter().filter(|present| **present).count();
-    Ok(Some(AdaptiveI64Set::Dense { contains, len }))
+    Ok(Some(markers.into_adaptive_i64_set()))
 }
 
 fn q21_atomic_final_order_row_group_chunk() -> usize {
@@ -26337,7 +26326,7 @@ fn q21_atomic_final_order_row_group_chunk() -> usize {
         .unwrap_or(8)
 }
 
-fn q21_final_orders_atomic_view_into(view: BatchView<'_>, markers: &[AtomicU8]) -> Result<()> {
+fn q21_final_orders_atomic_view_into(view: BatchView<'_>, markers: &DenseAtomicU8) -> Result<()> {
     if view.num_columns() == 2
         && let Some(orderkeys) = view.i64_vector(0)
     {
@@ -26359,7 +26348,7 @@ fn q21_final_orders_atomic_view_into(view: BatchView<'_>, markers: &[AtomicU8]) 
 fn q21_final_orders_atomic_dictionary_view_into(
     orderkeys: I64VectorView<'_>,
     statuses: DictionaryI32View<'_>,
-    markers: &[AtomicU8],
+    markers: &DenseAtomicU8,
 ) -> Result<()> {
     if statuses.null_count() != 0 {
         return Ok(());
@@ -26372,9 +26361,8 @@ fn q21_final_orders_atomic_dictionary_view_into(
         for (row, orderkey) in orderkey_values.iter().copied().enumerate() {
             if q21_status_is_final(status_keys, &match_flags, row)
                 && let Ok(index) = usize::try_from(orderkey)
-                && let Some(marker) = markers.get(index)
             {
-                marker.store(1, Ordering::Relaxed);
+                markers.store_present(index);
             }
         }
         return Ok(());
@@ -26383,10 +26371,8 @@ fn q21_final_orders_atomic_dictionary_view_into(
         if orderkeys.is_null(row) || !q21_status_is_final(status_keys, &match_flags, row) {
             continue;
         }
-        if let Ok(index) = usize::try_from(orderkeys.value(row))
-            && let Some(marker) = markers.get(index)
-        {
-            marker.store(1, Ordering::Relaxed);
+        if let Ok(index) = usize::try_from(orderkeys.value(row)) {
+            markers.store_present(index);
         }
     }
     Ok(())
@@ -26406,7 +26392,7 @@ fn q21_status_is_final(status_keys: &[i32], match_flags: &[Option<usize>], row: 
 fn q21_final_orders_atomic_utf8_view_into(
     orderkeys: I64VectorView<'_>,
     statuses: &StringArray,
-    markers: &[AtomicU8],
+    markers: &DenseAtomicU8,
 ) -> Result<()> {
     if let Some(orderkey_values) = orderkeys.values_if_null_free()
         && statuses.null_count() == 0
@@ -26416,9 +26402,8 @@ fn q21_final_orders_atomic_utf8_view_into(
         for (row, orderkey) in orderkey_values.iter().copied().enumerate() {
             if bytes_string_parts(offsets, data, row) == b"F"
                 && let Ok(index) = usize::try_from(orderkey)
-                && let Some(marker) = markers.get(index)
             {
-                marker.store(1, Ordering::Relaxed);
+                markers.store_present(index);
             }
         }
         return Ok(());
@@ -26427,16 +26412,14 @@ fn q21_final_orders_atomic_utf8_view_into(
         if orderkeys.is_null(row) || statuses.is_null(row) || statuses.value(row) != "F" {
             continue;
         }
-        if let Ok(index) = usize::try_from(orderkeys.value(row))
-            && let Some(marker) = markers.get(index)
-        {
-            marker.store(1, Ordering::Relaxed);
+        if let Ok(index) = usize::try_from(orderkeys.value(row)) {
+            markers.store_present(index);
         }
     }
     Ok(())
 }
 
-fn q21_final_orders_atomic_batch_into(batch: &RecordBatch, markers: &[AtomicU8]) -> Result<()> {
+fn q21_final_orders_atomic_batch_into(batch: &RecordBatch, markers: &DenseAtomicU8) -> Result<()> {
     let orderkeys = batch_column(batch, "o_orderkey")?;
     let statuses = batch_string_column(batch, "o_orderstatus")?;
     if let Some(orderkeys) = orderkeys.as_any().downcast_ref::<Int64Array>() {
@@ -26446,9 +26429,8 @@ fn q21_final_orders_atomic_batch_into(batch: &RecordBatch, markers: &[AtomicU8])
             for row in 0..orderkeys.len() {
                 if bytes_string_parts(status_offsets, status_data, row) == b"F"
                     && let Ok(index) = usize::try_from(orderkeys.value(row))
-                    && let Some(marker) = markers.get(index)
                 {
-                    marker.store(1, Ordering::Relaxed);
+                    markers.store_present(index);
                 }
             }
             return Ok(());
@@ -26457,10 +26439,8 @@ fn q21_final_orders_atomic_batch_into(batch: &RecordBatch, markers: &[AtomicU8])
             if orderkeys.is_null(row) || statuses.is_null(row) || statuses.value(row) != "F" {
                 continue;
             }
-            if let Ok(index) = usize::try_from(orderkeys.value(row))
-                && let Some(marker) = markers.get(index)
-            {
-                marker.store(1, Ordering::Relaxed);
+            if let Ok(index) = usize::try_from(orderkeys.value(row)) {
+                markers.store_present(index);
             }
         }
         return Ok(());
@@ -26471,9 +26451,8 @@ fn q21_final_orders_atomic_batch_into(batch: &RecordBatch, markers: &[AtomicU8])
         }
         if let Some(key) = numeric_i64_value(orderkeys, row)?
             && let Ok(index) = usize::try_from(key)
-            && let Some(marker) = markers.get(index)
         {
-            marker.store(1, Ordering::Relaxed);
+            markers.store_present(index);
         }
     }
     Ok(())

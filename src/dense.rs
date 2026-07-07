@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::hash::{FastHashMap, FastHashSet};
+use rayon::prelude::*;
 
 const DEFAULT_MAX_DENSE_I64_KEY: usize = 20_000_000;
 
@@ -9,6 +11,48 @@ const DEFAULT_MAX_DENSE_I64_KEY: usize = 20_000_000;
 pub(crate) enum AdaptiveI64Set {
     Dense { contains: Vec<bool>, len: usize },
     Hash(FastHashSet<i64>),
+}
+
+pub(crate) struct DenseAtomicU8 {
+    markers: Vec<AtomicU8>,
+}
+
+impl DenseAtomicU8 {
+    pub(crate) fn zeroed(len: usize) -> Self {
+        Self {
+            markers: (0..len).map(|_| AtomicU8::new(0)).collect(),
+        }
+    }
+
+    pub(crate) fn from_values_parallel(values: &[u8]) -> Self {
+        Self {
+            markers: values
+                .par_iter()
+                .copied()
+                .map(AtomicU8::new)
+                .collect::<Vec<_>>(),
+        }
+    }
+
+    pub(crate) fn into_markers(self) -> Vec<AtomicU8> {
+        self.markers
+    }
+
+    pub(crate) fn store_present(&self, index: usize) {
+        if let Some(marker) = self.markers.get(index) {
+            marker.store(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn into_adaptive_i64_set(self) -> AdaptiveI64Set {
+        let contains = self
+            .markers
+            .into_par_iter()
+            .map(|marker| marker.load(Ordering::Relaxed) != 0)
+            .collect::<Vec<_>>();
+        let len = contains.par_iter().filter(|present| **present).count();
+        AdaptiveI64Set::Dense { contains, len }
+    }
 }
 
 impl AdaptiveI64Set {
