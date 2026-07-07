@@ -19434,94 +19434,32 @@ fn q04_collect_late_candidate_orderkeys_vector(
     }
 }
 
-fn q04_count_late_candidate_priorities_typed(
-    orderkeys: &ArrayRef,
-    commitdates: &ArrayRef,
-    receiptdates: &ArrayRef,
-    candidate_priorities: &mut [u8],
-    counts: &mut [u64],
-) -> Result<bool> {
-    let (Some(orderkeys), Some(commitdates), Some(receiptdates)) = (
-        orderkeys.as_any().downcast_ref::<Int64Array>(),
-        commitdates.as_any().downcast_ref::<Date32Array>(),
-        receiptdates.as_any().downcast_ref::<Date32Array>(),
-    ) else {
-        return Ok(false);
-    };
-    if orderkeys.null_count() == 0
-        && commitdates.null_count() == 0
-        && receiptdates.null_count() == 0
-    {
-        let orderkeys = orderkeys.values().as_ref();
-        let commitdates = commitdates.values().as_ref();
-        let receiptdates = receiptdates.values().as_ref();
-        for row in 0..orderkeys.len() {
-            if commitdates[row] >= receiptdates[row] {
-                continue;
-            }
-            let orderkey = orderkeys[row];
-            if orderkey < 0 {
-                continue;
-            }
-            let Ok(orderkey) = usize::try_from(orderkey) else {
-                continue;
-            };
-            let Some(priority_marker) = candidate_priorities.get_mut(orderkey) else {
-                continue;
-            };
-            if *priority_marker == 0 {
-                continue;
-            }
-            let priority_index = usize::from(*priority_marker - 1);
-            counts[priority_index] += 1;
-            *priority_marker = 0;
-        }
-        return Ok(true);
-    }
-    for row in 0..orderkeys.len() {
-        if orderkeys.is_null(row) || commitdates.is_null(row) || receiptdates.is_null(row) {
-            continue;
-        }
-        if commitdates.value(row) >= receiptdates.value(row) {
-            continue;
-        }
-        let orderkey = orderkeys.value(row);
-        if orderkey < 0 {
-            continue;
-        }
-        let Ok(orderkey) = usize::try_from(orderkey) else {
-            continue;
-        };
-        let Some(priority_marker) = candidate_priorities.get_mut(orderkey) else {
-            continue;
-        };
-        if *priority_marker == 0 {
-            continue;
-        }
-        let priority_index = usize::from(*priority_marker - 1);
-        counts[priority_index] += 1;
-        *priority_marker = 0;
-    }
-    Ok(true)
-}
-
 fn q04_count_late_candidate_priorities_view_into(
     view: BatchView<'_>,
     candidate_priorities: &mut [u8],
     counts: &mut [u64],
 ) -> Result<()> {
     if view.num_columns() == 3
-        && q04_count_late_candidate_priorities_typed(
-            view.column(0)?,
-            view.column(1)?,
-            view.column(2)?,
+        && let (Some(orderkeys), Some(commitdates), Some(receiptdates)) = (
+            view.i64_vector(0),
+            view.date32_vector(1),
+            view.date32_vector(2),
+        )
+    {
+        q04_count_late_candidate_priorities_vector(
+            orderkeys,
+            commitdates,
+            receiptdates,
             candidate_priorities,
             counts,
-        )?
-    {
+        );
         return Ok(());
     }
-    let batch = view.record_batch();
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "Q04 late candidate priority raw vector columns have unsupported types".to_string(),
+        ));
+    };
     let orderkeys = batch_column(batch, "l_orderkey")?;
     let commitdates = batch_column(batch, "l_commitdate")?;
     let receiptdates = batch_column(batch, "l_receiptdate")?;
@@ -19550,6 +19488,68 @@ fn q04_count_late_candidate_priorities_view_into(
         *priority_marker = 0;
     }
     Ok(())
+}
+
+fn q04_count_late_candidate_priorities_vector(
+    orderkeys: I64VectorView<'_>,
+    commitdates: Date32VectorView<'_>,
+    receiptdates: Date32VectorView<'_>,
+    candidate_priorities: &mut [u8],
+    counts: &mut [u64],
+) {
+    if let (Some(orderkey_values), Some(commitdate_values), Some(receiptdate_values)) = (
+        orderkeys.values_if_null_free(),
+        commitdates.values_if_null_free(),
+        receiptdates.values_if_null_free(),
+    ) {
+        for row in 0..orderkey_values.len() {
+            if commitdate_values[row] >= receiptdate_values[row] {
+                continue;
+            }
+            let orderkey = orderkey_values[row];
+            if orderkey < 0 {
+                continue;
+            }
+            let Ok(orderkey) = usize::try_from(orderkey) else {
+                continue;
+            };
+            let Some(priority_marker) = candidate_priorities.get_mut(orderkey) else {
+                continue;
+            };
+            if *priority_marker == 0 {
+                continue;
+            }
+            let priority_index = usize::from(*priority_marker - 1);
+            counts[priority_index] += 1;
+            *priority_marker = 0;
+        }
+        return;
+    }
+
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || commitdates.is_null(row) || receiptdates.is_null(row) {
+            continue;
+        }
+        if commitdates.value(row) >= receiptdates.value(row) {
+            continue;
+        }
+        let orderkey = orderkeys.value(row);
+        if orderkey < 0 {
+            continue;
+        }
+        let Ok(orderkey) = usize::try_from(orderkey) else {
+            continue;
+        };
+        let Some(priority_marker) = candidate_priorities.get_mut(orderkey) else {
+            continue;
+        };
+        if *priority_marker == 0 {
+            continue;
+        }
+        let priority_index = usize::from(*priority_marker - 1);
+        counts[priority_index] += 1;
+        *priority_marker = 0;
+    }
 }
 
 fn q04_priority_count_rows(priority_labels: Vec<String>, counts: Vec<u64>) -> Vec<Q04Row> {
