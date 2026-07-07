@@ -261,6 +261,21 @@ async fn duckdb_differential_join_matrix() {
 
     assert_same_as_duckdb(
         &format!(
+            "SELECT f.id, COALESCE(d.name, 'missing') AS dim_name FROM '{}' f LEFT JOIN '{}' d ON f.key = d.key WHERE f.id IN (1, 3) ORDER BY dim_name",
+            facts_path.display(),
+            dim_path.display()
+        ),
+        &format!(
+            "SELECT f.id, COALESCE(d.name, 'missing') AS dim_name FROM read_parquet('{}') f LEFT JOIN read_parquet('{}') d ON f.key = d.key WHERE f.id IN (1, 3) ORDER BY dim_name",
+            facts_path.display(),
+            dim_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
             "SELECT f.id, f.key FROM '{}' f LEFT SEMI JOIN '{}' d ON f.key = d.key ORDER BY f.id",
             facts_path.display(),
             dim_path.display()
@@ -1461,6 +1476,44 @@ async fn duckdb_differential_extended_type_matrix() {
         tempdir.path(),
     )
     .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, CAST(event_date AS VARCHAR), CAST(created_at AS VARCHAR) FROM '{}' ORDER BY id",
+            types_path.display()
+        ),
+        &format!(
+            "SELECT id, CAST(event_date AS VARCHAR), CAST(created_at AS VARCHAR) FROM read_parquet('{}') ORDER BY id",
+            types_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn duckdb_differential_aggregate_with_subquery_predicate() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let facts_path = tempdir.path().join("facts.parquet");
+    write_facts_parquet(&facts_path);
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT key, count(*), sum(value) FROM '{}' WHERE id IN (SELECT id FROM '{}' WHERE key = 3) GROUP BY key ORDER BY key",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT key, count(*), sum(value) FROM read_parquet('{}') WHERE id IN (SELECT id FROM read_parquet('{}') WHERE key = 3) GROUP BY key ORDER BY key",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1639,6 +1692,19 @@ async fn duckdb_differential_nested_struct_field_projection() {
         ),
         &format!(
             "SELECT id, attrs.rank AS rank, attrs.label AS label FROM read_parquet('{}') ORDER BY id",
+            input_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, array_length(tags) AS tag_count, tags[1] AS first_tag FROM '{}' WHERE attrs.rank > 1 OR tags[1] = 10 ORDER BY id",
+            input_path.display()
+        ),
+        &format!(
+            "SELECT id, array_length(tags) AS tag_count, tags[1] AS first_tag FROM read_parquet('{}') WHERE attrs.rank > 1 OR tags[1] = 10 ORDER BY id",
             input_path.display()
         ),
         tempdir.path(),
@@ -1910,8 +1976,7 @@ fn random_facts_query(rng: &mut TestRng, facts_path: &Path, case_id: usize) -> G
     let duckdb_table = format!("read_parquet('{}')", facts_path.display());
 
     let aggregate = rng.chance(1, 4);
-    let (dodam_predicate, duckdb_predicate) =
-        random_facts_predicate(rng, facts_path, "f", !aggregate);
+    let (dodam_predicate, duckdb_predicate) = random_facts_predicate(rng, facts_path, "f", true);
     let (dodam_sql, duckdb_sql) = if aggregate {
         (
             format!(

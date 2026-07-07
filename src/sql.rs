@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Decimal128Array, DictionaryArray,
-    Float64Array, Int32Array, Int64Array, StringArray, StructArray, TimestampMillisecondArray,
-    UInt64Array,
+    Float64Array, Int32Array, Int64Array, ListArray, StringArray, StructArray,
+    TimestampMillisecondArray, UInt64Array,
 };
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Int32Type, Schema, TimeUnit};
@@ -21,10 +21,10 @@ use memchr::memmem::Finder;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use rayon::prelude::*;
 use sqlparser::ast::{
-    BinaryOperator, DateTimeField, Distinct, DuplicateTreatment, Expr as SqlExpr, FunctionArg,
-    FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, LimitClause,
-    ObjectName, ObjectNamePart, OrderByKind, Query, Select, SelectItem, SetExpr, Statement,
-    TableFactor, UnaryOperator, Value,
+    AccessExpr, BinaryOperator, DateTimeField, Distinct, DuplicateTreatment, Expr as SqlExpr,
+    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator,
+    LimitClause, ObjectName, ObjectNamePart, OrderByKind, Query, Select, SelectItem, SetExpr,
+    Statement, Subscript, TableFactor, UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -335,10 +335,17 @@ pub async fn execute_sql(
         let aggregates = query.aggregates.clone();
         let group_by = query.group_by.clone();
         let join_input_projection = &query.projection;
+        let projection_requires_expression =
+            projection_requires_expression_path(&query.expressions);
+        let input_order_by = if projection_requires_expression {
+            None
+        } else {
+            query.order_by.as_ref()
+        };
         let join_plan = plan_join_inputs(
             join_input_projection,
             query.filter.as_ref(),
-            query.order_by.as_ref(),
+            input_order_by,
             &join.left_alias,
             &join.left_keys,
             &join.right_alias,
@@ -394,8 +401,6 @@ pub async fn execute_sql(
         }
         let mut batches = collect_batches(stream)?;
         batches = apply_output_filter(batches, query.filter.as_ref())?;
-        let projection_requires_expression =
-            projection_requires_expression_path(&query.expressions);
         if projection_requires_expression {
             batches = apply_output_expression_projection(batches, &query.expressions)?;
             batches = apply_output_order_limit(batches, query.order_by.as_ref(), query.limit)?;
@@ -1854,11 +1859,6 @@ async fn try_execute_in_subquery_sql(
     let path = parse_from(select)?;
     let group_by = parse_group_by(select, path.alias.as_deref())?;
     let parsed_projection = parse_projection(select, &group_by, path.alias.as_deref())?;
-    if !parsed_projection.aggregates.is_empty() || !group_by.is_empty() || select.having.is_some() {
-        return Err(DodamError::UnsupportedSql(
-            "IN subquery filters with aggregates are not supported yet".to_string(),
-        ));
-    }
     let distinct = parse_distinct(select)?;
     let selection = select.selection.as_ref().expect("selection checked");
     let filter_requires_expression = predicate_requires_expression_path(selection);
@@ -1890,11 +1890,60 @@ async fn try_execute_in_subquery_sql(
     )?;
 
     let mut scan_projection = parsed_projection.projection.clone();
+    if !parsed_projection.aggregates.is_empty() {
+        for aggregate in &parsed_projection.aggregates {
+            if let Some(column) = aggregate.referenced_column() {
+                add_projection_columns(&mut scan_projection, vec![column.to_string()]);
+            }
+        }
+        for expression in &parsed_projection.aggregate_expressions {
+            for column in scalar_expression_columns(&expression.expr) {
+                add_projection_columns(&mut scan_projection, vec![column]);
+            }
+        }
+    }
     if filter_requires_expression {
         add_projection_columns(
             &mut scan_projection,
             predicate_expression_columns(selection, path.alias.as_deref())?,
         );
+    }
+
+    if !parsed_projection.aggregates.is_empty() || !group_by.is_empty() || select.having.is_some() {
+        let stream = engine
+            .scan_parquet_batches(path.path, batch_size, None, scan_projection, filter)
+            .await?;
+        let mut batches = collect_batches(stream)?;
+        for expression_filter in expression_filters {
+            batches =
+                apply_output_expression_filter(batches, &expression_filter, path.alias.as_deref())?;
+        }
+        batches =
+            append_aggregate_expression_columns(batches, &parsed_projection.aggregate_expressions)?;
+        let stream = Box::new(MemoryExec::new(batches)).execute()?;
+        let metrics = if group_by.is_empty() {
+            collect_aggregates(stream, 1, &parsed_projection.aggregates)?
+        } else {
+            collect_grouped_aggregates(stream, 1, &group_by, &parsed_projection.aggregates)?
+        };
+        let mut batches =
+            aggregate_metrics_to_batches(&metrics, &group_by, &parsed_projection.aggregates)?;
+        let having = select
+            .having
+            .as_ref()
+            .map(|expr| parse_filter(expr, &parsed_projection.aliases, None, true))
+            .transpose()?;
+        batches = apply_output_filter(batches, having.as_ref())?;
+        let has_output_expressions =
+            projection_requires_expression_path(&parsed_projection.expressions);
+        if has_output_expressions {
+            batches = apply_output_expression_projection(batches, &parsed_projection.expressions)?;
+        }
+        batches = apply_output_order_limit(batches, order_by.as_ref(), limit)?;
+        if !has_output_expressions {
+            batches = rename_output_batches(batches, &parsed_projection.aliases)?;
+        }
+        return Ok(Some(QueryOutput::Aggregate { metrics, batches }));
     }
 
     let stream = if distinct {
@@ -2165,10 +2214,11 @@ fn predicate_requires_expression_path(expr: &SqlExpr) -> bool {
 }
 
 fn scalar_predicate_side_requires_expression(expr: &SqlExpr) -> bool {
-    !matches!(
-        expr,
-        SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_)
-    ) && sql_literal_value(expr).is_err()
+    match expr {
+        SqlExpr::Identifier(_) => false,
+        SqlExpr::CompoundIdentifier(parts) => parts.len() > 1,
+        _ => sql_literal_value(expr).is_err(),
+    }
 }
 
 fn add_projection_columns(projection: &mut Projection, columns: Vec<String>) {
@@ -2203,7 +2253,18 @@ fn collect_predicate_expression_columns(
             collect_predicate_expression_columns(expr, table_alias, columns)?;
         }
         SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
-            add_column_once(columns, sql_column_name(expr, table_alias)?);
+            if let Some((column, _)) = parse_struct_field_access(expr, table_alias)? {
+                add_column_once(columns, column);
+            } else {
+                add_column_once(columns, sql_column_name(expr, table_alias)?);
+            }
+        }
+        SqlExpr::CompoundFieldAccess { .. } => {
+            for column in
+                scalar_expression_columns(&parse_scalar_sql_expression(expr, table_alias)?)
+            {
+                add_column_once(columns, column);
+            }
         }
         SqlExpr::Function(function) => {
             if let Some(expression) = parse_scalar_function_projection(function, None, table_alias)?
@@ -34454,6 +34515,7 @@ fn parse_join_projection(
                         for column in join_scalar_expression_columns(&expr.expr, table_aliases)? {
                             add_column_once(&mut columns, column);
                         }
+                        aliases.push((alias.value.clone(), alias.value.clone()));
                         expressions.push(expr);
                     } else {
                         let (aggregate, expression) = parse_join_aggregate_with_input_expression(
@@ -34615,12 +34677,10 @@ fn parse_join_order_by(
             }
             let column = match &order.expr {
                 SqlExpr::Identifier(ident) => {
-                    let resolved = resolve_alias(&ident.value, aliases);
-                    if resolved == ident.value {
-                        join_column_name(&order.expr, table_aliases)?
-                    } else {
-                        resolved
-                    }
+                    alias_target(&ident.value, aliases)
+                        .cloned()
+                        .map(Ok)
+                        .unwrap_or_else(|| join_column_name(&order.expr, table_aliases))?
                 }
                 SqlExpr::CompoundIdentifier(_) => join_column_name(&order.expr, table_aliases)?,
                 SqlExpr::Function(function) => resolve_alias(
@@ -34842,14 +34902,10 @@ fn join_filter_column(
     allow_aggregates: bool,
 ) -> Result<String> {
     match expr {
-        SqlExpr::Identifier(ident) => {
-            let resolved = resolve_alias(&ident.value, aliases);
-            if resolved == ident.value {
-                join_column_name(expr, table_aliases)
-            } else {
-                Ok(resolved)
-            }
-        }
+        SqlExpr::Identifier(ident) => alias_target(&ident.value, aliases)
+            .cloned()
+            .map(Ok)
+            .unwrap_or_else(|| join_column_name(expr, table_aliases)),
         SqlExpr::CompoundIdentifier(_) => join_column_name(expr, table_aliases),
         SqlExpr::Function(function) if allow_aggregates => {
             let function_name = function.to_string();
@@ -35219,6 +35275,11 @@ enum ScalarSqlExpression {
         column: String,
         field: String,
     },
+    ListIndex {
+        column: String,
+        index: usize,
+    },
+    ListLength(String),
     Literal(LiteralValue),
     Binary {
         left: Box<ScalarSqlExpression>,
@@ -35495,7 +35556,7 @@ fn parse_scalar_function_projection(
     let lowercase_name = name.to_ascii_lowercase();
     if !matches!(
         lowercase_name.as_str(),
-        "coalesce" | "lower" | "upper" | "length"
+        "coalesce" | "lower" | "upper" | "length" | "array_length" | "list_length"
     ) {
         return Ok(None);
     }
@@ -35543,7 +35604,7 @@ fn parse_scalar_function_projection(
             }
             ScalarSqlExpression::Coalesce(values)
         }
-        "lower" | "upper" | "length" => {
+        "lower" | "upper" | "length" | "array_length" | "list_length" => {
             let [value] = values.as_slice() else {
                 return Err(DodamError::UnsupportedSql(format!(
                     "{name} requires exactly one argument"
@@ -35553,6 +35614,14 @@ fn parse_scalar_function_projection(
                 "lower" => ScalarSqlExpression::Lower(Box::new(value.clone())),
                 "upper" => ScalarSqlExpression::Upper(Box::new(value.clone())),
                 "length" => ScalarSqlExpression::Length(Box::new(value.clone())),
+                "array_length" | "list_length" => {
+                    let ScalarSqlExpression::Column(column) = value else {
+                        return Err(DodamError::UnsupportedSql(format!(
+                            "{name} currently requires a list column"
+                        )));
+                    };
+                    ScalarSqlExpression::ListLength(column.clone())
+                }
                 _ => unreachable!("validated scalar function"),
             }
         }
@@ -35647,6 +35716,14 @@ fn parse_scalar_sql_expression(
     table_alias: Option<&str>,
 ) -> Result<ScalarSqlExpression> {
     match expr {
+        SqlExpr::CompoundFieldAccess { .. } => {
+            let Some((column, index)) = parse_list_index_access(expr, table_alias)? else {
+                return Err(DodamError::UnsupportedSql(format!(
+                    "unsupported nested/list expression: {expr}"
+                )));
+            };
+            Ok(ScalarSqlExpression::ListIndex { column, index })
+        }
         SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
             if let Some((column, field)) = parse_struct_field_access(expr, table_alias)? {
                 Ok(ScalarSqlExpression::StructField { column, field })
@@ -35871,6 +35948,40 @@ fn parse_struct_field_access(
     }
 }
 
+fn parse_list_index_access(
+    expr: &SqlExpr,
+    table_alias: Option<&str>,
+) -> Result<Option<(String, usize)>> {
+    let SqlExpr::CompoundFieldAccess { root, access_chain } = expr else {
+        return Ok(None);
+    };
+    let [AccessExpr::Subscript(Subscript::Index { index })] = access_chain.as_slice() else {
+        return Ok(None);
+    };
+    let column = sql_column_name(root, table_alias)?;
+    let SqlExpr::Value(value) = index else {
+        return Err(DodamError::UnsupportedSql(format!(
+            "list index must be a positive integer literal, got {index}"
+        )));
+    };
+    let Value::Number(raw, _) = &value.value else {
+        return Err(DodamError::UnsupportedSql(format!(
+            "list index must be a positive integer literal, got {index}"
+        )));
+    };
+    let index = raw.parse::<usize>().map_err(|_| {
+        DodamError::UnsupportedSql(format!(
+            "list index must be a positive integer literal, got {index}"
+        ))
+    })?;
+    if index == 0 {
+        return Err(DodamError::UnsupportedSql(
+            "list indexes are 1-based and must be positive".to_string(),
+        ));
+    }
+    Ok(Some((column, index)))
+}
+
 fn parse_join_aggregate_output_expression(
     expr: &SqlExpr,
     table_aliases: &[&str],
@@ -36052,6 +36163,9 @@ fn collect_join_scalar_expression_columns(
     match expr {
         ScalarSqlExpression::Column(column) => add_column_once(columns, column.clone()),
         ScalarSqlExpression::StructField { column, .. } => add_column_once(columns, column.clone()),
+        ScalarSqlExpression::ListIndex { column, .. } | ScalarSqlExpression::ListLength(column) => {
+            add_column_once(columns, column.clone())
+        }
         ScalarSqlExpression::Literal(_) => {}
         ScalarSqlExpression::Binary { left, right, .. } => {
             collect_join_scalar_expression_columns(left, table_aliases, columns)?;
@@ -36134,6 +36248,9 @@ fn collect_scalar_expression_columns(expr: &ScalarSqlExpression, columns: &mut V
     match expr {
         ScalarSqlExpression::Column(column) => add_column_once(columns, column.clone()),
         ScalarSqlExpression::StructField { column, .. } => add_column_once(columns, column.clone()),
+        ScalarSqlExpression::ListIndex { column, .. } | ScalarSqlExpression::ListLength(column) => {
+            add_column_once(columns, column.clone())
+        }
         ScalarSqlExpression::Literal(_) => {}
         ScalarSqlExpression::Binary { left, right, .. } => {
             collect_scalar_expression_columns(left, columns);
@@ -36188,7 +36305,9 @@ fn scalar_expression_references_aggregate(
         ScalarSqlExpression::Column(column) => aggregates
             .iter()
             .any(|aggregate| column == &aggregate.to_string()),
-        ScalarSqlExpression::StructField { .. } => false,
+        ScalarSqlExpression::StructField { .. }
+        | ScalarSqlExpression::ListIndex { .. }
+        | ScalarSqlExpression::ListLength(_) => false,
         ScalarSqlExpression::Literal(_) => false,
         ScalarSqlExpression::Binary { left, right, .. } => {
             scalar_expression_references_aggregate(left, aggregates)
@@ -36657,11 +36776,16 @@ fn parse_order_expr(
 }
 
 fn resolve_alias(name: &str, aliases: &[(String, String)]) -> String {
+    alias_target(name, aliases)
+        .cloned()
+        .unwrap_or_else(|| name.to_string())
+}
+
+fn alias_target<'a>(name: &str, aliases: &'a [(String, String)]) -> Option<&'a String> {
     aliases
         .iter()
         .find(|(alias, _)| alias == name)
-        .map(|(_, target)| target.clone())
-        .unwrap_or_else(|| name.to_string())
+        .map(|(_, target)| target)
 }
 
 fn parse_limit(query: &Query) -> Result<Option<usize>> {
@@ -37943,6 +38067,8 @@ enum EvaluatedScalar {
     Float64(Vec<Option<f64>>),
     Utf8(Vec<Option<String>>),
     Boolean(Vec<Option<bool>>),
+    Date32(Vec<Option<i32>>),
+    TimestampMillisecond(Vec<Option<i64>>),
 }
 
 impl EvaluatedScalar {
@@ -37952,6 +38078,8 @@ impl EvaluatedScalar {
             Self::Float64(values) => values.len(),
             Self::Utf8(values) => values.len(),
             Self::Boolean(values) => values.len(),
+            Self::Date32(values) => values.len(),
+            Self::TimestampMillisecond(values) => values.len(),
         }
     }
 
@@ -37961,6 +38089,8 @@ impl EvaluatedScalar {
             Self::Float64(_) => DataType::Float64,
             Self::Utf8(_) => DataType::Utf8,
             Self::Boolean(_) => DataType::Boolean,
+            Self::Date32(_) => DataType::Date32,
+            Self::TimestampMillisecond(_) => DataType::Timestamp(TimeUnit::Millisecond, None),
         }
     }
 
@@ -37970,6 +38100,8 @@ impl EvaluatedScalar {
             Self::Float64(values) => values.iter().any(Option::is_none),
             Self::Utf8(values) => values.iter().any(Option::is_none),
             Self::Boolean(values) => values.iter().any(Option::is_none),
+            Self::Date32(values) => values.iter().any(Option::is_none),
+            Self::TimestampMillisecond(values) => values.iter().any(Option::is_none),
         }
     }
 
@@ -37979,6 +38111,10 @@ impl EvaluatedScalar {
             Self::Float64(values) => Arc::new(Float64Array::from(values)) as ArrayRef,
             Self::Utf8(values) => Arc::new(StringArray::from(values)) as ArrayRef,
             Self::Boolean(values) => Arc::new(BooleanArray::from(values)) as ArrayRef,
+            Self::Date32(values) => Arc::new(Date32Array::from(values)) as ArrayRef,
+            Self::TimestampMillisecond(values) => {
+                Arc::new(TimestampMillisecondArray::from(values)) as ArrayRef
+            }
         }
     }
 }
@@ -37992,6 +38128,10 @@ fn evaluate_scalar_expression(
         ScalarSqlExpression::StructField { column, field } => {
             evaluated_struct_field(batch, column, field)
         }
+        ScalarSqlExpression::ListIndex { column, index } => {
+            evaluated_list_index(batch, column, *index)
+        }
+        ScalarSqlExpression::ListLength(column) => evaluated_list_length(batch, column),
         ScalarSqlExpression::Literal(value) => Ok(evaluated_literal(value, batch.num_rows())),
         ScalarSqlExpression::Binary { left, op, right } => {
             if decimal_expression_fast_enabled()
@@ -38426,6 +38566,8 @@ enum ScalarValue {
     Float64(f64),
     Utf8(String),
     Boolean(bool),
+    Date32(i32),
+    TimestampMillisecond(i64),
 }
 
 fn scalar_value_at(value: &EvaluatedScalar, row: usize) -> Result<Option<ScalarValue>> {
@@ -38434,6 +38576,10 @@ fn scalar_value_at(value: &EvaluatedScalar, row: usize) -> Result<Option<ScalarV
         EvaluatedScalar::Float64(values) => values[row].map(ScalarValue::Float64),
         EvaluatedScalar::Utf8(values) => values[row].clone().map(ScalarValue::Utf8),
         EvaluatedScalar::Boolean(values) => values[row].map(ScalarValue::Boolean),
+        EvaluatedScalar::Date32(values) => values[row].map(ScalarValue::Date32),
+        EvaluatedScalar::TimestampMillisecond(values) => {
+            values[row].map(ScalarValue::TimestampMillisecond)
+        }
     })
 }
 
@@ -38445,6 +38591,20 @@ fn cast_scalar_for_kind(
         EvaluatedScalarKind::Int64 => Ok(EvaluatedScalar::Int64(scalar_as_i64(value)?)),
         EvaluatedScalarKind::Float64 => Ok(EvaluatedScalar::Float64(scalar_as_f64(value)?)),
         EvaluatedScalarKind::Utf8 => Ok(EvaluatedScalar::Utf8(scalar_as_utf8(value)?)),
+        EvaluatedScalarKind::Date32 => match value {
+            EvaluatedScalar::Date32(_) => Ok(value),
+            other => Err(DodamError::UnsupportedSql(format!(
+                "cannot use {} in date IN list",
+                other.data_type()
+            ))),
+        },
+        EvaluatedScalarKind::TimestampMillisecond => match value {
+            EvaluatedScalar::TimestampMillisecond(_) => Ok(value),
+            other => Err(DodamError::UnsupportedSql(format!(
+                "cannot use {} in timestamp IN list",
+                other.data_type()
+            ))),
+        },
         EvaluatedScalarKind::Boolean => match value {
             EvaluatedScalar::Boolean(_) => Ok(value),
             other => Err(DodamError::UnsupportedSql(format!(
@@ -38461,6 +38621,8 @@ enum EvaluatedScalarKind {
     Float64,
     Utf8,
     Boolean,
+    Date32,
+    TimestampMillisecond,
 }
 
 fn evaluated_scalar_kind(value: &EvaluatedScalar) -> Option<EvaluatedScalarKind> {
@@ -38469,6 +38631,8 @@ fn evaluated_scalar_kind(value: &EvaluatedScalar) -> Option<EvaluatedScalarKind>
         EvaluatedScalar::Float64(_) => EvaluatedScalarKind::Float64,
         EvaluatedScalar::Utf8(_) => EvaluatedScalarKind::Utf8,
         EvaluatedScalar::Boolean(_) => EvaluatedScalarKind::Boolean,
+        EvaluatedScalar::Date32(_) => EvaluatedScalarKind::Date32,
+        EvaluatedScalar::TimestampMillisecond(_) => EvaluatedScalarKind::TimestampMillisecond,
     })
 }
 
@@ -38478,6 +38642,10 @@ fn empty_scalar_values(kind: EvaluatedScalarKind, rows: usize) -> EvaluatedScala
         EvaluatedScalarKind::Float64 => EvaluatedScalar::Float64(vec![None; rows]),
         EvaluatedScalarKind::Utf8 => EvaluatedScalar::Utf8(vec![None; rows]),
         EvaluatedScalarKind::Boolean => EvaluatedScalar::Boolean(vec![None; rows]),
+        EvaluatedScalarKind::Date32 => EvaluatedScalar::Date32(vec![None; rows]),
+        EvaluatedScalarKind::TimestampMillisecond => {
+            EvaluatedScalar::TimestampMillisecond(vec![None; rows])
+        }
     }
 }
 
@@ -38511,6 +38679,18 @@ fn set_scalar_value_from(
                 .transpose()?
                 .flatten();
         }
+        EvaluatedScalar::Date32(values) => {
+            values[row] = source
+                .map(|source| scalar_value_as_date32(source, row))
+                .transpose()?
+                .flatten();
+        }
+        EvaluatedScalar::TimestampMillisecond(values) => {
+            values[row] = source
+                .map(|source| scalar_value_as_timestamp_millis(source, row))
+                .transpose()?
+                .flatten();
+        }
     }
     Ok(())
 }
@@ -38540,12 +38720,34 @@ fn scalar_value_as_utf8(value: &EvaluatedScalar, row: usize) -> Result<Option<St
         EvaluatedScalar::Float64(values) => Ok(values[row].map(|value| value.to_string())),
         EvaluatedScalar::Utf8(values) => Ok(values[row].clone()),
         EvaluatedScalar::Boolean(values) => Ok(values[row].map(|value| value.to_string())),
+        EvaluatedScalar::Date32(values) => Ok(values[row].map(format_date32_days)),
+        EvaluatedScalar::TimestampMillisecond(values) => {
+            Ok(values[row].map(format_timestamp_millis))
+        }
     }
 }
 
 fn scalar_value_as_bool(value: &EvaluatedScalar, row: usize) -> Result<Option<bool>> {
     match value {
         EvaluatedScalar::Boolean(values) => Ok(values[row]),
+        _ => Err(DodamError::UnsupportedSql(
+            "CASE result type mismatch".to_string(),
+        )),
+    }
+}
+
+fn scalar_value_as_date32(value: &EvaluatedScalar, row: usize) -> Result<Option<i32>> {
+    match value {
+        EvaluatedScalar::Date32(values) => Ok(values[row]),
+        _ => Err(DodamError::UnsupportedSql(
+            "CASE result type mismatch".to_string(),
+        )),
+    }
+}
+
+fn scalar_value_as_timestamp_millis(value: &EvaluatedScalar, row: usize) -> Result<Option<i64>> {
+    match value {
+        EvaluatedScalar::TimestampMillisecond(values) => Ok(values[row]),
         _ => Err(DodamError::UnsupportedSql(
             "CASE result type mismatch".to_string(),
         )),
@@ -38612,20 +38814,15 @@ fn evaluated_column(batch: &RecordBatch, column: &str) -> Result<EvaluatedScalar
                 .as_any()
                 .downcast_ref::<Date32Array>()
                 .expect("Date32");
-            Ok(EvaluatedScalar::Int64(
-                values.iter().map(|value| value.map(i64::from)).collect(),
-            ))
+            Ok(EvaluatedScalar::Date32(values.iter().collect()))
         }
         DataType::Date64 => {
             let values = array
                 .as_any()
                 .downcast_ref::<Date64Array>()
                 .expect("Date64");
-            Ok(EvaluatedScalar::Int64(
-                values
-                    .iter()
-                    .map(|value| value.map(|value| value / 86_400_000))
-                    .collect(),
+            Ok(EvaluatedScalar::TimestampMillisecond(
+                values.iter().collect(),
             ))
         }
         DataType::Timestamp(TimeUnit::Millisecond, _) => {
@@ -38633,11 +38830,8 @@ fn evaluated_column(batch: &RecordBatch, column: &str) -> Result<EvaluatedScalar
                 .as_any()
                 .downcast_ref::<TimestampMillisecondArray>()
                 .expect("TimestampMillisecond");
-            Ok(EvaluatedScalar::Int64(
-                values
-                    .iter()
-                    .map(|value| value.map(|value| value / 86_400_000))
-                    .collect(),
+            Ok(EvaluatedScalar::TimestampMillisecond(
+                values.iter().collect(),
             ))
         }
         data_type => Err(DodamError::UnsupportedSql(format!(
@@ -38673,6 +38867,110 @@ fn evaluated_struct_field(
         return Err(DodamError::UnknownColumn(format!("{column}.{field}")));
     };
     evaluated_array(struct_array.column(field_index).as_ref())
+}
+
+fn evaluated_list_length(batch: &RecordBatch, column: &str) -> Result<EvaluatedScalar> {
+    let list = list_array_column(batch, column)?;
+    Ok(EvaluatedScalar::Int64(
+        (0..list.len())
+            .map(|row| {
+                if list.is_null(row) {
+                    None
+                } else {
+                    Some(i64::from(list.value_length(row)))
+                }
+            })
+            .collect(),
+    ))
+}
+
+fn evaluated_list_index(
+    batch: &RecordBatch,
+    column: &str,
+    index: usize,
+) -> Result<EvaluatedScalar> {
+    let list = list_array_column(batch, column)?;
+    let values = list.values();
+    match values.data_type() {
+        DataType::Int32 => {
+            let values = values.as_any().downcast_ref::<Int32Array>().expect("Int32");
+            Ok(EvaluatedScalar::Int64(
+                list_element_indices(list, index)
+                    .into_iter()
+                    .map(|value_index| {
+                        value_index.and_then(|value_index| {
+                            values
+                                .is_valid(value_index)
+                                .then(|| i64::from(values.value(value_index)))
+                        })
+                    })
+                    .collect(),
+            ))
+        }
+        DataType::Int64 => {
+            let values = values.as_any().downcast_ref::<Int64Array>().expect("Int64");
+            Ok(EvaluatedScalar::Int64(
+                list_element_indices(list, index)
+                    .into_iter()
+                    .map(|value_index| {
+                        value_index.and_then(|value_index| {
+                            values
+                                .is_valid(value_index)
+                                .then(|| values.value(value_index))
+                        })
+                    })
+                    .collect(),
+            ))
+        }
+        DataType::Utf8 => {
+            let values = values.as_any().downcast_ref::<StringArray>().expect("Utf8");
+            Ok(EvaluatedScalar::Utf8(
+                list_element_indices(list, index)
+                    .into_iter()
+                    .map(|value_index| {
+                        value_index.and_then(|value_index| {
+                            values
+                                .is_valid(value_index)
+                                .then(|| values.value(value_index).to_string())
+                        })
+                    })
+                    .collect(),
+            ))
+        }
+        data_type => Err(DodamError::UnsupportedSql(format!(
+            "list index over {data_type} values is not supported yet"
+        ))),
+    }
+}
+
+fn list_array_column<'a>(batch: &'a RecordBatch, column: &str) -> Result<&'a ListArray> {
+    let index = batch
+        .schema()
+        .fields()
+        .iter()
+        .position(|schema_field| schema_field.name() == column)
+        .ok_or_else(|| DodamError::UnknownColumn(column.to_string()))?;
+    batch
+        .column(index)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| DodamError::UnsupportedSql(format!("{column} requires a LIST column")))
+}
+
+fn list_element_indices(list: &ListArray, index: usize) -> Vec<Option<usize>> {
+    (0..list.len())
+        .map(|row| {
+            if list.is_null(row) {
+                return None;
+            }
+            let len = usize::try_from(list.value_length(row)).ok()?;
+            if index > len {
+                return None;
+            }
+            let offset = usize::try_from(list.value_offsets()[row]).ok()?;
+            Some(offset + index - 1)
+        })
+        .collect()
 }
 
 fn evaluated_array(array: &dyn Array) -> Result<EvaluatedScalar> {
@@ -38827,6 +39125,12 @@ fn scalar_null_mask(value: EvaluatedScalar) -> Vec<bool> {
         EvaluatedScalar::Boolean(values) => {
             values.into_iter().map(|value| value.is_none()).collect()
         }
+        EvaluatedScalar::Date32(values) => {
+            values.into_iter().map(|value| value.is_none()).collect()
+        }
+        EvaluatedScalar::TimestampMillisecond(values) => {
+            values.into_iter().map(|value| value.is_none()).collect()
+        }
     }
 }
 
@@ -38881,6 +39185,11 @@ fn evaluate_binary_scalar(
 fn scalar_as_i64(value: EvaluatedScalar) -> Result<Vec<Option<i64>>> {
     match value {
         EvaluatedScalar::Int64(values) => Ok(values),
+        EvaluatedScalar::Date32(values) => Ok(values
+            .into_iter()
+            .map(|value| value.map(i64::from))
+            .collect()),
+        EvaluatedScalar::TimestampMillisecond(values) => Ok(values),
         other => Err(DodamError::UnsupportedSql(format!(
             "cannot use {} in integer arithmetic",
             other.data_type()
@@ -38895,6 +39204,14 @@ fn scalar_as_f64(value: EvaluatedScalar) -> Result<Vec<Option<f64>>> {
             .map(|value| value.map(|value| value as f64))
             .collect()),
         EvaluatedScalar::Float64(values) => Ok(values),
+        EvaluatedScalar::Date32(values) => Ok(values
+            .into_iter()
+            .map(|value| value.map(f64::from))
+            .collect()),
+        EvaluatedScalar::TimestampMillisecond(values) => Ok(values
+            .into_iter()
+            .map(|value| value.map(|value| value as f64))
+            .collect()),
         other => Err(DodamError::UnsupportedSql(format!(
             "cannot use {} in floating point arithmetic",
             other.data_type()
@@ -38921,6 +39238,14 @@ fn cast_evaluated_scalar(value: EvaluatedScalar, target: &str) -> Result<Evaluat
             EvaluatedScalar::Boolean(values) => values
                 .into_iter()
                 .map(|value| value.map(|value| value.to_string()))
+                .collect(),
+            EvaluatedScalar::Date32(values) => values
+                .into_iter()
+                .map(|value| value.map(format_date32_days))
+                .collect(),
+            EvaluatedScalar::TimestampMillisecond(values) => values
+                .into_iter()
+                .map(|value| value.map(format_timestamp_millis))
                 .collect(),
         }));
     }
@@ -38949,6 +39274,11 @@ fn cast_evaluated_scalar(value: EvaluatedScalar, target: &str) -> Result<Evaluat
                 .into_iter()
                 .map(|value| value.map(i64::from))
                 .collect(),
+            EvaluatedScalar::Date32(values) => values
+                .into_iter()
+                .map(|value| value.map(i64::from))
+                .collect(),
+            EvaluatedScalar::TimestampMillisecond(values) => values,
         }));
     }
     if matches!(target.as_str(), "double" | "float8" | "float" | "real") {
@@ -38975,6 +39305,14 @@ fn cast_evaluated_scalar(value: EvaluatedScalar, target: &str) -> Result<Evaluat
             EvaluatedScalar::Boolean(values) => values
                 .into_iter()
                 .map(|value| value.map(|value| if value { 1.0 } else { 0.0 }))
+                .collect(),
+            EvaluatedScalar::Date32(values) => values
+                .into_iter()
+                .map(|value| value.map(f64::from))
+                .collect(),
+            EvaluatedScalar::TimestampMillisecond(values) => values
+                .into_iter()
+                .map(|value| value.map(|value| value as f64))
                 .collect(),
         }));
     }
@@ -39010,6 +39348,15 @@ fn coalesce_evaluated_scalar(
         (EvaluatedScalar::Boolean(left), EvaluatedScalar::Boolean(right)) => {
             Ok(EvaluatedScalar::Boolean(coalesce_options(left, right)))
         }
+        (EvaluatedScalar::Date32(left), EvaluatedScalar::Date32(right)) => {
+            Ok(EvaluatedScalar::Date32(coalesce_options(left, right)))
+        }
+        (
+            EvaluatedScalar::TimestampMillisecond(left),
+            EvaluatedScalar::TimestampMillisecond(right),
+        ) => Ok(EvaluatedScalar::TimestampMillisecond(coalesce_options(
+            left, right,
+        ))),
         (left, right) => Err(DodamError::UnsupportedSql(format!(
             "cannot COALESCE {} and {}",
             left.data_type(),
@@ -39033,7 +39380,42 @@ fn scalar_as_utf8(value: EvaluatedScalar) -> Result<Vec<Option<String>>> {
             .into_iter()
             .map(|value| value.map(|value| value.to_string()))
             .collect(),
+        EvaluatedScalar::Date32(values) => values
+            .into_iter()
+            .map(|value| value.map(format_date32_days))
+            .collect(),
+        EvaluatedScalar::TimestampMillisecond(values) => values
+            .into_iter()
+            .map(|value| value.map(format_timestamp_millis))
+            .collect(),
     })
+}
+
+fn format_date32_days(days: i32) -> String {
+    match civil_from_days(i64::from(days)) {
+        Ok((year, month, day)) => format!("{year:04}-{month:02}-{day:02}"),
+        Err(_) => days.to_string(),
+    }
+}
+
+fn format_timestamp_millis(millis: i64) -> String {
+    let days = millis.div_euclid(86_400_000);
+    let millis_of_day = millis.rem_euclid(86_400_000);
+    let Ok((year, month, day)) = civil_from_days(days) else {
+        return millis.to_string();
+    };
+    let seconds_of_day = millis_of_day / 1_000;
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    let millis_remainder = millis_of_day % 1_000;
+    if millis_remainder == 0 {
+        format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
+    } else {
+        format!(
+            "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{millis_remainder:03}"
+        )
+    }
 }
 
 fn coalesce_options<T>(left: Vec<Option<T>>, right: Vec<Option<T>>) -> Vec<Option<T>> {
