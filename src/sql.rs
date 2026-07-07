@@ -19639,7 +19639,7 @@ async fn q07_volume_rows_late_materialized(
     pruning_predicates: Vec<Expr>,
 ) -> Result<Option<FastHashMap<(i64, i64, i32), f64>>> {
     let Some(chunks) = engine
-        .late_materialized_parquet_map_pruned_with_policy(
+        .late_materialized_parquet_map_pruned_with_policy_view(
             path,
             batch_size,
             Projection::Columns(vec![
@@ -19669,10 +19669,10 @@ async fn q07_volume_rows_late_materialized(
                     year_cache: Date32YearCache::default(),
                 }
             },
-            move |batch, selection, state| {
-                q07_late_build_selection_batch(batch, selection, state, start_days, end_days)
+            move |view, selection, state| {
+                q07_late_build_selection_view(view, selection, state, start_days, end_days)
             },
-            q07_late_consume_payload_batch,
+            q07_late_consume_payload_view,
             |state, metrics| {
                 if state.payload_offset != state.selected_rows.len() {
                     return Err(DodamError::UnsupportedSql(
@@ -19832,6 +19832,73 @@ fn q07_late_build_selection_batch(
     Ok(Some(()))
 }
 
+fn q07_late_build_selection_view(
+    view: BatchView<'_>,
+    selection: &mut LateSelectionBuilder,
+    state: &mut Q07LateState,
+    start_days: i32,
+    end_days: i32,
+) -> Result<Option<()>> {
+    if view.num_columns() == 3
+        && let (Ok(orderkeys), Ok(suppkeys), Ok(shipdates)) = (
+            view.required_i64(0),
+            view.required_i64(1),
+            view.required_date32(2),
+        )
+    {
+        if orderkeys.null_count() == 0 && suppkeys.null_count() == 0 && shipdates.null_count() == 0
+        {
+            let orderkey_values = orderkeys.values().as_ref();
+            let suppkey_values = suppkeys.values().as_ref();
+            let shipdate_values = shipdates.values().as_ref();
+            for row in 0..orderkey_values.len() {
+                let selected = q07_late_selected_row(
+                    orderkey_values[row],
+                    suppkey_values[row],
+                    shipdate_values[row],
+                    state,
+                    start_days,
+                    end_days,
+                );
+                if let Some(row) = selected {
+                    selection.push(true);
+                    state.selected_rows.push(row);
+                } else {
+                    selection.push(false);
+                }
+            }
+            return Ok(Some(()));
+        }
+    }
+    q07_late_build_selection_batch(
+        view.record_batch().clone(),
+        selection,
+        state,
+        start_days,
+        end_days,
+    )
+}
+
+fn q07_late_selected_row(
+    orderkey: i64,
+    suppkey: i64,
+    shipdate: i32,
+    state: &Q07LateState,
+    start_days: i32,
+    end_days: i32,
+) -> Option<Q07LateSelectedRow> {
+    if shipdate < start_days || shipdate > end_days {
+        return None;
+    }
+    let supp_nation_key = state.supplier_nations.get(suppkey)?;
+    let cust_nation_key = *state.order_customer_nations.get(&orderkey)?;
+    (supp_nation_key != cust_nation_key).then_some(Q07LateSelectedRow {
+        supp_nation_key,
+        cust_nation_key,
+        shipdate,
+    })
+}
+
 fn q07_late_consume_payload_batch(
     batch: RecordBatch,
     state: &mut Q07LateState,
@@ -19893,6 +19960,77 @@ fn q07_late_consume_payload_batch(
             .or_insert(0.0) += extendedprice * (1.0 - discount);
     }
     Ok(Some(()))
+}
+
+fn q07_late_consume_payload_view(
+    view: BatchView<'_>,
+    state: &mut Q07LateState,
+) -> Result<Option<()>> {
+    if view.num_columns() == 2
+        && let (Some(extendedprices), Some(discounts)) = (
+            decimal_input(view.column(0)?)?,
+            decimal_input(view.column(1)?)?,
+        )
+    {
+        q07_late_consume_payload_typed(extendedprices, discounts, state)?;
+        return Ok(Some(()));
+    }
+    q07_late_consume_payload_batch(view.record_batch().clone(), state)
+}
+
+fn q07_late_consume_payload_typed(
+    extendedprices: DecimalInput<'_>,
+    discounts: DecimalInput<'_>,
+    state: &mut Q07LateState,
+) -> Result<()> {
+    if extendedprices.null_count() == 0 && discounts.null_count() == 0 {
+        let extendedprice_values = extendedprices.raw_values();
+        let discount_values = discounts.raw_values();
+        let (discount_scale, revenue_scale) =
+            decimal_discounted_revenue_scales(extendedprices, discounts);
+        for row in 0..extendedprice_values.len() {
+            let Some(selected) = state.selected_rows.get(state.payload_offset).copied() else {
+                return Err(DodamError::UnsupportedSql(
+                    "Q07 payload row overflow".to_string(),
+                ));
+            };
+            state.payload_offset += 1;
+            *state
+                .groups
+                .entry((
+                    selected.supp_nation_key,
+                    selected.cust_nation_key,
+                    state.year_cache.year(selected.shipdate)?,
+                ))
+                .or_insert(0.0) += decimal_discounted_revenue_raw(
+                extendedprice_values[row],
+                discount_values[row],
+                discount_scale,
+                revenue_scale,
+            );
+        }
+        return Ok(());
+    }
+    for row in 0..extendedprices.raw_values().len() {
+        let Some(selected) = state.selected_rows.get(state.payload_offset).copied() else {
+            return Err(DodamError::UnsupportedSql(
+                "Q07 payload row overflow".to_string(),
+            ));
+        };
+        state.payload_offset += 1;
+        if extendedprices.is_null(row) || discounts.is_null(row) {
+            continue;
+        }
+        *state
+            .groups
+            .entry((
+                selected.supp_nation_key,
+                selected.cust_nation_key,
+                state.year_cache.year(selected.shipdate)?,
+            ))
+            .or_insert(0.0) += extendedprices.value(row) * (1.0 - discounts.value(row));
+    }
+    Ok(())
 }
 
 fn q07_log_late_materialized_profile(metrics: LateMaterializedMetrics, row_group_chunk: usize) {
@@ -20762,7 +20900,7 @@ async fn q08_market_share_rows_late_materialized(
     let part_keys = Arc::new(AdaptiveI64Set::from_hash(part_keys.clone()));
     let supplier_is_brazil = Arc::new(AdaptiveI64Map::from_hash(supplier_is_brazil.clone()));
     let Some(chunks) = engine
-        .late_materialized_parquet_map_with_policy(
+        .late_materialized_parquet_map_pruned_with_policy_view(
             path,
             batch_size,
             Projection::Columns(vec!["l_partkey".to_string()]),
@@ -20772,6 +20910,7 @@ async fn q08_market_share_rows_late_materialized(
                 "l_extendedprice".to_string(),
                 "l_discount".to_string(),
             ]),
+            Vec::new(),
             q08_late_row_group_chunk(),
             LateMaterializationPolicy::selective_with_selector_run_ratio(
                 q08_late_max_selected_ratio(),
@@ -20788,8 +20927,8 @@ async fn q08_market_share_rows_late_materialized(
                     groups: HashMap::new(),
                 }
             },
-            q08_late_build_partkey_selection_batch,
-            q08_late_consume_market_payload_batch,
+            q08_late_build_partkey_selection_view,
+            q08_late_consume_market_payload_view,
             |state, _metrics| Ok(Some(state.groups)),
         )
         .await?
@@ -20880,6 +21019,41 @@ fn q08_late_build_partkey_selection_batch(
     Ok(Some(()))
 }
 
+fn q08_late_build_partkey_selection_view(
+    view: BatchView<'_>,
+    selection: &mut LateSelectionBuilder,
+    state: &mut Q08LateMarketState,
+) -> Result<Option<()>> {
+    if view.num_columns() == 1 {
+        let Some(partkeys) = view.i64(0) else {
+            return Ok(None);
+        };
+        let dense_part_keys = state.part_keys.dense_contains_slice();
+        if partkeys.null_count() == 0 {
+            for &partkey in partkeys.values().as_ref() {
+                selection.push(adaptive_i64_set_contains_cached(
+                    &state.part_keys,
+                    dense_part_keys,
+                    partkey,
+                ));
+            }
+            return Ok(Some(()));
+        }
+        for row in 0..partkeys.len() {
+            selection.push(
+                partkeys.is_valid(row)
+                    && adaptive_i64_set_contains_cached(
+                        &state.part_keys,
+                        dense_part_keys,
+                        partkeys.value(row),
+                    ),
+            );
+        }
+        return Ok(Some(()));
+    }
+    q08_late_build_partkey_selection_batch(view.record_batch().clone(), selection, state)
+}
+
 fn q08_late_consume_market_payload_batch(
     batch: RecordBatch,
     state: &mut Q08LateMarketState,
@@ -20950,6 +21124,91 @@ fn q08_late_consume_market_payload_batch(
         group.1 += volume;
     }
     Ok(Some(()))
+}
+
+fn q08_late_consume_market_payload_view(
+    view: BatchView<'_>,
+    state: &mut Q08LateMarketState,
+) -> Result<Option<()>> {
+    if view.num_columns() == 4
+        && let (Ok(orderkeys), Ok(suppkeys)) = (view.required_i64(0), view.required_i64(1))
+        && let (Some(extendedprices), Some(discounts)) = (
+            decimal_input(view.column(2)?)?,
+            decimal_input(view.column(3)?)?,
+        )
+    {
+        q08_late_consume_market_payload_typed(
+            orderkeys,
+            suppkeys,
+            extendedprices,
+            discounts,
+            state,
+        );
+        return Ok(Some(()));
+    }
+    q08_late_consume_market_payload_batch(view.record_batch().clone(), state)
+}
+
+fn q08_late_consume_market_payload_typed(
+    orderkeys: &Int64Array,
+    suppkeys: &Int64Array,
+    extendedprices: DecimalInput<'_>,
+    discounts: DecimalInput<'_>,
+    state: &mut Q08LateMarketState,
+) {
+    if orderkeys.null_count() == 0
+        && suppkeys.null_count() == 0
+        && extendedprices.null_count() == 0
+        && discounts.null_count() == 0
+    {
+        let orderkey_values = orderkeys.values().as_ref();
+        let suppkey_values = suppkeys.values().as_ref();
+        let extendedprice_values = extendedprices.raw_values();
+        let discount_values = discounts.raw_values();
+        let (discount_scale, revenue_scale) =
+            decimal_discounted_revenue_scales(extendedprices, discounts);
+        for row in 0..orderkey_values.len() {
+            let Some(o_year) = state.order_years.get(orderkey_values[row]) else {
+                continue;
+            };
+            let Some(is_brazil) = state.supplier_is_brazil.get(suppkey_values[row]) else {
+                continue;
+            };
+            let volume = decimal_discounted_revenue_raw(
+                extendedprice_values[row],
+                discount_values[row],
+                discount_scale,
+                revenue_scale,
+            );
+            let group = state.groups.entry(o_year).or_insert((0.0, 0.0));
+            if is_brazil {
+                group.0 += volume;
+            }
+            group.1 += volume;
+        }
+        return;
+    }
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row)
+            || suppkeys.is_null(row)
+            || extendedprices.is_null(row)
+            || discounts.is_null(row)
+        {
+            continue;
+        }
+        let Some(o_year) = state.order_years.get(orderkeys.value(row)) else {
+            continue;
+        };
+        let Some(is_brazil) = state.supplier_is_brazil.get(suppkeys.value(row)) else {
+            continue;
+        };
+        let volume = extendedprices.value(row) * (1.0 - discounts.value(row));
+        let group = state.groups.entry(o_year).or_insert((0.0, 0.0));
+        if is_brazil {
+            group.0 += volume;
+        }
+        group.1 += volume;
+    }
 }
 
 fn q08_log_late_market_profile(metrics: LateMaterializedMetrics, row_group_chunk: usize) {
@@ -22919,11 +23178,12 @@ async fn q19_late_materialized_lineitem_revenue(
     let rules_for_state = rules.clone();
     let part_masks_for_state = part_masks.clone();
     let Some(chunks) = engine
-        .late_materialized_parquet_map_with_policy(
+        .late_materialized_parquet_map_pruned_with_policy_view(
             path,
             batch_size,
             predicate_projection,
             payload_projection,
+            Vec::new(),
             q19_late_materialized_row_group_chunk(),
             late_materialization_policy_from_env("DODAM_Q19_LATE_MAX_SELECTED_RATIO", 0.60),
             move || Q19LateState {
@@ -22936,8 +23196,8 @@ async fn q19_late_materialized_lineitem_revenue(
                 discount_offset: 0,
                 sum: 0.0,
             },
-            q19_late_build_selection_batch,
-            q19_late_consume_payload_batch,
+            q19_late_build_selection_view,
+            q19_late_consume_payload_view,
             |state, _metrics| {
                 if state.discount_offset != state.selected_discounts.len() {
                     return Err(DodamError::UnsupportedSql(
@@ -23046,6 +23306,89 @@ fn q19_late_build_selection_batch(
     Ok(Some(()))
 }
 
+fn q19_late_build_selection_view(
+    view: BatchView<'_>,
+    selection: &mut LateSelectionBuilder,
+    state: &mut Q19LateState,
+) -> Result<Option<()>> {
+    if view.num_columns() == 5
+        && let (Ok(partkeys), Some(quantities), Some(discounts), Ok(shipmodes), Ok(shipinstructs)) = (
+            view.required_i64(0),
+            decimal_input(view.column(1)?)?,
+            decimal_input(view.column(2)?)?,
+            view.required_utf8(3),
+            view.required_utf8(4),
+        )
+    {
+        return q19_late_build_selection_typed(
+            partkeys,
+            quantities,
+            discounts,
+            shipmodes,
+            shipinstructs,
+            selection,
+            state,
+        );
+    }
+    q19_late_build_selection_batch(view.record_batch().clone(), selection, state)
+}
+
+fn q19_late_build_selection_typed(
+    partkeys: &Int64Array,
+    quantities: DecimalInput<'_>,
+    discounts: DecimalInput<'_>,
+    shipmodes: &StringArray,
+    shipinstructs: &StringArray,
+    selection: &mut LateSelectionBuilder,
+    state: &mut Q19LateState,
+) -> Result<Option<()>> {
+    if partkeys.null_count() != 0
+        || quantities.null_count() != 0
+        || discounts.null_count() != 0
+        || shipmodes.null_count() != 0
+        || shipinstructs.null_count() != 0
+        || quantities.precision > 18
+        || discounts.precision > 18
+    {
+        return Ok(None);
+    }
+    let discount_scale = discounts.scale as i64;
+    if let Some(existing) = state.discount_scale {
+        if existing != discount_scale {
+            return Ok(None);
+        }
+    } else {
+        state.discount_scale = Some(discount_scale);
+    }
+    let raw_rules =
+        q19_raw_line_rules_cached(&state.rules, quantities.scale, &mut state.raw_rule_cache);
+    let shipmode_offsets = shipmodes.value_offsets();
+    let shipmode_data = shipmodes.value_data();
+    let shipinstruct_offsets = shipinstructs.value_offsets();
+    let shipinstruct_data = shipinstructs.value_data();
+    let partkey_values = partkeys.values();
+    let quantity_values = quantities.raw_values();
+    let discount_values = discounts.raw_values();
+    for row in 0..partkeys.len() {
+        let selected = if let Some(mask) = state.part_masks.get(partkey_values[row]) {
+            q19_rule_matches_lineitem_raw(
+                raw_rules,
+                mask,
+                quantity_values[row],
+                bytes_string_parts(shipmode_offsets, shipmode_data, row),
+                bytes_string_parts(shipinstruct_offsets, shipinstruct_data, row),
+            )
+        } else {
+            false
+        };
+        if selected {
+            state.selected_discounts.push(discount_values[row] as i64);
+        }
+        selection.push(selected);
+    }
+    Ok(Some(()))
+}
+
 fn q19_late_consume_payload_batch(
     batch: RecordBatch,
     state: &mut Q19LateState,
@@ -23054,6 +23397,50 @@ fn q19_late_consume_payload_batch(
     let Some(extendedprices) = decimal_input(extendedprices)? else {
         return Ok(None);
     };
+    if extendedprices.null_count() != 0 || extendedprices.precision > 18 {
+        return Ok(None);
+    }
+    let price_scale = extendedprices.scale as i64;
+    if let Some(existing) = state.extendedprice_scale {
+        if existing != price_scale {
+            return Ok(None);
+        }
+    } else {
+        state.extendedprice_scale = Some(price_scale);
+    }
+    let discount_scale = state
+        .discount_scale
+        .ok_or_else(|| DodamError::UnsupportedSql("Q19 missing discount scale".to_string()))?;
+    let revenue_scale = 1.0 / ((price_scale as f64) * (discount_scale as f64));
+    for &extendedprice in extendedprices.raw_values() {
+        let discount = *state
+            .selected_discounts
+            .get(state.discount_offset)
+            .ok_or_else(|| {
+                DodamError::UnsupportedSql("Q19 row selection payload mismatch".to_string())
+            })?;
+        state.sum += ((extendedprice as i64) * (discount_scale - discount)) as f64 * revenue_scale;
+        state.discount_offset += 1;
+    }
+    Ok(Some(()))
+}
+
+fn q19_late_consume_payload_view(
+    view: BatchView<'_>,
+    state: &mut Q19LateState,
+) -> Result<Option<()>> {
+    if view.num_columns() == 1
+        && let Some(extendedprices) = decimal_input(view.column(0)?)?
+    {
+        return q19_late_consume_payload_typed(extendedprices, state);
+    }
+    q19_late_consume_payload_batch(view.record_batch().clone(), state)
+}
+
+fn q19_late_consume_payload_typed(
+    extendedprices: DecimalInput<'_>,
+    state: &mut Q19LateState,
+) -> Result<Option<()>> {
     if extendedprices.null_count() != 0 || extendedprices.precision > 18 {
         return Ok(None);
     }
