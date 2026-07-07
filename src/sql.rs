@@ -16591,7 +16591,7 @@ async fn q04_count_late_candidate_priorities_late_materialized(
             .collect::<Vec<_>>(),
     );
     let Some(chunks) = engine
-        .late_materialized_parquet_map_pruned_with_policy(
+        .late_materialized_parquet_map_pruned_with_policy_view(
             path,
             batch_size,
             Projection::Columns(vec!["l_orderkey".to_string()]),
@@ -16614,8 +16614,8 @@ async fn q04_count_late_candidate_priorities_late_materialized(
                     counts: vec![0_u64; priority_count],
                 }
             },
-            q04_lineitem_late_build_selection_batch,
-            q04_lineitem_late_consume_dates_batch,
+            q04_lineitem_late_build_selection_view,
+            q04_lineitem_late_consume_dates_view,
             |state, metrics| {
                 if state.payload_offset != state.selected_orderkeys.len() {
                     return Err(DodamError::UnsupportedSql(
@@ -16735,6 +16735,61 @@ fn q04_lineitem_late_build_selection_batch(
     Ok(Some(()))
 }
 
+fn q04_lineitem_late_build_selection_view(
+    view: BatchView<'_>,
+    selection: &mut LateSelectionBuilder,
+    state: &mut Q04LineitemLateState,
+) -> Result<Option<()>> {
+    if view.num_columns() == 1 {
+        let Some(orderkeys) = view.i64(0) else {
+            return Ok(None);
+        };
+        if orderkeys.null_count() == 0 {
+            for &orderkey in orderkeys.values() {
+                let selected = usize::try_from(orderkey)
+                    .ok()
+                    .and_then(|index| {
+                        state
+                            .candidate_priorities
+                            .get(index)
+                            .map(|marker| (index, marker))
+                    })
+                    .filter(|(_, marker)| marker.load(Ordering::Relaxed) != 0);
+                if let Some((index, _)) = selected {
+                    selection.push(true);
+                    state.selected_orderkeys.push(index);
+                } else {
+                    selection.push(false);
+                }
+            }
+            return Ok(Some(()));
+        }
+        for row in 0..orderkeys.len() {
+            let selected = if orderkeys.is_null(row) {
+                None
+            } else {
+                usize::try_from(orderkeys.value(row))
+                    .ok()
+                    .and_then(|index| {
+                        state
+                            .candidate_priorities
+                            .get(index)
+                            .map(|marker| (index, marker))
+                    })
+                    .filter(|(_, marker)| marker.load(Ordering::Relaxed) != 0)
+            };
+            if let Some((index, _)) = selected {
+                selection.push(true);
+                state.selected_orderkeys.push(index);
+            } else {
+                selection.push(false);
+            }
+        }
+        return Ok(Some(()));
+    }
+    q04_lineitem_late_build_selection_batch(view.record_batch().clone(), selection, state)
+}
+
 fn q04_lineitem_late_consume_dates_batch(
     batch: RecordBatch,
     state: &mut Q04LineitemLateState,
@@ -16792,6 +16847,39 @@ fn q04_lineitem_late_consume_dates_batch(
         }
     }
     Ok(Some(()))
+}
+
+fn q04_lineitem_late_consume_dates_view(
+    view: BatchView<'_>,
+    state: &mut Q04LineitemLateState,
+) -> Result<Option<()>> {
+    if view.num_columns() == 2
+        && let (Ok(commitdates), Ok(receiptdates)) =
+            (view.required_date32(0), view.required_date32(1))
+    {
+        if commitdates.null_count() == 0 && receiptdates.null_count() == 0 {
+            for row in 0..commitdates.len() {
+                let Some(&orderkey) = state.selected_orderkeys.get(state.payload_offset) else {
+                    return Err(DodamError::UnsupportedSql(
+                        "Q04 lineitem payload row overflow".to_string(),
+                    ));
+                };
+                state.payload_offset += 1;
+                if commitdates.value(row) >= receiptdates.value(row) {
+                    continue;
+                }
+                let Some(marker) = state.candidate_priorities.get(orderkey) else {
+                    continue;
+                };
+                let priority_marker = marker.swap(0, Ordering::Relaxed);
+                if priority_marker != 0 {
+                    state.counts[usize::from(priority_marker - 1)] += 1;
+                }
+            }
+            return Ok(Some(()));
+        }
+    }
+    q04_lineitem_late_consume_dates_batch(view.record_batch().clone(), state)
 }
 
 fn q04_log_lineitem_late_materialized_profile(
