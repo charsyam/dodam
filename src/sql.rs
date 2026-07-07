@@ -12549,17 +12549,20 @@ fn q12_shipping_mode_counts_projected_view(
         return Ok(groups);
     }
     if view.num_columns() == 2
-        && let Some(orderpriorities) = view.dictionary_i32_view(1)
+        && let (Some(orderkeys), Some(orderpriorities)) =
+            (view.i64_vector(0), view.dictionary_i32_view(1))
         && q12_typed_loop_enabled()
-        && let Some(groups) = q12_shipping_mode_counts_batch_dictionary_typed(
-            view.column(0)?,
-            orderpriorities,
-            pending,
-        )
+        && let Some(groups) =
+            q12_shipping_mode_counts_dictionary_vector_typed(orderkeys, orderpriorities, pending)
     {
         return Ok(groups);
     }
-    q12_shipping_mode_counts_batch(view.record_batch().clone(), pending)
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "Q12 shipping mode raw vector columns have unsupported types".to_string(),
+        ));
+    };
+    q12_shipping_mode_counts_batch(batch.clone(), pending)
 }
 
 fn q12_shipping_mode_counts_projected_batch_sorted(
@@ -12605,7 +12608,12 @@ fn q12_shipping_mode_counts_projected_view_sorted(
     {
         return Ok(groups);
     }
-    q12_shipping_mode_counts_projected_batch_sorted(view.record_batch().clone(), pending)
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "Q12 sorted shipping mode raw vector columns have unsupported types".to_string(),
+        ));
+    };
+    q12_shipping_mode_counts_projected_batch_sorted(batch.clone(), pending)
 }
 
 #[allow(dead_code)]
@@ -12688,13 +12696,11 @@ fn q12_shipping_mode_counts_projected_view_partial(
         return Ok(partial);
     }
     if view.num_columns() == 2
-        && let Some(orderpriorities) = view.dictionary_i32_view(1)
+        && let (Some(orderkeys), Some(orderpriorities)) =
+            (view.i64_vector(0), view.dictionary_i32_view(1))
         && q12_typed_loop_enabled()
-        && let Some(groups) = q12_shipping_mode_counts_batch_dictionary_typed(
-            view.column(0)?,
-            orderpriorities,
-            pending,
-        )
+        && let Some(groups) =
+            q12_shipping_mode_counts_dictionary_vector_typed(orderkeys, orderpriorities, pending)
     {
         return Ok(Q12OrdersPartial {
             groups,
@@ -12707,7 +12713,12 @@ fn q12_shipping_mode_counts_projected_view_partial(
             },
         });
     }
-    let groups = q12_shipping_mode_counts_batch(view.record_batch().clone(), pending)?;
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "Q12 profiled shipping mode raw vector columns have unsupported types".to_string(),
+        ));
+    };
+    let groups = q12_shipping_mode_counts_batch(batch.clone(), pending)?;
     let profile = Q12OrdersProfile {
         batches: 1,
         fallback_batches: 1,
@@ -12907,6 +12918,68 @@ fn q12_shipping_mode_counts_batch_dictionary_typed(
     let mut groups = [Q12State::default(); 2];
     if orderkeys.null_count() == 0 && orderpriorities.null_count() == 0 {
         let orderkey_values = orderkeys.values().as_ref();
+        if let Some((pending_values, pending_present)) = pending.dense_slices() {
+            for row in 0..orderkey_values.len() {
+                let Ok(index) = usize::try_from(orderkey_values[row]) else {
+                    continue;
+                };
+                if index >= pending_present.len() || !pending_present[index] {
+                    continue;
+                }
+                let priority_index = usize::try_from(priority_keys[row]).ok()?;
+                let is_high_priority = priority_flags
+                    .get(priority_index)
+                    .copied()
+                    .flatten()
+                    .is_some();
+                q12_apply_pending_order(&mut groups, pending_values[index], is_high_priority);
+            }
+            return Some(groups);
+        }
+        for row in 0..orderkey_values.len() {
+            let Some(order) = pending.get(orderkey_values[row]) else {
+                continue;
+            };
+            let priority_index = usize::try_from(priority_keys[row]).ok()?;
+            let is_high_priority = priority_flags
+                .get(priority_index)
+                .copied()
+                .flatten()
+                .is_some();
+            q12_apply_pending_order(&mut groups, order, is_high_priority);
+        }
+        return Some(groups);
+    }
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || orderpriorities.is_null(row) {
+            continue;
+        }
+        let Some(order) = pending.get(orderkeys.value(row)) else {
+            continue;
+        };
+        let priority_index = usize::try_from(priority_keys[row]).ok()?;
+        let is_high_priority = priority_flags
+            .get(priority_index)
+            .copied()
+            .flatten()
+            .is_some();
+        q12_apply_pending_order(&mut groups, order, is_high_priority);
+    }
+    Some(groups)
+}
+
+fn q12_shipping_mode_counts_dictionary_vector_typed(
+    orderkeys: I64VectorView<'_>,
+    orderpriorities: DictionaryI32View<'_>,
+    pending: &AdaptiveI64Map<Q12PendingOrder>,
+) -> Option<[Q12State; 2]> {
+    let priority_flags =
+        dictionary_i32_view_match_flags(orderpriorities, &[b"1-URGENT", b"2-HIGH"])?;
+    let priority_keys = orderpriorities.keys();
+    let mut groups = [Q12State::default(); 2];
+    if let Some(orderkey_values) = orderkeys.values_if_null_free()
+        && orderpriorities.null_count() == 0
+    {
         if let Some((pending_values, pending_present)) = pending.dense_slices() {
             for row in 0..orderkey_values.len() {
                 let Ok(index) = usize::try_from(orderkey_values[row]) else {
