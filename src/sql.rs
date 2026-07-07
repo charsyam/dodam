@@ -7424,23 +7424,41 @@ fn q09_profit_projected_view(
     supply_costs: &Q09SupplyCosts,
 ) -> Result<Q09ProfitPartial> {
     if view.num_columns() == 6
-        && let Some(groups) = q09_profit_decimal_batch(
-            view.column(0)?,
-            view.column(1)?,
-            view.column(2)?,
-            view.column(3)?,
-            view.column(4)?,
-            view.column(5)?,
+        && let (
+            Some(orderkeys),
+            Some(partkeys),
+            Some(suppkeys),
+            Some(quantities),
+            Some(extendedprices),
+            Some(discounts),
+        ) = (
+            view.i64_vector(0),
+            view.i64_vector(1),
+            view.i64_vector(2),
+            view.decimal128_vector(3),
+            view.decimal128_vector(4),
+            view.decimal128_vector(5),
+        )
+        && let Some(groups) = q09_profit_decimal_view(
+            orderkeys,
+            partkeys,
+            suppkeys,
+            quantities,
+            extendedprices,
+            discounts,
             part_keys,
             supplier_nations,
             order_years,
             supply_costs,
-        )?
+        )
     {
         return Ok(groups);
     }
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(Q09ProfitPartial::default());
+    };
     q09_profit_batch(
-        view.record_batch().clone(),
+        batch.clone(),
         part_keys,
         supplier_nations,
         order_years,
@@ -7710,6 +7728,219 @@ fn q09_profit_decimal_batch(
         groups.add(nationkey, o_year, amount);
     }
     Ok(Some(Q09ProfitPartial { groups, profile }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q09_profit_decimal_view(
+    orderkeys: I64VectorView<'_>,
+    partkeys: I64VectorView<'_>,
+    suppkeys: I64VectorView<'_>,
+    quantities: Decimal128VectorView<'_>,
+    extendedprices: Decimal128VectorView<'_>,
+    discounts: Decimal128VectorView<'_>,
+    part_keys: &AdaptiveI64Set,
+    supplier_nations: &AdaptiveI64Map<i64>,
+    order_years: &Q09OrderYears,
+    supply_costs: &Q09SupplyCosts,
+) -> Option<Q09ProfitPartial> {
+    let mut groups = Q09ProfitGroups::default();
+    let mut profile = Q09ProfitProfile::default();
+    let collect_profile = tpch_profile_enabled();
+    let dense_part_keys = part_keys.dense_contains_slice();
+    let dense_order_years = order_years.dense_slice();
+    let quantity_values = quantities.raw_values();
+    let extendedprice_values = extendedprices.raw_values();
+    let discount_values = discounts.raw_values();
+    let discount_scale = discounts.scale();
+    let revenue_scale = 1.0 / (extendedprices.scale() * discount_scale);
+    let quantity_scale = 1.0 / quantities.scale();
+    if let (Some(orderkey_values), Some(partkey_values), Some(suppkey_values)) = (
+        orderkeys.values_if_null_free(),
+        partkeys.values_if_null_free(),
+        suppkeys.values_if_null_free(),
+    ) && quantities.null_count() == 0
+        && extendedprices.null_count() == 0
+        && discounts.null_count() == 0
+    {
+        if q09_matched_index_enabled()
+            && let Some(dense_part_keys) = dense_part_keys
+        {
+            return Some(q09_profit_decimal_batch_matched_index(
+                orderkey_values,
+                partkey_values,
+                suppkey_values,
+                quantity_values,
+                extendedprice_values,
+                discount_values,
+                discount_scale,
+                revenue_scale,
+                quantity_scale,
+                dense_part_keys,
+                supplier_nations,
+                order_years,
+                dense_order_years,
+                supply_costs,
+                collect_profile,
+            ));
+        }
+        for row in 0..orderkey_values.len() {
+            if collect_profile {
+                profile.rows += 1;
+            }
+            let partkey = partkey_values[row];
+            let started = collect_profile.then(Instant::now);
+            let part_hit = q09_part_key_contains(part_keys, dense_part_keys, partkey);
+            if let Some(started) = started {
+                profile.part_nanos = profile
+                    .part_nanos
+                    .saturating_add(sql_elapsed_nanos(started));
+            }
+            if !part_hit {
+                continue;
+            }
+            if collect_profile {
+                profile.part_hits += 1;
+            }
+            let orderkey = orderkey_values[row];
+            let suppkey = suppkey_values[row];
+            let started = collect_profile.then(Instant::now);
+            let o_year = q09_order_year_get(order_years, dense_order_years, orderkey);
+            if let Some(started) = started {
+                profile.order_nanos = profile
+                    .order_nanos
+                    .saturating_add(sql_elapsed_nanos(started));
+            }
+            let Some(o_year) = o_year else {
+                continue;
+            };
+            if collect_profile {
+                profile.order_hits += 1;
+            }
+            let started = collect_profile.then(Instant::now);
+            let nationkey = supplier_nations.get(suppkey);
+            if let Some(started) = started {
+                profile.supplier_nanos = profile
+                    .supplier_nanos
+                    .saturating_add(sql_elapsed_nanos(started));
+            }
+            let Some(nationkey) = nationkey else {
+                continue;
+            };
+            if collect_profile {
+                profile.supplier_hits += 1;
+            }
+            let started = collect_profile.then(Instant::now);
+            let supplycost = supply_costs.get(partkey, suppkey);
+            if let Some(started) = started {
+                profile.supply_nanos = profile
+                    .supply_nanos
+                    .saturating_add(sql_elapsed_nanos(started));
+            }
+            let Some(supplycost) = supplycost else {
+                continue;
+            };
+            if collect_profile {
+                profile.supply_hits += 1;
+            }
+            let started = collect_profile.then(Instant::now);
+            let amount = (extendedprice_values[row] as f64)
+                * (discount_scale - discount_values[row] as f64)
+                * revenue_scale
+                - supplycost * (quantity_values[row] as f64) * quantity_scale;
+            if let Some(started) = started {
+                profile.amount_nanos = profile
+                    .amount_nanos
+                    .saturating_add(sql_elapsed_nanos(started));
+            }
+            if collect_profile {
+                profile.amount_rows += 1;
+            }
+            groups.add(nationkey, o_year, amount);
+        }
+        return Some(Q09ProfitPartial { groups, profile });
+    }
+    for row in 0..orderkeys.len() {
+        if collect_profile {
+            profile.rows += 1;
+        }
+        if orderkeys.is_null(row)
+            || partkeys.is_null(row)
+            || suppkeys.is_null(row)
+            || quantities.is_null(row)
+            || extendedprices.is_null(row)
+            || discounts.is_null(row)
+        {
+            continue;
+        }
+        let partkey = partkeys.value(row);
+        let started = collect_profile.then(Instant::now);
+        let part_hit = q09_part_key_contains(part_keys, dense_part_keys, partkey);
+        if let Some(started) = started {
+            profile.part_nanos = profile
+                .part_nanos
+                .saturating_add(sql_elapsed_nanos(started));
+        }
+        if !part_hit {
+            continue;
+        }
+        if collect_profile {
+            profile.part_hits += 1;
+        }
+        let orderkey = orderkeys.value(row);
+        let suppkey = suppkeys.value(row);
+        let started = collect_profile.then(Instant::now);
+        let o_year = q09_order_year_get(order_years, dense_order_years, orderkey);
+        if let Some(started) = started {
+            profile.order_nanos = profile
+                .order_nanos
+                .saturating_add(sql_elapsed_nanos(started));
+        }
+        let Some(o_year) = o_year else {
+            continue;
+        };
+        if collect_profile {
+            profile.order_hits += 1;
+        }
+        let started = collect_profile.then(Instant::now);
+        let nationkey = supplier_nations.get(suppkey);
+        if let Some(started) = started {
+            profile.supplier_nanos = profile
+                .supplier_nanos
+                .saturating_add(sql_elapsed_nanos(started));
+        }
+        let Some(nationkey) = nationkey else {
+            continue;
+        };
+        if collect_profile {
+            profile.supplier_hits += 1;
+        }
+        let started = collect_profile.then(Instant::now);
+        let supplycost = supply_costs.get(partkey, suppkey);
+        if let Some(started) = started {
+            profile.supply_nanos = profile
+                .supply_nanos
+                .saturating_add(sql_elapsed_nanos(started));
+        }
+        let Some(supplycost) = supplycost else {
+            continue;
+        };
+        if collect_profile {
+            profile.supply_hits += 1;
+        }
+        let started = collect_profile.then(Instant::now);
+        let amount = extendedprices.value(row) * (1.0 - discounts.value(row))
+            - supplycost * quantities.value(row);
+        if let Some(started) = started {
+            profile.amount_nanos = profile
+                .amount_nanos
+                .saturating_add(sql_elapsed_nanos(started));
+        }
+        if collect_profile {
+            profile.amount_rows += 1;
+        }
+        groups.add(nationkey, o_year, amount);
+    }
+    Some(Q09ProfitPartial { groups, profile })
 }
 
 #[allow(clippy::too_many_arguments)]
