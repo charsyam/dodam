@@ -25334,18 +25334,27 @@ fn q21_lineitem_order_states_projected_view_into(
     states: &mut Q21OrderStateMap,
 ) -> Result<()> {
     if view.num_columns() == 4
-        && q21_lineitem_order_states_typed_into(
-            view.column(0)?,
-            view.column(1)?,
-            view.column(2)?,
-            view.column(3)?,
-            final_orders,
-            states,
+        && let (Some(orderkeys), Some(suppkeys), Some(receipt), Some(commit)) = (
+            view.i64_vector(0),
+            view.i64_vector(1),
+            view.date32_vector(2),
+            view.date32_vector(3),
         )
     {
+        q21_lineitem_order_states_vector_typed_into(
+            orderkeys,
+            suppkeys,
+            receipt,
+            commit,
+            final_orders,
+            states,
+        );
         return Ok(());
     }
-    q21_lineitem_order_states_batch_into(view.record_batch().clone(), final_orders, states)
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(());
+    };
+    q21_lineitem_order_states_batch_into(batch.clone(), final_orders, states)
 }
 
 fn q21_lineitem_order_states_typed_into(
@@ -25443,6 +25452,89 @@ fn q21_lineitem_order_states_typed_into(
     true
 }
 
+fn q21_lineitem_order_states_vector_typed_into(
+    orderkeys: I64VectorView<'_>,
+    suppkeys: I64VectorView<'_>,
+    receipt: Date32VectorView<'_>,
+    commit: Date32VectorView<'_>,
+    final_orders: &Q21FinalOrders,
+    states: &mut Q21OrderStateMap,
+) {
+    let dense_final_orders = final_orders.dense_contains_slice();
+    if let (Some(orderkey_values), Some(suppkey_values), Some(receipts), Some(commits)) = (
+        orderkeys.values_if_null_free(),
+        suppkeys.values_if_null_free(),
+        receipt.values_if_null_free(),
+        commit.values_if_null_free(),
+    ) {
+        let mut current_orderkey = None::<i64>;
+        let mut current_order_selected = false;
+        let mut current_state = Q21OrderState::default();
+        for row in 0..orderkey_values.len() {
+            let orderkey = orderkey_values[row];
+            if current_orderkey.is_some_and(|current| current != orderkey) {
+                if current_order_selected {
+                    q21_flush_run_state(states, current_orderkey, &mut current_state);
+                }
+                current_order_selected =
+                    q21_final_order_contains(final_orders, dense_final_orders, orderkey);
+                current_orderkey = Some(orderkey);
+            } else if current_orderkey.is_none() {
+                current_order_selected =
+                    q21_final_order_contains(final_orders, dense_final_orders, orderkey);
+                current_orderkey = Some(orderkey);
+            }
+            if !current_order_selected {
+                continue;
+            }
+            let suppkey = suppkey_values[row];
+            current_state.add_supplier(suppkey);
+            if receipts[row] > commits[row] {
+                current_state.add_late_supplier(suppkey);
+            }
+        }
+        if current_order_selected {
+            q21_flush_run_state(states, current_orderkey, &mut current_state);
+        }
+        return;
+    }
+    let mut current_orderkey = None::<i64>;
+    let mut current_order_selected = false;
+    let mut current_state = Q21OrderState::default();
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || suppkeys.is_null(row) {
+            continue;
+        }
+        let orderkey = orderkeys.value(row);
+        if current_orderkey.is_some_and(|current| current != orderkey) {
+            if current_order_selected {
+                q21_flush_run_state(states, current_orderkey, &mut current_state);
+            }
+            current_order_selected =
+                q21_final_order_contains(final_orders, dense_final_orders, orderkey);
+            current_orderkey = Some(orderkey);
+        } else if current_orderkey.is_none() {
+            current_order_selected =
+                q21_final_order_contains(final_orders, dense_final_orders, orderkey);
+            current_orderkey = Some(orderkey);
+        }
+        if !current_order_selected {
+            continue;
+        }
+        let suppkey = suppkeys.value(row);
+        current_state.add_supplier(suppkey);
+        if receipt.is_null(row) || commit.is_null(row) {
+            continue;
+        }
+        if receipt.value(row) > commit.value(row) {
+            current_state.add_late_supplier(suppkey);
+        }
+    }
+    if current_order_selected {
+        q21_flush_run_state(states, current_orderkey, &mut current_state);
+    }
+}
+
 fn q21_final_order_contains(
     final_orders: &Q21FinalOrders,
     dense_final_orders: Option<&[bool]>,
@@ -25524,13 +25616,13 @@ fn q21_ordered_lineitem_chunk_view(
 ) -> Result<Option<()>> {
     if view.num_columns() == 4
         && let (Some(orderkeys), Some(suppkeys), Some(receipt), Some(commit)) = (
-            view.column(0)?.as_any().downcast_ref::<Int64Array>(),
-            view.column(1)?.as_any().downcast_ref::<Int64Array>(),
-            view.column(2)?.as_any().downcast_ref::<Date32Array>(),
-            view.column(3)?.as_any().downcast_ref::<Date32Array>(),
+            view.i64_vector(0),
+            view.i64_vector(1),
+            view.date32_vector(2),
+            view.date32_vector(3),
         )
     {
-        return q21_ordered_lineitem_chunk_typed_batch(
+        return q21_ordered_lineitem_chunk_vector_typed(
             orderkeys,
             suppkeys,
             receipt,
@@ -25540,7 +25632,10 @@ fn q21_ordered_lineitem_chunk_view(
             state,
         );
     }
-    q21_ordered_lineitem_chunk_batch(view.record_batch(), final_orders, suppliers, state)
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    q21_ordered_lineitem_chunk_batch(batch, final_orders, suppliers, state)
 }
 
 fn q21_ordered_lineitem_chunk_batch(
@@ -25609,6 +25704,88 @@ fn q21_ordered_lineitem_chunk_typed_batch(
         let suppkey = suppkeys.value(row);
         chunk.current_state.add_supplier(suppkey);
         if receipt.is_valid(row) && commit.is_valid(row) && receipt.value(row) > commit.value(row) {
+            chunk.current_state.add_late_supplier(suppkey);
+        }
+    }
+    Ok(Some(()))
+}
+
+fn q21_ordered_lineitem_chunk_vector_typed(
+    orderkeys: I64VectorView<'_>,
+    suppkeys: I64VectorView<'_>,
+    receipt: Date32VectorView<'_>,
+    commit: Date32VectorView<'_>,
+    final_orders: &Q21FinalOrders,
+    suppliers: &HashMap<i64, String>,
+    chunk: &mut Q21OrderedLineitemChunkState,
+) -> Result<Option<()>> {
+    let dense_final_orders = final_orders.dense_contains_slice();
+    if let (Some(orderkey_values), Some(suppkey_values), Some(receipts), Some(commits)) = (
+        orderkeys.values_if_null_free(),
+        suppkeys.values_if_null_free(),
+        receipt.values_if_null_free(),
+        commit.values_if_null_free(),
+    ) {
+        for row in 0..orderkey_values.len() {
+            let orderkey = orderkey_values[row];
+            if let Some(current) = chunk.current_orderkey {
+                if orderkey < current {
+                    return Ok(None);
+                }
+                if orderkey != current {
+                    q21_ordered_chunk_finish_current(chunk, suppliers);
+                    chunk.current_orderkey = Some(orderkey);
+                    chunk.current_selected =
+                        q21_final_order_contains(final_orders, dense_final_orders, orderkey);
+                    chunk.current_state = Q21OrderState::default();
+                    chunk.order_count += 1;
+                }
+            } else {
+                chunk.current_orderkey = Some(orderkey);
+                chunk.current_selected =
+                    q21_final_order_contains(final_orders, dense_final_orders, orderkey);
+                chunk.order_count = 1;
+            }
+            if !chunk.current_selected {
+                continue;
+            }
+            let suppkey = suppkey_values[row];
+            chunk.current_state.add_supplier(suppkey);
+            if receipts[row] > commits[row] {
+                chunk.current_state.add_late_supplier(suppkey);
+            }
+        }
+        return Ok(Some(()));
+    }
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || suppkeys.is_null(row) {
+            continue;
+        }
+        let orderkey = orderkeys.value(row);
+        if let Some(current) = chunk.current_orderkey {
+            if orderkey < current {
+                return Ok(None);
+            }
+            if orderkey != current {
+                q21_ordered_chunk_finish_current(chunk, suppliers);
+                chunk.current_orderkey = Some(orderkey);
+                chunk.current_selected =
+                    q21_final_order_contains(final_orders, dense_final_orders, orderkey);
+                chunk.current_state = Q21OrderState::default();
+                chunk.order_count += 1;
+            }
+        } else {
+            chunk.current_orderkey = Some(orderkey);
+            chunk.current_selected =
+                q21_final_order_contains(final_orders, dense_final_orders, orderkey);
+            chunk.order_count = 1;
+        }
+        if !chunk.current_selected {
+            continue;
+        }
+        let suppkey = suppkeys.value(row);
+        chunk.current_state.add_supplier(suppkey);
+        if !receipt.is_null(row) && !commit.is_null(row) && receipt.value(row) > commit.value(row) {
             chunk.current_state.add_late_supplier(suppkey);
         }
     }
