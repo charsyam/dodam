@@ -44,7 +44,7 @@ use crate::storage::{
     scan_parquet_i64_byte_array_payload_columns_with_store,
     scan_parquet_i64_i32_i32_columns_with_store,
 };
-use crate::vector::BatchView;
+use crate::vector::{BatchView, RawColumnView};
 
 const LOCAL_SHUFFLE_FILE_TARGET_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -710,7 +710,14 @@ impl DodamEngine {
             batch_size,
             row_groups,
             columns,
-            move |first, second, third| consume(BatchView::from_i64_i32_i32(first, second, third)),
+            move |first, second, third| {
+                let columns = [
+                    RawColumnView::I64(first),
+                    RawColumnView::I32(second),
+                    RawColumnView::I32(third),
+                ];
+                consume(BatchView::from_raw_columns(&columns))
+            },
         )
     }
 

@@ -15,11 +15,13 @@ pub(crate) struct BatchView<'a> {
 #[derive(Clone, Copy)]
 enum BatchViewInner<'a> {
     RecordBatch(&'a RecordBatch),
-    I64I32I32 {
-        first: &'a [i64],
-        second: &'a [i32],
-        third: &'a [i32],
-    },
+    RawColumns(&'a [RawColumnView<'a>]),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RawColumnView<'a> {
+    I64(&'a [i64]),
+    I32(&'a [i32]),
 }
 
 impl<'a> BatchView<'a> {
@@ -29,20 +31,16 @@ impl<'a> BatchView<'a> {
         }
     }
 
-    pub(crate) fn from_i64_i32_i32(first: &'a [i64], second: &'a [i32], third: &'a [i32]) -> Self {
+    pub(crate) fn from_raw_columns(columns: &'a [RawColumnView<'a>]) -> Self {
         Self {
-            inner: BatchViewInner::I64I32I32 {
-                first,
-                second,
-                third,
-            },
+            inner: BatchViewInner::RawColumns(columns),
         }
     }
 
     pub(crate) fn record_batch(&self) -> &'a RecordBatch {
         match self.inner {
             BatchViewInner::RecordBatch(batch) => batch,
-            BatchViewInner::I64I32I32 { .. } => {
+            BatchViewInner::RawColumns(_) => {
                 panic!("raw vector BatchView does not expose a RecordBatch")
             }
         }
@@ -51,14 +49,16 @@ impl<'a> BatchView<'a> {
     pub(crate) fn num_columns(&self) -> usize {
         match self.inner {
             BatchViewInner::RecordBatch(batch) => batch.num_columns(),
-            BatchViewInner::I64I32I32 { .. } => 3,
+            BatchViewInner::RawColumns(columns) => columns.len(),
         }
     }
 
     pub(crate) fn num_rows(&self) -> usize {
         match self.inner {
             BatchViewInner::RecordBatch(batch) => batch.num_rows(),
-            BatchViewInner::I64I32I32 { first, .. } => first.len(),
+            BatchViewInner::RawColumns(columns) => {
+                columns.first().map(RawColumnView::len).unwrap_or_default()
+            }
         }
     }
 
@@ -67,20 +67,34 @@ impl<'a> BatchView<'a> {
             BatchViewInner::RecordBatch(batch) => batch.columns().get(index).ok_or_else(|| {
                 DodamError::UnsupportedSql(format!("projected column index {index} missing"))
             }),
-            BatchViewInner::I64I32I32 { .. } => Err(DodamError::UnsupportedSql(format!(
+            BatchViewInner::RawColumns(_) => Err(DodamError::UnsupportedSql(format!(
                 "raw vector BatchView column {index} is not an Arrow array"
             ))),
         }
     }
 
+    pub(crate) fn raw_i64(&self, index: usize) -> Option<&'a [i64]> {
+        match self.raw_column(index)? {
+            RawColumnView::I64(values) => Some(values),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn raw_i32(&self, index: usize) -> Option<&'a [i32]> {
+        match self.raw_column(index)? {
+            RawColumnView::I32(values) => Some(values),
+            _ => None,
+        }
+    }
+
     pub(crate) fn raw_i64_i32_i32(&self) -> Option<(&'a [i64], &'a [i32], &'a [i32])> {
+        Some((self.raw_i64(0)?, self.raw_i32(1)?, self.raw_i32(2)?))
+    }
+
+    fn raw_column(&self, index: usize) -> Option<RawColumnView<'a>> {
         match self.inner {
             BatchViewInner::RecordBatch(_) => None,
-            BatchViewInner::I64I32I32 {
-                first,
-                second,
-                third,
-            } => Some((first, second, third)),
+            BatchViewInner::RawColumns(columns) => columns.get(index).copied(),
         }
     }
 
@@ -136,7 +150,16 @@ impl<'a> BatchView<'a> {
             BatchViewInner::RecordBatch(batch) => {
                 batch.columns().get(index)?.as_any().downcast_ref::<T>()
             }
-            BatchViewInner::I64I32I32 { .. } => None,
+            BatchViewInner::RawColumns(_) => None,
+        }
+    }
+}
+
+impl RawColumnView<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::I64(values) => values.len(),
+            Self::I32(values) => values.len(),
         }
     }
 }
