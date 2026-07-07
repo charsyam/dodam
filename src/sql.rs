@@ -8646,13 +8646,9 @@ async fn q16_part_groups(
         let view = BatchView::new(&batch);
         let partkeys = view.column(0)?;
         let part_sizes = view.column(3)?;
-        if let (Some(brands), Some(types)) =
-            (view.dictionary_i32_view(1), view.dictionary_i32_view(2))
+        if let Some(layout) = Q16PartDictionaryView::try_new(view)
             && q16_part_groups_dictionary_typed_batch(
-                partkeys,
-                brands,
-                types,
-                part_sizes,
+                layout,
                 excluded_brand,
                 excluded_type_prefix,
                 sizes,
@@ -8744,12 +8740,54 @@ fn q16_part_dictionary_strings_enabled() -> bool {
     std::env::var_os("DODAM_Q16_DISABLE_PART_DICTIONARY_STRINGS").is_none()
 }
 
+enum Q16PartSizeView<'a> {
+    I32(&'a Int32Array),
+    I64(&'a Int64Array),
+}
+
+impl Q16PartSizeView<'_> {
+    fn null_count(&self) -> usize {
+        match self {
+            Self::I32(values) => values.null_count(),
+            Self::I64(values) => values.null_count(),
+        }
+    }
+
+    fn value_i64(&self, row: usize) -> i64 {
+        match self {
+            Self::I32(values) => i64::from(values.value(row)),
+            Self::I64(values) => values.value(row),
+        }
+    }
+}
+
+struct Q16PartDictionaryView<'a> {
+    partkeys: &'a Int64Array,
+    brands: DictionaryI32View<'a>,
+    types: DictionaryI32View<'a>,
+    sizes: Q16PartSizeView<'a>,
+}
+
+impl<'a> Q16PartDictionaryView<'a> {
+    fn try_new(view: BatchView<'a>) -> Option<Self> {
+        let sizes = if let Some(values) = view.column(3).ok()?.as_any().downcast_ref::<Int32Array>()
+        {
+            Q16PartSizeView::I32(values)
+        } else {
+            Q16PartSizeView::I64(view.i64(3)?)
+        };
+        Some(Self {
+            partkeys: view.i64(0)?,
+            brands: view.dictionary_i32_view(1)?,
+            types: view.dictionary_i32_view(2)?,
+            sizes,
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn q16_part_groups_dictionary_typed_batch(
-    partkeys: &ArrayRef,
-    brands: DictionaryI32View<'_>,
-    types: DictionaryI32View<'_>,
-    part_sizes: &ArrayRef,
+    view: Q16PartDictionaryView<'_>,
     excluded_brand: &str,
     excluded_type_prefix: &str,
     sizes: &AdaptiveI64Set,
@@ -8761,16 +8799,17 @@ fn q16_part_groups_dictionary_typed_batch(
     groups: &mut Vec<Q16GroupKey>,
     part_to_group: &mut FastHashMap<i64, usize>,
 ) -> Result<bool> {
-    let Some(partkeys) = partkeys.as_any().downcast_ref::<Int64Array>() else {
-        return Ok(false);
-    };
-    if partkeys.null_count() != 0 || brands.null_count() != 0 || types.null_count() != 0 {
+    if view.partkeys.null_count() != 0
+        || view.brands.null_count() != 0
+        || view.types.null_count() != 0
+        || view.sizes.null_count() != 0
+    {
         return Ok(false);
     }
-    let Some(brand_values) = brands.string_values() else {
+    let Some(brand_values) = view.brands.string_values() else {
         return Ok(false);
     };
-    let Some(type_values) = types.string_values() else {
+    let Some(type_values) = view.types.string_values() else {
         return Ok(false);
     };
     let brand_lookup = q16_dictionary_group_string_ids(
@@ -8787,70 +8826,33 @@ fn q16_part_groups_dictionary_typed_batch(
         type_ids,
         types_by_id,
     )?;
-    let brand_keys = brands.keys();
-    let type_keys = types.keys();
-    let partkey_values = partkeys.values().as_ref();
-    if let Some(part_sizes) = part_sizes.as_any().downcast_ref::<Int32Array>() {
-        if part_sizes.null_count() != 0 {
-            return Ok(false);
+    let brand_keys = view.brands.keys();
+    let type_keys = view.types.keys();
+    let partkey_values = view.partkeys.values().as_ref();
+    for row in 0..partkey_values.len() {
+        let size = view.sizes.value_i64(row);
+        if !sizes.contains(size) {
+            continue;
         }
-        let size_values = part_sizes.values().as_ref();
-        for row in 0..partkey_values.len() {
-            let size = i64::from(size_values[row]);
-            if !sizes.contains(size) {
-                continue;
-            }
-            let (Some(brand_id), Some(type_id)) = (
-                q16_dictionary_lookup_id(&brand_lookup, brand_keys[row]),
-                q16_dictionary_lookup_id(&type_lookup, type_keys[row]),
-            ) else {
-                continue;
-            };
-            q16_insert_part_group_ids(
-                partkey_values[row],
-                size,
-                brand_id,
-                type_id,
-                brands_by_id,
-                types_by_id,
-                group_ids,
-                groups,
-                part_to_group,
-            );
-        }
-        return Ok(true);
+        let (Some(brand_id), Some(type_id)) = (
+            q16_dictionary_lookup_id(&brand_lookup, brand_keys[row]),
+            q16_dictionary_lookup_id(&type_lookup, type_keys[row]),
+        ) else {
+            continue;
+        };
+        q16_insert_part_group_ids(
+            partkey_values[row],
+            size,
+            brand_id,
+            type_id,
+            brands_by_id,
+            types_by_id,
+            group_ids,
+            groups,
+            part_to_group,
+        );
     }
-    if let Some(part_sizes) = part_sizes.as_any().downcast_ref::<Int64Array>() {
-        if part_sizes.null_count() != 0 {
-            return Ok(false);
-        }
-        let size_values = part_sizes.values().as_ref();
-        for row in 0..partkey_values.len() {
-            let size = size_values[row];
-            if !sizes.contains(size) {
-                continue;
-            }
-            let (Some(brand_id), Some(type_id)) = (
-                q16_dictionary_lookup_id(&brand_lookup, brand_keys[row]),
-                q16_dictionary_lookup_id(&type_lookup, type_keys[row]),
-            ) else {
-                continue;
-            };
-            q16_insert_part_group_ids(
-                partkey_values[row],
-                size,
-                brand_id,
-                type_id,
-                brands_by_id,
-                types_by_id,
-                group_ids,
-                groups,
-                part_to_group,
-            );
-        }
-        return Ok(true);
-    }
-    Ok(false)
+    Ok(true)
 }
 
 fn q16_dictionary_group_string_ids<S: BuildHasher>(
