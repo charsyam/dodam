@@ -32,6 +32,12 @@ impl<'a> BatchView<'a> {
     }
 
     pub(crate) fn from_raw_columns(columns: &'a [RawColumnView<'a>]) -> Self {
+        debug_assert!(
+            columns
+                .windows(2)
+                .all(|window| window[0].len() == window[1].len()),
+            "raw vector BatchView columns must have equal lengths"
+        );
         Self {
             inner: BatchViewInner::RawColumns(columns),
         }

@@ -18,7 +18,7 @@ use parquet::arrow::arrow_reader::{
     ParquetRecordBatchReaderBuilder, RowFilter, RowSelection,
 };
 use parquet::column::reader::{ColumnReader, ColumnReaderImpl};
-use parquet::data_type::{ByteArray, ByteArrayType, FixedLenByteArray};
+use parquet::data_type::{ByteArray, ByteArrayType, FixedLenByteArray, Int32Type, Int64Type};
 use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::metadata::PageIndexPolicy;
 use parquet::file::reader::{ChunkReader, FileReader as ParquetFileReader, Length};
@@ -31,6 +31,7 @@ use crate::error::{DodamError, Result};
 use crate::execution::{
     ComparisonExpr, ComparisonOp, Expr, FilterExpr, Projection, evaluate_filter_mask,
 };
+use crate::vector::RawColumnView;
 
 #[derive(Debug, Clone)]
 pub struct ObjectMetadata {
@@ -1267,7 +1268,7 @@ fn percentile_nanos(samples: &[u64], percentile: usize) -> u64 {
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct DirectI64I32I32ScanMetrics {
+pub(crate) struct DirectPrimitiveColumnScanMetrics {
     pub row_groups: usize,
     pub batches: usize,
     pub rows: usize,
@@ -1275,7 +1276,9 @@ pub(crate) struct DirectI64I32I32ScanMetrics {
     pub consume_nanos: u64,
 }
 
-impl DirectI64I32I32ScanMetrics {
+pub(crate) type DirectI64I32I32ScanMetrics = DirectPrimitiveColumnScanMetrics;
+
+impl DirectPrimitiveColumnScanMetrics {
     fn add_read_nanos(&mut self, nanos: u64) {
         self.read_nanos = self.read_nanos.saturating_add(nanos);
     }
@@ -1283,6 +1286,18 @@ impl DirectI64I32I32ScanMetrics {
     fn add_consume_nanos(&mut self, nanos: u64) {
         self.consume_nanos = self.consume_nanos.saturating_add(nanos);
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DirectPrimitiveColumnType {
+    I64,
+    I32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DirectPrimitiveColumnSpec<'a> {
+    pub name: &'a str,
+    pub column_type: DirectPrimitiveColumnType,
 }
 
 pub(crate) fn parquet_column_indices_by_name<R: ChunkReader + 'static>(
@@ -1465,138 +1480,189 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn scan_parquet_i64_i32_i32_columns_with_store<F>(
+pub(crate) fn scan_parquet_primitive_columns_with_store<F>(
     path: &Path,
     batch_size: usize,
     row_groups: &[usize],
-    columns: [&str; 3],
+    columns: &[DirectPrimitiveColumnSpec<'_>],
     file_cache: Arc<ParquetFileCache>,
     store: &dyn ObjectStore,
     consume: F,
-) -> Result<Option<DirectI64I32I32ScanMetrics>>
+) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
 where
-    F: FnMut(&[i64], &[i32], &[i32]) -> Result<()>,
+    F: for<'a> FnMut(&[RawColumnView<'a>]) -> Result<()>,
 {
     if file_cache.enabled() {
         let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
         let reader = SerializedFileReader::new(reader)?;
-        return scan_parquet_i64_i32_i32_columns_reader(
+        return scan_parquet_primitive_columns_reader(
             reader, batch_size, row_groups, columns, consume,
         );
     }
     let file = store.open(path)?;
     let reader = SerializedFileReader::new(file)?;
-    scan_parquet_i64_i32_i32_columns_reader(reader, batch_size, row_groups, columns, consume)
+    scan_parquet_primitive_columns_reader(reader, batch_size, row_groups, columns, consume)
 }
 
-fn scan_parquet_i64_i32_i32_columns_reader<R, F>(
+enum DirectPrimitiveColumnReader {
+    I64(ColumnReaderImpl<Int64Type>),
+    I32(ColumnReaderImpl<Int32Type>),
+}
+
+enum DirectPrimitiveColumnValues {
+    I64(Vec<i64>),
+    I32(Vec<i32>),
+}
+
+impl DirectPrimitiveColumnValues {
+    fn new(column_type: DirectPrimitiveColumnType, capacity: usize) -> Self {
+        match column_type {
+            DirectPrimitiveColumnType::I64 => Self::I64(Vec::with_capacity(capacity)),
+            DirectPrimitiveColumnType::I32 => Self::I32(Vec::with_capacity(capacity)),
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Self::I64(values) => values.clear(),
+            Self::I32(values) => values.clear(),
+        }
+    }
+
+    fn as_view(&self) -> RawColumnView<'_> {
+        match self {
+            Self::I64(values) => RawColumnView::I64(values),
+            Self::I32(values) => RawColumnView::I32(values),
+        }
+    }
+}
+
+fn read_direct_primitive_records(
+    reader: &mut DirectPrimitiveColumnReader,
+    values: &mut DirectPrimitiveColumnValues,
+    records: usize,
+    required: bool,
+    def_levels: &mut Vec<i16>,
+) -> Result<(usize, usize, usize)> {
+    match (reader, values) {
+        (DirectPrimitiveColumnReader::I64(reader), DirectPrimitiveColumnValues::I64(values)) => {
+            if required {
+                Ok(reader.read_records(records, None, None, values)?)
+            } else {
+                Ok(reader.read_records(records, Some(def_levels), None, values)?)
+            }
+        }
+        (DirectPrimitiveColumnReader::I32(reader), DirectPrimitiveColumnValues::I32(values)) => {
+            if required {
+                Ok(reader.read_records(records, None, None, values)?)
+            } else {
+                Ok(reader.read_records(records, Some(def_levels), None, values)?)
+            }
+        }
+        _ => Err(DodamError::UnsupportedSql(
+            "direct primitive column reader/value type mismatch".to_string(),
+        )),
+    }
+}
+
+fn scan_parquet_primitive_columns_reader<R, F>(
     reader: SerializedFileReader<R>,
     batch_size: usize,
     row_groups: &[usize],
-    columns: [&str; 3],
+    columns: &[DirectPrimitiveColumnSpec<'_>],
     mut consume: F,
-) -> Result<Option<DirectI64I32I32ScanMetrics>>
+) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
 where
     R: ChunkReader + 'static,
-    F: FnMut(&[i64], &[i32], &[i32]) -> Result<()>,
+    F: for<'a> FnMut(&[RawColumnView<'a>]) -> Result<()>,
 {
-    let Some(column_indices) = parquet_column_indices_by_name(&reader, &columns) else {
+    let names: Vec<&str> = columns.iter().map(|column| column.name).collect();
+    let Some(column_indices) = parquet_column_indices_by_name(&reader, &names) else {
         return Ok(None);
     };
-    let [first_column, second_column, third_column] = <[usize; 3]>::try_from(column_indices)
-        .map_err(|_| {
-            DodamError::UnsupportedSql("direct parquet column index shape mismatch".to_string())
-        })?;
     let skip_required_def_levels = direct_skip_required_def_levels_enabled();
     let schema = reader.metadata().file_metadata().schema_descr();
-    let first_required =
-        skip_required_def_levels && schema.column(first_column).max_def_level() == 0;
-    let second_required =
-        skip_required_def_levels && schema.column(second_column).max_def_level() == 0;
-    let third_required =
-        skip_required_def_levels && schema.column(third_column).max_def_level() == 0;
-    let mut metrics = DirectI64I32I32ScanMetrics {
+    let required_columns: Vec<bool> = column_indices
+        .iter()
+        .map(|&index| skip_required_def_levels && schema.column(index).max_def_level() == 0)
+        .collect();
+    let mut metrics = DirectPrimitiveColumnScanMetrics {
         row_groups: row_groups.len(),
-        ..DirectI64I32I32ScanMetrics::default()
+        ..DirectPrimitiveColumnScanMetrics::default()
     };
     for &row_group_index in row_groups {
         let row_group = reader.get_row_group(row_group_index)?;
-        let mut first_reader = match row_group.get_column_reader(first_column)? {
-            ColumnReader::Int64ColumnReader(reader) => reader,
-            _ => return Ok(None),
-        };
-        let mut second_reader = match row_group.get_column_reader(second_column)? {
-            ColumnReader::Int32ColumnReader(reader) => reader,
-            _ => return Ok(None),
-        };
-        let mut third_reader = match row_group.get_column_reader(third_column)? {
-            ColumnReader::Int32ColumnReader(reader) => reader,
-            _ => return Ok(None),
-        };
-        let mut first_values = Vec::<i64>::with_capacity(batch_size);
-        let mut second_values = Vec::<i32>::with_capacity(batch_size);
-        let mut third_values = Vec::<i32>::with_capacity(batch_size);
-        let mut first_def_levels = Vec::<i16>::with_capacity(batch_size);
-        let mut second_def_levels = Vec::<i16>::with_capacity(batch_size);
-        let mut third_def_levels = Vec::<i16>::with_capacity(batch_size);
-        loop {
-            first_values.clear();
-            second_values.clear();
-            third_values.clear();
-            first_def_levels.clear();
-            second_def_levels.clear();
-            third_def_levels.clear();
-            let read_started = Instant::now();
-            let (first_records, first_value_count, first_levels) = if first_required {
-                first_reader.read_records(batch_size, None, None, &mut first_values)?
-            } else {
-                first_reader.read_records(
-                    batch_size,
-                    Some(&mut first_def_levels),
-                    None,
-                    &mut first_values,
-                )?
+        let mut readers = Vec::with_capacity(columns.len());
+        for (column, &column_index) in columns.iter().zip(column_indices.iter()) {
+            let reader = match (
+                column.column_type,
+                row_group.get_column_reader(column_index)?,
+            ) {
+                (DirectPrimitiveColumnType::I64, ColumnReader::Int64ColumnReader(reader)) => {
+                    DirectPrimitiveColumnReader::I64(reader)
+                }
+                (DirectPrimitiveColumnType::I32, ColumnReader::Int32ColumnReader(reader)) => {
+                    DirectPrimitiveColumnReader::I32(reader)
+                }
+                _ => return Ok(None),
             };
-            if first_records == 0 {
+            readers.push(reader);
+        }
+        let mut values: Vec<DirectPrimitiveColumnValues> = columns
+            .iter()
+            .map(|column| DirectPrimitiveColumnValues::new(column.column_type, batch_size))
+            .collect();
+        let mut def_levels: Vec<Vec<i16>> = columns
+            .iter()
+            .map(|_| Vec::<i16>::with_capacity(batch_size))
+            .collect();
+        loop {
+            for values in &mut values {
+                values.clear();
+            }
+            for levels in &mut def_levels {
+                levels.clear();
+            }
+            let read_started = Instant::now();
+            let mut record_count = 0usize;
+            for index in 0..readers.len() {
+                let requested = if index == 0 { batch_size } else { record_count };
+                let (records, value_count, level_count) = read_direct_primitive_records(
+                    &mut readers[index],
+                    &mut values[index],
+                    requested,
+                    required_columns[index],
+                    &mut def_levels[index],
+                )?;
+                if index == 0 {
+                    record_count = records;
+                    if record_count == 0 {
+                        break;
+                    }
+                } else if records != record_count {
+                    metrics.add_read_nanos(elapsed_nanos(read_started));
+                    return Ok(None);
+                }
+                if value_count != record_count
+                    || !direct_def_levels_match(level_count, record_count, required_columns[index])
+                {
+                    metrics.add_read_nanos(elapsed_nanos(read_started));
+                    return Ok(None);
+                }
+            }
+            if record_count == 0 {
                 metrics.add_read_nanos(elapsed_nanos(read_started));
                 break;
             }
-            let (second_records, second_value_count, second_levels) = if second_required {
-                second_reader.read_records(first_records, None, None, &mut second_values)?
-            } else {
-                second_reader.read_records(
-                    first_records,
-                    Some(&mut second_def_levels),
-                    None,
-                    &mut second_values,
-                )?
-            };
-            let (third_records, third_value_count, third_levels) = if third_required {
-                third_reader.read_records(first_records, None, None, &mut third_values)?
-            } else {
-                third_reader.read_records(
-                    first_records,
-                    Some(&mut third_def_levels),
-                    None,
-                    &mut third_values,
-                )?
-            };
             metrics.add_read_nanos(elapsed_nanos(read_started));
-            if first_value_count != first_records
-                || !direct_def_levels_match(first_levels, first_records, first_required)
-                || second_records != first_records
-                || second_value_count != first_records
-                || !direct_def_levels_match(second_levels, first_records, second_required)
-                || third_records != first_records
-                || third_value_count != first_records
-                || !direct_def_levels_match(third_levels, first_records, third_required)
-            {
-                return Ok(None);
-            }
             metrics.batches += 1;
-            metrics.rows = metrics.rows.saturating_add(first_records);
+            metrics.rows = metrics.rows.saturating_add(record_count);
+            let views: Vec<RawColumnView<'_>> = values
+                .iter()
+                .map(DirectPrimitiveColumnValues::as_view)
+                .collect();
             let consume_started = Instant::now();
-            consume(&first_values, &second_values, &third_values)?;
+            consume(&views)?;
             metrics.add_consume_nanos(elapsed_nanos(consume_started));
         }
     }

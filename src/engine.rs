@@ -37,14 +37,15 @@ use crate::plan::{
 };
 use crate::storage::{
     DirectByteArrayPayloadReader, DirectColumnScanMetrics, DirectI64I32I32ScanMetrics,
+    DirectPrimitiveColumnScanMetrics, DirectPrimitiveColumnSpec, DirectPrimitiveColumnType,
     I64BloomPredicate, LocalFileSystemObjectStore, ObjectStore, ParquetBatchReader,
     ParquetFileCache, ParquetFileCacheStats, ParquetMetadataCache,
     parquet_row_group_count_with_store, plan_parquet_scan_tasks, read_parquet_file_statistics,
     read_parquet_i64_column_constant, read_parquet_i64_column_max,
     scan_parquet_i64_byte_array_payload_columns_with_store,
-    scan_parquet_i64_i32_i32_columns_with_store,
+    scan_parquet_primitive_columns_with_store,
 };
-use crate::vector::{BatchView, RawColumnView};
+use crate::vector::BatchView;
 
 const LOCAL_SHUFFLE_FILE_TARGET_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -672,7 +673,7 @@ impl DodamEngine {
         )
     }
 
-    pub(crate) fn scan_parquet_i64_i32_i32_columns<F>(
+    pub(crate) fn scan_parquet_i64_i32_i32_columns_view<F>(
         &self,
         path: impl AsRef<Path>,
         batch_size: usize,
@@ -681,43 +682,44 @@ impl DodamEngine {
         consume: F,
     ) -> Result<Option<DirectI64I32I32ScanMetrics>>
     where
-        F: FnMut(&[i64], &[i32], &[i32]) -> Result<()>,
+        F: for<'a> FnMut(BatchView<'a>) -> Result<()>,
     {
-        scan_parquet_i64_i32_i32_columns_with_store(
+        let specs = [
+            DirectPrimitiveColumnSpec {
+                name: columns[0],
+                column_type: DirectPrimitiveColumnType::I64,
+            },
+            DirectPrimitiveColumnSpec {
+                name: columns[1],
+                column_type: DirectPrimitiveColumnType::I32,
+            },
+            DirectPrimitiveColumnSpec {
+                name: columns[2],
+                column_type: DirectPrimitiveColumnType::I32,
+            },
+        ];
+        self.scan_parquet_primitive_columns_view(path, batch_size, row_groups, &specs, consume)
+    }
+
+    pub(crate) fn scan_parquet_primitive_columns_view<F>(
+        &self,
+        path: impl AsRef<Path>,
+        batch_size: usize,
+        row_groups: &[usize],
+        columns: &[DirectPrimitiveColumnSpec<'_>],
+        mut consume: F,
+    ) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
+    where
+        F: for<'a> FnMut(BatchView<'a>) -> Result<()>,
+    {
+        scan_parquet_primitive_columns_with_store(
             path.as_ref(),
             batch_size,
             row_groups,
             columns,
             self.file_cache.clone(),
             self.object_store.as_ref(),
-            consume,
-        )
-    }
-
-    pub(crate) fn scan_parquet_i64_i32_i32_columns_view<F>(
-        &self,
-        path: impl AsRef<Path>,
-        batch_size: usize,
-        row_groups: &[usize],
-        columns: [&str; 3],
-        mut consume: F,
-    ) -> Result<Option<DirectI64I32I32ScanMetrics>>
-    where
-        F: for<'a> FnMut(BatchView<'a>) -> Result<()>,
-    {
-        self.scan_parquet_i64_i32_i32_columns(
-            path,
-            batch_size,
-            row_groups,
-            columns,
-            move |first, second, third| {
-                let columns = [
-                    RawColumnView::I64(first),
-                    RawColumnView::I32(second),
-                    RawColumnView::I32(third),
-                ];
-                consume(BatchView::from_raw_columns(&columns))
-            },
+            move |columns| consume(BatchView::from_raw_columns(columns)),
         )
     }
 
