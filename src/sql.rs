@@ -16523,18 +16523,21 @@ fn q04_lineitem_direct_column_chunk_scan(
         &row_groups,
         ["l_orderkey", "l_commitdate", "l_receiptdate"],
         |view| {
-            let before = partial.counts.iter().copied().sum::<u64>();
+            if let Some((orderkeys, _, _)) = view.raw_i64_i32_i32() {
+                let batch_hits = q04_count_late_candidate_priorities_atomic_view_hits(
+                    view,
+                    &candidate_priorities,
+                    &mut partial.counts,
+                )?;
+                hits = hits.saturating_add(batch_hits);
+                misses = misses.saturating_add(orderkeys.len().saturating_sub(batch_hits));
+                return Ok(());
+            }
             q04_count_late_candidate_priorities_atomic_view(
                 view,
                 &candidate_priorities,
                 &mut partial.counts,
             )?;
-            let after = partial.counts.iter().copied().sum::<u64>();
-            let batch_hits = usize::try_from(after.saturating_sub(before)).unwrap_or(usize::MAX);
-            hits = hits.saturating_add(batch_hits);
-            if let Some((orderkeys, _, _)) = view.raw_i64_i32_i32() {
-                misses = misses.saturating_add(orderkeys.len().saturating_sub(batch_hits));
-            }
             Ok(())
         },
     )?
@@ -17022,15 +17025,23 @@ fn q04_count_late_candidate_priorities_atomic_view(
     candidate_priorities: &[AtomicU8],
     counts: &mut [u64],
 ) -> Result<Option<()>> {
+    q04_count_late_candidate_priorities_atomic_view_hits(view, candidate_priorities, counts)?;
+    Ok(Some(()))
+}
+
+fn q04_count_late_candidate_priorities_atomic_view_hits(
+    view: BatchView<'_>,
+    candidate_priorities: &[AtomicU8],
+    counts: &mut [u64],
+) -> Result<usize> {
     if let Some((orderkeys, commitdates, receiptdates)) = view.raw_i64_i32_i32() {
-        q04_count_late_candidate_priorities_atomic_raw(
+        return Ok(q04_count_late_candidate_priorities_atomic_raw(
             orderkeys,
             commitdates,
             receiptdates,
             candidate_priorities,
             counts,
-        );
-        return Ok(Some(()));
+        ));
     }
     if view.num_columns() == 3
         && q04_count_late_candidate_priorities_atomic_typed(
@@ -17041,13 +17052,14 @@ fn q04_count_late_candidate_priorities_atomic_view(
             counts,
         )?
     {
-        return Ok(Some(()));
+        return Ok(0);
     }
-    q04_count_late_candidate_priorities_atomic_batch(
+    let _ = q04_count_late_candidate_priorities_atomic_batch(
         view.record_batch().clone(),
         candidate_priorities,
         counts,
-    )
+    )?;
+    Ok(0)
 }
 
 fn q04_lineitem_row_filter_enabled(candidate_key_count: usize) -> bool {
@@ -17318,7 +17330,8 @@ fn q04_count_late_candidate_priorities_atomic_raw(
     receiptdates: &[i32],
     candidate_priorities: &[AtomicU8],
     counts: &mut [u64],
-) {
+) -> usize {
+    let mut hits = 0usize;
     for row in 0..orderkeys.len() {
         if commitdates[row] >= receiptdates[row] {
             continue;
@@ -17342,7 +17355,9 @@ fn q04_count_late_candidate_priorities_atomic_raw(
             continue;
         }
         counts[usize::from(priority_marker - 1)] += 1;
+        hits += 1;
     }
+    hits
 }
 
 fn q04_lineitem_selection_vector_enabled() -> bool {
