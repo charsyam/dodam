@@ -133,6 +133,39 @@ impl<'a> Date32VectorView<'a> {
 }
 
 #[derive(Clone, Copy)]
+pub(crate) enum Utf8VectorView<'a> {
+    Arrow(&'a StringArray),
+}
+
+impl<'a> Utf8VectorView<'a> {
+    pub(crate) fn null_count(&self) -> usize {
+        match self {
+            Self::Arrow(values) => values.null_count(),
+        }
+    }
+
+    pub(crate) fn is_null(&self, row: usize) -> bool {
+        match self {
+            Self::Arrow(values) => values.is_null(row),
+        }
+    }
+
+    pub(crate) fn is_valid(&self, row: usize) -> bool {
+        !self.is_null(row)
+    }
+
+    pub(crate) fn value_bytes(&self, row: usize) -> &'a [u8] {
+        match self {
+            Self::Arrow(values) => {
+                let offsets = values.value_offsets();
+                let data = values.value_data();
+                &data[offsets[row] as usize..offsets[row + 1] as usize]
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 pub(crate) enum Decimal128VectorView<'a> {
     Arrow {
         values: &'a Decimal128Array,
@@ -305,6 +338,13 @@ impl<'a> BatchView<'a> {
 
     pub(crate) fn utf8(&self, index: usize) -> Option<&'a StringArray> {
         self.downcast(index)
+    }
+
+    pub(crate) fn utf8_vector(&self, index: usize) -> Option<Utf8VectorView<'a>> {
+        match self.inner {
+            BatchViewInner::RecordBatch(_) => self.utf8(index).map(Utf8VectorView::Arrow),
+            BatchViewInner::RawColumns(_) => None,
+        }
     }
 
     pub(crate) fn required_utf8(&self, index: usize) -> Result<&'a StringArray> {

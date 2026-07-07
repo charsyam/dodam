@@ -56,8 +56,8 @@ use crate::storage::{
 };
 use crate::vector::{
     BatchConsumer, BatchView, Date32VectorView, Decimal128VectorView, DictionaryI32View,
-    DictionaryStringValues, I32VectorView, I64VectorView, SelectionVector, consume_record_batch,
-    dictionary_i32_view_match_flags,
+    DictionaryStringValues, I32VectorView, I64VectorView, SelectionVector, Utf8VectorView,
+    consume_record_batch, dictionary_i32_view_match_flags,
 };
 
 fn tpch_profile_enabled() -> bool {
@@ -4513,7 +4513,7 @@ fn q10_returned_revenue_late_build_selection_view(
     state: &mut Q10ReturnedRevenueLateState,
 ) -> Result<Option<()>> {
     if view.num_columns() == 2 {
-        let (Some(orderkeys), Some(returnflags)) = (view.i64_vector(0), view.utf8(1)) else {
+        let (Some(orderkeys), Some(returnflags)) = (view.i64_vector(0), view.utf8_vector(1)) else {
             let Some(batch) = view.try_record_batch() else {
                 return Ok(None);
             };
@@ -4523,20 +4523,17 @@ fn q10_returned_revenue_late_build_selection_view(
                 state,
             );
         };
-        let returnflag_offsets = returnflags.value_offsets();
-        let returnflag_data = returnflags.value_data();
         if let Some(orderkey_values) = orderkeys.values_if_null_free()
             && returnflags.null_count() == 0
         {
             for row in 0..orderkey_values.len() {
-                let selected =
-                    utf8_value_is_one_byte(returnflag_offsets, returnflag_data, row, b'R')
-                        && state
-                            .order_customers
-                            .get(&orderkey_values[row])
-                            .copied()
-                            .inspect(|custkey| state.selected_custkeys.push(*custkey))
-                            .is_some();
+                let selected = returnflags.value_bytes(row) == b"R"
+                    && state
+                        .order_customers
+                        .get(&orderkey_values[row])
+                        .copied()
+                        .inspect(|custkey| state.selected_custkeys.push(*custkey))
+                        .is_some();
                 selection.push(selected);
             }
             return Ok(Some(()));
@@ -4544,7 +4541,7 @@ fn q10_returned_revenue_late_build_selection_view(
         for row in 0..orderkeys.len() {
             let selected = !orderkeys.is_null(row)
                 && returnflags.is_valid(row)
-                && utf8_value_is_one_byte(returnflag_offsets, returnflag_data, row, b'R')
+                && returnflags.value_bytes(row) == b"R"
                 && state
                     .order_customers
                     .get(&orderkeys.value(row))
@@ -4770,29 +4767,28 @@ fn q10_returned_revenue_view(
 ) -> Result<FastHashMap<i64, f64>> {
     if view.num_columns() == 4 {
         let (Some(orderkeys), Some(returnflags), Some(extendedprices), Some(discounts)) = (
-            view.i64(0),
-            view.utf8(1),
-            decimal_input(view.column(2)?)?,
-            decimal_input(view.column(3)?)?,
+            view.i64_vector(0),
+            view.utf8_vector(1),
+            view.decimal128_vector(2),
+            view.decimal128_vector(3),
         ) else {
-            return q10_returned_revenue_batch(view.record_batch().clone(), order_customers);
+            let Some(batch) = view.try_record_batch() else {
+                return Ok(fast_hash_map::<i64, f64>());
+            };
+            return q10_returned_revenue_batch(batch.clone(), order_customers);
         };
         let mut revenues = fast_hash_map::<i64, f64>();
-        let returnflag_offsets = returnflags.value_offsets();
-        let returnflag_data = returnflags.value_data();
-        if orderkeys.null_count() == 0
+        if let Some(orderkey_values) = orderkeys.values_if_null_free()
+            && returnflags.null_count() == 0
             && extendedprices.null_count() == 0
             && discounts.null_count() == 0
         {
-            let orderkey_values = orderkeys.values().as_ref();
             let extendedprice_values = extendedprices.raw_values();
             let discount_values = discounts.raw_values();
-            let (discount_scale, revenue_scale) =
-                decimal_discounted_revenue_scales(extendedprices, discounts);
+            let discount_scale = discounts.scale();
+            let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
             for row in 0..view.num_rows() {
-                if returnflags.is_null(row)
-                    || !utf8_value_is_one_byte(returnflag_offsets, returnflag_data, row, b'R')
-                {
+                if returnflags.value_bytes(row) != b"R" {
                     continue;
                 }
                 let Some(custkey) = order_customers.get(&orderkey_values[row]).copied() else {
@@ -4809,7 +4805,7 @@ fn q10_returned_revenue_view(
         }
         for row in 0..view.num_rows() {
             if returnflags.is_null(row)
-                || !utf8_value_is_one_byte(returnflag_offsets, returnflag_data, row, b'R')
+                || returnflags.value_bytes(row) != b"R"
                 || orderkeys.is_null(row)
                 || extendedprices.is_null(row)
                 || discounts.is_null(row)
@@ -10924,7 +10920,7 @@ fn q12_late_build_selection_view(
     state: &mut Q12LateState,
 ) -> Result<Option<()>> {
     if view.num_columns() == 4 {
-        let Some(modes) = view.column(0)?.as_any().downcast_ref::<StringArray>() else {
+        let Some(modes) = view.utf8_vector(0) else {
             let Some(batch) = view.try_record_batch() else {
                 return Ok(None);
             };
@@ -10950,8 +10946,6 @@ fn q12_late_build_selection_view(
         }
         let left_mode = left_mode.as_bytes();
         let right_mode = right_mode.as_bytes();
-        let mode_offsets = modes.value_offsets();
-        let mode_data = modes.value_data();
         let commitdate_values = commitdates.values().as_ref();
         let receiptdate_values = receiptdates.values().as_ref();
         let shipdate_values = shipdates.values().as_ref();
@@ -10968,7 +10962,7 @@ fn q12_late_build_selection_view(
                 selection.push(false);
                 continue;
             }
-            let mode = bytes_string_parts(mode_offsets, mode_data, row);
+            let mode = modes.value_bytes(row);
             let mode_index = if mode == left_mode {
                 0
             } else if mode == right_mode {
@@ -11742,13 +11736,13 @@ struct Q12OrderLateState {
 }
 
 struct Q12OrderPriorityView<'a> {
-    priorities: &'a StringArray,
+    priorities: Utf8VectorView<'a>,
 }
 
 impl<'a> Q12OrderPriorityView<'a> {
     fn try_new(view: BatchView<'a>) -> Option<Self> {
         (view.num_columns() == 1).then_some(Self {
-            priorities: view.utf8(0)?,
+            priorities: view.utf8_vector(0)?,
         })
     }
 }
@@ -11863,8 +11857,6 @@ fn q12_order_late_consume_priority_view(
 ) -> Result<Option<()>> {
     if let Some(layout) = Q12OrderPriorityView::try_new(view) {
         let priorities = layout.priorities;
-        let priority_offsets = priorities.value_offsets();
-        let priority_data = priorities.value_data();
         for row in 0..view.num_rows() {
             let Some(&order) = state.selected_orders.get(state.selected_offset) else {
                 return Err(DodamError::UnsupportedSql(
@@ -11875,8 +11867,7 @@ fn q12_order_late_consume_priority_view(
             if priorities.is_null(row) {
                 continue;
             }
-            let priority = bytes_string_parts(priority_offsets, priority_data, row);
-            let is_high_priority = q12_is_high_priority_bytes(priority);
+            let is_high_priority = q12_is_high_priority_bytes(priorities.value_bytes(row));
             q12_apply_pending_order(&mut state.groups, order, is_high_priority);
         }
         return Ok(Some(()));
@@ -11987,10 +11978,10 @@ fn q12_shipping_mode_counts_projected_view(
     pending: &AdaptiveI64Map<Q12PendingOrder>,
 ) -> Result<[Q12State; 2]> {
     if view.num_columns() == 2
-        && let Some(orderpriorities) = view.utf8(1)
+        && let (Some(orderkeys), Some(orderpriorities)) = (view.i64_vector(0), view.utf8_vector(1))
         && q12_typed_loop_enabled()
         && let Some(groups) =
-            q12_shipping_mode_counts_batch_typed(view.column(0)?, orderpriorities, pending)
+            q12_shipping_mode_counts_vector_typed(orderkeys, orderpriorities, pending)
     {
         return Ok(groups);
     }
@@ -12044,10 +12035,10 @@ fn q12_shipping_mode_counts_projected_view_sorted(
     pending: &SortedI64Lookup<Q12PendingOrder>,
 ) -> Result<[Q12State; 2]> {
     if view.num_columns() == 2
-        && let Some(orderpriorities) = view.utf8(1)
+        && let (Some(orderkeys), Some(orderpriorities)) = (view.i64_vector(0), view.utf8_vector(1))
         && q12_typed_loop_enabled()
         && let Some(groups) =
-            q12_shipping_mode_counts_batch_typed_sorted(view.column(0)?, orderpriorities, pending)
+            q12_shipping_mode_counts_vector_typed_sorted(orderkeys, orderpriorities, pending)
     {
         return Ok(groups);
     }
@@ -12125,10 +12116,10 @@ fn q12_shipping_mode_counts_projected_view_partial(
     let started = Instant::now();
     let rows = view.num_rows();
     if view.num_columns() == 2
-        && let Some(orderpriorities) = view.utf8(1)
+        && let (Some(orderkeys), Some(orderpriorities)) = (view.i64_vector(0), view.utf8_vector(1))
         && q12_typed_loop_enabled()
         && let Some(mut partial) =
-            q12_shipping_mode_counts_batch_typed_profile(view.column(0)?, orderpriorities, pending)
+            q12_shipping_mode_counts_vector_typed_profile(orderkeys, orderpriorities, pending)
     {
         partial.profile.total_nanos = sql_elapsed_nanos(started);
         return Ok(partial);
@@ -12230,6 +12221,26 @@ fn q12_profile_priority(
     }
     let priority = bytes_string_parts(priority_offsets, priority_data, row);
     let is_high_priority = q12_is_high_priority_bytes(priority);
+    profile.priority_rows += 1;
+    is_high_priority
+}
+
+fn q12_profile_priority_vector(
+    priorities: Utf8VectorView<'_>,
+    row: usize,
+    profile: &mut Q12OrdersProfile,
+) -> bool {
+    if q12_profile_sample(profile.priority_rows) {
+        profile.priority_samples += 1;
+        let started = Instant::now();
+        let is_high_priority = q12_is_high_priority_bytes(priorities.value_bytes(row));
+        profile.priority_nanos = profile
+            .priority_nanos
+            .saturating_add(sql_elapsed_nanos(started));
+        profile.priority_rows += 1;
+        return is_high_priority;
+    }
+    let is_high_priority = q12_is_high_priority_bytes(priorities.value_bytes(row));
     profile.priority_rows += 1;
     is_high_priority
 }
@@ -12430,6 +12441,145 @@ fn q12_shipping_mode_counts_batch_typed(
         q12_apply_pending_order(&mut groups, order, is_high_priority);
     }
     Some(groups)
+}
+
+fn q12_shipping_mode_counts_vector_typed(
+    orderkeys: I64VectorView<'_>,
+    orderpriorities: Utf8VectorView<'_>,
+    pending: &AdaptiveI64Map<Q12PendingOrder>,
+) -> Option<[Q12State; 2]> {
+    let mut groups = [Q12State::default(); 2];
+    if let Some(orderkey_values) = orderkeys.values_if_null_free()
+        && orderpriorities.null_count() == 0
+    {
+        if let Some((pending_values, pending_present)) = pending.dense_slices() {
+            for row in 0..orderkey_values.len() {
+                let Ok(index) = usize::try_from(orderkey_values[row]) else {
+                    continue;
+                };
+                if index >= pending_present.len() || !pending_present[index] {
+                    continue;
+                }
+                let is_high_priority = q12_is_high_priority_bytes(orderpriorities.value_bytes(row));
+                q12_apply_pending_order(&mut groups, pending_values[index], is_high_priority);
+            }
+            return Some(groups);
+        }
+        for row in 0..orderkey_values.len() {
+            let Some(order) = pending.get(orderkey_values[row]) else {
+                continue;
+            };
+            let is_high_priority = q12_is_high_priority_bytes(orderpriorities.value_bytes(row));
+            q12_apply_pending_order(&mut groups, order, is_high_priority);
+        }
+        return Some(groups);
+    }
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || orderpriorities.is_null(row) {
+            continue;
+        }
+        let Some(order) = pending.get(orderkeys.value(row)) else {
+            continue;
+        };
+        let is_high_priority = q12_is_high_priority_bytes(orderpriorities.value_bytes(row));
+        q12_apply_pending_order(&mut groups, order, is_high_priority);
+    }
+    Some(groups)
+}
+
+fn q12_shipping_mode_counts_vector_typed_sorted(
+    orderkeys: I64VectorView<'_>,
+    orderpriorities: Utf8VectorView<'_>,
+    pending: &SortedI64Lookup<Q12PendingOrder>,
+) -> Option<[Q12State; 2]> {
+    let mut groups = [Q12State::default(); 2];
+    if let Some(orderkey_values) = orderkeys.values_if_null_free()
+        && orderpriorities.null_count() == 0
+    {
+        for row in 0..orderkey_values.len() {
+            let Some(order) = pending.get(orderkey_values[row]) else {
+                continue;
+            };
+            let is_high_priority = q12_is_high_priority_bytes(orderpriorities.value_bytes(row));
+            q12_apply_pending_order(&mut groups, order, is_high_priority);
+        }
+        return Some(groups);
+    }
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || orderpriorities.is_null(row) {
+            continue;
+        }
+        let Some(order) = pending.get(orderkeys.value(row)) else {
+            continue;
+        };
+        let is_high_priority = q12_is_high_priority_bytes(orderpriorities.value_bytes(row));
+        q12_apply_pending_order(&mut groups, order, is_high_priority);
+    }
+    Some(groups)
+}
+
+fn q12_shipping_mode_counts_vector_typed_profile(
+    orderkeys: I64VectorView<'_>,
+    orderpriorities: Utf8VectorView<'_>,
+    pending: &AdaptiveI64Map<Q12PendingOrder>,
+) -> Option<Q12OrdersPartial> {
+    let mut groups = [Q12State::default(); 2];
+    let mut profile = Q12OrdersProfile {
+        batches: 1,
+        typed_batches: 1,
+        rows: orderkeys.len(),
+        ..Default::default()
+    };
+    if let Some(orderkey_values) = orderkeys.values_if_null_free()
+        && orderpriorities.null_count() == 0
+    {
+        if let Some((pending_values, pending_present)) = pending.dense_slices() {
+            for row in 0..orderkey_values.len() {
+                let order = q12_profile_dense_lookup(
+                    orderkey_values[row],
+                    pending_values,
+                    pending_present,
+                    row,
+                    &mut profile,
+                );
+                let Some(order) = order else {
+                    profile.lookup_misses += 1;
+                    continue;
+                };
+                profile.lookup_hits += 1;
+                let is_high_priority =
+                    q12_profile_priority_vector(orderpriorities, row, &mut profile);
+                q12_profile_apply(&mut groups, order, is_high_priority, &mut profile);
+            }
+            return Some(Q12OrdersPartial { groups, profile });
+        }
+        for row in 0..orderkey_values.len() {
+            let order = q12_profile_map_lookup(pending, orderkey_values[row], row, &mut profile);
+            let Some(order) = order else {
+                profile.lookup_misses += 1;
+                continue;
+            };
+            profile.lookup_hits += 1;
+            let is_high_priority = q12_profile_priority_vector(orderpriorities, row, &mut profile);
+            q12_profile_apply(&mut groups, order, is_high_priority, &mut profile);
+        }
+        return Some(Q12OrdersPartial { groups, profile });
+    }
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || orderpriorities.is_null(row) {
+            profile.null_rows += 1;
+            continue;
+        }
+        let order = q12_profile_map_lookup(pending, orderkeys.value(row), row, &mut profile);
+        let Some(order) = order else {
+            profile.lookup_misses += 1;
+            continue;
+        };
+        profile.lookup_hits += 1;
+        let is_high_priority = q12_profile_priority_vector(orderpriorities, row, &mut profile);
+        q12_profile_apply(&mut groups, order, is_high_priority, &mut profile);
+    }
+    Some(Q12OrdersPartial { groups, profile })
 }
 
 fn q12_shipping_mode_counts_batch_typed_sorted(
