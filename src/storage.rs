@@ -1479,6 +1479,14 @@ where
         .map_err(|_| {
             DodamError::UnsupportedSql("direct parquet column index shape mismatch".to_string())
         })?;
+    let skip_required_def_levels = direct_skip_required_def_levels_enabled();
+    let schema = reader.metadata().file_metadata().schema_descr();
+    let first_required =
+        skip_required_def_levels && schema.column(first_column).max_def_level() == 0;
+    let second_required =
+        skip_required_def_levels && schema.column(second_column).max_def_level() == 0;
+    let third_required =
+        skip_required_def_levels && schema.column(third_column).max_def_level() == 0;
     let mut metrics = DirectI64I32I32ScanMetrics {
         row_groups: row_groups.len(),
         ..DirectI64I32I32ScanMetrics::default()
@@ -1511,37 +1519,49 @@ where
             second_def_levels.clear();
             third_def_levels.clear();
             let read_started = Instant::now();
-            let (first_records, first_value_count, first_levels) = first_reader.read_records(
-                batch_size,
-                Some(&mut first_def_levels),
-                None,
-                &mut first_values,
-            )?;
+            let (first_records, first_value_count, first_levels) = if first_required {
+                first_reader.read_records(batch_size, None, None, &mut first_values)?
+            } else {
+                first_reader.read_records(
+                    batch_size,
+                    Some(&mut first_def_levels),
+                    None,
+                    &mut first_values,
+                )?
+            };
             if first_records == 0 {
                 metrics.add_read_nanos(elapsed_nanos(read_started));
                 break;
             }
-            let (second_records, second_value_count, second_levels) = second_reader.read_records(
-                first_records,
-                Some(&mut second_def_levels),
-                None,
-                &mut second_values,
-            )?;
-            let (third_records, third_value_count, third_levels) = third_reader.read_records(
-                first_records,
-                Some(&mut third_def_levels),
-                None,
-                &mut third_values,
-            )?;
+            let (second_records, second_value_count, second_levels) = if second_required {
+                second_reader.read_records(first_records, None, None, &mut second_values)?
+            } else {
+                second_reader.read_records(
+                    first_records,
+                    Some(&mut second_def_levels),
+                    None,
+                    &mut second_values,
+                )?
+            };
+            let (third_records, third_value_count, third_levels) = if third_required {
+                third_reader.read_records(first_records, None, None, &mut third_values)?
+            } else {
+                third_reader.read_records(
+                    first_records,
+                    Some(&mut third_def_levels),
+                    None,
+                    &mut third_values,
+                )?
+            };
             metrics.add_read_nanos(elapsed_nanos(read_started));
             if first_value_count != first_records
-                || first_levels != first_records
+                || !direct_def_levels_match(first_levels, first_records, first_required)
                 || second_records != first_records
                 || second_value_count != first_records
-                || second_levels != first_records
+                || !direct_def_levels_match(second_levels, first_records, second_required)
                 || third_records != first_records
                 || third_value_count != first_records
-                || third_levels != first_records
+                || !direct_def_levels_match(third_levels, first_records, third_required)
             {
                 return Ok(None);
             }
@@ -1553,6 +1573,19 @@ where
         }
     }
     Ok(Some(metrics))
+}
+
+fn direct_def_levels_match(level_count: usize, record_count: usize, required: bool) -> bool {
+    if required {
+        level_count == 0
+    } else {
+        level_count == record_count
+    }
+}
+
+fn direct_skip_required_def_levels_enabled() -> bool {
+    std::env::var("DODAM_DIRECT_SKIP_REQUIRED_DEF_LEVELS")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 enum I64SetPredicate {

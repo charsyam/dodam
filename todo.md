@@ -1697,3 +1697,7 @@ Tried and rejected or neutral:
         - Checked row-group pruning potential with DuckDB metadata: all 524 lineitem row groups have at least one Q04 candidate orderkey in their min/max range, so row-group range skip cannot help this dataset.
         - Added an opt-in `DODAM_Q04_ENABLE_CANDIDATE_BLOOM=1` front-filter before atomic marker probes. It regressed badly: default-off Q04 sampled `~145.8ms` vs DuckDB `~123.5ms`, while Bloom opt-in sampled `~192.4ms` vs DuckDB `~124.5ms`.
         - Lesson: for Q04/SF=10, two hash probes plus bit checks cost more than the avoided relaxed atomic loads. The remaining gap still points back to Arrow/Parquet read/decode and the need for page/vector-level fusion rather than another row-loop prefilter.
+      - Direct ColumnReader required-level experiment:
+        - Added opt-in `DODAM_DIRECT_SKIP_REQUIRED_DEF_LEVELS=1` for the direct `i64/i32/i32` vector scan. When parquet schema says `max_def_level == 0`, it passes `None` for definition-level buffers instead of decoding/filling them.
+        - It regressed Q04 direct opt-in: normal direct path sampled `~191.1ms` vs DuckDB `~124.5ms`, while skip-required-levels sampled `~244.7ms` vs DuckDB `~130.0ms`.
+        - Lesson: parquet-rs public `ColumnReader::read_records` is not faster on this path when def-level buffers are omitted. Keep this disabled by default; it reinforces that useful decode fusion needs a different buffered page/vector path, not just toggling public ColumnReader arguments.
