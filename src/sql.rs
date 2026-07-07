@@ -4307,12 +4307,12 @@ fn q10_customer_late_consume_payload_view(
             Some(phones),
             Some(comments),
         ) = (
-            view.utf8(0),
-            decimal_input(view.column(1)?)?,
-            view.i64(2),
-            view.utf8(3),
-            view.utf8(4),
-            view.utf8(5),
+            view.utf8_vector(0),
+            view.decimal128_vector(1),
+            view.i64_vector(2),
+            view.utf8_vector(3),
+            view.utf8_vector(4),
+            view.utf8_vector(5),
         )
         else {
             let Some(batch) = view.try_record_batch() else {
@@ -4332,15 +4332,23 @@ fn q10_customer_late_consume_payload_view(
             {
                 continue;
             }
+            let c_name = std::str::from_utf8(names.value_bytes(row))
+                .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+            let c_address = std::str::from_utf8(addresses.value_bytes(row))
+                .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+            let c_phone = std::str::from_utf8(phones.value_bytes(row))
+                .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+            let c_comment = std::str::from_utf8(comments.value_bytes(row))
+                .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
             state.payload.customers.insert(
                 custkey,
                 Q10Customer {
-                    c_name: names.value(row).to_string(),
+                    c_name: c_name.to_string(),
                     c_acctbal: acctbals.value(row),
                     c_nationkey: nationkeys.value(row),
-                    c_address: addresses.value(row).to_string(),
-                    c_phone: phones.value(row).to_string(),
-                    c_comment: comments.value(row).to_string(),
+                    c_address: c_address.to_string(),
+                    c_phone: c_phone.to_string(),
+                    c_comment: c_comment.to_string(),
                 },
             );
         }
@@ -4474,7 +4482,12 @@ fn q10_order_customers_view(
         }
         return Ok(orders);
     }
-    q10_order_customers_batch(view.record_batch().clone(), start_days, end_days)
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "Q10 order customer raw vector columns have unsupported types".to_string(),
+        ));
+    };
+    q10_order_customers_batch(batch.clone(), start_days, end_days)
 }
 
 fn q10_order_customers_batch_typed(
@@ -4972,7 +4985,12 @@ fn q10_returned_revenue_view(
         }
         return Ok(revenues);
     }
-    q10_returned_revenue_batch(view.record_batch().clone(), order_customers)
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "Q10 returned revenue raw vector columns have unsupported types".to_string(),
+        ));
+    };
+    q10_returned_revenue_batch(batch.clone(), order_customers)
 }
 
 fn q10_output(rows: Vec<Q10Row>) -> Result<QueryOutput> {
