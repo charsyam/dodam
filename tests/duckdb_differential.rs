@@ -1112,6 +1112,21 @@ async fn duckdb_differential_exists_subquery() {
 
     assert_same_as_duckdb(
         &format!(
+            "SELECT f.key, count(*) FROM '{}' f WHERE NOT EXISTS (SELECT id FROM '{}' g WHERE g.key = f.key AND g.id > 4) GROUP BY f.key ORDER BY f.key",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT f.key, count(*) FROM read_parquet('{}') f WHERE NOT EXISTS (SELECT id FROM read_parquet('{}') g WHERE g.key = f.key AND g.id > 4) GROUP BY f.key ORDER BY f.key",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
             "SELECT f.id, f.payload FROM '{}' f WHERE f.id = 1 OR EXISTS (SELECT id FROM '{}' g WHERE g.key = f.key AND g.id > 4) ORDER BY f.id",
             facts_path.display(),
             facts_path.display()
@@ -1433,8 +1448,10 @@ async fn dodam_sql_error_contract_matrix() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let facts_path = tempdir.path().join("facts.parquet");
     let dim_path = tempdir.path().join("dim.parquet");
+    let types_path = tempdir.path().join("types.parquet");
     write_facts_parquet(&facts_path);
     write_dim_parquet(&dim_path);
+    write_types_parquet(&types_path);
 
     assert_dodam_unknown_column(
         &format!("SELECT missing FROM '{}'", facts_path.display()),
@@ -1483,6 +1500,32 @@ async fn dodam_sql_error_contract_matrix() {
             facts_path.display()
         ),
         "GROUP BY ALL",
+    )
+    .await;
+    assert_dodam_error_contains(
+        &format!("SELECT id + payload FROM '{}'", facts_path.display()),
+        "cannot use Utf8 in integer arithmetic",
+    )
+    .await;
+    assert_dodam_error_contains(
+        &format!("SELECT flag + 1 FROM '{}'", types_path.display()),
+        "cannot use Boolean in integer arithmetic",
+    )
+    .await;
+    assert_dodam_error_contains(
+        &format!(
+            "SELECT CAST('not-a-date' AS DATE) FROM '{}'",
+            facts_path.display()
+        ),
+        "invalid DATE literal",
+    )
+    .await;
+    assert_dodam_error_contains(
+        &format!(
+            "SELECT CAST('2024-99-99 00:00:00' AS TIMESTAMP) FROM '{}'",
+            facts_path.display()
+        ),
+        "invalid DATE literal",
     )
     .await;
 }
@@ -1598,6 +1641,45 @@ async fn duckdb_differential_extended_type_matrix() {
         ),
         &format!(
             "SELECT id, CAST(amount AS VARCHAR), COALESCE(CAST(amount AS VARCHAR), 'missing') FROM read_parquet('{}') ORDER BY id",
+            types_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, CAST(amount + amount AS VARCHAR), CAST(amount - amount AS VARCHAR) FROM '{}' ORDER BY id",
+            types_path.display()
+        ),
+        &format!(
+            "SELECT id, CAST(amount + amount AS VARCHAR), CAST(amount - amount AS VARCHAR) FROM read_parquet('{}') ORDER BY id",
+            types_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id FROM '{}' WHERE amount + amount > '0.00' ORDER BY id",
+            types_path.display()
+        ),
+        &format!(
+            "SELECT id FROM read_parquet('{}') WHERE amount + amount > '0.00' ORDER BY id",
+            types_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, CAST(CAST('2024-01-02' AS DATE) AS VARCHAR), CAST(CAST('2024-01-02 03:04:05' AS TIMESTAMP) AS VARCHAR), CAST(CAST(created_at AS DATE) AS VARCHAR), CAST(CAST(event_date AS TIMESTAMP) AS VARCHAR) FROM '{}' ORDER BY id",
+            types_path.display()
+        ),
+        &format!(
+            "SELECT id, CAST(CAST('2024-01-02' AS DATE) AS VARCHAR), CAST(CAST('2024-01-02 03:04:05' AS TIMESTAMP) AS VARCHAR), CAST(CAST(created_at AS DATE) AS VARCHAR), CAST(CAST(event_date AS TIMESTAMP) AS VARCHAR) FROM read_parquet('{}') ORDER BY id",
             types_path.display()
         ),
         tempdir.path(),
@@ -1904,6 +1986,19 @@ async fn duckdb_differential_nested_struct_field_projection() {
         ),
         &format!(
             "SELECT id, attrs.rank AS rank, attrs.label AS label FROM read_parquet('{}') ORDER BY id",
+            input_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, attrs.detail.score AS score, attrs.detail.code AS code FROM '{}' WHERE attrs.detail.score >= 20 OR attrs.detail.code = 'a' ORDER BY id",
+            input_path.display()
+        ),
+        &format!(
+            "SELECT id, attrs.detail.score AS score, attrs.detail.code AS code FROM read_parquet('{}') WHERE attrs.detail.score >= 20 OR attrs.detail.code = 'a' ORDER BY id",
             input_path.display()
         ),
         tempdir.path(),
@@ -2690,6 +2785,17 @@ fn write_nested_values_parquet(path: &Path) {
     let attrs_fields = vec![
         Field::new("rank", DataType::Int32, true),
         Field::new("label", DataType::Utf8, true),
+        Field::new(
+            "detail",
+            DataType::Struct(
+                vec![
+                    Field::new("score", DataType::Int32, true),
+                    Field::new("code", DataType::Utf8, true),
+                ]
+                .into(),
+            ),
+            true,
+        ),
     ]
     .into();
     let schema = Arc::new(Schema::new(vec![
@@ -2717,6 +2823,35 @@ fn write_nested_values_parquet(path: &Path) {
                 Some("cold"),
                 None,
                 Some("flat"),
+            ])) as Arc<dyn arrow::array::Array>,
+        ),
+        (
+            Arc::new(Field::new(
+                "detail",
+                DataType::Struct(
+                    vec![
+                        Field::new("score", DataType::Int32, true),
+                        Field::new("code", DataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
+                true,
+            )),
+            Arc::new(StructArray::from(vec![
+                (
+                    Arc::new(Field::new("score", DataType::Int32, true)),
+                    Arc::new(Int32Array::from(vec![Some(7), Some(20), None, Some(40)]))
+                        as Arc<dyn arrow::array::Array>,
+                ),
+                (
+                    Arc::new(Field::new("code", DataType::Utf8, true)),
+                    Arc::new(StringArray::from(vec![
+                        Some("a"),
+                        Some("b"),
+                        None,
+                        Some("z"),
+                    ])) as Arc<dyn arrow::array::Array>,
+                ),
             ])) as Arc<dyn arrow::array::Array>,
         ),
     ]);

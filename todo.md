@@ -226,6 +226,12 @@
 - Closed the previous scalar display compatibility gap:
   - `EvaluatedScalar` now preserves `Decimal128(precision, scale)` through scalar expression projection instead of immediately lowering it to `Float64`.
   - `CAST(Date32/Timestamp/Decimal/Float64 AS VARCHAR)` now has active DuckDB differential coverage, including fixed-scale decimal output and `.0` preservation for whole `Float64` values.
+- Expanded typed expression compatibility further:
+  - same-scale `Decimal128` comparisons and `+`/`-` scalar expressions now use raw decimal values and preserve decimal scale instead of always falling back to `Float64`.
+  - Added typed scalar casts for `CAST(string AS DATE)`, `CAST(string AS TIMESTAMP)`, `CAST(timestamp AS DATE)`, and `CAST(date AS TIMESTAMP)`.
+  - Added multi-level struct field projection/filter support such as `attrs.detail.score`.
+  - Extended negative error coverage for scalar type mismatches and invalid date/timestamp casts.
+  - Extended the correlated `EXISTS` semijoin optimizer rule to support `NOT EXISTS` as an anti-semijoin mask, including aggregate outer queries.
 - Moved several TPC-H fast-path building blocks toward reusable optimizer/execution rules:
   - moved sorted `i64` lookup from Q-specific SQL code into a reusable `SortedI64Lookup`
   - moved packed `u32,u32` pair distinct counting into reusable `PackedU32PairDistinct`

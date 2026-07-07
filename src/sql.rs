@@ -636,22 +636,17 @@ async fn try_execute_correlated_exists_semijoin_sql(
     let outer_alias = table_ref_alias_or_name(&outer_path);
     let mut outer_conjuncts = Vec::new();
     collect_sql_and_conjuncts(selection, &mut outer_conjuncts);
-    let Some((exists_index, exists_subquery)) =
-        outer_conjuncts
-            .iter()
-            .enumerate()
-            .find_map(|(index, expr)| match expr {
-                SqlExpr::Exists { subquery, negated } if !negated => {
-                    Some((index, subquery.as_ref()))
-                }
-                SqlExpr::Nested(expr) => match expr.as_ref() {
-                    SqlExpr::Exists { subquery, negated } if !negated => {
-                        Some((index, subquery.as_ref()))
-                    }
-                    _ => None,
-                },
+    let Some((exists_index, exists_subquery, exists_negated)) = outer_conjuncts
+        .iter()
+        .enumerate()
+        .find_map(|(index, expr)| match expr {
+            SqlExpr::Exists { subquery, negated } => Some((index, subquery.as_ref(), *negated)),
+            SqlExpr::Nested(expr) => match expr.as_ref() {
+                SqlExpr::Exists { subquery, negated } => Some((index, subquery.as_ref(), *negated)),
                 _ => None,
-            })
+            },
+            _ => None,
+        })
     else {
         return Ok(None);
     };
@@ -754,7 +749,10 @@ async fn try_execute_correlated_exists_semijoin_sql(
     let outer_batches = collect_batches(stream)?;
     let mut filtered = Vec::new();
     for batch in outer_batches {
-        let mask = semijoin_membership_mask(&batch, &outer_key, &inner_keys)?;
+        let mut mask = semijoin_membership_mask(&batch, &outer_key, &inner_keys)?;
+        if exists_negated {
+            mask = invert_boolean_array(&mask);
+        }
         let batch = filter_record_batch(&batch, &mask)?;
         if batch.num_rows() > 0 {
             filtered.push(batch);
@@ -941,6 +939,15 @@ fn semijoin_membership_mask(
         .map(|row| keys.contains_column_value(column, row))
         .collect::<Result<Vec<_>>>()?;
     Ok(BooleanArray::from(values))
+}
+
+fn invert_boolean_array(array: &BooleanArray) -> BooleanArray {
+    BooleanArray::from(
+        array
+            .iter()
+            .map(|value| value.map(|value| !value))
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn semijoin_outer_projection(
@@ -35953,8 +35960,28 @@ fn parse_struct_field_access(
     };
     match (table_alias, parts.as_slice()) {
         (None, [column, field]) => Ok(Some((column.value.clone(), field.value.clone()))),
+        (None, [column, fields @ ..]) if fields.len() >= 2 => Ok(Some((
+            column.value.clone(),
+            fields
+                .iter()
+                .map(|field| field.value.as_str())
+                .collect::<Vec<_>>()
+                .join("."),
+        ))),
         (Some(alias), [qualifier, column, field]) if qualifier.value == alias => {
             Ok(Some((column.value.clone(), field.value.clone())))
+        }
+        (Some(alias), [qualifier, column, fields @ ..])
+            if qualifier.value == alias && fields.len() >= 2 =>
+        {
+            Ok(Some((
+                column.value.clone(),
+                fields
+                    .iter()
+                    .map(|field| field.value.as_str())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            )))
         }
         _ => Ok(None),
     }
@@ -38974,15 +39001,30 @@ fn evaluated_struct_field(
         .ok_or_else(|| {
             DodamError::UnsupportedSql(format!("{column}.{field} requires a STRUCT column"))
         })?;
-    let Some((field_index, _)) = struct_array
-        .fields()
-        .iter()
-        .enumerate()
-        .find(|(_, schema_field)| schema_field.name() == field)
-    else {
-        return Err(DodamError::UnknownColumn(format!("{column}.{field}")));
-    };
-    evaluated_array(struct_array.column(field_index).as_ref())
+    let mut current: &dyn Array = struct_array;
+    let mut current_path = column.to_string();
+    for field in field.split('.') {
+        let struct_array = current
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                DodamError::UnsupportedSql(format!(
+                    "{current_path}.{field} requires a STRUCT column"
+                ))
+            })?;
+        let Some((field_index, _)) = struct_array
+            .fields()
+            .iter()
+            .enumerate()
+            .find(|(_, schema_field)| schema_field.name() == field)
+        else {
+            return Err(DodamError::UnknownColumn(format!("{current_path}.{field}")));
+        };
+        current_path.push('.');
+        current_path.push_str(field);
+        current = struct_array.column(field_index).as_ref();
+    }
+    evaluated_array(current)
 }
 
 fn evaluated_list_length(batch: &RecordBatch, column: &str) -> Result<EvaluatedScalar> {
@@ -39193,6 +39235,23 @@ fn compare_evaluated_scalars(
                 .map(|(left, right)| compare_optional_f64(left, op, right))
                 .collect())
         }
+        (
+            EvaluatedScalar::Decimal128 {
+                values: left,
+                precision: left_precision,
+                scale: left_scale,
+            },
+            EvaluatedScalar::Decimal128 {
+                values: right,
+                precision: right_precision,
+                scale: right_scale,
+            },
+        ) if left_precision == right_precision && left_scale == right_scale => Ok(left
+            .iter()
+            .copied()
+            .zip(right.iter().copied())
+            .map(|(left, right)| compare_optional_values(left, op, right))
+            .collect()),
         (EvaluatedScalar::Decimal128 { .. }, _) | (_, EvaluatedScalar::Decimal128 { .. }) => {
             let left = scalar_as_f64(left)?;
             let right = scalar_as_f64(right)?;
@@ -39280,6 +39339,39 @@ fn evaluate_binary_scalar(
     right: EvaluatedScalar,
 ) -> Result<EvaluatedScalar> {
     match (&left, &right) {
+        (
+            EvaluatedScalar::Decimal128 {
+                values: left,
+                precision,
+                scale,
+            },
+            EvaluatedScalar::Decimal128 {
+                values: right,
+                precision: right_precision,
+                scale: right_scale,
+            },
+        ) if precision == right_precision
+            && scale == right_scale
+            && matches!(op, BinaryOperator::Plus | BinaryOperator::Minus) =>
+        {
+            Ok(EvaluatedScalar::Decimal128 {
+                values: left
+                    .iter()
+                    .copied()
+                    .zip(right.iter().copied())
+                    .map(|(left, right)| match (left, right) {
+                        (Some(left), Some(right)) => match op {
+                            BinaryOperator::Plus => left.checked_add(right),
+                            BinaryOperator::Minus => left.checked_sub(right),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .collect(),
+                precision: *precision,
+                scale: *scale,
+            })
+        }
         (EvaluatedScalar::Float64(_), _)
         | (_, EvaluatedScalar::Float64(_))
         | (EvaluatedScalar::Decimal128 { .. }, _)
@@ -39486,6 +39578,48 @@ fn cast_evaluated_scalar(value: EvaluatedScalar, target: &str) -> Result<Evaluat
                 .collect(),
         }));
     }
+    if target == "date" {
+        return Ok(EvaluatedScalar::Date32(match value {
+            EvaluatedScalar::Date32(values) => values,
+            EvaluatedScalar::TimestampMillisecond(values) => values
+                .into_iter()
+                .map(|value| value.map(|value| (value.div_euclid(86_400_000)) as i32))
+                .collect(),
+            EvaluatedScalar::Utf8(values) => values
+                .into_iter()
+                .map(|value| value.map(|value| parse_date32_days(&value)).transpose())
+                .collect::<Result<Vec<_>>>()?,
+            other => {
+                return Err(DodamError::UnsupportedSql(format!(
+                    "cannot cast {} to DATE",
+                    other.data_type()
+                )));
+            }
+        }));
+    }
+    if matches!(target.as_str(), "timestamp" | "timestamp without time zone") {
+        return Ok(EvaluatedScalar::TimestampMillisecond(match value {
+            EvaluatedScalar::TimestampMillisecond(values) => values,
+            EvaluatedScalar::Date32(values) => values
+                .into_iter()
+                .map(|value| value.map(|value| i64::from(value) * 86_400_000))
+                .collect(),
+            EvaluatedScalar::Utf8(values) => values
+                .into_iter()
+                .map(|value| {
+                    value
+                        .map(|value| parse_timestamp_millis_value(&value))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?,
+            other => {
+                return Err(DodamError::UnsupportedSql(format!(
+                    "cannot cast {} to TIMESTAMP",
+                    other.data_type()
+                )));
+            }
+        }));
+    }
     Err(DodamError::UnsupportedSql(format!(
         "unsupported CAST target: {target}"
     )))
@@ -39608,6 +39742,59 @@ fn format_timestamp_millis(millis: i64) -> String {
             "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{millis_remainder:03}"
         )
     }
+}
+
+fn parse_date32_days(value: &str) -> Result<i32> {
+    let (year, month, day) = parse_ymd(value)?;
+    i32::try_from(days_from_civil(year, month, day)?)
+        .map_err(|_| DodamError::UnsupportedSql("DATE overflow".to_string()))
+}
+
+fn parse_timestamp_millis_value(value: &str) -> Result<i64> {
+    let (date, time) = value
+        .split_once(' ')
+        .or_else(|| value.split_once('T'))
+        .map_or((value, "00:00:00"), |(date, time)| (date, time));
+    let days = i64::from(parse_date32_days(date)?);
+    let mut time_parts = time.split(':');
+    let hour = parse_timestamp_part(time_parts.next(), value, "hour")?;
+    let minute = parse_timestamp_part(time_parts.next(), value, "minute")?;
+    let second_raw = time_parts
+        .next()
+        .ok_or_else(|| DodamError::UnsupportedSql(format!("invalid TIMESTAMP literal: {value}")))?;
+    if time_parts.next().is_some() {
+        return Err(DodamError::UnsupportedSql(format!(
+            "invalid TIMESTAMP literal: {value}"
+        )));
+    }
+    let (second_text, millis_text) = second_raw.split_once('.').unwrap_or((second_raw, ""));
+    let second = second_text
+        .parse::<i64>()
+        .map_err(|_| DodamError::UnsupportedSql(format!("invalid TIMESTAMP literal: {value}")))?;
+    let millis = if millis_text.is_empty() {
+        0
+    } else {
+        let millis_text = &millis_text[..millis_text.len().min(3)];
+        millis_text.parse::<i64>().map_err(|_| {
+            DodamError::UnsupportedSql(format!("invalid TIMESTAMP literal: {value}"))
+        })? * 10_i64.pow(u32::try_from(3_usize.saturating_sub(millis_text.len())).unwrap_or(0))
+    };
+    if !(0..24).contains(&hour) || !(0..60).contains(&minute) || !(0..60).contains(&second) {
+        return Err(DodamError::UnsupportedSql(format!(
+            "invalid TIMESTAMP literal: {value}"
+        )));
+    }
+    days.checked_mul(86_400_000)
+        .and_then(|base| {
+            base.checked_add(hour * 3_600_000 + minute * 60_000 + second * 1_000 + millis)
+        })
+        .ok_or_else(|| DodamError::UnsupportedSql("TIMESTAMP overflow".to_string()))
+}
+
+fn parse_timestamp_part(part: Option<&str>, value: &str, label: &str) -> Result<i64> {
+    part.ok_or_else(|| DodamError::UnsupportedSql(format!("invalid TIMESTAMP literal: {value}")))?
+        .parse::<i64>()
+        .map_err(|_| DodamError::UnsupportedSql(format!("invalid TIMESTAMP {label}: {value}")))
 }
 
 fn coalesce_options<T>(left: Vec<Option<T>>, right: Vec<Option<T>>) -> Vec<Option<T>> {
