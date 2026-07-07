@@ -9666,7 +9666,7 @@ fn q16_part_group_chunk_size() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(4)
+        .unwrap_or(2)
 }
 
 struct Q16PartGroupPartialRow {
