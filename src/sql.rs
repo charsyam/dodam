@@ -23871,25 +23871,151 @@ fn q08_market_share_view(
     supplier_is_brazil: &AdaptiveI64Map<bool>,
 ) -> Result<HashMap<i32, (f64, f64)>> {
     if view.num_columns() == 5
-        && let Some(groups) = q08_market_share_batch_typed(
-            view.column(0)?,
-            view.column(1)?,
-            view.column(2)?,
-            view.column(3)?,
-            view.column(4)?,
+        && let (
+            Some(orderkeys),
+            Some(partkeys),
+            Some(suppkeys),
+            Some(extendedprices),
+            Some(discounts),
+        ) = (
+            view.i64_vector(0),
+            view.i64_vector(1),
+            view.i64_vector(2),
+            view.decimal128_vector(3),
+            view.decimal128_vector(4),
+        )
+    {
+        return Ok(q08_market_share_vector(
+            orderkeys,
+            partkeys,
+            suppkeys,
+            extendedprices,
+            discounts,
             order_years,
             part_keys,
             supplier_is_brazil,
-        )?
-    {
-        return Ok(groups);
+        ));
     }
-    q08_market_share_batch(
-        view.record_batch().clone(),
-        order_years,
-        part_keys,
-        supplier_is_brazil,
-    )
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "Q08 market share raw vector columns have unsupported types".to_string(),
+        ));
+    };
+    q08_market_share_batch(batch.clone(), order_years, part_keys, supplier_is_brazil)
+}
+
+fn q08_market_share_vector(
+    orderkeys: I64VectorView<'_>,
+    partkeys: I64VectorView<'_>,
+    suppkeys: I64VectorView<'_>,
+    extendedprices: Decimal128VectorView<'_>,
+    discounts: Decimal128VectorView<'_>,
+    order_years: &AdaptiveI64Map<i32>,
+    part_keys: &AdaptiveI64Set,
+    supplier_is_brazil: &AdaptiveI64Map<bool>,
+) -> HashMap<i32, (f64, f64)> {
+    let mut groups = HashMap::<i32, (f64, f64)>::new();
+    if let (Some(orderkey_values), Some(partkey_values), Some(suppkey_values)) = (
+        orderkeys.values_if_null_free(),
+        partkeys.values_if_null_free(),
+        suppkeys.values_if_null_free(),
+    ) && extendedprices.null_count() == 0
+        && discounts.null_count() == 0
+    {
+        let extendedprice_values = extendedprices.raw_values();
+        let discount_values = discounts.raw_values();
+        let discount_scale = discounts.scale();
+        let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
+        let part_contains = part_keys.dense_contains_slice();
+        if let (
+            Some((order_year_values, order_year_present)),
+            Some((brazil_values, brazil_present)),
+        ) = (
+            order_years.dense_slices(),
+            supplier_is_brazil.dense_slices(),
+        ) {
+            for row in 0..orderkey_values.len() {
+                if !part_keys.contains_cached(part_contains, partkey_values[row]) {
+                    continue;
+                }
+                let Ok(orderkey) = usize::try_from(orderkey_values[row]) else {
+                    continue;
+                };
+                if !order_year_present.get(orderkey).copied().unwrap_or(false) {
+                    continue;
+                }
+                let Ok(suppkey) = usize::try_from(suppkey_values[row]) else {
+                    continue;
+                };
+                if !brazil_present.get(suppkey).copied().unwrap_or(false) {
+                    continue;
+                }
+                let volume = decimal_discounted_revenue_raw(
+                    extendedprice_values[row],
+                    discount_values[row],
+                    discount_scale,
+                    revenue_scale,
+                );
+                let group = groups
+                    .entry(order_year_values[orderkey])
+                    .or_insert((0.0, 0.0));
+                if brazil_values[suppkey] {
+                    group.0 += volume;
+                }
+                group.1 += volume;
+            }
+            return groups;
+        }
+        for row in 0..orderkey_values.len() {
+            if !part_keys.contains_cached(part_contains, partkey_values[row]) {
+                continue;
+            }
+            let Some(o_year) = order_years.get(orderkey_values[row]) else {
+                continue;
+            };
+            let Some(is_brazil) = supplier_is_brazil.get(suppkey_values[row]) else {
+                continue;
+            };
+            let volume = decimal_discounted_revenue_raw(
+                extendedprice_values[row],
+                discount_values[row],
+                discount_scale,
+                revenue_scale,
+            );
+            let group = groups.entry(o_year).or_insert((0.0, 0.0));
+            if is_brazil {
+                group.0 += volume;
+            }
+            group.1 += volume;
+        }
+        return groups;
+    }
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row)
+            || partkeys.is_null(row)
+            || suppkeys.is_null(row)
+            || extendedprices.is_null(row)
+            || discounts.is_null(row)
+        {
+            continue;
+        }
+        if !part_keys.contains(partkeys.value(row)) {
+            continue;
+        }
+        let Some(o_year) = order_years.get(orderkeys.value(row)) else {
+            continue;
+        };
+        let Some(is_brazil) = supplier_is_brazil.get(suppkeys.value(row)) else {
+            continue;
+        };
+        let volume = extendedprices.value(row) * (1.0 - discounts.value(row));
+        let group = groups.entry(o_year).or_insert((0.0, 0.0));
+        if is_brazil {
+            group.0 += volume;
+        }
+        group.1 += volume;
+    }
+    groups
 }
 
 fn q08_market_share_batch_typed(
