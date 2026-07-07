@@ -10651,10 +10651,16 @@ async fn q12_filtered_lineitem_counts_row_filtered(
             )? {
                 Ok(Some(()))
             } else {
+                let Some(batch) = view.try_record_batch() else {
+                    return Err(DodamError::UnsupportedSql(
+                        "Q12 row-filter lineitem raw vector columns have unsupported types"
+                            .to_string(),
+                    ));
+                };
                 q12_merge_pending_orders(
                     pending,
                     q12_filtered_lineitem_counts_projected_batch(
-                        view.record_batch().clone(),
+                        batch.clone(),
                         &shipmodes,
                         start_days,
                         end_days,
@@ -10701,10 +10707,16 @@ async fn q12_filtered_lineitem_counts_row_group_map(
                     )? {
                         Ok(Some(()))
                     } else {
+                        let Some(batch) = view.try_record_batch() else {
+                            return Err(DodamError::UnsupportedSql(
+                                "Q12 row-group lineitem raw vector columns have unsupported types"
+                                    .to_string(),
+                            ));
+                        };
                         q12_merge_pending_orders(
                             pending,
                             q12_filtered_lineitem_counts_projected_batch(
-                                view.record_batch().clone(),
+                                batch.clone(),
                                 &shipmodes,
                                 start_days,
                                 end_days,
@@ -10814,10 +10826,15 @@ async fn q12_filtered_lineitem_counts_stream(
             )? {
                 return Ok(Some(()));
             }
+            let Some(batch) = view.try_record_batch() else {
+                return Err(DodamError::UnsupportedSql(
+                    "Q12 lineitem raw vector columns have unsupported types".to_string(),
+                ));
+            };
             q12_merge_pending_orders(
                 pending,
                 q12_filtered_lineitem_counts_projected_batch(
-                    view.record_batch().clone(),
+                    batch.clone(),
                     &shipmodes,
                     start_days,
                     end_days,
@@ -11023,8 +11040,13 @@ impl BatchConsumer for Q12ProjectedLineitemConsumer<'_, '_> {
         )? {
             return Ok(());
         }
+        let Some(batch) = view.try_record_batch() else {
+            return Err(DodamError::UnsupportedSql(
+                "Q12 consumer lineitem raw vector columns have unsupported types".to_string(),
+            ));
+        };
         q12_filtered_lineitem_counts_batch_into(
-            view.record_batch().clone(),
+            batch.clone(),
             self.shipmodes,
             self.start_days,
             self.end_days,
@@ -11058,60 +11080,45 @@ fn q12_filtered_lineitem_counts_projected_view_into(
     {
         return Ok(true);
     }
-    if let Some(modes) = view.utf8(1)
-        && q12_filtered_lineitem_counts_batch_typed_into(
-            view.column(0)?,
-            modes,
-            view.column(2)?,
-            view.column(3)?,
-            view.column(4)?,
-            shipmodes,
-            start_days,
-            end_days,
-            pending,
-        )
-    {
-        return Ok(true);
-    }
     Ok(false)
 }
 
 struct Q12LineitemStringView<'a> {
-    orderkeys: &'a Int64Array,
-    modes: &'a StringArray,
-    commitdates: &'a Date32Array,
-    receiptdates: &'a Date32Array,
-    shipdates: &'a Date32Array,
+    orderkeys: I64VectorView<'a>,
+    modes: Utf8VectorView<'a>,
+    commitdates: Date32VectorView<'a>,
+    receiptdates: Date32VectorView<'a>,
+    shipdates: Date32VectorView<'a>,
 }
 
 impl<'a> Q12LineitemStringView<'a> {
     fn try_new(view: BatchView<'a>) -> Option<Self> {
         (view.num_columns() == 5).then_some(Self {
-            orderkeys: view.i64(0)?,
-            modes: view.utf8(1)?,
-            commitdates: view.date32(2)?,
-            receiptdates: view.date32(3)?,
-            shipdates: view.date32(4)?,
+            orderkeys: view.i64_vector(0)?,
+            modes: view.utf8_vector(1)?,
+            commitdates: view.date32_vector(2)?,
+            receiptdates: view.date32_vector(3)?,
+            shipdates: view.date32_vector(4)?,
         })
     }
 }
 
 struct Q12LineitemDictionaryView<'a> {
-    orderkeys: &'a Int64Array,
+    orderkeys: I64VectorView<'a>,
     modes: DictionaryI32View<'a>,
-    commitdates: &'a Date32Array,
-    receiptdates: &'a Date32Array,
-    shipdates: &'a Date32Array,
+    commitdates: Date32VectorView<'a>,
+    receiptdates: Date32VectorView<'a>,
+    shipdates: Date32VectorView<'a>,
 }
 
 impl<'a> Q12LineitemDictionaryView<'a> {
     fn try_new(view: BatchView<'a>) -> Option<Self> {
         (view.num_columns() == 5).then_some(Self {
-            orderkeys: view.i64(0)?,
+            orderkeys: view.i64_vector(0)?,
             modes: view.dictionary_i32_view(1)?,
-            commitdates: view.date32(2)?,
-            receiptdates: view.date32(3)?,
-            shipdates: view.date32(4)?,
+            commitdates: view.date32_vector(2)?,
+            receiptdates: view.date32_vector(3)?,
+            shipdates: view.date32_vector(4)?,
         })
     }
 }
@@ -11133,19 +11140,17 @@ fn q12_filtered_lineitem_counts_batch_dictionary_typed_into(
         return false;
     };
     let mode_keys = view.modes.keys();
-    if view.orderkeys.null_count() == 0
+    if let Some(orderkey_values) = view.orderkeys.values_if_null_free()
         && view.modes.null_count() == 0
-        && view.commitdates.null_count() == 0
-        && view.receiptdates.null_count() == 0
-        && view.shipdates.null_count() == 0
+        && let (Some(commitdate_values), Some(receiptdate_values), Some(shipdate_values)) = (
+            view.commitdates.values_if_null_free(),
+            view.receiptdates.values_if_null_free(),
+            view.shipdates.values_if_null_free(),
+        )
     {
-        let orderkey_values = view.orderkeys.values().as_ref();
-        let commitdate_values = view.commitdates.values().as_ref();
-        let receiptdate_values = view.receiptdates.values().as_ref();
-        let shipdate_values = view.shipdates.values().as_ref();
         if q12_lineitem_selection_vector_enabled() {
             let mut selected = SelectionVector::with_capacity(orderkey_values.len().min(4096));
-            for row in 0..view.orderkeys.len() {
+            for row in 0..orderkey_values.len() {
                 let commitdate = commitdate_values[row];
                 let receiptdate = receiptdate_values[row];
                 if q12_lineitem_dates_match(
@@ -11158,7 +11163,7 @@ fn q12_filtered_lineitem_counts_batch_dictionary_typed_into(
                     selected.push(row);
                 }
             }
-            if q12_should_use_lineitem_selection_vector(selected.len(), view.orderkeys.len()) {
+            if q12_should_use_lineitem_selection_vector(selected.len(), orderkey_values.len()) {
                 for &row in selected.as_slice() {
                     let row = row as usize;
                     let Ok(mode_key) = usize::try_from(mode_keys[row]) else {
@@ -11172,7 +11177,7 @@ fn q12_filtered_lineitem_counts_batch_dictionary_typed_into(
                 return true;
             }
         }
-        for row in 0..view.orderkeys.len() {
+        for row in 0..orderkey_values.len() {
             let commitdate = commitdate_values[row];
             let receiptdate = receiptdate_values[row];
             if !q12_lineitem_dates_match(
@@ -11251,11 +11256,11 @@ fn q12_filtered_lineitem_counts_batch_typed_into(
     };
     q12_filtered_lineitem_counts_string_view_into(
         Q12LineitemStringView {
-            orderkeys,
-            modes,
-            commitdates,
-            receiptdates,
-            shipdates,
+            orderkeys: I64VectorView::Arrow(orderkeys),
+            modes: Utf8VectorView::Arrow(modes),
+            commitdates: Date32VectorView::Arrow(commitdates),
+            receiptdates: Date32VectorView::Arrow(receiptdates),
+            shipdates: Date32VectorView::Arrow(shipdates),
         },
         shipmodes,
         start_days,
@@ -11276,21 +11281,17 @@ fn q12_filtered_lineitem_counts_string_view_into(
     };
     let left_mode = left_mode.as_bytes();
     let right_mode = right_mode.as_bytes();
-    let mode_offsets = view.modes.value_offsets();
-    let mode_data = view.modes.value_data();
-    if view.orderkeys.null_count() == 0
+    if let Some(orderkey_values) = view.orderkeys.values_if_null_free()
         && view.modes.null_count() == 0
-        && view.commitdates.null_count() == 0
-        && view.receiptdates.null_count() == 0
-        && view.shipdates.null_count() == 0
+        && let (Some(commitdate_values), Some(receiptdate_values), Some(shipdate_values)) = (
+            view.commitdates.values_if_null_free(),
+            view.receiptdates.values_if_null_free(),
+            view.shipdates.values_if_null_free(),
+        )
     {
-        let orderkey_values = view.orderkeys.values().as_ref();
-        let commitdate_values = view.commitdates.values().as_ref();
-        let receiptdate_values = view.receiptdates.values().as_ref();
-        let shipdate_values = view.shipdates.values().as_ref();
         if q12_lineitem_selection_vector_enabled() {
             let mut selected = SelectionVector::with_capacity(orderkey_values.len().min(4096));
-            for row in 0..view.orderkeys.len() {
+            for row in 0..orderkey_values.len() {
                 let commitdate = commitdate_values[row];
                 let receiptdate = receiptdate_values[row];
                 if q12_lineitem_dates_match(
@@ -11303,10 +11304,10 @@ fn q12_filtered_lineitem_counts_string_view_into(
                     selected.push(row);
                 }
             }
-            if q12_should_use_lineitem_selection_vector(selected.len(), view.orderkeys.len()) {
+            if q12_should_use_lineitem_selection_vector(selected.len(), orderkey_values.len()) {
                 for &row in selected.as_slice() {
                     let row = row as usize;
-                    let mode = bytes_string_parts(mode_offsets, mode_data, row);
+                    let mode = view.modes.value_bytes(row);
                     let mode_index = if mode == left_mode {
                         0
                     } else if mode == right_mode {
@@ -11319,7 +11320,7 @@ fn q12_filtered_lineitem_counts_string_view_into(
                 return true;
             }
         }
-        for row in 0..view.orderkeys.len() {
+        for row in 0..orderkey_values.len() {
             let commitdate = commitdate_values[row];
             let receiptdate = receiptdate_values[row];
             if !q12_lineitem_dates_match(
@@ -11331,7 +11332,7 @@ fn q12_filtered_lineitem_counts_string_view_into(
             ) {
                 continue;
             }
-            let mode = bytes_string_parts(mode_offsets, mode_data, row);
+            let mode = view.modes.value_bytes(row);
             let mode_index = if mode == left_mode {
                 0
             } else if mode == right_mode {
@@ -11363,7 +11364,7 @@ fn q12_filtered_lineitem_counts_string_view_into(
         ) {
             continue;
         }
-        let mode = bytes_string_parts(mode_offsets, mode_data, row);
+        let mode = view.modes.value_bytes(row);
         let mode_index = if mode == left_mode {
             0
         } else if mode == right_mode {
