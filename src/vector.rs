@@ -405,12 +405,6 @@ impl<'a> BatchView<'a> {
         }
     }
 
-    pub(crate) fn required_date32(&self, index: usize) -> Result<&'a Date32Array> {
-        self.date32(index).ok_or_else(|| {
-            DodamError::UnsupportedSql(format!("projected column {index} is not Date32"))
-        })
-    }
-
     pub(crate) fn decimal128(&self, index: usize) -> Option<&'a Decimal128Array> {
         self.downcast(index)
     }

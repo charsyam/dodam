@@ -45,8 +45,7 @@ use crate::execution::{
     JoinBuildSide, LiteralValue, MemoryExec, PhysicalPlan, Projection, RecordBatchSink,
     ScanPlanMetrics, SendableBatchStream, SortExpr, SortKey, collect_aggregates,
     collect_grouped_aggregates, decimal_discounted_revenue_raw, decimal_discounted_revenue_scales,
-    decimal_input, evaluate_filter_mask, filter_batch, try_for_each_i64_date32_str,
-    try_for_each_i64_i64_date32,
+    decimal_input, evaluate_filter_mask, filter_batch, try_for_each_i64_i64_date32,
 };
 use crate::hash::{FastHashMap, FastHashSet, fast_hash_map, fast_hash_map_with_capacity};
 use crate::optimizer::plan_join_inputs;
@@ -17243,47 +17242,6 @@ fn q04_log_late_candidate_profile(metrics: LateMaterializedMetrics, row_group_ch
     );
 }
 
-fn q04_candidate_order_priorities_typed(
-    orderkeys: &ArrayRef,
-    orderdates: &ArrayRef,
-    orderpriorities: &StringArray,
-    start_days: i32,
-    end_days: i32,
-    priorities: &mut Vec<u8>,
-    labels: &mut Vec<String>,
-    label_indices: &mut HashMap<String, u8>,
-    candidate_count: &mut usize,
-) -> Result<bool> {
-    try_for_each_i64_date32_str(
-        orderkeys,
-        orderdates,
-        orderpriorities,
-        |orderkey, orderdate, priority| {
-            if orderdate < start_days || orderdate >= end_days || orderkey < 0 {
-                return Ok(());
-            }
-            let priority_index = if let Some(index) = label_indices.get(priority) {
-                *index
-            } else {
-                let next_index = u8::try_from(labels.len()).map_err(|_| {
-                    DodamError::UnsupportedSql("too many Q04 order priorities".to_string())
-                })?;
-                labels.push(priority.to_string());
-                label_indices.insert(priority.to_string(), next_index);
-                next_index
-            };
-            let orderkey = usize::try_from(orderkey)
-                .map_err(|_| DodamError::UnsupportedSql("order key overflow".to_string()))?;
-            if orderkey >= priorities.len() {
-                priorities.resize(orderkey + 1, 0);
-            }
-            priorities[orderkey] = priority_index + 1;
-            *candidate_count += 1;
-            Ok(())
-        },
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn q04_candidate_order_priorities_view_into(
     view: BatchView<'_>,
@@ -17295,15 +17253,15 @@ fn q04_candidate_order_priorities_view_into(
     candidate_count: &mut usize,
 ) -> Result<()> {
     if view.num_columns() == 3
-        && let (Ok(orderkeys), Ok(orderdates), Ok(orderpriorities)) = (
-            view.required_i64(0),
-            view.required_date32(1),
-            view.required_utf8(2),
+        && let (Some(orderkeys), Some(orderdates), Some(orderpriorities)) = (
+            view.i64_vector(0),
+            view.date32_vector(1),
+            view.utf8_vector(2),
         )
     {
-        if q04_candidate_order_priorities_typed(
-            view.column(0)?,
-            view.column(1)?,
+        q04_candidate_order_priorities_vector_into(
+            orderkeys,
+            orderdates,
             orderpriorities,
             start_days,
             end_days,
@@ -17311,12 +17269,14 @@ fn q04_candidate_order_priorities_view_into(
             labels,
             label_indices,
             candidate_count,
-        )? {
-            let _ = (orderkeys, orderdates);
-            return Ok(());
-        }
+        )?;
+        return Ok(());
     }
-    let batch = view.record_batch();
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "Q04 candidate priority raw vector columns have unsupported types".to_string(),
+        ));
+    };
     let orderkeys = batch_column(batch, "o_orderkey")?;
     let orderdates = batch_column(batch, "o_orderdate")?;
     let orderpriorities = batch_string_column(batch, "o_orderpriority")?;
@@ -17351,6 +17311,92 @@ fn q04_candidate_order_priorities_view_into(
         priorities[orderkey] = priority_index + 1;
         *candidate_count += 1;
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q04_candidate_order_priorities_vector_into(
+    orderkeys: I64VectorView<'_>,
+    orderdates: Date32VectorView<'_>,
+    orderpriorities: Utf8VectorView<'_>,
+    start_days: i32,
+    end_days: i32,
+    priorities: &mut Vec<u8>,
+    labels: &mut Vec<String>,
+    label_indices: &mut HashMap<String, u8>,
+    candidate_count: &mut usize,
+) -> Result<()> {
+    if let (Some(orderkey_values), Some(orderdate_values)) = (
+        orderkeys.values_if_null_free(),
+        orderdates.values_if_null_free(),
+    ) && orderpriorities.null_count() == 0
+    {
+        for row in 0..orderkey_values.len() {
+            let orderkey = orderkey_values[row];
+            let orderdate = orderdate_values[row];
+            if orderdate < start_days || orderdate >= end_days || orderkey < 0 {
+                continue;
+            }
+            let priority = std::str::from_utf8(orderpriorities.value_bytes(row))
+                .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+            q04_store_candidate_priority(
+                orderkey,
+                priority,
+                priorities,
+                labels,
+                label_indices,
+                candidate_count,
+            )?;
+        }
+        return Ok(());
+    }
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || orderdates.is_null(row) || orderpriorities.is_null(row) {
+            continue;
+        }
+        let orderkey = orderkeys.value(row);
+        let orderdate = orderdates.value(row);
+        if orderdate < start_days || orderdate >= end_days || orderkey < 0 {
+            continue;
+        }
+        let priority = std::str::from_utf8(orderpriorities.value_bytes(row))
+            .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+        q04_store_candidate_priority(
+            orderkey,
+            priority,
+            priorities,
+            labels,
+            label_indices,
+            candidate_count,
+        )?;
+    }
+    Ok(())
+}
+
+fn q04_store_candidate_priority(
+    orderkey: i64,
+    priority: &str,
+    priorities: &mut Vec<u8>,
+    labels: &mut Vec<String>,
+    label_indices: &mut HashMap<String, u8>,
+    candidate_count: &mut usize,
+) -> Result<()> {
+    let priority_index = if let Some(index) = label_indices.get(priority) {
+        *index
+    } else {
+        let next_index = u8::try_from(labels.len())
+            .map_err(|_| DodamError::UnsupportedSql("too many Q04 order priorities".to_string()))?;
+        labels.push(priority.to_string());
+        label_indices.insert(priority.to_string(), next_index);
+        next_index
+    };
+    let orderkey = usize::try_from(orderkey)
+        .map_err(|_| DodamError::UnsupportedSql("order key overflow".to_string()))?;
+    if orderkey >= priorities.len() {
+        priorities.resize(orderkey + 1, 0);
+    }
+    priorities[orderkey] = priority_index + 1;
+    *candidate_count += 1;
     Ok(())
 }
 
@@ -17789,11 +17835,11 @@ fn q04_lineitem_late_build_selection_view(
     state: &mut Q04LineitemLateState,
 ) -> Result<Option<()>> {
     if view.num_columns() == 1 {
-        let Some(orderkeys) = view.i64(0) else {
+        let Some(orderkeys) = view.i64_vector(0) else {
             return Ok(None);
         };
-        if orderkeys.null_count() == 0 {
-            for &orderkey in orderkeys.values() {
+        if let Some(orderkey_values) = orderkeys.values_if_null_free() {
+            for &orderkey in orderkey_values {
                 let selected = usize::try_from(orderkey)
                     .ok()
                     .and_then(|index| {
@@ -17835,7 +17881,10 @@ fn q04_lineitem_late_build_selection_view(
         }
         return Ok(Some(()));
     }
-    q04_lineitem_late_build_selection_batch(view.record_batch().clone(), selection, state)
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    q04_lineitem_late_build_selection_batch(batch.clone(), selection, state)
 }
 
 fn q04_lineitem_late_consume_dates_batch(
