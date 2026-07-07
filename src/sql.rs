@@ -17713,13 +17713,7 @@ fn q04_count_late_candidate_priorities_direct_column_reader(
     let started = tpch_profile_start();
     let row_groups = (0..engine.parquet_row_group_count(&path)?).collect::<Vec<_>>();
     let candidate_bloom = Arc::new(q04_candidate_bloom(candidate_priorities));
-    let candidate_priorities = Arc::new(
-        candidate_priorities
-            .iter()
-            .copied()
-            .map(AtomicU8::new)
-            .collect::<Vec<_>>(),
-    );
+    let candidate_priorities = q04_atomic_candidate_priorities(candidate_priorities);
     let chunks = row_groups
         .chunks(q04_lineitem_direct_row_group_chunk())
         .map(|chunk| chunk.to_vec())
@@ -17888,13 +17882,7 @@ async fn q04_count_late_candidate_priorities_late_materialized(
     let pruning_predicates = selective_candidate_priority_range(candidate_priorities)
         .map(|(min_key, max_key)| i64_range_pruning_predicates("l_orderkey", min_key, max_key))
         .unwrap_or_default();
-    let candidate_priorities = Arc::new(
-        candidate_priorities
-            .iter()
-            .copied()
-            .map(AtomicU8::new)
-            .collect::<Vec<_>>(),
-    );
+    let candidate_priorities = q04_atomic_candidate_priorities(candidate_priorities);
     let Some(chunks) = engine
         .late_materialized_parquet_map_pruned_with_policy_view(
             path,
@@ -18319,13 +18307,7 @@ async fn q04_count_late_candidate_priorities_atomic_row_group_map(
     priority_count: usize,
 ) -> Result<Option<Vec<u64>>> {
     let candidate_bloom = Arc::new(q04_candidate_bloom(candidate_priorities));
-    let candidate_priorities = Arc::new(
-        candidate_priorities
-            .iter()
-            .copied()
-            .map(AtomicU8::new)
-            .collect::<Vec<_>>(),
-    );
+    let candidate_priorities = q04_atomic_candidate_priorities(candidate_priorities);
     let Some(partials) = engine
         .parquet_row_group_map_pruned_view(
             path,
@@ -18448,6 +18430,16 @@ fn q04_atomic_lineitem_probe_enabled() -> bool {
     std::env::var("DODAM_Q04_DISABLE_ATOMIC_LINEITEM_PROBE")
         .map(|value| !matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(true)
+}
+
+fn q04_atomic_candidate_priorities(candidate_priorities: &[u8]) -> Arc<Vec<AtomicU8>> {
+    Arc::new(
+        candidate_priorities
+            .par_iter()
+            .copied()
+            .map(AtomicU8::new)
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn q04_lineitem_row_group_map_enabled() -> bool {
