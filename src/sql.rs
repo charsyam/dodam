@@ -5387,45 +5387,106 @@ async fn q02_suppliers(
     let mut suppliers = HashMap::new();
     while let Some(batch) = stream.next() {
         let batch = batch?;
-        let suppkeys = batch_column(&batch, "s_suppkey")?;
-        let acctbals = batch_column(&batch, "s_acctbal")?;
-        let names = batch_string_column(&batch, "s_name")?;
-        let addresses = batch_string_column(&batch, "s_address")?;
-        let nationkeys = batch_column(&batch, "s_nationkey")?;
-        let phones = batch_string_column(&batch, "s_phone")?;
-        let comments = batch_string_column(&batch, "s_comment")?;
-        for row in 0..batch.num_rows() {
-            if names.is_null(row)
+        q02_suppliers_view_into(BatchView::new(&batch), nation_names, &mut suppliers)?;
+    }
+    Ok(suppliers)
+}
+
+fn q02_suppliers_view_into(
+    view: BatchView<'_>,
+    nation_names: &HashMap<i64, String>,
+    suppliers: &mut HashMap<i64, Q02Supplier>,
+) -> Result<()> {
+    if view.num_columns() == 7
+        && let (
+            Some(suppkeys),
+            Some(acctbals),
+            Some(names),
+            Some(addresses),
+            Some(nationkeys),
+            Some(phones),
+            Some(comments),
+        ) = (
+            view.i64_vector(0),
+            view.decimal128_vector(1),
+            view.utf8_vector(2),
+            view.utf8_vector(3),
+            view.i64_vector(4),
+            view.utf8_vector(5),
+            view.utf8_vector(6),
+        )
+    {
+        for row in 0..view.num_rows() {
+            if suppkeys.is_null(row)
+                || acctbals.is_null(row)
+                || names.is_null(row)
                 || addresses.is_null(row)
+                || nationkeys.is_null(row)
                 || phones.is_null(row)
                 || comments.is_null(row)
             {
                 continue;
             }
-            let (Some(suppkey), Some(acctbal), Some(nationkey)) = (
-                numeric_i64_value(suppkeys, row)?,
-                numeric_f64_value(acctbals, row)?,
-                numeric_i64_value(nationkeys, row)?,
-            ) else {
-                continue;
-            };
-            let Some(nation_name) = nation_names.get(&nationkey) else {
+            let Some(nation_name) = nation_names.get(&nationkeys.value(row)) else {
                 continue;
             };
             suppliers.insert(
-                suppkey,
+                suppkeys.value(row),
                 Q02Supplier {
-                    acctbal,
-                    name: names.value(row).to_string(),
+                    acctbal: acctbals.value(row),
+                    name: utf8_vector_value_string(names, row)?,
                     nation_name: nation_name.clone(),
-                    address: addresses.value(row).to_string(),
-                    phone: phones.value(row).to_string(),
-                    comment: comments.value(row).to_string(),
+                    address: utf8_vector_value_string(addresses, row)?,
+                    phone: utf8_vector_value_string(phones, row)?,
+                    comment: utf8_vector_value_string(comments, row)?,
                 },
             );
         }
+        return Ok(());
     }
-    Ok(suppliers)
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "Q02 supplier raw vector columns have unsupported types".to_string(),
+        ));
+    };
+    let suppkeys = batch_column(batch, "s_suppkey")?;
+    let acctbals = batch_column(batch, "s_acctbal")?;
+    let names = batch_string_column(batch, "s_name")?;
+    let addresses = batch_string_column(batch, "s_address")?;
+    let nationkeys = batch_column(batch, "s_nationkey")?;
+    let phones = batch_string_column(batch, "s_phone")?;
+    let comments = batch_string_column(batch, "s_comment")?;
+    for row in 0..batch.num_rows() {
+        if names.is_null(row)
+            || addresses.is_null(row)
+            || phones.is_null(row)
+            || comments.is_null(row)
+        {
+            continue;
+        }
+        let (Some(suppkey), Some(acctbal), Some(nationkey)) = (
+            numeric_i64_value(suppkeys, row)?,
+            numeric_f64_value(acctbals, row)?,
+            numeric_i64_value(nationkeys, row)?,
+        ) else {
+            continue;
+        };
+        let Some(nation_name) = nation_names.get(&nationkey) else {
+            continue;
+        };
+        suppliers.insert(
+            suppkey,
+            Q02Supplier {
+                acctbal,
+                name: names.value(row).to_string(),
+                nation_name: nation_name.clone(),
+                address: addresses.value(row).to_string(),
+                phone: phones.value(row).to_string(),
+                comment: comments.value(row).to_string(),
+            },
+        );
+    }
+    Ok(())
 }
 
 async fn q02_matching_parts(
@@ -5452,27 +5513,71 @@ async fn q02_matching_parts(
     let mut parts = HashMap::new();
     while let Some(batch) = stream.next() {
         let batch = batch?;
-        let partkeys = batch_column(&batch, "p_partkey")?;
-        let mfgrs = batch_string_column(&batch, "p_mfgr")?;
-        let sizes = batch_column(&batch, "p_size")?;
-        let types = batch_string_column(&batch, "p_type")?;
-        for row in 0..batch.num_rows() {
-            if mfgrs.is_null(row) || types.is_null(row) || !types.value(row).ends_with(type_suffix)
+        q02_matching_parts_view_into(BatchView::new(&batch), part_size, type_suffix, &mut parts)?;
+    }
+    Ok(parts)
+}
+
+fn q02_matching_parts_view_into(
+    view: BatchView<'_>,
+    part_size: f64,
+    type_suffix: &str,
+    parts: &mut HashMap<i64, String>,
+) -> Result<()> {
+    if view.num_columns() == 4
+        && let (Some(partkeys), Some(mfgrs), Some(sizes), Some(types)) = (
+            view.i64_vector(0),
+            view.utf8_vector(1),
+            view.i32_vector(2),
+            view.utf8_vector(3),
+        )
+    {
+        for row in 0..view.num_rows() {
+            if partkeys.is_null(row)
+                || mfgrs.is_null(row)
+                || sizes.is_null(row)
+                || types.is_null(row)
             {
                 continue;
             }
-            let (Some(partkey), Some(size)) = (
-                numeric_i64_value(partkeys, row)?,
-                numeric_f64_value(sizes, row)?,
-            ) else {
-                continue;
-            };
-            if size == part_size {
-                parts.insert(partkey, mfgrs.value(row).to_string());
+            if f64::from(sizes.value(row)) == part_size
+                && types.value_bytes(row).ends_with(type_suffix.as_bytes())
+            {
+                parts.insert(partkeys.value(row), utf8_vector_value_string(mfgrs, row)?);
             }
         }
+        return Ok(());
     }
-    Ok(parts)
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "Q02 part raw vector columns have unsupported types".to_string(),
+        ));
+    };
+    let partkeys = batch_column(batch, "p_partkey")?;
+    let mfgrs = batch_string_column(batch, "p_mfgr")?;
+    let sizes = batch_column(batch, "p_size")?;
+    let types = batch_string_column(batch, "p_type")?;
+    for row in 0..batch.num_rows() {
+        if mfgrs.is_null(row) || types.is_null(row) || !types.value(row).ends_with(type_suffix) {
+            continue;
+        }
+        let (Some(partkey), Some(size)) = (
+            numeric_i64_value(partkeys, row)?,
+            numeric_f64_value(sizes, row)?,
+        ) else {
+            continue;
+        };
+        if size == part_size {
+            parts.insert(partkey, mfgrs.value(row).to_string());
+        }
+    }
+    Ok(())
+}
+
+fn utf8_vector_value_string(values: Utf8VectorView<'_>, row: usize) -> Result<String> {
+    Ok(std::str::from_utf8(values.value_bytes(row))
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?
+        .to_string())
 }
 
 struct Q02Row {
@@ -5508,9 +5613,18 @@ async fn q02_min_cost_rows(
         .await?;
     let part_keys = Arc::new(parts.keys().copied().collect::<HashSet<_>>());
     let supplier_keys = Arc::new(suppliers.keys().copied().collect::<HashSet<_>>());
-    let (min_costs, candidates) = parallel_batch_fold(
+    let (min_costs, candidates) = parallel_batch_fold_view_chunks(
         &mut stream,
-        move |batch| q02_partsupp_min_cost_batch(batch, &part_keys, &supplier_keys),
+        4,
+        Q02PartsuppPartial::default,
+        move |view, partial| {
+            q02_merge_partsupp_min_cost(
+                partial,
+                q02_partsupp_min_cost_view(view, &part_keys, &supplier_keys)?,
+            );
+            Ok(Some(()))
+        },
+        Ok,
         Q02PartsuppPartial::default(),
         q02_merge_partsupp_min_cost,
         "Q02 partsupp partials",
@@ -5596,6 +5710,62 @@ fn q02_partsupp_min_cost_batch(
         q02_push_partsupp_candidate(&mut partial, partkey, suppkey, supplycost);
     }
     Ok(partial)
+}
+
+fn q02_partsupp_min_cost_view(
+    view: BatchView<'_>,
+    part_keys: &HashSet<i64>,
+    supplier_keys: &HashSet<i64>,
+) -> Result<Q02PartsuppPartial> {
+    if view.num_columns() == 3
+        && let (Some(partkeys), Some(suppkeys), Some(supplycosts)) = (
+            view.i64_vector(0),
+            view.i64_vector(1),
+            view.decimal128_vector(2),
+        )
+    {
+        let mut partial = Q02PartsuppPartial::default();
+        if let (Some(partkey_values), Some(suppkey_values)) = (
+            partkeys.values_if_null_free(),
+            suppkeys.values_if_null_free(),
+        ) && supplycosts.null_count() == 0
+        {
+            let supplycost_values = supplycosts.raw_values();
+            let supplycost_scale = 1.0 / supplycosts.scale();
+            for row in 0..partkey_values.len() {
+                let partkey = partkey_values[row];
+                let suppkey = suppkey_values[row];
+                if !part_keys.contains(&partkey) || !supplier_keys.contains(&suppkey) {
+                    continue;
+                }
+                q02_push_partsupp_candidate(
+                    &mut partial,
+                    partkey,
+                    suppkey,
+                    supplycost_values[row] as f64 * supplycost_scale,
+                );
+            }
+            return Ok(partial);
+        }
+        for row in 0..view.num_rows() {
+            if partkeys.is_null(row) || suppkeys.is_null(row) || supplycosts.is_null(row) {
+                continue;
+            }
+            let partkey = partkeys.value(row);
+            let suppkey = suppkeys.value(row);
+            if !part_keys.contains(&partkey) || !supplier_keys.contains(&suppkey) {
+                continue;
+            }
+            q02_push_partsupp_candidate(&mut partial, partkey, suppkey, supplycosts.value(row));
+        }
+        return Ok(partial);
+    }
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "Q02 partsupp raw vector columns have unsupported types".to_string(),
+        ));
+    };
+    q02_partsupp_min_cost_batch(batch.clone(), part_keys, supplier_keys)
 }
 
 fn q02_partsupp_min_cost_batch_typed(
