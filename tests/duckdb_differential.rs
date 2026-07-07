@@ -1219,6 +1219,21 @@ async fn duckdb_differential_correlated_in_and_scalar_subquery() {
 
     assert_same_as_duckdb(
         &format!(
+            "SELECT f.id, f.payload FROM '{}' f WHERE f.payload IS NOT NULL AND f.id IN (SELECT g.id FROM '{}' g WHERE g.key = f.key AND (g.id > 4 OR g.payload IS NULL)) ORDER BY f.id",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT f.id, f.payload FROM read_parquet('{}') f WHERE f.payload IS NOT NULL AND f.id IN (SELECT g.id FROM read_parquet('{}') g WHERE g.key = f.key AND (g.id > 4 OR g.payload IS NULL)) ORDER BY f.id",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
             "SELECT f.id, f.payload FROM '{}' f WHERE f.id = (SELECT g.id FROM '{}' g WHERE g.key = f.key ORDER BY g.id LIMIT 1) ORDER BY f.id",
             facts_path.display(),
             facts_path.display()
@@ -1662,6 +1677,32 @@ async fn duckdb_differential_extended_type_matrix() {
 
     assert_same_as_duckdb(
         &format!(
+            "SELECT id, CAST(amount + amount3 AS VARCHAR), CAST(amount3 - amount AS VARCHAR) FROM '{}' ORDER BY id",
+            types_path.display()
+        ),
+        &format!(
+            "SELECT id, CAST(amount + amount3 AS VARCHAR), CAST(amount3 - amount AS VARCHAR) FROM read_parquet('{}') ORDER BY id",
+            types_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, CASE WHEN amount = amount3 THEN 'eq' WHEN amount3 > amount THEN 'gt' ELSE 'no' END FROM '{}' ORDER BY id",
+            types_path.display()
+        ),
+        &format!(
+            "SELECT id, CASE WHEN amount = amount3 THEN 'eq' WHEN amount3 > amount THEN 'gt' ELSE 'no' END FROM read_parquet('{}') ORDER BY id",
+            types_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
             "SELECT id FROM '{}' WHERE amount + amount > '0.00' ORDER BY id",
             types_path.display()
         ),
@@ -1680,6 +1721,19 @@ async fn duckdb_differential_extended_type_matrix() {
         ),
         &format!(
             "SELECT id, CAST(CAST('2024-01-02' AS DATE) AS VARCHAR), CAST(CAST('2024-01-02 03:04:05' AS TIMESTAMP) AS VARCHAR), CAST(CAST(created_at AS DATE) AS VARCHAR), CAST(CAST(event_date AS TIMESTAMP) AS VARCHAR) FROM read_parquet('{}') ORDER BY id",
+            types_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, CAST(DATE '2024-01-03' AS VARCHAR), CAST(TIMESTAMP '2024-01-03 04:05:06.789' AS VARCHAR) FROM '{}' ORDER BY id",
+            types_path.display()
+        ),
+        &format!(
+            "SELECT id, CAST(DATE '2024-01-03' AS VARCHAR), CAST(TIMESTAMP '2024-01-03 04:05:06.789' AS VARCHAR) FROM read_parquet('{}') ORDER BY id",
             types_path.display()
         ),
         tempdir.path(),
@@ -2025,6 +2079,19 @@ async fn duckdb_differential_nested_struct_field_projection() {
         ),
         &format!(
             "SELECT id, tags[array_length(tags)] AS last_tag FROM read_parquet('{}') WHERE tags[array_length(tags)] = 2 OR attrs.rank > 30 ORDER BY id",
+            input_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, array_length(attrs.more_tags) AS nested_tag_count FROM '{}' WHERE array_length(attrs.more_tags) > 1 OR attrs.detail.score >= 40 ORDER BY id",
+            input_path.display()
+        ),
+        &format!(
+            "SELECT id, array_length(attrs.more_tags) AS nested_tag_count FROM read_parquet('{}') WHERE array_length(attrs.more_tags) > 1 OR attrs.detail.score >= 40 ORDER BY id",
             input_path.display()
         ),
         tempdir.path(),
@@ -2691,6 +2758,7 @@ fn write_types_parquet(path: &Path) {
         Field::new("score", DataType::Float64, true),
         Field::new("note", DataType::Utf8, true),
         Field::new("amount", DataType::Decimal128(10, 2), true),
+        Field::new("amount3", DataType::Decimal128(10, 3), true),
         Field::new(
             "created_at",
             DataType::Timestamp(TimeUnit::Millisecond, None),
@@ -2710,6 +2778,9 @@ fn write_types_parquet(path: &Path) {
     let notes = StringArray::from(vec![Some("alpha"), None, Some("gamma"), Some("")]);
     let amounts = Decimal128Array::from(vec![Some(12345), Some(-700), None, Some(0)])
         .with_precision_and_scale(10, 2)
+        .expect("decimal precision");
+    let amount3 = Decimal128Array::from(vec![Some(123450), Some(-7000), None, Some(5)])
+        .with_precision_and_scale(10, 3)
         .expect("decimal precision");
     let created_at = TimestampMillisecondArray::from(vec![
         Some(1_704_067_200_000),
@@ -2740,6 +2811,7 @@ fn write_types_parquet(path: &Path) {
             Arc::new(scores),
             Arc::new(notes),
             Arc::new(amounts),
+            Arc::new(amount3),
             Arc::new(created_at),
             Arc::new(created_at_utc),
             Arc::new(event_date),
@@ -2796,6 +2868,11 @@ fn write_nested_values_parquet(path: &Path) {
             ),
             true,
         ),
+        Field::new(
+            "more_tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        ),
     ]
     .into();
     let schema = Arc::new(Schema::new(vec![
@@ -2808,6 +2885,12 @@ fn write_nested_values_parquet(path: &Path) {
         Some(vec![Some(1), Some(2)]),
         None,
         Some(vec![None, Some(4)]),
+        Some(vec![]),
+    ]);
+    let more_tags = ListArray::from_iter_primitive::<Int32Type, _, _>([
+        Some(vec![Some(9), Some(8), Some(7)]),
+        Some(vec![Some(5)]),
+        None,
         Some(vec![]),
     ]);
     let attrs = StructArray::from(vec![
@@ -2853,6 +2936,14 @@ fn write_nested_values_parquet(path: &Path) {
                     ])) as Arc<dyn arrow::array::Array>,
                 ),
             ])) as Arc<dyn arrow::array::Array>,
+        ),
+        (
+            Arc::new(Field::new(
+                "more_tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            )),
+            Arc::new(more_tags) as Arc<dyn arrow::array::Array>,
         ),
     ]);
     write_parquet(

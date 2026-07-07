@@ -19,6 +19,18 @@ pub enum DodamError {
     #[error("unknown column in projection: {0}")]
     UnknownColumn(String),
 
+    #[error("ambiguous column {0}")]
+    AmbiguousColumn(String),
+
+    #[error("unknown table qualifier: {0}")]
+    UnknownTableQualifier(String),
+
+    #[error("invalid cast: {0}")]
+    InvalidCast(String),
+
+    #[error("type mismatch: {0}")]
+    TypeMismatch(String),
+
     #[error("invalid filter expression: expected column=value, got {0}")]
     InvalidFilter(String),
 
