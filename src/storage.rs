@@ -17,8 +17,8 @@ use parquet::arrow::arrow_reader::{
     ArrowPredicate, ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions,
     ParquetRecordBatchReaderBuilder, RowFilter, RowSelection,
 };
-use parquet::column::reader::ColumnReader;
-use parquet::data_type::{ByteArray, FixedLenByteArray};
+use parquet::column::reader::{ColumnReader, ColumnReaderImpl};
+use parquet::data_type::{ByteArray, ByteArrayType, FixedLenByteArray};
 use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::reader::{ChunkReader, FileReader as ParquetFileReader, Length};
 use parquet::file::serialized_reader::SerializedFileReader;
@@ -1254,6 +1254,133 @@ pub(crate) fn parquet_row_group_count(path: &Path) -> Result<usize> {
     let file = File::open(path)?;
     let reader = SerializedFileReader::new(file)?;
     Ok(reader.metadata().num_row_groups())
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct DirectColumnScanMetrics {
+    pub row_groups: usize,
+    pub batches: usize,
+    pub rows: usize,
+    pub read_nanos: u64,
+    pub consume_nanos: u64,
+}
+
+impl DirectColumnScanMetrics {
+    fn add_read_nanos(&mut self, nanos: u64) {
+        self.read_nanos = self.read_nanos.saturating_add(nanos);
+    }
+
+    fn add_consume_nanos(&mut self, nanos: u64) {
+        self.consume_nanos = self.consume_nanos.saturating_add(nanos);
+    }
+}
+
+pub(crate) struct DirectByteArrayPayloadReader<'a> {
+    reader: &'a mut ColumnReaderImpl<ByteArrayType>,
+    read_nanos: u64,
+}
+
+impl<'a> DirectByteArrayPayloadReader<'a> {
+    fn new(reader: &'a mut ColumnReaderImpl<ByteArrayType>) -> Self {
+        Self {
+            reader,
+            read_nanos: 0,
+        }
+    }
+
+    pub(crate) fn read_records(
+        &mut self,
+        records: usize,
+        def_levels: &mut Vec<i16>,
+        values: &mut Vec<ByteArray>,
+    ) -> Result<(usize, usize, usize)> {
+        let started = Instant::now();
+        let result = self
+            .reader
+            .read_records(records, Some(def_levels), None, values)?;
+        self.read_nanos = self.read_nanos.saturating_add(elapsed_nanos(started));
+        Ok(result)
+    }
+
+    pub(crate) fn skip_records(&mut self, records: usize) -> Result<usize> {
+        let started = Instant::now();
+        let skipped = self.reader.skip_records(records)?;
+        self.read_nanos = self.read_nanos.saturating_add(elapsed_nanos(started));
+        Ok(skipped)
+    }
+
+    fn take_read_nanos(&mut self) -> u64 {
+        let read_nanos = self.read_nanos;
+        self.read_nanos = 0;
+        read_nanos
+    }
+}
+
+pub(crate) fn scan_parquet_i64_byte_array_payload_columns<F>(
+    path: &Path,
+    batch_size: usize,
+    row_groups: &[usize],
+    columns: [&str; 2],
+    mut consume: F,
+) -> Result<Option<DirectColumnScanMetrics>>
+where
+    F: for<'a> FnMut(&[i64], &mut DirectByteArrayPayloadReader<'a>) -> Result<Option<()>>,
+{
+    let file = File::open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    let Some(column_indices) = parquet_column_indices_by_name(&reader, &columns) else {
+        return Ok(None);
+    };
+    let [key_column, payload_column] = <[usize; 2]>::try_from(column_indices).map_err(|_| {
+        DodamError::UnsupportedSql("direct parquet column index shape mismatch".to_string())
+    })?;
+    let mut metrics = DirectColumnScanMetrics {
+        row_groups: row_groups.len(),
+        ..DirectColumnScanMetrics::default()
+    };
+    for &row_group_index in row_groups {
+        let row_group = reader.get_row_group(row_group_index)?;
+        let mut key_reader = match row_group.get_column_reader(key_column)? {
+            ColumnReader::Int64ColumnReader(reader) => reader,
+            _ => return Ok(None),
+        };
+        let mut payload_reader = match row_group.get_column_reader(payload_column)? {
+            ColumnReader::ByteArrayColumnReader(reader) => reader,
+            _ => return Ok(None),
+        };
+        let mut key_values = Vec::<i64>::with_capacity(batch_size);
+        let mut key_def_levels = Vec::<i16>::with_capacity(batch_size);
+        loop {
+            key_values.clear();
+            key_def_levels.clear();
+            let read_started = Instant::now();
+            let (key_records, key_value_count, _key_levels) = key_reader.read_records(
+                batch_size,
+                Some(&mut key_def_levels),
+                None,
+                &mut key_values,
+            )?;
+            metrics.add_read_nanos(elapsed_nanos(read_started));
+            if key_records == 0 {
+                break;
+            }
+            if key_value_count != key_records {
+                return Ok(None);
+            }
+            metrics.batches += 1;
+            metrics.rows = metrics.rows.saturating_add(key_records);
+            let consume_started = Instant::now();
+            let mut payload = DirectByteArrayPayloadReader::new(&mut payload_reader);
+            if consume(&key_values, &mut payload)?.is_none() {
+                return Ok(None);
+            }
+            let payload_read_nanos = payload.take_read_nanos();
+            let consume_nanos = elapsed_nanos(consume_started);
+            metrics.add_read_nanos(payload_read_nanos);
+            metrics.add_consume_nanos(consume_nanos.saturating_sub(payload_read_nanos));
+        }
+    }
+    Ok(Some(metrics))
 }
 
 pub(crate) fn scan_parquet_i64_i32_i32_columns<F>(

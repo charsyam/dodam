@@ -18,9 +18,6 @@ use arrow_select::concat::concat_batches;
 use arrow_select::take::take_record_batch;
 use memchr::memmem::Finder;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::column::reader::ColumnReader;
-use parquet::file::reader::FileReader;
-use parquet::file::serialized_reader::SerializedFileReader;
 use rayon::prelude::*;
 use sqlparser::ast::{
     BinaryOperator, DateTimeField, Distinct, DuplicateTreatment, Expr as SqlExpr, FunctionArg,
@@ -54,7 +51,8 @@ use crate::execution::{
 use crate::hash::{FastHashMap, FastHashSet, fast_hash_map, fast_hash_map_with_capacity};
 use crate::optimizer::plan_join_inputs;
 use crate::storage::{
-    DirectI64I32I32ScanMetrics, parquet_row_group_count, scan_parquet_i64_i32_i32_columns,
+    DirectColumnScanMetrics, DirectI64I32I32ScanMetrics, parquet_row_group_count,
+    scan_parquet_i64_byte_array_payload_columns, scan_parquet_i64_i32_i32_columns,
 };
 use crate::vector::{
     BatchConsumer, BatchView, DictionaryStringValues, SelectionVector, consume_record_batch,
@@ -11220,12 +11218,7 @@ fn q12_shipping_mode_counts_from_orders_direct(
     pending: &Q12PendingMap,
 ) -> Result<Option<Vec<Q12Row>>> {
     let started = tpch_profile_start();
-    let file = File::open(&path)?;
-    let reader = Arc::new(SerializedFileReader::new(file)?);
-    let Some((orderkey_column, priority_column)) = q12_order_direct_column_indices(&reader) else {
-        return Ok(None);
-    };
-    let row_groups = (0..reader.metadata().num_row_groups()).collect::<Vec<_>>();
+    let row_groups = (0..parquet_row_group_count(&path)?).collect::<Vec<_>>();
     let pending = Arc::new(AdaptiveI64Map::from_hash(pending.clone()));
     let chunks = row_groups
         .chunks(q12_order_direct_row_group_chunk())
@@ -11239,8 +11232,6 @@ fn q12_shipping_mode_counts_from_orders_direct(
                 path.clone(),
                 batch_size,
                 row_groups,
-                orderkey_column,
-                priority_column,
                 pending.clone(),
                 profile,
             )
@@ -11284,17 +11275,6 @@ fn q12_shipping_mode_counts_from_orders_direct(
     ))
 }
 
-fn q12_order_direct_column_indices(reader: &SerializedFileReader<File>) -> Option<(usize, usize)> {
-    let columns = reader.metadata().file_metadata().schema_descr().columns();
-    let orderkey = columns
-        .iter()
-        .position(|column| column.name() == "o_orderkey")?;
-    let priority = columns
-        .iter()
-        .position(|column| column.name() == "o_orderpriority")?;
-    Some((orderkey, priority))
-}
-
 fn q12_order_direct_row_group_chunk() -> usize {
     std::env::var("DODAM_Q12_ORDER_DIRECT_ROW_GROUP_CHUNK")
         .ok()
@@ -11324,6 +11304,14 @@ struct Q12OrderDirectMetrics {
 }
 
 impl Q12OrderDirectMetrics {
+    fn add_scan_metrics(&mut self, metrics: DirectColumnScanMetrics) {
+        self.row_groups = self.row_groups.saturating_add(metrics.row_groups);
+        self.batches = self.batches.saturating_add(metrics.batches);
+        self.rows = self.rows.saturating_add(metrics.rows);
+        self.read_nanos = self.read_nanos.saturating_add(metrics.read_nanos);
+        self.consume_nanos = self.consume_nanos.saturating_add(metrics.consume_nanos);
+    }
+
     fn add(&mut self, other: Self) {
         self.row_groups = self.row_groups.saturating_add(other.row_groups);
         self.batches = self.batches.saturating_add(other.batches);
@@ -11344,58 +11332,25 @@ fn q12_order_direct_row_group_chunk_scan(
     path: PathBuf,
     batch_size: usize,
     row_groups: Vec<usize>,
-    orderkey_column: usize,
-    priority_column: usize,
     pending: Arc<AdaptiveI64Map<Q12PendingOrder>>,
     profile: bool,
 ) -> Result<Option<Q12OrderDirectPartial>> {
     let started = profile.then(Instant::now);
-    let file = File::open(path)?;
-    let reader = SerializedFileReader::new(file)?;
     let mut partial = Q12OrderDirectPartial::default();
-    partial.metrics.row_groups = row_groups.len();
-    for row_group_index in row_groups {
-        let row_group = reader.get_row_group(row_group_index)?;
-        let mut orderkey_reader = match row_group.get_column_reader(orderkey_column)? {
-            ColumnReader::Int64ColumnReader(reader) => reader,
-            _ => return Ok(None),
-        };
-        let mut priority_reader = match row_group.get_column_reader(priority_column)? {
-            ColumnReader::ByteArrayColumnReader(reader) => reader,
-            _ => return Ok(None),
-        };
-        let mut orderkeys = Vec::<i64>::with_capacity(batch_size);
-        let mut priorities = Vec::<parquet::data_type::ByteArray>::with_capacity(batch_size);
-        let mut orderkey_def_levels = Vec::<i16>::with_capacity(batch_size);
-        let mut priority_def_levels = Vec::<i16>::with_capacity(batch_size);
-        let mut hits = Vec::<(usize, Q12PendingOrder)>::with_capacity(batch_size.min(1024));
-        loop {
-            orderkeys.clear();
+    let mut priorities = Vec::<parquet::data_type::ByteArray>::with_capacity(batch_size);
+    let mut priority_def_levels = Vec::<i16>::with_capacity(batch_size);
+    let mut hits = Vec::<(usize, Q12PendingOrder)>::with_capacity(batch_size.min(1024));
+    let Some(scan_metrics) = scan_parquet_i64_byte_array_payload_columns(
+        &path,
+        batch_size,
+        &row_groups,
+        ["o_orderkey", "o_orderpriority"],
+        |orderkeys, priority_reader| {
             priorities.clear();
-            orderkey_def_levels.clear();
             priority_def_levels.clear();
             hits.clear();
-            let key_read_started = Instant::now();
-            let (order_records, order_values, _) = orderkey_reader.read_records(
-                batch_size,
-                Some(&mut orderkey_def_levels),
-                None,
-                &mut orderkeys,
-            )?;
-            partial.metrics.read_nanos = partial
-                .metrics
-                .read_nanos
-                .saturating_add(sql_elapsed_nanos(key_read_started));
-            if order_records == 0 {
-                break;
-            }
-            if order_values != order_records {
-                return Ok(None);
-            }
-            partial.metrics.batches += 1;
-            partial.metrics.rows = partial.metrics.rows.saturating_add(order_records);
-            let consume_started = Instant::now();
-            for row in 0..order_records {
+            let order_records = orderkeys.len();
+            for row in 0..orderkeys.len() {
                 let Some(order) = pending.get(orderkeys[row]) else {
                     partial.metrics.misses += 1;
                     continue;
@@ -11403,21 +11358,12 @@ fn q12_order_direct_row_group_chunk_scan(
                 partial.metrics.hits += 1;
                 hits.push((row, order));
             }
-            partial.metrics.consume_nanos = partial
-                .metrics
-                .consume_nanos
-                .saturating_add(sql_elapsed_nanos(consume_started));
-            let payload_read_started = Instant::now();
             if hits.is_empty() {
                 let skipped = priority_reader.skip_records(order_records)?;
                 if skipped != order_records {
                     return Ok(None);
                 }
-                partial.metrics.read_nanos = partial
-                    .metrics
-                    .read_nanos
-                    .saturating_add(sql_elapsed_nanos(payload_read_started));
-                continue;
+                return Ok(Some(()));
             }
             let payload_runs = q12_order_direct_payload_runs(&hits);
             partial.metrics.payload_runs =
@@ -11427,20 +11373,10 @@ fn q12_order_direct_row_group_chunk_scan(
                 priorities.clear();
                 priority_def_levels.clear();
                 let (priority_records, priority_values, priority_levels) = priority_reader
-                    .read_records(
-                        order_records,
-                        Some(&mut priority_def_levels),
-                        None,
-                        &mut priorities,
-                    )?;
+                    .read_records(order_records, &mut priority_def_levels, &mut priorities)?;
                 if priority_records != order_records || priority_levels != order_records {
                     return Ok(None);
                 }
-                partial.metrics.read_nanos = partial
-                    .metrics
-                    .read_nanos
-                    .saturating_add(sql_elapsed_nanos(payload_read_started));
-                let consume_started = Instant::now();
                 if priority_values == order_records {
                     for &(row, order) in &hits {
                         let is_high_priority = q12_is_high_priority_bytes(priorities[row].data());
@@ -11473,11 +11409,7 @@ fn q12_order_direct_row_group_chunk_scan(
                         q12_apply_pending_order(&mut partial.groups, order, is_high_priority);
                     }
                 }
-                partial.metrics.consume_nanos = partial
-                    .metrics
-                    .consume_nanos
-                    .saturating_add(sql_elapsed_nanos(consume_started));
-                continue;
+                return Ok(Some(()));
             }
             partial.metrics.selective_batches = partial.metrics.selective_batches.saturating_add(1);
             let mut cursor = 0usize;
@@ -11498,16 +11430,10 @@ fn q12_order_direct_row_group_chunk_scan(
                 priorities.clear();
                 priority_def_levels.clear();
                 let (priority_records, priority_values, priority_levels) = priority_reader
-                    .read_records(
-                        run_len,
-                        Some(&mut priority_def_levels),
-                        None,
-                        &mut priorities,
-                    )?;
+                    .read_records(run_len, &mut priority_def_levels, &mut priorities)?;
                 if priority_records != run_len || priority_levels != run_len {
                     return Ok(None);
                 }
-                let consume_started = Instant::now();
                 if priority_values == run_len {
                     for (offset, hit) in hits[hit_index..end_index].iter().enumerate() {
                         let is_high_priority =
@@ -11534,10 +11460,6 @@ fn q12_order_direct_row_group_chunk_scan(
                         return Ok(None);
                     }
                 }
-                partial.metrics.consume_nanos = partial
-                    .metrics
-                    .consume_nanos
-                    .saturating_add(sql_elapsed_nanos(consume_started));
                 cursor = start + run_len;
                 hit_index = end_index;
             }
@@ -11547,12 +11469,13 @@ fn q12_order_direct_row_group_chunk_scan(
                     return Ok(None);
                 }
             }
-            partial.metrics.read_nanos = partial
-                .metrics
-                .read_nanos
-                .saturating_add(sql_elapsed_nanos(payload_read_started));
-        }
-    }
+            Ok(Some(()))
+        },
+    )?
+    else {
+        return Ok(None);
+    };
+    partial.metrics.add_scan_metrics(scan_metrics);
     if let Some(started) = started {
         eprintln!(
             "[dodam:tpch-profile] Q12 orders direct_column_chunk: row_groups={} rows={} hits={} misses={} payload_runs={} selective_batches={} full_batches={} elapsed={:.3} ms read={:.3} ms consume={:.3} ms",
