@@ -14553,7 +14553,11 @@ fn q15_supplier_rows_view_into(
         }
         return Ok(());
     }
-    let batch = view.record_batch();
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "Q15 supplier raw vector columns have unsupported types".to_string(),
+        ));
+    };
     let suppkeys = batch_column(batch, "s_suppkey")?;
     let names = batch_string_column(batch, "s_name")?;
     let addresses = batch_string_column(batch, "s_address")?;
@@ -15570,13 +15574,15 @@ async fn q03_revenue_rows(
             4,
             fast_hash_map::<i64, f64>,
             move |view, revenues| {
+                let Some(batch) = view.try_record_batch() else {
+                    return Err(DodamError::UnsupportedSql(
+                        "Q03 sorted revenue raw vector columns have unsupported fallback layout"
+                            .to_string(),
+                    ));
+                };
                 merge_f64_groups(
                     revenues,
-                    q03_revenue_batch_sorted(
-                        view.record_batch().clone(),
-                        &orders_for_scan,
-                        ship_cutoff,
-                    )?,
+                    q03_revenue_batch_sorted(batch.clone(), &orders_for_scan, ship_cutoff)?,
                 );
                 Ok(Some(()))
             },
@@ -15595,10 +15601,16 @@ async fn q03_revenue_rows(
             4,
             fast_hash_map::<i64, f64>,
             move |view, revenues| {
+                let Some(batch) = view.try_record_batch() else {
+                    return Err(DodamError::UnsupportedSql(
+                        "Q03 revenue raw vector columns have unsupported fallback layout"
+                            .to_string(),
+                    ));
+                };
                 merge_f64_groups(
                     revenues,
                     q03_revenue_batch(
-                        view.record_batch().clone(),
+                        batch.clone(),
                         &orders_for_scan,
                         order_probe.as_deref(),
                         ship_cutoff,
@@ -23227,7 +23239,11 @@ fn q08_part_keys_view_into(
         }
         return Ok(());
     }
-    let batch = view.record_batch();
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "Q08 part-key raw vector columns have unsupported types".to_string(),
+        ));
+    };
     let partkeys = batch_column(batch, "p_partkey")?;
     let types = batch_string_column(batch, "p_type")?;
     for row in 0..batch.num_rows() {
@@ -23491,7 +23507,11 @@ fn q08_supplier_is_brazil_view_into(
         }
         return Ok(());
     }
-    let batch = view.record_batch();
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "Q08 supplier raw vector columns have unsupported types".to_string(),
+        ));
+    };
     let suppkeys = batch_column(batch, "s_suppkey")?;
     let nationkeys = batch_column(batch, "s_nationkey")?;
     for row in 0..batch.num_rows() {
