@@ -6103,10 +6103,13 @@ fn q09_order_years_partial_view_into(
     partial: &mut Q09OrderYearPartial,
 ) -> Result<Option<()>> {
     if view.num_columns() == 2
-        && let (Some(orderkeys), Some(orderdates)) = (view.i64(0), view.date32(1))
+        && let (Some(orderkeys), Some(orderdates)) = (view.i64_vector(0), view.date32_vector(1))
     {
-        if orderkeys.null_count() == 0 && orderdates.null_count() == 0 {
-            for (&orderkey, &orderdate) in orderkeys.values().iter().zip(orderdates.values()) {
+        if let (Some(orderkey_values), Some(orderdate_values)) = (
+            orderkeys.values_if_null_free(),
+            orderdates.values_if_null_free(),
+        ) {
+            for (&orderkey, &orderdate) in orderkey_values.iter().zip(orderdate_values) {
                 let year = partial.year_cache.year(orderdate)?;
                 partial.push(orderkey, year);
             }
@@ -6121,7 +6124,10 @@ fn q09_order_years_partial_view_into(
         }
         return Ok(Some(()));
     }
-    q09_order_years_partial_batch_into(view.record_batch().clone(), partial)
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    q09_order_years_partial_batch_into(batch.clone(), partial)
 }
 
 fn q09_order_year_row_group_map_enabled() -> bool {
@@ -20343,12 +20349,16 @@ fn q07_order_customers_view(
     customer_nations: &AdaptiveI64Map<i64>,
 ) -> Result<FastHashMap<i64, i64>> {
     if view.num_columns() == 2
+        && let (Some(orderkeys), Some(custkeys)) = (view.i64_vector(0), view.i64_vector(1))
         && let Some(orders) =
-            q07_order_customers_batch_typed(view.column(0)?, view.column(1)?, customer_nations)
+            q07_order_customers_vector_typed(orderkeys, custkeys, customer_nations)
     {
         return Ok(orders);
     }
-    q07_order_customers_batch(view.record_batch().clone(), customer_nations)
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(fast_hash_map());
+    };
+    q07_order_customers_batch(batch.clone(), customer_nations)
 }
 
 fn q07_order_customers_batch_typed(
@@ -20367,6 +20377,34 @@ fn q07_order_customers_batch_typed(
         for row in 0..orderkeys.len() {
             if let Some(nationkey) = customer_nations.get(custkeys.value(row)) {
                 orders.insert(orderkeys.value(row), nationkey);
+            }
+        }
+        return Some(orders);
+    }
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row) || custkeys.is_null(row) {
+            continue;
+        }
+        if let Some(nationkey) = customer_nations.get(custkeys.value(row)) {
+            orders.insert(orderkeys.value(row), nationkey);
+        }
+    }
+    Some(orders)
+}
+
+fn q07_order_customers_vector_typed(
+    orderkeys: I64VectorView<'_>,
+    custkeys: I64VectorView<'_>,
+    customer_nations: &AdaptiveI64Map<i64>,
+) -> Option<FastHashMap<i64, i64>> {
+    let mut orders = fast_hash_map::<i64, i64>();
+    if let (Some(orderkey_values), Some(custkey_values)) = (
+        orderkeys.values_if_null_free(),
+        custkeys.values_if_null_free(),
+    ) {
+        for row in 0..orderkey_values.len() {
+            if let Some(nationkey) = customer_nations.get(custkey_values[row]) {
+                orders.insert(orderkey_values[row], nationkey);
             }
         }
         return Some(orders);
