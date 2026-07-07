@@ -9436,8 +9436,6 @@ async fn q16_part_groups(
     while let Some(batch) = stream.next() {
         let batch = batch?;
         let view = BatchView::new(&batch);
-        let partkeys = view.column(0)?;
-        let part_sizes = view.column(3)?;
         if let Some(layout) = Q16PartDictionaryView::try_new(view)
             && q16_part_groups_dictionary_typed_batch(
                 layout,
@@ -9455,6 +9453,31 @@ async fn q16_part_groups(
         {
             continue;
         }
+        let size_view = if let Some(values) = view.i32_vector(3) {
+            Q16PartSizeView::I32(values)
+        } else if let Some(values) = view.i64_vector(3) {
+            Q16PartSizeView::I64(values)
+        } else {
+            let Some(batch) = view.try_record_batch() else {
+                return Err(DodamError::UnsupportedSql(
+                    "Q16 part-group size raw vector has unsupported type".to_string(),
+                ));
+            };
+            q16_part_groups_batch_fallback(
+                batch,
+                excluded_brand,
+                excluded_type_prefix,
+                sizes,
+                &mut brand_ids,
+                &mut type_ids,
+                &mut brands_by_id,
+                &mut types_by_id,
+                &mut group_ids,
+                &mut groups,
+                &mut part_to_group,
+            )?;
+            continue;
+        };
         let Some(brands) = view.utf8(1) else {
             return Err(DodamError::UnsupportedSql(
                 "p_brand must be Utf8".to_string(),
@@ -9465,11 +9488,33 @@ async fn q16_part_groups(
                 "p_type must be Utf8".to_string(),
             ));
         };
-        if q16_part_groups_typed_batch(
-            partkeys,
-            brands,
-            types,
-            part_sizes,
+        if let Some(partkeys) = view.i64_vector(0)
+            && q16_part_groups_vector_batch(
+                partkeys,
+                brands,
+                types,
+                size_view,
+                excluded_brand,
+                excluded_type_prefix,
+                sizes,
+                &mut brand_ids,
+                &mut type_ids,
+                &mut brands_by_id,
+                &mut types_by_id,
+                &mut group_ids,
+                &mut groups,
+                &mut part_to_group,
+            )?
+        {
+            continue;
+        }
+        let Some(batch) = view.try_record_batch() else {
+            return Err(DodamError::UnsupportedSql(
+                "Q16 part-group raw vector columns have unsupported nullable layout".to_string(),
+            ));
+        };
+        q16_part_groups_batch_fallback(
+            batch,
             excluded_brand,
             excluded_type_prefix,
             sizes,
@@ -9480,52 +9525,136 @@ async fn q16_part_groups(
             &mut group_ids,
             &mut groups,
             &mut part_to_group,
-        )? {
-            continue;
-        }
-        for row in 0..batch.num_rows() {
-            let (Some(partkey), Some(size)) = (
-                numeric_i64_value(partkeys, row)?,
-                numeric_i64_value(part_sizes, row)?,
-            ) else {
-                continue;
-            };
-            if !sizes.contains(size) {
-                continue;
-            }
-            if brands.is_null(row)
-                || types.is_null(row)
-                || brands.value(row) == excluded_brand
-                || types.value(row).starts_with(excluded_type_prefix)
-            {
-                continue;
-            }
-            let brand_id = q16_intern_string(&mut brand_ids, &mut brands_by_id, brands.value(row));
-            let type_id = q16_intern_string(&mut type_ids, &mut types_by_id, types.value(row));
-            let key = Q16GroupIdKey {
-                brand_id,
-                type_id,
-                size,
-            };
-            let group_id = if let Some(group_id) = group_ids.get(&key).copied() {
-                group_id
-            } else {
-                let group_id = groups.len();
-                groups.push(Q16GroupKey {
-                    brand: brands_by_id[brand_id].clone(),
-                    type_name: types_by_id[type_id].clone(),
-                    size,
-                });
-                group_ids.insert(key, group_id);
-                group_id
-            };
-            part_to_group.insert(partkey, group_id);
-        }
+        )?;
     }
     Ok(Q16PartGroups {
         groups,
         part_to_group: AdaptiveI64Map::from_hash(part_to_group),
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q16_part_groups_batch_fallback(
+    batch: &RecordBatch,
+    excluded_brand: &str,
+    excluded_type_prefix: &str,
+    sizes: &AdaptiveI64Set,
+    brand_ids: &mut FastHashMap<String, usize>,
+    type_ids: &mut FastHashMap<String, usize>,
+    brands_by_id: &mut Vec<String>,
+    types_by_id: &mut Vec<String>,
+    group_ids: &mut FastHashMap<Q16GroupIdKey, usize>,
+    groups: &mut Vec<Q16GroupKey>,
+    part_to_group: &mut FastHashMap<i64, usize>,
+) -> Result<()> {
+    let partkeys = batch_column(batch, "p_partkey")?;
+    let part_sizes = batch_column(batch, "p_size")?;
+    let brands = batch_string_column(batch, "p_brand")?;
+    let types = batch_string_column(batch, "p_type")?;
+    if q16_part_groups_typed_batch(
+        partkeys,
+        brands,
+        types,
+        part_sizes,
+        excluded_brand,
+        excluded_type_prefix,
+        sizes,
+        brand_ids,
+        type_ids,
+        brands_by_id,
+        types_by_id,
+        group_ids,
+        groups,
+        part_to_group,
+    )? {
+        return Ok(());
+    }
+    for row in 0..batch.num_rows() {
+        let (Some(partkey), Some(size)) = (
+            numeric_i64_value(partkeys, row)?,
+            numeric_i64_value(part_sizes, row)?,
+        ) else {
+            continue;
+        };
+        if !sizes.contains(size) {
+            continue;
+        }
+        if brands.is_null(row)
+            || types.is_null(row)
+            || brands.value(row) == excluded_brand
+            || types.value(row).starts_with(excluded_type_prefix)
+        {
+            continue;
+        }
+        let brand_id = q16_intern_string(brand_ids, brands_by_id, brands.value(row));
+        let type_id = q16_intern_string(type_ids, types_by_id, types.value(row));
+        let key = Q16GroupIdKey {
+            brand_id,
+            type_id,
+            size,
+        };
+        let group_id = if let Some(group_id) = group_ids.get(&key).copied() {
+            group_id
+        } else {
+            let group_id = groups.len();
+            groups.push(Q16GroupKey {
+                brand: brands_by_id[brand_id].clone(),
+                type_name: types_by_id[type_id].clone(),
+                size,
+            });
+            group_ids.insert(key, group_id);
+            group_id
+        };
+        part_to_group.insert(partkey, group_id);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q16_part_groups_vector_batch(
+    partkeys: I64VectorView<'_>,
+    brands: &StringArray,
+    types: &StringArray,
+    part_sizes: Q16PartSizeView<'_>,
+    excluded_brand: &str,
+    excluded_type_prefix: &str,
+    sizes: &AdaptiveI64Set,
+    brand_ids: &mut FastHashMap<String, usize>,
+    type_ids: &mut FastHashMap<String, usize>,
+    brands_by_id: &mut Vec<String>,
+    types_by_id: &mut Vec<String>,
+    group_ids: &mut FastHashMap<Q16GroupIdKey, usize>,
+    groups: &mut Vec<Q16GroupKey>,
+    part_to_group: &mut FastHashMap<i64, usize>,
+) -> Result<bool> {
+    let Some(partkey_values) = partkeys.values_if_null_free() else {
+        return Ok(false);
+    };
+    if brands.null_count() != 0 || types.null_count() != 0 || part_sizes.null_count() != 0 {
+        return Ok(false);
+    }
+    for (row, &partkey) in partkey_values.iter().enumerate() {
+        let size = part_sizes.value_i64(row);
+        if !sizes.contains(size) {
+            continue;
+        }
+        q16_insert_part_group_row(
+            partkey,
+            size,
+            brands.value(row),
+            types.value(row),
+            excluded_brand,
+            excluded_type_prefix,
+            brand_ids,
+            type_ids,
+            brands_by_id,
+            types_by_id,
+            group_ids,
+            groups,
+            part_to_group,
+        );
+    }
+    Ok(true)
 }
 
 fn q16_part_dictionary_strings_enabled() -> bool {
@@ -9600,7 +9729,7 @@ impl Q16PartSizeView<'_> {
 }
 
 struct Q16PartDictionaryView<'a> {
-    partkeys: &'a Int64Array,
+    partkeys: I64VectorView<'a>,
     brands: DictionaryI32View<'a>,
     types: DictionaryI32View<'a>,
     sizes: Q16PartSizeView<'a>,
@@ -9614,7 +9743,7 @@ impl<'a> Q16PartDictionaryView<'a> {
             Q16PartSizeView::I64(view.i64_vector(3)?)
         };
         Some(Self {
-            partkeys: view.i64(0)?,
+            partkeys: view.i64_vector(0)?,
             brands: view.dictionary_i32_view(1)?,
             types: view.dictionary_i32_view(2)?,
             sizes,
@@ -9636,7 +9765,7 @@ fn q16_part_groups_dictionary_typed_batch(
     groups: &mut Vec<Q16GroupKey>,
     part_to_group: &mut FastHashMap<i64, usize>,
 ) -> Result<bool> {
-    if view.partkeys.null_count() != 0
+    if view.partkeys.values_if_null_free().is_none()
         || view.brands.null_count() != 0
         || view.types.null_count() != 0
         || view.sizes.null_count() != 0
@@ -9665,7 +9794,10 @@ fn q16_part_groups_dictionary_typed_batch(
     )?;
     let brand_keys = view.brands.keys();
     let type_keys = view.types.keys();
-    let partkey_values = view.partkeys.values().as_ref();
+    let partkey_values = view
+        .partkeys
+        .values_if_null_free()
+        .expect("checked partkeys");
     for row in 0..partkey_values.len() {
         let size = view.sizes.value_i64(row);
         if !sizes.contains(size) {
@@ -9775,7 +9907,7 @@ fn q16_part_groups_dictionary_partial_batch(
     sizes: &AdaptiveI64Set,
     partial: &mut Q16PartGroupPartial,
 ) -> Result<bool> {
-    if view.partkeys.null_count() != 0
+    if view.partkeys.values_if_null_free().is_none()
         || view.brands.null_count() != 0
         || view.types.null_count() != 0
         || view.sizes.null_count() != 0
@@ -9804,7 +9936,10 @@ fn q16_part_groups_dictionary_partial_batch(
     )?;
     let brand_keys = view.brands.keys();
     let type_keys = view.types.keys();
-    let partkey_values = view.partkeys.values().as_ref();
+    let partkey_values = view
+        .partkeys
+        .values_if_null_free()
+        .expect("checked partkeys");
     for row in 0..partkey_values.len() {
         let size = view.sizes.value_i64(row);
         if !sizes.contains(size) {
