@@ -218,6 +218,7 @@ struct ParquetMapChunkMetrics {
     total_nanos: u64,
     read_nanos: u64,
     reader_next_nanos: u64,
+    reader_p95_next_nanos: u64,
     reader_max_next_nanos: u64,
     reader_calls: usize,
     reader_eof: usize,
@@ -238,6 +239,7 @@ impl ParquetMapChunkMetrics {
         self.reader_next_nanos = self
             .reader_next_nanos
             .saturating_add(other.reader_next_nanos);
+        self.reader_p95_next_nanos = self.reader_p95_next_nanos.max(other.reader_p95_next_nanos);
         self.reader_max_next_nanos = self.reader_max_next_nanos.max(other.reader_max_next_nanos);
         self.reader_calls = self.reader_calls.saturating_add(other.reader_calls);
         self.reader_eof = self.reader_eof.saturating_add(other.reader_eof);
@@ -5421,6 +5423,7 @@ where
         total_nanos,
         read_nanos,
         reader_next_nanos: reader.next_nanos(),
+        reader_p95_next_nanos: reader.p95_next_nanos(),
         reader_max_next_nanos: reader.max_next_nanos(),
         reader_calls: reader.next_calls(),
         reader_eof: reader.eof_calls(),
@@ -5431,7 +5434,7 @@ where
     let finished = finish(state);
     if let (Some(label), Some(_)) = (profile_label, started) {
         eprintln!(
-            "[dodam:tpch-profile] row_group_map {label}: chunk={} row_groups={} projected_columns={} rows={} batches={} zero_batches={} total={:.3} ms setup={:.3} ms metadata={:.3} ms planning={:.3} ms read_next={:.3} ms reader_next={:.3} ms reader_next_avg={:.3} ms reader_next_max={:.3} ms reader_calls={} reader_eof={} avg_batch_rows={:.1} consume={:.3} ms compressed={}/{}",
+            "[dodam:tpch-profile] row_group_map {label}: chunk={} row_groups={} projected_columns={} rows={} batches={} zero_batches={} total={:.3} ms setup={:.3} ms metadata={:.3} ms planning={:.3} ms read_next={:.3} ms reader_next={:.3} ms reader_next_avg={:.3} ms reader_next_p95={:.3} ms reader_next_max={:.3} ms reader_calls={} reader_eof={} avg_batch_rows={:.1} consume={:.3} ms compressed={}/{}",
             profile_chunk,
             row_groups.len(),
             reader.projected_columns(),
@@ -5445,6 +5448,7 @@ where
             nanos_to_millis(read_nanos),
             nanos_to_millis(reader.next_nanos()),
             average_nanos_millis(reader.next_nanos(), reader.next_calls()),
+            nanos_to_millis(reader.p95_next_nanos()),
             nanos_to_millis(reader.max_next_nanos()),
             reader.next_calls(),
             reader.eof_calls(),
@@ -5524,6 +5528,7 @@ where
         total_nanos,
         read_nanos,
         reader_next_nanos: reader.next_nanos(),
+        reader_p95_next_nanos: reader.p95_next_nanos(),
         reader_max_next_nanos: reader.max_next_nanos(),
         reader_calls: reader.next_calls(),
         reader_eof: reader.eof_calls(),
@@ -5534,7 +5539,7 @@ where
     let finished = finish(state);
     if let (Some(label), Some(_)) = (profile_label, started) {
         eprintln!(
-            "[dodam:tpch-profile] row_group_map_view {label}: chunk={} row_groups={} projected_columns={} rows={} batches={} zero_batches={} total={:.3} ms setup={:.3} ms metadata={:.3} ms planning={:.3} ms read_next={:.3} ms reader_next={:.3} ms reader_next_avg={:.3} ms reader_next_max={:.3} ms reader_calls={} reader_eof={} avg_batch_rows={:.1} consume={:.3} ms compressed={}/{}",
+            "[dodam:tpch-profile] row_group_map_view {label}: chunk={} row_groups={} projected_columns={} rows={} batches={} zero_batches={} total={:.3} ms setup={:.3} ms metadata={:.3} ms planning={:.3} ms read_next={:.3} ms reader_next={:.3} ms reader_next_avg={:.3} ms reader_next_p95={:.3} ms reader_next_max={:.3} ms reader_calls={} reader_eof={} avg_batch_rows={:.1} consume={:.3} ms compressed={}/{}",
             profile_chunk,
             row_groups.len(),
             reader.projected_columns(),
@@ -5548,6 +5553,7 @@ where
             nanos_to_millis(read_nanos),
             nanos_to_millis(reader.next_nanos()),
             average_nanos_millis(reader.next_nanos(), reader.next_calls()),
+            nanos_to_millis(reader.p95_next_nanos()),
             nanos_to_millis(reader.max_next_nanos()),
             reader.next_calls(),
             reader.eof_calls(),
@@ -5629,6 +5635,7 @@ where
         total_nanos,
         read_nanos,
         reader_next_nanos: reader.next_nanos(),
+        reader_p95_next_nanos: reader.p95_next_nanos(),
         reader_max_next_nanos: reader.max_next_nanos(),
         reader_calls: reader.next_calls(),
         reader_eof: reader.eof_calls(),
@@ -5639,7 +5646,7 @@ where
     let finished = finish(state);
     if let (Some(label), Some(_)) = (profile_label, started) {
         eprintln!(
-            "[dodam:tpch-profile] dictionary_row_group_map {label}: chunk={} row_groups={} projected_columns={} rows={} batches={} zero_batches={} total={:.3} ms setup={:.3} ms metadata={:.3} ms planning={:.3} ms read_next={:.3} ms reader_next={:.3} ms reader_next_avg={:.3} ms reader_next_max={:.3} ms reader_calls={} reader_eof={} avg_batch_rows={:.1} consume={:.3} ms compressed={}/{}",
+            "[dodam:tpch-profile] dictionary_row_group_map {label}: chunk={} row_groups={} projected_columns={} rows={} batches={} zero_batches={} total={:.3} ms setup={:.3} ms metadata={:.3} ms planning={:.3} ms read_next={:.3} ms reader_next={:.3} ms reader_next_avg={:.3} ms reader_next_p95={:.3} ms reader_next_max={:.3} ms reader_calls={} reader_eof={} avg_batch_rows={:.1} consume={:.3} ms compressed={}/{}",
             profile_chunk,
             row_groups.len(),
             reader.projected_columns(),
@@ -5653,6 +5660,7 @@ where
             nanos_to_millis(read_nanos),
             nanos_to_millis(reader.next_nanos()),
             average_nanos_millis(reader.next_nanos(), reader.next_calls()),
+            nanos_to_millis(reader.p95_next_nanos()),
             nanos_to_millis(reader.max_next_nanos()),
             reader.next_calls(),
             reader.eof_calls(),
@@ -5734,6 +5742,7 @@ where
         total_nanos,
         read_nanos,
         reader_next_nanos: reader.next_nanos(),
+        reader_p95_next_nanos: reader.p95_next_nanos(),
         reader_max_next_nanos: reader.max_next_nanos(),
         reader_calls: reader.next_calls(),
         reader_eof: reader.eof_calls(),
@@ -5744,7 +5753,7 @@ where
     let finished = finish(state);
     if let (Some(label), Some(_)) = (profile_label, started) {
         eprintln!(
-            "[dodam:tpch-profile] dictionary_row_group_map_view {label}: chunk={} row_groups={} projected_columns={} rows={} batches={} zero_batches={} total={:.3} ms setup={:.3} ms metadata={:.3} ms planning={:.3} ms read_next={:.3} ms reader_next={:.3} ms reader_next_avg={:.3} ms reader_next_max={:.3} ms reader_calls={} reader_eof={} avg_batch_rows={:.1} consume={:.3} ms compressed={}/{}",
+            "[dodam:tpch-profile] dictionary_row_group_map_view {label}: chunk={} row_groups={} projected_columns={} rows={} batches={} zero_batches={} total={:.3} ms setup={:.3} ms metadata={:.3} ms planning={:.3} ms read_next={:.3} ms reader_next={:.3} ms reader_next_avg={:.3} ms reader_next_p95={:.3} ms reader_next_max={:.3} ms reader_calls={} reader_eof={} avg_batch_rows={:.1} consume={:.3} ms compressed={}/{}",
             profile_chunk,
             row_groups.len(),
             reader.projected_columns(),
@@ -5758,6 +5767,7 @@ where
             nanos_to_millis(read_nanos),
             nanos_to_millis(reader.next_nanos()),
             average_nanos_millis(reader.next_nanos(), reader.next_calls()),
+            nanos_to_millis(reader.p95_next_nanos()),
             nanos_to_millis(reader.max_next_nanos()),
             reader.next_calls(),
             reader.eof_calls(),
@@ -5793,7 +5803,7 @@ fn log_parquet_map_summary(kind: &str, label: Option<&str>, metrics: ParquetMapC
         return;
     };
     eprintln!(
-        "[dodam:scan-profile] {kind}_summary {label}: chunks={} row_groups={} rows={} batches={} zero_batches={} total_sum={:.3} ms read_next={:.3} ms reader_next={:.3} ms reader_next_avg={:.3} ms reader_next_max={:.3} ms reader_calls={} reader_eof={} avg_batch_rows={:.1} consume={:.3} ms compressed={}/{}",
+        "[dodam:scan-profile] {kind}_summary {label}: chunks={} row_groups={} rows={} batches={} zero_batches={} total_sum={:.3} ms read_next={:.3} ms reader_next={:.3} ms reader_next_avg={:.3} ms reader_next_p95_max={:.3} ms reader_next_max={:.3} ms reader_calls={} reader_eof={} avg_batch_rows={:.1} consume={:.3} ms compressed={}/{}",
         metrics.chunks,
         metrics.row_groups,
         metrics.rows,
@@ -5803,6 +5813,7 @@ fn log_parquet_map_summary(kind: &str, label: Option<&str>, metrics: ParquetMapC
         nanos_to_millis(metrics.read_nanos),
         nanos_to_millis(metrics.reader_next_nanos),
         average_nanos_millis(metrics.reader_next_nanos, metrics.reader_calls),
+        nanos_to_millis(metrics.reader_p95_next_nanos),
         nanos_to_millis(metrics.reader_max_next_nanos),
         metrics.reader_calls,
         metrics.reader_eof,

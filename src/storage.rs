@@ -596,6 +596,7 @@ pub struct ParquetBatchReader {
     zero_row_batches: usize,
     next_nanos: u64,
     max_next_nanos: u64,
+    next_samples: Option<Vec<u64>>,
 }
 
 enum ProjectionOrderState {
@@ -986,6 +987,7 @@ impl ParquetBatchReader {
             zero_row_batches: 0,
             next_nanos: 0,
             max_next_nanos: 0,
+            next_samples: parquet_next_sample_enabled().then(Vec::new),
         })
     }
 
@@ -1054,6 +1056,7 @@ impl ParquetBatchReader {
             zero_row_batches: 0,
             next_nanos: 0,
             max_next_nanos: 0,
+            next_samples: parquet_next_sample_enabled().then(Vec::new),
         })
     }
 
@@ -1121,6 +1124,7 @@ impl ParquetBatchReader {
             zero_row_batches: 0,
             next_nanos: 0,
             max_next_nanos: 0,
+            next_samples: parquet_next_sample_enabled().then(Vec::new),
         })
     }
 
@@ -1178,6 +1182,7 @@ impl ParquetBatchReader {
             zero_row_batches: 0,
             next_nanos: 0,
             max_next_nanos: 0,
+            next_samples: parquet_next_sample_enabled().then(Vec::new),
         })
     }
 
@@ -1236,6 +1241,29 @@ impl ParquetBatchReader {
     pub fn max_next_nanos(&self) -> u64 {
         self.max_next_nanos
     }
+
+    pub fn p95_next_nanos(&self) -> u64 {
+        percentile_nanos(self.next_samples.as_deref().unwrap_or(&[]), 95)
+    }
+}
+
+fn parquet_next_sample_enabled() -> bool {
+    std::env::var_os("DODAM_SCAN_PROFILE").is_some()
+        || std::env::var_os("DODAM_TPCH_PROFILE").is_some()
+}
+
+fn percentile_nanos(samples: &[u64], percentile: usize) -> u64 {
+    if samples.is_empty() {
+        return 0;
+    }
+    let mut values = samples.to_vec();
+    values.sort_unstable();
+    let index = values
+        .len()
+        .saturating_sub(1)
+        .saturating_mul(percentile.min(100))
+        / 100;
+    values[index]
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -1957,6 +1985,9 @@ impl Iterator for ParquetBatchReader {
         self.next_calls = self.next_calls.saturating_add(1);
         self.next_nanos = self.next_nanos.saturating_add(next_nanos);
         self.max_next_nanos = self.max_next_nanos.max(next_nanos);
+        if let Some(samples) = self.next_samples.as_mut() {
+            samples.push(next_nanos);
+        }
         match next {
             Some(Ok(batch)) => {
                 let batch = match enforce_projection_order_cached(batch, &mut self.projection_order)
