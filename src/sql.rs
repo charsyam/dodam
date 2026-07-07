@@ -23108,7 +23108,7 @@ async fn q19_lineitem_revenue(
     }
     let profile = tpch_profile_enabled();
     engine
-        .parquet_scan_fold_chunks(
+        .parquet_scan_accumulate_chunks_view(
             path,
             batch_size,
             Projection::Columns(vec![
@@ -23124,25 +23124,22 @@ async fn q19_lineitem_revenue(
             scan_aggregate_fusion_enabled(),
             || (0.0, 0_u64, Q19SelectionProfile::default()),
             || (0.0, 0_u64, Q19SelectionProfile::default()),
-            move |batch| {
-                let mut sum = 0.0;
-                let mut count = 0_u64;
-                let mut profile_metrics = Q19SelectionProfile::default();
+            move |view, output| {
                 let mut raw_rule_cache = None;
                 let mut batch_profile = profile.then_some(Q19SelectionProfile::default());
                 let (batch_sum, batch_count) = q19_lineitem_revenue_batch(
-                    batch,
+                    view,
                     &rules,
                     &part_masks,
                     &mut raw_rule_cache,
                     batch_profile.as_mut(),
                 )?;
-                sum += batch_sum;
-                count += batch_count;
+                output.0 += batch_sum;
+                output.1 += batch_count;
                 if let Some(batch_profile) = batch_profile {
-                    profile_metrics.add(batch_profile);
+                    output.2.add(batch_profile);
                 }
-                Ok((sum, count, profile_metrics))
+                Ok(Some(()))
             },
             |total, batch| {
                 total.0 += batch.0;
@@ -23485,12 +23482,43 @@ fn q19_log_late_materialized_profile(metrics: LateMaterializedMetrics, row_group
 }
 
 fn q19_lineitem_revenue_batch(
-    batch: RecordBatch,
+    view: BatchView<'_>,
     rules: &[Q19Rule],
     part_masks: &AdaptiveI64Map<u8>,
     raw_rule_cache: &mut Option<(u64, Vec<Q19RawLineRule>)>,
     mut profile: Option<&mut Q19SelectionProfile>,
 ) -> Result<(f64, u64)> {
+    if view.num_columns() == 6
+        && let (
+            Ok(partkeys),
+            Some(quantities),
+            Some(extendedprices),
+            Some(discounts),
+            Ok(shipmodes),
+            Ok(shipinstructs),
+        ) = (
+            view.required_i64(0),
+            decimal_input(view.column(1)?)?,
+            decimal_input(view.column(2)?)?,
+            decimal_input(view.column(3)?)?,
+            view.required_utf8(4),
+            view.required_utf8(5),
+        )
+    {
+        return q19_lineitem_revenue_typed(
+            partkeys,
+            quantities,
+            extendedprices,
+            discounts,
+            shipmodes,
+            shipinstructs,
+            rules,
+            part_masks,
+            raw_rule_cache,
+            profile,
+        );
+    }
+    let batch = view.record_batch();
     let partkeys = batch_column(&batch, "l_partkey")?;
     let quantities = batch_column(&batch, "l_quantity")?;
     let extendedprices = batch_column(&batch, "l_extendedprice")?;
@@ -23620,6 +23648,100 @@ fn q19_lineitem_revenue_batch(
             sum += extendedprice * (1.0 - discount);
             count += 1;
         }
+    }
+    Ok((sum, count))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q19_lineitem_revenue_typed(
+    partkeys: &Int64Array,
+    quantities: DecimalInput<'_>,
+    extendedprices: DecimalInput<'_>,
+    discounts: DecimalInput<'_>,
+    shipmodes: &StringArray,
+    shipinstructs: &StringArray,
+    rules: &[Q19Rule],
+    part_masks: &AdaptiveI64Map<u8>,
+    raw_rule_cache: &mut Option<(u64, Vec<Q19RawLineRule>)>,
+    mut profile: Option<&mut Q19SelectionProfile>,
+) -> Result<(f64, u64)> {
+    let mut sum = 0.0;
+    let mut count = 0_u64;
+    let raw_rules = q19_raw_line_rules_cached(rules, quantities.scale, raw_rule_cache);
+    if partkeys.null_count() == 0
+        && quantities.null_count() == 0
+        && extendedprices.null_count() == 0
+        && discounts.null_count() == 0
+        && shipmodes.null_count() == 0
+        && shipinstructs.null_count() == 0
+    {
+        let discount_one_raw = scaled_f64_to_i128(1.0, discounts.scale);
+        let revenue_scale = 1.0 / (extendedprices.scale * discounts.scale);
+        let shipmode_offsets = shipmodes.value_offsets();
+        let shipmode_data = shipmodes.value_data();
+        let shipinstruct_offsets = shipinstructs.value_offsets();
+        let shipinstruct_data = shipinstructs.value_data();
+        let partkey_values = partkeys.values();
+        let quantity_values = quantities.raw_values();
+        let extendedprice_values = extendedprices.raw_values();
+        let discount_values = discounts.raw_values();
+        for row in 0..partkeys.len() {
+            let selected = if let Some(mask) = part_masks.get(partkey_values[row]) {
+                q19_rule_matches_lineitem_raw(
+                    raw_rules,
+                    mask,
+                    quantity_values[row],
+                    bytes_string_parts(shipmode_offsets, shipmode_data, row),
+                    bytes_string_parts(shipinstruct_offsets, shipinstruct_data, row),
+                )
+            } else {
+                false
+            };
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.record(selected);
+            }
+            if !selected {
+                continue;
+            }
+            sum += (extendedprice_values[row] * (discount_one_raw - discount_values[row])) as f64
+                * revenue_scale;
+            count += 1;
+        }
+        return Ok((sum, count));
+    }
+    for row in 0..partkeys.len() {
+        if partkeys.is_null(row)
+            || quantities.is_null(row)
+            || extendedprices.is_null(row)
+            || discounts.is_null(row)
+            || shipmodes.is_null(row)
+            || shipinstructs.is_null(row)
+        {
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.record(false);
+            }
+            continue;
+        }
+        let quantity = quantities.value(row);
+        let selected = if let Some(mask) = part_masks.get(partkeys.value(row)) {
+            q19_rule_matches_lineitem(
+                rules,
+                mask,
+                quantity,
+                shipmodes.value(row),
+                shipinstructs.value(row),
+            )
+        } else {
+            false
+        };
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.record(selected);
+        }
+        if !selected {
+            continue;
+        }
+        sum += extendedprices.value(row) * (1.0 - discounts.value(row));
+        count += 1;
     }
     Ok((sum, count))
 }
@@ -25179,7 +25301,7 @@ async fn q20_lineitem_quantity_sums(
 ) -> Result<HashMap<(i64, i64), f64>> {
     let forest_parts = Arc::new(forest_parts.clone());
     engine
-        .parquet_scan_fold_chunks(
+        .parquet_scan_accumulate_chunks_view(
             path,
             batch_size,
             Projection::Columns(vec![
@@ -25193,18 +25315,38 @@ async fn q20_lineitem_quantity_sums(
             scan_aggregate_fusion_enabled(),
             HashMap::<(i64, i64), f64>::new,
             HashMap::<(i64, i64), f64>::new,
-            move |batch| {
-                let mut sums = HashMap::<(i64, i64), f64>::new();
-                merge_f64_groups(
-                    &mut sums,
-                    q20_lineitem_quantity_sums_batch(batch, &forest_parts)?,
-                );
-                Ok(sums)
+            move |view, sums| {
+                q20_lineitem_quantity_sums_view_into(view, &forest_parts, sums)?;
+                Ok(Some(()))
             },
             merge_f64_groups,
             "Q20 lineitem quantity aggregate",
         )
         .await
+}
+
+fn q20_lineitem_quantity_sums_view_into(
+    view: BatchView<'_>,
+    forest_parts: &AdaptiveI64Set,
+    sums: &mut HashMap<(i64, i64), f64>,
+) -> Result<()> {
+    if view.num_columns() == 4
+        && let Some(batch_sums) = q20_lineitem_quantity_sums_typed(
+            view.column(0)?,
+            view.column(1)?,
+            view.column(2)?,
+            view.column(3)?,
+            forest_parts,
+        )?
+    {
+        merge_f64_groups(sums, batch_sums);
+        return Ok(());
+    }
+    merge_f64_groups(
+        sums,
+        q20_lineitem_quantity_sums_batch(view.record_batch().clone(), forest_parts)?,
+    );
+    Ok(())
 }
 
 fn q20_lineitem_quantity_sums_batch(
