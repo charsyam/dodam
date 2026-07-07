@@ -20353,22 +20353,118 @@ fn q05_revenue_by_nation_projected_view(
     supplier_nations: &AdaptiveI64Map<i64>,
 ) -> Result<FastHashMap<i64, f64>> {
     if view.num_columns() == 4
-        && let Some(groups) = q05_revenue_by_nation_typed(
-            view.column(0)?,
-            view.column(1)?,
-            view.column(2)?,
-            view.column(3)?,
+        && let (Some(orderkeys), Some(suppkeys), Some(extendedprices), Some(discounts)) = (
+            view.i64_vector(0),
+            view.i64_vector(1),
+            view.decimal128_vector(2),
+            view.decimal128_vector(3),
+        )
+    {
+        return Ok(q05_revenue_by_nation_vector(
+            orderkeys,
+            suppkeys,
+            extendedprices,
+            discounts,
             order_customer_nations,
             supplier_nations,
-        )?
-    {
-        return Ok(groups);
+        ));
     }
-    q05_revenue_by_nation_batch(
-        view.record_batch().clone(),
-        order_customer_nations,
-        supplier_nations,
-    )
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "Q05 revenue raw vector columns have unsupported types".to_string(),
+        ));
+    };
+    q05_revenue_by_nation_batch(batch.clone(), order_customer_nations, supplier_nations)
+}
+
+fn q05_revenue_by_nation_vector(
+    orderkeys: I64VectorView<'_>,
+    suppkeys: I64VectorView<'_>,
+    extendedprices: Decimal128VectorView<'_>,
+    discounts: Decimal128VectorView<'_>,
+    order_customer_nations: &FastHashMap<i64, i64>,
+    supplier_nations: &AdaptiveI64Map<i64>,
+) -> FastHashMap<i64, f64> {
+    let mut groups = fast_hash_map::<i64, f64>();
+    if let (Some(orderkey_values), Some(suppkey_values)) = (
+        orderkeys.values_if_null_free(),
+        suppkeys.values_if_null_free(),
+    ) && extendedprices.null_count() == 0
+        && discounts.null_count() == 0
+    {
+        let extendedprice_values = extendedprices.raw_values();
+        let discount_values = discounts.raw_values();
+        let discount_scale = discounts.scale();
+        let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
+        if let Some((supplier_nation_values, supplier_nation_present)) =
+            supplier_nations.dense_slices()
+        {
+            for row in 0..orderkey_values.len() {
+                let orderkey = orderkey_values[row];
+                let Some(customer_nation) = order_customer_nations.get(&orderkey).copied() else {
+                    continue;
+                };
+                let Ok(suppkey) = usize::try_from(suppkey_values[row]) else {
+                    continue;
+                };
+                if supplier_nation_present
+                    .get(suppkey)
+                    .copied()
+                    .unwrap_or(false)
+                    && supplier_nation_values[suppkey] == customer_nation
+                {
+                    *groups.entry(customer_nation).or_insert(0.0) += decimal_discounted_revenue_raw(
+                        extendedprice_values[row],
+                        discount_values[row],
+                        discount_scale,
+                        revenue_scale,
+                    );
+                }
+            }
+            return groups;
+        }
+        for row in 0..orderkey_values.len() {
+            let orderkey = orderkey_values[row];
+            let suppkey = suppkey_values[row];
+            let (Some(customer_nation), Some(supplier_nation)) = (
+                order_customer_nations.get(&orderkey).copied(),
+                supplier_nations.get(suppkey),
+            ) else {
+                continue;
+            };
+            if customer_nation == supplier_nation {
+                *groups.entry(customer_nation).or_insert(0.0) += decimal_discounted_revenue_raw(
+                    extendedprice_values[row],
+                    discount_values[row],
+                    discount_scale,
+                    revenue_scale,
+                );
+            }
+        }
+        return groups;
+    }
+    for row in 0..orderkeys.len() {
+        if orderkeys.is_null(row)
+            || suppkeys.is_null(row)
+            || extendedprices.is_null(row)
+            || discounts.is_null(row)
+        {
+            continue;
+        }
+        let orderkey = orderkeys.value(row);
+        let suppkey = suppkeys.value(row);
+        let (Some(customer_nation), Some(supplier_nation)) = (
+            order_customer_nations.get(&orderkey).copied(),
+            supplier_nations.get(suppkey),
+        ) else {
+            continue;
+        };
+        if customer_nation == supplier_nation {
+            *groups.entry(customer_nation).or_insert(0.0) +=
+                extendedprices.value(row) * (1.0 - discounts.value(row));
+        }
+    }
+    groups
 }
 
 fn q05_revenue_by_nation_typed(
