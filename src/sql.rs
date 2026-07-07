@@ -17792,24 +17792,18 @@ async fn q05_order_customer_nations(
         )
         .await?;
     let customer_nations = Arc::new(AdaptiveI64Map::from_hash(customer_nations.clone()));
-    parallel_batch_fold_chunks(
+    parallel_batch_fold_view_chunks(
         &mut stream,
         4,
-        move |batches| {
-            let mut orders = fast_hash_map::<i64, i64>();
-            for batch in batches {
-                merge_maps(
-                    &mut orders,
-                    q05_order_customer_nations_batch(
-                        batch,
-                        &customer_nations,
-                        start_days,
-                        end_days,
-                    )?,
-                );
-            }
-            Ok(orders)
+        || fast_hash_map::<i64, i64>(),
+        move |view, orders| {
+            merge_maps(
+                orders,
+                q05_order_customer_nations_view(view, &customer_nations, start_days, end_days)?,
+            );
+            Ok(Some(()))
         },
+        Ok,
         fast_hash_map::<i64, i64>(),
         merge_maps,
         "Q05 order customer nations",
@@ -17854,6 +17848,32 @@ fn q05_order_customer_nations_batch(
         }
     }
     Ok(orders)
+}
+
+fn q05_order_customer_nations_view(
+    view: BatchView<'_>,
+    customer_nations: &AdaptiveI64Map<i64>,
+    start_days: i32,
+    end_days: i32,
+) -> Result<FastHashMap<i64, i64>> {
+    if view.num_columns() == 3
+        && let Some(orders) = q05_order_customer_nations_batch_typed(
+            view.column(0)?,
+            view.column(1)?,
+            view.column(2)?,
+            customer_nations,
+            start_days,
+            end_days,
+        )
+    {
+        return Ok(orders);
+    }
+    q05_order_customer_nations_batch(
+        view.record_batch().clone(),
+        customer_nations,
+        start_days,
+        end_days,
+    )
 }
 
 fn q05_order_customer_nations_batch_typed(
@@ -18018,19 +18038,22 @@ async fn q05_revenue_by_nation_stream(
             .scan_parquet_batches_pruned(path, batch_size, projection, pruning_predicates)
             .await?
     };
-    parallel_batch_fold_chunks(
+    parallel_batch_fold_view_chunks(
         &mut stream,
         join_aggregate_chunk_size(),
-        move |batches| {
-            let mut groups = fast_hash_map::<i64, f64>();
-            for batch in batches {
-                merge_f64_groups(
-                    &mut groups,
-                    q05_revenue_by_nation_batch(batch, &order_customer_nations, &supplier_nations)?,
-                );
-            }
-            Ok(groups)
+        || fast_hash_map::<i64, f64>(),
+        move |view, groups| {
+            merge_f64_groups(
+                groups,
+                q05_revenue_by_nation_projected_view(
+                    view,
+                    &order_customer_nations,
+                    &supplier_nations,
+                )?,
+            );
+            Ok(Some(()))
         },
+        Ok,
         fast_hash_map::<i64, f64>(),
         merge_f64_groups,
         "Q05 revenue aggregate",
@@ -19243,19 +19266,15 @@ async fn q07_order_customers(
         )
         .await?;
     let customer_nations = Arc::new(AdaptiveI64Map::from_hash(customer_nations.clone()));
-    parallel_batch_fold_chunks(
+    parallel_batch_fold_view_chunks(
         &mut stream,
         4,
-        move |batches| {
-            let mut orders = fast_hash_map::<i64, i64>();
-            for batch in batches {
-                merge_maps(
-                    &mut orders,
-                    q07_order_customers_batch(batch, &customer_nations)?,
-                );
-            }
-            Ok(orders)
+        || fast_hash_map::<i64, i64>(),
+        move |view, orders| {
+            merge_maps(orders, q07_order_customers_view(view, &customer_nations)?);
+            Ok(Some(()))
         },
+        Ok,
         fast_hash_map::<i64, i64>(),
         merge_maps,
         "Q07 order customer nations",
@@ -19284,6 +19303,19 @@ fn q07_order_customers_batch(
         }
     }
     Ok(orders)
+}
+
+fn q07_order_customers_view(
+    view: BatchView<'_>,
+    customer_nations: &AdaptiveI64Map<i64>,
+) -> Result<FastHashMap<i64, i64>> {
+    if view.num_columns() == 2
+        && let Some(orders) =
+            q07_order_customers_batch_typed(view.column(0)?, view.column(1)?, customer_nations)
+    {
+        return Ok(orders);
+    }
+    q07_order_customers_batch(view.record_batch().clone(), customer_nations)
 }
 
 fn q07_order_customers_batch_typed(
@@ -19759,25 +19791,24 @@ async fn q07_volume_rows_stream(
             .scan_parquet_batches_pruned(path, batch_size, projection, pruning_predicates)
             .await?
     };
-    parallel_batch_fold_chunks(
+    parallel_batch_fold_view_chunks(
         &mut stream,
         join_aggregate_chunk_size(),
-        move |batches| {
-            let mut groups = fast_hash_map::<(i64, i64, i32), f64>();
-            for batch in batches {
-                merge_f64_groups(
-                    &mut groups,
-                    q07_volume_batch(
-                        batch,
-                        &supplier_nations,
-                        &order_customer_nations,
-                        start_days,
-                        end_days,
-                    )?,
-                );
-            }
-            Ok(groups)
+        || fast_hash_map::<(i64, i64, i32), f64>(),
+        move |view, groups| {
+            merge_f64_groups(
+                groups,
+                q07_volume_projected_view(
+                    view,
+                    &supplier_nations,
+                    &order_customer_nations,
+                    start_days,
+                    end_days,
+                )?,
+            );
+            Ok(Some(()))
         },
+        Ok,
         fast_hash_map::<(i64, i64, i32), f64>(),
         merge_f64_groups,
         "Q07 volume aggregate",
@@ -20552,19 +20583,18 @@ async fn q08_market_share_rows(
     let order_years = Arc::new(AdaptiveI64Map::from_hash(order_years.clone()));
     let part_keys = Arc::new(AdaptiveI64Set::from_hash(part_keys.clone()));
     let supplier_is_brazil = Arc::new(AdaptiveI64Map::from_hash(supplier_is_brazil.clone()));
-    let groups = parallel_batch_fold_chunks(
+    let groups = parallel_batch_fold_view_chunks(
         &mut stream,
         join_aggregate_chunk_size(),
-        move |batches| {
-            let mut groups = HashMap::<i32, (f64, f64)>::new();
-            for batch in batches {
-                q08_merge_market_share_groups(
-                    &mut groups,
-                    q08_market_share_batch(batch, &order_years, &part_keys, &supplier_is_brazil)?,
-                );
-            }
-            Ok(groups)
+        HashMap::<i32, (f64, f64)>::new,
+        move |view, groups| {
+            q08_merge_market_share_groups(
+                groups,
+                q08_market_share_view(view, &order_years, &part_keys, &supplier_is_brazil)?,
+            );
+            Ok(Some(()))
         },
+        Ok,
         HashMap::<i32, (f64, f64)>::new(),
         q08_merge_market_share_groups,
         "Q08 market share aggregate",
@@ -20852,6 +20882,34 @@ fn q08_market_share_batch(
         group.1 += volume;
     }
     Ok(groups)
+}
+
+fn q08_market_share_view(
+    view: BatchView<'_>,
+    order_years: &AdaptiveI64Map<i32>,
+    part_keys: &AdaptiveI64Set,
+    supplier_is_brazil: &AdaptiveI64Map<bool>,
+) -> Result<HashMap<i32, (f64, f64)>> {
+    if view.num_columns() == 5
+        && let Some(groups) = q08_market_share_batch_typed(
+            view.column(0)?,
+            view.column(1)?,
+            view.column(2)?,
+            view.column(3)?,
+            view.column(4)?,
+            order_years,
+            part_keys,
+            supplier_is_brazil,
+        )?
+    {
+        return Ok(groups);
+    }
+    q08_market_share_batch(
+        view.record_batch().clone(),
+        order_years,
+        part_keys,
+        supplier_is_brazil,
+    )
 }
 
 fn q08_market_share_batch_typed(

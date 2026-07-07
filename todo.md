@@ -1652,3 +1652,7 @@ Tried and rejected or neutral:
         - Moved additional fallback stream folds from `parallel_batch_fold_chunks` to `parallel_batch_fold_view_chunks`: Q01 projected aggregate fallback, Q12 lineitem stream fallback, and Q03 orders stream fallback now consume `BatchView` directly and keep per-chunk state instead of mapping owned `Vec<RecordBatch>` first.
         - Removed the now-unused Q01 projected `RecordBatch` wrapper. This is mostly structural: it makes the fallback path match the row-group-map/vector consumer shape and reduces query-local batch ownership, but it does not bypass Arrow `RecordBatch` materialization.
         - Validation: `cargo test -q` and release build passed. Individual SF=10 samples: Q01 Dodam `~169.3ms` vs DuckDB `~186.0ms`, Q03 Dodam `~258.1ms` vs DuckDB `~247.0ms`, Q12 Dodam `~156.5ms` vs DuckDB `~126.0ms`.
+      - Stream fold vectorization pass 2:
+        - Moved Q05 order build, Q05 revenue stream fallback, Q07 order build, Q07 volume stream fallback, and Q08 market-share stream fallback to `parallel_batch_fold_view_chunks`.
+        - Added small `BatchView` wrappers for Q05/Q07 order maps and Q08 market-share so fallback stream execution now follows the same vector consumer shape as row-group-map paths. The fallback still clones `RecordBatch` only when the typed/projected layout does not match.
+        - Validation: `cargo test -q` and release build passed. Individual SF=10 samples: Q05 Dodam `~278.3ms` vs DuckDB `~296.0ms`, Q07 Dodam `~307.6ms` vs DuckDB `~314.0ms`, Q08 Dodam `~371.6ms` vs DuckDB `~399.0ms`.
