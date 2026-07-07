@@ -88,6 +88,13 @@ pub(crate) enum I32VectorView<'a> {
 }
 
 impl<'a> I32VectorView<'a> {
+    pub(crate) fn is_null(&self, row: usize) -> bool {
+        match self {
+            Self::Arrow(values) => values.is_null(row),
+            Self::Raw(_) => false,
+        }
+    }
+
     pub(crate) fn value(&self, row: usize) -> i32 {
         match self {
             Self::Arrow(values) => values.value(row),
@@ -382,12 +389,6 @@ impl<'a> BatchView<'a> {
                 _ => None,
             },
         }
-    }
-
-    pub(crate) fn required_i32(&self, index: usize) -> Result<&'a Int32Array> {
-        self.i32(index).ok_or_else(|| {
-            DodamError::UnsupportedSql(format!("projected column {index} is not Int32"))
-        })
     }
 
     pub(crate) fn date32(&self, index: usize) -> Option<&'a Date32Array> {

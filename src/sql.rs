@@ -8538,12 +8538,12 @@ fn q11_late_build_suppkey_selection_view(
     state: &mut Q11LateStockState,
 ) -> Result<Option<()>> {
     if view.num_columns() == 1 {
-        let Some(suppkeys) = view.i64(0) else {
+        let Some(suppkeys) = view.i64_vector(0) else {
             return Ok(None);
         };
         let dense_supplier_keys = state.supplier_keys.dense_contains_slice();
-        if suppkeys.null_count() == 0 {
-            for &suppkey in suppkeys.values() {
+        if let Some(suppkey_values) = suppkeys.values_if_null_free() {
+            for &suppkey in suppkey_values {
                 selection.push(adaptive_i64_set_contains_cached(
                     &state.supplier_keys,
                     dense_supplier_keys,
@@ -8553,7 +8553,7 @@ fn q11_late_build_suppkey_selection_view(
             return Ok(Some(()));
         }
         for row in 0..suppkeys.len() {
-            let selected = suppkeys.is_valid(row)
+            let selected = !suppkeys.is_null(row)
                 && adaptive_i64_set_contains_cached(
                     &state.supplier_keys,
                     dense_supplier_keys,
@@ -8604,17 +8604,54 @@ fn q11_late_consume_stock_payload_view(
     state: &mut Q11LateStockState,
 ) -> Result<Option<()>> {
     if view.num_columns() == 3
-        && let Ok(partkeys) = view.required_i64(0)
-        && let Some(supplycosts) = decimal_input(view.column(1)?)?
-        && let Ok(availqtys) = view.required_i32(2)
+        && let (Some(partkeys), Some(supplycosts), Some(availqtys)) = (
+            view.i64_vector(0),
+            view.decimal128_vector(1),
+            view.i32_vector(2),
+        )
     {
-        q11_late_consume_stock_payload_typed(partkeys, supplycosts, availqtys, state);
+        q11_late_consume_stock_payload_vector_typed(partkeys, supplycosts, availqtys, state);
         return Ok(Some(()));
     }
     let Some(batch) = view.try_record_batch() else {
         return Ok(None);
     };
     q11_late_consume_stock_payload_batch(batch.clone(), state)
+}
+
+fn q11_late_consume_stock_payload_vector_typed(
+    partkeys: I64VectorView<'_>,
+    supplycosts: Decimal128VectorView<'_>,
+    availqtys: I32VectorView<'_>,
+    state: &mut Q11LateStockState,
+) {
+    let supplycost_values = supplycosts.raw_values();
+    let supplycost_scale = supplycosts.scale();
+    if let (Some(partkey_values), Some(availqty_values)) = (
+        partkeys.values_if_null_free(),
+        availqtys.values_if_null_free(),
+    ) && supplycosts.null_count() == 0
+    {
+        for ((&partkey, &supplycost), &availqty) in partkey_values
+            .iter()
+            .zip(supplycost_values)
+            .zip(availqty_values)
+        {
+            let value = (supplycost as f64 / supplycost_scale) * f64::from(availqty);
+            state.total += value;
+            *state.values.entry(partkey).or_insert(0.0) += value;
+        }
+        return;
+    }
+    for row in 0..partkeys.len() {
+        if partkeys.is_null(row) || supplycosts.is_null(row) || availqtys.is_null(row) {
+            continue;
+        }
+        let value =
+            (supplycost_values[row] as f64 / supplycost_scale) * f64::from(availqtys.value(row));
+        state.total += value;
+        *state.values.entry(partkeys.value(row)).or_insert(0.0) += value;
+    }
 }
 
 fn q11_late_consume_stock_payload_typed(
