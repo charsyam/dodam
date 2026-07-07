@@ -1,6 +1,6 @@
 use arrow::array::{
-    Array, ArrayRef, Date32Array, Decimal128Array, DictionaryArray, Int64Array, LargeStringArray,
-    StringArray,
+    Array, ArrayRef, Date32Array, Decimal128Array, DictionaryArray, Int32Array, Int64Array,
+    LargeStringArray, StringArray,
 };
 use arrow::datatypes::Int32Type;
 use arrow::record_batch::RecordBatch;
@@ -64,6 +64,13 @@ impl<'a> BatchView<'a> {
             BatchViewInner::RawColumns(_) => {
                 panic!("raw vector BatchView does not expose a RecordBatch")
             }
+        }
+    }
+
+    pub(crate) fn try_record_batch(&self) -> Option<&'a RecordBatch> {
+        match self.inner {
+            BatchViewInner::RecordBatch(batch) => Some(batch),
+            BatchViewInner::RawColumns(_) => None,
         }
     }
 
@@ -148,6 +155,16 @@ impl<'a> BatchView<'a> {
     pub(crate) fn required_i64(&self, index: usize) -> Result<&'a Int64Array> {
         self.i64(index).ok_or_else(|| {
             DodamError::UnsupportedSql(format!("projected column {index} is not Int64"))
+        })
+    }
+
+    pub(crate) fn i32(&self, index: usize) -> Option<&'a Int32Array> {
+        self.downcast(index)
+    }
+
+    pub(crate) fn required_i32(&self, index: usize) -> Result<&'a Int32Array> {
+        self.i32(index).ok_or_else(|| {
+            DodamError::UnsupportedSql(format!("projected column {index} is not Int32"))
         })
     }
 

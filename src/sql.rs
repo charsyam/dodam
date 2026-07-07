@@ -8052,7 +8052,10 @@ fn q11_late_build_suppkey_selection_view(
         }
         return Ok(Some(()));
     }
-    q11_late_build_suppkey_selection_batch(view.record_batch().clone(), selection, state)
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    q11_late_build_suppkey_selection_batch(batch.clone(), selection, state)
 }
 
 fn q11_late_consume_stock_payload_batch(
@@ -8092,12 +8095,15 @@ fn q11_late_consume_stock_payload_view(
     if view.num_columns() == 3
         && let Ok(partkeys) = view.required_i64(0)
         && let Some(supplycosts) = decimal_input(view.column(1)?)?
-        && let Some(availqtys) = view.column(2)?.as_any().downcast_ref::<Int32Array>()
+        && let Ok(availqtys) = view.required_i32(2)
     {
         q11_late_consume_stock_payload_typed(partkeys, supplycosts, availqtys, state);
         return Ok(Some(()));
     }
-    q11_late_consume_stock_payload_batch(view.record_batch().clone(), state)
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    q11_late_consume_stock_payload_batch(batch.clone(), state)
 }
 
 fn q11_late_consume_stock_payload_typed(
@@ -9434,22 +9440,64 @@ fn q16_supplier_counts_packed_batch(
 
 #[derive(Clone, Copy)]
 struct Q16SupplierKeyView<'a> {
-    partkeys: &'a Int64Array,
-    suppkeys: &'a Int64Array,
+    partkeys: Q16I64Vector<'a>,
+    suppkeys: Q16I64Vector<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum Q16I64Vector<'a> {
+    Arrow(&'a Int64Array),
+    Raw(&'a [i64]),
+}
+
+impl<'a> Q16I64Vector<'a> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Arrow(values) => values.len(),
+            Self::Raw(values) => values.len(),
+        }
+    }
+
+    fn is_null(&self, row: usize) -> bool {
+        match self {
+            Self::Arrow(values) => values.is_null(row),
+            Self::Raw(_) => false,
+        }
+    }
+
+    fn value(&self, row: usize) -> i64 {
+        match self {
+            Self::Arrow(values) => values.value(row),
+            Self::Raw(values) => values[row],
+        }
+    }
+
+    fn values_if_null_free(&self) -> Option<&'a [i64]> {
+        match self {
+            Self::Arrow(values) => (values.null_count() == 0).then(|| values.values().as_ref()),
+            Self::Raw(values) => Some(values),
+        }
+    }
 }
 
 impl<'a> Q16SupplierKeyView<'a> {
     fn try_new(partkeys: &'a ArrayRef, suppkeys: &'a ArrayRef) -> Option<Self> {
         Some(Self {
-            partkeys: partkeys.as_any().downcast_ref::<Int64Array>()?,
-            suppkeys: suppkeys.as_any().downcast_ref::<Int64Array>()?,
+            partkeys: Q16I64Vector::Arrow(partkeys.as_any().downcast_ref::<Int64Array>()?),
+            suppkeys: Q16I64Vector::Arrow(suppkeys.as_any().downcast_ref::<Int64Array>()?),
         })
     }
 
     fn try_new_view(view: BatchView<'a>) -> Option<Self> {
+        if let (Some(partkeys), Some(suppkeys)) = (view.i64(0), view.i64(1)) {
+            return Some(Self {
+                partkeys: Q16I64Vector::Arrow(partkeys),
+                suppkeys: Q16I64Vector::Arrow(suppkeys),
+            });
+        }
         Some(Self {
-            partkeys: view.i64(0)?,
-            suppkeys: view.i64(1)?,
+            partkeys: Q16I64Vector::Raw(view.raw_i64(0)?),
+            suppkeys: Q16I64Vector::Raw(view.raw_i64(1)?),
         })
     }
 }
@@ -9482,9 +9530,10 @@ fn q16_supplier_counts_packed_typed(
 ) -> bool {
     let partkeys = keys.partkeys;
     let suppkeys = keys.suppkeys;
-    if partkeys.null_count() == 0 && suppkeys.null_count() == 0 {
-        let partkey_values = partkeys.values().as_ref();
-        let suppkey_values = suppkeys.values().as_ref();
+    if let (Some(partkey_values), Some(suppkey_values)) = (
+        partkeys.values_if_null_free(),
+        suppkeys.values_if_null_free(),
+    ) {
         if let (Some((group_values, group_present)), Some(bad_present)) = (
             part_to_group.dense_slices(),
             bad_suppliers.dense_contains_slice(),
@@ -9606,9 +9655,10 @@ fn q16_supplier_counts_bitset_typed(
 ) -> bool {
     let partkeys = keys.partkeys;
     let suppkeys = keys.suppkeys;
-    if partkeys.null_count() == 0 && suppkeys.null_count() == 0 {
-        let partkey_values = partkeys.values().as_ref();
-        let suppkey_values = suppkeys.values().as_ref();
+    if let (Some(partkey_values), Some(suppkey_values)) = (
+        partkeys.values_if_null_free(),
+        suppkeys.values_if_null_free(),
+    ) {
         for row in 0..partkey_values.len() {
             let suppkey = suppkey_values[row];
             if bad_suppliers.contains(suppkey) {
