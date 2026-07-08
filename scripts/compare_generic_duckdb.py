@@ -136,6 +136,26 @@ def generic_queries(data_dir: Path) -> list[GenericQuery]:
             f"SELECT bucket, event_date, coalesce(label, 'missing') AS label_or_missing, count(*), sum(value) FROM '{facts}' WHERE amount < '50.00' GROUP BY bucket, event_date, coalesce(label, 'missing') ORDER BY bucket, event_date, label_or_missing LIMIT 2000",
             f"SELECT bucket, event_date, coalesce(label, 'missing') AS label_or_missing, count(*), sum(value) FROM read_parquet('{facts}') WHERE amount < '50.00' GROUP BY bucket, event_date, coalesce(label, 'missing') ORDER BY bucket, event_date, label_or_missing LIMIT 2000",
         ),
+        GenericQuery(
+            "nullable_key_group",
+            f"SELECT key, count(*), sum(value) FROM '{facts}' GROUP BY key ORDER BY key NULLS FIRST",
+            f"SELECT key, count(*), sum(value) FROM read_parquet('{facts}') GROUP BY key ORDER BY key NULLS FIRST",
+        ),
+        GenericQuery(
+            "string_low_cardinality_group",
+            f"SELECT label, count(*), sum(value) FROM '{facts}' WHERE id < 200000 GROUP BY label ORDER BY label NULLS FIRST",
+            f"SELECT label, count(*), sum(value) FROM read_parquet('{facts}') WHERE id < 200000 GROUP BY label ORDER BY label NULLS FIRST",
+        ),
+        GenericQuery(
+            "three_key_expression_group_no_order",
+            f"SELECT bucket, event_date, coalesce(label, 'missing') AS label_or_missing, count(*), sum(value) FROM '{facts}' WHERE amount < '50.00' GROUP BY bucket, event_date, coalesce(label, 'missing')",
+            f"SELECT bucket, event_date, coalesce(label, 'missing') AS label_or_missing, count(*), sum(value) FROM read_parquet('{facts}') WHERE amount < '50.00' GROUP BY bucket, event_date, coalesce(label, 'missing')",
+        ),
+        GenericQuery(
+            "decimal_date_group_no_order",
+            f"SELECT bucket, count(*), sum(value), min(amount), max(event_date) FROM '{facts}' WHERE amount >= '10.00' AND event_date <= '2024-01-20' GROUP BY bucket",
+            f"SELECT bucket, count(*), sum(value), min(amount), max(event_date) FROM read_parquet('{facts}') WHERE amount >= '10.00' AND event_date <= '2024-01-20' GROUP BY bucket",
+        ),
     ]
 
 

@@ -4007,7 +4007,10 @@ impl DodamEngine {
         if partials.is_empty() {
             return Ok(None);
         }
-        merge_partial_aggregate_metrics(partials, 1, &group_by, &aggregates).map(Some)
+        let started = Instant::now();
+        let metrics = merge_partial_aggregate_metrics(partials, 1, &group_by, &aggregates)?;
+        log_aggregate_profile("fused_parquet_aggregate_merge", &metrics, started.elapsed());
+        Ok(Some(metrics))
     }
 
     async fn try_late_materialized_parquet_aggregate(
@@ -4170,13 +4173,16 @@ impl DodamEngine {
     }
 
     fn execute_aggregate_plan(&self, plan: AggregatePlan) -> Result<AggregateMetrics> {
+        let started = Instant::now();
         let fragment_count = plan.scan.source.fragments.len();
         let stream = self.execute_scan_plan(plan.scan)?;
-        if plan.group_by.is_empty() {
+        let metrics = if plan.group_by.is_empty() {
             collect_aggregates(stream, fragment_count, &plan.aggregates)
         } else {
             collect_grouped_aggregates(stream, fragment_count, &plan.group_by, &plan.aggregates)
-        }
+        }?;
+        log_aggregate_profile("aggregate_plan", &metrics, started.elapsed());
+        Ok(metrics)
     }
 
     pub async fn plan_table_source(&self, path: PathBuf) -> Result<TableScanSource> {
@@ -4574,6 +4580,34 @@ fn late_materialized_aggregate_enabled() -> bool {
     std::env::var("DODAM_ENABLE_LATE_MATERIALIZED_AGGREGATE")
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
+}
+
+fn aggregate_profile_enabled() -> bool {
+    std::env::var("DODAM_AGGREGATE_PROFILE")
+        .or_else(|_| std::env::var("DODAM_GENERIC_PROFILE"))
+        .or_else(|_| std::env::var("DODAM_TPCH_PROFILE"))
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn log_aggregate_profile(label: &str, metrics: &AggregateMetrics, total: Duration) {
+    if !aggregate_profile_enabled() {
+        return;
+    }
+    eprintln!(
+        "[dodam:aggregate-profile] {label}: fragments={} batches={} rows={} groups={} values={} total={:.3} ms aggregate={:.3} ms merge={:.3} ms other={:.3} ms",
+        metrics.fragments,
+        metrics.batches,
+        metrics.rows,
+        metrics.groups.len(),
+        metrics.values.len(),
+        total.as_secs_f64() * 1000.0,
+        nanos_to_millis(metrics.aggregate_nanos),
+        nanos_to_millis(metrics.aggregate_merge_nanos),
+        (total.as_nanos() as f64
+            - (metrics.aggregate_nanos as f64 + metrics.aggregate_merge_nanos as f64))
+            .max(0.0)
+            / 1_000_000.0,
+    );
 }
 
 fn late_materialized_aggregate_row_group_chunk() -> usize {

@@ -1044,6 +1044,16 @@ pub fn merge_partial_aggregate_metrics(
         metrics.groups = groups;
         return Ok(metrics);
     }
+    if can_use_single_key_count_sum_path(group_by, aggregates)
+        && let Some(groups) = merge_single_key_count_sum_partials(&partials, aggregates)?
+    {
+        metrics.aggregate_nanos = partials.iter().fold(0_u64, |nanos, partial| {
+            nanos.saturating_add(partial.aggregate_nanos)
+        });
+        metrics.aggregate_merge_nanos = elapsed_nanos(merge_started);
+        metrics.groups = groups;
+        return Ok(metrics);
+    }
     let mut groups = AggregateHashMap::<Vec<GroupValue>, Vec<AggregateResult>>::default();
     for partial in partials {
         metrics.aggregate_nanos = metrics
@@ -1089,6 +1099,8 @@ pub fn collect_partial_aggregate_batch(
     let aggregate_started = Instant::now();
     if group_by.is_empty() {
         metrics.values = GlobalAggregateState::from_batch(batch, aggregates)?.finish()?;
+    } else if can_use_single_key_count_sum_path(group_by, aggregates) {
+        metrics.groups = collect_single_key_count_sum_batch_results(&batch, group_by, aggregates)?;
     } else {
         let groups = collect_grouped_aggregates_batch(batch, group_by, aggregates)?;
         metrics.groups = finish_group_map(groups)?;
@@ -1169,6 +1181,110 @@ fn decimal_min_result_type(value: Option<&AggregateResult>) -> Option<(u8, i8)> 
         return None;
     };
     Some((precision, scale))
+}
+
+fn merge_single_key_count_sum_partials(
+    partials: &[AggregateMetrics],
+    aggregates: &[AggregateExpr],
+) -> Result<Option<Vec<GroupAggregateResult>>> {
+    let mut index = CountSumGroupIndex::Unset;
+    let mut groups = Vec::<CountSumGroup>::new();
+    for partial in partials {
+        for group in &partial.groups {
+            let Some(key) = group.keys.first() else {
+                return Ok(None);
+            };
+            let sum_is_float = matches!(
+                group.values.get(1).map(|value| &value.value),
+                Some(AggregateValue::Float64(_))
+            );
+            let group_id = match key {
+                GroupValue::Utf8(Some(key)) => {
+                    index.ensure_type(&DataType::Utf8);
+                    let CountSumGroupIndex::Utf8 {
+                        groups: key_index, ..
+                    } = &mut index
+                    else {
+                        return Ok(None);
+                    };
+                    if let Some(group_id) = key_index.get(key).copied() {
+                        group_id
+                    } else {
+                        let group_id = groups.len();
+                        key_index.insert(key.clone(), group_id);
+                        groups.push(CountSumGroup::new_for_merge(
+                            GroupValue::Utf8(Some(key.clone())),
+                            sum_is_float,
+                        ));
+                        group_id
+                    }
+                }
+                GroupValue::Utf8(None) => {
+                    index.ensure_type(&DataType::Utf8);
+                    let CountSumGroupIndex::Utf8 { null_group, .. } = &mut index else {
+                        return Ok(None);
+                    };
+                    count_sum_null_group_id_for_merge(
+                        null_group,
+                        &mut groups,
+                        GroupValue::Utf8(None),
+                        sum_is_float,
+                    )
+                }
+                GroupValue::Int64(Some(key)) => {
+                    index.ensure_type(&DataType::Int64);
+                    let CountSumGroupIndex::Int64 {
+                        groups: key_index, ..
+                    } = &mut index
+                    else {
+                        return Ok(None);
+                    };
+                    count_sum_group_id_for_i64_merge(key_index, *key, &mut groups, sum_is_float)
+                }
+                GroupValue::Int64(None) => {
+                    index.ensure_type(&DataType::Int64);
+                    let CountSumGroupIndex::Int64 { null_group, .. } = &mut index else {
+                        return Ok(None);
+                    };
+                    count_sum_null_group_id_for_merge(
+                        null_group,
+                        &mut groups,
+                        GroupValue::Int64(None),
+                        sum_is_float,
+                    )
+                }
+                GroupValue::UInt64(Some(key)) => {
+                    index.ensure_type(&DataType::UInt64);
+                    let CountSumGroupIndex::UInt64 {
+                        groups: key_index, ..
+                    } = &mut index
+                    else {
+                        return Ok(None);
+                    };
+                    count_sum_group_id_for_u64_merge(key_index, *key, &mut groups, sum_is_float)
+                }
+                GroupValue::UInt64(None) => {
+                    index.ensure_type(&DataType::UInt64);
+                    let CountSumGroupIndex::UInt64 { null_group, .. } = &mut index else {
+                        return Ok(None);
+                    };
+                    count_sum_null_group_id_for_merge(
+                        null_group,
+                        &mut groups,
+                        GroupValue::UInt64(None),
+                        sum_is_float,
+                    )
+                }
+                _ => return Ok(None),
+            };
+            groups[group_id].merge_partial_values(&group.values)?;
+        }
+    }
+    Ok(Some(finish_count_sum_groups(
+        index,
+        groups,
+        aggregates[1].clone(),
+    )))
 }
 
 pub fn aggregate_metrics_to_batches(
@@ -2604,9 +2720,6 @@ fn collect_single_key_count_sum_groups(
     group_by: &[String],
     aggregates: &[AggregateExpr],
 ) -> Result<AggregateMetrics> {
-    let AggregateExpr::Sum(sum_column) = &aggregates[1] else {
-        unreachable!("count/sum fast path precondition");
-    };
     let sum_expr = aggregates[1].clone();
     let mut group_index = CountSumGroupIndex::Unset;
     let mut groups = Vec::<CountSumGroup>::new();
@@ -2623,11 +2736,13 @@ fn collect_single_key_count_sum_groups(
         metrics.batches += 1;
         metrics.rows += batch.num_rows();
 
-        let key_column = batch.column(column_index(&batch, &group_by[0])?);
-        if !matches!(
-            key_column.data_type(),
-            DataType::Utf8 | DataType::Int32 | DataType::Int64 | DataType::UInt64
-        ) {
+        if !update_single_key_count_sum_groups(
+            &batch,
+            group_by,
+            aggregates,
+            &mut group_index,
+            &mut groups,
+        )? {
             return collect_grouped_aggregates_generic(
                 stream,
                 fragments,
@@ -2637,23 +2752,61 @@ fn collect_single_key_count_sum_groups(
                 Some(metrics),
             );
         }
-        group_index.ensure_type(key_column.data_type());
-        let sum_column = batch.column(column_index(&batch, sum_column)?);
-        let sum_input = CountSumValueInput::new(sum_column, &sum_expr)?;
-
-        for row in 0..batch.num_rows() {
-            let group_id = group_index.group_id(key_column, row, &mut groups, &sum_input)?;
-            groups[group_id].update(&sum_input, row);
-        }
     }
 
-    let mut group_results = groups
-        .into_iter()
-        .map(|group| group.finish(sum_expr.clone()))
-        .collect::<Vec<_>>();
-    group_results.sort_by(|left, right| compare_group_keys(&left.keys, &right.keys));
-    metrics.groups = group_results;
+    metrics.groups = finish_count_sum_groups(group_index, groups, sum_expr);
     Ok(metrics)
+}
+
+fn collect_single_key_count_sum_batch_results(
+    batch: &RecordBatch,
+    group_by: &[String],
+    aggregates: &[AggregateExpr],
+) -> Result<Vec<GroupAggregateResult>> {
+    let AggregateExpr::Sum(_) = &aggregates[1] else {
+        unreachable!("count/sum fast path precondition");
+    };
+    let mut group_index = CountSumGroupIndex::Unset;
+    let mut groups = Vec::<CountSumGroup>::new();
+    if !update_single_key_count_sum_groups(
+        batch,
+        group_by,
+        aggregates,
+        &mut group_index,
+        &mut groups,
+    )? {
+        let groups = collect_grouped_aggregates_batch(batch.clone(), group_by, aggregates)?;
+        return finish_group_map(groups);
+    }
+    Ok(finish_count_sum_groups(
+        group_index,
+        groups,
+        aggregates[1].clone(),
+    ))
+}
+
+fn update_single_key_count_sum_groups(
+    batch: &RecordBatch,
+    group_by: &[String],
+    aggregates: &[AggregateExpr],
+    group_index: &mut CountSumGroupIndex,
+    groups: &mut Vec<CountSumGroup>,
+) -> Result<bool> {
+    let AggregateExpr::Sum(sum_column) = &aggregates[1] else {
+        unreachable!("count/sum fast path precondition");
+    };
+    let key_column = batch.column(column_index(batch, &group_by[0])?);
+    if !matches!(
+        key_column.data_type(),
+        DataType::Utf8 | DataType::Int32 | DataType::Int64 | DataType::UInt64
+    ) {
+        return Ok(false);
+    }
+    group_index.ensure_type(key_column.data_type());
+    let sum_expr = aggregates[1].clone();
+    let sum_column = batch.column(column_index(batch, sum_column)?);
+    let sum_input = CountSumValueInput::new(sum_column, &sum_expr)?;
+    group_index.update_batch(key_column, groups, &sum_input)
 }
 
 enum CountSumValueInput<'a> {
@@ -2699,15 +2852,15 @@ enum CountSumGroupIndex {
         null_group: Option<usize>,
     },
     Int32 {
-        groups: AggregateHashMap<i32, usize>,
+        groups: AdaptiveCopyGroupIndex<i32>,
         null_group: Option<usize>,
     },
     Int64 {
-        groups: AggregateHashMap<i64, usize>,
+        groups: AdaptiveCopyGroupIndex<i64>,
         null_group: Option<usize>,
     },
     UInt64 {
-        groups: AggregateHashMap<u64, usize>,
+        groups: AdaptiveCopyGroupIndex<u64>,
         null_group: Option<usize>,
     },
 }
@@ -2723,126 +2876,170 @@ impl CountSumGroupIndex {
                 null_group: None,
             },
             DataType::Int32 => Self::Int32 {
-                groups: AggregateHashMap::default(),
+                groups: AdaptiveCopyGroupIndex::default(),
                 null_group: None,
             },
             DataType::Int64 => Self::Int64 {
-                groups: AggregateHashMap::default(),
+                groups: AdaptiveCopyGroupIndex::default(),
                 null_group: None,
             },
             DataType::UInt64 => Self::UInt64 {
-                groups: AggregateHashMap::default(),
+                groups: AdaptiveCopyGroupIndex::default(),
                 null_group: None,
             },
             _ => unreachable!("count/sum fast path key type precondition"),
         };
     }
 
-    fn group_id(
+    fn update_batch(
         &mut self,
         key_column: &ArrayRef,
-        row: usize,
         groups_out: &mut Vec<CountSumGroup>,
         sum_input: &CountSumValueInput<'_>,
-    ) -> Result<usize> {
+    ) -> Result<bool> {
         match self {
             Self::Utf8 { groups, null_group } => {
                 let values = key_column
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .expect("Utf8 group key");
-                if values.is_null(row) {
-                    return Ok(count_sum_null_group_id(
-                        null_group,
-                        groups_out,
-                        GroupValue::Utf8(None),
-                        sum_input,
-                    ));
+                for row in 0..values.len() {
+                    let group_id = if values.is_null(row) {
+                        count_sum_null_group_id(
+                            null_group,
+                            groups_out,
+                            GroupValue::Utf8(None),
+                            sum_input,
+                        )
+                    } else {
+                        let key = values.value(row);
+                        if let Some(group_id) = groups.get(key).copied() {
+                            group_id
+                        } else {
+                            let group_id = groups_out.len();
+                            groups.insert(key.to_string(), group_id);
+                            groups_out.push(CountSumGroup::new(
+                                GroupValue::Utf8(Some(key.to_string())),
+                                sum_input,
+                            ));
+                            group_id
+                        }
+                    };
+                    groups_out[group_id].update(sum_input, row);
                 }
-                let key = values.value(row);
-                if let Some(group_id) = groups.get(key).copied() {
-                    return Ok(group_id);
-                }
-                let group_id = groups_out.len();
-                groups.insert(key.to_string(), group_id);
-                groups_out.push(CountSumGroup::new(
-                    GroupValue::Utf8(Some(key.to_string())),
-                    sum_input,
-                ));
-                Ok(group_id)
+                Ok(true)
             }
             Self::Int32 { groups, null_group } => {
                 let values = key_column
                     .as_any()
                     .downcast_ref::<Int32Array>()
                     .expect("Int32 group key");
-                if values.is_null(row) {
-                    return Ok(count_sum_null_group_id(
-                        null_group,
-                        groups_out,
-                        GroupValue::Int64(None),
-                        sum_input,
-                    ));
+                for row in 0..values.len() {
+                    let group_id = if values.is_null(row) {
+                        count_sum_null_group_id(
+                            null_group,
+                            groups_out,
+                            GroupValue::Int64(None),
+                            sum_input,
+                        )
+                    } else {
+                        count_sum_group_id_for_i32(groups, values.value(row), groups_out, sum_input)
+                    };
+                    groups_out[group_id].update(sum_input, row);
                 }
-                let key = values.value(row);
-                if let Some(group_id) = groups.get(&key).copied() {
-                    return Ok(group_id);
-                }
-                let group_id = groups_out.len();
-                groups.insert(key, group_id);
-                groups_out.push(CountSumGroup::new(
-                    GroupValue::Int64(Some(i64::from(key))),
-                    sum_input,
-                ));
-                Ok(group_id)
+                Ok(true)
             }
             Self::Int64 { groups, null_group } => {
                 let values = key_column
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .expect("Int64 group key");
-                if values.is_null(row) {
-                    return Ok(count_sum_null_group_id(
-                        null_group,
-                        groups_out,
-                        GroupValue::Int64(None),
-                        sum_input,
-                    ));
+                for row in 0..values.len() {
+                    let group_id = if values.is_null(row) {
+                        count_sum_null_group_id(
+                            null_group,
+                            groups_out,
+                            GroupValue::Int64(None),
+                            sum_input,
+                        )
+                    } else {
+                        count_sum_group_id_for_i64(groups, values.value(row), groups_out, sum_input)
+                    };
+                    groups_out[group_id].update(sum_input, row);
                 }
-                let key = values.value(row);
-                if let Some(group_id) = groups.get(&key).copied() {
-                    return Ok(group_id);
-                }
-                let group_id = groups_out.len();
-                groups.insert(key, group_id);
-                groups_out.push(CountSumGroup::new(GroupValue::Int64(Some(key)), sum_input));
-                Ok(group_id)
+                Ok(true)
             }
             Self::UInt64 { groups, null_group } => {
                 let values = key_column
                     .as_any()
                     .downcast_ref::<UInt64Array>()
                     .expect("UInt64 group key");
-                if values.is_null(row) {
-                    return Ok(count_sum_null_group_id(
-                        null_group,
-                        groups_out,
-                        GroupValue::UInt64(None),
-                        sum_input,
-                    ));
+                for row in 0..values.len() {
+                    let group_id = if values.is_null(row) {
+                        count_sum_null_group_id(
+                            null_group,
+                            groups_out,
+                            GroupValue::UInt64(None),
+                            sum_input,
+                        )
+                    } else {
+                        count_sum_group_id_for_u64(groups, values.value(row), groups_out, sum_input)
+                    };
+                    groups_out[group_id].update(sum_input, row);
                 }
-                let key = values.value(row);
-                if let Some(group_id) = groups.get(&key).copied() {
-                    return Ok(group_id);
-                }
-                let group_id = groups_out.len();
-                groups.insert(key, group_id);
-                groups_out.push(CountSumGroup::new(GroupValue::UInt64(Some(key)), sum_input));
-                Ok(group_id)
+                Ok(true)
             }
             Self::Unset => unreachable!("group index type should be initialized"),
         }
     }
+}
+
+fn count_sum_group_id_for_i32(
+    index: &mut AdaptiveCopyGroupIndex<i32>,
+    key: i32,
+    groups: &mut Vec<CountSumGroup>,
+    sum_input: &CountSumValueInput<'_>,
+) -> usize {
+    if let Some(group_id) = index.get(key) {
+        return group_id;
+    }
+    let group_id = groups.len();
+    index.insert(key, group_id);
+    groups.push(CountSumGroup::new(
+        GroupValue::Int64(Some(i64::from(key))),
+        sum_input,
+    ));
+    group_id
+}
+
+fn count_sum_group_id_for_i64(
+    index: &mut AdaptiveCopyGroupIndex<i64>,
+    key: i64,
+    groups: &mut Vec<CountSumGroup>,
+    sum_input: &CountSumValueInput<'_>,
+) -> usize {
+    if let Some(group_id) = index.get(key) {
+        return group_id;
+    }
+    let group_id = groups.len();
+    index.insert(key, group_id);
+    groups.push(CountSumGroup::new(GroupValue::Int64(Some(key)), sum_input));
+    group_id
+}
+
+fn count_sum_group_id_for_u64(
+    index: &mut AdaptiveCopyGroupIndex<u64>,
+    key: u64,
+    groups: &mut Vec<CountSumGroup>,
+    sum_input: &CountSumValueInput<'_>,
+) -> usize {
+    if let Some(group_id) = index.get(key) {
+        return group_id;
+    }
+    let group_id = groups.len();
+    index.insert(key, group_id);
+    groups.push(CountSumGroup::new(GroupValue::UInt64(Some(key)), sum_input));
+    group_id
 }
 
 fn count_sum_null_group_id(
@@ -2857,6 +3054,57 @@ fn count_sum_null_group_id(
     let group_id = groups.len();
     groups.push(CountSumGroup::new(key, sum_input));
     *null_group = Some(group_id);
+    group_id
+}
+
+fn count_sum_null_group_id_for_merge(
+    null_group: &mut Option<usize>,
+    groups: &mut Vec<CountSumGroup>,
+    key: GroupValue,
+    sum_is_float: bool,
+) -> usize {
+    if let Some(group_id) = *null_group {
+        return group_id;
+    }
+    let group_id = groups.len();
+    groups.push(CountSumGroup::new_for_merge(key, sum_is_float));
+    *null_group = Some(group_id);
+    group_id
+}
+
+fn count_sum_group_id_for_i64_merge(
+    index: &mut AdaptiveCopyGroupIndex<i64>,
+    key: i64,
+    groups: &mut Vec<CountSumGroup>,
+    sum_is_float: bool,
+) -> usize {
+    if let Some(group_id) = index.get(key) {
+        return group_id;
+    }
+    let group_id = groups.len();
+    index.insert(key, group_id);
+    groups.push(CountSumGroup::new_for_merge(
+        GroupValue::Int64(Some(key)),
+        sum_is_float,
+    ));
+    group_id
+}
+
+fn count_sum_group_id_for_u64_merge(
+    index: &mut AdaptiveCopyGroupIndex<u64>,
+    key: u64,
+    groups: &mut Vec<CountSumGroup>,
+    sum_is_float: bool,
+) -> usize {
+    if let Some(group_id) = index.get(key) {
+        return group_id;
+    }
+    let group_id = groups.len();
+    index.insert(key, group_id);
+    groups.push(CountSumGroup::new_for_merge(
+        GroupValue::UInt64(Some(key)),
+        sum_is_float,
+    ));
     group_id
 }
 
@@ -2881,6 +3129,17 @@ impl CountSumGroup {
         }
     }
 
+    fn new_for_merge(key: GroupValue, sum_is_float: bool) -> Self {
+        Self {
+            key,
+            count: 0,
+            sum_i64: 0,
+            sum_f64: 0.0,
+            sum_is_float,
+            sum_count: 0,
+        }
+    }
+
     fn update(&mut self, sum_input: &CountSumValueInput<'_>, row: usize) {
         self.count += 1;
         match sum_input {
@@ -2898,6 +3157,34 @@ impl CountSumGroup {
             }
             _ => {}
         }
+    }
+
+    fn merge_partial_values(&mut self, values: &[AggregateResult]) -> Result<()> {
+        let Some(AggregateResult {
+            value: AggregateValue::Count(count),
+            ..
+        }) = values.first()
+        else {
+            return Ok(());
+        };
+        self.count = self.count.saturating_add(*count);
+        match values.get(1).map(|value| &value.value) {
+            Some(AggregateValue::Int64(Some(value))) => {
+                self.sum_i64 = self.sum_i64.saturating_add(*value);
+                self.sum_count += 1;
+            }
+            Some(AggregateValue::Float64(Some(value))) => {
+                self.sum_f64 += *value;
+                self.sum_count += 1;
+            }
+            Some(AggregateValue::Int64(None) | AggregateValue::Float64(None)) | None => {}
+            _ => {
+                return Err(DodamError::UnsupportedSql(
+                    "partial count/sum aggregate type mismatch".to_string(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn finish(self, sum_expr: AggregateExpr) -> GroupAggregateResult {
@@ -2926,6 +3213,62 @@ impl CountSumGroup {
             ],
         }
     }
+}
+
+fn finish_count_sum_groups(
+    group_index: CountSumGroupIndex,
+    groups: Vec<CountSumGroup>,
+    sum_expr: AggregateExpr,
+) -> Vec<GroupAggregateResult> {
+    match group_index {
+        CountSumGroupIndex::Int32 {
+            groups: index,
+            null_group,
+        } => finish_ordered_count_sum_groups(index.iter(), null_group, groups, sum_expr),
+        CountSumGroupIndex::Int64 {
+            groups: index,
+            null_group,
+        } => finish_ordered_count_sum_groups(index.iter(), null_group, groups, sum_expr),
+        CountSumGroupIndex::UInt64 {
+            groups: index,
+            null_group,
+        } => finish_ordered_count_sum_groups(index.iter(), null_group, groups, sum_expr),
+        _ => {
+            let mut group_results = groups
+                .into_iter()
+                .map(|group| group.finish(sum_expr.clone()))
+                .collect::<Vec<_>>();
+            group_results.sort_by(|left, right| compare_group_keys(&left.keys, &right.keys));
+            group_results
+        }
+    }
+}
+
+fn finish_ordered_count_sum_groups<K, I>(
+    index: I,
+    null_group: Option<usize>,
+    groups: Vec<CountSumGroup>,
+    sum_expr: AggregateExpr,
+) -> Vec<GroupAggregateResult>
+where
+    K: Copy + Ord,
+    I: Iterator<Item = (K, usize)>,
+{
+    let mut groups = groups.into_iter().map(Some).collect::<Vec<_>>();
+    let mut entries = index.collect::<Vec<_>>();
+    entries.sort_by_key(|(key, _)| *key);
+    let mut results = Vec::with_capacity(entries.len() + usize::from(null_group.is_some()));
+    if let Some(group_id) = null_group
+        && let Some(group) = groups.get_mut(group_id).and_then(Option::take)
+    {
+        results.push(group.finish(sum_expr.clone()));
+    }
+    for (_, group_id) in entries {
+        if let Some(group) = groups.get_mut(group_id).and_then(Option::take) {
+            results.push(group.finish(sum_expr.clone()));
+        }
+    }
+    results
 }
 
 fn collect_grouped_aggregates_generic(
