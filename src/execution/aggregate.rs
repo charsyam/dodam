@@ -373,12 +373,7 @@ fn collect_coalesce_key_count_sum_groups(
                 reader.dense_leading_range(batch.num_rows()),
             )
         });
-        for row in 0..batch.num_rows() {
-            groups.update(
-                reader.key(row, plan.fallback.as_str()),
-                reader.sum_value(row),
-            );
-        }
+        reader.update_groups(groups, batch.num_rows(), plan.fallback.as_str());
     }
     metrics.groups = groups
         .map(|groups| groups.finish(aggregates))
@@ -514,6 +509,51 @@ impl<'a> CoalesceKeyCountSumReader<'a> {
             | Self::TwoInt64 { sum, .. }
             | Self::ThreeInt32Date { sum, .. }
             | Self::ThreeInt64Date { sum, .. } => sum.value(row),
+        }
+    }
+
+    fn update_groups(
+        &self,
+        groups: &mut CoalesceKeyCountSumGroups,
+        row_count: usize,
+        fallback: &'a str,
+    ) {
+        match self {
+            Self::ThreeInt32Date {
+                first,
+                second,
+                coalesce,
+                sum,
+            } if first.null_count() == 0 && second.null_count() == 0 => {
+                for row in 0..row_count {
+                    groups.update_three_non_null(
+                        i64::from(first.value(row)),
+                        second.value(row),
+                        coalesce_key(coalesce, row, fallback).expect("coalesce key is non-null"),
+                        sum.value(row),
+                    );
+                }
+            }
+            Self::ThreeInt64Date {
+                first,
+                second,
+                coalesce,
+                sum,
+            } if first.null_count() == 0 && second.null_count() == 0 => {
+                for row in 0..row_count {
+                    groups.update_three_non_null(
+                        first.value(row),
+                        second.value(row),
+                        coalesce_key(coalesce, row, fallback).expect("coalesce key is non-null"),
+                        sum.value(row),
+                    );
+                }
+            }
+            _ => {
+                for row in 0..row_count {
+                    groups.update(self.key(row, fallback), self.sum_value(row));
+                }
+            }
         }
     }
 
@@ -681,6 +721,34 @@ impl CoalesceKeyCountSumGroups {
         self.groups[group_id].update(sum);
     }
 
+    fn update_three_non_null(&mut self, first: i64, second: i32, third: &str, sum: Option<i64>) {
+        let string_id = if let Some(string_id) = self.third_string_ids.get(third).copied() {
+            string_id
+        } else {
+            let string_id =
+                u32::try_from(self.third_strings.len()).expect("too many string groups");
+            self.third_string_ids.insert(third.to_string(), string_id);
+            self.third_strings.push(third.to_string());
+            string_id
+        };
+        let third_index = self.index.third_groups_three_non_null(first, second);
+        let group_id = if let Some(group_id) = third_index.non_null.get(string_id) {
+            group_id
+        } else {
+            let group_id = self.groups.len();
+            third_index.non_null.insert(string_id, group_id);
+            self.groups
+                .push(CoalesceKeyCountSumGroup::new(coalesce_group_values(
+                    self.key_len,
+                    Some(first),
+                    Some(second),
+                    Some(self.third_strings[string_id as usize].clone()),
+                )));
+            group_id
+        };
+        self.groups[group_id].update(sum);
+    }
+
     fn finish(self, aggregates: &[AggregateExpr]) -> Vec<GroupAggregateResult> {
         let mut groups = self
             .groups
@@ -752,6 +820,32 @@ impl CoalesceLeadingIndex {
                     .or_default()
                     .index
                     .entry(second)
+                    .or_default()
+            }
+        }
+    }
+
+    fn third_groups_three_non_null(&mut self, first: i64, second: i32) -> &mut CoalesceThirdGroups {
+        match self {
+            Self::Hash(index) => index
+                .entry(Some(first))
+                .or_default()
+                .index
+                .entry(Some(second))
+                .or_default(),
+            Self::DenseThree {
+                range,
+                slots,
+                fallback,
+            } => {
+                if let Some(slot) = dense_leading_slot(*range, first, second) {
+                    return &mut slots[slot];
+                }
+                fallback
+                    .entry(Some(first))
+                    .or_default()
+                    .index
+                    .entry(Some(second))
                     .or_default()
             }
         }
