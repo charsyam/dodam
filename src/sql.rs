@@ -357,7 +357,7 @@ pub async fn execute_sql(
             &join.right_alias,
             &join.right_keys,
         );
-        let output_projection = pushed_join_output_projection(&query);
+        let output_projection = pushed_join_output_projection(&query)?;
         let output_projection_pushed = !matches!(output_projection, Projection::All);
         let stream = engine
             .join_parquet_batches(JoinParquetRequest {
@@ -429,8 +429,12 @@ pub async fn execute_sql(
             )?;
         }
         if projection_requires_expression {
-            batches = apply_output_expression_projection(batches, &query.expressions)?;
-            batches = apply_output_order_limit(batches, query.order_by.as_ref(), query.limit)?;
+            batches = apply_output_expression_projection_order_limit(
+                batches,
+                &query.expressions,
+                query.order_by.as_ref(),
+                query.limit,
+            )?;
         } else {
             batches = apply_output_order_limit(batches, query.order_by.as_ref(), query.limit)?;
             if !output_projection_pushed {
@@ -30459,7 +30463,12 @@ async fn try_execute_with_cte_sql(
     let projection_requires_expression =
         projection_requires_expression_path(&projection.expressions);
     batches = if projection_requires_expression {
-        apply_output_expression_projection(batches, &projection.expressions)?
+        apply_output_expression_projection_order_limit(
+            batches,
+            &projection.expressions,
+            order_by.as_ref(),
+            limit,
+        )?
     } else {
         apply_output_projection(batches, &projection.projection)?
     };
@@ -30468,7 +30477,9 @@ async fn try_execute_with_cte_sql(
             Box::new(DistinctExec::new(Box::new(MemoryExec::new(batches)))).execute()?,
         )?;
     }
-    batches = apply_output_order_limit(batches, order_by.as_ref(), limit)?;
+    if !projection_requires_expression {
+        batches = apply_output_order_limit(batches, order_by.as_ref(), limit)?;
+    }
     if !projection_requires_expression {
         batches = rename_output_batches(batches, &projection.aliases)?;
     }
@@ -30714,7 +30725,12 @@ async fn try_execute_derived_join_sql(
     let projection_requires_expression =
         projection_requires_expression_path(&projection.expressions);
     batches = if projection_requires_expression {
-        apply_output_expression_projection(batches, &projection.expressions)?
+        apply_output_expression_projection_order_limit(
+            batches,
+            &projection.expressions,
+            order_by.as_ref(),
+            limit,
+        )?
     } else {
         apply_output_projection(batches, &projection.projection)?
     };
@@ -30723,7 +30739,9 @@ async fn try_execute_derived_join_sql(
             Box::new(DistinctExec::new(Box::new(MemoryExec::new(batches)))).execute()?,
         )?;
     }
-    batches = apply_output_order_limit(batches, order_by.as_ref(), limit)?;
+    if !projection_requires_expression {
+        batches = apply_output_order_limit(batches, order_by.as_ref(), limit)?;
+    }
     if !projection_requires_expression {
         batches = rename_output_batches(batches, &projection.aliases)?;
     }
@@ -30813,7 +30831,7 @@ async fn execute_parsed_join_query(
         &join.right_alias,
         &join.right_keys,
     );
-    let output_projection = pushed_join_output_projection(&query);
+    let output_projection = pushed_join_output_projection(&query)?;
     let output_projection_pushed = !matches!(output_projection, Projection::All);
     let stream = engine
         .join_parquet_batches(JoinParquetRequest {
@@ -30884,8 +30902,12 @@ async fn execute_parsed_join_query(
     }
     let projection_requires_expression = projection_requires_expression_path(&query.expressions);
     if projection_requires_expression {
-        batches = apply_output_expression_projection(batches, &query.expressions)?;
-        batches = apply_output_order_limit(batches, query.order_by.as_ref(), query.limit)?;
+        batches = apply_output_expression_projection_order_limit(
+            batches,
+            &query.expressions,
+            query.order_by.as_ref(),
+            query.limit,
+        )?;
     } else {
         batches = apply_output_order_limit(batches, query.order_by.as_ref(), query.limit)?;
         if !output_projection_pushed {
@@ -32302,7 +32324,12 @@ async fn try_execute_multi_comma_join_sql(
     let projection_requires_expression =
         projection_requires_expression_path(&projection.expressions);
     batches = if projection_requires_expression {
-        apply_output_expression_projection(batches, &projection.expressions)?
+        apply_output_expression_projection_order_limit(
+            batches,
+            &projection.expressions,
+            order_by.as_ref(),
+            limit,
+        )?
     } else {
         apply_output_projection(batches, &projection.projection)?
     };
@@ -32311,7 +32338,9 @@ async fn try_execute_multi_comma_join_sql(
             Box::new(DistinctExec::new(Box::new(MemoryExec::new(batches)))).execute()?,
         )?;
     }
-    batches = apply_output_order_limit(batches, order_by.as_ref(), limit)?;
+    if !projection_requires_expression {
+        batches = apply_output_order_limit(batches, order_by.as_ref(), limit)?;
+    }
     if !projection_requires_expression {
         batches = rename_output_batches(batches, &projection.aliases)?;
     }
@@ -33394,7 +33423,7 @@ fn direct_join_sink_request(
         &join.right_alias,
         &join.right_keys,
     );
-    let output_projection = pushed_join_output_projection(&query);
+    let output_projection = pushed_join_output_projection(&query)?;
     if matches!(output_projection, Projection::All) && !matches!(query.projection, Projection::All)
     {
         return Ok(None);
@@ -33427,7 +33456,15 @@ fn query_allows_direct_join_sink(query: &SqlQuery) -> bool {
         && query.filter.is_none()
         && query.expression_filter.is_none()
         && query.order_by.is_none()
-        && query.aliases.is_empty()
+        && join_aliases_are_implicit_output_names(&query.aliases)
+}
+
+fn join_aliases_are_implicit_output_names(aliases: &[(String, String)]) -> bool {
+    aliases.iter().all(|(source, target)| {
+        source
+            .rsplit_once('.')
+            .is_some_and(|(_, column)| column == target)
+    })
 }
 
 async fn explain_sql(engine: &DodamEngine, sql: &str, batch_size: usize) -> Result<Option<String>> {
@@ -33545,28 +33582,27 @@ async fn explain_query(engine: &DodamEngine, query: SqlQuery, batch_size: usize)
         .await
 }
 
-fn pushed_join_output_projection(query: &SqlQuery) -> Projection {
+fn pushed_join_output_projection(query: &SqlQuery) -> Result<Projection> {
     let Some(join) = &query.join else {
-        return Projection::All;
+        return Ok(Projection::All);
     };
     if !query.aggregate_expressions.is_empty() {
-        return Projection::All;
+        return Ok(Projection::All);
     }
     if query.is_aggregate() {
-        return aggregate_join_output_projection(query);
+        return Ok(aggregate_join_output_projection(query));
     }
     if !matches!(join.join_type, JoinType::Inner | JoinType::Semi) {
-        return Projection::All;
+        return Ok(Projection::All);
     }
-    if projection_requires_expression_path(&query.expressions)
-        || query.expression_filter.is_some()
-        || query.filter.is_some()
-        || query.order_by.is_some()
+    if query.filter.is_some() || query.order_by.is_some() {
+        return Ok(Projection::All);
+    }
+    if projection_requires_expression_path(&query.expressions) || query.expression_filter.is_some()
     {
-        Projection::All
-    } else {
-        query.projection.clone()
+        return join_input_projection_with_expression_filter(query);
     }
+    Ok(query.projection.clone())
 }
 
 fn join_input_projection_with_expression_filter(query: &SqlQuery) -> Result<Projection> {
@@ -34867,16 +34903,19 @@ fn parse_join_projection(
             ) => {
                 if let Some((column, field)) = parse_join_struct_field_access(expr, table_aliases)?
                 {
+                    let output_name = column_output_name(expr);
                     add_column_once(&mut columns, column.clone());
+                    aliases.push((expr.to_string(), output_name.clone()));
                     expressions.push(ProjectionExpression {
-                        output_name: column_output_name(expr),
+                        output_name,
                         expr: ScalarSqlExpression::StructField { column, field },
                     });
                 } else {
                     let column = join_column_name(expr, table_aliases)?;
+                    let output_name = column_output_name(expr);
                     columns.push(column.clone());
                     expressions.push(ProjectionExpression {
-                        output_name: column_output_name(expr),
+                        output_name,
                         expr: ScalarSqlExpression::Column(column),
                     });
                 }
@@ -35145,7 +35184,10 @@ fn parse_join_order_by(
                         .map(Ok)
                         .unwrap_or_else(|| join_column_name(&order.expr, table_aliases))?
                 }
-                SqlExpr::CompoundIdentifier(_) => join_column_name(&order.expr, table_aliases)?,
+                SqlExpr::CompoundIdentifier(_) => alias_target(&order.expr.to_string(), aliases)
+                    .cloned()
+                    .map(Ok)
+                    .unwrap_or_else(|| join_column_name(&order.expr, table_aliases))?,
                 SqlExpr::Function(function) => {
                     if let Some(column) = alias_target(&function.to_string(), aliases).cloned() {
                         column
@@ -38465,6 +38507,34 @@ fn apply_output_order_limit(
     Ok(vec![sort_output_batch(&batch, order_by, limit)?])
 }
 
+fn apply_output_expression_projection_order_limit(
+    mut batches: Vec<RecordBatch>,
+    expressions: &[ProjectionExpression],
+    order_by: Option<&SortKey>,
+    limit: Option<usize>,
+) -> Result<Vec<RecordBatch>> {
+    if sort_key_available_in_batches(&batches, order_by) {
+        batches = apply_output_order_limit(batches, order_by, limit)?;
+        apply_output_expression_projection(batches, expressions)
+    } else {
+        batches = apply_output_expression_projection(batches, expressions)?;
+        apply_output_order_limit(batches, order_by, limit)
+    }
+}
+
+fn sort_key_available_in_batches(batches: &[RecordBatch], order_by: Option<&SortKey>) -> bool {
+    let Some(order_by) = order_by else {
+        return false;
+    };
+    let Some(batch) = batches.first() else {
+        return false;
+    };
+    order_by
+        .expressions
+        .iter()
+        .all(|sort| output_batch_column_index(batch, &sort.column).is_ok())
+}
+
 fn topk_batch_prune_enabled() -> bool {
     std::env::var("DODAM_DISABLE_TOPK_BATCH_PRUNE")
         .map(|value| value != "1" && !value.eq_ignore_ascii_case("true"))
@@ -38769,18 +38839,18 @@ fn apply_output_projection(
         .map(|batch| {
             let indices = columns
                 .iter()
-                .map(|column| {
-                    batch
-                        .schema()
-                        .fields()
-                        .iter()
-                        .position(|field| field.name() == column)
-                        .ok_or_else(|| DodamError::UnknownColumn(column.clone()))
-                })
+                .map(|column| output_batch_column_index(&batch, column))
                 .collect::<Result<Vec<_>>>()?;
             Ok(batch.project(&indices)?)
         })
         .collect()
+}
+
+fn output_batch_column_index(batch: &RecordBatch, column: &str) -> Result<usize> {
+    if let Some(bound) = resolve_batch_column(batch, column)? {
+        return batch_column_index(batch, &bound.physical_name);
+    }
+    Err(DodamError::UnknownColumn(column.to_string()))
 }
 
 fn apply_output_expression_projection(
@@ -39667,12 +39737,7 @@ fn scalar_value_as_timestamp_millis(value: &EvaluatedScalar, row: usize) -> Resu
 }
 
 fn evaluated_column(batch: &RecordBatch, column: &str) -> Result<EvaluatedScalar> {
-    let index = batch
-        .schema()
-        .fields()
-        .iter()
-        .position(|field| field.name() == column)
-        .ok_or_else(|| DodamError::UnknownColumn(column.to_string()))?;
+    let index = output_batch_column_index(batch, column)?;
     let array = batch.column(index);
     match array.data_type() {
         DataType::Int32 => {
@@ -39763,12 +39828,7 @@ fn struct_field_array<'a>(
     column: &str,
     field: &str,
 ) -> Result<&'a dyn Array> {
-    let index = batch
-        .schema()
-        .fields()
-        .iter()
-        .position(|schema_field| schema_field.name() == column)
-        .ok_or_else(|| DodamError::UnknownColumn(column.to_string()))?;
+    let index = output_batch_column_index(batch, column)?;
     let array = batch.column(index);
     let struct_array = array
         .as_any()
@@ -39896,12 +39956,7 @@ fn list_array_column<'a>(
     let array: &'a dyn Array = if let Some(field) = field {
         struct_field_array(batch, column, field)?
     } else {
-        let index = batch
-            .schema()
-            .fields()
-            .iter()
-            .position(|schema_field| schema_field.name() == column)
-            .ok_or_else(|| DodamError::UnknownColumn(column.to_string()))?;
+        let index = output_batch_column_index(batch, column)?;
         batch.column(index).as_ref()
     };
     array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {

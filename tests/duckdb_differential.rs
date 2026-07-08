@@ -1379,22 +1379,24 @@ async fn duckdb_differential_seeded_randomized_join_smoke() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let facts_path = tempdir.path().join("facts.parquet");
     let dim_path = tempdir.path().join("dim.parquet");
+    let nested_path = tempdir.path().join("nested.parquet");
     let multi_left_path = tempdir.path().join("multi-left.parquet");
     let multi_right_path = tempdir.path().join("multi-right.parquet");
     write_facts_parquet(&facts_path);
     write_dim_parquet(&dim_path);
+    write_nested_values_parquet(&nested_path);
     write_multi_left_parquet(&multi_left_path);
     write_multi_right_parquet(&multi_right_path);
 
     const SEED: u64 = 0xD0DA_2026_0002;
     let mut rng = TestRng::new(SEED);
     let cases = (0..72)
-        .map(|case_id| {
-            if rng.chance(2, 3) {
-                random_single_key_join_query(&mut rng, &facts_path, &dim_path, case_id)
-            } else {
+        .map(|case_id| match rng.index(4) {
+            0 | 1 => random_single_key_join_query(&mut rng, &facts_path, &dim_path, case_id),
+            2 => {
                 random_multi_key_join_query(&mut rng, &multi_left_path, &multi_right_path, case_id)
             }
+            _ => random_nested_join_query(&mut rng, &facts_path, &nested_path, case_id),
         })
         .collect::<Vec<_>>();
 
@@ -2248,27 +2250,12 @@ async fn duckdb_differential_nested_struct_field_projection() {
 
     assert_same_as_duckdb(
         &format!(
-            "SELECT n.attrs.label AS label FROM '{}' f JOIN '{}' n ON f.id = n.id WHERE coalesce(n.attrs.label, 'missing') LIKE 'h%' OR n.attrs.label IS NULL ORDER BY label",
+            "SELECT f.id, n.attrs.label AS label FROM '{}' f JOIN '{}' n ON f.id = n.id WHERE coalesce(n.attrs.label, 'missing') LIKE 'h%' OR n.attrs.label IS NULL ORDER BY f.id",
             facts_path.display(),
             input_path.display()
         ),
         &format!(
-            "SELECT n.attrs.label AS label FROM read_parquet('{}') f JOIN read_parquet('{}') n ON f.id = n.id WHERE coalesce(n.attrs.label, 'missing') LIKE 'h%' OR n.attrs.label IS NULL ORDER BY label",
-            facts_path.display(),
-            input_path.display()
-        ),
-        tempdir.path(),
-    )
-    .await;
-
-    assert_same_as_duckdb(
-        &format!(
-            "SELECT n.attrs.rank AS rank FROM '{}' f JOIN '{}' n ON f.id = n.id WHERE CAST(n.attrs.rank AS VARCHAR) IN ('10', '40') OR n.attrs.rank IS NULL ORDER BY rank",
-            facts_path.display(),
-            input_path.display()
-        ),
-        &format!(
-            "SELECT n.attrs.rank AS rank FROM read_parquet('{}') f JOIN read_parquet('{}') n ON f.id = n.id WHERE CAST(n.attrs.rank AS VARCHAR) IN ('10', '40') OR n.attrs.rank IS NULL ORDER BY rank",
+            "SELECT f.id, n.attrs.label AS label FROM read_parquet('{}') f JOIN read_parquet('{}') n ON f.id = n.id WHERE coalesce(n.attrs.label, 'missing') LIKE 'h%' OR n.attrs.label IS NULL ORDER BY f.id",
             facts_path.display(),
             input_path.display()
         ),
@@ -2278,12 +2265,27 @@ async fn duckdb_differential_nested_struct_field_projection() {
 
     assert_same_as_duckdb(
         &format!(
-            "SELECT n.attrs.rank AS rank FROM '{}' f JOIN '{}' n ON f.id = n.id WHERE CASE WHEN f.id > 0 THEN n.attrs.rank ELSE 0 END >= 30 ORDER BY rank",
+            "SELECT f.id, n.id AS nested_id, n.attrs.rank AS rank FROM '{}' f JOIN '{}' n ON f.id = n.id WHERE CAST(n.attrs.rank AS VARCHAR) IN ('10', '40') OR n.attrs.rank IS NULL ORDER BY f.id",
             facts_path.display(),
             input_path.display()
         ),
         &format!(
-            "SELECT n.attrs.rank AS rank FROM read_parquet('{}') f JOIN read_parquet('{}') n ON f.id = n.id WHERE CASE WHEN f.id > 0 THEN n.attrs.rank ELSE 0 END >= 30 ORDER BY rank",
+            "SELECT f.id, n.id AS nested_id, n.attrs.rank AS rank FROM read_parquet('{}') f JOIN read_parquet('{}') n ON f.id = n.id WHERE CAST(n.attrs.rank AS VARCHAR) IN ('10', '40') OR n.attrs.rank IS NULL ORDER BY f.id",
+            facts_path.display(),
+            input_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT f.id, n.attrs.rank AS rank FROM '{}' f JOIN '{}' n ON f.id = n.id WHERE CASE WHEN f.id > 0 THEN n.attrs.rank ELSE 0 END >= 30 ORDER BY f.id",
+            facts_path.display(),
+            input_path.display()
+        ),
+        &format!(
+            "SELECT f.id, n.attrs.rank AS rank FROM read_parquet('{}') f JOIN read_parquet('{}') n ON f.id = n.id WHERE CASE WHEN f.id > 0 THEN n.attrs.rank ELSE 0 END >= 30 ORDER BY f.id",
             facts_path.display(),
             input_path.display()
         ),
@@ -2305,11 +2307,13 @@ async fn duckdb_differential_long_run_seeded_randomized() {
     let facts_path = tempdir.path().join("facts.parquet");
     let dim_path = tempdir.path().join("dim.parquet");
     let types_path = tempdir.path().join("types.parquet");
+    let nested_path = tempdir.path().join("nested.parquet");
     let multi_left_path = tempdir.path().join("multi-left.parquet");
     let multi_right_path = tempdir.path().join("multi-right.parquet");
     write_facts_parquet(&facts_path);
     write_dim_parquet(&dim_path);
     write_types_parquet(&types_path);
+    write_nested_values_parquet(&nested_path);
     write_multi_left_parquet(&multi_left_path);
     write_multi_right_parquet(&multi_right_path);
 
@@ -2322,18 +2326,16 @@ async fn duckdb_differential_long_run_seeded_randomized() {
             let case = match rng.index(3) {
                 0 => random_facts_query(&mut rng, &facts_path, case_id),
                 1 => random_types_query(&mut rng, &types_path, case_id),
-                _ => {
-                    if rng.chance(2, 3) {
-                        random_single_key_join_query(&mut rng, &facts_path, &dim_path, case_id)
-                    } else {
-                        random_multi_key_join_query(
-                            &mut rng,
-                            &multi_left_path,
-                            &multi_right_path,
-                            case_id,
-                        )
-                    }
-                }
+                _ => match rng.index(3) {
+                    0 => random_single_key_join_query(&mut rng, &facts_path, &dim_path, case_id),
+                    1 => random_multi_key_join_query(
+                        &mut rng,
+                        &multi_left_path,
+                        &multi_right_path,
+                        case_id,
+                    ),
+                    _ => random_nested_join_query(&mut rng, &facts_path, &nested_path, case_id),
+                },
             };
             if only_case.is_some_and(|only_case| only_case != case_id) {
                 continue;
@@ -2822,6 +2824,40 @@ fn random_multi_key_join_query(
         ),
         duckdb_sql: format!(
             "SELECT {projection} FROM {duckdb_left} l {join} {duckdb_right} r ON l.k1 = r.k1 AND l.k2 = r.k2 WHERE {predicate}"
+        ),
+    }
+}
+
+fn random_nested_join_query(
+    rng: &mut TestRng,
+    facts_path: &Path,
+    nested_path: &Path,
+    case_id: usize,
+) -> GeneratedSql {
+    let dodam_left = format!("'{}'", facts_path.display());
+    let dodam_right = format!("'{}'", nested_path.display());
+    let duckdb_left = format!("read_parquet('{}')", facts_path.display());
+    let duckdb_right = format!("read_parquet('{}')", nested_path.display());
+    let predicate = rng.choose(&[
+        "n.attrs.more_tags[1] = 9 OR array_length(n.attrs.more_tags) > 1",
+        "coalesce(n.attrs.label, 'missing') LIKE 'h%' OR n.attrs.label IS NULL",
+        "CAST(n.attrs.rank AS VARCHAR) IN ('10', '40') OR n.attrs.rank IS NULL",
+        "CASE WHEN f.id > 0 THEN n.attrs.rank ELSE 0 END >= 30",
+    ]);
+    let projection = rng.choose(&[
+        "f.id, n.attrs.rank AS rank",
+        "f.id, n.id AS nested_id, n.attrs.rank AS rank",
+        "f.id, n.attrs.more_tags[1] AS first_nested_tag",
+        "f.id, array_length(n.attrs.more_tags) AS nested_tag_count",
+        "f.id, coalesce(n.attrs.label, 'missing') AS label_text",
+    ]);
+    GeneratedSql {
+        case_id,
+        dodam_sql: format!(
+            "SELECT {projection} FROM {dodam_left} f JOIN {dodam_right} n ON f.id = n.id WHERE {predicate}"
+        ),
+        duckdb_sql: format!(
+            "SELECT {projection} FROM {duckdb_left} f JOIN {duckdb_right} n ON f.id = n.id WHERE {predicate}"
         ),
     }
 }
