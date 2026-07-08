@@ -912,6 +912,48 @@ async fn duckdb_differential_scalar_where_expressions() {
 }
 
 #[tokio::test]
+async fn duckdb_differential_grouped_coalesce_expression_aggregates() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let facts_path = tempdir.path().join("facts.parquet");
+    let dim_path = tempdir.path().join("dim.parquet");
+    let types_path = tempdir.path().join("types.parquet");
+    write_facts_parquet(&facts_path);
+    write_dim_parquet(&dim_path);
+    write_types_parquet(&types_path);
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, event_date, COALESCE(note, 'missing') AS note_text, count(*), sum(id) FROM '{}' WHERE amount >= '-10.00' GROUP BY id, event_date, COALESCE(note, 'missing') ORDER BY id, event_date, note_text",
+            types_path.display()
+        ),
+        &format!(
+            "SELECT id, event_date, COALESCE(note, 'missing') AS note_text, count(*), sum(id) FROM read_parquet('{}') WHERE amount >= '-10.00' GROUP BY id, event_date, COALESCE(note, 'missing') ORDER BY id, event_date, note_text",
+            types_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT f.key, COALESCE(d.name, 'missing') AS name_text, count(*), sum(f.value) FROM '{}' f JOIN '{}' d ON f.key = d.key GROUP BY f.key, COALESCE(d.name, 'missing') ORDER BY f.key, name_text",
+            facts_path.display(),
+            dim_path.display()
+        ),
+        &format!(
+            "SELECT f.key, COALESCE(d.name, 'missing') AS name_text, count(*), sum(f.value) FROM read_parquet('{}') f JOIN read_parquet('{}') d ON f.key = d.key GROUP BY f.key, COALESCE(d.name, 'missing') ORDER BY f.key, name_text",
+            facts_path.display(),
+            dim_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn duckdb_differential_string_functions_and_case() {
     let Some(_duckdb) = DuckDbGuard::new() else {
         return;

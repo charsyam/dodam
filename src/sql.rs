@@ -398,22 +398,16 @@ pub async fn execute_sql(
                         &[join.left_alias.as_str(), join.right_alias.as_str()],
                     )?))
                     .execute()?
-                } else if query.aggregate_expressions.is_empty() {
-                    stream
-                } else {
-                    append_aggregate_expression_stream(stream, query.aggregate_expressions.clone())
-                };
-            let stream: SendableBatchStream =
-                if query.expression_filter.is_some() && !query.aggregate_expressions.is_empty() {
-                    append_aggregate_expression_stream(stream, query.aggregate_expressions.clone())
                 } else {
                     stream
                 };
-            let metrics = if group_by.is_empty() {
-                collect_aggregates(stream, 2, &aggregates)?
-            } else {
-                collect_grouped_aggregates(stream, 2, &group_by, &aggregates)?
-            };
+            let metrics = collect_aggregates_with_optional_expression_views(
+                stream,
+                2,
+                &group_by,
+                &aggregates,
+                &query.aggregate_expressions,
+            )?;
             let mut batches = aggregate_metrics_to_batches(&metrics, &group_by, &aggregates)?;
             batches = apply_output_filter(batches, query.having.as_ref())?;
             let has_output_expressions = projection_requires_expression_path(&query.expressions);
@@ -40382,24 +40376,46 @@ fn collect_aggregates_with_optional_expression_views(
     aggregates: &[AggregateExpr],
     expressions: &[ProjectionExpression],
 ) -> Result<AggregateMetrics> {
+    let started = generic_profile_start();
     if group_by.is_empty() {
         let stream = append_aggregate_expression_stream(stream, expressions.to_vec());
-        return collect_aggregates(stream, fragments, aggregates);
+        let metrics = collect_aggregates(stream, fragments, aggregates)?;
+        generic_profile_elapsed("aggregate global append/fold", started);
+        return Ok(metrics);
     }
     if CoalesceThreeKeyGroupAggregatePlan::new(group_by, aggregates, expressions).is_some()
         || CoalesceTwoKeyGroupAggregatePlan::new(group_by, aggregates, expressions).is_some()
     {
-        return Ok(collect_grouped_aggregates_with_expression_views(
+        let metrics = collect_grouped_aggregates_with_expression_views(
             stream,
             fragments,
             group_by,
             aggregates,
             expressions,
         )?
-        .expect("expression-view aggregate precondition"));
+        .expect("expression-view aggregate precondition");
+        generic_profile_elapsed("aggregate grouped expression-view", started);
+        return Ok(metrics);
     }
     let stream = append_aggregate_expression_stream(stream, expressions.to_vec());
-    collect_grouped_aggregates(stream, fragments, group_by, aggregates)
+    let metrics = collect_grouped_aggregates(stream, fragments, group_by, aggregates)?;
+    generic_profile_elapsed("aggregate grouped append/fold", started);
+    Ok(metrics)
+}
+
+fn generic_profile_start() -> Option<Instant> {
+    std::env::var("DODAM_GENERIC_PROFILE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .then(Instant::now)
+}
+
+fn generic_profile_elapsed(label: &str, started: Option<Instant>) {
+    if let Some(started) = started {
+        eprintln!(
+            "[dodam:generic-profile] {label}: {:.3} ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
 }
 
 fn collect_grouped_aggregates_with_expression_views(
