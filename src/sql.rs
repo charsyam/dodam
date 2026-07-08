@@ -31433,11 +31433,7 @@ async fn execute_parsed_join_query(
         let stream: SendableBatchStream = if query.aggregate_expressions.is_empty() {
             stream
         } else {
-            let batches = append_aggregate_expression_columns(
-                collect_batches(stream)?,
-                &query.aggregate_expressions,
-            )?;
-            Box::new(MemoryExec::new(batches)).execute()?
+            append_aggregate_expression_stream(stream, query.aggregate_expressions.clone())
         };
         let metrics = if group_by.is_empty() {
             collect_aggregates(stream, 2, &aggregates)?
@@ -39738,6 +39734,9 @@ fn evaluate_scalar_predicate_with_parser(
     predicate: &SqlExpr,
     parser: ScalarPredicateParser<'_>,
 ) -> Result<BooleanArray> {
+    if let Some(mask) = try_evaluate_vector_scalar_predicate(batch, predicate, parser)? {
+        return Ok(mask);
+    }
     match predicate {
         SqlExpr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
             let left = evaluate_scalar_predicate_with_parser(batch, left, parser)?;
@@ -39827,6 +39826,186 @@ fn evaluate_scalar_predicate_with_parser(
             "unsupported {} WHERE predicate: {predicate}",
             parser.unsupported_context()
         ))),
+    }
+}
+
+fn try_evaluate_vector_scalar_predicate(
+    batch: &RecordBatch,
+    predicate: &SqlExpr,
+    parser: ScalarPredicateParser<'_>,
+) -> Result<Option<BooleanArray>> {
+    match predicate {
+        SqlExpr::BinaryOp { left, op, right }
+            if matches!(
+                op,
+                BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+            ) =>
+        {
+            let left = parser.parse(left)?;
+            let right = parser.parse(right)?;
+            if let Some(mask) = vector_list_length_literal_compare(batch, &left, op, &right)? {
+                return Ok(Some(mask));
+            }
+            if let Some(mask) = vector_list_length_literal_compare(
+                batch,
+                &right,
+                &reverse_binary_operator(op),
+                &left,
+            )? {
+                return Ok(Some(mask));
+            }
+            Ok(None)
+        }
+        SqlExpr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let expr = parser.parse(expr)?;
+            let values = list
+                .iter()
+                .map(|expr| parser.parse(expr))
+                .collect::<Result<Vec<_>>>()?;
+            vector_i64_expression_in_list(batch, &expr, &values, *negated)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn reverse_binary_operator(op: &BinaryOperator) -> BinaryOperator {
+    match op {
+        BinaryOperator::Gt => BinaryOperator::Lt,
+        BinaryOperator::GtEq => BinaryOperator::LtEq,
+        BinaryOperator::Lt => BinaryOperator::Gt,
+        BinaryOperator::LtEq => BinaryOperator::GtEq,
+        _ => op.clone(),
+    }
+}
+
+fn vector_list_length_literal_compare(
+    batch: &RecordBatch,
+    left: &ScalarSqlExpression,
+    op: &BinaryOperator,
+    right: &ScalarSqlExpression,
+) -> Result<Option<BooleanArray>> {
+    let ScalarSqlExpression::ListLength { column, field } = left else {
+        return Ok(None);
+    };
+    let Some(literal) = scalar_i64_literal(right) else {
+        return Ok(None);
+    };
+    let list = list_array_column(batch, column, field.as_deref())?;
+    Ok(Some(BooleanArray::from(
+        (0..list.len())
+            .map(|row| {
+                if list.is_null(row) {
+                    None
+                } else {
+                    compare_optional_values(
+                        Some(i64::from(list.value_length(row))),
+                        op,
+                        Some(literal),
+                    )
+                }
+            })
+            .collect::<Vec<_>>(),
+    )))
+}
+
+fn vector_i64_expression_in_list(
+    batch: &RecordBatch,
+    expr: &ScalarSqlExpression,
+    values: &[ScalarSqlExpression],
+    negated: bool,
+) -> Result<Option<BooleanArray>> {
+    let Some(probe) = vector_i64_expression(batch, expr)? else {
+        return Ok(None);
+    };
+    let mut literals = Vec::new();
+    let mut has_null = false;
+    for value in values {
+        match scalar_i64_literal(value) {
+            Some(value) => literals.push(value),
+            None if matches!(value, ScalarSqlExpression::Literal(LiteralValue::Null)) => {
+                has_null = true
+            }
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(BooleanArray::from(
+        probe
+            .into_iter()
+            .map(|value| {
+                let Some(value) = value else {
+                    return None;
+                };
+                let matched = literals.contains(&value);
+                if matched {
+                    Some(!negated)
+                } else if has_null {
+                    None
+                } else {
+                    Some(negated)
+                }
+            })
+            .collect::<Vec<_>>(),
+    )))
+}
+
+fn vector_i64_expression(
+    batch: &RecordBatch,
+    expr: &ScalarSqlExpression,
+) -> Result<Option<Vec<Option<i64>>>> {
+    match expr {
+        ScalarSqlExpression::Column(column) => vector_i64_array(batch_column(batch, column)?),
+        ScalarSqlExpression::StructField { column, field } => {
+            vector_i64_array(struct_field_array(batch, column, field)?)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn vector_i64_array(array: &dyn Array) -> Result<Option<Vec<Option<i64>>>> {
+    match array.data_type() {
+        DataType::Int32 => {
+            let values = array.as_any().downcast_ref::<Int32Array>().expect("Int32");
+            if values.null_count() == 0 {
+                Ok(Some(
+                    values
+                        .values()
+                        .iter()
+                        .map(|value| Some(i64::from(*value)))
+                        .collect(),
+                ))
+            } else {
+                Ok(Some(
+                    values.iter().map(|value| value.map(i64::from)).collect(),
+                ))
+            }
+        }
+        DataType::Int64 => {
+            let values = array.as_any().downcast_ref::<Int64Array>().expect("Int64");
+            if values.null_count() == 0 {
+                Ok(Some(
+                    values.values().iter().map(|value| Some(*value)).collect(),
+                ))
+            } else {
+                Ok(Some(values.iter().collect()))
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+fn scalar_i64_literal(expr: &ScalarSqlExpression) -> Option<i64> {
+    match expr {
+        ScalarSqlExpression::Literal(LiteralValue::Int64(value)) => Some(*value),
+        _ => None,
     }
 }
 

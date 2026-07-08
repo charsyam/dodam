@@ -247,6 +247,8 @@ pub fn collect_grouped_aggregates(
         collect_single_key_groups(stream, fragments, group_by, aggregates)?
     } else if can_use_two_utf8_key_fast_path(group_by, aggregates) {
         collect_two_utf8_key_groups(stream, fragments, group_by, aggregates)?
+    } else if can_use_two_key_count_sum_path(group_by, aggregates) {
+        collect_two_key_count_sum_groups(stream, fragments, group_by, aggregates)?
     } else if can_use_two_key_sum_path(group_by, aggregates) {
         collect_two_key_sum_groups(stream, fragments, group_by, aggregates)?
     } else {
@@ -1043,6 +1045,211 @@ impl TwoKeyGroup {
 
 fn can_use_two_key_sum_path(group_by: &[String], aggregates: &[AggregateExpr]) -> bool {
     group_by.len() == 2 && matches!(aggregates, [AggregateExpr::Sum(_)])
+}
+
+fn can_use_two_key_count_sum_path(group_by: &[String], aggregates: &[AggregateExpr]) -> bool {
+    group_by.len() == 2
+        && matches!(
+            aggregates,
+            [AggregateExpr::CountStar, AggregateExpr::Sum(_)]
+        )
+}
+
+fn collect_two_key_count_sum_groups(
+    mut stream: SendableBatchStream,
+    fragments: usize,
+    group_by: &[String],
+    aggregates: &[AggregateExpr],
+) -> Result<AggregateMetrics> {
+    let AggregateExpr::Sum(sum_column) = &aggregates[1] else {
+        unreachable!("two-key count/sum fast path precondition");
+    };
+    let sum_expr = aggregates[1].clone();
+    let mut groups: AggregateHashMap<TwoKeyCountSumKey, TwoKeyCountSumGroup> =
+        AggregateHashMap::default();
+    let mut metrics = AggregateMetrics {
+        fragments,
+        ..AggregateMetrics::default()
+    };
+
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        metrics.batches += 1;
+        metrics.rows += batch.num_rows();
+
+        let first_key = batch.column(column_index(&batch, &group_by[0])?);
+        let second_key = batch.column(column_index(&batch, &group_by[1])?);
+        let Some(key_reader) = TwoKeyCountSumReader::new(first_key, second_key) else {
+            return collect_grouped_aggregates_generic(
+                stream,
+                fragments,
+                group_by,
+                aggregates,
+                Some(batch),
+                Some(metrics),
+            );
+        };
+        let sum_column = batch.column(column_index(&batch, sum_column)?);
+        let sum_input = CountSumValueInput::new(sum_column, &sum_expr)?;
+
+        for row in 0..batch.num_rows() {
+            let key = key_reader.key(row);
+            let group = groups
+                .entry(key.clone())
+                .or_insert_with(|| TwoKeyCountSumGroup::new(key.into_group_values(), &sum_input));
+            group.update(&sum_input, row);
+        }
+    }
+
+    let mut group_results = groups
+        .into_values()
+        .map(|group| group.finish(sum_expr.clone()))
+        .collect::<Vec<_>>();
+    group_results.sort_by(|left, right| compare_group_keys(&left.keys, &right.keys));
+    metrics.groups = group_results;
+    Ok(metrics)
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum TwoKeyCountSumKey {
+    IntUtf8(Option<i64>, Option<String>),
+    Utf8Int(Option<String>, Option<i64>),
+}
+
+impl TwoKeyCountSumKey {
+    fn into_group_values(self) -> Vec<GroupValue> {
+        match self {
+            Self::IntUtf8(first, second) => {
+                vec![GroupValue::Int64(first), GroupValue::Utf8(second)]
+            }
+            Self::Utf8Int(first, second) => {
+                vec![GroupValue::Utf8(first), GroupValue::Int64(second)]
+            }
+        }
+    }
+}
+
+enum TwoKeyCountSumReader<'a> {
+    Int32Utf8(&'a Int32Array, &'a StringArray),
+    Int64Utf8(&'a Int64Array, &'a StringArray),
+    Utf8Int32(&'a StringArray, &'a Int32Array),
+    Utf8Int64(&'a StringArray, &'a Int64Array),
+}
+
+impl<'a> TwoKeyCountSumReader<'a> {
+    fn new(first: &'a ArrayRef, second: &'a ArrayRef) -> Option<Self> {
+        match (first.data_type(), second.data_type()) {
+            (DataType::Int32, DataType::Utf8) => Some(Self::Int32Utf8(
+                first.as_any().downcast_ref::<Int32Array>()?,
+                second.as_any().downcast_ref::<StringArray>()?,
+            )),
+            (DataType::Int64, DataType::Utf8) => Some(Self::Int64Utf8(
+                first.as_any().downcast_ref::<Int64Array>()?,
+                second.as_any().downcast_ref::<StringArray>()?,
+            )),
+            (DataType::Utf8, DataType::Int32) => Some(Self::Utf8Int32(
+                first.as_any().downcast_ref::<StringArray>()?,
+                second.as_any().downcast_ref::<Int32Array>()?,
+            )),
+            (DataType::Utf8, DataType::Int64) => Some(Self::Utf8Int64(
+                first.as_any().downcast_ref::<StringArray>()?,
+                second.as_any().downcast_ref::<Int64Array>()?,
+            )),
+            _ => None,
+        }
+    }
+
+    fn key(&self, row: usize) -> TwoKeyCountSumKey {
+        match self {
+            Self::Int32Utf8(first, second) => TwoKeyCountSumKey::IntUtf8(
+                first.is_valid(row).then(|| i64::from(first.value(row))),
+                second.is_valid(row).then(|| second.value(row).to_string()),
+            ),
+            Self::Int64Utf8(first, second) => TwoKeyCountSumKey::IntUtf8(
+                first.is_valid(row).then(|| first.value(row)),
+                second.is_valid(row).then(|| second.value(row).to_string()),
+            ),
+            Self::Utf8Int32(first, second) => TwoKeyCountSumKey::Utf8Int(
+                first.is_valid(row).then(|| first.value(row).to_string()),
+                second.is_valid(row).then(|| i64::from(second.value(row))),
+            ),
+            Self::Utf8Int64(first, second) => TwoKeyCountSumKey::Utf8Int(
+                first.is_valid(row).then(|| first.value(row).to_string()),
+                second.is_valid(row).then(|| second.value(row)),
+            ),
+        }
+    }
+}
+
+struct TwoKeyCountSumGroup {
+    keys: Vec<GroupValue>,
+    count: u64,
+    sum_i64: i64,
+    sum_f64: f64,
+    sum_is_float: bool,
+    sum_count: u64,
+}
+
+impl TwoKeyCountSumGroup {
+    fn new(keys: Vec<GroupValue>, sum_input: &CountSumValueInput<'_>) -> Self {
+        Self {
+            keys,
+            count: 0,
+            sum_i64: 0,
+            sum_f64: 0.0,
+            sum_is_float: matches!(sum_input, CountSumValueInput::Float64(_)),
+            sum_count: 0,
+        }
+    }
+
+    fn update(&mut self, sum_input: &CountSumValueInput<'_>, row: usize) {
+        self.count += 1;
+        match sum_input {
+            CountSumValueInput::Int32(values) if values.is_valid(row) => {
+                self.sum_i64 += i64::from(values.value(row));
+                self.sum_count += 1;
+            }
+            CountSumValueInput::Int64(values) if values.is_valid(row) => {
+                self.sum_i64 += values.value(row);
+                self.sum_count += 1;
+            }
+            CountSumValueInput::Float64(values) if values.is_valid(row) => {
+                self.sum_f64 += values.value(row);
+                self.sum_count += 1;
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(self, sum_expr: AggregateExpr) -> GroupAggregateResult {
+        let sum_value = if self.sum_count == 0 {
+            if self.sum_is_float {
+                AggregateValue::Float64(None)
+            } else {
+                AggregateValue::Int64(None)
+            }
+        } else if self.sum_is_float {
+            AggregateValue::Float64(Some(self.sum_f64))
+        } else {
+            AggregateValue::Int64(Some(self.sum_i64))
+        };
+        GroupAggregateResult {
+            keys: self.keys,
+            values: vec![
+                AggregateResult {
+                    expr: AggregateExpr::CountStar,
+                    value: AggregateValue::Count(self.count),
+                },
+                AggregateResult {
+                    expr: sum_expr,
+                    value: sum_value,
+                },
+            ],
+        }
+    }
 }
 
 fn collect_two_key_sum_groups(
