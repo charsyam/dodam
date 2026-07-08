@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::collections::hash_map::Entry;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::Instant;
 
 use arrow::array::{
@@ -8,7 +8,7 @@ use arrow::array::{
     Int64Array, StringArray, TimestampMillisecondArray, UInt64Array,
 };
 use arrow::compute::kernels::aggregate::{max, max_string, min, min_string, sum};
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use arrow_row::{OwnedRow, RowConverter, SortField};
 
@@ -356,6 +356,303 @@ pub fn collect_partial_aggregate_batch(
     }
     metrics.aggregate_nanos = elapsed_nanos(aggregate_started);
     Ok(Some(metrics))
+}
+
+pub fn aggregate_metrics_to_batches(
+    metrics: &AggregateMetrics,
+    group_by: &[String],
+    aggregates: &[AggregateExpr],
+) -> Result<Vec<RecordBatch>> {
+    if group_by.is_empty() {
+        return aggregate_values_to_batch(&metrics.values).map(|batch| vec![batch]);
+    }
+
+    let mut fields = Vec::new();
+    let mut columns = Vec::new();
+
+    for (index, column) in group_by.iter().enumerate() {
+        let values = metrics
+            .groups
+            .iter()
+            .map(|group| group.keys.get(index))
+            .collect::<Vec<_>>();
+        let (field, array) = group_values_to_column(column, &values);
+        fields.push(field);
+        columns.push(array);
+    }
+
+    for (index, aggregate) in aggregates.iter().enumerate() {
+        let values = metrics
+            .groups
+            .iter()
+            .filter_map(|group| group.values.get(index))
+            .map(|result| &result.value)
+            .collect::<Vec<_>>();
+        let (field, array) = aggregate_values_to_column(&aggregate.to_string(), &values);
+        fields.push(field);
+        columns.push(array);
+    }
+
+    let schema = Arc::new(Schema::new(fields));
+    Ok(vec![RecordBatch::try_new(schema, columns)?])
+}
+
+fn aggregate_values_to_batch(values: &[AggregateResult]) -> Result<RecordBatch> {
+    let mut fields = Vec::new();
+    let mut columns = Vec::new();
+
+    for value in values {
+        let (field, array) = aggregate_values_to_column(&value.expr.to_string(), &[&value.value]);
+        fields.push(field);
+        columns.push(array);
+    }
+
+    let schema = Arc::new(Schema::new(fields));
+    Ok(RecordBatch::try_new(schema, columns)?)
+}
+
+fn group_values_to_column(name: &str, values: &[Option<&GroupValue>]) -> (Field, ArrayRef) {
+    let data_type = values
+        .iter()
+        .find_map(|value| match value {
+            Some(GroupValue::Utf8(_)) => Some(DataType::Utf8),
+            Some(GroupValue::Date64(_)) => Some(DataType::Date64),
+            Some(GroupValue::Date32(_)) => Some(DataType::Date32),
+            Some(GroupValue::Decimal128(_, precision, scale)) => {
+                Some(DataType::Decimal128(*precision, *scale))
+            }
+            Some(GroupValue::UInt64(_)) => Some(DataType::UInt64),
+            Some(GroupValue::Int64(_)) => Some(DataType::Int64),
+            None => None,
+        })
+        .unwrap_or(DataType::Int64);
+
+    match data_type {
+        DataType::Utf8 => {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    Some(GroupValue::Utf8(value)) => value.clone(),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (
+                Field::new(name, DataType::Utf8, true),
+                Arc::new(StringArray::from(values)),
+            )
+        }
+        DataType::UInt64 => {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    Some(GroupValue::UInt64(value)) => *value,
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (
+                Field::new(name, DataType::UInt64, true),
+                Arc::new(UInt64Array::from(values)),
+            )
+        }
+        DataType::Decimal128(precision, scale) => {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    Some(GroupValue::Decimal128(value, _, _)) => *value,
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (
+                Field::new(name, DataType::Decimal128(precision, scale), true),
+                Arc::new(
+                    Decimal128Array::from(values)
+                        .with_precision_and_scale(precision, scale)
+                        .expect("valid Decimal128 group type"),
+                ),
+            )
+        }
+        DataType::Date32 => {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    Some(GroupValue::Date32(value)) => *value,
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (
+                Field::new(name, DataType::Date32, true),
+                Arc::new(Date32Array::from(values)),
+            )
+        }
+        DataType::Date64 => {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    Some(GroupValue::Date64(value)) => *value,
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (
+                Field::new(name, DataType::Date64, true),
+                Arc::new(Date64Array::from(values)),
+            )
+        }
+        _ => {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    Some(GroupValue::Int64(value)) => *value,
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (
+                Field::new(name, DataType::Int64, true),
+                Arc::new(Int64Array::from(values)),
+            )
+        }
+    }
+}
+
+fn aggregate_values_to_column(name: &str, values: &[&AggregateValue]) -> (Field, ArrayRef) {
+    let data_type = values
+        .iter()
+        .map(|value| match value {
+            AggregateValue::Count(_) => DataType::UInt64,
+            AggregateValue::Int64(_) => DataType::Int64,
+            AggregateValue::Float64(_) => DataType::Float64,
+            AggregateValue::Date32(_) => DataType::Date32,
+            AggregateValue::Date64(_) => DataType::Date64,
+            AggregateValue::TimestampMillisecond(_, timezone) => {
+                DataType::Timestamp(TimeUnit::Millisecond, timezone.clone().map(Into::into))
+            }
+            AggregateValue::Decimal128(_, precision, scale) => {
+                DataType::Decimal128(*precision, *scale)
+            }
+            AggregateValue::Utf8(_) => DataType::Utf8,
+        })
+        .next()
+        .unwrap_or(DataType::Int64);
+
+    match data_type {
+        DataType::UInt64 => {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    AggregateValue::Count(value) => Some(*value),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (
+                Field::new(name, DataType::UInt64, true),
+                Arc::new(UInt64Array::from(values)),
+            )
+        }
+        DataType::Float64 => {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    AggregateValue::Float64(value) => *value,
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (
+                Field::new(name, DataType::Float64, true),
+                Arc::new(Float64Array::from(values)),
+            )
+        }
+        DataType::Utf8 => {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    AggregateValue::Utf8(value) => value.clone(),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (
+                Field::new(name, DataType::Utf8, true),
+                Arc::new(StringArray::from(values)),
+            )
+        }
+        DataType::Date32 => {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    AggregateValue::Date32(value) => *value,
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (
+                Field::new(name, DataType::Date32, true),
+                Arc::new(Date32Array::from(values)),
+            )
+        }
+        DataType::Date64 => {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    AggregateValue::Date64(value) => *value,
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (
+                Field::new(name, DataType::Date64, true),
+                Arc::new(Date64Array::from(values)),
+            )
+        }
+        DataType::Decimal128(precision, scale) => {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    AggregateValue::Decimal128(value, _, _) => *value,
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (
+                Field::new(name, DataType::Decimal128(precision, scale), true),
+                Arc::new(
+                    Decimal128Array::from(values)
+                        .with_precision_and_scale(precision, scale)
+                        .expect("valid Decimal128 aggregate type"),
+                ),
+            )
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, timezone) => {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    AggregateValue::TimestampMillisecond(value, _) => *value,
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let array = TimestampMillisecondArray::from(values);
+            let array = if let Some(timezone) = timezone.as_ref() {
+                array.with_timezone(timezone.clone())
+            } else {
+                array
+            };
+            (
+                Field::new(
+                    name,
+                    DataType::Timestamp(TimeUnit::Millisecond, timezone),
+                    true,
+                ),
+                Arc::new(array),
+            )
+        }
+        _ => {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    AggregateValue::Int64(value) => *value,
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (
+                Field::new(name, DataType::Int64, true),
+                Arc::new(Int64Array::from(values)),
+            )
+        }
+    }
 }
 
 fn elapsed_nanos(started: Instant) -> u64 {

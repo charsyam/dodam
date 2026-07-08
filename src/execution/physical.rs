@@ -31,10 +31,14 @@ use memchr::memmem::Finder;
 use crate::catalog::{FileFragment, StorageFormat};
 use crate::error::{DodamError, Result};
 use crate::execution::logical::{
-    ComparisonExpr, ComparisonOp, Expr, FilterExpr, PhysicalPlan, Projection, SortExpr, SortKey,
+    AggregateExpr, ComparisonExpr, ComparisonOp, Expr, FilterExpr, PhysicalPlan, Projection,
+    SortExpr, SortKey,
 };
 use crate::execution::metrics::{
     RecordBatchSink, ScanMetrics, ScanPlanMetrics, ScanPlanMetricsCounter, SendableBatchStream,
+};
+use crate::execution::{
+    aggregate_metrics_to_batches, collect_aggregates, collect_grouped_aggregates,
 };
 use crate::hash::{FastHashMap as JoinKeyHashMap, FastHashSet as JoinKeyHashSet};
 use crate::storage::{
@@ -58,6 +62,18 @@ pub struct MemoryExec {
     batches: Vec<RecordBatch>,
 }
 
+pub struct LocalFoldExec {
+    input: Box<dyn PhysicalPlan>,
+    _group_by: Vec<String>,
+    _aggregates: Vec<AggregateExpr>,
+}
+
+pub struct FinalMergeExec {
+    input: Box<dyn PhysicalPlan>,
+    group_by: Vec<String>,
+    aggregates: Vec<AggregateExpr>,
+}
+
 impl MemoryExec {
     pub fn new(batches: Vec<RecordBatch>) -> Self {
         Self { batches }
@@ -67,6 +83,54 @@ impl MemoryExec {
 impl PhysicalPlan for MemoryExec {
     fn execute(self: Box<Self>) -> Result<SendableBatchStream> {
         Ok(SendableBatchStream::from_batches(self.batches))
+    }
+}
+
+impl LocalFoldExec {
+    pub fn new(
+        input: Box<dyn PhysicalPlan>,
+        group_by: Vec<String>,
+        aggregates: Vec<AggregateExpr>,
+    ) -> Self {
+        Self {
+            input,
+            _group_by: group_by,
+            _aggregates: aggregates,
+        }
+    }
+}
+
+impl PhysicalPlan for LocalFoldExec {
+    fn execute(self: Box<Self>) -> Result<SendableBatchStream> {
+        self.input.execute()
+    }
+}
+
+impl FinalMergeExec {
+    pub fn new(
+        input: Box<dyn PhysicalPlan>,
+        group_by: Vec<String>,
+        aggregates: Vec<AggregateExpr>,
+    ) -> Self {
+        Self {
+            input,
+            group_by,
+            aggregates,
+        }
+    }
+}
+
+impl PhysicalPlan for FinalMergeExec {
+    fn execute(self: Box<Self>) -> Result<SendableBatchStream> {
+        let stream = self.input.execute()?;
+        let metrics = if self.group_by.is_empty() {
+            collect_aggregates(stream, 1, &self.aggregates)?
+        } else {
+            collect_grouped_aggregates(stream, 1, &self.group_by, &self.aggregates)?
+        };
+        Ok(SendableBatchStream::from_batches(
+            aggregate_metrics_to_batches(&metrics, &self.group_by, &self.aggregates)?,
+        ))
     }
 }
 

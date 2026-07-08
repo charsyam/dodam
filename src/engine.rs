@@ -24,11 +24,11 @@ use crate::error::{DodamError, Result};
 use crate::execution::metrics::ScanPlanMetricsCounter;
 use crate::execution::{
     AggregateExpr, AggregateMetrics, ComparisonOp, DistinctExec, Expr, FilterExec, FilterExpr,
-    HashJoinExec, IpcExec, JoinBuildSide, JoinType, LimitExec, LiteralValue, MemoryExec,
-    PartitionedHashJoinExec, PartitionedHashJoinOptions, PhysicalPlan, PredicateSet, Projection,
-    ProjectionExec, RecordBatchSink, ScanExec, ScanMetrics, ScanPlanMetrics, SendableBatchStream,
-    SortExec, SortExpr, SortKey, SortMergeJoinExec, can_merge_partial_aggregates,
-    collect_aggregates, collect_grouped_aggregates, collect_metrics,
+    FinalMergeExec, HashJoinExec, IpcExec, JoinBuildSide, JoinType, LimitExec, LiteralValue,
+    LocalFoldExec, MemoryExec, PartitionedHashJoinExec, PartitionedHashJoinOptions, PhysicalPlan,
+    PredicateSet, Projection, ProjectionExec, RecordBatchSink, ScanExec, ScanMetrics,
+    ScanPlanMetrics, SendableBatchStream, SortExec, SortExpr, SortKey, SortMergeJoinExec,
+    can_merge_partial_aggregates, collect_aggregates, collect_grouped_aggregates, collect_metrics,
     collect_partial_aggregate_batch, evaluate_filter_mask, merge_partial_aggregate_metrics,
     scan_projection, write_stream_to_sink,
 };
@@ -512,6 +512,10 @@ impl AggregatePlan {
                         .join(",")
                 ),
             )
+            .execution(PhysicalExecutionConfig::LocalFold {
+                group_by: self.group_by.clone(),
+                aggregates: self.aggregates.clone(),
+            })
             .child(self.scan.to_plan_node());
         PhysicalPlanNode::new("FinalMergeExec")
             .attr(
@@ -546,6 +550,10 @@ impl AggregatePlan {
                         .join(",")
                 ),
             )
+            .execution(PhysicalExecutionConfig::FinalMerge {
+                group_by: self.group_by.clone(),
+                aggregates: self.aggregates.clone(),
+            })
             .child(local_fold)
     }
 }
@@ -3625,6 +3633,26 @@ impl DodamEngine {
             (PhysicalOperator::Distinct, Some(PhysicalExecutionConfig::Distinct)) => {
                 let input = self.lower_single_child(children, "DistinctExec")?;
                 Ok(Box::new(DistinctExec::new(input)))
+            }
+            (
+                PhysicalOperator::LocalFold,
+                Some(PhysicalExecutionConfig::LocalFold {
+                    group_by,
+                    aggregates,
+                }),
+            ) => {
+                let input = self.lower_single_child(children, "LocalFoldExec")?;
+                Ok(Box::new(LocalFoldExec::new(input, group_by, aggregates)))
+            }
+            (
+                PhysicalOperator::FinalMerge,
+                Some(PhysicalExecutionConfig::FinalMerge {
+                    group_by,
+                    aggregates,
+                }),
+            ) => {
+                let input = self.lower_single_child(children, "FinalMergeExec")?;
+                Ok(Box::new(FinalMergeExec::new(input, group_by, aggregates)))
             }
             (
                 PhysicalOperator::HashJoin,

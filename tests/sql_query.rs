@@ -825,6 +825,44 @@ async fn executes_grouped_aggregate_sql() {
 }
 
 #[tokio::test]
+async fn lowered_grouped_aggregate_physical_plan_executes() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let path = tempdir.path().join("part-000.parquet");
+    write_test_parquet(&path);
+
+    let plan = DodamEngine::default()
+        .plan_parquet_aggregate(
+            path,
+            3,
+            vec![
+                dodam::execution::AggregateExpr::CountStar,
+                dodam::execution::AggregateExpr::Sum("id".to_string()),
+            ],
+            vec!["payload".to_string()],
+            None,
+        )
+        .await
+        .expect("plan aggregate");
+
+    let physical = plan.to_logical_plan().to_physical_plan();
+    assert_eq!(physical.operator(), &PhysicalOperator::FinalMerge);
+    assert_eq!(
+        physical.children()[0].operator(),
+        &PhysicalOperator::LocalFold
+    );
+
+    let batches = DodamEngine::default()
+        .execute_physical_plan_node(physical)
+        .expect("execute lowered aggregate physical plan")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect aggregate physical output");
+
+    assert_eq!(strings_from_column(&batches, 0), vec!["a", "b", "c"]);
+    assert_eq!(u64s_from_column(&batches, 1), vec![3, 2, 1]);
+    assert_eq!(i64s_from_column(&batches, 2), vec![6, 4, 5]);
+}
+
+#[tokio::test]
 async fn executes_count_distinct_grouped_aggregate_sql() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let path = tempdir.path().join("part-000.parquet");

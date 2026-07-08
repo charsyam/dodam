@@ -135,6 +135,14 @@ pub enum PhysicalExecutionConfig {
         limit: usize,
     },
     Distinct,
+    LocalFold {
+        group_by: Vec<String>,
+        aggregates: Vec<AggregateExpr>,
+    },
+    FinalMerge {
+        group_by: Vec<String>,
+        aggregates: Vec<AggregateExpr>,
+    },
     HashJoin {
         left_keys: Vec<String>,
         right_keys: Vec<String>,
@@ -333,11 +341,19 @@ impl PhysicalPlanner {
                     .attr("mode", mode)
                     .attr("group_by", format!("[{}]", group_by.join(",")))
                     .attr("aggregates", aggregate_exprs_display(aggregates))
+                    .execution(PhysicalExecutionConfig::LocalFold {
+                        group_by: group_by.clone(),
+                        aggregates: aggregates.clone(),
+                    })
                     .child(input);
                 PhysicalPlanNode::new("FinalMergeExec")
                     .attr("mode", mode)
                     .attr("group_by", format!("[{}]", group_by.join(",")))
                     .attr("aggregates", aggregate_exprs_display(aggregates))
+                    .execution(PhysicalExecutionConfig::FinalMerge {
+                        group_by: group_by.clone(),
+                        aggregates: aggregates.clone(),
+                    })
                     .child(local_fold)
             }
             LogicalPlan::Join {
