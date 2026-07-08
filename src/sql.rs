@@ -14247,9 +14247,10 @@ fn q12_order_late_build_selection_batch(
     };
     if orderkeys.null_count() == 0 {
         let orderkey_values = orderkeys.values();
+        let pending_dense = state.pending.dense_slices();
         selection.push_selected_rows(orderkey_values.len(), |row| {
             let orderkey = orderkey_values[row];
-            if let Some(order) = state.pending.get(orderkey) {
+            if let Some(order) = state.pending.get_cached(pending_dense, orderkey) {
                 state.selected_orders.push(order);
                 true
             } else {
@@ -14286,9 +14287,10 @@ fn q12_order_late_build_selection_view(
             return q12_order_late_build_selection_batch(batch.clone(), selection, state);
         };
         if let Some(orderkey_values) = orderkeys.values_if_null_free() {
+            let pending_dense = state.pending.dense_slices();
             selection.push_selected_rows(orderkey_values.len(), |row| {
                 let orderkey = orderkey_values[row];
-                if let Some(order) = state.pending.get(orderkey) {
+                if let Some(order) = state.pending.get_cached(pending_dense, orderkey) {
                     state.selected_orders.push(order);
                     true
                 } else {
@@ -27507,8 +27509,12 @@ fn q19_late_build_selection_batch(
     let partkey_values = partkeys.values();
     let quantity_values = quantities.raw_values();
     let discount_values = discounts.raw_values();
+    let part_masks_dense = state.part_masks.dense_slices();
     selection.push_selected_rows(batch.num_rows(), |row| {
-        let selected = if let Some(mask) = state.part_masks.get(partkey_values[row]) {
+        let selected = if let Some(mask) = state
+            .part_masks
+            .get_cached(part_masks_dense, partkey_values[row])
+        {
             q19_rule_matches_lineitem_raw(
                 raw_rules,
                 mask,
@@ -27589,6 +27595,7 @@ fn q19_late_build_selection_vector_typed(
         q19_raw_line_rules_cached(&state.rules, quantities.scale(), &mut state.raw_rule_cache);
     let quantity_values = quantities.raw_values();
     let discount_values = discounts.raw_values();
+    let part_masks_dense = state.part_masks.dense_slices();
     selection.push_selected_rows(partkeys.len(), |row| {
         if partkeys.is_null(row)
             || quantities.is_null(row)
@@ -27598,7 +27605,10 @@ fn q19_late_build_selection_vector_typed(
         {
             return false;
         }
-        let selected = if let Some(mask) = state.part_masks.get(partkeys.value(row)) {
+        let selected = if let Some(mask) = state
+            .part_masks
+            .get_cached(part_masks_dense, partkeys.value(row))
+        {
             q19_rule_matches_lineitem_raw(
                 raw_rules,
                 mask,

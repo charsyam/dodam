@@ -400,6 +400,18 @@ where
         }
     }
 
+    pub(crate) fn get_cached(&self, dense_slices: Option<(&[V], &[bool])>, key: i64) -> Option<V> {
+        if let Some((values, present)) = dense_slices {
+            let index = usize::try_from(key).ok()?;
+            return present
+                .get(index)
+                .copied()
+                .filter(|present| *present)
+                .map(|_| values[index]);
+        }
+        self.get(key)
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         match self {
             Self::Dense { len, .. } => *len == 0,
