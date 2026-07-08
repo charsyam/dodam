@@ -6,8 +6,9 @@ pub mod physical;
 pub mod typed_rows;
 
 pub use aggregate::{
-    aggregate_metrics_to_batches, can_merge_partial_aggregates, collect_aggregates,
-    collect_grouped_aggregates, collect_partial_aggregate_batch, merge_partial_aggregate_metrics,
+    GroupKeyExpr, aggregate_metrics_to_batches, can_merge_partial_aggregates, collect_aggregates,
+    collect_grouped_aggregates, collect_grouped_aggregates_with_key_exprs,
+    collect_partial_aggregate_batch, merge_partial_aggregate_metrics,
 };
 pub use decimal::{
     DecimalInput, decimal_discounted_revenue_raw, decimal_discounted_revenue_scales, decimal_input,

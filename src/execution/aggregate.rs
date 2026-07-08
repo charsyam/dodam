@@ -262,6 +262,372 @@ pub fn collect_grouped_aggregates(
     Ok(metrics)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupKeyExpr {
+    Column(String),
+    CoalesceUtf8Literal { column: String, fallback: String },
+}
+
+pub fn collect_grouped_aggregates_with_key_exprs(
+    stream: SendableBatchStream,
+    fragments: usize,
+    group_keys: &[GroupKeyExpr],
+    aggregates: &[AggregateExpr],
+) -> Result<Option<AggregateMetrics>> {
+    if let Some(plan) = CoalesceKeyCountSumPlan::new(group_keys, aggregates) {
+        return collect_coalesce_key_count_sum_groups(stream, fragments, aggregates, plan)
+            .map(Some);
+    }
+    Ok(None)
+}
+
+struct CoalesceKeyCountSumPlan {
+    leading_keys: Vec<String>,
+    coalesce_column: String,
+    fallback: String,
+    sum_column: String,
+}
+
+impl CoalesceKeyCountSumPlan {
+    fn new(group_keys: &[GroupKeyExpr], aggregates: &[AggregateExpr]) -> Option<Self> {
+        if !(group_keys.len() == 2 || group_keys.len() == 3) {
+            return None;
+        }
+        let [AggregateExpr::CountStar, AggregateExpr::Sum(sum_column)] = aggregates else {
+            return None;
+        };
+        let GroupKeyExpr::CoalesceUtf8Literal { column, fallback } = group_keys.last()? else {
+            return None;
+        };
+        let mut leading_keys = Vec::with_capacity(group_keys.len() - 1);
+        for key in &group_keys[..group_keys.len() - 1] {
+            let GroupKeyExpr::Column(column) = key else {
+                return None;
+            };
+            leading_keys.push(column.clone());
+        }
+        Some(Self {
+            leading_keys,
+            coalesce_column: column.clone(),
+            fallback: fallback.clone(),
+            sum_column: sum_column.clone(),
+        })
+    }
+}
+
+fn collect_coalesce_key_count_sum_groups(
+    mut stream: SendableBatchStream,
+    fragments: usize,
+    aggregates: &[AggregateExpr],
+    plan: CoalesceKeyCountSumPlan,
+) -> Result<AggregateMetrics> {
+    let mut groups = CoalesceKeyCountSumGroups::new(plan.leading_keys.len());
+    let mut metrics = AggregateMetrics {
+        fragments,
+        ..AggregateMetrics::default()
+    };
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        metrics.batches += 1;
+        metrics.rows += batch.num_rows();
+
+        let first = batch.column(column_index(&batch, &plan.leading_keys[0])?);
+        let second = if plan.leading_keys.len() == 2 {
+            Some(batch.column(column_index(&batch, &plan.leading_keys[1])?))
+        } else {
+            None
+        };
+        let coalesce = batch.column(column_index(&batch, &plan.coalesce_column)?);
+        let sum = batch.column(column_index(&batch, &plan.sum_column)?);
+        let Some(reader) = CoalesceKeyCountSumReader::new(first, second, coalesce, sum) else {
+            return Err(DodamError::UnsupportedSql(
+                "group expression view aggregate requires integer/date leading keys, coalesce(utf8,literal), and integer sum inputs"
+                    .to_string(),
+            ));
+        };
+        for row in 0..batch.num_rows() {
+            groups.update(
+                reader.key(row, plan.fallback.as_str()),
+                reader.sum_value(row),
+            );
+        }
+    }
+    metrics.groups = groups.finish(aggregates);
+    Ok(metrics)
+}
+
+enum CoalesceKeyCountSumReader<'a> {
+    TwoInt32 {
+        first: &'a Int32Array,
+        coalesce: &'a StringArray,
+        sum: Int64LikeArray<'a>,
+    },
+    TwoInt64 {
+        first: &'a Int64Array,
+        coalesce: &'a StringArray,
+        sum: Int64LikeArray<'a>,
+    },
+    ThreeInt32Date {
+        first: &'a Int32Array,
+        second: &'a Date32Array,
+        coalesce: &'a StringArray,
+        sum: Int64LikeArray<'a>,
+    },
+    ThreeInt64Date {
+        first: &'a Int64Array,
+        second: &'a Date32Array,
+        coalesce: &'a StringArray,
+        sum: Int64LikeArray<'a>,
+    },
+}
+
+impl<'a> CoalesceKeyCountSumReader<'a> {
+    fn new(
+        first: &'a ArrayRef,
+        second: Option<&'a ArrayRef>,
+        coalesce: &'a ArrayRef,
+        sum: &'a ArrayRef,
+    ) -> Option<Self> {
+        let coalesce = coalesce.as_any().downcast_ref::<StringArray>()?;
+        let sum = Int64LikeArray::new(sum)?;
+        match (first.data_type(), second.map(|array| array.data_type())) {
+            (DataType::Int32, None) => Some(Self::TwoInt32 {
+                first: first.as_any().downcast_ref::<Int32Array>()?,
+                coalesce,
+                sum,
+            }),
+            (DataType::Int64, None) => Some(Self::TwoInt64 {
+                first: first.as_any().downcast_ref::<Int64Array>()?,
+                coalesce,
+                sum,
+            }),
+            (DataType::Int32, Some(DataType::Date32)) => Some(Self::ThreeInt32Date {
+                first: first.as_any().downcast_ref::<Int32Array>()?,
+                second: second?.as_any().downcast_ref::<Date32Array>()?,
+                coalesce,
+                sum,
+            }),
+            (DataType::Int64, Some(DataType::Date32)) => Some(Self::ThreeInt64Date {
+                first: first.as_any().downcast_ref::<Int64Array>()?,
+                second: second?.as_any().downcast_ref::<Date32Array>()?,
+                coalesce,
+                sum,
+            }),
+            _ => None,
+        }
+    }
+
+    fn key(&self, row: usize, fallback: &'a str) -> CoalesceKeyBorrowed<'a> {
+        match self {
+            Self::TwoInt32 {
+                first, coalesce, ..
+            } => CoalesceKeyBorrowed {
+                first: first.is_valid(row).then(|| i64::from(first.value(row))),
+                second: None,
+                third: coalesce_key(coalesce, row, fallback),
+            },
+            Self::TwoInt64 {
+                first, coalesce, ..
+            } => CoalesceKeyBorrowed {
+                first: first.is_valid(row).then(|| first.value(row)),
+                second: None,
+                third: coalesce_key(coalesce, row, fallback),
+            },
+            Self::ThreeInt32Date {
+                first,
+                second,
+                coalesce,
+                ..
+            } => CoalesceKeyBorrowed {
+                first: first.is_valid(row).then(|| i64::from(first.value(row))),
+                second: second.is_valid(row).then(|| second.value(row)),
+                third: coalesce_key(coalesce, row, fallback),
+            },
+            Self::ThreeInt64Date {
+                first,
+                second,
+                coalesce,
+                ..
+            } => CoalesceKeyBorrowed {
+                first: first.is_valid(row).then(|| first.value(row)),
+                second: second.is_valid(row).then(|| second.value(row)),
+                third: coalesce_key(coalesce, row, fallback),
+            },
+        }
+    }
+
+    fn sum_value(&self, row: usize) -> Option<i64> {
+        match self {
+            Self::TwoInt32 { sum, .. }
+            | Self::TwoInt64 { sum, .. }
+            | Self::ThreeInt32Date { sum, .. }
+            | Self::ThreeInt64Date { sum, .. } => sum.value(row),
+        }
+    }
+}
+
+fn coalesce_key<'a>(values: &'a StringArray, row: usize, fallback: &'a str) -> Option<&'a str> {
+    if values.is_valid(row) {
+        Some(values.value(row))
+    } else {
+        Some(fallback)
+    }
+}
+
+struct CoalesceKeyBorrowed<'a> {
+    first: Option<i64>,
+    second: Option<i32>,
+    third: Option<&'a str>,
+}
+
+struct CoalesceKeyCountSumGroups {
+    key_len: usize,
+    index: AggregateHashMap<Option<i64>, CoalesceSecondGroups>,
+    groups: Vec<CoalesceKeyCountSumGroup>,
+}
+
+impl CoalesceKeyCountSumGroups {
+    fn new(leading_key_count: usize) -> Self {
+        Self {
+            key_len: leading_key_count + 1,
+            index: AggregateHashMap::default(),
+            groups: Vec::new(),
+        }
+    }
+
+    fn update(&mut self, key: CoalesceKeyBorrowed<'_>, sum: Option<i64>) {
+        let third_index = self
+            .index
+            .entry(key.first)
+            .or_default()
+            .index
+            .entry(key.second)
+            .or_default();
+        let group_id = match key.third {
+            Some(value) => {
+                if let Some(group_id) = third_index.non_null.get(value).copied() {
+                    group_id
+                } else {
+                    let group_id = self.groups.len();
+                    third_index.non_null.insert(value.to_string(), group_id);
+                    self.groups
+                        .push(CoalesceKeyCountSumGroup::new(coalesce_group_values(
+                            self.key_len,
+                            key.first,
+                            key.second,
+                            Some(value.to_string()),
+                        )));
+                    group_id
+                }
+            }
+            None => {
+                if let Some(group_id) = third_index.null_group {
+                    group_id
+                } else {
+                    let group_id = self.groups.len();
+                    third_index.null_group = Some(group_id);
+                    self.groups
+                        .push(CoalesceKeyCountSumGroup::new(coalesce_group_values(
+                            self.key_len,
+                            key.first,
+                            key.second,
+                            None,
+                        )));
+                    group_id
+                }
+            }
+        };
+        self.groups[group_id].update(sum);
+    }
+
+    fn finish(self, aggregates: &[AggregateExpr]) -> Vec<GroupAggregateResult> {
+        let mut groups = self
+            .groups
+            .into_iter()
+            .map(|group| group.finish(aggregates))
+            .collect::<Vec<_>>();
+        groups.sort_by(|left, right| compare_group_keys(&left.keys, &right.keys));
+        groups
+    }
+}
+
+fn coalesce_group_values(
+    key_len: usize,
+    first: Option<i64>,
+    second: Option<i32>,
+    third: Option<String>,
+) -> Vec<GroupValue> {
+    if key_len == 2 {
+        vec![GroupValue::Int64(first), GroupValue::Utf8(third)]
+    } else {
+        vec![
+            GroupValue::Int64(first),
+            GroupValue::Date32(second),
+            GroupValue::Utf8(third),
+        ]
+    }
+}
+
+#[derive(Default)]
+struct CoalesceSecondGroups {
+    index: AggregateHashMap<Option<i32>, CoalesceThirdGroups>,
+}
+
+#[derive(Default)]
+struct CoalesceThirdGroups {
+    non_null: AggregateHashMap<String, usize>,
+    null_group: Option<usize>,
+}
+
+struct CoalesceKeyCountSumGroup {
+    keys: Vec<GroupValue>,
+    count: u64,
+    sum: i64,
+    sum_count: u64,
+}
+
+impl CoalesceKeyCountSumGroup {
+    fn new(keys: Vec<GroupValue>) -> Self {
+        Self {
+            keys,
+            count: 0,
+            sum: 0,
+            sum_count: 0,
+        }
+    }
+
+    fn update(&mut self, sum: Option<i64>) {
+        self.count += 1;
+        if let Some(sum) = sum {
+            self.sum += sum;
+            self.sum_count += 1;
+        }
+    }
+
+    fn finish(self, aggregates: &[AggregateExpr]) -> GroupAggregateResult {
+        GroupAggregateResult {
+            keys: self.keys,
+            values: vec![
+                AggregateResult {
+                    expr: aggregates[0].clone(),
+                    value: AggregateValue::Count(self.count),
+                },
+                AggregateResult {
+                    expr: aggregates[1].clone(),
+                    value: if self.sum_count == 0 {
+                        AggregateValue::Int64(None)
+                    } else {
+                        AggregateValue::Int64(Some(self.sum))
+                    },
+                },
+            ],
+        }
+    }
+}
+
 pub fn can_merge_partial_aggregates(aggregates: &[AggregateExpr]) -> bool {
     aggregates.iter().all(|aggregate| {
         !matches!(
