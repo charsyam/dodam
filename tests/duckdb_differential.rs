@@ -1464,9 +1464,11 @@ async fn dodam_sql_error_contract_matrix() {
     let facts_path = tempdir.path().join("facts.parquet");
     let dim_path = tempdir.path().join("dim.parquet");
     let types_path = tempdir.path().join("types.parquet");
+    let nested_path = tempdir.path().join("nested.parquet");
     write_facts_parquet(&facts_path);
     write_dim_parquet(&dim_path);
     write_types_parquet(&types_path);
+    write_nested_values_parquet(&nested_path);
 
     assert_dodam_unknown_column(
         &format!("SELECT missing FROM '{}'", facts_path.display()),
@@ -1541,6 +1543,42 @@ async fn dodam_sql_error_contract_matrix() {
             facts_path.display()
         ),
         "invalid DATE literal",
+    )
+    .await;
+    assert_dodam_error_contains(
+        &format!(
+            "SELECT n.id FROM '{}' f JOIN '{}' n ON f.id = n.id WHERE n.attrs.missing = 1",
+            facts_path.display(),
+            nested_path.display()
+        ),
+        "unknown column in projection: n.attrs.missing",
+    )
+    .await;
+    assert_dodam_error_contains(
+        &format!(
+            "SELECT n.id FROM '{}' f JOIN '{}' n ON f.id = n.id WHERE n.attrs.more_tags['bad'] = 1",
+            facts_path.display(),
+            nested_path.display()
+        ),
+        "cannot use Utf8 in integer arithmetic",
+    )
+    .await;
+    assert_dodam_error_contains(
+        &format!(
+            "SELECT n.id FROM '{}' f JOIN '{}' n ON f.id = n.id WHERE z.attrs.rank = 1",
+            facts_path.display(),
+            nested_path.display()
+        ),
+        "unknown table qualifier: z",
+    )
+    .await;
+    assert_dodam_error_contains(
+        &format!(
+            "SELECT n.id FROM '{}' f JOIN '{}' n ON f.id = n.id WHERE array_sort(n.attrs.more_tags) IS NULL",
+            facts_path.display(),
+            nested_path.display()
+        ),
+        "unsupported JOIN scalar function",
     )
     .await;
 }
@@ -2201,6 +2239,51 @@ async fn duckdb_differential_nested_struct_field_projection() {
         ),
         &format!(
             "SELECT n.attrs.rank AS rank, n.attrs.more_tags[1] AS first_nested_tag FROM read_parquet('{}') f JOIN read_parquet('{}') n ON f.id = n.id WHERE n.attrs.more_tags[1] = 9 OR array_length(n.attrs.more_tags) > 1 ORDER BY rank",
+            facts_path.display(),
+            input_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT n.attrs.label AS label FROM '{}' f JOIN '{}' n ON f.id = n.id WHERE coalesce(n.attrs.label, 'missing') LIKE 'h%' OR n.attrs.label IS NULL ORDER BY label",
+            facts_path.display(),
+            input_path.display()
+        ),
+        &format!(
+            "SELECT n.attrs.label AS label FROM read_parquet('{}') f JOIN read_parquet('{}') n ON f.id = n.id WHERE coalesce(n.attrs.label, 'missing') LIKE 'h%' OR n.attrs.label IS NULL ORDER BY label",
+            facts_path.display(),
+            input_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT n.attrs.rank AS rank FROM '{}' f JOIN '{}' n ON f.id = n.id WHERE CAST(n.attrs.rank AS VARCHAR) IN ('10', '40') OR n.attrs.rank IS NULL ORDER BY rank",
+            facts_path.display(),
+            input_path.display()
+        ),
+        &format!(
+            "SELECT n.attrs.rank AS rank FROM read_parquet('{}') f JOIN read_parquet('{}') n ON f.id = n.id WHERE CAST(n.attrs.rank AS VARCHAR) IN ('10', '40') OR n.attrs.rank IS NULL ORDER BY rank",
+            facts_path.display(),
+            input_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT n.attrs.rank AS rank FROM '{}' f JOIN '{}' n ON f.id = n.id WHERE CASE WHEN f.id > 0 THEN n.attrs.rank ELSE 0 END >= 30 ORDER BY rank",
+            facts_path.display(),
+            input_path.display()
+        ),
+        &format!(
+            "SELECT n.attrs.rank AS rank FROM read_parquet('{}') f JOIN read_parquet('{}') n ON f.id = n.id WHERE CASE WHEN f.id > 0 THEN n.attrs.rank ELSE 0 END >= 30 ORDER BY rank",
             facts_path.display(),
             input_path.display()
         ),

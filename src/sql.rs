@@ -340,11 +340,7 @@ pub async fn execute_sql(
         let is_aggregate = query.is_aggregate();
         let aggregates = query.aggregates.clone();
         let group_by = query.group_by.clone();
-        let join_input_projection = if query.expression_filter.is_some() {
-            &Projection::All
-        } else {
-            &query.projection
-        };
+        let join_input_projection = join_input_projection_with_expression_filter(&query)?;
         let projection_requires_expression =
             projection_requires_expression_path(&query.expressions);
         let input_order_by = if projection_requires_expression {
@@ -353,7 +349,7 @@ pub async fn execute_sql(
             query.order_by.as_ref()
         };
         let join_plan = plan_join_inputs(
-            join_input_projection,
+            &join_input_projection,
             query.filter.as_ref(),
             input_order_by,
             &join.left_alias,
@@ -30807,13 +30803,9 @@ async fn execute_parsed_join_query(
     let is_aggregate = query.is_aggregate();
     let aggregates = query.aggregates.clone();
     let group_by = query.group_by.clone();
-    let join_input_projection = if query.expression_filter.is_some() {
-        &Projection::All
-    } else {
-        &query.projection
-    };
+    let join_input_projection = join_input_projection_with_expression_filter(&query)?;
     let join_plan = plan_join_inputs(
-        join_input_projection,
+        &join_input_projection,
         query.filter.as_ref(),
         query.order_by.as_ref(),
         &join.left_alias,
@@ -33484,13 +33476,9 @@ async fn explain_query(engine: &DodamEngine, query: SqlQuery, batch_size: usize)
                 "JOIN with aggregates, HAVING, or DISTINCT is not supported".to_string(),
             ));
         }
-        let join_input_projection = if query.expression_filter.is_some() {
-            &Projection::All
-        } else {
-            &query.projection
-        };
+        let join_input_projection = join_input_projection_with_expression_filter(&query)?;
         let join_plan = plan_join_inputs(
-            join_input_projection,
+            &join_input_projection,
             query.filter.as_ref(),
             query.order_by.as_ref(),
             &join.left_alias,
@@ -33579,6 +33567,26 @@ fn pushed_join_output_projection(query: &SqlQuery) -> Projection {
     } else {
         query.projection.clone()
     }
+}
+
+fn join_input_projection_with_expression_filter(query: &SqlQuery) -> Result<Projection> {
+    let Some(join) = &query.join else {
+        return Ok(query.projection.clone());
+    };
+    let Some(expression_filter) = query.expression_filter.as_ref() else {
+        return Ok(query.projection.clone());
+    };
+    let mut projection = if query.is_aggregate() {
+        aggregate_join_output_projection(query)
+    } else {
+        query.projection.clone()
+    };
+    let aliases = [join.left_alias.as_str(), join.right_alias.as_str()];
+    add_projection_columns(
+        &mut projection,
+        join_sql_expression_columns(expression_filter, &aliases)?,
+    );
+    Ok(projection)
 }
 
 fn aggregate_join_output_projection(query: &SqlQuery) -> Projection {
@@ -36553,6 +36561,9 @@ fn parse_join_struct_field_access(
                     .join("."),
             )))
         }
+        [qualifier, _, fields @ ..] if !fields.is_empty() => {
+            Err(DodamError::UnknownTableQualifier(qualifier.value.clone()))
+        }
         _ => Ok(None),
     }
 }
@@ -38559,115 +38570,11 @@ fn evaluate_join_scalar_predicate(
     predicate: &SqlExpr,
     table_aliases: &[&str],
 ) -> Result<BooleanArray> {
-    match predicate {
-        SqlExpr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
-            let left = evaluate_join_scalar_predicate(batch, left, table_aliases)?;
-            let right = evaluate_join_scalar_predicate(batch, right, table_aliases)?;
-            Ok(boolean_and(&left, &right))
-        }
-        SqlExpr::BinaryOp { left, op, right } if *op == BinaryOperator::Or => {
-            let left = evaluate_join_scalar_predicate(batch, left, table_aliases)?;
-            let right = evaluate_join_scalar_predicate(batch, right, table_aliases)?;
-            Ok(boolean_or(&left, &right))
-        }
-        SqlExpr::UnaryOp { op, expr } if *op == UnaryOperator::Not => {
-            let mask = evaluate_join_scalar_predicate(batch, expr, table_aliases)?;
-            Ok(boolean_not(&mask))
-        }
-        SqlExpr::Nested(expr) => evaluate_join_scalar_predicate(batch, expr, table_aliases),
-        SqlExpr::BinaryOp { left, op, right }
-            if matches!(
-                op,
-                BinaryOperator::Eq
-                    | BinaryOperator::NotEq
-                    | BinaryOperator::Gt
-                    | BinaryOperator::GtEq
-                    | BinaryOperator::Lt
-                    | BinaryOperator::LtEq
-            ) =>
-        {
-            let left = evaluate_scalar_expression(
-                batch,
-                &parse_join_scalar_sql_expression(left, table_aliases)?,
-            )?;
-            let right = evaluate_scalar_expression(
-                batch,
-                &parse_join_scalar_sql_expression(right, table_aliases)?,
-            )?;
-            Ok(BooleanArray::from(compare_evaluated_scalars(
-                left, op, right,
-            )?))
-        }
-        SqlExpr::IsNull(expr) | SqlExpr::IsNotNull(expr) => {
-            let value = evaluate_scalar_expression(
-                batch,
-                &parse_join_scalar_sql_expression(expr, table_aliases)?,
-            )?;
-            let is_not_null = matches!(predicate, SqlExpr::IsNotNull(_));
-            Ok(BooleanArray::from(
-                scalar_null_mask(value)
-                    .into_iter()
-                    .map(|is_null| Some(if is_not_null { !is_null } else { is_null }))
-                    .collect::<Vec<_>>(),
-            ))
-        }
-        SqlExpr::InList {
-            expr,
-            list,
-            negated,
-        } => {
-            let value = evaluate_scalar_expression(
-                batch,
-                &parse_join_scalar_sql_expression(expr, table_aliases)?,
-            )?;
-            let values = list
-                .iter()
-                .map(|expr| {
-                    evaluate_scalar_expression(
-                        batch,
-                        &parse_join_scalar_sql_expression(expr, table_aliases)?,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(BooleanArray::from(evaluate_scalar_in_list(
-                value, &values, *negated,
-            )?))
-        }
-        SqlExpr::Like {
-            negated,
-            any,
-            expr,
-            pattern,
-            escape_char,
-        } => {
-            if *any {
-                return Err(DodamError::UnsupportedSql(
-                    "LIKE ANY is not supported".to_string(),
-                ));
-            }
-            let value = scalar_as_utf8(evaluate_scalar_expression(
-                batch,
-                &parse_join_scalar_sql_expression(expr, table_aliases)?,
-            )?)?;
-            let pattern = sql_like_pattern(pattern)?;
-            let escape = sql_like_escape(escape_char)?;
-            let tokens = scalar_like_pattern_tokens(&pattern, escape)?;
-            Ok(BooleanArray::from(
-                value
-                    .into_iter()
-                    .map(|value| {
-                        value.map(|value| {
-                            let matched = scalar_like_matches(&value, &tokens);
-                            if *negated { !matched } else { matched }
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-            ))
-        }
-        _ => Err(DodamError::UnsupportedSql(format!(
-            "unsupported JOIN expression WHERE predicate: {predicate}"
-        ))),
-    }
+    evaluate_scalar_predicate_with_parser(
+        batch,
+        predicate,
+        ScalarPredicateParser::Join(table_aliases),
+    )
 }
 
 fn evaluate_scalar_predicate(
@@ -38675,22 +38582,60 @@ fn evaluate_scalar_predicate(
     predicate: &SqlExpr,
     table_alias: Option<&str>,
 ) -> Result<BooleanArray> {
+    evaluate_scalar_predicate_with_parser(
+        batch,
+        predicate,
+        ScalarPredicateParser::Single(table_alias),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ScalarPredicateParser<'a> {
+    Single(Option<&'a str>),
+    Join(&'a [&'a str]),
+}
+
+impl ScalarPredicateParser<'_> {
+    fn parse(self, expr: &SqlExpr) -> Result<ScalarSqlExpression> {
+        match self {
+            ScalarPredicateParser::Single(table_alias) => {
+                parse_scalar_sql_expression(expr, table_alias)
+            }
+            ScalarPredicateParser::Join(table_aliases) => {
+                parse_join_scalar_sql_expression(expr, table_aliases)
+            }
+        }
+    }
+
+    fn unsupported_context(self) -> &'static str {
+        match self {
+            ScalarPredicateParser::Single(_) => "expression",
+            ScalarPredicateParser::Join(_) => "JOIN expression",
+        }
+    }
+}
+
+fn evaluate_scalar_predicate_with_parser(
+    batch: &RecordBatch,
+    predicate: &SqlExpr,
+    parser: ScalarPredicateParser<'_>,
+) -> Result<BooleanArray> {
     match predicate {
         SqlExpr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
-            let left = evaluate_scalar_predicate(batch, left, table_alias)?;
-            let right = evaluate_scalar_predicate(batch, right, table_alias)?;
+            let left = evaluate_scalar_predicate_with_parser(batch, left, parser)?;
+            let right = evaluate_scalar_predicate_with_parser(batch, right, parser)?;
             Ok(boolean_and(&left, &right))
         }
         SqlExpr::BinaryOp { left, op, right } if *op == BinaryOperator::Or => {
-            let left = evaluate_scalar_predicate(batch, left, table_alias)?;
-            let right = evaluate_scalar_predicate(batch, right, table_alias)?;
+            let left = evaluate_scalar_predicate_with_parser(batch, left, parser)?;
+            let right = evaluate_scalar_predicate_with_parser(batch, right, parser)?;
             Ok(boolean_or(&left, &right))
         }
         SqlExpr::UnaryOp { op, expr } if *op == UnaryOperator::Not => {
-            let mask = evaluate_scalar_predicate(batch, expr, table_alias)?;
+            let mask = evaluate_scalar_predicate_with_parser(batch, expr, parser)?;
             Ok(boolean_not(&mask))
         }
-        SqlExpr::Nested(expr) => evaluate_scalar_predicate(batch, expr, table_alias),
+        SqlExpr::Nested(expr) => evaluate_scalar_predicate_with_parser(batch, expr, parser),
         SqlExpr::BinaryOp { left, op, right }
             if matches!(
                 op,
@@ -38702,23 +38647,14 @@ fn evaluate_scalar_predicate(
                     | BinaryOperator::LtEq
             ) =>
         {
-            let left = evaluate_scalar_expression(
-                batch,
-                &parse_scalar_sql_expression(left, table_alias)?,
-            )?;
-            let right = evaluate_scalar_expression(
-                batch,
-                &parse_scalar_sql_expression(right, table_alias)?,
-            )?;
+            let left = evaluate_scalar_expression(batch, &parser.parse(left)?)?;
+            let right = evaluate_scalar_expression(batch, &parser.parse(right)?)?;
             Ok(BooleanArray::from(compare_evaluated_scalars(
                 left, op, right,
             )?))
         }
         SqlExpr::IsNull(expr) | SqlExpr::IsNotNull(expr) => {
-            let value = evaluate_scalar_expression(
-                batch,
-                &parse_scalar_sql_expression(expr, table_alias)?,
-            )?;
+            let value = evaluate_scalar_expression(batch, &parser.parse(expr)?)?;
             let is_not_null = matches!(predicate, SqlExpr::IsNotNull(_));
             Ok(BooleanArray::from(
                 scalar_null_mask(value)
@@ -38732,18 +38668,10 @@ fn evaluate_scalar_predicate(
             list,
             negated,
         } => {
-            let value = evaluate_scalar_expression(
-                batch,
-                &parse_scalar_sql_expression(expr, table_alias)?,
-            )?;
+            let value = evaluate_scalar_expression(batch, &parser.parse(expr)?)?;
             let values = list
                 .iter()
-                .map(|expr| {
-                    evaluate_scalar_expression(
-                        batch,
-                        &parse_scalar_sql_expression(expr, table_alias)?,
-                    )
-                })
+                .map(|expr| evaluate_scalar_expression(batch, &parser.parse(expr)?))
                 .collect::<Result<Vec<_>>>()?;
             Ok(BooleanArray::from(evaluate_scalar_in_list(
                 value, &values, *negated,
@@ -38761,10 +38689,7 @@ fn evaluate_scalar_predicate(
                     "LIKE ANY is not supported".to_string(),
                 ));
             }
-            let value = scalar_as_utf8(evaluate_scalar_expression(
-                batch,
-                &parse_scalar_sql_expression(expr, table_alias)?,
-            )?)?;
+            let value = scalar_as_utf8(evaluate_scalar_expression(batch, &parser.parse(expr)?)?)?;
             let pattern = sql_like_pattern(pattern)?;
             let escape = sql_like_escape(escape_char)?;
             let tokens = scalar_like_pattern_tokens(&pattern, escape)?;
@@ -38781,7 +38706,8 @@ fn evaluate_scalar_predicate(
             ))
         }
         _ => Err(DodamError::UnsupportedSql(format!(
-            "unsupported expression WHERE predicate: {predicate}"
+            "unsupported {} WHERE predicate: {predicate}",
+            parser.unsupported_context()
         ))),
     }
 }

@@ -1946,6 +1946,10 @@ Tried and rejected or neutral:
           - Routed arithmetic type mismatches through the dedicated `TypeMismatch` error variant instead of generic `UnsupportedSql`.
           - Expanded randomized DuckDB differential generation with correlated pair-key `IN`, mixed-scale decimal column comparisons, Decimal CAST, and Decimal product projection.
           - Added a JOIN expression-filter fallback for nested/list predicates, so alias-qualified predicates such as `n.attrs.more_tags[1] = 9 OR array_length(n.attrs.more_tags) > 1` are evaluated after join materialization with DuckDB differential coverage.
+          - Generalized the JOIN expression-filter path further: input scan projection now adds only the base columns referenced by the expression predicate instead of falling back to `Projection::All`, while the joined output still stays wide until the filter is applied.
+          - Removed duplicate scalar predicate evaluator logic by routing single-table and JOIN expression predicates through one evaluator with parser-specific scalar binding.
+          - Extended JOIN nested/list predicate differential coverage to `COALESCE`/`LIKE`, `CAST`/`IN`/`IS NULL`, and searched `CASE` expression predicates.
+          - Added JOIN nested/list error-contract coverage for unknown nested fields, invalid list-index expression types, unknown nested qualifiers, and unsupported nested scalar functions.
           - Validation: full `cargo fmt && cargo check -q && cargo test -q` passed.
         - Retuned Q12 defaults: `DODAM_Q12_ROW_GROUP_MAP_CHUNK` from `2` to `4`, and `DODAM_Q12_ORDER_FUSED_ROW_GROUP_CHUNK` from `4` to `1`. Sequential sweeps: lineitem chunk `4` was best in the sampled run (`~129.0ms` vs default area `~129.8-133.5ms`), while order fused chunk `1` was clearly best (`~125.3ms` vs `~132-139ms` for larger chunks). Combined explicit setting sampled Dodam `~123.0ms` vs DuckDB `~125.5ms`.
         - Validation after making these Q12 defaults: `cargo fmt --all --check`, `cargo check -q`, `cargo test -q`, and release build passed. Individual SF=10 Q12 sampled Dodam `~123.8ms` vs DuckDB `~127.5ms`, moving Q12 back to faster in this run.
