@@ -142,6 +142,11 @@ def generic_queries(data_dir: Path) -> list[GenericQuery]:
             f"SELECT key, count(*), sum(value) FROM read_parquet('{facts}') GROUP BY key ORDER BY key NULLS FIRST",
         ),
         GenericQuery(
+            "non_null_bucket_count_sum",
+            f"SELECT bucket, count(*), sum(value) FROM '{facts}' GROUP BY bucket ORDER BY bucket",
+            f"SELECT bucket, count(*), sum(value) FROM read_parquet('{facts}') GROUP BY bucket ORDER BY bucket",
+        ),
+        GenericQuery(
             "string_low_cardinality_group",
             f"SELECT label, count(*), sum(value) FROM '{facts}' WHERE id < 200000 GROUP BY label ORDER BY label NULLS FIRST",
             f"SELECT label, count(*), sum(value) FROM read_parquet('{facts}') WHERE id < 200000 GROUP BY label ORDER BY label NULLS FIRST",

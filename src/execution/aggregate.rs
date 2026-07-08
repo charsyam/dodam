@@ -14,8 +14,8 @@ use arrow_row::{OwnedRow, RowConverter, SortField};
 
 use crate::error::{DodamError, Result};
 use crate::execution::logical::{
-    AggregateExpr, AggregateMetrics, AggregateResult, AggregateValue, GroupAggregateResult,
-    GroupValue,
+    AggregateExpr, AggregateMetrics, AggregateResult, AggregateValue, ComparisonOp, Expr,
+    GroupAggregateResult, GroupValue, LiteralValue,
 };
 use crate::execution::metrics::SendableBatchStream;
 use crate::execution::physical::column_index;
@@ -1321,6 +1321,99 @@ fn decimal_min_result_type(value: Option<&AggregateResult>) -> Option<(u8, i8)> 
     Some((precision, scale))
 }
 
+pub(crate) struct SingleKeyCountSumVectorState {
+    sum_expr: AggregateExpr,
+    group_index: CountSumGroupIndex,
+    groups: Vec<CountSumGroup>,
+}
+
+impl SingleKeyCountSumVectorState {
+    pub(crate) fn new(sum_expr: AggregateExpr) -> Self {
+        Self {
+            sum_expr,
+            group_index: CountSumGroupIndex::Int32 {
+                groups: DenseI32GroupIndex::default(),
+                null_group: None,
+            },
+            groups: Vec::new(),
+        }
+    }
+
+    pub(crate) fn consume_i32_i64_batch(&mut self, batch: BatchView<'_>) -> Result<()> {
+        let key_values = batch.i32_vector(0).ok_or_else(|| {
+            DodamError::UnsupportedSql(
+                "direct primitive count/sum projected key is not Int32".to_string(),
+            )
+        })?;
+        let sum_values = batch.i64_vector(1).ok_or_else(|| {
+            DodamError::UnsupportedSql(
+                "direct primitive count/sum projected sum input is not Int64".to_string(),
+            )
+        })?;
+        let Some(keys) = key_values.values_if_null_free() else {
+            return Err(DodamError::UnsupportedSql(
+                "direct primitive count/sum requires non-null key".to_string(),
+            ));
+        };
+        let Some(sums) = sum_values.values_if_null_free() else {
+            return Err(DodamError::UnsupportedSql(
+                "direct primitive count/sum requires non-null sum input".to_string(),
+            ));
+        };
+        if keys.len() != sums.len() {
+            return Err(DodamError::UnsupportedSql(
+                "direct primitive count/sum column length mismatch".to_string(),
+            ));
+        }
+        let CountSumGroupIndex::Int32 { groups: index, .. } = &mut self.group_index else {
+            unreachable!("vector count/sum state uses Int32 group index")
+        };
+        for row in 0..keys.len() {
+            let group_id = count_sum_group_id_for_i32(
+                index,
+                keys[row],
+                &mut self.groups,
+                &CountSumValueInput::Int64Raw,
+            );
+            self.groups[group_id].update_raw_i64_non_null(sums[row]);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn merge(&mut self, partial: Self) -> Result<()> {
+        let CountSumGroupIndex::Int32 { groups: index, .. } = &mut self.group_index else {
+            unreachable!("vector count/sum state uses Int32 group index")
+        };
+        for partial_group in partial.groups {
+            let GroupValue::Int64(Some(key)) = partial_group.key else {
+                return Err(DodamError::UnsupportedSql(
+                    "direct primitive count/sum partial key shape mismatch".to_string(),
+                ));
+            };
+            let key = i32::try_from(key).map_err(|_| {
+                DodamError::UnsupportedSql(
+                    "direct primitive count/sum partial key out of Int32 range".to_string(),
+                )
+            })?;
+            let group_id = count_sum_group_id_for_i32(
+                index,
+                key,
+                &mut self.groups,
+                &CountSumValueInput::Int64Raw,
+            );
+            self.groups[group_id].merge_group(partial_group);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> AggregateMetrics {
+        AggregateMetrics {
+            groups: finish_count_sum_groups(self.group_index, self.groups, self.sum_expr),
+            ..AggregateMetrics::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct DecimalDateRangeFilter {
     pub(crate) decimal_min: Option<i128>,
@@ -1330,12 +1423,208 @@ pub(crate) struct DecimalDateRangeFilter {
 }
 
 impl DecimalDateRangeFilter {
+    pub(crate) fn try_new(
+        expr: &Expr,
+        decimal_column: &str,
+        date_column: &str,
+        decimal_scale: i8,
+    ) -> Result<Option<Self>> {
+        let mut filter = Self::default();
+        if !filter.add_expr(expr, decimal_column, date_column, decimal_scale)? {
+            return Ok(None);
+        }
+        Ok(Some(filter))
+    }
+
+    fn add_expr(
+        &mut self,
+        expr: &Expr,
+        decimal_column: &str,
+        date_column: &str,
+        decimal_scale: i8,
+    ) -> Result<bool> {
+        match expr {
+            Expr::Boolean(Some(true)) => Ok(true),
+            Expr::And(left, right) => {
+                Ok(
+                    self.add_expr(left, decimal_column, date_column, decimal_scale)?
+                        && self.add_expr(right, decimal_column, date_column, decimal_scale)?,
+                )
+            }
+            Expr::Comparison(comparison) if comparison.column == decimal_column => {
+                let Some(value) = literal_to_decimal_raw(&comparison.value, decimal_scale) else {
+                    return Ok(false);
+                };
+                Ok(self.add_decimal_comparison(comparison.op, value))
+            }
+            Expr::Comparison(comparison) if comparison.column == date_column => {
+                let Some(value) = literal_to_date32(&comparison.value) else {
+                    return Ok(false);
+                };
+                Ok(self.add_date_comparison(comparison.op, value))
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn add_decimal_comparison(&mut self, op: ComparisonOp, value: i128) -> bool {
+        match op {
+            ComparisonOp::Eq => {
+                self.decimal_min =
+                    Some(self.decimal_min.map_or(value, |current| current.max(value)));
+                self.decimal_max =
+                    Some(self.decimal_max.map_or(value, |current| current.min(value)));
+                true
+            }
+            ComparisonOp::Lt => {
+                let Some(value) = value.checked_sub(1) else {
+                    return false;
+                };
+                self.decimal_max =
+                    Some(self.decimal_max.map_or(value, |current| current.min(value)));
+                true
+            }
+            ComparisonOp::LtEq => {
+                self.decimal_max =
+                    Some(self.decimal_max.map_or(value, |current| current.min(value)));
+                true
+            }
+            ComparisonOp::Gt => {
+                let Some(value) = value.checked_add(1) else {
+                    return false;
+                };
+                self.decimal_min =
+                    Some(self.decimal_min.map_or(value, |current| current.max(value)));
+                true
+            }
+            ComparisonOp::GtEq => {
+                self.decimal_min =
+                    Some(self.decimal_min.map_or(value, |current| current.max(value)));
+                true
+            }
+            ComparisonOp::NotEq => false,
+        }
+    }
+
+    fn add_date_comparison(&mut self, op: ComparisonOp, value: i32) -> bool {
+        match op {
+            ComparisonOp::Eq => {
+                self.date_min = Some(self.date_min.map_or(value, |current| current.max(value)));
+                self.date_max = Some(self.date_max.map_or(value, |current| current.min(value)));
+                true
+            }
+            ComparisonOp::Lt => {
+                let Some(value) = value.checked_sub(1) else {
+                    return false;
+                };
+                self.date_max = Some(self.date_max.map_or(value, |current| current.min(value)));
+                true
+            }
+            ComparisonOp::LtEq => {
+                self.date_max = Some(self.date_max.map_or(value, |current| current.min(value)));
+                true
+            }
+            ComparisonOp::Gt => {
+                let Some(value) = value.checked_add(1) else {
+                    return false;
+                };
+                self.date_min = Some(self.date_min.map_or(value, |current| current.max(value)));
+                true
+            }
+            ComparisonOp::GtEq => {
+                self.date_min = Some(self.date_min.map_or(value, |current| current.max(value)));
+                true
+            }
+            ComparisonOp::NotEq => false,
+        }
+    }
+
     fn matches(&self, decimal: i128, date: i32) -> bool {
         self.decimal_min.is_none_or(|min| decimal >= min)
             && self.decimal_max.is_none_or(|max| decimal <= max)
             && self.date_min.is_none_or(|min| date >= min)
             && self.date_max.is_none_or(|max| date <= max)
     }
+}
+
+fn literal_to_decimal_raw(value: &LiteralValue, scale: i8) -> Option<i128> {
+    let factor = decimal_scale_factor_i128(scale)?;
+    match value {
+        LiteralValue::Int64(value) => i128::from(*value).checked_mul(factor),
+        LiteralValue::Float64(value) if value.is_finite() => {
+            Some((*value * factor as f64).round() as i128)
+        }
+        LiteralValue::Utf8(value) => parse_decimal_literal_raw(value, scale),
+        _ => None,
+    }
+}
+
+fn decimal_scale_factor_i128(scale: i8) -> Option<i128> {
+    let scale = u32::try_from(scale).ok()?;
+    10_i128.checked_pow(scale)
+}
+
+fn parse_decimal_literal_raw(value: &str, scale: i8) -> Option<i128> {
+    if scale < 0 {
+        return None;
+    }
+    let scale = usize::try_from(scale).ok()?;
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let negative = value.starts_with('-');
+    let unsigned = value.strip_prefix(['-', '+']).unwrap_or(value);
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    if whole.is_empty() && fraction.is_empty() {
+        return None;
+    }
+    if !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.len() > scale
+    {
+        return None;
+    }
+    let mut raw = whole.parse::<i128>().ok()?;
+    raw = raw.checked_mul(10_i128.checked_pow(u32::try_from(scale).ok()?)?)?;
+    if !fraction.is_empty() {
+        let mut fraction_raw = fraction.parse::<i128>().ok()?;
+        fraction_raw = fraction_raw
+            .checked_mul(10_i128.checked_pow(u32::try_from(scale - fraction.len()).ok()?)?)?;
+        raw = raw.checked_add(fraction_raw)?;
+    }
+    Some(if negative { -raw } else { raw })
+}
+
+fn literal_to_date32(value: &LiteralValue) -> Option<i32> {
+    match value {
+        LiteralValue::Int64(value) => i32::try_from(*value).ok(),
+        LiteralValue::Utf8(value) => parse_date32_literal(value),
+        _ => None,
+    }
+}
+
+fn parse_date32_literal(value: &str) -> Option<i32> {
+    let mut parts = value.trim().split('-');
+    let year = parts.next()?.parse::<i32>().ok()?;
+    let month = parts.next()?.parse::<u32>().ok()?;
+    let day = parts.next()?.parse::<u32>().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some(days_from_civil(year, month, day))
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i32 {
+    let year = year - i32::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month = month as i32;
+    let day = day as i32;
+    let mp = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 pub(crate) struct SingleKeyCountSumMinMaxVectorState {
@@ -3102,6 +3391,7 @@ enum CountSumValueInput<'a> {
     Int32(&'a Int32Array),
     Int64(&'a Int64Array),
     Float64(&'a Float64Array),
+    Int64Raw,
 }
 
 impl<'a> CountSumValueInput<'a> {
@@ -3599,6 +3889,19 @@ impl CountSumGroup {
             }
             _ => {}
         }
+    }
+
+    fn update_raw_i64_non_null(&mut self, value: i64) {
+        self.count += 1;
+        self.sum_i64 = self.sum_i64.saturating_add(value);
+        self.sum_count += 1;
+    }
+
+    fn merge_group(&mut self, partial: Self) {
+        self.count = self.count.saturating_add(partial.count);
+        self.sum_i64 = self.sum_i64.saturating_add(partial.sum_i64);
+        self.sum_f64 += partial.sum_f64;
+        self.sum_count = self.sum_count.saturating_add(partial.sum_count);
     }
 
     fn merge_partial_values(&mut self, values: &[AggregateResult]) -> Result<()> {

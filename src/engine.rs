@@ -28,9 +28,10 @@ use crate::execution::{
     LimitExec, LiteralValue, LocalFoldExec, MemoryExec, PartitionedHashJoinExec,
     PartitionedHashJoinOptions, PhysicalPlan, PredicateSet, Projection, ProjectionExec,
     RecordBatchSink, ScanExec, ScanMetrics, ScanPlanMetrics, SendableBatchStream,
-    SingleKeyCountSumMinMaxVectorState, SortExec, SortExpr, SortKey, SortMergeJoinExec,
-    can_merge_partial_aggregates, collect_aggregates, collect_grouped_aggregates, collect_metrics,
-    evaluate_filter_mask, merge_partial_aggregate_metrics, scan_projection, write_stream_to_sink,
+    SingleKeyCountSumMinMaxVectorState, SingleKeyCountSumVectorState, SortExec, SortExpr, SortKey,
+    SortMergeJoinExec, can_merge_partial_aggregates, collect_aggregates,
+    collect_grouped_aggregates, collect_metrics, evaluate_filter_mask,
+    merge_partial_aggregate_metrics, scan_projection, write_stream_to_sink,
 };
 use crate::plan::{
     ExchangeKind, ExecutionGraphPlan, LogicalPlan, LogicalScan, PhysicalExecutionConfig,
@@ -75,6 +76,24 @@ pub struct LocalExecutionGraphOutput {
     pub streams: Vec<SendableBatchStream>,
     pub metrics: LocalExecutionGraphMetrics,
     pub stage_metrics: Vec<LocalStageExecutionMetrics>,
+}
+
+#[derive(Debug, Clone)]
+struct OwnedDirectPrimitiveColumnSpec {
+    name: String,
+    column_type: DirectPrimitiveColumnType,
+}
+
+impl OwnedDirectPrimitiveColumnSpec {
+    fn borrowed_specs(columns: &[Self]) -> Vec<DirectPrimitiveColumnSpec<'_>> {
+        columns
+            .iter()
+            .map(|column| DirectPrimitiveColumnSpec {
+                name: column.name.as_str(),
+                column_type: column.column_type,
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -764,6 +783,93 @@ impl DodamEngine {
             self.object_store.as_ref(),
             move |columns| consume(BatchView::from_raw_columns(columns)),
         )
+    }
+
+    fn scan_parquet_primitive_columns_parallel_fold<S, Init, Consume, Merge>(
+        &self,
+        path: impl AsRef<Path>,
+        batch_size: usize,
+        row_groups: &[usize],
+        columns: Vec<OwnedDirectPrimitiveColumnSpec>,
+        init: Init,
+        consume: Consume,
+        merge: Merge,
+    ) -> Result<Option<(S, DirectPrimitiveColumnScanMetrics)>>
+    where
+        S: Send,
+        Init: Fn() -> S + Sync,
+        Consume: for<'a> Fn(&mut S, BatchView<'a>) -> Result<()> + Sync,
+        Merge: Fn(&mut S, S) -> Result<()> + Sync,
+    {
+        let path = path.as_ref();
+        let mut state = init();
+        let mut scan_metrics = DirectPrimitiveColumnScanMetrics::default();
+        if row_groups.is_empty() {
+            return Ok(Some((state, scan_metrics)));
+        }
+        if row_groups.len() <= 1 {
+            let specs = OwnedDirectPrimitiveColumnSpec::borrowed_specs(&columns);
+            let Some(metrics) = self.scan_parquet_primitive_columns_view(
+                path,
+                batch_size,
+                row_groups,
+                &specs,
+                |batch| consume(&mut state, batch),
+            )?
+            else {
+                return Ok(None);
+            };
+            log_direct_primitive_fold_profile(path, &columns, &metrics);
+            return Ok(Some((state, metrics)));
+        }
+
+        let workers = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4)
+            .min(row_groups.len());
+        let chunk_size = row_groups.len().div_ceil(workers).max(1);
+        let (sender, receiver) = mpsc::channel();
+        std::thread::scope(|scope| {
+            for row_group_chunk in row_groups.chunks(chunk_size) {
+                let sender = sender.clone();
+                let engine = self.clone();
+                let path = path.to_path_buf();
+                let columns = columns.clone();
+                let row_groups = row_group_chunk.to_vec();
+                let init = &init;
+                let consume = &consume;
+                scope.spawn(move || {
+                    let specs = OwnedDirectPrimitiveColumnSpec::borrowed_specs(&columns);
+                    let mut state = init();
+                    let result = engine.scan_parquet_primitive_columns_view(
+                        &path,
+                        batch_size,
+                        &row_groups,
+                        &specs,
+                        |batch| consume(&mut state, batch),
+                    );
+                    let _ =
+                        sender.send(result.map(|metrics| metrics.map(|metrics| (state, metrics))));
+                });
+            }
+        });
+        drop(sender);
+
+        for received in receiver {
+            let Some((partial, metrics)) = received? else {
+                return Ok(None);
+            };
+            merge(&mut state, partial)?;
+            scan_metrics.row_groups = scan_metrics.row_groups.saturating_add(metrics.row_groups);
+            scan_metrics.batches = scan_metrics.batches.saturating_add(metrics.batches);
+            scan_metrics.rows = scan_metrics.rows.saturating_add(metrics.rows);
+            scan_metrics.read_nanos = scan_metrics.read_nanos.saturating_add(metrics.read_nanos);
+            scan_metrics.consume_nanos = scan_metrics
+                .consume_nanos
+                .saturating_add(metrics.consume_nanos);
+        }
+        log_direct_primitive_fold_profile(path, &columns, &scan_metrics);
+        Ok(Some((state, scan_metrics)))
     }
 
     pub(crate) fn scan_parquet_i64_byte_array_payload_columns<F>(
@@ -3986,6 +4092,17 @@ impl DodamEngine {
                 )
                 .await;
         }
+        if let Some(metrics) = self
+            .try_direct_primitive_count_sum_aggregate(
+                path.clone(),
+                batch_size,
+                &aggregates,
+                &group_by,
+            )
+            .await?
+        {
+            return Ok(Some(metrics));
+        }
         let projection = aggregate_projection(&aggregates, &group_by);
         if matches!(projection, Projection::All) {
             return Ok(None);
@@ -4070,117 +4187,46 @@ impl DodamEngine {
             .iter()
             .map(|task| task.row_group)
             .collect::<Vec<_>>();
-        let specs = [
-            DirectPrimitiveColumnSpec {
-                name: shape.key_column.as_str(),
+        let started = Instant::now();
+        let columns = vec![
+            OwnedDirectPrimitiveColumnSpec {
+                name: shape.key_column.clone(),
                 column_type: DirectPrimitiveColumnType::I32,
             },
-            DirectPrimitiveColumnSpec {
-                name: shape.sum_column.as_str(),
+            OwnedDirectPrimitiveColumnSpec {
+                name: shape.sum_column.clone(),
                 column_type: DirectPrimitiveColumnType::I64,
             },
-            DirectPrimitiveColumnSpec {
-                name: shape.min_decimal_column.as_str(),
+            OwnedDirectPrimitiveColumnSpec {
+                name: shape.min_decimal_column.clone(),
                 column_type: DirectPrimitiveColumnType::Decimal128Int64 {
                     precision: shape.decimal_precision,
                     scale: shape.decimal_scale,
                 },
             },
-            DirectPrimitiveColumnSpec {
-                name: shape.max_date_column.as_str(),
+            OwnedDirectPrimitiveColumnSpec {
+                name: shape.max_date_column.clone(),
                 column_type: DirectPrimitiveColumnType::Date32,
             },
         ];
-        let started = Instant::now();
-        let mut state = SingleKeyCountSumMinMaxVectorState::new(
-            aggregates.to_vec(),
-            shape.decimal_precision,
-            shape.decimal_scale,
-        );
-        let mut scan_metrics = DirectPrimitiveColumnScanMetrics::default();
-        if row_groups.len() <= 1 {
-            let Some(metrics) = self.scan_parquet_primitive_columns_view(
-                &local_path,
-                batch_size,
-                &row_groups,
-                &specs,
-                |batch| state.consume_i32_i64_decimal_date_batch(batch, &shape.filter),
-            )?
-            else {
-                return Ok(None);
-            };
-            scan_metrics = metrics;
-        } else {
-            let workers = std::thread::available_parallelism()
-                .map(usize::from)
-                .unwrap_or(4)
-                .min(row_groups.len());
-            let chunk_size = row_groups.len().div_ceil(workers).max(1);
-            let (sender, receiver) = mpsc::channel();
-            std::thread::scope(|scope| {
-                for row_group_chunk in row_groups.chunks(chunk_size) {
-                    let sender = sender.clone();
-                    let engine = self.clone();
-                    let local_path = local_path.clone();
-                    let shape = shape.clone();
-                    let aggregates = aggregates.to_vec();
-                    let row_groups = row_group_chunk.to_vec();
-                    scope.spawn(move || {
-                        let specs = [
-                            DirectPrimitiveColumnSpec {
-                                name: shape.key_column.as_str(),
-                                column_type: DirectPrimitiveColumnType::I32,
-                            },
-                            DirectPrimitiveColumnSpec {
-                                name: shape.sum_column.as_str(),
-                                column_type: DirectPrimitiveColumnType::I64,
-                            },
-                            DirectPrimitiveColumnSpec {
-                                name: shape.min_decimal_column.as_str(),
-                                column_type: DirectPrimitiveColumnType::Decimal128Int64 {
-                                    precision: shape.decimal_precision,
-                                    scale: shape.decimal_scale,
-                                },
-                            },
-                            DirectPrimitiveColumnSpec {
-                                name: shape.max_date_column.as_str(),
-                                column_type: DirectPrimitiveColumnType::Date32,
-                            },
-                        ];
-                        let mut state = SingleKeyCountSumMinMaxVectorState::new(
-                            aggregates,
-                            shape.decimal_precision,
-                            shape.decimal_scale,
-                        );
-                        let result = engine.scan_parquet_primitive_columns_view(
-                            &local_path,
-                            batch_size,
-                            &row_groups,
-                            &specs,
-                            |batch| state.consume_i32_i64_decimal_date_batch(batch, &shape.filter),
-                        );
-                        let _ = sender
-                            .send(result.map(|metrics| metrics.map(|metrics| (state, metrics))));
-                    });
-                }
-            });
-            drop(sender);
-            for received in receiver {
-                let Some((partial, metrics)) = received? else {
-                    return Ok(None);
-                };
-                state.merge(partial)?;
-                scan_metrics.row_groups =
-                    scan_metrics.row_groups.saturating_add(metrics.row_groups);
-                scan_metrics.batches = scan_metrics.batches.saturating_add(metrics.batches);
-                scan_metrics.rows = scan_metrics.rows.saturating_add(metrics.rows);
-                scan_metrics.read_nanos =
-                    scan_metrics.read_nanos.saturating_add(metrics.read_nanos);
-                scan_metrics.consume_nanos = scan_metrics
-                    .consume_nanos
-                    .saturating_add(metrics.consume_nanos);
-            }
-        }
+        let Some((state, scan_metrics)) = self.scan_parquet_primitive_columns_parallel_fold(
+            &local_path,
+            batch_size,
+            &row_groups,
+            columns,
+            || {
+                SingleKeyCountSumMinMaxVectorState::new(
+                    aggregates.to_vec(),
+                    shape.decimal_precision,
+                    shape.decimal_scale,
+                )
+            },
+            |state, batch| state.consume_i32_i64_decimal_date_batch(batch, &shape.filter),
+            |state, partial| state.merge(partial),
+        )?
+        else {
+            return Ok(None);
+        };
         let mut metrics = state.finish();
         metrics.fragments = 1;
         metrics.batches = scan_metrics.batches;
@@ -4191,6 +4237,72 @@ impl DodamEngine {
             &metrics,
             started.elapsed(),
         );
+        Ok(Some(metrics))
+    }
+
+    async fn try_direct_primitive_count_sum_aggregate(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        aggregates: &[AggregateExpr],
+        group_by: &[String],
+    ) -> Result<Option<AggregateMetrics>> {
+        let Some(shape) = DirectCountSumShape::try_new(aggregates, group_by) else {
+            return Ok(None);
+        };
+        let source = self.plan_table_source(path.clone()).await?;
+        if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
+            return Ok(None);
+        }
+        let local_path = source.fragments[0].parquet_local_path()?.to_path_buf();
+        let projection = Projection::Columns(shape.projection_columns());
+        let task_plan = plan_parquet_scan_tasks(
+            &local_path,
+            &projection,
+            &[],
+            &self.metadata_cache,
+            self.object_store.as_ref(),
+        )?;
+        if task_plan.tasks.is_empty() {
+            return Ok(Some(AggregateMetrics {
+                fragments: 1,
+                ..AggregateMetrics::default()
+            }));
+        }
+        let row_groups = task_plan
+            .tasks
+            .iter()
+            .map(|task| task.row_group)
+            .collect::<Vec<_>>();
+        let columns = vec![
+            OwnedDirectPrimitiveColumnSpec {
+                name: shape.key_column.clone(),
+                column_type: DirectPrimitiveColumnType::I32,
+            },
+            OwnedDirectPrimitiveColumnSpec {
+                name: shape.sum_column.clone(),
+                column_type: DirectPrimitiveColumnType::I64,
+            },
+        ];
+        let started = Instant::now();
+        let Some((state, scan_metrics)) = self.scan_parquet_primitive_columns_parallel_fold(
+            &local_path,
+            batch_size,
+            &row_groups,
+            columns,
+            || SingleKeyCountSumVectorState::new(aggregates[1].clone()),
+            |state, batch| state.consume_i32_i64_batch(batch),
+            |state, partial| state.merge(partial),
+        )?
+        else {
+            return Ok(None);
+        };
+        let mut metrics = state.finish();
+        metrics.fragments = 1;
+        metrics.batches = scan_metrics.batches;
+        metrics.rows = scan_metrics.rows;
+        metrics.aggregate_nanos = elapsed_nanos(started.elapsed());
+        log_aggregate_profile("direct_primitive_count_sum", &metrics, started.elapsed());
         Ok(Some(metrics))
     }
 
@@ -4561,6 +4673,39 @@ fn scan_profile_enabled() -> bool {
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
+fn direct_primitive_profile_enabled() -> bool {
+    std::env::var("DODAM_DIRECT_PRIMITIVE_PROFILE")
+        .or_else(|_| std::env::var("DODAM_TPCH_PROFILE"))
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn log_direct_primitive_fold_profile(
+    path: &Path,
+    columns: &[OwnedDirectPrimitiveColumnSpec],
+    metrics: &DirectPrimitiveColumnScanMetrics,
+) {
+    if !direct_primitive_profile_enabled() {
+        return;
+    }
+    let table = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("scan");
+    let columns = columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    eprintln!(
+        "[dodam:direct-primitive-profile] {table}[{columns}]: row_groups={} rows={} batches={} read={:.3} ms consume={:.3} ms",
+        metrics.row_groups,
+        metrics.rows,
+        metrics.batches,
+        nanos_to_millis(metrics.read_nanos),
+        nanos_to_millis(metrics.consume_nanos),
+    );
+}
+
 fn scan_profile_label(plan: &ScanPlan) -> String {
     let table = plan
         .source
@@ -4699,6 +4844,38 @@ fn average_nanos_millis(nanos: u64, count: usize) -> f64 {
 }
 
 #[derive(Debug, Clone)]
+struct DirectCountSumShape {
+    key_column: String,
+    sum_column: String,
+}
+
+impl DirectCountSumShape {
+    fn try_new(aggregates: &[AggregateExpr], group_by: &[String]) -> Option<Self> {
+        let [key_column] = group_by else {
+            return None;
+        };
+        let [AggregateExpr::CountStar, AggregateExpr::Sum(sum_column)] = aggregates else {
+            return None;
+        };
+        if sum_column == key_column {
+            return None;
+        }
+        Some(Self {
+            key_column: key_column.clone(),
+            sum_column: sum_column.clone(),
+        })
+    }
+
+    fn projection_columns(&self) -> Vec<String> {
+        let mut columns = vec![self.key_column.clone()];
+        if self.sum_column != self.key_column {
+            columns.push(self.sum_column.clone());
+        }
+        columns
+    }
+}
+
+#[derive(Debug, Clone)]
 struct DirectCountSumMinMaxShape {
     key_column: String,
     sum_column: String,
@@ -4768,204 +4945,6 @@ impl DirectCountSumMinMaxShape {
         }
         columns
     }
-}
-
-impl DecimalDateRangeFilter {
-    fn try_new(
-        expr: &Expr,
-        decimal_column: &str,
-        date_column: &str,
-        decimal_scale: i8,
-    ) -> Result<Option<Self>> {
-        let mut filter = Self::default();
-        if !filter.add_expr(expr, decimal_column, date_column, decimal_scale)? {
-            return Ok(None);
-        }
-        Ok(Some(filter))
-    }
-
-    fn add_expr(
-        &mut self,
-        expr: &Expr,
-        decimal_column: &str,
-        date_column: &str,
-        decimal_scale: i8,
-    ) -> Result<bool> {
-        match expr {
-            Expr::Boolean(Some(true)) => Ok(true),
-            Expr::And(left, right) => {
-                Ok(
-                    self.add_expr(left, decimal_column, date_column, decimal_scale)?
-                        && self.add_expr(right, decimal_column, date_column, decimal_scale)?,
-                )
-            }
-            Expr::Comparison(comparison) if comparison.column == decimal_column => {
-                let Some(value) = literal_to_decimal_raw(&comparison.value, decimal_scale) else {
-                    return Ok(false);
-                };
-                Ok(self.add_decimal_comparison(comparison.op, value))
-            }
-            Expr::Comparison(comparison) if comparison.column == date_column => {
-                let Some(value) = literal_to_date32(&comparison.value) else {
-                    return Ok(false);
-                };
-                Ok(self.add_date_comparison(comparison.op, value))
-            }
-            _ => Ok(false),
-        }
-    }
-
-    fn add_decimal_comparison(&mut self, op: ComparisonOp, value: i128) -> bool {
-        match op {
-            ComparisonOp::Eq => {
-                self.decimal_min =
-                    Some(self.decimal_min.map_or(value, |current| current.max(value)));
-                self.decimal_max =
-                    Some(self.decimal_max.map_or(value, |current| current.min(value)));
-                true
-            }
-            ComparisonOp::Lt => {
-                let Some(value) = value.checked_sub(1) else {
-                    return false;
-                };
-                self.decimal_max =
-                    Some(self.decimal_max.map_or(value, |current| current.min(value)));
-                true
-            }
-            ComparisonOp::LtEq => {
-                self.decimal_max =
-                    Some(self.decimal_max.map_or(value, |current| current.min(value)));
-                true
-            }
-            ComparisonOp::Gt => {
-                let Some(value) = value.checked_add(1) else {
-                    return false;
-                };
-                self.decimal_min =
-                    Some(self.decimal_min.map_or(value, |current| current.max(value)));
-                true
-            }
-            ComparisonOp::GtEq => {
-                self.decimal_min =
-                    Some(self.decimal_min.map_or(value, |current| current.max(value)));
-                true
-            }
-            ComparisonOp::NotEq => false,
-        }
-    }
-
-    fn add_date_comparison(&mut self, op: ComparisonOp, value: i32) -> bool {
-        match op {
-            ComparisonOp::Eq => {
-                self.date_min = Some(self.date_min.map_or(value, |current| current.max(value)));
-                self.date_max = Some(self.date_max.map_or(value, |current| current.min(value)));
-                true
-            }
-            ComparisonOp::Lt => {
-                let Some(value) = value.checked_sub(1) else {
-                    return false;
-                };
-                self.date_max = Some(self.date_max.map_or(value, |current| current.min(value)));
-                true
-            }
-            ComparisonOp::LtEq => {
-                self.date_max = Some(self.date_max.map_or(value, |current| current.min(value)));
-                true
-            }
-            ComparisonOp::Gt => {
-                let Some(value) = value.checked_add(1) else {
-                    return false;
-                };
-                self.date_min = Some(self.date_min.map_or(value, |current| current.max(value)));
-                true
-            }
-            ComparisonOp::GtEq => {
-                self.date_min = Some(self.date_min.map_or(value, |current| current.max(value)));
-                true
-            }
-            ComparisonOp::NotEq => false,
-        }
-    }
-}
-
-fn literal_to_decimal_raw(value: &LiteralValue, scale: i8) -> Option<i128> {
-    let factor = decimal_scale_factor_i128(scale)?;
-    match value {
-        LiteralValue::Int64(value) => i128::from(*value).checked_mul(factor),
-        LiteralValue::Float64(value) if value.is_finite() => {
-            Some((*value * factor as f64).round() as i128)
-        }
-        LiteralValue::Utf8(value) => parse_decimal_literal_raw(value, scale),
-        _ => None,
-    }
-}
-
-fn decimal_scale_factor_i128(scale: i8) -> Option<i128> {
-    let scale = u32::try_from(scale).ok()?;
-    10_i128.checked_pow(scale)
-}
-
-fn parse_decimal_literal_raw(value: &str, scale: i8) -> Option<i128> {
-    if scale < 0 {
-        return None;
-    }
-    let scale = usize::try_from(scale).ok()?;
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
-    }
-    let negative = value.starts_with('-');
-    let unsigned = value.strip_prefix(['-', '+']).unwrap_or(value);
-    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
-    if whole.is_empty() && fraction.is_empty() {
-        return None;
-    }
-    if !whole.bytes().all(|byte| byte.is_ascii_digit())
-        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-        || fraction.len() > scale
-    {
-        return None;
-    }
-    let mut raw = whole.parse::<i128>().ok()?;
-    raw = raw.checked_mul(10_i128.checked_pow(u32::try_from(scale).ok()?)?)?;
-    if !fraction.is_empty() {
-        let mut fraction_raw = fraction.parse::<i128>().ok()?;
-        fraction_raw = fraction_raw
-            .checked_mul(10_i128.checked_pow(u32::try_from(scale - fraction.len()).ok()?)?)?;
-        raw = raw.checked_add(fraction_raw)?;
-    }
-    Some(if negative { -raw } else { raw })
-}
-
-fn literal_to_date32(value: &LiteralValue) -> Option<i32> {
-    match value {
-        LiteralValue::Int64(value) => i32::try_from(*value).ok(),
-        LiteralValue::Utf8(value) => parse_date32_literal(value),
-        _ => None,
-    }
-}
-
-fn parse_date32_literal(value: &str) -> Option<i32> {
-    let mut parts = value.trim().split('-');
-    let year = parts.next()?.parse::<i32>().ok()?;
-    let month = parts.next()?.parse::<u32>().ok()?;
-    let day = parts.next()?.parse::<u32>().ok()?;
-    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    Some(days_from_civil(year, month, day))
-}
-
-fn days_from_civil(year: i32, month: u32, day: u32) -> i32 {
-    let year = year - i32::from(month <= 2);
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let yoe = year - era * 400;
-    let month = month as i32;
-    let day = day as i32;
-    let mp = month + if month > 2 { -3 } else { 9 };
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
 }
 
 fn aggregate_projection(aggregates: &[AggregateExpr], group_by: &[String]) -> Projection {
