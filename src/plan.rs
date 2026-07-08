@@ -93,6 +93,8 @@ pub enum PhysicalOperator {
     Filter,
     Projection,
     Aggregate,
+    LocalFold,
+    FinalMerge,
     HashJoin,
     PartitionedHashJoin,
     SortMergeJoin,
@@ -322,18 +324,21 @@ impl PhysicalPlanner {
                 group_by,
             } => {
                 let input = self.plan_aggregate_input(input, group_by);
-                PhysicalPlanNode::new("AggregateExec")
-                    .attr(
-                        "mode",
-                        if group_by.is_empty() {
-                            "global"
-                        } else {
-                            "grouped"
-                        },
-                    )
+                let mode = if group_by.is_empty() {
+                    "global"
+                } else {
+                    "grouped"
+                };
+                let local_fold = PhysicalPlanNode::new("LocalFoldExec")
+                    .attr("mode", mode)
                     .attr("group_by", format!("[{}]", group_by.join(",")))
                     .attr("aggregates", aggregate_exprs_display(aggregates))
-                    .child(input)
+                    .child(input);
+                PhysicalPlanNode::new("FinalMergeExec")
+                    .attr("mode", mode)
+                    .attr("group_by", format!("[{}]", group_by.join(",")))
+                    .attr("aggregates", aggregate_exprs_display(aggregates))
+                    .child(local_fold)
             }
             LogicalPlan::Join {
                 left,
@@ -908,6 +913,8 @@ impl PhysicalOperator {
             "FilterExec" => Self::Filter,
             "ProjectionExec" => Self::Projection,
             "AggregateExec" => Self::Aggregate,
+            "LocalFoldExec" => Self::LocalFold,
+            "FinalMergeExec" => Self::FinalMerge,
             "JoinExec" => Self::HashJoin,
             "PartitionedHashJoinExec" => Self::PartitionedHashJoin,
             "SortMergeJoinExec" => Self::SortMergeJoin,
@@ -929,6 +936,8 @@ impl PhysicalOperator {
             Self::Filter => "FilterExec",
             Self::Projection => "ProjectionExec",
             Self::Aggregate => "AggregateExec",
+            Self::LocalFold => "LocalFoldExec",
+            Self::FinalMerge => "FinalMergeExec",
             Self::HashJoin => "JoinExec",
             Self::PartitionedHashJoin => "PartitionedHashJoinExec",
             Self::SortMergeJoin => "SortMergeJoinExec",
@@ -1021,13 +1030,15 @@ mod tests {
 
     #[test]
     fn splits_physical_plan_into_exchange_stages() {
-        let plan = PhysicalPlanNode::new("AggregateExec")
+        let plan = PhysicalPlanNode::new("FinalMergeExec")
             .child(
-                PhysicalPlanNode::exchange(ExchangeKind::HashRepartition {
-                    keys: vec!["k".to_string()],
-                    partitions: 8,
-                })
-                .child(PhysicalPlanNode::new("ScanExec").attr("fragments", 4)),
+                PhysicalPlanNode::new("LocalFoldExec").child(
+                    PhysicalPlanNode::exchange(ExchangeKind::HashRepartition {
+                        keys: vec!["k".to_string()],
+                        partitions: 8,
+                    })
+                    .child(PhysicalPlanNode::new("ScanExec").attr("fragments", 4)),
+                ),
             )
             .partitioning(Partitioning::Hash {
                 keys: vec!["k".to_string()],
@@ -1040,10 +1051,14 @@ mod tests {
         assert_eq!(stages[0].root.operator(), &PhysicalOperator::Scan);
         assert!(stages[0].input_stages.is_empty());
         assert_eq!(stages[1].id, 1);
-        assert_eq!(stages[1].root.operator(), &PhysicalOperator::Aggregate);
+        assert_eq!(stages[1].root.operator(), &PhysicalOperator::FinalMerge);
         assert_eq!(stages[1].input_stages, vec![0]);
         assert_eq!(
-            stages[1].root.children()[0].partitioning_ref(),
+            stages[1].root.children()[0].operator(),
+            &PhysicalOperator::LocalFold
+        );
+        assert_eq!(
+            stages[1].root.children()[0].children()[0].partitioning_ref(),
             &Partitioning::Hash {
                 keys: vec!["k".to_string()],
                 partitions: 8,

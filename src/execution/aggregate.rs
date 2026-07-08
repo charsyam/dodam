@@ -331,6 +331,33 @@ pub fn merge_partial_aggregate_metrics(
     Ok(metrics)
 }
 
+pub fn collect_partial_aggregate_batch(
+    batch: RecordBatch,
+    fragments: usize,
+    group_by: &[String],
+    aggregates: &[AggregateExpr],
+) -> Result<Option<AggregateMetrics>> {
+    if batch.num_rows() == 0 {
+        return Ok(None);
+    }
+    let rows = batch.num_rows();
+    let mut metrics = AggregateMetrics {
+        fragments,
+        batches: 1,
+        rows,
+        ..AggregateMetrics::default()
+    };
+    let aggregate_started = Instant::now();
+    if group_by.is_empty() {
+        metrics.values = GlobalAggregateState::from_batch(batch, aggregates)?.finish()?;
+    } else {
+        let groups = collect_grouped_aggregates_batch(batch, group_by, aggregates)?;
+        metrics.groups = finish_group_map(groups)?;
+    }
+    metrics.aggregate_nanos = elapsed_nanos(aggregate_started);
+    Ok(Some(metrics))
+}
+
 fn elapsed_nanos(started: Instant) -> u64 {
     started.elapsed().as_nanos().min(u64::MAX as u128) as u64
 }
@@ -1294,6 +1321,13 @@ fn collect_grouped_aggregates_generic(
         merge_group_maps(&mut groups, partial);
     }
 
+    metrics.groups = finish_group_map(groups)?;
+    Ok(metrics)
+}
+
+fn finish_group_map(
+    groups: AggregateHashMap<OwnedRow, GroupState>,
+) -> Result<Vec<GroupAggregateResult>> {
     let mut group_results = groups
         .into_values()
         .map(|group| {
@@ -1308,8 +1342,7 @@ fn collect_grouped_aggregates_generic(
         })
         .collect::<Result<Vec<_>>>()?;
     group_results.sort_by(|left, right| compare_group_keys(&left.keys, &right.keys));
-    metrics.groups = group_results;
-    Ok(metrics)
+    Ok(group_results)
 }
 
 fn collect_grouped_aggregates_batch(

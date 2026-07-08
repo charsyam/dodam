@@ -34232,7 +34232,7 @@ fn join_working_projection(query: &SqlQuery) -> Result<Projection> {
 }
 
 fn join_input_projection_with_expression_filter(query: &SqlQuery) -> Result<Projection> {
-    if query.join.is_none() || query.expression_filter.is_none() {
+    if query.join.is_none() {
         return Ok(query.projection.clone());
     }
     join_working_projection(query)

@@ -28,8 +28,9 @@ use crate::execution::{
     PartitionedHashJoinExec, PartitionedHashJoinOptions, PhysicalPlan, PredicateSet, Projection,
     ProjectionExec, RecordBatchSink, ScanExec, ScanMetrics, ScanPlanMetrics, SendableBatchStream,
     SortExec, SortExpr, SortKey, SortMergeJoinExec, can_merge_partial_aggregates,
-    collect_aggregates, collect_grouped_aggregates, collect_metrics, evaluate_filter_mask,
-    merge_partial_aggregate_metrics, scan_projection, write_stream_to_sink,
+    collect_aggregates, collect_grouped_aggregates, collect_metrics,
+    collect_partial_aggregate_batch, evaluate_filter_mask, merge_partial_aggregate_metrics,
+    scan_projection, write_stream_to_sink,
 };
 use crate::plan::{
     ExchangeKind, ExecutionGraphPlan, LogicalPlan, LogicalScan, PhysicalExecutionConfig,
@@ -478,7 +479,7 @@ impl AggregatePlan {
     }
 
     pub fn to_plan_node(&self) -> PhysicalPlanNode {
-        PhysicalPlanNode::new("AggregateExec")
+        let local_fold = PhysicalPlanNode::new("LocalFoldExec")
             .attr(
                 "mode",
                 if self.group_by.is_empty() {
@@ -511,7 +512,41 @@ impl AggregatePlan {
                         .join(",")
                 ),
             )
-            .child(self.scan.to_plan_node())
+            .child(self.scan.to_plan_node());
+        PhysicalPlanNode::new("FinalMergeExec")
+            .attr(
+                "mode",
+                if self.group_by.is_empty() {
+                    "global"
+                } else {
+                    "grouped"
+                },
+            )
+            .attr("group_by", format!("[{}]", self.group_by.join(",")))
+            .attr(
+                "payload_columns",
+                projection_display(&self.column_read_plan.payload_projection),
+            )
+            .attr(
+                "predicate_columns",
+                projection_display(&self.column_read_plan.predicate_projection),
+            )
+            .attr(
+                "scan_columns",
+                projection_display(&self.column_read_plan.scan_projection),
+            )
+            .attr(
+                "aggregates",
+                format!(
+                    "[{}]",
+                    self.aggregates
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            )
+            .child(local_fold)
     }
 }
 
@@ -3921,29 +3956,26 @@ impl DodamEngine {
                 batch_size,
                 projection,
                 fused_parquet_aggregate_row_group_chunk(),
-                Vec::<RecordBatch>::new,
-                |batch, batches| {
-                    batches.push(batch);
-                    Ok(Some(()))
-                },
+                Vec::<AggregateMetrics>::new,
                 {
                     let aggregates = aggregates.clone();
                     let group_by = group_by.clone();
-                    move |batches| {
-                        let stream = Box::new(MemoryExec::new(batches)).execute()?;
-                        let metrics = if group_by.is_empty() {
-                            collect_aggregates(stream, 1, &aggregates)?
-                        } else {
-                            collect_grouped_aggregates(stream, 1, &group_by, &aggregates)?
-                        };
-                        Ok(Some(metrics))
+                    move |batch, partials| {
+                        if let Some(metrics) =
+                            collect_partial_aggregate_batch(batch, 1, &group_by, &aggregates)?
+                        {
+                            partials.push(metrics);
+                        }
+                        Ok(Some(()))
                     }
                 },
+                |partials| Ok(Some(partials)),
             )
             .await?
         else {
             return Ok(None);
         };
+        let partials = partials.into_iter().flatten().collect::<Vec<_>>();
         if partials.is_empty() {
             return Ok(None);
         }

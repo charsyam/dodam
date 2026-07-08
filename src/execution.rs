@@ -7,7 +7,7 @@ pub mod typed_rows;
 
 pub use aggregate::{
     can_merge_partial_aggregates, collect_aggregates, collect_grouped_aggregates,
-    merge_partial_aggregate_metrics,
+    collect_partial_aggregate_batch, merge_partial_aggregate_metrics,
 };
 pub use decimal::{
     DecimalInput, decimal_discounted_revenue_raw, decimal_discounted_revenue_scales, decimal_input,
