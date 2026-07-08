@@ -691,13 +691,11 @@ impl CoalesceKeyCountSumGroups {
                 } else {
                     let group_id = self.groups.len();
                     third_index.non_null.insert(string_id, group_id);
-                    self.groups
-                        .push(CoalesceKeyCountSumGroup::new(coalesce_group_values(
-                            self.key_len,
-                            key.first,
-                            key.second,
-                            Some(self.third_strings[string_id as usize].clone()),
-                        )));
+                    self.groups.push(CoalesceKeyCountSumGroup::new(
+                        key.first,
+                        key.second,
+                        Some(string_id),
+                    ));
                     group_id
                 }
             }
@@ -708,12 +706,7 @@ impl CoalesceKeyCountSumGroups {
                     let group_id = self.groups.len();
                     third_index.null_group = Some(group_id);
                     self.groups
-                        .push(CoalesceKeyCountSumGroup::new(coalesce_group_values(
-                            self.key_len,
-                            key.first,
-                            key.second,
-                            None,
-                        )));
+                        .push(CoalesceKeyCountSumGroup::new(key.first, key.second, None));
                     group_id
                 }
             }
@@ -737,13 +730,11 @@ impl CoalesceKeyCountSumGroups {
         } else {
             let group_id = self.groups.len();
             third_index.non_null.insert(string_id, group_id);
-            self.groups
-                .push(CoalesceKeyCountSumGroup::new(coalesce_group_values(
-                    self.key_len,
-                    Some(first),
-                    Some(second),
-                    Some(self.third_strings[string_id as usize].clone()),
-                )));
+            self.groups.push(CoalesceKeyCountSumGroup::new(
+                Some(first),
+                Some(second),
+                Some(string_id),
+            ));
             group_id
         };
         self.groups[group_id].update(sum);
@@ -776,7 +767,7 @@ impl CoalesceKeyCountSumGroups {
         let _ = index;
         let mut groups = groups
             .into_iter()
-            .map(|group| group.finish(aggregates))
+            .map(|group| group.finish(key_len, &third_strings, aggregates))
             .collect::<Vec<_>>();
         groups.sort_by(|left, right| compare_group_keys(&left.keys, &right.keys));
         groups
@@ -799,7 +790,7 @@ fn finish_dense_three_ordered_groups(
             if let Some(group_id) = third_groups.null_group
                 && let Some(group) = groups[group_id].take()
             {
-                output.push(group.finish(aggregates));
+                output.push(group.finish(3, &third_strings, aggregates));
             }
             let mut non_null = third_groups.non_null.iter().collect::<Vec<_>>();
             non_null.sort_by(|(left, _), (right, _)| {
@@ -807,7 +798,7 @@ fn finish_dense_three_ordered_groups(
             });
             for (_, group_id) in non_null {
                 if let Some(group) = groups[group_id].take() {
-                    output.push(group.finish(aggregates));
+                    output.push(group.finish(3, &third_strings, aggregates));
                 }
             }
         }
@@ -917,23 +908,6 @@ fn dense_leading_slot(range: DenseLeadingRange, first: i64, second: i32) -> Opti
     }
 }
 
-fn coalesce_group_values(
-    key_len: usize,
-    first: Option<i64>,
-    second: Option<i32>,
-    third: Option<String>,
-) -> Vec<GroupValue> {
-    if key_len == 2 {
-        vec![GroupValue::Int64(first), GroupValue::Utf8(third)]
-    } else {
-        vec![
-            GroupValue::Int64(first),
-            GroupValue::Date32(second),
-            GroupValue::Utf8(third),
-        ]
-    }
-}
-
 #[derive(Default)]
 struct CoalesceSecondGroups {
     index: AggregateHashMap<Option<i32>, CoalesceThirdGroups>,
@@ -946,16 +920,20 @@ struct CoalesceThirdGroups {
 }
 
 struct CoalesceKeyCountSumGroup {
-    keys: Vec<GroupValue>,
+    first: Option<i64>,
+    second: Option<i32>,
+    third_string_id: Option<u32>,
     count: u64,
     sum: i64,
     sum_count: u64,
 }
 
 impl CoalesceKeyCountSumGroup {
-    fn new(keys: Vec<GroupValue>) -> Self {
+    fn new(first: Option<i64>, second: Option<i32>, third_string_id: Option<u32>) -> Self {
         Self {
-            keys,
+            first,
+            second,
+            third_string_id,
             count: 0,
             sum: 0,
             sum_count: 0,
@@ -970,9 +948,25 @@ impl CoalesceKeyCountSumGroup {
         }
     }
 
-    fn finish(self, aggregates: &[AggregateExpr]) -> GroupAggregateResult {
+    fn finish(
+        self,
+        key_len: usize,
+        third_strings: &[String],
+        aggregates: &[AggregateExpr],
+    ) -> GroupAggregateResult {
+        let third = self
+            .third_string_id
+            .map(|id| third_strings[id as usize].clone());
         GroupAggregateResult {
-            keys: self.keys,
+            keys: if key_len == 2 {
+                vec![GroupValue::Int64(self.first), GroupValue::Utf8(third)]
+            } else {
+                vec![
+                    GroupValue::Int64(self.first),
+                    GroupValue::Date32(self.second),
+                    GroupValue::Utf8(third),
+                ]
+            },
             values: vec![
                 AggregateResult {
                     expr: aggregates[0].clone(),
