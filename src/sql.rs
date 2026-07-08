@@ -358,7 +358,7 @@ pub async fn execute_sql(
             &join.right_keys,
         );
         let output_projection = pushed_join_output_projection(&query)?;
-        let output_projection_pushed = !matches!(output_projection, Projection::All);
+        let output_projection_is_final = output_projection == query.projection;
         let stream = engine
             .join_parquet_batches(JoinParquetRequest {
                 left_path: query.path.clone(),
@@ -437,7 +437,7 @@ pub async fn execute_sql(
             )?;
         } else {
             batches = apply_output_order_limit(batches, query.order_by.as_ref(), query.limit)?;
-            if !output_projection_pushed {
+            if !output_projection_is_final {
                 batches = apply_output_projection(batches, &query.projection)?;
             }
         }
@@ -30832,7 +30832,7 @@ async fn execute_parsed_join_query(
         &join.right_keys,
     );
     let output_projection = pushed_join_output_projection(&query)?;
-    let output_projection_pushed = !matches!(output_projection, Projection::All);
+    let output_projection_is_final = output_projection == query.projection;
     let stream = engine
         .join_parquet_batches(JoinParquetRequest {
             left_path: query.path.clone(),
@@ -30910,7 +30910,7 @@ async fn execute_parsed_join_query(
         )?;
     } else {
         batches = apply_output_order_limit(batches, query.order_by.as_ref(), query.limit)?;
-        if !output_projection_pushed {
+        if !output_projection_is_final {
             batches = apply_output_projection(batches, &query.projection)?;
         }
     }
@@ -33461,6 +33461,9 @@ fn query_allows_direct_join_sink(query: &SqlQuery) -> bool {
 
 fn join_aliases_are_implicit_output_names(aliases: &[(String, String)]) -> bool {
     aliases.iter().all(|(source, target)| {
+        if source.parse::<usize>().is_ok() {
+            return true;
+        }
         source
             .rsplit_once('.')
             .is_some_and(|(_, column)| column == target)
@@ -33595,21 +33598,11 @@ fn pushed_join_output_projection(query: &SqlQuery) -> Result<Projection> {
     if !matches!(join.join_type, JoinType::Inner | JoinType::Semi) {
         return Ok(Projection::All);
     }
-    if query.filter.is_some() || query.order_by.is_some() {
-        return Ok(Projection::All);
-    }
-    if projection_requires_expression_path(&query.expressions) || query.expression_filter.is_some()
-    {
-        return join_input_projection_with_expression_filter(query);
-    }
-    Ok(query.projection.clone())
+    join_working_projection(query)
 }
 
-fn join_input_projection_with_expression_filter(query: &SqlQuery) -> Result<Projection> {
+fn join_working_projection(query: &SqlQuery) -> Result<Projection> {
     let Some(join) = &query.join else {
-        return Ok(query.projection.clone());
-    };
-    let Some(expression_filter) = query.expression_filter.as_ref() else {
         return Ok(query.projection.clone());
     };
     let mut projection = if query.is_aggregate() {
@@ -33617,12 +33610,34 @@ fn join_input_projection_with_expression_filter(query: &SqlQuery) -> Result<Proj
     } else {
         query.projection.clone()
     };
-    let aliases = [join.left_alias.as_str(), join.right_alias.as_str()];
-    add_projection_columns(
-        &mut projection,
-        join_sql_expression_columns(expression_filter, &aliases)?,
-    );
+    if let Some(filter) = &query.filter {
+        add_projection_columns(&mut projection, filter.referenced_columns());
+    }
+    if let Some(order_by) = &query.order_by {
+        add_projection_columns(
+            &mut projection,
+            order_by
+                .expressions
+                .iter()
+                .map(|sort| sort.column.clone())
+                .collect(),
+        );
+    }
+    if let Some(expression_filter) = query.expression_filter.as_ref() {
+        let aliases = [join.left_alias.as_str(), join.right_alias.as_str()];
+        add_projection_columns(
+            &mut projection,
+            join_sql_expression_columns(expression_filter, &aliases)?,
+        );
+    }
     Ok(projection)
+}
+
+fn join_input_projection_with_expression_filter(query: &SqlQuery) -> Result<Projection> {
+    if query.join.is_none() || query.expression_filter.is_none() {
+        return Ok(query.projection.clone());
+    }
+    join_working_projection(query)
 }
 
 fn aggregate_join_output_projection(query: &SqlQuery) -> Projection {
@@ -35117,6 +35132,7 @@ fn parse_join_projection(
         for column in aggregate_expression_columns {
             add_column_once(&mut projected_columns, column);
         }
+        add_projection_ordinal_aliases(&mut aliases, &columns, &aggregates, &expressions);
         return Ok(ParsedProjection {
             projection: Projection::Columns(projected_columns),
             aggregates,
@@ -35126,6 +35142,7 @@ fn parse_join_projection(
         });
     }
 
+    add_projection_ordinal_aliases(&mut aliases, &columns, &aggregates, &expressions);
     Ok(ParsedProjection {
         projection: if wildcard {
             Projection::All
@@ -35178,6 +35195,7 @@ fn parse_join_order_by(
                 ));
             }
             let column = match &order.expr {
+                SqlExpr::Value(value) => resolve_order_by_ordinal(value, aliases)?,
                 SqlExpr::Identifier(ident) => {
                     alias_target(&ident.value, aliases)
                         .cloned()
@@ -36086,6 +36104,7 @@ fn parse_projection(
     }
 
     if aggregates.is_empty() {
+        add_projection_ordinal_aliases(&mut aliases, &columns, &aggregates, &expressions);
         return Ok(ParsedProjection {
             projection: if wildcard {
                 Projection::All
@@ -36128,6 +36147,7 @@ fn parse_projection(
     for column in aggregate_expression_columns {
         add_column_once(&mut projected_columns, column);
     }
+    add_projection_ordinal_aliases(&mut aliases, &columns, &aggregates, &expressions);
     Ok(ParsedProjection {
         projection: Projection::Columns(projected_columns),
         aggregates,
@@ -37518,6 +37538,34 @@ fn add_column_once(columns: &mut Vec<String>, column: String) {
     }
 }
 
+fn add_projection_ordinal_aliases(
+    aliases: &mut Vec<(String, String)>,
+    columns: &[String],
+    aggregates: &[AggregateExpr],
+    expressions: &[ProjectionExpression],
+) {
+    let targets = if !aggregates.is_empty() {
+        columns
+            .iter()
+            .cloned()
+            .chain(aggregates.iter().map(ToString::to_string))
+            .collect::<Vec<_>>()
+    } else if !expressions.is_empty() {
+        expressions
+            .iter()
+            .map(|expression| expression.output_name.clone())
+            .collect::<Vec<_>>()
+    } else {
+        columns.to_vec()
+    };
+    for (index, target) in targets.into_iter().enumerate() {
+        let ordinal = (index + 1).to_string();
+        if alias_target(&ordinal, aliases).is_none() {
+            aliases.push((ordinal, target));
+        }
+    }
+}
+
 fn parse_order_by(
     query: &Query,
     aliases: &[(String, String)],
@@ -37559,6 +37607,7 @@ fn parse_order_expr(
     table_alias: Option<&str>,
 ) -> Result<String> {
     let column = match expr {
+        SqlExpr::Value(value) => resolve_order_by_ordinal(value, aliases)?,
         SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
             sql_column_name(expr, table_alias)?
         }
@@ -37576,6 +37625,31 @@ fn resolve_alias(name: &str, aliases: &[(String, String)]) -> String {
     alias_target(name, aliases)
         .cloned()
         .unwrap_or_else(|| name.to_string())
+}
+
+fn resolve_order_by_ordinal(
+    value: &sqlparser::ast::ValueWithSpan,
+    aliases: &[(String, String)],
+) -> Result<String> {
+    let Value::Number(number, _) = &value.value else {
+        return Err(DodamError::UnsupportedSql(format!(
+            "expected ORDER BY column, ordinal, or aggregate expression, got {}",
+            value.value
+        )));
+    };
+    let ordinal = number
+        .parse::<usize>()
+        .map_err(|_| DodamError::UnsupportedSql(format!("invalid ORDER BY ordinal: {number}")))?;
+    if ordinal == 0 {
+        return Err(DodamError::UnsupportedSql(
+            "ORDER BY ordinal must be greater than zero".to_string(),
+        ));
+    }
+    alias_target(&ordinal.to_string(), aliases)
+        .cloned()
+        .ok_or_else(|| {
+            DodamError::UnsupportedSql(format!("ORDER BY position {ordinal} is out of range"))
+        })
 }
 
 fn alias_target<'a>(name: &str, aliases: &'a [(String, String)]) -> Option<&'a String> {
@@ -41000,7 +41074,11 @@ fn rename_output_batches(
                 .map(|field| {
                     let name = aliases
                         .iter()
-                        .find(|(alias, target)| !alias.contains('(') && target == field.name())
+                        .find(|(alias, target)| {
+                            !alias.contains('(')
+                                && alias.parse::<usize>().is_err()
+                                && target == field.name()
+                        })
                         .map(|(alias, _)| alias.as_str())
                         .unwrap_or_else(|| field.name().as_str());
                     Field::new(name, field.data_type().clone(), field.is_nullable())

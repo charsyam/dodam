@@ -755,6 +755,19 @@ async fn duckdb_differential_string_functions_and_case() {
         tempdir.path(),
     )
     .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, upper(note) AS note_upper FROM '{}' ORDER BY 1",
+            types_path.display()
+        ),
+        &format!(
+            "SELECT id, upper(note) AS note_upper FROM read_parquet('{}') ORDER BY 1",
+            types_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -821,6 +834,19 @@ async fn duckdb_differential_tpch_lite_queries() {
 
     assert_same_as_duckdb(
         &format!(
+            "SELECT l_returnflag, count(DISTINCT l_orderkey), count(DISTINCT l_linestatus) FROM '{}' GROUP BY l_returnflag ORDER BY 1",
+            lineitem_path.display()
+        ),
+        &format!(
+            "SELECT l_returnflag, count(DISTINCT l_orderkey), count(DISTINCT l_linestatus) FROM read_parquet('{}') GROUP BY l_returnflag ORDER BY 1",
+            lineitem_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
             "SELECT sum(l_extendedprice * l_discount) FROM '{}' WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1994-01-01' + INTERVAL '1' YEAR AND l_discount BETWEEN 5 AND 7 AND l_quantity < 24",
             lineitem_path.display()
         ),
@@ -840,6 +866,21 @@ async fn duckdb_differential_tpch_lite_queries() {
         ),
         &format!(
             "SELECT c.c_mktsegment, count(*), sum(o.o_totalprice) FROM read_parquet('{}') c JOIN read_parquet('{}') o ON c.c_custkey = o.o_custkey WHERE c.c_mktsegment = 'BUILDING' GROUP BY c.c_mktsegment ORDER BY c.c_mktsegment",
+            customer_path.display(),
+            orders_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT c.c_mktsegment, count(DISTINCT o.o_orderkey), sum(o.o_totalprice) FROM '{}' c JOIN '{}' o ON c.c_custkey = o.o_custkey WHERE c.c_mktsegment = 'BUILDING' GROUP BY c.c_mktsegment ORDER BY 1",
+            customer_path.display(),
+            orders_path.display()
+        ),
+        &format!(
+            "SELECT c.c_mktsegment, count(DISTINCT o.o_orderkey), sum(o.o_totalprice) FROM read_parquet('{}') c JOIN read_parquet('{}') o ON c.c_custkey = o.o_custkey WHERE c.c_mktsegment = 'BUILDING' GROUP BY c.c_mktsegment ORDER BY 1",
             customer_path.display(),
             orders_path.display()
         ),
@@ -2292,6 +2333,21 @@ async fn duckdb_differential_nested_struct_field_projection() {
         tempdir.path(),
     )
     .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT f.id, n.attrs.rank AS rank FROM '{}' f JOIN '{}' n ON f.id = n.id WHERE n.attrs.rank IS NOT NULL ORDER BY 2, 1",
+            facts_path.display(),
+            input_path.display()
+        ),
+        &format!(
+            "SELECT f.id, n.attrs.rank AS rank FROM read_parquet('{}') f JOIN read_parquet('{}') n ON f.id = n.id WHERE n.attrs.rank IS NOT NULL ORDER BY 2, 1",
+            facts_path.display(),
+            input_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -2838,6 +2894,7 @@ fn random_nested_join_query(
     let dodam_right = format!("'{}'", nested_path.display());
     let duckdb_left = format!("read_parquet('{}')", facts_path.display());
     let duckdb_right = format!("read_parquet('{}')", nested_path.display());
+    let join = rng.choose(&["JOIN", "INNER JOIN", "LEFT JOIN"]);
     let predicate = rng.choose(&[
         "n.attrs.more_tags[1] = 9 OR array_length(n.attrs.more_tags) > 1",
         "coalesce(n.attrs.label, 'missing') LIKE 'h%' OR n.attrs.label IS NULL",
@@ -2854,10 +2911,10 @@ fn random_nested_join_query(
     GeneratedSql {
         case_id,
         dodam_sql: format!(
-            "SELECT {projection} FROM {dodam_left} f JOIN {dodam_right} n ON f.id = n.id WHERE {predicate}"
+            "SELECT {projection} FROM {dodam_left} f {join} {dodam_right} n ON f.id = n.id WHERE {predicate}"
         ),
         duckdb_sql: format!(
-            "SELECT {projection} FROM {duckdb_left} f JOIN {duckdb_right} n ON f.id = n.id WHERE {predicate}"
+            "SELECT {projection} FROM {duckdb_left} f {join} {duckdb_right} n ON f.id = n.id WHERE {predicate}"
         ),
     }
 }
