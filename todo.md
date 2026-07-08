@@ -2093,3 +2093,7 @@ Tried and rejected or neutral:
           - The optimization is conservative: it is used only for dense 3-key groups with no fallback keys; all other shapes keep the generic sorted finish path.
           - Generic benchmark after the change sampled Dodam `~77.9ms` vs DuckDB `~84.6ms` (`~0.92x`). `three_key_expression_group` sampled `~22.7ms` vs DuckDB `~19.7ms`; the remaining gap is now mostly per-row probe/string-id work.
           - Validation: `scripts/check_correctness.sh quick` passed. SF=10 TPC-H regression check sampled Dodam `~4.256s` vs DuckDB `~6.932s` (`~0.614x`) with no slower query across all 22.
+        - Applied the same finish-order idea to single-key decimal/date aggregates:
+          - The `count(*) + sum(int) + min(decimal) + max(date32)` fast path now finishes Int32/Int64/UInt64 groups by sorting the existing key-index entries and taking group ids in that order, instead of materializing every `GroupAggregateResult` and sorting via the generic `GroupValue` comparator.
+          - Generic benchmark sampled Dodam `~78.4ms` vs DuckDB `~84.2ms` (`~0.93x`). `filter_group_decimal_date` was still in the `~21.4ms` area, so this is a small structural cleanup rather than a large win.
+          - Validation: `scripts/check_correctness.sh quick` passed. SF=10 TPC-H regression check sampled Dodam `~4.252s` vs DuckDB `~6.929s` (`~0.614x`) with no slower query across all 22.

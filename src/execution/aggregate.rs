@@ -3301,13 +3301,64 @@ fn collect_single_key_count_sum_min_max_groups(
         }
     }
 
-    let mut group_results = groups
-        .into_iter()
-        .map(|group| group.finish(aggregates))
-        .collect::<Vec<_>>();
-    group_results.sort_by(|left, right| compare_group_keys(&left.keys, &right.keys));
-    metrics.groups = group_results;
+    metrics.groups = finish_single_key_count_sum_min_max_groups(group_index, groups, aggregates);
     Ok(metrics)
+}
+
+fn finish_single_key_count_sum_min_max_groups(
+    group_index: SingleKeyCountSumMinMaxIndex,
+    groups: Vec<SingleKeyCountSumMinMaxGroup>,
+    aggregates: &[AggregateExpr],
+) -> Vec<GroupAggregateResult> {
+    match group_index {
+        SingleKeyCountSumMinMaxIndex::Int32 {
+            groups: index,
+            null_group,
+        } => finish_ordered_copy_key_groups(index.iter(), null_group, groups, aggregates),
+        SingleKeyCountSumMinMaxIndex::Int64 {
+            groups: index,
+            null_group,
+        } => finish_ordered_copy_key_groups(index.iter(), null_group, groups, aggregates),
+        SingleKeyCountSumMinMaxIndex::UInt64 {
+            groups: index,
+            null_group,
+        } => finish_ordered_copy_key_groups(index.iter(), null_group, groups, aggregates),
+        _ => {
+            let mut group_results = groups
+                .into_iter()
+                .map(|group| group.finish(aggregates))
+                .collect::<Vec<_>>();
+            group_results.sort_by(|left, right| compare_group_keys(&left.keys, &right.keys));
+            group_results
+        }
+    }
+}
+
+fn finish_ordered_copy_key_groups<K, I>(
+    index: I,
+    null_group: Option<usize>,
+    groups: Vec<SingleKeyCountSumMinMaxGroup>,
+    aggregates: &[AggregateExpr],
+) -> Vec<GroupAggregateResult>
+where
+    K: Copy + Ord,
+    I: Iterator<Item = (K, usize)>,
+{
+    let mut groups = groups.into_iter().map(Some).collect::<Vec<_>>();
+    let mut output = Vec::with_capacity(groups.len());
+    if let Some(group_id) = null_group
+        && let Some(group) = groups[group_id].take()
+    {
+        output.push(group.finish(aggregates));
+    }
+    let mut keyed = index.collect::<Vec<_>>();
+    keyed.sort_by_key(|(key, _)| *key);
+    for (_, group_id) in keyed {
+        if let Some(group) = groups[group_id].take() {
+            output.push(group.finish(aggregates));
+        }
+    }
+    output
 }
 
 struct BoundSingleKeyCountSumMinMaxPlan {
