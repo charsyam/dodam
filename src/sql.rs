@@ -34186,9 +34186,6 @@ fn pushed_join_output_projection(query: &SqlQuery) -> Result<Projection> {
     let Some(join) = &query.join else {
         return Ok(Projection::All);
     };
-    if !query.aggregate_expressions.is_empty() {
-        return Ok(Projection::All);
-    }
     if query.is_aggregate() {
         return Ok(aggregate_join_output_projection(query));
     }
