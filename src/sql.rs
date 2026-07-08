@@ -39859,6 +39859,14 @@ fn try_evaluate_vector_scalar_predicate(
             )? {
                 return Ok(Some(mask));
             }
+            if let Some(mask) = vector_column_literal_compare(batch, &left, op, &right)? {
+                return Ok(Some(mask));
+            }
+            if let Some(mask) =
+                vector_column_literal_compare(batch, &right, &reverse_binary_operator(op), &left)?
+            {
+                return Ok(Some(mask));
+            }
             Ok(None)
         }
         SqlExpr::InList {
@@ -39915,6 +39923,149 @@ fn vector_list_length_literal_compare(
             })
             .collect::<Vec<_>>(),
     )))
+}
+
+fn vector_column_literal_compare(
+    batch: &RecordBatch,
+    left: &ScalarSqlExpression,
+    op: &BinaryOperator,
+    right: &ScalarSqlExpression,
+) -> Result<Option<BooleanArray>> {
+    let ScalarSqlExpression::Column(column) = left else {
+        return Ok(None);
+    };
+    let ScalarSqlExpression::Literal(literal) = right else {
+        return Ok(None);
+    };
+    if matches!(literal, LiteralValue::Null) {
+        return Ok(Some(BooleanArray::from(vec![None; batch.num_rows()])));
+    }
+    let column_index = output_batch_column_index(batch, column)?;
+    let array = batch.column(column_index);
+    match array.data_type() {
+        DataType::Int32 => {
+            let values = array.as_any().downcast_ref::<Int32Array>().expect("Int32");
+            let literal = literal_as_i64_for_type(literal)?;
+            Ok(Some(BooleanArray::from(
+                (0..values.len())
+                    .map(|row| {
+                        if values.is_null(row) {
+                            None
+                        } else {
+                            compare_optional_values(Some(i64::from(values.value(row))), op, literal)
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )))
+        }
+        DataType::Int64 => {
+            let values = array.as_any().downcast_ref::<Int64Array>().expect("Int64");
+            let literal = literal_as_i64_for_type(literal)?;
+            Ok(Some(BooleanArray::from(
+                (0..values.len())
+                    .map(|row| {
+                        if values.is_null(row) {
+                            None
+                        } else {
+                            compare_optional_values(Some(values.value(row)), op, literal)
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )))
+        }
+        DataType::Float64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("Float64");
+            let literal = literal_as_f64_for_type(literal)?;
+            Ok(Some(BooleanArray::from(
+                (0..values.len())
+                    .map(|row| {
+                        if values.is_null(row) {
+                            None
+                        } else {
+                            compare_optional_f64(Some(values.value(row)), op, literal)
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )))
+        }
+        DataType::Boolean => {
+            let values = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("Boolean");
+            let literal = literal_as_bool_for_type(literal)?;
+            Ok(Some(BooleanArray::from(
+                (0..values.len())
+                    .map(|row| {
+                        if values.is_null(row) {
+                            None
+                        } else {
+                            compare_optional_values(Some(values.value(row)), op, literal)
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )))
+        }
+        DataType::Date32 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .expect("Date32");
+            let literal = literal_as_date32_for_type(literal)?;
+            Ok(Some(BooleanArray::from(
+                (0..values.len())
+                    .map(|row| {
+                        if values.is_null(row) {
+                            None
+                        } else {
+                            compare_optional_values(Some(values.value(row)), op, literal)
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )))
+        }
+        DataType::Decimal128(precision, scale) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("Decimal128");
+            let literal = literal_as_decimal128_for_type(literal, *precision, *scale)?;
+            Ok(Some(BooleanArray::from(
+                (0..values.len())
+                    .map(|row| {
+                        if values.is_null(row) {
+                            None
+                        } else {
+                            compare_optional_values(Some(values.value(row)), op, literal)
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )))
+        }
+        DataType::Utf8 => {
+            let values = array.as_any().downcast_ref::<StringArray>().expect("Utf8");
+            let literal = literal_as_utf8_for_type(literal)?;
+            Ok(Some(BooleanArray::from(
+                (0..values.len())
+                    .map(|row| {
+                        if values.is_null(row) {
+                            None
+                        } else {
+                            compare_optional_values(
+                                Some(values.value(row).to_string()),
+                                op,
+                                literal.clone(),
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn vector_i64_expression_in_list(
@@ -40312,7 +40463,7 @@ fn evaluate_scalar_expression(
             cast_evaluated_scalar(value, target)
         }
         ScalarSqlExpression::Coalesce(values) => {
-            if let Some(value) = evaluate_utf8_column_literal_coalesce(batch, values)? {
+            if let Some(value) = evaluate_column_literal_coalesce(batch, values)? {
                 return Ok(value);
             }
             let mut evaluated = values
@@ -40401,20 +40552,20 @@ fn evaluate_scalar_expression(
     }
 }
 
-fn evaluate_utf8_column_literal_coalesce(
+fn evaluate_column_literal_coalesce(
     batch: &RecordBatch,
     values: &[ScalarSqlExpression],
 ) -> Result<Option<EvaluatedScalar>> {
     let [left, right] = values else {
         return Ok(None);
     };
-    if let Some(value) = utf8_column_literal_coalesce(batch, left, right, false)? {
+    if let Some(value) = column_literal_coalesce(batch, left, right, false)? {
         return Ok(Some(value));
     }
-    utf8_column_literal_coalesce(batch, right, left, true)
+    column_literal_coalesce(batch, right, left, true)
 }
 
-fn utf8_column_literal_coalesce(
+fn column_literal_coalesce(
     batch: &RecordBatch,
     column_expr: &ScalarSqlExpression,
     literal_expr: &ScalarSqlExpression,
@@ -40423,46 +40574,250 @@ fn utf8_column_literal_coalesce(
     let ScalarSqlExpression::Column(column) = column_expr else {
         return Ok(None);
     };
-    let literal = match literal_expr {
-        ScalarSqlExpression::Literal(LiteralValue::Utf8(value)) => Some(value.as_str()),
-        ScalarSqlExpression::Literal(LiteralValue::Null) => None,
-        _ => return Ok(None),
+    let ScalarSqlExpression::Literal(literal) = literal_expr else {
+        return Ok(None);
     };
     let column_index = output_batch_column_index(batch, column)?;
     let array = batch.column(column_index);
-    if !matches!(array.data_type(), DataType::Utf8) {
-        return Ok(None);
-    }
-    let values = array.as_any().downcast_ref::<StringArray>().expect("Utf8");
     if literal_first {
-        if let Some(literal) = literal {
-            return Ok(Some(EvaluatedScalar::Utf8(vec![
-                Some(literal.to_string());
-                batch.num_rows()
-            ])));
+        if !matches!(literal, LiteralValue::Null) {
+            return Ok(Some(evaluated_literal(literal, batch.num_rows())));
         }
-        return Ok(Some(EvaluatedScalar::Utf8(utf8_array_to_scalar(values))));
+        return Ok(Some(evaluated_array(array.as_ref())?));
     }
-    if values.null_count() == 0 {
-        return Ok(Some(EvaluatedScalar::Utf8(utf8_array_to_scalar(values))));
+    if array.null_count() == 0 || matches!(literal, LiteralValue::Null) {
+        return Ok(Some(evaluated_array(array.as_ref())?));
     }
-    let output = (0..values.len())
-        .map(|row| {
-            if values.is_valid(row) {
-                Some(values.value(row).to_string())
-            } else {
-                literal.map(str::to_string)
-            }
-        })
-        .collect();
-    Ok(Some(EvaluatedScalar::Utf8(output)))
+    coalesce_array_with_literal(array.as_ref(), literal)
 }
 
-fn utf8_array_to_scalar(values: &StringArray) -> Vec<Option<String>> {
-    values
-        .iter()
-        .map(|value| value.map(str::to_string))
-        .collect()
+fn coalesce_array_with_literal(
+    array: &dyn Array,
+    literal: &LiteralValue,
+) -> Result<Option<EvaluatedScalar>> {
+    match array.data_type() {
+        DataType::Int32 => {
+            let values = array.as_any().downcast_ref::<Int32Array>().expect("Int32");
+            let literal = literal_as_i64_for_type(literal)?;
+            Ok(Some(EvaluatedScalar::Int64(
+                (0..values.len())
+                    .map(|row| {
+                        if values.is_valid(row) {
+                            Some(i64::from(values.value(row)))
+                        } else {
+                            literal
+                        }
+                    })
+                    .collect(),
+            )))
+        }
+        DataType::Int64 => {
+            let values = array.as_any().downcast_ref::<Int64Array>().expect("Int64");
+            let literal = literal_as_i64_for_type(literal)?;
+            Ok(Some(EvaluatedScalar::Int64(
+                (0..values.len())
+                    .map(|row| {
+                        if values.is_valid(row) {
+                            Some(values.value(row))
+                        } else {
+                            literal
+                        }
+                    })
+                    .collect(),
+            )))
+        }
+        DataType::Float64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("Float64");
+            let literal = literal_as_f64_for_type(literal)?;
+            Ok(Some(EvaluatedScalar::Float64(
+                (0..values.len())
+                    .map(|row| {
+                        if values.is_valid(row) {
+                            Some(values.value(row))
+                        } else {
+                            literal
+                        }
+                    })
+                    .collect(),
+            )))
+        }
+        DataType::Boolean => {
+            let values = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("Boolean");
+            let literal = literal_as_bool_for_type(literal)?;
+            Ok(Some(EvaluatedScalar::Boolean(
+                (0..values.len())
+                    .map(|row| {
+                        if values.is_valid(row) {
+                            Some(values.value(row))
+                        } else {
+                            literal
+                        }
+                    })
+                    .collect(),
+            )))
+        }
+        DataType::Date32 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .expect("Date32");
+            let literal = literal_as_date32_for_type(literal)?;
+            Ok(Some(EvaluatedScalar::Date32(
+                (0..values.len())
+                    .map(|row| {
+                        if values.is_valid(row) {
+                            Some(values.value(row))
+                        } else {
+                            literal
+                        }
+                    })
+                    .collect(),
+            )))
+        }
+        DataType::Decimal128(precision, scale) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("Decimal128");
+            let literal = literal_as_decimal128_for_type(literal, *precision, *scale)?;
+            Ok(Some(EvaluatedScalar::Decimal128 {
+                values: (0..values.len())
+                    .map(|row| {
+                        if values.is_valid(row) {
+                            Some(values.value(row))
+                        } else {
+                            literal
+                        }
+                    })
+                    .collect(),
+                precision: *precision,
+                scale: *scale,
+            }))
+        }
+        DataType::Utf8 => {
+            let values = array.as_any().downcast_ref::<StringArray>().expect("Utf8");
+            let literal = literal_as_utf8_for_type(literal)?;
+            Ok(Some(EvaluatedScalar::Utf8(
+                (0..values.len())
+                    .map(|row| {
+                        if values.is_valid(row) {
+                            Some(values.value(row).to_string())
+                        } else {
+                            literal.clone()
+                        }
+                    })
+                    .collect(),
+            )))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn literal_as_i64_for_type(literal: &LiteralValue) -> Result<Option<i64>> {
+    match literal {
+        LiteralValue::Null => Ok(None),
+        LiteralValue::Int64(value) => Ok(Some(*value)),
+        LiteralValue::Float64(value) => Ok(Some(*value as i64)),
+        LiteralValue::Utf8(value) => value
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|_| DodamError::InvalidCast(format!("cannot cast '{value}' to integer"))),
+        LiteralValue::Boolean(value) => Ok(Some(i64::from(*value))),
+    }
+}
+
+fn literal_as_f64_for_type(literal: &LiteralValue) -> Result<Option<f64>> {
+    match literal {
+        LiteralValue::Null => Ok(None),
+        LiteralValue::Int64(value) => Ok(Some(*value as f64)),
+        LiteralValue::Float64(value) => Ok(Some(*value)),
+        LiteralValue::Utf8(value) => value
+            .parse::<f64>()
+            .map(Some)
+            .map_err(|_| DodamError::InvalidCast(format!("cannot cast '{value}' to double"))),
+        LiteralValue::Boolean(value) => Ok(Some(if *value { 1.0 } else { 0.0 })),
+    }
+}
+
+fn literal_as_bool_for_type(literal: &LiteralValue) -> Result<Option<bool>> {
+    match literal {
+        LiteralValue::Null => Ok(None),
+        LiteralValue::Boolean(value) => Ok(Some(*value)),
+        other => Err(DodamError::InvalidCast(format!(
+            "cannot cast {} to boolean",
+            literal_type_name(other)
+        ))),
+    }
+}
+
+fn literal_as_date32_for_type(literal: &LiteralValue) -> Result<Option<i32>> {
+    match literal {
+        LiteralValue::Null => Ok(None),
+        LiteralValue::Utf8(value) => parse_date32_days(value).map(Some),
+        LiteralValue::Int64(value) => i32::try_from(*value)
+            .map(Some)
+            .map_err(|_| DodamError::InvalidCast(format!("cannot cast {value} to DATE"))),
+        other => Err(DodamError::InvalidCast(format!(
+            "cannot cast {} to DATE",
+            literal_type_name(other)
+        ))),
+    }
+}
+
+fn literal_as_decimal128_for_type(
+    literal: &LiteralValue,
+    precision: u8,
+    scale: i8,
+) -> Result<Option<i128>> {
+    match literal {
+        LiteralValue::Null => Ok(None),
+        LiteralValue::Int64(value) => {
+            let factor = decimal_scale_i128(scale).ok_or_else(|| {
+                DodamError::InvalidCast(format!("decimal scale {scale} overflows"))
+            })?;
+            i128::from(*value)
+                .checked_mul(factor)
+                .ok_or_else(|| DodamError::InvalidCast("decimal cast overflow".to_string()))
+                .and_then(|value| validate_decimal_precision(value, precision))
+                .map(Some)
+        }
+        LiteralValue::Float64(value) => {
+            parse_decimal_literal_to_scaled(&value.to_string(), scale, precision).map(Some)
+        }
+        LiteralValue::Utf8(value) => {
+            parse_decimal_literal_to_scaled(value, scale, precision).map(Some)
+        }
+        other => Err(DodamError::InvalidCast(format!(
+            "cannot cast {} to DECIMAL({precision},{scale})",
+            literal_type_name(other)
+        ))),
+    }
+}
+
+fn literal_as_utf8_for_type(literal: &LiteralValue) -> Result<Option<String>> {
+    Ok(match literal {
+        LiteralValue::Null => None,
+        LiteralValue::Utf8(value) => Some(value.clone()),
+        LiteralValue::Int64(value) => Some(value.to_string()),
+        LiteralValue::Float64(value) => Some(format_f64_for_sql_varchar(*value)),
+        LiteralValue::Boolean(value) => Some(value.to_string()),
+    })
+}
+
+fn literal_type_name(literal: &LiteralValue) -> &'static str {
+    match literal {
+        LiteralValue::Null => "NULL",
+        LiteralValue::Boolean(_) => "BOOLEAN",
+        LiteralValue::Int64(_) => "INTEGER",
+        LiteralValue::Float64(_) => "DOUBLE",
+        LiteralValue::Utf8(_) => "VARCHAR",
+    }
 }
 
 struct DecimalScalarColumn<'a> {

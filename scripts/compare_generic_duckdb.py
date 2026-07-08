@@ -126,6 +126,16 @@ def generic_queries(data_dir: Path) -> list[GenericQuery]:
             f"SELECT id, attrs.rank, tags[1] FROM '{nested}' WHERE array_length(tags) = 3 AND attrs.rank IN (1, 3, 5) ORDER BY id LIMIT 2000",
             f"SELECT id, attrs.rank, tags[1] FROM read_parquet('{nested}') WHERE array_length(tags) = 3 AND attrs.rank IN (1, 3, 5) ORDER BY id LIMIT 2000",
         ),
+        GenericQuery(
+            "coalesce_type_projection",
+            f"SELECT id, coalesce(key, -1) AS key_or_missing, coalesce(label, 'missing') AS label_or_missing, coalesce(amount, '0.00') AS amount_or_zero, coalesce(event_date, DATE '2024-01-01') AS event_or_default FROM '{facts}' WHERE id < 20000 ORDER BY id",
+            f"SELECT id, coalesce(key, -1) AS key_or_missing, coalesce(label, 'missing') AS label_or_missing, coalesce(amount, '0.00') AS amount_or_zero, coalesce(event_date, DATE '2024-01-01') AS event_or_default FROM read_parquet('{facts}') WHERE id < 20000 ORDER BY id",
+        ),
+        GenericQuery(
+            "three_key_expression_group",
+            f"SELECT bucket, event_date, coalesce(label, 'missing') AS label_or_missing, count(*), sum(value) FROM '{facts}' WHERE amount < '50.00' GROUP BY bucket, event_date, coalesce(label, 'missing') ORDER BY bucket, event_date, label_or_missing LIMIT 2000",
+            f"SELECT bucket, event_date, coalesce(label, 'missing') AS label_or_missing, count(*), sum(value) FROM read_parquet('{facts}') WHERE amount < '50.00' GROUP BY bucket, event_date, coalesce(label, 'missing') ORDER BY bucket, event_date, label_or_missing LIMIT 2000",
+        ),
     ]
 
 

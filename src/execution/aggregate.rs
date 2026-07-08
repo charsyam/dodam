@@ -241,7 +241,9 @@ pub fn collect_grouped_aggregates(
     aggregates: &[AggregateExpr],
 ) -> Result<AggregateMetrics> {
     let aggregate_started = Instant::now();
-    let mut metrics = if can_use_single_key_count_sum_path(group_by, aggregates) {
+    let mut metrics = if can_use_single_key_count_sum_min_max_path(group_by, aggregates) {
+        collect_single_key_count_sum_min_max_groups(stream, fragments, group_by, aggregates)?
+    } else if can_use_single_key_count_sum_path(group_by, aggregates) {
         collect_single_key_count_sum_groups(stream, fragments, group_by, aggregates)?
     } else if can_use_single_key_fast_path(group_by, aggregates) {
         collect_single_key_groups(stream, fragments, group_by, aggregates)?
@@ -249,6 +251,8 @@ pub fn collect_grouped_aggregates(
         collect_two_utf8_key_groups(stream, fragments, group_by, aggregates)?
     } else if can_use_two_key_count_sum_path(group_by, aggregates) {
         collect_two_key_count_sum_groups(stream, fragments, group_by, aggregates)?
+    } else if can_use_three_key_count_sum_path(group_by, aggregates) {
+        collect_three_key_count_sum_groups(stream, fragments, group_by, aggregates)?
     } else if can_use_two_key_sum_path(group_by, aggregates) {
         collect_two_key_sum_groups(stream, fragments, group_by, aggregates)?
     } else {
@@ -1053,6 +1057,206 @@ fn can_use_two_key_count_sum_path(group_by: &[String], aggregates: &[AggregateEx
             aggregates,
             [AggregateExpr::CountStar, AggregateExpr::Sum(_)]
         )
+}
+
+fn can_use_three_key_count_sum_path(group_by: &[String], aggregates: &[AggregateExpr]) -> bool {
+    group_by.len() == 3
+        && matches!(
+            aggregates,
+            [AggregateExpr::CountStar, AggregateExpr::Sum(_)]
+        )
+}
+
+fn collect_three_key_count_sum_groups(
+    mut stream: SendableBatchStream,
+    fragments: usize,
+    group_by: &[String],
+    aggregates: &[AggregateExpr],
+) -> Result<AggregateMetrics> {
+    let AggregateExpr::Sum(sum_column) = &aggregates[1] else {
+        unreachable!("three-key count/sum fast path precondition");
+    };
+    let mut groups = Vec::new();
+    let mut group_index = ThreeKeyCountSumIndex::default();
+    let mut metrics = AggregateMetrics {
+        fragments,
+        ..AggregateMetrics::default()
+    };
+
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        metrics.batches += 1;
+        metrics.rows += batch.num_rows();
+
+        let first = batch.column(column_index(&batch, &group_by[0])?);
+        let second = batch.column(column_index(&batch, &group_by[1])?);
+        let third = batch.column(column_index(&batch, &group_by[2])?);
+        let Some(keys) = ThreeKeyCountSumReader::new(first, second, third) else {
+            return collect_grouped_aggregates_generic(
+                stream,
+                fragments,
+                group_by,
+                aggregates,
+                Some(batch),
+                Some(metrics),
+            );
+        };
+        let sum_values = batch.column(column_index(&batch, sum_column)?);
+        let Some(sum_values) = Int64LikeArray::new(sum_values) else {
+            return collect_grouped_aggregates_generic(
+                stream,
+                fragments,
+                group_by,
+                aggregates,
+                Some(batch),
+                Some(metrics),
+            );
+        };
+
+        for row in 0..batch.num_rows() {
+            let key = keys.key(row);
+            let group_id = group_index.group_id(key, &mut groups);
+            groups[group_id].update(&sum_values, row);
+        }
+    }
+
+    let mut group_results = groups
+        .into_iter()
+        .map(|group| group.finish(aggregates))
+        .collect::<Vec<_>>();
+    group_results.sort_by(|left, right| compare_group_keys(&left.keys, &right.keys));
+    metrics.groups = group_results;
+    Ok(metrics)
+}
+
+enum ThreeKeyCountSumReader<'a> {
+    Int32DateUtf8(&'a Int32Array, &'a Date32Array, &'a StringArray),
+    Int64DateUtf8(&'a Int64Array, &'a Date32Array, &'a StringArray),
+}
+
+impl<'a> ThreeKeyCountSumReader<'a> {
+    fn new(first: &'a ArrayRef, second: &'a ArrayRef, third: &'a ArrayRef) -> Option<Self> {
+        match (first.data_type(), second.data_type(), third.data_type()) {
+            (DataType::Int32, DataType::Date32, DataType::Utf8) => Some(Self::Int32DateUtf8(
+                first.as_any().downcast_ref::<Int32Array>()?,
+                second.as_any().downcast_ref::<Date32Array>()?,
+                third.as_any().downcast_ref::<StringArray>()?,
+            )),
+            (DataType::Int64, DataType::Date32, DataType::Utf8) => Some(Self::Int64DateUtf8(
+                first.as_any().downcast_ref::<Int64Array>()?,
+                second.as_any().downcast_ref::<Date32Array>()?,
+                third.as_any().downcast_ref::<StringArray>()?,
+            )),
+            _ => None,
+        }
+    }
+
+    fn key(&self, row: usize) -> ThreeKeyCountSumBorrowedKey<'_> {
+        match self {
+            Self::Int32DateUtf8(first, second, third) => ThreeKeyCountSumBorrowedKey {
+                first: first.is_valid(row).then(|| i64::from(first.value(row))),
+                second: second.is_valid(row).then(|| second.value(row)),
+                third: third.is_valid(row).then(|| third.value(row)),
+            },
+            Self::Int64DateUtf8(first, second, third) => ThreeKeyCountSumBorrowedKey {
+                first: first.is_valid(row).then(|| first.value(row)),
+                second: second.is_valid(row).then(|| second.value(row)),
+                third: third.is_valid(row).then(|| third.value(row)),
+            },
+        }
+    }
+}
+
+struct ThreeKeyCountSumBorrowedKey<'a> {
+    first: Option<i64>,
+    second: Option<i32>,
+    third: Option<&'a str>,
+}
+
+#[derive(Default)]
+struct ThreeKeyCountSumIndex {
+    first: AggregateHashMap<Option<i64>, ThreeKeySecondIndex>,
+}
+
+#[derive(Default)]
+struct ThreeKeySecondIndex {
+    second: AggregateHashMap<Option<i32>, Utf8SecondGroupIndex>,
+}
+
+impl ThreeKeyCountSumIndex {
+    fn group_id(
+        &mut self,
+        key: ThreeKeyCountSumBorrowedKey<'_>,
+        groups: &mut Vec<ThreeKeyCountSumGroup>,
+    ) -> usize {
+        let third = self
+            .first
+            .entry(key.first)
+            .or_default()
+            .second
+            .entry(key.second)
+            .or_default();
+        if let Some(group_id) = third.lookup(key.third) {
+            return group_id;
+        }
+        let group_id = groups.len();
+        third.insert(key.third, group_id);
+        groups.push(ThreeKeyCountSumGroup::new(vec![
+            GroupValue::Int64(key.first),
+            GroupValue::Date32(key.second),
+            GroupValue::Utf8(key.third.map(str::to_string)),
+        ]));
+        group_id
+    }
+}
+
+struct ThreeKeyCountSumGroup {
+    keys: Vec<GroupValue>,
+    count: u64,
+    sum: i64,
+    sum_count: u64,
+}
+
+impl ThreeKeyCountSumGroup {
+    fn new(keys: Vec<GroupValue>) -> Self {
+        Self {
+            keys,
+            count: 0,
+            sum: 0,
+            sum_count: 0,
+        }
+    }
+
+    fn update(&mut self, sum_values: &Int64LikeArray<'_>, row: usize) {
+        self.count += 1;
+        if let Some(value) = sum_values.value(row) {
+            self.sum += value;
+            self.sum_count += 1;
+        }
+    }
+
+    fn finish(self, aggregates: &[AggregateExpr]) -> GroupAggregateResult {
+        GroupAggregateResult {
+            keys: self.keys,
+            values: vec![
+                AggregateResult {
+                    expr: aggregates[0].clone(),
+                    value: AggregateValue::Count(self.count),
+                },
+                AggregateResult {
+                    expr: aggregates[1].clone(),
+                    value: if self.sum_count == 0 {
+                        AggregateValue::Int64(None)
+                    } else {
+                        AggregateValue::Int64(Some(self.sum))
+                    },
+                },
+            ],
+        }
+    }
 }
 
 fn collect_two_key_count_sum_groups(
@@ -2082,6 +2286,434 @@ fn can_use_single_key_fast_path(group_by: &[String], aggregates: &[AggregateExpr
                     | AggregateExpr::Max(_)
             )
         })
+}
+
+fn can_use_single_key_count_sum_min_max_path(
+    group_by: &[String],
+    aggregates: &[AggregateExpr],
+) -> bool {
+    group_by.len() == 1
+        && matches!(
+            aggregates,
+            [
+                AggregateExpr::CountStar,
+                AggregateExpr::Sum(_),
+                AggregateExpr::Min(_),
+                AggregateExpr::Max(_)
+            ]
+        )
+}
+
+fn collect_single_key_count_sum_min_max_groups(
+    mut stream: SendableBatchStream,
+    fragments: usize,
+    group_by: &[String],
+    aggregates: &[AggregateExpr],
+) -> Result<AggregateMetrics> {
+    let (
+        AggregateExpr::CountStar,
+        AggregateExpr::Sum(sum_column),
+        AggregateExpr::Min(min_column),
+        AggregateExpr::Max(max_column),
+    ) = (
+        &aggregates[0],
+        &aggregates[1],
+        &aggregates[2],
+        &aggregates[3],
+    )
+    else {
+        unreachable!("single-key count/sum/min/max fast path precondition");
+    };
+    let mut group_index = SingleKeyCountSumMinMaxIndex::Unset;
+    let mut groups = Vec::<SingleKeyCountSumMinMaxGroup>::new();
+    let mut metrics = AggregateMetrics {
+        fragments,
+        ..AggregateMetrics::default()
+    };
+
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        metrics.batches += 1;
+        metrics.rows += batch.num_rows();
+
+        let key_column = batch.column(column_index(&batch, &group_by[0])?);
+        let sum_column_ref = batch.column(column_index(&batch, sum_column)?);
+        let min_column_ref = batch.column(column_index(&batch, min_column)?);
+        let max_column_ref = batch.column(column_index(&batch, max_column)?);
+        let Some(sum_values) = Int64LikeArray::new(sum_column_ref) else {
+            return collect_grouped_aggregates_generic(
+                stream,
+                fragments,
+                group_by,
+                aggregates,
+                Some(batch),
+                Some(metrics),
+            );
+        };
+        let DataType::Decimal128(decimal_precision, decimal_scale) = min_column_ref.data_type()
+        else {
+            return collect_grouped_aggregates_generic(
+                stream,
+                fragments,
+                group_by,
+                aggregates,
+                Some(batch),
+                Some(metrics),
+            );
+        };
+        let Some(min_values) = min_column_ref.as_any().downcast_ref::<Decimal128Array>() else {
+            return collect_grouped_aggregates_generic(
+                stream,
+                fragments,
+                group_by,
+                aggregates,
+                Some(batch),
+                Some(metrics),
+            );
+        };
+        let Some(max_values) = max_column_ref.as_any().downcast_ref::<Date32Array>() else {
+            return collect_grouped_aggregates_generic(
+                stream,
+                fragments,
+                group_by,
+                aggregates,
+                Some(batch),
+                Some(metrics),
+            );
+        };
+        if !matches!(
+            key_column.data_type(),
+            DataType::Utf8 | DataType::Int32 | DataType::Int64 | DataType::UInt64
+        ) {
+            return collect_grouped_aggregates_generic(
+                stream,
+                fragments,
+                group_by,
+                aggregates,
+                Some(batch),
+                Some(metrics),
+            );
+        }
+        group_index.ensure_type(key_column.data_type());
+
+        for row in 0..batch.num_rows() {
+            let group_id = group_index.group_id(
+                key_column,
+                row,
+                &mut groups,
+                *decimal_precision,
+                *decimal_scale,
+            )?;
+            groups[group_id].update(&sum_values, min_values, max_values, row);
+        }
+    }
+
+    let mut group_results = groups
+        .into_iter()
+        .map(|group| group.finish(aggregates))
+        .collect::<Vec<_>>();
+    group_results.sort_by(|left, right| compare_group_keys(&left.keys, &right.keys));
+    metrics.groups = group_results;
+    Ok(metrics)
+}
+
+enum Int64LikeArray<'a> {
+    Int32(&'a Int32Array),
+    Int64(&'a Int64Array),
+}
+
+impl<'a> Int64LikeArray<'a> {
+    fn new(array: &'a ArrayRef) -> Option<Self> {
+        match array.data_type() {
+            DataType::Int32 => Some(Self::Int32(array.as_any().downcast_ref::<Int32Array>()?)),
+            DataType::Int64 => Some(Self::Int64(array.as_any().downcast_ref::<Int64Array>()?)),
+            _ => None,
+        }
+    }
+
+    fn value(&self, row: usize) -> Option<i64> {
+        match self {
+            Self::Int32(values) => values.is_valid(row).then(|| i64::from(values.value(row))),
+            Self::Int64(values) => values.is_valid(row).then(|| values.value(row)),
+        }
+    }
+}
+
+enum SingleKeyCountSumMinMaxIndex {
+    Unset,
+    Utf8 {
+        groups: AggregateHashMap<String, usize>,
+        null_group: Option<usize>,
+    },
+    Int32 {
+        groups: AdaptiveCopyGroupIndex<i32>,
+        null_group: Option<usize>,
+    },
+    Int64 {
+        groups: AdaptiveCopyGroupIndex<i64>,
+        null_group: Option<usize>,
+    },
+    UInt64 {
+        groups: AdaptiveCopyGroupIndex<u64>,
+        null_group: Option<usize>,
+    },
+}
+
+impl SingleKeyCountSumMinMaxIndex {
+    fn ensure_type(&mut self, data_type: &DataType) {
+        if !matches!(self, Self::Unset) {
+            return;
+        }
+        *self = match data_type {
+            DataType::Utf8 => Self::Utf8 {
+                groups: AggregateHashMap::default(),
+                null_group: None,
+            },
+            DataType::Int32 => Self::Int32 {
+                groups: AdaptiveCopyGroupIndex::default(),
+                null_group: None,
+            },
+            DataType::Int64 => Self::Int64 {
+                groups: AdaptiveCopyGroupIndex::default(),
+                null_group: None,
+            },
+            DataType::UInt64 => Self::UInt64 {
+                groups: AdaptiveCopyGroupIndex::default(),
+                null_group: None,
+            },
+            _ => unreachable!("fast path key type precondition"),
+        };
+    }
+
+    fn group_id(
+        &mut self,
+        key_column: &ArrayRef,
+        row: usize,
+        groups_out: &mut Vec<SingleKeyCountSumMinMaxGroup>,
+        decimal_precision: u8,
+        decimal_scale: i8,
+    ) -> Result<usize> {
+        match self {
+            Self::Utf8 { groups, null_group } => {
+                let values = key_column
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("Utf8 group key");
+                if values.is_null(row) {
+                    return Ok(count_sum_min_max_group_id_for_null(
+                        null_group,
+                        groups_out,
+                        GroupValue::Utf8(None),
+                        decimal_precision,
+                        decimal_scale,
+                    ));
+                }
+                let key = values.value(row);
+                if let Some(group_id) = groups.get(key).copied() {
+                    return Ok(group_id);
+                }
+                let group_id = groups_out.len();
+                groups.insert(key.to_string(), group_id);
+                groups_out.push(SingleKeyCountSumMinMaxGroup::new(
+                    GroupValue::Utf8(Some(key.to_string())),
+                    decimal_precision,
+                    decimal_scale,
+                ));
+                Ok(group_id)
+            }
+            Self::Int32 { groups, null_group } => {
+                let values = key_column
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("Int32 group key");
+                if values.is_null(row) {
+                    return Ok(count_sum_min_max_group_id_for_null(
+                        null_group,
+                        groups_out,
+                        GroupValue::Int64(None),
+                        decimal_precision,
+                        decimal_scale,
+                    ));
+                }
+                let key = values.value(row);
+                if let Some(group_id) = groups.get(key) {
+                    return Ok(group_id);
+                }
+                let group_id = groups_out.len();
+                groups.insert(key, group_id);
+                groups_out.push(SingleKeyCountSumMinMaxGroup::new(
+                    GroupValue::Int64(Some(i64::from(key))),
+                    decimal_precision,
+                    decimal_scale,
+                ));
+                Ok(group_id)
+            }
+            Self::Int64 { groups, null_group } => {
+                let values = key_column
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64 group key");
+                if values.is_null(row) {
+                    return Ok(count_sum_min_max_group_id_for_null(
+                        null_group,
+                        groups_out,
+                        GroupValue::Int64(None),
+                        decimal_precision,
+                        decimal_scale,
+                    ));
+                }
+                let key = values.value(row);
+                if let Some(group_id) = groups.get(key) {
+                    return Ok(group_id);
+                }
+                let group_id = groups_out.len();
+                groups.insert(key, group_id);
+                groups_out.push(SingleKeyCountSumMinMaxGroup::new(
+                    GroupValue::Int64(Some(key)),
+                    decimal_precision,
+                    decimal_scale,
+                ));
+                Ok(group_id)
+            }
+            Self::UInt64 { groups, null_group } => {
+                let values = key_column
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .expect("UInt64 group key");
+                if values.is_null(row) {
+                    return Ok(count_sum_min_max_group_id_for_null(
+                        null_group,
+                        groups_out,
+                        GroupValue::UInt64(None),
+                        decimal_precision,
+                        decimal_scale,
+                    ));
+                }
+                let key = values.value(row);
+                if let Some(group_id) = groups.get(key) {
+                    return Ok(group_id);
+                }
+                let group_id = groups_out.len();
+                groups.insert(key, group_id);
+                groups_out.push(SingleKeyCountSumMinMaxGroup::new(
+                    GroupValue::UInt64(Some(key)),
+                    decimal_precision,
+                    decimal_scale,
+                ));
+                Ok(group_id)
+            }
+            Self::Unset => unreachable!("group index type should be initialized"),
+        }
+    }
+}
+
+fn count_sum_min_max_group_id_for_null(
+    null_group: &mut Option<usize>,
+    groups: &mut Vec<SingleKeyCountSumMinMaxGroup>,
+    key: GroupValue,
+    decimal_precision: u8,
+    decimal_scale: i8,
+) -> usize {
+    if let Some(group_id) = *null_group {
+        return group_id;
+    }
+    let group_id = groups.len();
+    groups.push(SingleKeyCountSumMinMaxGroup::new(
+        key,
+        decimal_precision,
+        decimal_scale,
+    ));
+    *null_group = Some(group_id);
+    group_id
+}
+
+struct SingleKeyCountSumMinMaxGroup {
+    key: GroupValue,
+    count: u64,
+    sum: i64,
+    sum_count: u64,
+    min_decimal: Option<i128>,
+    decimal_precision: u8,
+    decimal_scale: i8,
+    max_date32: Option<i32>,
+}
+
+impl SingleKeyCountSumMinMaxGroup {
+    fn new(key: GroupValue, decimal_precision: u8, decimal_scale: i8) -> Self {
+        Self {
+            key,
+            count: 0,
+            sum: 0,
+            sum_count: 0,
+            min_decimal: None,
+            decimal_precision,
+            decimal_scale,
+            max_date32: None,
+        }
+    }
+
+    fn update(
+        &mut self,
+        sum_values: &Int64LikeArray<'_>,
+        min_values: &Decimal128Array,
+        max_values: &Date32Array,
+        row: usize,
+    ) {
+        self.count += 1;
+        if let Some(value) = sum_values.value(row) {
+            self.sum += value;
+            self.sum_count += 1;
+        }
+        if min_values.is_valid(row) {
+            let value = min_values.value(row);
+            self.min_decimal = Some(match self.min_decimal {
+                Some(current) => current.min(value),
+                None => value,
+            });
+        }
+        if max_values.is_valid(row) {
+            let value = max_values.value(row);
+            self.max_date32 = Some(match self.max_date32 {
+                Some(current) => current.max(value),
+                None => value,
+            });
+        }
+    }
+
+    fn finish(self, aggregates: &[AggregateExpr]) -> GroupAggregateResult {
+        GroupAggregateResult {
+            keys: vec![self.key],
+            values: vec![
+                AggregateResult {
+                    expr: aggregates[0].clone(),
+                    value: AggregateValue::Count(self.count),
+                },
+                AggregateResult {
+                    expr: aggregates[1].clone(),
+                    value: if self.sum_count == 0 {
+                        AggregateValue::Int64(None)
+                    } else {
+                        AggregateValue::Int64(Some(self.sum))
+                    },
+                },
+                AggregateResult {
+                    expr: aggregates[2].clone(),
+                    value: AggregateValue::Decimal128(
+                        self.min_decimal,
+                        self.decimal_precision,
+                        self.decimal_scale,
+                    ),
+                },
+                AggregateResult {
+                    expr: aggregates[3].clone(),
+                    value: AggregateValue::Date32(self.max_date32),
+                },
+            ],
+        }
+    }
 }
 
 fn collect_single_key_groups(
