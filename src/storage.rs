@@ -1267,13 +1267,14 @@ fn percentile_nanos(samples: &[u64], percentile: usize) -> u64 {
     values[index]
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct DirectPrimitiveColumnScanMetrics {
     pub row_groups: usize,
     pub batches: usize,
     pub rows: usize,
     pub read_nanos: u64,
     pub consume_nanos: u64,
+    pub column_read_nanos: Vec<u64>,
 }
 
 pub(crate) type DirectI64I32I32ScanMetrics = DirectPrimitiveColumnScanMetrics;
@@ -1285,6 +1286,12 @@ impl DirectPrimitiveColumnScanMetrics {
 
     fn add_consume_nanos(&mut self, nanos: u64) {
         self.consume_nanos = self.consume_nanos.saturating_add(nanos);
+    }
+
+    fn add_column_read_nanos(&mut self, index: usize, nanos: u64) {
+        if let Some(value) = self.column_read_nanos.get_mut(index) {
+            *value = value.saturating_add(nanos);
+        }
     }
 }
 
@@ -1514,6 +1521,211 @@ where
     scan_parquet_primitive_columns_reader(reader, batch_size, row_groups, columns, consume)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scan_parquet_i32_i64_decimal_i32_selected_with_store<F>(
+    path: &Path,
+    batch_size: usize,
+    row_groups: &[usize],
+    columns: [&str; 4],
+    decimal_precision: u8,
+    decimal_scale: i8,
+    decimal_min: Option<i64>,
+    decimal_max: Option<i64>,
+    date_min: Option<i32>,
+    date_max: Option<i32>,
+    file_cache: Arc<ParquetFileCache>,
+    store: &dyn ObjectStore,
+    consume: F,
+) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
+where
+    F: for<'a> FnMut(&[RawColumnView<'a>]) -> Result<()>,
+{
+    if file_cache.enabled() {
+        let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
+        let reader = SerializedFileReader::new(reader)?;
+        return scan_parquet_i32_i64_decimal_i32_selected_reader(
+            reader,
+            batch_size,
+            row_groups,
+            columns,
+            decimal_precision,
+            decimal_scale,
+            decimal_min,
+            decimal_max,
+            date_min,
+            date_max,
+            consume,
+        );
+    }
+    let file = store.open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    scan_parquet_i32_i64_decimal_i32_selected_reader(
+        reader,
+        batch_size,
+        row_groups,
+        columns,
+        decimal_precision,
+        decimal_scale,
+        decimal_min,
+        decimal_max,
+        date_min,
+        date_max,
+        consume,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_parquet_i32_i64_decimal_i32_selected_reader<R, F>(
+    reader: SerializedFileReader<R>,
+    batch_size: usize,
+    row_groups: &[usize],
+    columns: [&str; 4],
+    decimal_precision: u8,
+    decimal_scale: i8,
+    decimal_min: Option<i64>,
+    decimal_max: Option<i64>,
+    date_min: Option<i32>,
+    date_max: Option<i32>,
+    mut consume: F,
+) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
+where
+    R: ChunkReader + 'static,
+    F: for<'a> FnMut(&[RawColumnView<'a>]) -> Result<()>,
+{
+    let Some(column_indices) = parquet_column_indices_by_name(&reader, &columns) else {
+        return Ok(None);
+    };
+    let [key_column, sum_column, decimal_column, date_column] =
+        <[usize; 4]>::try_from(column_indices).map_err(|_| {
+            DodamError::UnsupportedSql(
+                "direct selected primitive column shape mismatch".to_string(),
+            )
+        })?;
+    let schema = reader.metadata().file_metadata().schema_descr();
+    for &column_index in &[key_column, sum_column, decimal_column, date_column] {
+        if schema.column(column_index).max_def_level() != 0 {
+            return Ok(None);
+        }
+    }
+    let mut metrics = DirectPrimitiveColumnScanMetrics {
+        row_groups: row_groups.len(),
+        column_read_nanos: vec![0; 4],
+        ..DirectPrimitiveColumnScanMetrics::default()
+    };
+    for &row_group_index in row_groups {
+        let row_group = reader.get_row_group(row_group_index)?;
+        let mut key_reader = match row_group.get_column_reader(key_column)? {
+            ColumnReader::Int32ColumnReader(reader) => reader,
+            _ => return Ok(None),
+        };
+        let mut sum_reader = match row_group.get_column_reader(sum_column)? {
+            ColumnReader::Int64ColumnReader(reader) => reader,
+            _ => return Ok(None),
+        };
+        let mut decimal_reader = match row_group.get_column_reader(decimal_column)? {
+            ColumnReader::Int64ColumnReader(reader) => reader,
+            _ => return Ok(None),
+        };
+        let mut date_reader = match row_group.get_column_reader(date_column)? {
+            ColumnReader::Int32ColumnReader(reader) => reader,
+            _ => return Ok(None),
+        };
+        let mut decimal_values = Vec::<i64>::with_capacity(batch_size);
+        let mut date_values = Vec::<i32>::with_capacity(batch_size);
+        let mut selected_keys = Vec::<i32>::with_capacity(batch_size);
+        let mut selected_sums = Vec::<i64>::with_capacity(batch_size);
+        let mut selected_decimals = Vec::<i64>::with_capacity(batch_size);
+        let mut selected_dates = Vec::<i32>::with_capacity(batch_size);
+        let mut selected_runs = Vec::<(usize, usize)>::new();
+        loop {
+            decimal_values.clear();
+            date_values.clear();
+            selected_keys.clear();
+            selected_sums.clear();
+            selected_decimals.clear();
+            selected_dates.clear();
+            selected_runs.clear();
+            let read_started = Instant::now();
+            let decimal_started = Instant::now();
+            let (records, value_count, level_count) =
+                decimal_reader.read_records(batch_size, None, None, &mut decimal_values)?;
+            metrics.add_column_read_nanos(2, elapsed_nanos(decimal_started));
+            if records == 0 {
+                metrics.add_read_nanos(elapsed_nanos(read_started));
+                break;
+            }
+            if value_count != records || !direct_def_levels_match(level_count, records, true) {
+                metrics.add_read_nanos(elapsed_nanos(read_started));
+                return Ok(None);
+            }
+            let date_started = Instant::now();
+            let (date_records, date_value_count, date_level_count) =
+                date_reader.read_records(records, None, None, &mut date_values)?;
+            metrics.add_column_read_nanos(3, elapsed_nanos(date_started));
+            if date_records != records
+                || date_value_count != records
+                || !direct_def_levels_match(date_level_count, records, true)
+            {
+                metrics.add_read_nanos(elapsed_nanos(read_started));
+                return Ok(None);
+            }
+            build_selected_runs(
+                &decimal_values,
+                &date_values,
+                decimal_min,
+                decimal_max,
+                date_min,
+                date_max,
+                &mut selected_runs,
+                &mut selected_decimals,
+                &mut selected_dates,
+            );
+            let key_started = Instant::now();
+            if !read_i32_selected_runs(
+                &mut key_reader,
+                records,
+                &selected_runs,
+                &mut selected_keys,
+            )? {
+                metrics.add_read_nanos(elapsed_nanos(read_started));
+                return Ok(None);
+            }
+            metrics.add_column_read_nanos(0, elapsed_nanos(key_started));
+            let sum_started = Instant::now();
+            if !read_i64_selected_runs(
+                &mut sum_reader,
+                records,
+                &selected_runs,
+                &mut selected_sums,
+            )? {
+                metrics.add_read_nanos(elapsed_nanos(read_started));
+                return Ok(None);
+            }
+            metrics.add_column_read_nanos(1, elapsed_nanos(sum_started));
+            metrics.add_read_nanos(elapsed_nanos(read_started));
+            metrics.batches += 1;
+            metrics.rows = metrics.rows.saturating_add(records);
+            if selected_keys.is_empty() {
+                continue;
+            }
+            let consume_started = Instant::now();
+            let views = [
+                RawColumnView::I32(&selected_keys),
+                RawColumnView::I64(&selected_sums),
+                RawColumnView::Decimal128I64 {
+                    values: &selected_decimals,
+                    precision: decimal_precision,
+                    scale: decimal_scale,
+                },
+                RawColumnView::Date32(&selected_dates),
+            ];
+            consume(&views)?;
+            metrics.add_consume_nanos(elapsed_nanos(consume_started));
+        }
+    }
+    Ok(Some(metrics))
+}
+
 enum DirectPrimitiveColumnReader {
     I64(ColumnReaderImpl<Int64Type>),
     I32(ColumnReaderImpl<Int32Type>),
@@ -1522,7 +1734,10 @@ enum DirectPrimitiveColumnReader {
 enum DirectPrimitiveColumnValues {
     I64(Vec<i64>),
     I32(Vec<i32>),
-    Decimal128(Vec<i128>),
+    Decimal128 {
+        values: Vec<i128>,
+        raw_i64: Vec<i64>,
+    },
 }
 
 impl DirectPrimitiveColumnValues {
@@ -1532,9 +1747,10 @@ impl DirectPrimitiveColumnValues {
             DirectPrimitiveColumnType::I32 | DirectPrimitiveColumnType::Date32 => {
                 Self::I32(Vec::with_capacity(capacity))
             }
-            DirectPrimitiveColumnType::Decimal128Int64 { .. } => {
-                Self::Decimal128(Vec::with_capacity(capacity))
-            }
+            DirectPrimitiveColumnType::Decimal128Int64 { .. } => Self::Decimal128 {
+                values: Vec::with_capacity(capacity),
+                raw_i64: Vec::with_capacity(capacity),
+            },
             DirectPrimitiveColumnType::Decimal128Int64Raw { .. } => {
                 Self::I64(Vec::with_capacity(capacity))
             }
@@ -1545,7 +1761,10 @@ impl DirectPrimitiveColumnValues {
         match self {
             Self::I64(values) => values.clear(),
             Self::I32(values) => values.clear(),
-            Self::Decimal128(values) => values.clear(),
+            Self::Decimal128 { values, raw_i64 } => {
+                values.clear();
+                raw_i64.clear();
+            }
         }
     }
 
@@ -1555,7 +1774,7 @@ impl DirectPrimitiveColumnValues {
             (Self::I32(values), DirectPrimitiveColumnType::I32) => RawColumnView::I32(values),
             (Self::I32(values), DirectPrimitiveColumnType::Date32) => RawColumnView::Date32(values),
             (
-                Self::Decimal128(values),
+                Self::Decimal128 { values, .. },
                 DirectPrimitiveColumnType::Decimal128Int64 { precision, scale },
             ) => RawColumnView::Decimal128 {
                 values,
@@ -1599,15 +1818,15 @@ fn read_direct_primitive_records(
         }
         (
             DirectPrimitiveColumnReader::I64(reader),
-            DirectPrimitiveColumnValues::Decimal128(values),
+            DirectPrimitiveColumnValues::Decimal128 { values, raw_i64 },
         ) => {
-            let mut raw = Vec::<i64>::with_capacity(records);
+            raw_i64.clear();
             let result = if required {
-                reader.read_records(records, None, None, &mut raw)?
+                reader.read_records(records, None, None, raw_i64)?
             } else {
-                reader.read_records(records, Some(def_levels), None, &mut raw)?
+                reader.read_records(records, Some(def_levels), None, raw_i64)?
             };
-            values.extend(raw.into_iter().map(i128::from));
+            values.extend(raw_i64.iter().copied().map(i128::from));
             Ok(result)
         }
         _ => Err(DodamError::UnsupportedSql(
@@ -1639,6 +1858,7 @@ where
         .collect();
     let mut metrics = DirectPrimitiveColumnScanMetrics {
         row_groups: row_groups.len(),
+        column_read_nanos: vec![0; columns.len()],
         ..DirectPrimitiveColumnScanMetrics::default()
     };
     for &row_group_index in row_groups {
@@ -1686,6 +1906,7 @@ where
             let mut record_count = 0usize;
             for index in 0..readers.len() {
                 let requested = if index == 0 { batch_size } else { record_count };
+                let column_read_started = Instant::now();
                 let (records, value_count, level_count) = read_direct_primitive_records(
                     &mut readers[index],
                     &mut values[index],
@@ -1693,6 +1914,7 @@ where
                     required_columns[index],
                     &mut def_levels[index],
                 )?;
+                metrics.add_column_read_nanos(index, elapsed_nanos(column_read_started));
                 if index == 0 {
                     record_count = records;
                     if record_count == 0 {
@@ -1760,6 +1982,92 @@ where
         }
     }
     Ok(Some(metrics))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_selected_runs(
+    decimals: &[i64],
+    dates: &[i32],
+    decimal_min: Option<i64>,
+    decimal_max: Option<i64>,
+    date_min: Option<i32>,
+    date_max: Option<i32>,
+    runs: &mut Vec<(usize, usize)>,
+    selected_decimals: &mut Vec<i64>,
+    selected_dates: &mut Vec<i32>,
+) {
+    let mut run_start = None;
+    let mut run_len = 0usize;
+    for row in 0..decimals.len() {
+        let selected = decimal_min.is_none_or(|min| decimals[row] >= min)
+            && decimal_max.is_none_or(|max| decimals[row] <= max)
+            && date_min.is_none_or(|min| dates[row] >= min)
+            && date_max.is_none_or(|max| dates[row] <= max);
+        if selected {
+            selected_decimals.push(decimals[row]);
+            selected_dates.push(dates[row]);
+            if run_start.is_none() {
+                run_start = Some(row);
+                run_len = 1;
+            } else {
+                run_len += 1;
+            }
+        } else if let Some(start) = run_start.take() {
+            runs.push((start, run_len));
+            run_len = 0;
+        }
+    }
+    if let Some(start) = run_start {
+        runs.push((start, run_len));
+    }
+}
+
+fn read_i32_selected_runs(
+    reader: &mut ColumnReaderImpl<Int32Type>,
+    records: usize,
+    runs: &[(usize, usize)],
+    output: &mut Vec<i32>,
+) -> Result<bool> {
+    let mut cursor = 0usize;
+    for &(start, len) in runs {
+        if start > cursor && reader.skip_records(start - cursor)? != start - cursor {
+            return Ok(false);
+        }
+        let (read_records, value_count, level_count) =
+            reader.read_records(len, None, None, output)?;
+        if read_records != len || value_count != len || level_count != 0 {
+            return Ok(false);
+        }
+        cursor = start + len;
+    }
+    if records > cursor && reader.skip_records(records - cursor)? != records - cursor {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn read_i64_selected_runs(
+    reader: &mut ColumnReaderImpl<Int64Type>,
+    records: usize,
+    runs: &[(usize, usize)],
+    output: &mut Vec<i64>,
+) -> Result<bool> {
+    let mut cursor = 0usize;
+    for &(start, len) in runs {
+        if start > cursor && reader.skip_records(start - cursor)? != start - cursor {
+            return Ok(false);
+        }
+        let (read_records, value_count, level_count) =
+            reader.read_records(len, None, None, output)?;
+        if read_records != len || value_count != len || level_count != 0 {
+            return Ok(false);
+        }
+        cursor = start + len;
+    }
+    if records > cursor && reader.skip_records(records - cursor)? != records - cursor {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 fn direct_def_levels_match(level_count: usize, record_count: usize, required: bool) -> bool {

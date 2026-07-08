@@ -44,6 +44,7 @@ use crate::storage::{
     ParquetFileCache, ParquetFileCacheStats, ParquetMetadataCache,
     parquet_row_group_count_with_store, plan_parquet_scan_tasks, read_parquet_file_statistics,
     read_parquet_i64_column_constant, read_parquet_i64_column_max,
+    scan_parquet_i32_i64_decimal_i32_selected_with_store,
     scan_parquet_i64_byte_array_payload_columns_with_store,
     scan_parquet_primitive_columns_with_store,
 };
@@ -867,8 +868,115 @@ impl DodamEngine {
             scan_metrics.consume_nanos = scan_metrics
                 .consume_nanos
                 .saturating_add(metrics.consume_nanos);
+            if scan_metrics.column_read_nanos.len() < metrics.column_read_nanos.len() {
+                scan_metrics
+                    .column_read_nanos
+                    .resize(metrics.column_read_nanos.len(), 0);
+            }
+            for (index, nanos) in metrics.column_read_nanos.iter().enumerate() {
+                scan_metrics.column_read_nanos[index] =
+                    scan_metrics.column_read_nanos[index].saturating_add(*nanos);
+            }
         }
         log_direct_primitive_fold_profile(path, &columns, &scan_metrics);
+        Ok(Some((state, scan_metrics)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_parquet_i32_i64_decimal_i32_selected_fold<S, Init, Consume, Merge>(
+        &self,
+        path: impl AsRef<Path>,
+        batch_size: usize,
+        row_groups: &[usize],
+        columns: [&str; 4],
+        decimal_precision: u8,
+        decimal_scale: i8,
+        filter: DecimalDateRangeFilter,
+        init: Init,
+        consume: Consume,
+        merge: Merge,
+    ) -> Result<Option<(S, DirectPrimitiveColumnScanMetrics)>>
+    where
+        S: Send,
+        Init: Fn() -> S + Sync,
+        Consume: for<'a> Fn(&mut S, BatchView<'a>) -> Result<()> + Sync,
+        Merge: Fn(&mut S, S) -> Result<()> + Sync,
+    {
+        let decimal_min = option_i128_to_i64(filter.decimal_min)?;
+        let decimal_max = option_i128_to_i64(filter.decimal_max)?;
+        let path = path.as_ref();
+        let mut state = init();
+        let mut scan_metrics = DirectPrimitiveColumnScanMetrics::default();
+        if row_groups.is_empty() {
+            return Ok(Some((state, scan_metrics)));
+        }
+        let workers = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4)
+            .min(row_groups.len());
+        let chunk_size = row_groups.len().div_ceil(workers).max(1);
+        let (sender, receiver) = mpsc::channel();
+        std::thread::scope(|scope| {
+            for row_group_chunk in row_groups.chunks(chunk_size) {
+                let sender = sender.clone();
+                let engine = self.clone();
+                let path = path.to_path_buf();
+                let row_groups = row_group_chunk.to_vec();
+                let init = &init;
+                let consume = &consume;
+                scope.spawn(move || {
+                    let mut state = init();
+                    let result = scan_parquet_i32_i64_decimal_i32_selected_with_store(
+                        &path,
+                        batch_size,
+                        &row_groups,
+                        columns,
+                        decimal_precision,
+                        decimal_scale,
+                        decimal_min,
+                        decimal_max,
+                        filter.date_min,
+                        filter.date_max,
+                        engine.file_cache.clone(),
+                        engine.object_store.as_ref(),
+                        |columns| consume(&mut state, BatchView::from_raw_columns(columns)),
+                    );
+                    let _ =
+                        sender.send(result.map(|metrics| metrics.map(|metrics| (state, metrics))));
+                });
+            }
+        });
+        drop(sender);
+        for received in receiver {
+            let Some((partial, metrics)) = received? else {
+                return Ok(None);
+            };
+            merge(&mut state, partial)?;
+            scan_metrics.row_groups = scan_metrics.row_groups.saturating_add(metrics.row_groups);
+            scan_metrics.batches = scan_metrics.batches.saturating_add(metrics.batches);
+            scan_metrics.rows = scan_metrics.rows.saturating_add(metrics.rows);
+            scan_metrics.read_nanos = scan_metrics.read_nanos.saturating_add(metrics.read_nanos);
+            scan_metrics.consume_nanos = scan_metrics
+                .consume_nanos
+                .saturating_add(metrics.consume_nanos);
+            if scan_metrics.column_read_nanos.len() < metrics.column_read_nanos.len() {
+                scan_metrics
+                    .column_read_nanos
+                    .resize(metrics.column_read_nanos.len(), 0);
+            }
+            for (index, nanos) in metrics.column_read_nanos.iter().enumerate() {
+                scan_metrics.column_read_nanos[index] =
+                    scan_metrics.column_read_nanos[index].saturating_add(*nanos);
+            }
+        }
+        let profile_columns = columns
+            .iter()
+            .map(|name| OwnedDirectPrimitiveColumnSpec {
+                name: (*name).to_string(),
+                column_type: DirectPrimitiveColumnType::I64,
+            })
+            .collect::<Vec<_>>();
+        log_direct_primitive_fold_profile(path, &profile_columns, &scan_metrics);
         Ok(Some((state, scan_metrics)))
     }
 
@@ -4209,23 +4317,55 @@ impl DodamEngine {
                 column_type: DirectPrimitiveColumnType::Date32,
             },
         ];
-        let Some((state, scan_metrics)) = self.scan_parquet_primitive_columns_parallel_fold(
-            &local_path,
-            batch_size,
-            &row_groups,
-            columns,
-            || {
-                SingleKeyCountSumMinMaxVectorState::new(
-                    aggregates.to_vec(),
-                    shape.decimal_precision,
-                    shape.decimal_scale,
-                )
-            },
-            |state, batch| state.consume_i32_i64_decimal_date_batch(batch, &shape.filter),
-            |state, partial| state.merge(partial),
-        )?
-        else {
-            return Ok(None);
+        let scan_result = if direct_selection_fold_enabled() {
+            self.scan_parquet_i32_i64_decimal_i32_selected_fold(
+                &local_path,
+                batch_size,
+                &row_groups,
+                [
+                    shape.key_column.as_str(),
+                    shape.sum_column.as_str(),
+                    shape.min_decimal_column.as_str(),
+                    shape.max_date_column.as_str(),
+                ],
+                shape.decimal_precision,
+                shape.decimal_scale,
+                shape.filter,
+                || {
+                    SingleKeyCountSumMinMaxVectorState::new(
+                        aggregates.to_vec(),
+                        shape.decimal_precision,
+                        shape.decimal_scale,
+                    )
+                },
+                |state, batch| state.consume_i32_i64_decimal_date_batch(batch, &shape.filter),
+                |state, partial| state.merge(partial),
+            )?
+        } else {
+            None
+        };
+        let (state, scan_metrics) = if let Some(result) = scan_result {
+            result
+        } else {
+            let Some(result) = self.scan_parquet_primitive_columns_parallel_fold(
+                &local_path,
+                batch_size,
+                &row_groups,
+                columns,
+                || {
+                    SingleKeyCountSumMinMaxVectorState::new(
+                        aggregates.to_vec(),
+                        shape.decimal_precision,
+                        shape.decimal_scale,
+                    )
+                },
+                |state, batch| state.consume_i32_i64_decimal_date_batch(batch, &shape.filter),
+                |state, partial| state.merge(partial),
+            )?
+            else {
+                return Ok(None);
+            };
+            result
         };
         let mut metrics = state.finish();
         metrics.fragments = 1;
@@ -4679,6 +4819,23 @@ fn direct_primitive_profile_enabled() -> bool {
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
+fn direct_selection_fold_enabled() -> bool {
+    std::env::var("DODAM_DIRECT_SELECTION_FOLD")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn option_i128_to_i64(value: Option<i128>) -> Result<Option<i64>> {
+    value
+        .map(|value| {
+            i64::try_from(value).map_err(|_| {
+                DodamError::UnsupportedSql(
+                    "direct selection decimal bound is outside Int64 range".to_string(),
+                )
+            })
+        })
+        .transpose()
+}
+
 fn log_direct_primitive_fold_profile(
     path: &Path,
     columns: &[OwnedDirectPrimitiveColumnSpec],
@@ -4696,13 +4853,21 @@ fn log_direct_primitive_fold_profile(
         .map(|column| column.name.as_str())
         .collect::<Vec<_>>()
         .join(",");
+    let column_read = metrics
+        .column_read_nanos
+        .iter()
+        .enumerate()
+        .map(|(index, nanos)| format!("{index}:{:.3}", nanos_to_millis(*nanos)))
+        .collect::<Vec<_>>()
+        .join(",");
     eprintln!(
-        "[dodam:direct-primitive-profile] {table}[{columns}]: row_groups={} rows={} batches={} read={:.3} ms consume={:.3} ms",
+        "[dodam:direct-primitive-profile] {table}[{columns}]: row_groups={} rows={} batches={} read={:.3} ms consume={:.3} ms column_read=[{}]",
         metrics.row_groups,
         metrics.rows,
         metrics.batches,
         nanos_to_millis(metrics.read_nanos),
         nanos_to_millis(metrics.consume_nanos),
+        column_read,
     );
 }
 
