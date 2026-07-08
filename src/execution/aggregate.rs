@@ -24,6 +24,7 @@ use crate::hash::FastHashMap as AggregateHashMap;
 const SMALL_GROUP_LINEAR_LIMIT: usize = 8;
 const TWO_UTF8_SMALL_GROUP_LIMIT: usize = 8;
 const DENSE_I32_GROUP_INDEX_MAX_SLOTS: usize = 65_536;
+const DENSE_U32_GROUP_INDEX_MAX_SLOTS: usize = 65_536;
 
 fn small_group_linear_limit() -> usize {
     std::env::var("DODAM_SMALL_GROUP_LINEAR_LIMIT")
@@ -45,6 +46,14 @@ fn dense_i32_group_index_max_slots() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DENSE_I32_GROUP_INDEX_MAX_SLOTS)
+}
+
+fn dense_u32_group_index_max_slots() -> usize {
+    std::env::var("DODAM_DENSE_U32_GROUP_INDEX_MAX_SLOTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DENSE_U32_GROUP_INDEX_MAX_SLOTS)
 }
 
 pub fn collect_aggregates(
@@ -924,8 +933,127 @@ struct CoalesceSecondGroups {
 
 #[derive(Default)]
 struct CoalesceThirdGroups {
-    non_null: AdaptiveCopyGroupIndex<u32>,
+    non_null: DenseU32GroupIndex,
     null_group: Option<usize>,
+}
+
+enum DenseU32GroupIndex {
+    Small(Vec<(u32, usize)>),
+    Dense(Vec<Option<usize>>),
+    Hash(AggregateHashMap<u32, usize>),
+}
+
+impl Default for DenseU32GroupIndex {
+    fn default() -> Self {
+        Self::Small(Vec::new())
+    }
+}
+
+impl DenseU32GroupIndex {
+    fn get(&self, key: u32) -> Option<usize> {
+        match self {
+            Self::Small(groups) => groups
+                .iter()
+                .find_map(|(candidate, group_id)| (*candidate == key).then_some(*group_id)),
+            Self::Dense(slots) => slots.get(key as usize).copied().flatten(),
+            Self::Hash(groups) => groups.get(&key).copied(),
+        }
+    }
+
+    fn insert(&mut self, key: u32, group_id: usize) {
+        match self {
+            Self::Small(groups) if groups.len() < small_group_linear_limit() => {
+                groups.push((key, group_id));
+            }
+            Self::Small(groups) => {
+                if let Some(mut slots) = dense_u32_slots_for_new_key(groups, key) {
+                    for (existing_key, existing_group_id) in groups.drain(..) {
+                        slots[existing_key as usize] = Some(existing_group_id);
+                    }
+                    slots[key as usize] = Some(group_id);
+                    *self = Self::Dense(slots);
+                } else {
+                    let mut hash = groups.drain(..).collect::<AggregateHashMap<_, _>>();
+                    hash.insert(key, group_id);
+                    *self = Self::Hash(hash);
+                }
+            }
+            Self::Dense(slots) => {
+                let key_index = key as usize;
+                if key_index < slots.len() {
+                    slots[key_index] = Some(group_id);
+                    return;
+                }
+                let required = key_index.saturating_add(1);
+                if required <= dense_u32_group_index_max_slots() {
+                    slots.resize(required, None);
+                    slots[key_index] = Some(group_id);
+                } else {
+                    let mut hash = AggregateHashMap::default();
+                    for (key, existing_group_id) in slots.iter().enumerate() {
+                        if let Some(existing_group_id) = existing_group_id
+                            && let Ok(key) = u32::try_from(key)
+                        {
+                            hash.insert(key, *existing_group_id);
+                        }
+                    }
+                    hash.insert(key, group_id);
+                    *self = Self::Hash(hash);
+                }
+            }
+            Self::Hash(groups) => {
+                groups.insert(key, group_id);
+            }
+        }
+    }
+
+    fn iter(&self) -> DenseU32GroupIndexIter<'_> {
+        match self {
+            Self::Small(groups) => DenseU32GroupIndexIter::Small(groups.iter()),
+            Self::Dense(slots) => DenseU32GroupIndexIter::Dense { offset: 0, slots },
+            Self::Hash(groups) => DenseU32GroupIndexIter::Hash(groups.iter()),
+        }
+    }
+}
+
+fn dense_u32_slots_for_new_key(groups: &[(u32, usize)], key: u32) -> Option<Vec<Option<usize>>> {
+    let max = groups
+        .iter()
+        .fold(key, |max, (candidate, _)| max.max(*candidate));
+    let slot_count = usize::try_from(max).ok()?.checked_add(1)?;
+    (slot_count <= dense_u32_group_index_max_slots()).then(|| vec![None; slot_count])
+}
+
+enum DenseU32GroupIndexIter<'a> {
+    Small(std::slice::Iter<'a, (u32, usize)>),
+    Dense {
+        offset: usize,
+        slots: &'a [Option<usize>],
+    },
+    Hash(std::collections::hash_map::Iter<'a, u32, usize>),
+}
+
+impl Iterator for DenseU32GroupIndexIter<'_> {
+    type Item = (u32, usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Small(iter) => iter.next().map(|(key, group_id)| (*key, *group_id)),
+            Self::Dense { offset, slots } => {
+                while *offset < slots.len() {
+                    let current = *offset;
+                    *offset += 1;
+                    if let Some(group_id) = slots[current]
+                        && let Ok(key) = u32::try_from(current)
+                    {
+                        return Some((key, group_id));
+                    }
+                }
+                None
+            }
+            Self::Hash(iter) => iter.next().map(|(key, group_id)| (*key, *group_id)),
+        }
+    }
 }
 
 struct CoalesceKeyCountSumGroup {
