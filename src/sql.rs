@@ -330,7 +330,7 @@ pub async fn execute_sql(
     if let Some(output) = try_execute_in_subquery_sql(engine, sql, batch_size).await? {
         return Ok(output);
     }
-    if let Some(output) = try_execute_row_number_window_sql(engine, sql, batch_size).await? {
+    if let Some(output) = try_execute_window_sql(engine, sql, batch_size).await? {
         return Ok(output);
     }
     if let Some(output) = try_execute_projection_expression_sql(engine, sql, batch_size).await? {
@@ -440,28 +440,47 @@ pub async fn execute_sql(
             )?;
         }
         if projection_requires_expression {
-            batches = apply_output_expression_projection_order_limit(
-                batches,
-                &query.expressions,
-                query.order_by.as_ref(),
-                query.limit,
-                query.offset,
-            )?;
-        } else {
-            batches = apply_output_order_limit(
-                batches,
-                query.order_by.as_ref(),
-                query.limit,
-                query.offset,
-            )?;
-            if !output_projection_is_final && query.qualified_wildcards.is_empty() {
-                batches = apply_output_projection(batches, &query.projection)?;
+            if query.distinct {
+                batches = apply_output_expression_projection(batches, &query.expressions)?;
+                batches = apply_output_distinct(batches, true)?;
+                batches = apply_output_order_limit(
+                    batches,
+                    query.order_by.as_ref(),
+                    query.limit,
+                    query.offset,
+                )?;
+            } else {
+                batches = apply_output_expression_projection_order_limit(
+                    batches,
+                    &query.expressions,
+                    query.order_by.as_ref(),
+                    query.limit,
+                    query.offset,
+                )?;
             }
-        }
-        if query.distinct {
-            batches = collect_batches(
-                Box::new(DistinctExec::new(Box::new(MemoryExec::new(batches)))).execute()?,
-            )?;
+        } else {
+            if query.distinct {
+                if !output_projection_is_final && query.qualified_wildcards.is_empty() {
+                    batches = apply_output_projection(batches, &query.projection)?;
+                }
+                batches = apply_output_distinct(batches, true)?;
+                batches = apply_output_order_limit(
+                    batches,
+                    query.order_by.as_ref(),
+                    query.limit,
+                    query.offset,
+                )?;
+            } else {
+                batches = apply_output_order_limit(
+                    batches,
+                    query.order_by.as_ref(),
+                    query.limit,
+                    query.offset,
+                )?;
+                if !output_projection_is_final && query.qualified_wildcards.is_empty() {
+                    batches = apply_output_projection(batches, &query.projection)?;
+                }
+            }
         }
         if !query.qualified_wildcards.is_empty() {
             batches = apply_qualified_wildcard_projection(
@@ -2414,7 +2433,7 @@ async fn try_execute_in_subquery_sql(
     Ok(Some(QueryOutput::Scan { batches }))
 }
 
-async fn try_execute_row_number_window_sql(
+async fn try_execute_window_sql(
     engine: &DodamEngine,
     sql: &str,
     batch_size: usize,
@@ -2428,7 +2447,7 @@ async fn try_execute_row_number_window_sql(
     let SetExpr::Select(select) = query.body.as_ref() else {
         return Ok(None);
     };
-    let Some(window) = parse_row_number_window_projection(select)? else {
+    let Some(window) = parse_window_projection(select)? else {
         return Ok(None);
     };
     reject_query_features(query)?;
@@ -2473,25 +2492,31 @@ async fn try_execute_row_number_window_sql(
         .await?;
     let mut batches = collect_batches(stream)?;
     batches = apply_output_order_limit(batches, Some(&window.window_sort), None, 0)?;
-    batches = append_window_function_column(batches, &window)?;
-    let order_by = parse_row_number_query_order_by(query, &window, path.alias.as_deref())?;
+    batches = append_window_function_columns(batches, &window)?;
+    let order_by = parse_window_query_order_by(query, &window, path.alias.as_deref())?;
     let limit = parse_limit(query)?;
-    batches = apply_output_order_limit(batches, order_by.as_ref(), limit, 0)?;
+    let offset = parse_offset(query)?;
+    batches = apply_output_order_limit(batches, order_by.as_ref(), limit, offset)?;
     batches = apply_output_projection(batches, &Projection::Columns(window.output_columns))?;
     Ok(Some(QueryOutput::Scan { batches }))
 }
 
 #[derive(Debug)]
-struct RowNumberWindowProjection {
+struct WindowProjection {
     input_columns: Vec<String>,
     output_columns: Vec<String>,
+    window_sort: SortKey,
+    aliases: Vec<(String, String)>,
+    ordinal_targets: Vec<String>,
+    functions: Vec<WindowProjectionFunction>,
+}
+
+#[derive(Debug, Clone)]
+struct WindowProjectionFunction {
     output_name: String,
     function: WindowFunctionKind,
     partition_by: Vec<String>,
     order_by: Vec<String>,
-    window_sort: SortKey,
-    aliases: Vec<(String, String)>,
-    ordinal_targets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2501,9 +2526,7 @@ enum WindowFunctionKind {
     DenseRank,
 }
 
-fn parse_row_number_window_projection(
-    select: &Select,
-) -> Result<Option<RowNumberWindowProjection>> {
+fn parse_window_projection(select: &Select) -> Result<Option<WindowProjection>> {
     if !select
         .projection
         .iter()
@@ -2514,8 +2537,8 @@ fn parse_row_number_window_projection(
     let mut input_columns = Vec::new();
     let mut output_columns = Vec::new();
     let mut aliases = Vec::new();
-    let mut window_output = None;
-    let mut window = None;
+    let mut functions = Vec::new();
+    let mut window_sort = None;
 
     for item in &select.projection {
         match item {
@@ -2542,42 +2565,49 @@ fn parse_row_number_window_projection(
                 expr: SqlExpr::Function(function),
                 alias: _,
             } if supported_window_function(function).is_some() => {
-                if window_output.is_some() {
-                    return Err(DodamError::UnsupportedSql(
-                        "only one window projection is supported".to_string(),
-                    ));
-                }
                 let output_name = match item {
                     SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
                     _ => function.to_string(),
                 };
-                window = Some(parse_window_function(function)?);
-                window_output = Some(output_name.clone());
+                let (function, partition_by, order_by, sort) = parse_window_function(function)?;
+                if let Some(window_sort) = &window_sort {
+                    if window_sort != &sort {
+                        return Err(DodamError::UnsupportedSql(
+                            "multiple window projections currently require the same OVER specification"
+                                .to_string(),
+                        ));
+                    }
+                } else {
+                    window_sort = Some(sort);
+                }
+                functions.push(WindowProjectionFunction {
+                    output_name: output_name.clone(),
+                    function,
+                    partition_by,
+                    order_by,
+                });
                 output_columns.push(output_name);
             }
             _ => return Ok(None),
         }
     }
-    let Some(output_name) = window_output else {
+    if functions.is_empty() {
         return Ok(None);
-    };
-    let (function, partition_by, order_by, window_sort) =
-        window.expect("window output implies spec");
-    aliases.push((output_name.clone(), output_name.clone()));
+    }
+    for function in &functions {
+        aliases.push((function.output_name.clone(), function.output_name.clone()));
+    }
     let ordinal_targets = output_columns
         .iter()
         .map(|column| resolve_alias(column, &aliases))
         .collect();
-    Ok(Some(RowNumberWindowProjection {
+    Ok(Some(WindowProjection {
         input_columns,
         output_columns,
-        output_name,
-        function,
-        partition_by,
-        order_by,
-        window_sort,
+        window_sort: window_sort.expect("window functions imply sort"),
         aliases,
         ordinal_targets,
+        functions,
     }))
 }
 
@@ -2684,7 +2714,7 @@ fn parse_window_function(
 
 fn row_number_query_order_columns(
     order_by: &sqlparser::ast::OrderBy,
-    window: &RowNumberWindowProjection,
+    window: &WindowProjection,
     table_alias: Option<&str>,
 ) -> Result<Vec<String>> {
     let OrderByKind::Expressions(expressions) = &order_by.kind else {
@@ -2694,7 +2724,7 @@ fn row_number_query_order_columns(
         .iter()
         .filter_map(|order| match &order.expr {
             SqlExpr::Value(_) => None,
-            SqlExpr::Identifier(ident) if ident.value == window.output_name => None,
+            SqlExpr::Identifier(ident) if window.has_output_name(&ident.value) => None,
             expr => Some(
                 sql_column_name(expr, table_alias)
                     .map(|column| resolve_alias(&column, &window.aliases)),
@@ -2703,9 +2733,17 @@ fn row_number_query_order_columns(
         .collect()
 }
 
-fn parse_row_number_query_order_by(
+impl WindowProjection {
+    fn has_output_name(&self, name: &str) -> bool {
+        self.functions
+            .iter()
+            .any(|function| function.output_name == name)
+    }
+}
+
+fn parse_window_query_order_by(
     query: &Query,
-    window: &RowNumberWindowProjection,
+    window: &WindowProjection,
     table_alias: Option<&str>,
 ) -> Result<Option<SortKey>> {
     let Some(order_by) = &query.order_by else {
@@ -2731,8 +2769,8 @@ fn parse_row_number_query_order_by(
             }
             let column = match &order.expr {
                 SqlExpr::Value(value) => resolve_order_by_ordinal(value, &window.ordinal_targets)?,
-                SqlExpr::Identifier(ident) if ident.value == window.output_name => {
-                    window.output_name.clone()
+                SqlExpr::Identifier(ident) if window.has_output_name(&ident.value) => {
+                    ident.value.clone()
                 }
                 expr => resolve_alias(&sql_column_name(expr, table_alias)?, &window.aliases),
             };
@@ -2746,25 +2784,30 @@ fn parse_row_number_query_order_by(
     SortKey::new(expressions).map(Some)
 }
 
-fn append_window_function_column(
+fn append_window_function_columns(
     batches: Vec<RecordBatch>,
-    window: &RowNumberWindowProjection,
+    window: &WindowProjection,
 ) -> Result<Vec<RecordBatch>> {
     let mut offset = 0_u64;
     batches
         .into_iter()
         .map(|batch| {
             let row_count = batch.num_rows();
-            let values = window_function_values(&batch, window, offset)?;
+            let mut function_values = Vec::with_capacity(window.functions.len());
+            for function in &window.functions {
+                function_values.push(window_function_values(&batch, function, offset)?);
+            }
             offset += row_count as u64;
             let mut fields = batch.schema().fields().to_vec();
             let mut columns = batch.columns().to_vec();
-            fields.push(Arc::new(Field::new(
-                window.output_name.clone(),
-                DataType::UInt64,
-                false,
-            )));
-            columns.push(Arc::new(UInt64Array::from(values)) as ArrayRef);
+            for (function, values) in window.functions.iter().zip(function_values) {
+                fields.push(Arc::new(Field::new(
+                    function.output_name.clone(),
+                    DataType::UInt64,
+                    false,
+                )));
+                columns.push(Arc::new(UInt64Array::from(values)) as ArrayRef);
+            }
             Ok(RecordBatch::try_new(
                 Arc::new(Schema::new(fields)),
                 columns,
@@ -2775,7 +2818,7 @@ fn append_window_function_column(
 
 fn window_function_values(
     batch: &RecordBatch,
-    window: &RowNumberWindowProjection,
+    window: &WindowProjectionFunction,
     offset: u64,
 ) -> Result<Vec<u64>> {
     match window.function {
@@ -2812,7 +2855,7 @@ fn window_function_values(
 
 fn window_partition_equal(
     batch: &RecordBatch,
-    window: &RowNumberWindowProjection,
+    window: &WindowProjectionFunction,
     left: usize,
     right: usize,
 ) -> Result<bool> {
@@ -2821,7 +2864,7 @@ fn window_partition_equal(
 
 fn window_order_equal(
     batch: &RecordBatch,
-    window: &RowNumberWindowProjection,
+    window: &WindowProjectionFunction,
     left: usize,
     right: usize,
 ) -> Result<bool> {
@@ -34141,6 +34184,9 @@ fn pushed_join_output_projection(query: &SqlQuery) -> Result<Projection> {
     if query.is_aggregate() {
         return Ok(aggregate_join_output_projection(query));
     }
+    if query.distinct {
+        return Ok(Projection::All);
+    }
     if !matches!(join.join_type, JoinType::Inner | JoinType::Semi) {
         return Ok(Projection::All);
     }
@@ -34334,6 +34380,12 @@ fn parse_comma_join_select(query: &Query, select: &Select) -> Result<SqlQuery> {
     )?;
     let limit = parse_limit(query)?;
     let offset = parse_offset(query)?;
+    validate_distinct(
+        distinct,
+        &projection.projection,
+        &projection.aggregates,
+        order_by.as_ref(),
+    )?;
 
     Ok(SqlQuery {
         path: left.path.clone(),
@@ -34408,6 +34460,12 @@ fn parse_join_select(query: &Query, select: &Select) -> Result<SqlQuery> {
     )?;
     let limit = parse_limit(query)?;
     let offset = parse_offset(query)?;
+    validate_distinct(
+        distinct,
+        &projection.projection,
+        &projection.aggregates,
+        order_by.as_ref(),
+    )?;
 
     Ok(SqlQuery {
         path: left.path,
@@ -39506,6 +39564,13 @@ fn apply_output_order_limit(
     let sorted_limit = limit.and_then(|limit| limit.checked_add(offset));
     let sorted = sort_output_batch(&batch, order_by, sorted_limit)?;
     Ok(limit_batches(vec![sorted], limit, offset))
+}
+
+fn apply_output_distinct(batches: Vec<RecordBatch>, distinct: bool) -> Result<Vec<RecordBatch>> {
+    if !distinct {
+        return Ok(batches);
+    }
+    collect_batches(Box::new(DistinctExec::new(Box::new(MemoryExec::new(batches)))).execute()?)
 }
 
 fn apply_output_expression_projection_order_limit(

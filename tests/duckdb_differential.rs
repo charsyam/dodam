@@ -288,6 +288,19 @@ async fn duckdb_differential_aggregate_matrix() {
         tempdir.path(),
     )
     .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, key, row_number() OVER (PARTITION BY key ORDER BY value) AS rn, rank() OVER (PARTITION BY key ORDER BY value) AS rnk, dense_rank() OVER (PARTITION BY key ORDER BY value) AS drnk FROM '{}' ORDER BY key NULLS FIRST, value NULLS FIRST, id LIMIT 4 OFFSET 1",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id, key, row_number() OVER (PARTITION BY key ORDER BY value) AS rn, rank() OVER (PARTITION BY key ORDER BY value) AS rnk, dense_rank() OVER (PARTITION BY key ORDER BY value) AS drnk FROM read_parquet('{}') ORDER BY key NULLS FIRST, value NULLS FIRST, id LIMIT 4 OFFSET 1",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -475,6 +488,21 @@ async fn duckdb_differential_join_matrix() {
         ),
         &format!(
             "SELECT DISTINCT f.key, d.name FROM read_parquet('{}') f JOIN read_parquet('{}') d ON f.key = d.key ORDER BY f.key, d.name",
+            facts_path.display(),
+            dim_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT DISTINCT f.key FROM '{}' f JOIN '{}' d ON f.key = d.key ORDER BY f.key NULLS LAST LIMIT 2 OFFSET 1",
+            facts_path.display(),
+            dim_path.display()
+        ),
+        &format!(
+            "SELECT DISTINCT f.key FROM read_parquet('{}') f JOIN read_parquet('{}') d ON f.key = d.key ORDER BY f.key NULLS LAST LIMIT 2 OFFSET 1",
             facts_path.display(),
             dim_path.display()
         ),
@@ -1722,6 +1750,30 @@ async fn dodam_sql_error_contract_matrix() {
             facts_path.display()
         ),
         "GROUP BY ALL",
+    )
+    .await;
+    assert_dodam_error_contains(
+        &format!(
+            "SELECT id, row_number() OVER (ORDER BY id) AS rn, rank() OVER (ORDER BY value) AS rnk FROM '{}'",
+            facts_path.display()
+        ),
+        "same OVER specification",
+    )
+    .await;
+    assert_dodam_error_contains(
+        &format!(
+            "SELECT id, row_number() OVER (ORDER BY id) AS rn FROM '{}' QUALIFY rn = 1",
+            facts_path.display()
+        ),
+        "qualify",
+    )
+    .await;
+    assert_dodam_error_contains(
+        &format!(
+            "SELECT id, sum(value) OVER (PARTITION BY key ORDER BY id) AS running_sum FROM '{}'",
+            facts_path.display()
+        ),
+        "window",
     )
     .await;
     assert_dodam_error_contains(
