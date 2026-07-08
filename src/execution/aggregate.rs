@@ -750,14 +750,69 @@ impl CoalesceKeyCountSumGroups {
     }
 
     fn finish(self, aggregates: &[AggregateExpr]) -> Vec<GroupAggregateResult> {
-        let mut groups = self
-            .groups
+        let Self {
+            key_len,
+            index,
+            third_string_ids,
+            third_strings,
+            groups,
+        } = self;
+        let can_finish_ordered = key_len == 3
+            && matches!(
+                &index,
+                CoalesceLeadingIndex::DenseThree { fallback, .. } if fallback.is_empty()
+            );
+        if can_finish_ordered && let CoalesceLeadingIndex::DenseThree { range, slots, .. } = index {
+            return finish_dense_three_ordered_groups(
+                range,
+                slots,
+                third_strings,
+                groups,
+                aggregates,
+            );
+        }
+        let _ = third_string_ids;
+        let _ = third_strings;
+        let _ = index;
+        let mut groups = groups
             .into_iter()
             .map(|group| group.finish(aggregates))
             .collect::<Vec<_>>();
         groups.sort_by(|left, right| compare_group_keys(&left.keys, &right.keys));
         groups
     }
+}
+
+fn finish_dense_three_ordered_groups(
+    range: DenseLeadingRange,
+    slots: Vec<CoalesceThirdGroups>,
+    third_strings: Vec<String>,
+    groups: Vec<CoalesceKeyCountSumGroup>,
+    aggregates: &[AggregateExpr],
+) -> Vec<GroupAggregateResult> {
+    let mut groups = groups.into_iter().map(Some).collect::<Vec<_>>();
+    let mut output = Vec::with_capacity(groups.len());
+    for first_offset in 0..range.first_len {
+        for second_offset in 0..range.second_len {
+            let slot = first_offset * range.second_len + second_offset;
+            let third_groups = &slots[slot];
+            if let Some(group_id) = third_groups.null_group
+                && let Some(group) = groups[group_id].take()
+            {
+                output.push(group.finish(aggregates));
+            }
+            let mut non_null = third_groups.non_null.iter().collect::<Vec<_>>();
+            non_null.sort_by(|(left, _), (right, _)| {
+                third_strings[*left as usize].cmp(&third_strings[*right as usize])
+            });
+            for (_, group_id) in non_null {
+                if let Some(group) = groups[group_id].take() {
+                    output.push(group.finish(aggregates));
+                }
+            }
+        }
+    }
+    output
 }
 
 #[derive(Clone, Copy)]
@@ -3786,6 +3841,32 @@ where
             Self::Hash(groups) => {
                 groups.insert(key, group_id);
             }
+        }
+    }
+
+    fn iter(&self) -> AdaptiveCopyGroupIndexIter<'_, K> {
+        match self {
+            Self::Small(groups) => AdaptiveCopyGroupIndexIter::Small(groups.iter()),
+            Self::Hash(groups) => AdaptiveCopyGroupIndexIter::Hash(groups.iter()),
+        }
+    }
+}
+
+enum AdaptiveCopyGroupIndexIter<'a, K> {
+    Small(std::slice::Iter<'a, (K, usize)>),
+    Hash(std::collections::hash_map::Iter<'a, K, usize>),
+}
+
+impl<K> Iterator for AdaptiveCopyGroupIndexIter<'_, K>
+where
+    K: Copy,
+{
+    type Item = (K, usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Small(iter) => iter.next().map(|(key, group_id)| (*key, *group_id)),
+            Self::Hash(iter) => iter.next().map(|(key, group_id)| (*key, *group_id)),
         }
     }
 }
