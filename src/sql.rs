@@ -18713,6 +18713,7 @@ async fn q04_candidate_order_priorities_row_group_map(
             q04_candidate_row_group_map_chunk(),
             || Q04CandidatePartial {
                 labels: Vec::new(),
+                label_indices: HashMap::new(),
                 rows: Vec::new(),
             },
             move |batch, partial| {
@@ -18788,6 +18789,7 @@ async fn q04_candidate_order_priorities_late(
                 }
                 Ok(Some(Q04CandidatePartial {
                     labels: state.labels,
+                    label_indices: state.label_indices,
                     rows: state.rows,
                 }))
             },
@@ -18916,6 +18918,7 @@ impl<'a> Q04CandidatePayloadView<'a> {
 
 struct Q04CandidatePartial {
     labels: Vec<String>,
+    label_indices: HashMap<String, u8>,
     rows: Vec<(i64, u8)>,
 }
 
@@ -18928,15 +18931,6 @@ fn q04_candidate_order_priorities_partial_batch(
     let orderkeys = batch_column(&batch, "o_orderkey")?;
     let orderdates = batch_column(&batch, "o_orderdate")?;
     let orderpriorities = batch_column(&batch, "o_orderpriority")?;
-    let mut label_indices = HashMap::<String, u8>::new();
-    for (index, label) in partial.labels.iter().enumerate() {
-        let Ok(index) = u8::try_from(index) else {
-            return Err(DodamError::UnsupportedSql(
-                "too many Q04 order priorities".to_string(),
-            ));
-        };
-        label_indices.insert(label.clone(), index);
-    }
     if let (Some(orderkeys), Some(orderdates), Some(orderpriorities)) = (
         orderkeys.as_any().downcast_ref::<Int64Array>(),
         orderdates.as_any().downcast_ref::<Date32Array>(),
@@ -18950,7 +18944,6 @@ fn q04_candidate_order_priorities_partial_batch(
         start_days,
         end_days,
         partial,
-        &mut label_indices,
     )? {
         return Ok(Some(()));
     }
@@ -18973,7 +18966,7 @@ fn q04_candidate_order_priorities_partial_batch(
                 continue;
             }
             let priority = orderpriorities.value(row);
-            let priority_index = if let Some(index) = label_indices.get(priority) {
+            let priority_index = if let Some(index) = partial.label_indices.get(priority) {
                 *index
             } else {
                 let next_index = u8::try_from(partial.labels.len()).map_err(|_| {
@@ -18981,7 +18974,7 @@ fn q04_candidate_order_priorities_partial_batch(
                 })?;
                 let priority = priority.to_string();
                 partial.labels.push(priority.clone());
-                label_indices.insert(priority, next_index);
+                partial.label_indices.insert(priority, next_index);
                 next_index
             };
             partial.rows.push((orderkey, priority_index));
@@ -19002,7 +18995,7 @@ fn q04_candidate_order_priorities_partial_batch(
             continue;
         }
         let priority = orderpriorities.value(row);
-        let priority_index = if let Some(index) = label_indices.get(priority) {
+        let priority_index = if let Some(index) = partial.label_indices.get(priority) {
             *index
         } else {
             let next_index = u8::try_from(partial.labels.len()).map_err(|_| {
@@ -19010,7 +19003,7 @@ fn q04_candidate_order_priorities_partial_batch(
             })?;
             let priority = priority.to_string();
             partial.labels.push(priority.clone());
-            label_indices.insert(priority, next_index);
+            partial.label_indices.insert(priority, next_index);
             next_index
         };
         partial.rows.push((orderkey, priority_index));
@@ -19024,15 +19017,6 @@ fn q04_candidate_order_priorities_partial_view(
     end_days: i32,
     partial: &mut Q04CandidatePartial,
 ) -> Result<Option<()>> {
-    let mut label_indices = HashMap::<String, u8>::new();
-    for (index, label) in partial.labels.iter().enumerate() {
-        let Ok(index) = u8::try_from(index) else {
-            return Err(DodamError::UnsupportedSql(
-                "too many Q04 order priorities".to_string(),
-            ));
-        };
-        label_indices.insert(label.clone(), index);
-    }
     if let (Some(orderkeys), Some(orderdates), Some(orderpriorities)) =
         (view.i64(0), view.date32(1), view.dictionary_i32_view(2))
         && q04_candidate_order_priorities_dictionary_typed(
@@ -19042,7 +19026,6 @@ fn q04_candidate_order_priorities_partial_view(
             start_days,
             end_days,
             partial,
-            &mut label_indices,
         )?
     {
         return Ok(Some(()));
@@ -19064,7 +19047,7 @@ fn q04_candidate_order_priorities_partial_view(
             }
             let priority = std::str::from_utf8(orderpriorities.value_bytes(row))
                 .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
-            let priority_index = if let Some(index) = label_indices.get(priority) {
+            let priority_index = if let Some(index) = partial.label_indices.get(priority) {
                 *index
             } else {
                 let next_index = u8::try_from(partial.labels.len()).map_err(|_| {
@@ -19072,7 +19055,7 @@ fn q04_candidate_order_priorities_partial_view(
                 })?;
                 let priority = priority.to_string();
                 partial.labels.push(priority.clone());
-                label_indices.insert(priority, next_index);
+                partial.label_indices.insert(priority, next_index);
                 next_index
             };
             partial.rows.push((orderkey, priority_index));
@@ -19092,7 +19075,6 @@ fn q04_candidate_order_priorities_dictionary_typed(
     start_days: i32,
     end_days: i32,
     partial: &mut Q04CandidatePartial,
-    label_indices: &mut HashMap<String, u8>,
 ) -> Result<bool> {
     let Some(priority_values) = orderpriorities.string_values() else {
         return Ok(false);
@@ -19103,11 +19085,7 @@ fn q04_candidate_order_priorities_dictionary_typed(
         let priority = priority_values.value_bytes(index);
         let priority = std::str::from_utf8(priority)
             .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
-        priority_label_indices.push(Some(q04_priority_label_index(
-            priority,
-            partial,
-            label_indices,
-        )?));
+        priority_label_indices.push(Some(q04_priority_label_index(priority, partial)?));
     }
     if orderkeys.null_count() == 0
         && orderdates.null_count() == 0
@@ -19151,19 +19129,15 @@ fn q04_candidate_order_priorities_dictionary_typed(
     Ok(true)
 }
 
-fn q04_priority_label_index(
-    priority: &str,
-    partial: &mut Q04CandidatePartial,
-    label_indices: &mut HashMap<String, u8>,
-) -> Result<u8> {
-    if let Some(index) = label_indices.get(priority) {
+fn q04_priority_label_index(priority: &str, partial: &mut Q04CandidatePartial) -> Result<u8> {
+    if let Some(index) = partial.label_indices.get(priority) {
         return Ok(*index);
     }
     let next_index = u8::try_from(partial.labels.len())
         .map_err(|_| DodamError::UnsupportedSql("too many Q04 order priorities".to_string()))?;
     let priority = priority.to_string();
     partial.labels.push(priority.clone());
-    label_indices.insert(priority, next_index);
+    partial.label_indices.insert(priority, next_index);
     Ok(next_index)
 }
 
@@ -19183,14 +19157,16 @@ fn q04_late_candidate_build_selection_batch(
     if orderkeys.null_count() == 0 && orderdates.null_count() == 0 {
         let orderkey_values = orderkeys.values().as_ref();
         let orderdate_values = orderdates.values().as_ref();
-        for (&orderkey, &orderdate) in orderkey_values.iter().zip(orderdate_values) {
+        selection.push_selected_rows(orderkey_values.len(), |row| {
+            let orderkey = orderkey_values[row];
+            let orderdate = orderdate_values[row];
             let selected =
                 orderkey >= 0 && orderdate >= state.start_days && orderdate < state.end_days;
-            selection.push(selected);
             if selected {
                 state.selected_orderkeys.push(orderkey);
             }
-        }
+            selected
+        });
         return Ok(Some(()));
     }
     for row in 0..batch.num_rows() {
@@ -19221,14 +19197,16 @@ fn q04_late_candidate_build_selection_view(
             orderkeys.values_if_null_free(),
             orderdates.values_if_null_free(),
         ) {
-            for (&orderkey, &orderdate) in orderkey_values.iter().zip(orderdate_values) {
+            selection.push_selected_rows(orderkey_values.len(), |row| {
+                let orderkey = orderkey_values[row];
+                let orderdate = orderdate_values[row];
                 let selected =
                     orderkey >= 0 && orderdate >= state.start_days && orderdate < state.end_days;
-                selection.push(selected);
                 if selected {
                     state.selected_orderkeys.push(orderkey);
                 }
-            }
+                selected
+            });
             return Ok(Some(()));
         }
         for row in 0..view.num_rows() {
@@ -19904,16 +19882,9 @@ fn q04_lineitem_late_build_selection_batch(
         let orderkey_values = orderkeys.values();
         selection.push_selected_rows(orderkeys.len(), |row| {
             let orderkey = orderkey_values[row];
-            let selected = usize::try_from(orderkey)
-                .ok()
-                .and_then(|index| {
-                    state
-                        .candidate_priorities
-                        .get(index)
-                        .map(|marker| (index, marker))
-                })
-                .filter(|(_, marker)| marker.load(Ordering::Relaxed) != 0);
-            if let Some((index, _)) = selected {
+            if let Some(index) =
+                dense_atomic_marker_present_index(orderkey, &state.candidate_priorities)
+            {
                 state.selected_orderkeys.push(index);
                 true
             } else {
@@ -19926,17 +19897,9 @@ fn q04_lineitem_late_build_selection_batch(
         let selected = if orderkeys.is_null(row) {
             None
         } else {
-            usize::try_from(orderkeys.value(row))
-                .ok()
-                .and_then(|index| {
-                    state
-                        .candidate_priorities
-                        .get(index)
-                        .map(|marker| (index, marker))
-                })
-                .filter(|(_, marker)| marker.load(Ordering::Relaxed) != 0)
+            dense_atomic_marker_present_index(orderkeys.value(row), &state.candidate_priorities)
         };
-        if let Some((index, _)) = selected {
+        if let Some(index) = selected {
             selection.push(true);
             state.selected_orderkeys.push(index);
         } else {
@@ -19958,16 +19921,9 @@ fn q04_lineitem_late_build_selection_view(
         if let Some(orderkey_values) = orderkeys.values_if_null_free() {
             selection.push_selected_rows(orderkey_values.len(), |row| {
                 let orderkey = orderkey_values[row];
-                let selected = usize::try_from(orderkey)
-                    .ok()
-                    .and_then(|index| {
-                        state
-                            .candidate_priorities
-                            .get(index)
-                            .map(|marker| (index, marker))
-                    })
-                    .filter(|(_, marker)| marker.load(Ordering::Relaxed) != 0);
-                if let Some((index, _)) = selected {
+                if let Some(index) =
+                    dense_atomic_marker_present_index(orderkey, &state.candidate_priorities)
+                {
                     state.selected_orderkeys.push(index);
                     true
                 } else {
@@ -19980,17 +19936,9 @@ fn q04_lineitem_late_build_selection_view(
             let selected = if orderkeys.is_null(row) {
                 None
             } else {
-                usize::try_from(orderkeys.value(row))
-                    .ok()
-                    .and_then(|index| {
-                        state
-                            .candidate_priorities
-                            .get(index)
-                            .map(|marker| (index, marker))
-                    })
-                    .filter(|(_, marker)| marker.load(Ordering::Relaxed) != 0)
+                dense_atomic_marker_present_index(orderkeys.value(row), &state.candidate_priorities)
             };
-            if let Some((index, _)) = selected {
+            if let Some(index) = selected {
                 selection.push(true);
                 state.selected_orderkeys.push(index);
             } else {
@@ -20799,6 +20747,13 @@ fn q04_count_late_candidate_priorities_atomic_selected_rows(
         }
         count_dense_atomic_marker(orderkey, candidate_priorities, counts);
     }
+}
+
+#[inline(always)]
+fn dense_atomic_marker_present_index(key: i64, markers: &[AtomicU8]) -> Option<usize> {
+    let index = dense_marker_index_i64(key, markers.len())?;
+    let marker = unsafe { markers.get_unchecked(index) };
+    (marker.load(Ordering::Relaxed) != 0).then_some(index)
 }
 
 #[inline(always)]
