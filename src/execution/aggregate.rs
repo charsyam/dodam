@@ -612,6 +612,8 @@ struct CoalesceKeyBorrowed<'a> {
 struct CoalesceKeyCountSumGroups {
     key_len: usize,
     index: CoalesceLeadingIndex,
+    third_string_ids: AggregateHashMap<String, u32>,
+    third_strings: Vec<String>,
     groups: Vec<CoalesceKeyCountSumGroup>,
 }
 
@@ -620,25 +622,41 @@ impl CoalesceKeyCountSumGroups {
         Self {
             key_len: leading_key_count + 1,
             index: CoalesceLeadingIndex::new(leading_key_count, dense_range),
+            third_string_ids: AggregateHashMap::default(),
+            third_strings: Vec::new(),
             groups: Vec::new(),
         }
     }
 
     fn update(&mut self, key: CoalesceKeyBorrowed<'_>, sum: Option<i64>) {
+        let string_id = match key.third {
+            Some(value) => Some(
+                if let Some(string_id) = self.third_string_ids.get(value).copied() {
+                    string_id
+                } else {
+                    let string_id =
+                        u32::try_from(self.third_strings.len()).expect("too many string groups");
+                    self.third_string_ids.insert(value.to_string(), string_id);
+                    self.third_strings.push(value.to_string());
+                    string_id
+                },
+            ),
+            None => None,
+        };
         let third_index = self.index.third_groups(key.first, key.second);
-        let group_id = match key.third {
-            Some(value) => {
-                if let Some(group_id) = third_index.non_null.get(value).copied() {
+        let group_id = match string_id {
+            Some(string_id) => {
+                if let Some(group_id) = third_index.non_null.get(string_id) {
                     group_id
                 } else {
                     let group_id = self.groups.len();
-                    third_index.non_null.insert(value.to_string(), group_id);
+                    third_index.non_null.insert(string_id, group_id);
                     self.groups
                         .push(CoalesceKeyCountSumGroup::new(coalesce_group_values(
                             self.key_len,
                             key.first,
                             key.second,
-                            Some(value.to_string()),
+                            Some(self.third_strings[string_id as usize].clone()),
                         )));
                     group_id
                 }
@@ -774,7 +792,7 @@ struct CoalesceSecondGroups {
 
 #[derive(Default)]
 struct CoalesceThirdGroups {
-    non_null: AggregateHashMap<String, usize>,
+    non_null: AdaptiveCopyGroupIndex<u32>,
     null_group: Option<usize>,
 }
 
@@ -2986,25 +3004,42 @@ fn collect_single_key_count_sum_min_max_groups(
                     .as_any()
                     .downcast_ref::<Int32Array>()
                     .expect("Int32 group key");
-                for row in 0..batch.num_rows() {
-                    let group_id = if key_values.is_null(row) {
-                        count_sum_min_max_group_id_for_null(
-                            null_group,
-                            &mut groups,
-                            GroupValue::Int64(None),
-                            *decimal_precision,
-                            *decimal_scale,
-                        )
-                    } else {
-                        count_sum_min_max_group_id_for_i32(
+                if key_values.null_count() == 0
+                    && sum_values.null_count() == 0
+                    && min_values.null_count() == 0
+                    && max_values.null_count() == 0
+                {
+                    for row in 0..batch.num_rows() {
+                        let group_id = count_sum_min_max_group_id_for_i32(
                             index,
                             key_values.value(row),
                             &mut groups,
                             *decimal_precision,
                             *decimal_scale,
-                        )
-                    };
-                    groups[group_id].update(&sum_values, min_values, max_values, row);
+                        );
+                        groups[group_id].update_non_null(&sum_values, min_values, max_values, row);
+                    }
+                } else {
+                    for row in 0..batch.num_rows() {
+                        let group_id = if key_values.is_null(row) {
+                            count_sum_min_max_group_id_for_null(
+                                null_group,
+                                &mut groups,
+                                GroupValue::Int64(None),
+                                *decimal_precision,
+                                *decimal_scale,
+                            )
+                        } else {
+                            count_sum_min_max_group_id_for_i32(
+                                index,
+                                key_values.value(row),
+                                &mut groups,
+                                *decimal_precision,
+                                *decimal_scale,
+                            )
+                        };
+                        groups[group_id].update(&sum_values, min_values, max_values, row);
+                    }
                 }
             }
             SingleKeyCountSumMinMaxIndex::Int64 {
@@ -3015,25 +3050,42 @@ fn collect_single_key_count_sum_min_max_groups(
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .expect("Int64 group key");
-                for row in 0..batch.num_rows() {
-                    let group_id = if key_values.is_null(row) {
-                        count_sum_min_max_group_id_for_null(
-                            null_group,
-                            &mut groups,
-                            GroupValue::Int64(None),
-                            *decimal_precision,
-                            *decimal_scale,
-                        )
-                    } else {
-                        count_sum_min_max_group_id_for_i64(
+                if key_values.null_count() == 0
+                    && sum_values.null_count() == 0
+                    && min_values.null_count() == 0
+                    && max_values.null_count() == 0
+                {
+                    for row in 0..batch.num_rows() {
+                        let group_id = count_sum_min_max_group_id_for_i64(
                             index,
                             key_values.value(row),
                             &mut groups,
                             *decimal_precision,
                             *decimal_scale,
-                        )
-                    };
-                    groups[group_id].update(&sum_values, min_values, max_values, row);
+                        );
+                        groups[group_id].update_non_null(&sum_values, min_values, max_values, row);
+                    }
+                } else {
+                    for row in 0..batch.num_rows() {
+                        let group_id = if key_values.is_null(row) {
+                            count_sum_min_max_group_id_for_null(
+                                null_group,
+                                &mut groups,
+                                GroupValue::Int64(None),
+                                *decimal_precision,
+                                *decimal_scale,
+                            )
+                        } else {
+                            count_sum_min_max_group_id_for_i64(
+                                index,
+                                key_values.value(row),
+                                &mut groups,
+                                *decimal_precision,
+                                *decimal_scale,
+                            )
+                        };
+                        groups[group_id].update(&sum_values, min_values, max_values, row);
+                    }
                 }
             }
             SingleKeyCountSumMinMaxIndex::UInt64 {
@@ -3044,25 +3096,42 @@ fn collect_single_key_count_sum_min_max_groups(
                     .as_any()
                     .downcast_ref::<UInt64Array>()
                     .expect("UInt64 group key");
-                for row in 0..batch.num_rows() {
-                    let group_id = if key_values.is_null(row) {
-                        count_sum_min_max_group_id_for_null(
-                            null_group,
-                            &mut groups,
-                            GroupValue::UInt64(None),
-                            *decimal_precision,
-                            *decimal_scale,
-                        )
-                    } else {
-                        count_sum_min_max_group_id_for_u64(
+                if key_values.null_count() == 0
+                    && sum_values.null_count() == 0
+                    && min_values.null_count() == 0
+                    && max_values.null_count() == 0
+                {
+                    for row in 0..batch.num_rows() {
+                        let group_id = count_sum_min_max_group_id_for_u64(
                             index,
                             key_values.value(row),
                             &mut groups,
                             *decimal_precision,
                             *decimal_scale,
-                        )
-                    };
-                    groups[group_id].update(&sum_values, min_values, max_values, row);
+                        );
+                        groups[group_id].update_non_null(&sum_values, min_values, max_values, row);
+                    }
+                } else {
+                    for row in 0..batch.num_rows() {
+                        let group_id = if key_values.is_null(row) {
+                            count_sum_min_max_group_id_for_null(
+                                null_group,
+                                &mut groups,
+                                GroupValue::UInt64(None),
+                                *decimal_precision,
+                                *decimal_scale,
+                            )
+                        } else {
+                            count_sum_min_max_group_id_for_u64(
+                                index,
+                                key_values.value(row),
+                                &mut groups,
+                                *decimal_precision,
+                                *decimal_scale,
+                            )
+                        };
+                        groups[group_id].update(&sum_values, min_values, max_values, row);
+                    }
                 }
             }
             SingleKeyCountSumMinMaxIndex::Utf8 { .. } => {
@@ -3134,6 +3203,20 @@ impl<'a> Int64LikeArray<'a> {
         match self {
             Self::Int32(values) => values.is_valid(row).then(|| i64::from(values.value(row))),
             Self::Int64(values) => values.is_valid(row).then(|| values.value(row)),
+        }
+    }
+
+    fn value_non_null(&self, row: usize) -> i64 {
+        match self {
+            Self::Int32(values) => i64::from(values.value(row)),
+            Self::Int64(values) => values.value(row),
+        }
+    }
+
+    fn null_count(&self) -> usize {
+        match self {
+            Self::Int32(values) => values.null_count(),
+            Self::Int64(values) => values.null_count(),
         }
     }
 }
@@ -3437,6 +3520,30 @@ impl SingleKeyCountSumMinMaxGroup {
                 None => value,
             });
         }
+    }
+
+    fn update_non_null(
+        &mut self,
+        sum_values: &Int64LikeArray<'_>,
+        min_values: &Decimal128Array,
+        max_values: &Date32Array,
+        row: usize,
+    ) {
+        self.count += 1;
+        self.sum += sum_values.value_non_null(row);
+        self.sum_count += 1;
+
+        let min_value = min_values.value(row);
+        self.min_decimal = Some(match self.min_decimal {
+            Some(current) => current.min(min_value),
+            None => min_value,
+        });
+
+        let max_value = max_values.value(row);
+        self.max_date32 = Some(match self.max_date32 {
+            Some(current) => current.max(max_value),
+            None => max_value,
+        });
     }
 
     fn finish(self, aggregates: &[AggregateExpr]) -> GroupAggregateResult {
