@@ -415,11 +415,13 @@ pub async fn execute_sql(
             if has_output_expressions {
                 batches = apply_output_expression_projection(batches, &query.expressions)?;
             }
-            batches = apply_output_order_limit(
+            batches = apply_aggregate_output_order_limit(
                 batches,
                 query.order_by.as_ref(),
                 query.limit,
                 query.offset,
+                &metrics,
+                &group_by,
             )?;
             if !has_output_expressions {
                 batches = rename_output_batches(batches, &query.aliases)?;
@@ -532,8 +534,14 @@ pub async fn execute_sql(
         if has_output_expressions {
             batches = apply_output_expression_projection(batches, &query.expressions)?;
         }
-        batches =
-            apply_output_order_limit(batches, query.order_by.as_ref(), query.limit, query.offset)?;
+        batches = apply_aggregate_output_order_limit(
+            batches,
+            query.order_by.as_ref(),
+            query.limit,
+            query.offset,
+            &metrics,
+            &group_by,
+        )?;
         if !has_output_expressions {
             batches = rename_output_batches(batches, &query.aliases)?;
         }
@@ -861,7 +869,14 @@ async fn try_execute_correlated_exists_semijoin_sql(
         if has_output_expressions {
             batches = apply_output_expression_projection(batches, &parsed_projection.expressions)?;
         }
-        batches = apply_output_order_limit(batches, order_by.as_ref(), limit, 0)?;
+        batches = apply_aggregate_output_order_limit(
+            batches,
+            order_by.as_ref(),
+            limit,
+            0,
+            &metrics,
+            &group_by,
+        )?;
         if !has_output_expressions {
             batches = rename_output_batches(batches, &parsed_projection.aliases)?;
         }
@@ -39518,6 +39533,58 @@ fn apply_output_order_limit(
     let sorted_limit = limit.and_then(|limit| limit.checked_add(offset));
     let sorted = sort_output_batch(&batch, order_by, sorted_limit)?;
     Ok(limit_batches(vec![sorted], limit, offset))
+}
+
+fn apply_aggregate_output_order_limit(
+    batches: Vec<RecordBatch>,
+    order_by: Option<&SortKey>,
+    limit: Option<usize>,
+    offset: usize,
+    metrics: &AggregateMetrics,
+    group_by: &[String],
+) -> Result<Vec<RecordBatch>> {
+    if aggregate_output_already_ordered(metrics, group_by, order_by) {
+        return Ok(limit_batches(batches, limit, offset));
+    }
+    apply_output_order_limit(batches, order_by, limit, offset)
+}
+
+fn aggregate_output_already_ordered(
+    metrics: &AggregateMetrics,
+    group_by: &[String],
+    order_by: Option<&SortKey>,
+) -> bool {
+    let Some(order_by) = order_by else {
+        return false;
+    };
+    if order_by.expressions.is_empty() || order_by.expressions.len() > group_by.len() {
+        return false;
+    }
+    for (index, expression) in order_by.expressions.iter().enumerate() {
+        if expression.descending || expression.column != group_by[index] {
+            return false;
+        }
+        if !expression.nulls_first
+            && metrics
+                .groups
+                .iter()
+                .any(|group| group.keys.get(index).is_some_and(group_value_is_null))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn group_value_is_null(value: &GroupValue) -> bool {
+    match value {
+        GroupValue::Int64(value) => value.is_none(),
+        GroupValue::UInt64(value) => value.is_none(),
+        GroupValue::Decimal128(value, _, _) => value.is_none(),
+        GroupValue::Date32(value) => value.is_none(),
+        GroupValue::Date64(value) => value.is_none(),
+        GroupValue::Utf8(value) => value.is_none(),
+    }
 }
 
 fn apply_output_distinct(batches: Vec<RecordBatch>, distinct: bool) -> Result<Vec<RecordBatch>> {
