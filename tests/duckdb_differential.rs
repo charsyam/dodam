@@ -171,6 +171,45 @@ async fn duckdb_differential_aggregate_matrix() {
         tempdir.path(),
     )
     .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT lower(payload) AS bucket, count(*), count(DISTINCT key + 1) FROM '{}' GROUP BY lower(payload) HAVING count(*) >= 1 ORDER BY bucket",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT lower(payload) AS bucket, count(*), count(DISTINCT key + 1) FROM read_parquet('{}') GROUP BY lower(payload) HAVING count(*) >= 1 ORDER BY bucket",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT CASE WHEN key IS NULL THEN 'missing' ELSE 'present' END AS key_state, count(*), sum(value) AS total_value FROM '{}' GROUP BY CASE WHEN key IS NULL THEN 'missing' ELSE 'present' END HAVING total_value > 0 ORDER BY 1",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT CASE WHEN key IS NULL THEN 'missing' ELSE 'present' END AS key_state, count(*), sum(value) AS total_value FROM read_parquet('{}') GROUP BY CASE WHEN key IS NULL THEN 'missing' ELSE 'present' END HAVING total_value > 0 ORDER BY 1",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, payload, row_number() OVER (ORDER BY id DESC) AS rn FROM '{}' ORDER BY rn",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id, payload, row_number() OVER (ORDER BY id DESC) AS rn FROM read_parquet('{}') ORDER BY rn",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -328,6 +367,21 @@ async fn duckdb_differential_join_matrix() {
         ),
         &format!(
             "SELECT f.id, f.key, d.name FROM read_parquet('{}') f FULL OUTER JOIN read_parquet('{}') d ON f.key = d.key WHERE f.key IS NULL OR d.key IS NULL ORDER BY f.id, d.name",
+            facts_path.display(),
+            dim_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT COALESCE(d.name, 'missing') AS dim_name, count(*), count(DISTINCT f.value + 1) FROM '{}' f LEFT JOIN '{}' d ON f.key = d.key GROUP BY COALESCE(d.name, 'missing') HAVING count(*) >= 1 ORDER BY 1",
+            facts_path.display(),
+            dim_path.display()
+        ),
+        &format!(
+            "SELECT COALESCE(d.name, 'missing') AS dim_name, count(*), count(DISTINCT f.value + 1) FROM read_parquet('{}') f LEFT JOIN read_parquet('{}') d ON f.key = d.key GROUP BY COALESCE(d.name, 'missing') HAVING count(*) >= 1 ORDER BY 1",
             facts_path.display(),
             dim_path.display()
         ),

@@ -24,7 +24,7 @@ use sqlparser::ast::{
     AccessExpr, BinaryOperator, DateTimeField, Distinct, DuplicateTreatment, Expr as SqlExpr,
     FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator,
     LimitClause, ObjectName, ObjectNamePart, OrderByKind, Query, Select, SelectItem, SetExpr,
-    Statement, Subscript, TableFactor, UnaryOperator, Value,
+    Statement, Subscript, TableFactor, UnaryOperator, Value, WindowType,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -326,6 +326,9 @@ pub async fn execute_sql(
     if let Some(output) = try_execute_in_subquery_sql(engine, sql, batch_size).await? {
         return Ok(output);
     }
+    if let Some(output) = try_execute_row_number_window_sql(engine, sql, batch_size).await? {
+        return Ok(output);
+    }
     if let Some(output) = try_execute_projection_expression_sql(engine, sql, batch_size).await? {
         return Ok(output);
     }
@@ -571,7 +574,12 @@ async fn try_execute_exists_subquery_sql(
         ));
     }
     let distinct = parse_distinct(select)?;
-    let order_by = parse_order_by(query, &parsed_projection.aliases, path.alias.as_deref())?;
+    let order_by = parse_order_by(
+        query,
+        &parsed_projection.aliases,
+        &parsed_projection.ordinal_targets,
+        path.alias.as_deref(),
+    )?;
     let limit = parse_limit(query)?;
     validate_distinct(
         distinct,
@@ -751,6 +759,7 @@ async fn try_execute_correlated_exists_semijoin_sql(
     let order_by = parse_order_by(
         query,
         &parsed_projection.aliases,
+        &parsed_projection.ordinal_targets,
         outer_path.alias.as_deref(),
     )?;
     let limit = parse_limit(query)?;
@@ -978,6 +987,7 @@ async fn try_execute_correlated_in_pair_semijoin_sql(
     let order_by = parse_order_by(
         query,
         &parsed_projection.aliases,
+        &parsed_projection.ordinal_targets,
         outer_path.alias.as_deref(),
     )?;
     let limit = parse_limit(query)?;
@@ -1524,7 +1534,12 @@ async fn try_execute_correlated_subquery_filter_sql(
         .as_ref()
         .map(|expr| parse_filter(expr, &parsed_projection.aliases, None, true))
         .transpose()?;
-    let order_by = parse_order_by(query, &parsed_projection.aliases, path.alias.as_deref())?;
+    let order_by = parse_order_by(
+        query,
+        &parsed_projection.aliases,
+        &parsed_projection.ordinal_targets,
+        path.alias.as_deref(),
+    )?;
     let limit = parse_limit(query)?;
 
     let stream = engine
@@ -1925,7 +1940,12 @@ async fn try_execute_correlated_exists_subquery_sql(
             "correlated EXISTS currently supports only non-aggregate SELECT queries".to_string(),
         ));
     }
-    let order_by = parse_order_by(query, &parsed_projection.aliases, path.alias.as_deref())?;
+    let order_by = parse_order_by(
+        query,
+        &parsed_projection.aliases,
+        &parsed_projection.ordinal_targets,
+        path.alias.as_deref(),
+    )?;
     let limit = parse_limit(query)?;
 
     let stream = engine
@@ -2245,7 +2265,12 @@ async fn try_execute_in_subquery_sql(
             Vec::new(),
         )
     };
-    let order_by = parse_order_by(query, &parsed_projection.aliases, path.alias.as_deref())?;
+    let order_by = parse_order_by(
+        query,
+        &parsed_projection.aliases,
+        &parsed_projection.ordinal_targets,
+        path.alias.as_deref(),
+    )?;
     let limit = parse_limit(query)?;
     validate_distinct(
         distinct,
@@ -2356,6 +2381,318 @@ async fn try_execute_in_subquery_sql(
     Ok(Some(QueryOutput::Scan { batches }))
 }
 
+async fn try_execute_row_number_window_sql(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let Some(window) = parse_row_number_window_projection(select)? else {
+        return Ok(None);
+    };
+    reject_query_features(query)?;
+    reject_select_features(select)?;
+    if select.from.len() != 1
+        || select
+            .from
+            .first()
+            .is_some_and(|table| !table.joins.is_empty())
+        || parse_distinct(select)?
+        || select.having.is_some()
+        || !matches!(select.group_by, GroupByExpr::Expressions(ref exprs, _) if exprs.is_empty())
+    {
+        return Err(DodamError::UnsupportedSql(
+            "row_number window currently supports one non-aggregate table input".to_string(),
+        ));
+    }
+    let path = parse_from(select)?;
+    let filter = select
+        .selection
+        .as_ref()
+        .map(|expr| parse_filter(expr, &[], path.alias.as_deref(), false))
+        .transpose()?;
+    let mut scan_projection = Projection::Columns(window.input_columns.clone());
+    add_projection_columns(
+        &mut scan_projection,
+        window
+            .window_order
+            .expressions
+            .iter()
+            .map(|sort| sort.column.clone())
+            .collect(),
+    );
+    if let Some(order_by) = query.order_by.as_ref() {
+        add_projection_columns(
+            &mut scan_projection,
+            row_number_query_order_columns(order_by, &window, path.alias.as_deref())?,
+        );
+    }
+    let stream = engine
+        .scan_parquet_batches(path.path, batch_size, None, scan_projection, filter)
+        .await?;
+    let mut batches = collect_batches(stream)?;
+    batches = apply_output_order_limit(batches, Some(&window.window_order), None)?;
+    batches = append_row_number_column(batches, &window.output_name)?;
+    let order_by = parse_row_number_query_order_by(query, &window, path.alias.as_deref())?;
+    let limit = parse_limit(query)?;
+    batches = apply_output_order_limit(batches, order_by.as_ref(), limit)?;
+    batches = apply_output_projection(batches, &Projection::Columns(window.output_columns))?;
+    Ok(Some(QueryOutput::Scan { batches }))
+}
+
+#[derive(Debug)]
+struct RowNumberWindowProjection {
+    input_columns: Vec<String>,
+    output_columns: Vec<String>,
+    output_name: String,
+    window_order: SortKey,
+    aliases: Vec<(String, String)>,
+    ordinal_targets: Vec<String>,
+}
+
+fn parse_row_number_window_projection(
+    select: &Select,
+) -> Result<Option<RowNumberWindowProjection>> {
+    if !select
+        .projection
+        .iter()
+        .any(select_item_is_row_number_window)
+    {
+        return Ok(None);
+    }
+    let mut input_columns = Vec::new();
+    let mut output_columns = Vec::new();
+    let mut aliases = Vec::new();
+    let mut window_output = None;
+    let mut window_order = None;
+
+    for item in &select.projection {
+        match item {
+            SelectItem::UnnamedExpr(
+                expr @ (SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_)),
+            ) => {
+                let column = sql_column_name(expr, None)?;
+                add_column_once(&mut input_columns, column.clone());
+                output_columns.push(column);
+            }
+            SelectItem::ExprWithAlias { expr, alias }
+                if matches!(
+                    expr,
+                    SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_)
+                ) =>
+            {
+                let column = sql_column_name(expr, None)?;
+                add_column_once(&mut input_columns, column.clone());
+                output_columns.push(alias.value.clone());
+                aliases.push((alias.value.clone(), column));
+            }
+            SelectItem::UnnamedExpr(SqlExpr::Function(function))
+            | SelectItem::ExprWithAlias {
+                expr: SqlExpr::Function(function),
+                alias: _,
+            } if is_row_number_function(function) => {
+                if window_output.is_some() {
+                    return Err(DodamError::UnsupportedSql(
+                        "only one row_number window projection is supported".to_string(),
+                    ));
+                }
+                let output_name = match item {
+                    SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+                    _ => function.to_string(),
+                };
+                window_order = Some(parse_row_number_window_order(function)?);
+                window_output = Some(output_name.clone());
+                output_columns.push(output_name);
+            }
+            _ => return Ok(None),
+        }
+    }
+    let Some(output_name) = window_output else {
+        return Ok(None);
+    };
+    let window_order = window_order.expect("row_number output implies order");
+    aliases.push((output_name.clone(), output_name.clone()));
+    let ordinal_targets = output_columns
+        .iter()
+        .map(|column| resolve_alias(column, &aliases))
+        .collect();
+    Ok(Some(RowNumberWindowProjection {
+        input_columns,
+        output_columns,
+        output_name,
+        window_order,
+        aliases,
+        ordinal_targets,
+    }))
+}
+
+fn select_item_is_row_number_window(item: &SelectItem) -> bool {
+    match item {
+        SelectItem::UnnamedExpr(SqlExpr::Function(function))
+        | SelectItem::ExprWithAlias {
+            expr: SqlExpr::Function(function),
+            ..
+        } => is_row_number_function(function),
+        _ => false,
+    }
+}
+
+fn is_row_number_function(function: &sqlparser::ast::Function) -> bool {
+    object_name_to_string(&function.name).is_ok_and(|name| name.eq_ignore_ascii_case("row_number"))
+}
+
+fn parse_row_number_window_order(function: &sqlparser::ast::Function) -> Result<SortKey> {
+    if function.filter.is_some()
+        || function.null_treatment.is_some()
+        || !function.within_group.is_empty()
+        || !matches!(function.parameters, FunctionArguments::None)
+    {
+        return Err(DodamError::UnsupportedSql(
+            "row_number window filters, null treatment, within group, and parameters are not supported"
+                .to_string(),
+        ));
+    }
+    match &function.args {
+        FunctionArguments::None => {}
+        FunctionArguments::List(args) if args.args.is_empty() && args.clauses.is_empty() => {}
+        _ => {
+            return Err(DodamError::UnsupportedSql(format!(
+                "row_number expects no arguments, got {}",
+                function.args
+            )));
+        }
+    }
+    let Some(WindowType::WindowSpec(spec)) = &function.over else {
+        return Err(DodamError::UnsupportedSql(
+            "row_number requires an OVER window specification".to_string(),
+        ));
+    };
+    if spec.window_name.is_some() || !spec.partition_by.is_empty() || spec.window_frame.is_some() {
+        return Err(DodamError::UnsupportedSql(
+            "row_number currently supports only OVER (ORDER BY ...) without PARTITION BY or frame"
+                .to_string(),
+        ));
+    }
+    if spec.order_by.is_empty() {
+        return Err(DodamError::UnsupportedSql(
+            "row_number requires ORDER BY in the window specification".to_string(),
+        ));
+    }
+    let expressions = spec
+        .order_by
+        .iter()
+        .map(|order| {
+            if order.with_fill.is_some() || order.options.nulls_first.is_some() {
+                return Err(DodamError::UnsupportedSql(
+                    "row_number window ORDER BY WITH FILL and NULLS FIRST/LAST are not supported"
+                        .to_string(),
+                ));
+            }
+            Ok(SortExpr {
+                column: sql_column_name(&order.expr, None)?,
+                descending: order.options.asc == Some(false),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    SortKey::new(expressions)
+}
+
+fn row_number_query_order_columns(
+    order_by: &sqlparser::ast::OrderBy,
+    window: &RowNumberWindowProjection,
+    table_alias: Option<&str>,
+) -> Result<Vec<String>> {
+    let OrderByKind::Expressions(expressions) = &order_by.kind else {
+        return Ok(Vec::new());
+    };
+    expressions
+        .iter()
+        .filter_map(|order| match &order.expr {
+            SqlExpr::Value(_) => None,
+            SqlExpr::Identifier(ident) if ident.value == window.output_name => None,
+            expr => Some(
+                sql_column_name(expr, table_alias)
+                    .map(|column| resolve_alias(&column, &window.aliases)),
+            ),
+        })
+        .collect()
+}
+
+fn parse_row_number_query_order_by(
+    query: &Query,
+    window: &RowNumberWindowProjection,
+    table_alias: Option<&str>,
+) -> Result<Option<SortKey>> {
+    let Some(order_by) = &query.order_by else {
+        return Ok(None);
+    };
+    if order_by.interpolate.is_some() {
+        return Err(DodamError::UnsupportedSql(
+            "ORDER BY INTERPOLATE is not supported".to_string(),
+        ));
+    }
+    let OrderByKind::Expressions(expressions) = &order_by.kind else {
+        return Err(DodamError::UnsupportedSql(
+            "ORDER BY ALL is not supported".to_string(),
+        ));
+    };
+    let expressions = expressions
+        .iter()
+        .map(|order| {
+            if order.with_fill.is_some() || order.options.nulls_first.is_some() {
+                return Err(DodamError::UnsupportedSql(
+                    "ORDER BY WITH FILL and NULLS FIRST/LAST are not supported".to_string(),
+                ));
+            }
+            let column = match &order.expr {
+                SqlExpr::Value(value) => resolve_order_by_ordinal(value, &window.ordinal_targets)?,
+                SqlExpr::Identifier(ident) if ident.value == window.output_name => {
+                    window.output_name.clone()
+                }
+                expr => resolve_alias(&sql_column_name(expr, table_alias)?, &window.aliases),
+            };
+            Ok(SortExpr {
+                column,
+                descending: order.options.asc == Some(false),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    SortKey::new(expressions).map(Some)
+}
+
+fn append_row_number_column(
+    batches: Vec<RecordBatch>,
+    output_name: &str,
+) -> Result<Vec<RecordBatch>> {
+    let mut offset = 0_u64;
+    batches
+        .into_iter()
+        .map(|batch| {
+            let row_count = batch.num_rows();
+            let values = (1..=row_count)
+                .map(|row| offset + row as u64)
+                .collect::<Vec<_>>();
+            offset += row_count as u64;
+            let mut fields = batch.schema().fields().to_vec();
+            let mut columns = batch.columns().to_vec();
+            fields.push(Arc::new(Field::new(output_name, DataType::UInt64, false)));
+            columns.push(Arc::new(UInt64Array::from(values)) as ArrayRef);
+            Ok(RecordBatch::try_new(
+                Arc::new(Schema::new(fields)),
+                columns,
+            )?)
+        })
+        .collect()
+}
+
 async fn split_subquery_and_expression_filters(
     engine: &DodamEngine,
     selection: &SqlExpr,
@@ -2460,7 +2797,12 @@ async fn try_execute_projection_expression_sql(
         };
         let mut batches =
             aggregate_metrics_to_batches(&metrics, &group_by, &parsed_projection.aggregates)?;
-        let order_by = parse_order_by(query, &parsed_projection.aliases, path.alias.as_deref())?;
+        let order_by = parse_order_by(
+            query,
+            &parsed_projection.aliases,
+            &parsed_projection.ordinal_targets,
+            path.alias.as_deref(),
+        )?;
         let limit = parse_limit(query)?;
         batches = apply_output_order_limit(batches, order_by.as_ref(), limit)?;
         batches = rename_output_batches(batches, &parsed_projection.aliases)?;
@@ -2483,7 +2825,12 @@ async fn try_execute_projection_expression_sql(
             })
             .transpose()?
     };
-    let order_by = parse_order_by(query, &parsed_projection.aliases, path.alias.as_deref())?;
+    let order_by = parse_order_by(
+        query,
+        &parsed_projection.aliases,
+        &parsed_projection.ordinal_targets,
+        path.alias.as_deref(),
+    )?;
     let limit = parse_limit(query)?;
     let mut scan_projection = parsed_projection.projection.clone();
     if filter_requires_expression && let Some(selection) = select.selection.as_ref() {
@@ -29720,7 +30067,12 @@ async fn try_execute_correlated_join_subquery_filter_sql(
         .as_ref()
         .map(|expr| parse_join_filter(expr, &projection.aliases, &output_aliases, true))
         .transpose()?;
-    let order_by = parse_join_order_by(query, &projection.aliases, &output_aliases)?;
+    let order_by = parse_join_order_by(
+        query,
+        &projection.aliases,
+        &projection.ordinal_targets,
+        &output_aliases,
+    )?;
     let limit = parse_limit(query)?;
 
     let join_input_projection = &Projection::All;
@@ -30419,7 +30771,12 @@ async fn try_execute_with_cte_sql(
         .as_ref()
         .map(|expr| parse_join_filter(expr, &projection.aliases, &alias_refs, true))
         .transpose()?;
-    let order_by = parse_join_order_by(query, &projection.aliases, &alias_refs)?;
+    let order_by = parse_join_order_by(
+        query,
+        &projection.aliases,
+        &projection.ordinal_targets,
+        &alias_refs,
+    )?;
     let limit = parse_limit(query)?;
 
     let stream = Box::new(HashJoinExec::new(
@@ -30666,7 +31023,12 @@ async fn try_execute_derived_join_sql(
         &output_aliases,
         false,
     )?;
-    let order_by = parse_join_order_by(query, &projection.aliases, &output_aliases)?;
+    let order_by = parse_join_order_by(
+        query,
+        &projection.aliases,
+        &projection.ordinal_targets,
+        &output_aliases,
+    )?;
     let limit = parse_limit(query)?;
     validate_distinct(
         distinct,
@@ -30958,7 +31320,12 @@ async fn try_execute_derived_left_join_count_distribution_sql(
     {
         return Ok(None);
     }
-    let order_by = parse_order_by(query, &projection.aliases, Some(&alias))?;
+    let order_by = parse_order_by(
+        query,
+        &projection.aliases,
+        &projection.ordinal_targets,
+        Some(&alias),
+    )?;
     let limit = parse_limit(query)?;
 
     let inner = match parse_query(subquery) {
@@ -31973,7 +32340,12 @@ async fn try_execute_derived_sql(
         .as_ref()
         .map(|expr| parse_filter(expr, &parsed_projection.aliases, None, true))
         .transpose()?;
-    let order_by = parse_order_by(query, &parsed_projection.aliases, Some(&alias))?;
+    let order_by = parse_order_by(
+        query,
+        &parsed_projection.aliases,
+        &parsed_projection.ordinal_targets,
+        Some(&alias),
+    )?;
     let limit = parse_limit(query)?;
 
     if let QueryOutput::Aggregate {
@@ -32099,7 +32471,12 @@ async fn try_execute_multi_comma_join_sql(
         .as_ref()
         .map(|expr| parse_join_filter(expr, &projection.aliases, &alias_refs, true))
         .transpose()?;
-    let order_by = parse_join_order_by(query, &projection.aliases, &alias_refs)?;
+    let order_by = parse_join_order_by(
+        query,
+        &projection.aliases,
+        &projection.ordinal_targets,
+        &alias_refs,
+    )?;
     let limit = parse_limit(query)?;
     let scan_projections = comma_join_scan_projections(
         &conjuncts,
@@ -33461,9 +33838,6 @@ fn query_allows_direct_join_sink(query: &SqlQuery) -> bool {
 
 fn join_aliases_are_implicit_output_names(aliases: &[(String, String)]) -> bool {
     aliases.iter().all(|(source, target)| {
-        if source.parse::<usize>().is_ok() {
-            return true;
-        }
         source
             .rsplit_once('.')
             .is_some_and(|(_, column)| column == target)
@@ -33708,7 +34082,12 @@ fn parse_select(query: &Query, select: &Select) -> Result<SqlQuery> {
         .as_ref()
         .map(|expr| parse_filter(expr, &parsed_projection.aliases, None, true))
         .transpose()?;
-    let order_by = parse_order_by(query, &parsed_projection.aliases, path.alias.as_deref())?;
+    let order_by = parse_order_by(
+        query,
+        &parsed_projection.aliases,
+        &parsed_projection.ordinal_targets,
+        path.alias.as_deref(),
+    )?;
     let limit = parse_limit(query)?;
     validate_distinct(
         distinct,
@@ -33769,7 +34148,12 @@ fn parse_comma_join_select(query: &Query, select: &Select) -> Result<SqlQuery> {
         .as_ref()
         .map(|expr| parse_join_filter(expr, &projection.aliases, &output_aliases, true))
         .transpose()?;
-    let order_by = parse_join_order_by(query, &projection.aliases, &output_aliases)?;
+    let order_by = parse_join_order_by(
+        query,
+        &projection.aliases,
+        &projection.ordinal_targets,
+        &output_aliases,
+    )?;
     let limit = parse_limit(query)?;
 
     Ok(SqlQuery {
@@ -33835,7 +34219,12 @@ fn parse_join_select(query: &Query, select: &Select) -> Result<SqlQuery> {
         .as_ref()
         .map(|expr| parse_join_filter(expr, &projection.aliases, &output_aliases, true))
         .transpose()?;
-    let order_by = parse_join_order_by(query, &projection.aliases, &output_aliases)?;
+    let order_by = parse_join_order_by(
+        query,
+        &projection.aliases,
+        &projection.ordinal_targets,
+        &output_aliases,
+    )?;
     let limit = parse_limit(query)?;
 
     Ok(SqlQuery {
@@ -34909,6 +35298,7 @@ fn parse_join_projection(
     let mut aliases = Vec::new();
     let mut expressions = Vec::new();
     let mut wildcard = false;
+    let group_expression_bindings = join_group_expression_bindings(select, table_aliases)?;
 
     for item in &select.projection {
         match item {
@@ -34936,7 +35326,17 @@ fn parse_join_projection(
                 }
             }
             SelectItem::UnnamedExpr(SqlExpr::Function(function)) => {
-                if let Some(expr) =
+                let function_expr = SqlExpr::Function(function.clone());
+                if let Some((column, _)) =
+                    projected_group_expression(&function_expr, &group_expression_bindings)
+                {
+                    add_column_once(&mut columns, column.clone());
+                    aliases.push((function.to_string(), column.clone()));
+                    expressions.push(ProjectionExpression {
+                        output_name: function.to_string(),
+                        expr: ScalarSqlExpression::Column(column),
+                    });
+                } else if let Some(expr) =
                     parse_join_scalar_function_projection(function, None, table_aliases)?
                 {
                     for column in join_scalar_expression_columns(&expr.expr, table_aliases)? {
@@ -34970,7 +35370,16 @@ fn parse_join_projection(
             SelectItem::UnnamedExpr(expr) => {
                 let mut expression_columns = Vec::new();
                 let mut found_aggregate = false;
-                if let Ok(parsed) = parse_join_aggregate_output_expression(
+                if let Some((column, _)) =
+                    projected_group_expression(expr, &group_expression_bindings)
+                {
+                    add_column_once(&mut columns, column.clone());
+                    aliases.push((expr.to_string(), column.clone()));
+                    expressions.push(ProjectionExpression {
+                        output_name: expr.to_string(),
+                        expr: ScalarSqlExpression::Column(column),
+                    });
+                } else if let Ok(parsed) = parse_join_aggregate_output_expression(
                     expr,
                     table_aliases,
                     &mut aggregates,
@@ -35022,7 +35431,17 @@ fn parse_join_projection(
                     }
                 }
                 SqlExpr::Function(function) => {
-                    if let Some(expr) = parse_join_scalar_function_projection(
+                    let function_expr = SqlExpr::Function(function.clone());
+                    if let Some((column, _)) =
+                        projected_group_expression(&function_expr, &group_expression_bindings)
+                    {
+                        add_column_once(&mut columns, column.clone());
+                        aliases.push((alias.value.clone(), column.clone()));
+                        expressions.push(ProjectionExpression {
+                            output_name: alias.value.clone(),
+                            expr: ScalarSqlExpression::Column(column),
+                        });
+                    } else if let Some(expr) = parse_join_scalar_function_projection(
                         function,
                         Some(&alias.value),
                         table_aliases,
@@ -35058,7 +35477,16 @@ fn parse_join_projection(
                 _ => {
                     let mut expression_columns = Vec::new();
                     let mut found_aggregate = false;
-                    if let Ok(parsed) = parse_join_aggregate_output_expression(
+                    if let Some((column, _)) =
+                        projected_group_expression(expr, &group_expression_bindings)
+                    {
+                        add_column_once(&mut columns, column.clone());
+                        aliases.push((alias.value.clone(), column.clone()));
+                        expressions.push(ProjectionExpression {
+                            output_name: alias.value.clone(),
+                            expr: ScalarSqlExpression::Column(column),
+                        });
+                    } else if let Ok(parsed) = parse_join_aggregate_output_expression(
                         expr,
                         table_aliases,
                         &mut aggregates,
@@ -35123,7 +35551,7 @@ fn parse_join_projection(
                 )));
             }
         }
-        let mut projected_columns = columns.clone();
+        let mut projected_columns = physical_projection_columns(&columns);
         for aggregate in &aggregates {
             if let Some(column) = aggregate.referenced_column() {
                 add_column_once(&mut projected_columns, column.to_string());
@@ -35132,17 +35560,24 @@ fn parse_join_projection(
         for column in aggregate_expression_columns {
             add_column_once(&mut projected_columns, column);
         }
-        add_projection_ordinal_aliases(&mut aliases, &columns, &aggregates, &expressions);
+        for binding in &group_expression_bindings {
+            for column in join_scalar_expression_columns(&binding.expression.expr, table_aliases)? {
+                add_column_once(&mut projected_columns, column);
+            }
+            aggregate_expressions.push(binding.expression.clone());
+        }
+        let ordinal_targets = projection_ordinal_targets(&columns, &aggregates, &expressions);
         return Ok(ParsedProjection {
             projection: Projection::Columns(projected_columns),
             aggregates,
             aggregate_expressions,
             aliases,
             expressions,
+            ordinal_targets,
         });
     }
 
-    add_projection_ordinal_aliases(&mut aliases, &columns, &aggregates, &expressions);
+    let ordinal_targets = projection_ordinal_targets(&columns, &aggregates, &expressions);
     Ok(ParsedProjection {
         projection: if wildcard {
             Projection::All
@@ -35153,6 +35588,7 @@ fn parse_join_projection(
         aggregate_expressions,
         aliases,
         expressions,
+        ordinal_targets,
     })
 }
 
@@ -35160,7 +35596,13 @@ fn parse_join_group_by(select: &Select, table_aliases: &[&str]) -> Result<Vec<St
     match &select.group_by {
         GroupByExpr::Expressions(expressions, modifiers) if modifiers.is_empty() => expressions
             .iter()
-            .map(|expr| join_column_name(expr, table_aliases))
+            .enumerate()
+            .map(|(index, expr)| {
+                join_column_name(expr, table_aliases).or_else(|_| {
+                    parse_join_scalar_sql_expression(expr, table_aliases)
+                        .map(|_| group_by_synthetic_column(index))
+                })
+            })
             .collect::<Result<Vec<_>>>(),
         GroupByExpr::Expressions(_, _) | GroupByExpr::All(_) => Err(DodamError::UnsupportedSql(
             "GROUP BY modifiers and GROUP BY ALL are not supported".to_string(),
@@ -35171,6 +35613,7 @@ fn parse_join_group_by(select: &Select, table_aliases: &[&str]) -> Result<Vec<St
 fn parse_join_order_by(
     query: &Query,
     aliases: &[(String, String)],
+    ordinal_targets: &[String],
     table_aliases: &[&str],
 ) -> Result<Option<SortKey>> {
     let Some(order_by) = &query.order_by else {
@@ -35195,7 +35638,7 @@ fn parse_join_order_by(
                 ));
             }
             let column = match &order.expr {
-                SqlExpr::Value(value) => resolve_order_by_ordinal(value, aliases)?,
+                SqlExpr::Value(value) => resolve_order_by_ordinal(value, ordinal_targets)?,
                 SqlExpr::Identifier(ident) => {
                     alias_target(&ident.value, aliases)
                         .cloned()
@@ -35876,12 +36319,114 @@ struct ParsedProjection {
     aggregate_expressions: Vec<ProjectionExpression>,
     aliases: Vec<(String, String)>,
     expressions: Vec<ProjectionExpression>,
+    ordinal_targets: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 struct ProjectionExpression {
     output_name: String,
     expr: ScalarSqlExpression,
+}
+
+#[derive(Debug, Clone)]
+struct GroupExpressionBinding {
+    source: String,
+    expression: ProjectionExpression,
+}
+
+fn group_by_synthetic_column(index: usize) -> String {
+    format!("__dodam_group_expr_{index}")
+}
+
+fn is_group_by_synthetic_column(column: &str) -> bool {
+    column.starts_with("__dodam_group_expr_")
+}
+
+fn physical_projection_columns(columns: &[String]) -> Vec<String> {
+    columns
+        .iter()
+        .filter(|column| !is_group_by_synthetic_column(column))
+        .cloned()
+        .collect()
+}
+
+fn projected_group_expression(
+    expr: &SqlExpr,
+    bindings: &[GroupExpressionBinding],
+) -> Option<(String, ScalarSqlExpression)> {
+    bindings
+        .iter()
+        .find(|binding| binding.source == expr.to_string())
+        .map(|binding| {
+            (
+                binding.expression.output_name.clone(),
+                binding.expression.expr.clone(),
+            )
+        })
+}
+
+fn group_expression_bindings(
+    select: &Select,
+    table_alias: Option<&str>,
+) -> Result<Vec<GroupExpressionBinding>> {
+    let GroupByExpr::Expressions(expressions, modifiers) = &select.group_by else {
+        return Ok(Vec::new());
+    };
+    if !modifiers.is_empty() {
+        return Ok(Vec::new());
+    }
+    expressions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, expr)| {
+            if sql_column_name(expr, table_alias).is_ok() {
+                return None;
+            }
+            Some(
+                parse_scalar_sql_expression(expr, table_alias).map(|parsed| {
+                    GroupExpressionBinding {
+                        source: expr.to_string(),
+                        expression: ProjectionExpression {
+                            output_name: group_by_synthetic_column(index),
+                            expr: parsed,
+                        },
+                    }
+                }),
+            )
+        })
+        .collect()
+}
+
+fn join_group_expression_bindings(
+    select: &Select,
+    table_aliases: &[&str],
+) -> Result<Vec<GroupExpressionBinding>> {
+    let GroupByExpr::Expressions(expressions, modifiers) = &select.group_by else {
+        return Ok(Vec::new());
+    };
+    if !modifiers.is_empty() {
+        return Ok(Vec::new());
+    }
+    expressions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, expr)| {
+            if join_column_name(expr, table_aliases).is_ok() {
+                return None;
+            }
+            Some(
+                parse_join_scalar_sql_expression(expr, table_aliases).map(|parsed| {
+                    GroupExpressionBinding {
+                        source: expr.to_string(),
+                        expression: ProjectionExpression {
+                            output_name: group_by_synthetic_column(index),
+                            expr: parsed,
+                        },
+                    }
+                }),
+            )
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -35939,6 +36484,7 @@ fn parse_projection(
     let mut aliases = Vec::new();
     let mut expressions = Vec::new();
     let mut wildcard = false;
+    let group_expression_bindings = group_expression_bindings(select, table_alias)?;
 
     for item in &select.projection {
         match item {
@@ -35962,7 +36508,19 @@ fn parse_projection(
                 }
             }
             SelectItem::UnnamedExpr(SqlExpr::Function(function)) => {
-                if let Some(expr) = parse_scalar_function_projection(function, None, table_alias)? {
+                let function_expr = SqlExpr::Function(function.clone());
+                if let Some((column, _)) =
+                    projected_group_expression(&function_expr, &group_expression_bindings)
+                {
+                    add_column_once(&mut columns, column.clone());
+                    aliases.push((function.to_string(), column.clone()));
+                    expressions.push(ProjectionExpression {
+                        output_name: function.to_string(),
+                        expr: ScalarSqlExpression::Column(column),
+                    });
+                } else if let Some(expr) =
+                    parse_scalar_function_projection(function, None, table_alias)?
+                {
                     for column in scalar_expression_columns(&expr.expr) {
                         add_column_once(&mut columns, column);
                     }
@@ -35985,7 +36543,16 @@ fn parse_projection(
             SelectItem::UnnamedExpr(expr) => {
                 let mut expression_columns = Vec::new();
                 let mut found_aggregate = false;
-                if let Ok(parsed) = parse_aggregate_output_expression(
+                if let Some((column, _)) =
+                    projected_group_expression(expr, &group_expression_bindings)
+                {
+                    add_column_once(&mut columns, column.clone());
+                    aliases.push((expr.to_string(), column.clone()));
+                    expressions.push(ProjectionExpression {
+                        output_name: expr.to_string(),
+                        expr: ScalarSqlExpression::Column(column),
+                    });
+                } else if let Ok(parsed) = parse_aggregate_output_expression(
                     expr,
                     table_alias,
                     &mut aggregates,
@@ -36030,7 +36597,17 @@ fn parse_projection(
                     }
                 }
                 SqlExpr::Function(function) => {
-                    if let Some(expr) =
+                    let function_expr = SqlExpr::Function(function.clone());
+                    if let Some((column, _)) =
+                        projected_group_expression(&function_expr, &group_expression_bindings)
+                    {
+                        add_column_once(&mut columns, column.clone());
+                        aliases.push((alias.value.clone(), column.clone()));
+                        expressions.push(ProjectionExpression {
+                            output_name: alias.value.clone(),
+                            expr: ScalarSqlExpression::Column(column),
+                        });
+                    } else if let Some(expr) =
                         parse_scalar_function_projection(function, Some(&alias.value), table_alias)?
                     {
                         for column in scalar_expression_columns(&expr.expr) {
@@ -36056,7 +36633,16 @@ fn parse_projection(
                 _ => {
                     let mut expression_columns = Vec::new();
                     let mut found_aggregate = false;
-                    if let Ok(parsed) = parse_aggregate_output_expression(
+                    if let Some((column, _)) =
+                        projected_group_expression(expr, &group_expression_bindings)
+                    {
+                        add_column_once(&mut columns, column.clone());
+                        aliases.push((alias.value.clone(), column.clone()));
+                        expressions.push(ProjectionExpression {
+                            output_name: alias.value.clone(),
+                            expr: ScalarSqlExpression::Column(column),
+                        });
+                    } else if let Ok(parsed) = parse_aggregate_output_expression(
                         expr,
                         table_alias,
                         &mut aggregates,
@@ -36104,7 +36690,7 @@ fn parse_projection(
     }
 
     if aggregates.is_empty() {
-        add_projection_ordinal_aliases(&mut aliases, &columns, &aggregates, &expressions);
+        let ordinal_targets = projection_ordinal_targets(&columns, &aggregates, &expressions);
         return Ok(ParsedProjection {
             projection: if wildcard {
                 Projection::All
@@ -36115,6 +36701,7 @@ fn parse_projection(
             aggregate_expressions,
             aliases,
             expressions: if wildcard { Vec::new() } else { expressions },
+            ordinal_targets,
         });
     }
 
@@ -36136,7 +36723,7 @@ fn parse_projection(
             )));
         }
     }
-    let mut projected_columns = columns.clone();
+    let mut projected_columns = physical_projection_columns(&columns);
     for aggregate in &aggregates {
         if let Some(column) = aggregate.referenced_column() {
             if !column.starts_with("__dodam_agg_expr_") {
@@ -36147,13 +36734,20 @@ fn parse_projection(
     for column in aggregate_expression_columns {
         add_column_once(&mut projected_columns, column);
     }
-    add_projection_ordinal_aliases(&mut aliases, &columns, &aggregates, &expressions);
+    for binding in &group_expression_bindings {
+        for column in scalar_expression_columns(&binding.expression.expr) {
+            add_column_once(&mut projected_columns, column);
+        }
+        aggregate_expressions.push(binding.expression.clone());
+    }
+    let ordinal_targets = projection_ordinal_targets(&columns, &aggregates, &expressions);
     Ok(ParsedProjection {
         projection: Projection::Columns(projected_columns),
         aggregates,
         aggregate_expressions,
         aliases,
         expressions,
+        ordinal_targets,
     })
 }
 
@@ -37358,9 +37952,10 @@ fn parse_aggregate_with_input_expression(
         ));
     }
     let name = object_name_to_string(&function.name)?;
+    let lowercase_name = name.to_ascii_lowercase();
     if !matches!(
-        name.to_ascii_lowercase().as_str(),
-        "sum" | "avg" | "min" | "max"
+        lowercase_name.as_str(),
+        "sum" | "avg" | "min" | "max" | "count"
     ) {
         return Err(DodamError::UnsupportedSql(format!(
             "aggregate expression input is not supported for {name}"
@@ -37372,7 +37967,11 @@ fn parse_aggregate_with_input_expression(
             function.args
         )));
     };
-    if !args.clauses.is_empty() || args.duplicate_treatment.is_some() {
+    if !args.clauses.is_empty()
+        || (args.duplicate_treatment.is_some()
+            && !(lowercase_name == "count"
+                && args.duplicate_treatment == Some(DuplicateTreatment::Distinct)))
+    {
         return Err(DodamError::UnsupportedSql(format!(
             "unsupported function arguments: {}",
             function.args
@@ -37389,10 +37988,17 @@ fn parse_aggregate_with_input_expression(
         output_name: column.clone(),
         expr: parse_scalar_sql_expression(expr, table_alias)?,
     };
-    Ok((
-        AggregateExpr::parse(&format!("{name}({column})"))?,
-        Some(expression),
-    ))
+    let aggregate = if lowercase_name == "count" {
+        if args.duplicate_treatment != Some(DuplicateTreatment::Distinct) {
+            return Err(DodamError::UnsupportedSql(format!(
+                "aggregate expression input is not supported for {name}"
+            )));
+        }
+        AggregateExpr::parse(&format!("count_distinct({column})"))?
+    } else {
+        AggregateExpr::parse(&format!("{name}({column})"))?
+    };
+    Ok((aggregate, Some(expression)))
 }
 
 fn parse_join_aggregate(
@@ -37483,9 +38089,10 @@ fn parse_join_aggregate_with_input_expression(
         ));
     }
     let name = object_name_to_string(&function.name)?;
+    let lowercase_name = name.to_ascii_lowercase();
     if !matches!(
-        name.to_ascii_lowercase().as_str(),
-        "sum" | "avg" | "min" | "max"
+        lowercase_name.as_str(),
+        "sum" | "avg" | "min" | "max" | "count"
     ) {
         return Err(DodamError::UnsupportedSql(format!(
             "aggregate expression input is not supported for {name}"
@@ -37497,7 +38104,11 @@ fn parse_join_aggregate_with_input_expression(
             function.args
         )));
     };
-    if !args.clauses.is_empty() || args.duplicate_treatment.is_some() {
+    if !args.clauses.is_empty()
+        || (args.duplicate_treatment.is_some()
+            && !(lowercase_name == "count"
+                && args.duplicate_treatment == Some(DuplicateTreatment::Distinct)))
+    {
         return Err(DodamError::UnsupportedSql(format!(
             "unsupported function arguments: {}",
             function.args
@@ -37514,17 +38125,30 @@ fn parse_join_aggregate_with_input_expression(
         output_name: column.clone(),
         expr: parse_join_scalar_sql_expression(expr, table_aliases)?,
     };
-    Ok((
-        AggregateExpr::parse(&format!("{name}({column})"))?,
-        Some(expression),
-    ))
+    let aggregate = if lowercase_name == "count" {
+        if args.duplicate_treatment != Some(DuplicateTreatment::Distinct) {
+            return Err(DodamError::UnsupportedSql(format!(
+                "aggregate expression input is not supported for {name}"
+            )));
+        }
+        AggregateExpr::parse(&format!("count_distinct({column})"))?
+    } else {
+        AggregateExpr::parse(&format!("{name}({column})"))?
+    };
+    Ok((aggregate, Some(expression)))
 }
 
 fn parse_group_by(select: &Select, table_alias: Option<&str>) -> Result<Vec<String>> {
     match &select.group_by {
         GroupByExpr::Expressions(expressions, modifiers) if modifiers.is_empty() => expressions
             .iter()
-            .map(|expr| sql_column_name(expr, table_alias))
+            .enumerate()
+            .map(|(index, expr)| {
+                sql_column_name(expr, table_alias).or_else(|_| {
+                    parse_scalar_sql_expression(expr, table_alias)
+                        .map(|_| group_by_synthetic_column(index))
+                })
+            })
             .collect::<Result<Vec<_>>>(),
         GroupByExpr::Expressions(_, _) | GroupByExpr::All(_) => Err(DodamError::UnsupportedSql(
             "GROUP BY modifiers and GROUP BY ALL are not supported".to_string(),
@@ -37538,13 +38162,12 @@ fn add_column_once(columns: &mut Vec<String>, column: String) {
     }
 }
 
-fn add_projection_ordinal_aliases(
-    aliases: &mut Vec<(String, String)>,
+fn projection_ordinal_targets(
     columns: &[String],
     aggregates: &[AggregateExpr],
     expressions: &[ProjectionExpression],
-) {
-    let targets = if !aggregates.is_empty() {
+) -> Vec<String> {
+    if !aggregates.is_empty() {
         columns
             .iter()
             .cloned()
@@ -37557,18 +38180,13 @@ fn add_projection_ordinal_aliases(
             .collect::<Vec<_>>()
     } else {
         columns.to_vec()
-    };
-    for (index, target) in targets.into_iter().enumerate() {
-        let ordinal = (index + 1).to_string();
-        if alias_target(&ordinal, aliases).is_none() {
-            aliases.push((ordinal, target));
-        }
     }
 }
 
 fn parse_order_by(
     query: &Query,
     aliases: &[(String, String)],
+    ordinal_targets: &[String],
     table_alias: Option<&str>,
 ) -> Result<Option<SortKey>> {
     let Some(order_by) = &query.order_by else {
@@ -37593,7 +38211,7 @@ fn parse_order_by(
                 ));
             }
             Ok(SortExpr {
-                column: parse_order_expr(&order.expr, aliases, table_alias)?,
+                column: parse_order_expr(&order.expr, aliases, ordinal_targets, table_alias)?,
                 descending: order.options.asc == Some(false),
             })
         })
@@ -37604,10 +38222,11 @@ fn parse_order_by(
 fn parse_order_expr(
     expr: &SqlExpr,
     aliases: &[(String, String)],
+    ordinal_targets: &[String],
     table_alias: Option<&str>,
 ) -> Result<String> {
     let column = match expr {
-        SqlExpr::Value(value) => resolve_order_by_ordinal(value, aliases)?,
+        SqlExpr::Value(value) => resolve_order_by_ordinal(value, ordinal_targets)?,
         SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
             sql_column_name(expr, table_alias)?
         }
@@ -37629,7 +38248,7 @@ fn resolve_alias(name: &str, aliases: &[(String, String)]) -> String {
 
 fn resolve_order_by_ordinal(
     value: &sqlparser::ast::ValueWithSpan,
-    aliases: &[(String, String)],
+    ordinal_targets: &[String],
 ) -> Result<String> {
     let Value::Number(number, _) = &value.value else {
         return Err(DodamError::UnsupportedSql(format!(
@@ -37645,11 +38264,9 @@ fn resolve_order_by_ordinal(
             "ORDER BY ordinal must be greater than zero".to_string(),
         ));
     }
-    alias_target(&ordinal.to_string(), aliases)
-        .cloned()
-        .ok_or_else(|| {
-            DodamError::UnsupportedSql(format!("ORDER BY position {ordinal} is out of range"))
-        })
+    ordinal_targets.get(ordinal - 1).cloned().ok_or_else(|| {
+        DodamError::UnsupportedSql(format!("ORDER BY position {ordinal} is out of range"))
+    })
 }
 
 fn alias_target<'a>(name: &str, aliases: &'a [(String, String)]) -> Option<&'a String> {
@@ -41074,11 +41691,7 @@ fn rename_output_batches(
                 .map(|field| {
                     let name = aliases
                         .iter()
-                        .find(|(alias, target)| {
-                            !alias.contains('(')
-                                && alias.parse::<usize>().is_err()
-                                && target == field.name()
-                        })
+                        .find(|(alias, target)| !alias.contains('(') && target == field.name())
                         .map(|(alias, _)| alias.as_str())
                         .unwrap_or_else(|| field.name().as_str());
                     Field::new(name, field.data_type().clone(), field.is_nullable())
