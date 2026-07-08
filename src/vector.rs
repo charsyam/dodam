@@ -540,6 +540,18 @@ pub(crate) fn dictionary_i32_view_match_flags(
     Some(flags)
 }
 
+pub(crate) fn dictionary_i32_view_match_index(
+    dictionary_keys: &[i32],
+    match_flags: &[Option<usize>],
+    row: usize,
+) -> Option<usize> {
+    let key = dictionary_keys
+        .get(row)
+        .copied()
+        .and_then(|key| usize::try_from(key).ok())?;
+    match_flags.get(key).copied().flatten()
+}
+
 pub(crate) fn store_i64_keys_matching_dictionary_target(
     keys: I64VectorView<'_>,
     dictionary: DictionaryI32View<'_>,
@@ -611,14 +623,7 @@ fn dictionary_i32_row_matches(
     match_flags: &[Option<usize>],
     row: usize,
 ) -> bool {
-    let Some(key) = dictionary_keys
-        .get(row)
-        .copied()
-        .and_then(|key| usize::try_from(key).ok())
-    else {
-        return false;
-    };
-    match_flags.get(key).copied().flatten().is_some()
+    dictionary_i32_view_match_index(dictionary_keys, match_flags, row).is_some()
 }
 
 fn string_array_value_bytes<'a>(offsets: &[i32], data: &'a [u8], row: usize) -> &'a [u8] {

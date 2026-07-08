@@ -59,7 +59,7 @@ use crate::storage::{
 use crate::vector::{
     BatchConsumer, BatchView, Date32VectorView, Decimal128VectorView, DictionaryI32View,
     DictionaryStringValues, I32VectorView, I64VectorView, SelectionVector, Utf8VectorView,
-    consume_record_batch, dictionary_i32_view_match_flags,
+    consume_record_batch, dictionary_i32_view_match_flags, dictionary_i32_view_match_index,
     store_i64_keys_matching_dictionary_target, store_i64_keys_matching_utf8_target,
 };
 
@@ -13086,13 +13086,12 @@ fn q12_filtered_lineitem_counts_batch_dictionary_typed_into(
             if q12_should_use_lineitem_selection_vector(selected.len(), orderkey_values.len()) {
                 for &row in selected.as_slice() {
                     let row = row as usize;
-                    let Ok(mode_key) = usize::try_from(mode_keys[row]) else {
+                    let Some(mode_index) =
+                        dictionary_i32_view_match_index(mode_keys, &mode_flags, row)
+                    else {
                         continue;
                     };
-                    let Some(Some(mode_index)) = mode_flags.get(mode_key) else {
-                        continue;
-                    };
-                    q12_pending_increment(pending, orderkey_values[row], *mode_index);
+                    q12_pending_increment(pending, orderkey_values[row], mode_index);
                 }
                 return true;
             }
@@ -13109,13 +13108,11 @@ fn q12_filtered_lineitem_counts_batch_dictionary_typed_into(
             ) {
                 continue;
             }
-            let Ok(mode_key) = usize::try_from(mode_keys[row]) else {
+            let Some(mode_index) = dictionary_i32_view_match_index(mode_keys, &mode_flags, row)
+            else {
                 continue;
             };
-            let Some(Some(mode_index)) = mode_flags.get(mode_key) else {
-                continue;
-            };
-            q12_pending_increment(pending, orderkey_values[row], *mode_index);
+            q12_pending_increment(pending, orderkey_values[row], mode_index);
         }
         return true;
     }
@@ -13139,13 +13136,10 @@ fn q12_filtered_lineitem_counts_batch_dictionary_typed_into(
         ) {
             continue;
         }
-        let Ok(mode_key) = usize::try_from(mode_keys[row]) else {
+        let Some(mode_index) = dictionary_i32_view_match_index(mode_keys, &mode_flags, row) else {
             continue;
         };
-        let Some(Some(mode_index)) = mode_flags.get(mode_key) else {
-            continue;
-        };
-        q12_pending_increment(pending, view.orderkeys.value(row), *mode_index);
+        q12_pending_increment(pending, view.orderkeys.value(row), mode_index);
     }
     true
 }
@@ -14252,14 +14246,16 @@ fn q12_order_late_build_selection_batch(
         return Ok(None);
     };
     if orderkeys.null_count() == 0 {
-        for &orderkey in orderkeys.values() {
+        let orderkey_values = orderkeys.values();
+        selection.push_selected_rows(orderkey_values.len(), |row| {
+            let orderkey = orderkey_values[row];
             if let Some(order) = state.pending.get(orderkey) {
                 state.selected_orders.push(order);
-                selection.push(true);
+                true
             } else {
-                selection.push(false);
+                false
             }
-        }
+        });
         return Ok(Some(()));
     }
     for row in 0..orderkeys.len() {
@@ -14290,14 +14286,15 @@ fn q12_order_late_build_selection_view(
             return q12_order_late_build_selection_batch(batch.clone(), selection, state);
         };
         if let Some(orderkey_values) = orderkeys.values_if_null_free() {
-            for &orderkey in orderkey_values {
+            selection.push_selected_rows(orderkey_values.len(), |row| {
+                let orderkey = orderkey_values[row];
                 if let Some(order) = state.pending.get(orderkey) {
                     state.selected_orders.push(order);
-                    selection.push(true);
+                    true
                 } else {
-                    selection.push(false);
+                    false
                 }
-            }
+            });
             return Ok(Some(()));
         }
         for row in 0..orderkeys.len() {
@@ -14856,12 +14853,8 @@ fn q12_shipping_mode_counts_batch_dictionary_typed(
                 if index >= pending_present.len() || !pending_present[index] {
                     continue;
                 }
-                let priority_index = usize::try_from(priority_keys[row]).ok()?;
-                let is_high_priority = priority_flags
-                    .get(priority_index)
-                    .copied()
-                    .flatten()
-                    .is_some();
+                let is_high_priority =
+                    dictionary_i32_view_match_index(priority_keys, &priority_flags, row).is_some();
                 q12_apply_pending_order(&mut groups, pending_values[index], is_high_priority);
             }
             return Some(groups);
@@ -14870,12 +14863,8 @@ fn q12_shipping_mode_counts_batch_dictionary_typed(
             let Some(order) = pending.get(orderkey_values[row]) else {
                 continue;
             };
-            let priority_index = usize::try_from(priority_keys[row]).ok()?;
-            let is_high_priority = priority_flags
-                .get(priority_index)
-                .copied()
-                .flatten()
-                .is_some();
+            let is_high_priority =
+                dictionary_i32_view_match_index(priority_keys, &priority_flags, row).is_some();
             q12_apply_pending_order(&mut groups, order, is_high_priority);
         }
         return Some(groups);
@@ -14887,12 +14876,8 @@ fn q12_shipping_mode_counts_batch_dictionary_typed(
         let Some(order) = pending.get(orderkeys.value(row)) else {
             continue;
         };
-        let priority_index = usize::try_from(priority_keys[row]).ok()?;
-        let is_high_priority = priority_flags
-            .get(priority_index)
-            .copied()
-            .flatten()
-            .is_some();
+        let is_high_priority =
+            dictionary_i32_view_match_index(priority_keys, &priority_flags, row).is_some();
         q12_apply_pending_order(&mut groups, order, is_high_priority);
     }
     Some(groups)
@@ -14918,12 +14903,8 @@ fn q12_shipping_mode_counts_dictionary_vector_typed(
                 if index >= pending_present.len() || !pending_present[index] {
                     continue;
                 }
-                let priority_index = usize::try_from(priority_keys[row]).ok()?;
-                let is_high_priority = priority_flags
-                    .get(priority_index)
-                    .copied()
-                    .flatten()
-                    .is_some();
+                let is_high_priority =
+                    dictionary_i32_view_match_index(priority_keys, &priority_flags, row).is_some();
                 q12_apply_pending_order(&mut groups, pending_values[index], is_high_priority);
             }
             return Some(groups);
@@ -14932,12 +14913,8 @@ fn q12_shipping_mode_counts_dictionary_vector_typed(
             let Some(order) = pending.get(orderkey_values[row]) else {
                 continue;
             };
-            let priority_index = usize::try_from(priority_keys[row]).ok()?;
-            let is_high_priority = priority_flags
-                .get(priority_index)
-                .copied()
-                .flatten()
-                .is_some();
+            let is_high_priority =
+                dictionary_i32_view_match_index(priority_keys, &priority_flags, row).is_some();
             q12_apply_pending_order(&mut groups, order, is_high_priority);
         }
         return Some(groups);
@@ -14949,12 +14926,8 @@ fn q12_shipping_mode_counts_dictionary_vector_typed(
         let Some(order) = pending.get(orderkeys.value(row)) else {
             continue;
         };
-        let priority_index = usize::try_from(priority_keys[row]).ok()?;
-        let is_high_priority = priority_flags
-            .get(priority_index)
-            .copied()
-            .flatten()
-            .is_some();
+        let is_high_priority =
+            dictionary_i32_view_match_index(priority_keys, &priority_flags, row).is_some();
         q12_apply_pending_order(&mut groups, order, is_high_priority);
     }
     Some(groups)
@@ -27534,7 +27507,7 @@ fn q19_late_build_selection_batch(
     let partkey_values = partkeys.values();
     let quantity_values = quantities.raw_values();
     let discount_values = discounts.raw_values();
-    for row in 0..batch.num_rows() {
+    selection.push_selected_rows(batch.num_rows(), |row| {
         let selected = if let Some(mask) = state.part_masks.get(partkey_values[row]) {
             q19_rule_matches_lineitem_raw(
                 raw_rules,
@@ -27549,8 +27522,8 @@ fn q19_late_build_selection_batch(
         if selected {
             state.selected_discounts.push(discount_values[row] as i64);
         }
-        selection.push(selected);
-    }
+        selected
+    });
     Ok(Some(()))
 }
 
@@ -27616,15 +27589,14 @@ fn q19_late_build_selection_vector_typed(
         q19_raw_line_rules_cached(&state.rules, quantities.scale(), &mut state.raw_rule_cache);
     let quantity_values = quantities.raw_values();
     let discount_values = discounts.raw_values();
-    for row in 0..partkeys.len() {
+    selection.push_selected_rows(partkeys.len(), |row| {
         if partkeys.is_null(row)
             || quantities.is_null(row)
             || discounts.is_null(row)
             || shipmodes.is_null(row)
             || shipinstructs.is_null(row)
         {
-            selection.push(false);
-            continue;
+            return false;
         }
         let selected = if let Some(mask) = state.part_masks.get(partkeys.value(row)) {
             q19_rule_matches_lineitem_raw(
@@ -27640,8 +27612,8 @@ fn q19_late_build_selection_vector_typed(
         if selected {
             state.selected_discounts.push(discount_values[row] as i64);
         }
-        selection.push(selected);
-    }
+        selected
+    });
     Ok(Some(()))
 }
 
