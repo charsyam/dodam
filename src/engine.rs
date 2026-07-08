@@ -5258,6 +5258,49 @@ impl LateSelectionBuilder {
         self.selected_rows += appended_selected;
     }
 
+    pub fn push_selected_rows<F>(&mut self, row_count: usize, mut is_selected: F)
+    where
+        F: FnMut(usize) -> bool,
+    {
+        let mut consumed = 0usize;
+        let mut appended_selected = 0usize;
+        for row in 0..row_count {
+            if !is_selected(row) {
+                continue;
+            }
+            let skipped = row - consumed;
+            if skipped > 0 {
+                append_late_selector_run(
+                    &mut self.selectors,
+                    &mut self.current_selected,
+                    &mut self.run_len,
+                    false,
+                    skipped,
+                );
+            }
+            append_late_selector_run(
+                &mut self.selectors,
+                &mut self.current_selected,
+                &mut self.run_len,
+                true,
+                1,
+            );
+            consumed = row + 1;
+            appended_selected += 1;
+        }
+        if consumed < row_count {
+            append_late_selector_run(
+                &mut self.selectors,
+                &mut self.current_selected,
+                &mut self.run_len,
+                false,
+                row_count - consumed,
+            );
+        }
+        self.total_rows += row_count;
+        self.selected_rows += appended_selected;
+    }
+
     fn finish(mut self) -> (Option<RowSelection>, LateMaterializedMetrics) {
         finish_late_selector_run(&mut self.selectors, self.current_selected, self.run_len);
         let metrics = LateMaterializedMetrics {

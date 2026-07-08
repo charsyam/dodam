@@ -17233,8 +17233,7 @@ fn q03_revenue_late_carry_build_selection_batch(
     if orderkeys.null_count() == 0 && shipdates.null_count() == 0 {
         let orderkey_values = orderkeys.values().as_ref();
         let shipdate_values = shipdates.values().as_ref();
-        let mut selected_offsets = Vec::new();
-        for row in 0..orderkey_values.len() {
+        selection.push_selected_rows(orderkey_values.len(), |row| {
             let orderkey = orderkey_values[row];
             let selected_order = if shipdate_values[row] > state.ship_cutoff {
                 state.orders.get(&orderkey).copied()
@@ -17242,11 +17241,12 @@ fn q03_revenue_late_carry_build_selection_batch(
                 None
             };
             if let Some(order) = selected_order {
-                selected_offsets.push(row);
                 state.selected_orders.push((orderkey, order));
+                true
+            } else {
+                false
             }
-        }
-        selection.push_selected_offsets(orderkey_values.len(), selected_offsets);
+        });
         return Ok(Some(()));
     }
     for row in 0..orderkeys.len() {
@@ -17285,8 +17285,7 @@ fn q03_revenue_late_carry_build_selection_view(
             orderkeys.values_if_null_free(),
             shipdates.values_if_null_free(),
         ) {
-            let mut selected_offsets = Vec::new();
-            for row in 0..orderkey_values.len() {
+            selection.push_selected_rows(orderkey_values.len(), |row| {
                 let orderkey = orderkey_values[row];
                 let selected_order = if shipdate_values[row] > state.ship_cutoff {
                     state.orders.get(&orderkey).copied()
@@ -17294,11 +17293,12 @@ fn q03_revenue_late_carry_build_selection_view(
                     None
                 };
                 if let Some(order) = selected_order {
-                    selected_offsets.push(row);
                     state.selected_orders.push((orderkey, order));
+                    true
+                } else {
+                    false
                 }
-            }
-            selection.push_selected_offsets(orderkey_values.len(), selected_offsets);
+            });
             return Ok(Some(()));
         }
         for row in 0..orderkeys.len() {
@@ -17504,17 +17504,15 @@ fn q03_revenue_late_build_selection_batch(
     if orderkeys.null_count() == 0 && shipdates.null_count() == 0 {
         let orderkey_values = orderkeys.values().as_ref();
         let shipdate_values = shipdates.values().as_ref();
-        let mut selected_offsets = Vec::new();
-        for row in 0..orderkey_values.len() {
+        selection.push_selected_rows(orderkey_values.len(), |row| {
             let orderkey = orderkey_values[row];
             let selected =
                 shipdate_values[row] > state.ship_cutoff && state.orders.contains_key(&orderkey);
             if selected {
-                selected_offsets.push(row);
                 state.selected_orderkeys.push(orderkey);
             }
-        }
-        selection.push_selected_offsets(orderkey_values.len(), selected_offsets);
+            selected
+        });
         return Ok(Some(()));
     }
     for row in 0..orderkeys.len() {
@@ -17546,17 +17544,15 @@ fn q03_revenue_late_build_selection_view(
             orderkeys.values_if_null_free(),
             shipdates.values_if_null_free(),
         ) {
-            let mut selected_offsets = Vec::new();
-            for row in 0..orderkey_values.len() {
+            selection.push_selected_rows(orderkey_values.len(), |row| {
                 let orderkey = orderkey_values[row];
                 let selected = shipdate_values[row] > state.ship_cutoff
                     && state.orders.contains_key(&orderkey);
                 if selected {
-                    selected_offsets.push(row);
                     state.selected_orderkeys.push(orderkey);
                 }
-            }
-            selection.push_selected_offsets(orderkey_values.len(), selected_offsets);
+                selected
+            });
             return Ok(Some(()));
         }
         for row in 0..orderkeys.len() {
@@ -19879,8 +19875,9 @@ fn q04_lineitem_late_build_selection_batch(
         return Ok(None);
     };
     if orderkeys.null_count() == 0 {
-        let mut selected_offsets = Vec::new();
-        for (row, &orderkey) in orderkeys.values().iter().enumerate() {
+        let orderkey_values = orderkeys.values();
+        selection.push_selected_rows(orderkeys.len(), |row| {
+            let orderkey = orderkey_values[row];
             let selected = usize::try_from(orderkey)
                 .ok()
                 .and_then(|index| {
@@ -19891,11 +19888,12 @@ fn q04_lineitem_late_build_selection_batch(
                 })
                 .filter(|(_, marker)| marker.load(Ordering::Relaxed) != 0);
             if let Some((index, _)) = selected {
-                selected_offsets.push(row);
                 state.selected_orderkeys.push(index);
+                true
+            } else {
+                false
             }
-        }
-        selection.push_selected_offsets(orderkeys.len(), selected_offsets);
+        });
         return Ok(Some(()));
     }
     for row in 0..orderkeys.len() {
@@ -19932,8 +19930,8 @@ fn q04_lineitem_late_build_selection_view(
             return Ok(None);
         };
         if let Some(orderkey_values) = orderkeys.values_if_null_free() {
-            let mut selected_offsets = Vec::new();
-            for (row, &orderkey) in orderkey_values.iter().enumerate() {
+            selection.push_selected_rows(orderkey_values.len(), |row| {
+                let orderkey = orderkey_values[row];
                 let selected = usize::try_from(orderkey)
                     .ok()
                     .and_then(|index| {
@@ -19944,11 +19942,12 @@ fn q04_lineitem_late_build_selection_view(
                     })
                     .filter(|(_, marker)| marker.load(Ordering::Relaxed) != 0);
                 if let Some((index, _)) = selected {
-                    selected_offsets.push(row);
                     state.selected_orderkeys.push(index);
+                    true
+                } else {
+                    false
                 }
-            }
-            selection.push_selected_offsets(orderkey_values.len(), selected_offsets);
+            });
             return Ok(Some(()));
         }
         for row in 0..orderkeys.len() {
