@@ -176,6 +176,7 @@ impl std::fmt::Display for AggregateExpr {
 pub struct SortExpr {
     pub column: String,
     pub descending: bool,
+    pub nulls_first: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,14 +215,17 @@ impl SortExpr {
             [column] => Ok(Self {
                 column: (*column).to_string(),
                 descending: false,
+                nulls_first: false,
             }),
             [column, direction] if direction.eq_ignore_ascii_case("asc") => Ok(Self {
                 column: (*column).to_string(),
                 descending: false,
+                nulls_first: false,
             }),
             [column, direction] if direction.eq_ignore_ascii_case("desc") => Ok(Self {
                 column: (*column).to_string(),
                 descending: true,
+                nulls_first: false,
             }),
             _ => Err(DodamError::InvalidOrderBy(input.to_string())),
         }

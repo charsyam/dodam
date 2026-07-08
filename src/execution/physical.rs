@@ -856,7 +856,7 @@ fn sort_single_batch(
                 values: batch.column(column_index).clone(),
                 options: Some(SortOptions {
                     descending: sort.descending,
-                    nulls_first: false,
+                    nulls_first: sort.nulls_first,
                 }),
             })
         })
@@ -8332,6 +8332,7 @@ fn sort_single_batch_by_column(batch: RecordBatch, column: &str) -> Result<Recor
         &SortKey::from(SortExpr {
             column: column.to_string(),
             descending: false,
+            nulls_first: false,
         }),
         None,
     )

@@ -210,6 +210,84 @@ async fn duckdb_differential_aggregate_matrix() {
         tempdir.path(),
     )
     .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, key FROM '{}' ORDER BY key ASC NULLS FIRST, id LIMIT 3 OFFSET 1",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id, key FROM read_parquet('{}') ORDER BY key ASC NULLS FIRST, id LIMIT 3 OFFSET 1",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT lower(payload) AS bucket, count(*) FROM '{}' GROUP BY bucket ORDER BY 1",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT lower(payload) AS bucket, count(*) FROM read_parquet('{}') GROUP BY bucket ORDER BY 1",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT lower(payload) AS bucket, count(*) FROM '{}' GROUP BY 1 ORDER BY 1",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT lower(payload) AS bucket, count(*) FROM read_parquet('{}') GROUP BY 1 ORDER BY 1",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, key, row_number() OVER (PARTITION BY key ORDER BY id) AS rn FROM '{}' ORDER BY key NULLS FIRST, id",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id, key, row_number() OVER (PARTITION BY key ORDER BY id) AS rn FROM read_parquet('{}') ORDER BY key NULLS FIRST, id",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, key, rank() OVER (PARTITION BY key ORDER BY value) AS rnk FROM '{}' ORDER BY key NULLS FIRST, id",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id, key, rank() OVER (PARTITION BY key ORDER BY value) AS rnk FROM read_parquet('{}') ORDER BY key NULLS FIRST, id",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, key, dense_rank() OVER (PARTITION BY key ORDER BY value) AS drnk FROM '{}' ORDER BY key NULLS FIRST, id",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id, key, dense_rank() OVER (PARTITION BY key ORDER BY value) AS drnk FROM read_parquet('{}') ORDER BY key NULLS FIRST, id",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -382,6 +460,36 @@ async fn duckdb_differential_join_matrix() {
         ),
         &format!(
             "SELECT COALESCE(d.name, 'missing') AS dim_name, count(*), count(DISTINCT f.value + 1) FROM read_parquet('{}') f LEFT JOIN read_parquet('{}') d ON f.key = d.key GROUP BY COALESCE(d.name, 'missing') HAVING count(*) >= 1 ORDER BY 1",
+            facts_path.display(),
+            dim_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT DISTINCT f.key, d.name FROM '{}' f JOIN '{}' d ON f.key = d.key ORDER BY f.key, d.name",
+            facts_path.display(),
+            dim_path.display()
+        ),
+        &format!(
+            "SELECT DISTINCT f.key, d.name FROM read_parquet('{}') f JOIN read_parquet('{}') d ON f.key = d.key ORDER BY f.key, d.name",
+            facts_path.display(),
+            dim_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT f.*, d.name FROM '{}' f JOIN '{}' d ON f.key = d.key ORDER BY f.id, d.name",
+            facts_path.display(),
+            dim_path.display()
+        ),
+        &format!(
+            "SELECT f.*, d.name FROM read_parquet('{}') f JOIN read_parquet('{}') d ON f.key = d.key ORDER BY f.id, d.name",
             facts_path.display(),
             dim_path.display()
         ),

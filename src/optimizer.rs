@@ -225,6 +225,7 @@ mod tests {
         let order_by = SortKey::from(SortExpr {
             column: "o.customer_id".to_string(),
             descending: false,
+            nulls_first: false,
         });
         let left_keys = vec!["customer_id".to_string()];
         let right_keys = vec!["id".to_string()];
