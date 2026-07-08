@@ -1298,6 +1298,10 @@ pub(crate) enum DirectPrimitiveColumnType {
         precision: u8,
         scale: i8,
     },
+    Decimal128Int64Raw {
+        precision: u8,
+        scale: i8,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1531,6 +1535,9 @@ impl DirectPrimitiveColumnValues {
             DirectPrimitiveColumnType::Decimal128Int64 { .. } => {
                 Self::Decimal128(Vec::with_capacity(capacity))
             }
+            DirectPrimitiveColumnType::Decimal128Int64Raw { .. } => {
+                Self::I64(Vec::with_capacity(capacity))
+            }
         }
     }
 
@@ -1551,6 +1558,14 @@ impl DirectPrimitiveColumnValues {
                 Self::Decimal128(values),
                 DirectPrimitiveColumnType::Decimal128Int64 { precision, scale },
             ) => RawColumnView::Decimal128 {
+                values,
+                precision,
+                scale,
+            },
+            (
+                Self::I64(values),
+                DirectPrimitiveColumnType::Decimal128Int64Raw { precision, scale },
+            ) => RawColumnView::Decimal128I64 {
                 values,
                 precision,
                 scale,
@@ -1644,7 +1659,8 @@ where
                     DirectPrimitiveColumnReader::I32(reader)
                 }
                 (
-                    DirectPrimitiveColumnType::Decimal128Int64 { .. },
+                    DirectPrimitiveColumnType::Decimal128Int64 { .. }
+                    | DirectPrimitiveColumnType::Decimal128Int64Raw { .. },
                     ColumnReader::Int64ColumnReader(reader),
                 ) => DirectPrimitiveColumnReader::I64(reader),
                 _ => return Ok(None),

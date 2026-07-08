@@ -4199,7 +4199,7 @@ impl DodamEngine {
             },
             OwnedDirectPrimitiveColumnSpec {
                 name: shape.min_decimal_column.clone(),
-                column_type: DirectPrimitiveColumnType::Decimal128Int64 {
+                column_type: DirectPrimitiveColumnType::Decimal128Int64Raw {
                     precision: shape.decimal_precision,
                     scale: shape.decimal_scale,
                 },

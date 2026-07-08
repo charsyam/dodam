@@ -1545,6 +1545,10 @@ impl DecimalDateRangeFilter {
             && self.date_min.is_none_or(|min| date >= min)
             && self.date_max.is_none_or(|max| date <= max)
     }
+
+    fn matches_i64(&self, decimal: i64, date: i32) -> bool {
+        self.matches(i128::from(decimal), date)
+    }
 }
 
 fn literal_to_decimal_raw(value: &LiteralValue, scale: i8) -> Option<i128> {
@@ -1688,35 +1692,60 @@ impl SingleKeyCountSumMinMaxVectorState {
                 "direct primitive aggregate requires non-null sum input".to_string(),
             ));
         };
-        let decimals = decimal_values.raw_values();
         let Some(dates) = date_values.values_if_null_free() else {
             return Err(DodamError::UnsupportedSql(
                 "direct primitive aggregate requires non-null date input".to_string(),
             ));
         };
-        if keys.len() != sums.len() || keys.len() != decimals.len() || keys.len() != dates.len() {
-            return Err(DodamError::UnsupportedSql(
-                "direct primitive aggregate column length mismatch".to_string(),
-            ));
-        }
         let SingleKeyCountSumMinMaxIndex::Int32 { groups: index, .. } = &mut self.group_index
         else {
             unreachable!("vector state uses Int32 group index")
         };
-        for row in 0..keys.len() {
-            let decimal = decimals[row];
-            let date = dates[row];
-            if !filter.matches(decimal, date) {
-                continue;
+        if let Some(decimals) = decimal_values.raw_i64_values() {
+            if keys.len() != sums.len() || keys.len() != decimals.len() || keys.len() != dates.len()
+            {
+                return Err(DodamError::UnsupportedSql(
+                    "direct primitive aggregate column length mismatch".to_string(),
+                ));
             }
-            let group_id = count_sum_min_max_group_id_for_i32(
-                index,
-                keys[row],
-                &mut self.groups,
-                self.decimal_precision,
-                self.decimal_scale,
-            );
-            self.groups[group_id].update_raw_non_null(sums[row], decimal, date);
+            for row in 0..keys.len() {
+                let decimal = decimals[row];
+                let date = dates[row];
+                if !filter.matches_i64(decimal, date) {
+                    continue;
+                }
+                let group_id = count_sum_min_max_group_id_for_i32(
+                    index,
+                    keys[row],
+                    &mut self.groups,
+                    self.decimal_precision,
+                    self.decimal_scale,
+                );
+                self.groups[group_id].update_raw_non_null(sums[row], i128::from(decimal), date);
+            }
+        } else {
+            let decimals = decimal_values.raw_values();
+            if keys.len() != sums.len() || keys.len() != decimals.len() || keys.len() != dates.len()
+            {
+                return Err(DodamError::UnsupportedSql(
+                    "direct primitive aggregate column length mismatch".to_string(),
+                ));
+            }
+            for row in 0..keys.len() {
+                let decimal = decimals[row];
+                let date = dates[row];
+                if !filter.matches(decimal, date) {
+                    continue;
+                }
+                let group_id = count_sum_min_max_group_id_for_i32(
+                    index,
+                    keys[row],
+                    &mut self.groups,
+                    self.decimal_precision,
+                    self.decimal_scale,
+                );
+                self.groups[group_id].update_raw_non_null(sums[row], decimal, date);
+            }
         }
         Ok(())
     }

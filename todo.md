@@ -2152,3 +2152,10 @@ Tried and rejected or neutral:
           - Added `DODAM_DIRECT_PRIMITIVE_PROFILE=1` profiling for direct primitive folds. A focused count/sum run confirmed the raw path on `facts.parquet[bucket,value]`: `600000` rows, `39` batches, read `~12.7ms`, consume `~1.7ms`.
           - This completes the next reusable vector-pipeline layer, but true page/vector decoder fusion is still the remaining deeper boundary: the scan still calls parquet-rs `ColumnReader::read_records`; the new fold/profile API makes that boundary measurable and replaceable.
           - Validation: `cargo fmt && cargo check -q`, `cargo test -q`, release build, `scripts/check_correctness.sh quick`, and the expanded `scripts/compare_generic_duckdb.py --repeats 9 --warmup 3` passed.
+        - Pushed the direct primitive decimal path one layer lower:
+          - Added a `Decimal128Int64Raw` direct primitive column type and `RawColumnView::Decimal128I64`, so INT64-backed Decimal128 pages can be fed to vector aggregate states as raw `i64` values without building an intermediate `Vec<i128>` for every batch.
+          - The existing `Decimal128Int64` path is unchanged for older TPC-H/vector consumers that require `raw_values() -> &[i128]`; only the new direct aggregate path opts into raw-i64 decimal vectors.
+          - Expanded generic 10-query benchmark sampled Dodam `~125.6ms` vs DuckDB `~156.4ms` (`~0.80x`). Decimal/date queries improved modestly: `filter_group_decimal_date` around `~7.8ms`, `decimal_date_group_no_order` around `~7.7ms`.
+          - Direct primitive profile for `facts.parquet[bucket,value,amount,event_date]` showed `600000` rows, `39` batches, read `~16.6ms`, consume `~2.7ms`.
+          - This is still not a replacement page decoder, but it removes one decode-to-vector materialization step at the raw vector boundary and keeps the next page-fusion target measurable.
+          - Validation: `cargo fmt && cargo check -q`, `cargo test -q`, release build, `scripts/check_correctness.sh quick`, and expanded generic DuckDB comparison passed.
