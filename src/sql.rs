@@ -44,10 +44,10 @@ use crate::error::{DodamError, Result};
 use crate::execution::JoinType;
 use crate::execution::{
     AggregateExpr, AggregateMetrics, AggregateResult, AggregateValue, ComparisonExpr, ComparisonOp,
-    DecimalInput, DistinctExec, Expr, FilterExpr, GroupAggregateResult, GroupKeyExpr, GroupValue,
-    HashJoinExec, JoinBuildSide, LiteralValue, MemoryExec, PhysicalPlan, Projection,
-    RecordBatchSink, ScanPlanMetrics, SendableBatchStream, SortExpr, SortKey,
-    aggregate_metrics_to_batches, collect_aggregates, collect_grouped_aggregates,
+    DecimalInput, DistinctExec, Expr, FilterExpr, GroupAggregateResult, GroupKeyExpr,
+    GroupKeyLiteral, GroupValue, HashJoinExec, JoinBuildSide, LiteralValue, MemoryExec,
+    PhysicalPlan, Projection, RecordBatchSink, ScanPlanMetrics, SendableBatchStream, SortExpr,
+    SortKey, aggregate_metrics_to_batches, collect_aggregates, collect_grouped_aggregates,
     collect_grouped_aggregates_with_key_exprs, decimal_discounted_revenue_raw,
     decimal_discounted_revenue_scales, decimal_input, evaluate_filter_mask, filter_batch,
     try_for_each_i64_i64_date32,
@@ -40413,28 +40413,38 @@ fn group_key_exprs_for_aggregate(
     let [left, right] = values.as_slice() else {
         return None;
     };
-    let (column, fallback) = coalesce_column_literal_utf8(left, right)
-        .or_else(|| coalesce_column_literal_utf8(right, left))?;
+    let (column, fallback) =
+        coalesce_column_literal(left, right).or_else(|| coalesce_column_literal(right, left))?;
     let mut keys = group_by[..group_by.len() - 1]
         .iter()
         .cloned()
         .map(GroupKeyExpr::Column)
         .collect::<Vec<_>>();
-    keys.push(GroupKeyExpr::CoalesceUtf8Literal { column, fallback });
+    keys.push(GroupKeyExpr::CoalesceLiteral { column, fallback });
     Some(keys)
 }
 
-fn coalesce_column_literal_utf8(
+fn coalesce_column_literal(
     column_expr: &ScalarSqlExpression,
     literal_expr: &ScalarSqlExpression,
-) -> Option<(String, String)> {
+) -> Option<(String, GroupKeyLiteral)> {
     let ScalarSqlExpression::Column(column) = column_expr else {
         return None;
     };
-    let ScalarSqlExpression::Literal(LiteralValue::Utf8(value)) = literal_expr else {
+    let ScalarSqlExpression::Literal(value) = literal_expr else {
         return None;
     };
-    Some((column.clone(), value.clone()))
+    Some((column.clone(), group_key_literal(value)))
+}
+
+fn group_key_literal(value: &LiteralValue) -> GroupKeyLiteral {
+    match value {
+        LiteralValue::Null => GroupKeyLiteral::Null,
+        LiteralValue::Boolean(value) => GroupKeyLiteral::Boolean(*value),
+        LiteralValue::Int64(value) => GroupKeyLiteral::Int64(*value),
+        LiteralValue::Float64(value) => GroupKeyLiteral::Float64(value.to_bits()),
+        LiteralValue::Utf8(value) => GroupKeyLiteral::Utf8(value.clone()),
+    }
 }
 
 #[derive(Clone)]
