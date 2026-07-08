@@ -17127,7 +17127,7 @@ fn q03_revenue_late_materialized_row_group_chunk() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(2)
+        .unwrap_or(8)
 }
 
 fn q03_revenue_late_materialized_max_selected_ratio() -> f64 {
@@ -17233,6 +17233,7 @@ fn q03_revenue_late_carry_build_selection_batch(
     if orderkeys.null_count() == 0 && shipdates.null_count() == 0 {
         let orderkey_values = orderkeys.values().as_ref();
         let shipdate_values = shipdates.values().as_ref();
+        let mut selected_offsets = Vec::new();
         for row in 0..orderkey_values.len() {
             let orderkey = orderkey_values[row];
             let selected_order = if shipdate_values[row] > state.ship_cutoff {
@@ -17240,11 +17241,12 @@ fn q03_revenue_late_carry_build_selection_batch(
             } else {
                 None
             };
-            selection.push(selected_order.is_some());
             if let Some(order) = selected_order {
+                selected_offsets.push(row);
                 state.selected_orders.push((orderkey, order));
             }
         }
+        selection.push_selected_offsets(orderkey_values.len(), selected_offsets);
         return Ok(Some(()));
     }
     for row in 0..orderkeys.len() {
@@ -17283,6 +17285,7 @@ fn q03_revenue_late_carry_build_selection_view(
             orderkeys.values_if_null_free(),
             shipdates.values_if_null_free(),
         ) {
+            let mut selected_offsets = Vec::new();
             for row in 0..orderkey_values.len() {
                 let orderkey = orderkey_values[row];
                 let selected_order = if shipdate_values[row] > state.ship_cutoff {
@@ -17290,11 +17293,12 @@ fn q03_revenue_late_carry_build_selection_view(
                 } else {
                     None
                 };
-                selection.push(selected_order.is_some());
                 if let Some(order) = selected_order {
+                    selected_offsets.push(row);
                     state.selected_orders.push((orderkey, order));
                 }
             }
+            selection.push_selected_offsets(orderkey_values.len(), selected_offsets);
             return Ok(Some(()));
         }
         for row in 0..orderkeys.len() {
@@ -17500,15 +17504,17 @@ fn q03_revenue_late_build_selection_batch(
     if orderkeys.null_count() == 0 && shipdates.null_count() == 0 {
         let orderkey_values = orderkeys.values().as_ref();
         let shipdate_values = shipdates.values().as_ref();
+        let mut selected_offsets = Vec::new();
         for row in 0..orderkey_values.len() {
             let orderkey = orderkey_values[row];
             let selected =
                 shipdate_values[row] > state.ship_cutoff && state.orders.contains_key(&orderkey);
-            selection.push(selected);
             if selected {
+                selected_offsets.push(row);
                 state.selected_orderkeys.push(orderkey);
             }
         }
+        selection.push_selected_offsets(orderkey_values.len(), selected_offsets);
         return Ok(Some(()));
     }
     for row in 0..orderkeys.len() {
@@ -17540,15 +17546,17 @@ fn q03_revenue_late_build_selection_view(
             orderkeys.values_if_null_free(),
             shipdates.values_if_null_free(),
         ) {
+            let mut selected_offsets = Vec::new();
             for row in 0..orderkey_values.len() {
                 let orderkey = orderkey_values[row];
                 let selected = shipdate_values[row] > state.ship_cutoff
                     && state.orders.contains_key(&orderkey);
-                selection.push(selected);
                 if selected {
+                    selected_offsets.push(row);
                     state.selected_orderkeys.push(orderkey);
                 }
             }
+            selection.push_selected_offsets(orderkey_values.len(), selected_offsets);
             return Ok(Some(()));
         }
         for row in 0..orderkeys.len() {
