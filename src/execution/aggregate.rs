@@ -1065,8 +1065,8 @@ fn collect_two_key_count_sum_groups(
         unreachable!("two-key count/sum fast path precondition");
     };
     let sum_expr = aggregates[1].clone();
-    let mut groups: AggregateHashMap<TwoKeyCountSumKey, TwoKeyCountSumGroup> =
-        AggregateHashMap::default();
+    let mut groups = Vec::new();
+    let mut group_index = TwoKeyCountSumIndex::Uninitialized;
     let mut metrics = AggregateMetrics {
         fragments,
         ..AggregateMetrics::default()
@@ -1095,41 +1095,21 @@ fn collect_two_key_count_sum_groups(
         let sum_column = batch.column(column_index(&batch, sum_column)?);
         let sum_input = CountSumValueInput::new(sum_column, &sum_expr)?;
 
+        group_index.ensure_shape(&key_reader)?;
         for row in 0..batch.num_rows() {
             let key = key_reader.key(row);
-            let group = groups
-                .entry(key.clone())
-                .or_insert_with(|| TwoKeyCountSumGroup::new(key.into_group_values(), &sum_input));
-            group.update(&sum_input, row);
+            let group_id = group_index.group_id(key, &mut groups, &sum_input)?;
+            groups[group_id].update(&sum_input, row);
         }
     }
 
     let mut group_results = groups
-        .into_values()
+        .into_iter()
         .map(|group| group.finish(sum_expr.clone()))
         .collect::<Vec<_>>();
     group_results.sort_by(|left, right| compare_group_keys(&left.keys, &right.keys));
     metrics.groups = group_results;
     Ok(metrics)
-}
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-enum TwoKeyCountSumKey {
-    IntUtf8(Option<i64>, Option<String>),
-    Utf8Int(Option<String>, Option<i64>),
-}
-
-impl TwoKeyCountSumKey {
-    fn into_group_values(self) -> Vec<GroupValue> {
-        match self {
-            Self::IntUtf8(first, second) => {
-                vec![GroupValue::Int64(first), GroupValue::Utf8(second)]
-            }
-            Self::Utf8Int(first, second) => {
-                vec![GroupValue::Utf8(first), GroupValue::Int64(second)]
-            }
-        }
-    }
 }
 
 enum TwoKeyCountSumReader<'a> {
@@ -1162,25 +1142,189 @@ impl<'a> TwoKeyCountSumReader<'a> {
         }
     }
 
-    fn key(&self, row: usize) -> TwoKeyCountSumKey {
+    fn shape(&self) -> TwoKeyCountSumShape {
         match self {
-            Self::Int32Utf8(first, second) => TwoKeyCountSumKey::IntUtf8(
+            Self::Int32Utf8(_, _) | Self::Int64Utf8(_, _) => TwoKeyCountSumShape::IntUtf8,
+            Self::Utf8Int32(_, _) | Self::Utf8Int64(_, _) => TwoKeyCountSumShape::Utf8Int,
+        }
+    }
+
+    fn key(&self, row: usize) -> TwoKeyCountSumBorrowedKey<'_> {
+        match self {
+            Self::Int32Utf8(first, second) => TwoKeyCountSumBorrowedKey::IntUtf8(
                 first.is_valid(row).then(|| i64::from(first.value(row))),
-                second.is_valid(row).then(|| second.value(row).to_string()),
+                second.is_valid(row).then(|| second.value(row)),
             ),
-            Self::Int64Utf8(first, second) => TwoKeyCountSumKey::IntUtf8(
+            Self::Int64Utf8(first, second) => TwoKeyCountSumBorrowedKey::IntUtf8(
                 first.is_valid(row).then(|| first.value(row)),
-                second.is_valid(row).then(|| second.value(row).to_string()),
+                second.is_valid(row).then(|| second.value(row)),
             ),
-            Self::Utf8Int32(first, second) => TwoKeyCountSumKey::Utf8Int(
-                first.is_valid(row).then(|| first.value(row).to_string()),
+            Self::Utf8Int32(first, second) => TwoKeyCountSumBorrowedKey::Utf8Int(
+                first.is_valid(row).then(|| first.value(row)),
                 second.is_valid(row).then(|| i64::from(second.value(row))),
             ),
-            Self::Utf8Int64(first, second) => TwoKeyCountSumKey::Utf8Int(
-                first.is_valid(row).then(|| first.value(row).to_string()),
+            Self::Utf8Int64(first, second) => TwoKeyCountSumBorrowedKey::Utf8Int(
+                first.is_valid(row).then(|| first.value(row)),
                 second.is_valid(row).then(|| second.value(row)),
             ),
         }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TwoKeyCountSumShape {
+    IntUtf8,
+    Utf8Int,
+}
+
+enum TwoKeyCountSumBorrowedKey<'a> {
+    IntUtf8(Option<i64>, Option<&'a str>),
+    Utf8Int(Option<&'a str>, Option<i64>),
+}
+
+enum TwoKeyCountSumIndex {
+    Uninitialized,
+    IntUtf8(AggregateHashMap<Option<i64>, Utf8SecondGroupIndex>),
+    Utf8Int {
+        first_groups: AggregateHashMap<String, IntSecondGroupIndex>,
+        null_first: IntSecondGroupIndex,
+    },
+}
+
+#[derive(Default)]
+struct Utf8SecondGroupIndex {
+    non_null: AggregateHashMap<String, usize>,
+    null_group: Option<usize>,
+}
+
+#[derive(Default)]
+struct IntSecondGroupIndex {
+    groups: AggregateHashMap<Option<i64>, usize>,
+}
+
+impl TwoKeyCountSumIndex {
+    fn ensure_shape(&mut self, reader: &TwoKeyCountSumReader<'_>) -> Result<()> {
+        let shape = reader.shape();
+        match (&self, shape) {
+            (Self::Uninitialized, TwoKeyCountSumShape::IntUtf8) => {
+                *self = Self::IntUtf8(AggregateHashMap::default());
+            }
+            (Self::Uninitialized, TwoKeyCountSumShape::Utf8Int) => {
+                *self = Self::Utf8Int {
+                    first_groups: AggregateHashMap::default(),
+                    null_first: IntSecondGroupIndex::default(),
+                };
+            }
+            (Self::IntUtf8(_), TwoKeyCountSumShape::IntUtf8)
+            | (Self::Utf8Int { .. }, TwoKeyCountSumShape::Utf8Int) => {}
+            _ => {
+                return Err(DodamError::TypeMismatch(
+                    "mixed two-key aggregate batches changed key type shape".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn group_id(
+        &mut self,
+        key: TwoKeyCountSumBorrowedKey<'_>,
+        groups: &mut Vec<TwoKeyCountSumGroup>,
+        sum_input: &CountSumValueInput<'_>,
+    ) -> Result<usize> {
+        match (self, key) {
+            (Self::IntUtf8(index), TwoKeyCountSumBorrowedKey::IntUtf8(first, second)) => {
+                let second_index = index.entry(first).or_default();
+                if let Some(group_id) = second_index.lookup(second) {
+                    return Ok(group_id);
+                }
+                let group_id = Self::push_group(
+                    groups,
+                    vec![
+                        GroupValue::Int64(first),
+                        GroupValue::Utf8(second.map(str::to_string)),
+                    ],
+                    sum_input,
+                );
+                second_index.insert(second, group_id);
+                Ok(group_id)
+            }
+            (
+                Self::Utf8Int {
+                    first_groups,
+                    null_first,
+                },
+                TwoKeyCountSumBorrowedKey::Utf8Int(first, second),
+            ) => {
+                let second_index = match first {
+                    Some(first) => {
+                        if !first_groups.contains_key(first) {
+                            first_groups.insert(first.to_string(), IntSecondGroupIndex::default());
+                        }
+                        first_groups
+                            .get_mut(first)
+                            .expect("inserted utf8 first-key group")
+                    }
+                    None => null_first,
+                };
+                if let Some(group_id) = second_index.lookup(second) {
+                    return Ok(group_id);
+                }
+                let group_id = Self::push_group(
+                    groups,
+                    vec![
+                        GroupValue::Utf8(first.map(str::to_string)),
+                        GroupValue::Int64(second),
+                    ],
+                    sum_input,
+                );
+                second_index.insert(second, group_id);
+                Ok(group_id)
+            }
+            _ => Err(DodamError::TypeMismatch(
+                "mixed two-key aggregate key shape mismatch".to_string(),
+            )),
+        }
+    }
+
+    fn push_group(
+        groups: &mut Vec<TwoKeyCountSumGroup>,
+        keys: Vec<GroupValue>,
+        sum_input: &CountSumValueInput<'_>,
+    ) -> usize {
+        let group_id = groups.len();
+        groups.push(TwoKeyCountSumGroup::new(keys, sum_input));
+        group_id
+    }
+}
+
+impl Utf8SecondGroupIndex {
+    fn lookup(&self, value: Option<&str>) -> Option<usize> {
+        match value {
+            Some(value) => self.non_null.get(value).copied(),
+            None => self.null_group,
+        }
+    }
+
+    fn insert(&mut self, value: Option<&str>, group_id: usize) {
+        match value {
+            Some(value) => {
+                self.non_null.insert(value.to_string(), group_id);
+            }
+            None => {
+                self.null_group = Some(group_id);
+            }
+        }
+    }
+}
+
+impl IntSecondGroupIndex {
+    fn lookup(&self, value: Option<i64>) -> Option<usize> {
+        self.groups.get(&value).copied()
+    }
+
+    fn insert(&mut self, value: Option<i64>, group_id: usize) {
+        self.groups.insert(value, group_id);
     }
 }
 

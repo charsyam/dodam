@@ -40312,6 +40312,9 @@ fn evaluate_scalar_expression(
             cast_evaluated_scalar(value, target)
         }
         ScalarSqlExpression::Coalesce(values) => {
+            if let Some(value) = evaluate_utf8_column_literal_coalesce(batch, values)? {
+                return Ok(value);
+            }
             let mut evaluated = values
                 .iter()
                 .map(|expr| evaluate_scalar_expression(batch, expr))
@@ -40396,6 +40399,70 @@ fn evaluate_scalar_expression(
             else_result,
         } => evaluate_case_expression(batch, conditions, results, else_result.as_deref()),
     }
+}
+
+fn evaluate_utf8_column_literal_coalesce(
+    batch: &RecordBatch,
+    values: &[ScalarSqlExpression],
+) -> Result<Option<EvaluatedScalar>> {
+    let [left, right] = values else {
+        return Ok(None);
+    };
+    if let Some(value) = utf8_column_literal_coalesce(batch, left, right, false)? {
+        return Ok(Some(value));
+    }
+    utf8_column_literal_coalesce(batch, right, left, true)
+}
+
+fn utf8_column_literal_coalesce(
+    batch: &RecordBatch,
+    column_expr: &ScalarSqlExpression,
+    literal_expr: &ScalarSqlExpression,
+    literal_first: bool,
+) -> Result<Option<EvaluatedScalar>> {
+    let ScalarSqlExpression::Column(column) = column_expr else {
+        return Ok(None);
+    };
+    let literal = match literal_expr {
+        ScalarSqlExpression::Literal(LiteralValue::Utf8(value)) => Some(value.as_str()),
+        ScalarSqlExpression::Literal(LiteralValue::Null) => None,
+        _ => return Ok(None),
+    };
+    let column_index = output_batch_column_index(batch, column)?;
+    let array = batch.column(column_index);
+    if !matches!(array.data_type(), DataType::Utf8) {
+        return Ok(None);
+    }
+    let values = array.as_any().downcast_ref::<StringArray>().expect("Utf8");
+    if literal_first {
+        if let Some(literal) = literal {
+            return Ok(Some(EvaluatedScalar::Utf8(vec![
+                Some(literal.to_string());
+                batch.num_rows()
+            ])));
+        }
+        return Ok(Some(EvaluatedScalar::Utf8(utf8_array_to_scalar(values))));
+    }
+    if values.null_count() == 0 {
+        return Ok(Some(EvaluatedScalar::Utf8(utf8_array_to_scalar(values))));
+    }
+    let output = (0..values.len())
+        .map(|row| {
+            if values.is_valid(row) {
+                Some(values.value(row).to_string())
+            } else {
+                literal.map(str::to_string)
+            }
+        })
+        .collect();
+    Ok(Some(EvaluatedScalar::Utf8(output)))
+}
+
+fn utf8_array_to_scalar(values: &StringArray) -> Vec<Option<String>> {
+    values
+        .iter()
+        .map(|value| value.map(str::to_string))
+        .collect()
 }
 
 struct DecimalScalarColumn<'a> {
