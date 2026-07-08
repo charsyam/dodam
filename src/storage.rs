@@ -1275,6 +1275,10 @@ pub(crate) struct DirectPrimitiveColumnScanMetrics {
     pub read_nanos: u64,
     pub consume_nanos: u64,
     pub column_read_nanos: Vec<u64>,
+    pub selected_rows: usize,
+    pub selected_runs: usize,
+    pub full_payload_batches: usize,
+    pub selected_payload_batches: usize,
 }
 
 pub(crate) type DirectI64I32I32ScanMetrics = DirectPrimitiveColumnScanMetrics;
@@ -1680,26 +1684,61 @@ where
                 &mut selected_decimals,
                 &mut selected_dates,
             );
-            let key_started = Instant::now();
-            if !read_i32_selected_runs(
-                &mut key_reader,
+            metrics.selected_rows = metrics
+                .selected_rows
+                .saturating_add(selected_decimals.len());
+            metrics.selected_runs = metrics.selected_runs.saturating_add(selected_runs.len());
+            let use_selected_payload = direct_selection_payload_gate(
                 records,
-                &selected_runs,
-                &mut selected_keys,
-            )? {
-                metrics.add_read_nanos(elapsed_nanos(read_started));
-                return Ok(None);
+                selected_decimals.len(),
+                selected_runs.len(),
+            );
+            let key_started = Instant::now();
+            if use_selected_payload {
+                if !read_i32_selected_runs(
+                    &mut key_reader,
+                    records,
+                    &selected_runs,
+                    &mut selected_keys,
+                )? {
+                    metrics.add_read_nanos(elapsed_nanos(read_started));
+                    return Ok(None);
+                }
+            } else {
+                let (key_records, key_value_count, key_level_count) =
+                    key_reader.read_records(records, None, None, &mut selected_keys)?;
+                if key_records != records
+                    || key_value_count != records
+                    || !direct_def_levels_match(key_level_count, records, true)
+                {
+                    metrics.add_read_nanos(elapsed_nanos(read_started));
+                    return Ok(None);
+                }
             }
             metrics.add_column_read_nanos(0, elapsed_nanos(key_started));
             let sum_started = Instant::now();
-            if !read_i64_selected_runs(
-                &mut sum_reader,
-                records,
-                &selected_runs,
-                &mut selected_sums,
-            )? {
-                metrics.add_read_nanos(elapsed_nanos(read_started));
-                return Ok(None);
+            if use_selected_payload {
+                if !read_i64_selected_runs(
+                    &mut sum_reader,
+                    records,
+                    &selected_runs,
+                    &mut selected_sums,
+                )? {
+                    metrics.add_read_nanos(elapsed_nanos(read_started));
+                    return Ok(None);
+                }
+                metrics.selected_payload_batches += 1;
+            } else {
+                let (sum_records, sum_value_count, sum_level_count) =
+                    sum_reader.read_records(records, None, None, &mut selected_sums)?;
+                if sum_records != records
+                    || sum_value_count != records
+                    || !direct_def_levels_match(sum_level_count, records, true)
+                {
+                    metrics.add_read_nanos(elapsed_nanos(read_started));
+                    return Ok(None);
+                }
+                metrics.full_payload_batches += 1;
             }
             metrics.add_column_read_nanos(1, elapsed_nanos(sum_started));
             metrics.add_read_nanos(elapsed_nanos(read_started));
@@ -1709,15 +1748,25 @@ where
                 continue;
             }
             let consume_started = Instant::now();
+            let decimal_view = if use_selected_payload {
+                selected_decimals.as_slice()
+            } else {
+                decimal_values.as_slice()
+            };
+            let date_view = if use_selected_payload {
+                selected_dates.as_slice()
+            } else {
+                date_values.as_slice()
+            };
             let views = [
                 RawColumnView::I32(&selected_keys),
                 RawColumnView::I64(&selected_sums),
                 RawColumnView::Decimal128I64 {
-                    values: &selected_decimals,
+                    values: decimal_view,
                     precision: decimal_precision,
                     scale: decimal_scale,
                 },
-                RawColumnView::Date32(&selected_dates),
+                RawColumnView::Date32(date_view),
             ];
             consume(&views)?;
             metrics.add_consume_nanos(elapsed_nanos(consume_started));
@@ -2068,6 +2117,27 @@ fn read_i64_selected_runs(
         return Ok(false);
     }
     Ok(true)
+}
+
+fn direct_selection_payload_gate(
+    records: usize,
+    selected_rows: usize,
+    selected_runs: usize,
+) -> bool {
+    if records == 0 || selected_rows == 0 {
+        return false;
+    }
+    let max_ratio = std::env::var("DODAM_DIRECT_SELECTION_MAX_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.20);
+    let min_run_len = std::env::var("DODAM_DIRECT_SELECTION_MIN_RUN_LEN")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(32);
+    let selected_ratio = selected_rows as f64 / records as f64;
+    let average_run_len = selected_rows / selected_runs.max(1);
+    selected_ratio <= max_ratio && average_run_len >= min_run_len
 }
 
 fn direct_def_levels_match(level_count: usize, record_count: usize, required: bool) -> bool {

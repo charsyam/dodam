@@ -79,6 +79,21 @@ pub struct LocalExecutionGraphOutput {
     pub stage_metrics: Vec<LocalStageExecutionMetrics>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectPrimitiveKeyType {
+    I32,
+    I64,
+}
+
+impl DirectPrimitiveKeyType {
+    fn column_type(self) -> DirectPrimitiveColumnType {
+        match self {
+            Self::I32 => DirectPrimitiveColumnType::I32,
+            Self::I64 => DirectPrimitiveColumnType::I64,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct OwnedDirectPrimitiveColumnSpec {
     name: String,
@@ -94,6 +109,30 @@ impl OwnedDirectPrimitiveColumnSpec {
                 column_type: column.column_type,
             })
             .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DirectPrimitiveFoldPlan {
+    path: PathBuf,
+    batch_size: usize,
+    row_groups: Vec<usize>,
+    columns: Vec<OwnedDirectPrimitiveColumnSpec>,
+}
+
+impl DirectPrimitiveFoldPlan {
+    fn new(
+        path: impl Into<PathBuf>,
+        batch_size: usize,
+        row_groups: Vec<usize>,
+        columns: Vec<OwnedDirectPrimitiveColumnSpec>,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            batch_size,
+            row_groups,
+            columns,
+        }
     }
 }
 
@@ -788,10 +827,7 @@ impl DodamEngine {
 
     fn scan_parquet_primitive_columns_parallel_fold<S, Init, Consume, Merge>(
         &self,
-        path: impl AsRef<Path>,
-        batch_size: usize,
-        row_groups: &[usize],
-        columns: Vec<OwnedDirectPrimitiveColumnSpec>,
+        plan: DirectPrimitiveFoldPlan,
         init: Init,
         consume: Consume,
         merge: Merge,
@@ -802,40 +838,39 @@ impl DodamEngine {
         Consume: for<'a> Fn(&mut S, BatchView<'a>) -> Result<()> + Sync,
         Merge: Fn(&mut S, S) -> Result<()> + Sync,
     {
-        let path = path.as_ref();
         let mut state = init();
         let mut scan_metrics = DirectPrimitiveColumnScanMetrics::default();
-        if row_groups.is_empty() {
+        if plan.row_groups.is_empty() {
             return Ok(Some((state, scan_metrics)));
         }
-        if row_groups.len() <= 1 {
-            let specs = OwnedDirectPrimitiveColumnSpec::borrowed_specs(&columns);
+        if plan.row_groups.len() <= 1 {
+            let specs = OwnedDirectPrimitiveColumnSpec::borrowed_specs(&plan.columns);
             let Some(metrics) = self.scan_parquet_primitive_columns_view(
-                path,
-                batch_size,
-                row_groups,
+                &plan.path,
+                plan.batch_size,
+                &plan.row_groups,
                 &specs,
                 |batch| consume(&mut state, batch),
             )?
             else {
                 return Ok(None);
             };
-            log_direct_primitive_fold_profile(path, &columns, &metrics);
+            log_direct_primitive_fold_profile(&plan.path, &plan.columns, &metrics);
             return Ok(Some((state, metrics)));
         }
 
         let workers = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(4)
-            .min(row_groups.len());
-        let chunk_size = row_groups.len().div_ceil(workers).max(1);
+            .min(plan.row_groups.len());
+        let chunk_size = plan.row_groups.len().div_ceil(workers).max(1);
         let (sender, receiver) = mpsc::channel();
         std::thread::scope(|scope| {
-            for row_group_chunk in row_groups.chunks(chunk_size) {
+            for row_group_chunk in plan.row_groups.chunks(chunk_size) {
                 let sender = sender.clone();
                 let engine = self.clone();
-                let path = path.to_path_buf();
-                let columns = columns.clone();
+                let path = plan.path.clone();
+                let columns = plan.columns.clone();
                 let row_groups = row_group_chunk.to_vec();
                 let init = &init;
                 let consume = &consume;
@@ -844,7 +879,7 @@ impl DodamEngine {
                     let mut state = init();
                     let result = engine.scan_parquet_primitive_columns_view(
                         &path,
-                        batch_size,
+                        plan.batch_size,
                         &row_groups,
                         &specs,
                         |batch| consume(&mut state, batch),
@@ -868,6 +903,18 @@ impl DodamEngine {
             scan_metrics.consume_nanos = scan_metrics
                 .consume_nanos
                 .saturating_add(metrics.consume_nanos);
+            scan_metrics.selected_rows = scan_metrics
+                .selected_rows
+                .saturating_add(metrics.selected_rows);
+            scan_metrics.selected_runs = scan_metrics
+                .selected_runs
+                .saturating_add(metrics.selected_runs);
+            scan_metrics.full_payload_batches = scan_metrics
+                .full_payload_batches
+                .saturating_add(metrics.full_payload_batches);
+            scan_metrics.selected_payload_batches = scan_metrics
+                .selected_payload_batches
+                .saturating_add(metrics.selected_payload_batches);
             if scan_metrics.column_read_nanos.len() < metrics.column_read_nanos.len() {
                 scan_metrics
                     .column_read_nanos
@@ -878,7 +925,7 @@ impl DodamEngine {
                     scan_metrics.column_read_nanos[index].saturating_add(*nanos);
             }
         }
-        log_direct_primitive_fold_profile(path, &columns, &scan_metrics);
+        log_direct_primitive_fold_profile(&plan.path, &plan.columns, &scan_metrics);
         Ok(Some((state, scan_metrics)))
     }
 
@@ -959,6 +1006,18 @@ impl DodamEngine {
             scan_metrics.consume_nanos = scan_metrics
                 .consume_nanos
                 .saturating_add(metrics.consume_nanos);
+            scan_metrics.selected_rows = scan_metrics
+                .selected_rows
+                .saturating_add(metrics.selected_rows);
+            scan_metrics.selected_runs = scan_metrics
+                .selected_runs
+                .saturating_add(metrics.selected_runs);
+            scan_metrics.full_payload_batches = scan_metrics
+                .full_payload_batches
+                .saturating_add(metrics.full_payload_batches);
+            scan_metrics.selected_payload_batches = scan_metrics
+                .selected_payload_batches
+                .saturating_add(metrics.selected_payload_batches);
             if scan_metrics.column_read_nanos.len() < metrics.column_read_nanos.len() {
                 scan_metrics
                     .column_read_nanos
@@ -4299,7 +4358,7 @@ impl DodamEngine {
         let columns = vec![
             OwnedDirectPrimitiveColumnSpec {
                 name: shape.key_column.clone(),
-                column_type: DirectPrimitiveColumnType::I32,
+                column_type: shape.key_type.column_type(),
             },
             OwnedDirectPrimitiveColumnSpec {
                 name: shape.sum_column.clone(),
@@ -4317,7 +4376,9 @@ impl DodamEngine {
                 column_type: DirectPrimitiveColumnType::Date32,
             },
         ];
-        let scan_result = if direct_selection_fold_enabled() {
+        let scan_result = if direct_selection_fold_enabled()
+            && matches!(shape.key_type, DirectPrimitiveKeyType::I32)
+        {
             self.scan_parquet_i32_i64_decimal_i32_selected_fold(
                 &local_path,
                 batch_size,
@@ -4332,7 +4393,7 @@ impl DodamEngine {
                 shape.decimal_scale,
                 shape.filter,
                 || {
-                    SingleKeyCountSumMinMaxVectorState::new(
+                    SingleKeyCountSumMinMaxVectorState::new_i32(
                         aggregates.to_vec(),
                         shape.decimal_precision,
                         shape.decimal_scale,
@@ -4348,18 +4409,32 @@ impl DodamEngine {
             result
         } else {
             let Some(result) = self.scan_parquet_primitive_columns_parallel_fold(
-                &local_path,
-                batch_size,
-                &row_groups,
-                columns,
-                || {
-                    SingleKeyCountSumMinMaxVectorState::new(
+                DirectPrimitiveFoldPlan::new(
+                    local_path.clone(),
+                    batch_size,
+                    row_groups.clone(),
+                    columns,
+                ),
+                || match shape.key_type {
+                    DirectPrimitiveKeyType::I32 => SingleKeyCountSumMinMaxVectorState::new_i32(
                         aggregates.to_vec(),
                         shape.decimal_precision,
                         shape.decimal_scale,
-                    )
+                    ),
+                    DirectPrimitiveKeyType::I64 => SingleKeyCountSumMinMaxVectorState::new_i64(
+                        aggregates.to_vec(),
+                        shape.decimal_precision,
+                        shape.decimal_scale,
+                    ),
                 },
-                |state, batch| state.consume_i32_i64_decimal_date_batch(batch, &shape.filter),
+                |state, batch| match shape.key_type {
+                    DirectPrimitiveKeyType::I32 => {
+                        state.consume_i32_i64_decimal_date_batch(batch, &shape.filter)
+                    }
+                    DirectPrimitiveKeyType::I64 => {
+                        state.consume_i64_i64_decimal_date_batch(batch, &shape.filter)
+                    }
+                },
                 |state, partial| state.merge(partial),
             )?
             else {
@@ -4387,7 +4462,7 @@ impl DodamEngine {
         aggregates: &[AggregateExpr],
         group_by: &[String],
     ) -> Result<Option<AggregateMetrics>> {
-        let Some(shape) = DirectCountSumShape::try_new(aggregates, group_by) else {
+        let Some(shape) = DirectCountSumShape::try_new(aggregates, group_by, self, &path)? else {
             return Ok(None);
         };
         let source = self.plan_table_source(path.clone()).await?;
@@ -4417,7 +4492,7 @@ impl DodamEngine {
         let columns = vec![
             OwnedDirectPrimitiveColumnSpec {
                 name: shape.key_column.clone(),
-                column_type: DirectPrimitiveColumnType::I32,
+                column_type: shape.key_type.column_type(),
             },
             OwnedDirectPrimitiveColumnSpec {
                 name: shape.sum_column.clone(),
@@ -4426,12 +4501,24 @@ impl DodamEngine {
         ];
         let started = Instant::now();
         let Some((state, scan_metrics)) = self.scan_parquet_primitive_columns_parallel_fold(
-            &local_path,
-            batch_size,
-            &row_groups,
-            columns,
-            || SingleKeyCountSumVectorState::new(aggregates[1].clone()),
-            |state, batch| state.consume_i32_i64_batch(batch),
+            DirectPrimitiveFoldPlan::new(
+                local_path.clone(),
+                batch_size,
+                row_groups.clone(),
+                columns,
+            ),
+            || match shape.key_type {
+                DirectPrimitiveKeyType::I32 => {
+                    SingleKeyCountSumVectorState::new_i32(aggregates[1].clone())
+                }
+                DirectPrimitiveKeyType::I64 => {
+                    SingleKeyCountSumVectorState::new_i64(aggregates[1].clone())
+                }
+            },
+            |state, batch| match shape.key_type {
+                DirectPrimitiveKeyType::I32 => state.consume_i32_i64_batch(batch),
+                DirectPrimitiveKeyType::I64 => state.consume_i64_i64_batch(batch),
+            },
             |state, partial| state.merge(partial),
         )?
         else {
@@ -4462,6 +4549,27 @@ impl DodamEngine {
         };
         match field.data_type() {
             DataType::Decimal128(precision, scale) => Ok(Some((*precision, *scale))),
+            _ => Ok(None),
+        }
+    }
+
+    fn parquet_primitive_key_type(
+        &self,
+        path: impl AsRef<Path>,
+        column: &str,
+    ) -> Result<Option<DirectPrimitiveKeyType>> {
+        let path = path.as_ref();
+        let file = self.object_store.open(path)?;
+        let metadata = self
+            .metadata_cache
+            .get_with_store(path, self.object_store.as_ref())?;
+        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata);
+        let Ok(field) = builder.schema().field_with_name(column) else {
+            return Ok(None);
+        };
+        match field.data_type() {
+            DataType::Int32 => Ok(Some(DirectPrimitiveKeyType::I32)),
+            DataType::Int64 => Ok(Some(DirectPrimitiveKeyType::I64)),
             _ => Ok(None),
         }
     }
@@ -4860,14 +4968,24 @@ fn log_direct_primitive_fold_profile(
         .map(|(index, nanos)| format!("{index}:{:.3}", nanos_to_millis(*nanos)))
         .collect::<Vec<_>>()
         .join(",");
+    let selected_ratio = if metrics.rows == 0 {
+        0.0
+    } else {
+        metrics.selected_rows as f64 / metrics.rows as f64
+    };
     eprintln!(
-        "[dodam:direct-primitive-profile] {table}[{columns}]: row_groups={} rows={} batches={} read={:.3} ms consume={:.3} ms column_read=[{}]",
+        "[dodam:direct-primitive-profile] {table}[{columns}]: row_groups={} rows={} batches={} read={:.3} ms consume={:.3} ms column_read=[{}] selected_rows={} selected_ratio={:.3} selected_runs={} selected_batches={} full_batches={}",
         metrics.row_groups,
         metrics.rows,
         metrics.batches,
         nanos_to_millis(metrics.read_nanos),
         nanos_to_millis(metrics.consume_nanos),
         column_read,
+        metrics.selected_rows,
+        selected_ratio,
+        metrics.selected_runs,
+        metrics.selected_payload_batches,
+        metrics.full_payload_batches,
     );
 }
 
@@ -5011,24 +5129,34 @@ fn average_nanos_millis(nanos: u64, count: usize) -> f64 {
 #[derive(Debug, Clone)]
 struct DirectCountSumShape {
     key_column: String,
+    key_type: DirectPrimitiveKeyType,
     sum_column: String,
 }
 
 impl DirectCountSumShape {
-    fn try_new(aggregates: &[AggregateExpr], group_by: &[String]) -> Option<Self> {
+    fn try_new(
+        aggregates: &[AggregateExpr],
+        group_by: &[String],
+        engine: &DodamEngine,
+        path: &Path,
+    ) -> Result<Option<Self>> {
         let [key_column] = group_by else {
-            return None;
+            return Ok(None);
         };
         let [AggregateExpr::CountStar, AggregateExpr::Sum(sum_column)] = aggregates else {
-            return None;
+            return Ok(None);
         };
         if sum_column == key_column {
-            return None;
+            return Ok(None);
         }
-        Some(Self {
+        let Some(key_type) = engine.parquet_primitive_key_type(path, key_column)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
             key_column: key_column.clone(),
+            key_type,
             sum_column: sum_column.clone(),
-        })
+        }))
     }
 
     fn projection_columns(&self) -> Vec<String> {
@@ -5043,6 +5171,7 @@ impl DirectCountSumShape {
 #[derive(Debug, Clone)]
 struct DirectCountSumMinMaxShape {
     key_column: String,
+    key_type: DirectPrimitiveKeyType,
     sum_column: String,
     min_decimal_column: String,
     max_date_column: String,
@@ -5076,6 +5205,9 @@ impl DirectCountSumMinMaxShape {
         else {
             return Ok(None);
         };
+        let Some(key_type) = engine.parquet_primitive_key_type(path, key_column)? else {
+            return Ok(None);
+        };
         let Some(filter) = DecimalDateRangeFilter::try_new(
             filter.expr(),
             min_decimal_column,
@@ -5087,6 +5219,7 @@ impl DirectCountSumMinMaxShape {
         };
         Ok(Some(Self {
             key_column: key_column.clone(),
+            key_type,
             sum_column: sum_column.clone(),
             min_decimal_column: min_decimal_column.clone(),
             max_date_column: max_date_column.clone(),

@@ -1328,11 +1328,22 @@ pub(crate) struct SingleKeyCountSumVectorState {
 }
 
 impl SingleKeyCountSumVectorState {
-    pub(crate) fn new(sum_expr: AggregateExpr) -> Self {
+    pub(crate) fn new_i32(sum_expr: AggregateExpr) -> Self {
         Self {
             sum_expr,
             group_index: CountSumGroupIndex::Int32 {
                 groups: DenseI32GroupIndex::default(),
+                null_group: None,
+            },
+            groups: Vec::new(),
+        }
+    }
+
+    pub(crate) fn new_i64(sum_expr: AggregateExpr) -> Self {
+        Self {
+            sum_expr,
+            group_index: CountSumGroupIndex::Int64 {
+                groups: AdaptiveCopyGroupIndex::default(),
                 null_group: None,
             },
             groups: Vec::new(),
@@ -1380,28 +1391,87 @@ impl SingleKeyCountSumVectorState {
         Ok(())
     }
 
-    pub(crate) fn merge(&mut self, partial: Self) -> Result<()> {
-        let CountSumGroupIndex::Int32 { groups: index, .. } = &mut self.group_index else {
-            unreachable!("vector count/sum state uses Int32 group index")
+    pub(crate) fn consume_i64_i64_batch(&mut self, batch: BatchView<'_>) -> Result<()> {
+        let key_values = batch.i64_vector(0).ok_or_else(|| {
+            DodamError::UnsupportedSql(
+                "direct primitive count/sum projected key is not Int64".to_string(),
+            )
+        })?;
+        let sum_values = batch.i64_vector(1).ok_or_else(|| {
+            DodamError::UnsupportedSql(
+                "direct primitive count/sum projected sum input is not Int64".to_string(),
+            )
+        })?;
+        let Some(keys) = key_values.values_if_null_free() else {
+            return Err(DodamError::UnsupportedSql(
+                "direct primitive count/sum requires non-null key".to_string(),
+            ));
         };
-        for partial_group in partial.groups {
-            let GroupValue::Int64(Some(key)) = partial_group.key else {
-                return Err(DodamError::UnsupportedSql(
-                    "direct primitive count/sum partial key shape mismatch".to_string(),
-                ));
-            };
-            let key = i32::try_from(key).map_err(|_| {
-                DodamError::UnsupportedSql(
-                    "direct primitive count/sum partial key out of Int32 range".to_string(),
-                )
-            })?;
-            let group_id = count_sum_group_id_for_i32(
+        let Some(sums) = sum_values.values_if_null_free() else {
+            return Err(DodamError::UnsupportedSql(
+                "direct primitive count/sum requires non-null sum input".to_string(),
+            ));
+        };
+        if keys.len() != sums.len() {
+            return Err(DodamError::UnsupportedSql(
+                "direct primitive count/sum column length mismatch".to_string(),
+            ));
+        }
+        let CountSumGroupIndex::Int64 { groups: index, .. } = &mut self.group_index else {
+            unreachable!("vector count/sum state uses Int64 group index")
+        };
+        for row in 0..keys.len() {
+            let group_id = count_sum_group_id_for_i64(
                 index,
-                key,
+                keys[row],
                 &mut self.groups,
                 &CountSumValueInput::Int64Raw,
             );
-            self.groups[group_id].merge_group(partial_group);
+            self.groups[group_id].update_raw_i64_non_null(sums[row]);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn merge(&mut self, partial: Self) -> Result<()> {
+        match &mut self.group_index {
+            CountSumGroupIndex::Int32 { groups: index, .. } => {
+                for partial_group in partial.groups {
+                    let GroupValue::Int64(Some(key)) = partial_group.key else {
+                        return Err(DodamError::UnsupportedSql(
+                            "direct primitive count/sum partial key shape mismatch".to_string(),
+                        ));
+                    };
+                    let key = i32::try_from(key).map_err(|_| {
+                        DodamError::UnsupportedSql(
+                            "direct primitive count/sum partial key out of Int32 range".to_string(),
+                        )
+                    })?;
+                    let group_id = count_sum_group_id_for_i32(
+                        index,
+                        key,
+                        &mut self.groups,
+                        &CountSumValueInput::Int64Raw,
+                    );
+                    self.groups[group_id].merge_group(partial_group);
+                }
+            }
+            CountSumGroupIndex::Int64 { groups: index, .. } => {
+                for partial_group in partial.groups {
+                    let GroupValue::Int64(Some(key)) = partial_group.key else {
+                        return Err(DodamError::UnsupportedSql(
+                            "direct primitive count/sum partial key shape mismatch".to_string(),
+                        ));
+                    };
+                    let group_id = count_sum_group_id_for_i64(
+                        index,
+                        key,
+                        &mut self.groups,
+                        &CountSumValueInput::Int64Raw,
+                    );
+                    self.groups[group_id].merge_group(partial_group);
+                }
+            }
+            _ => unreachable!("vector count/sum state uses primitive numeric group index"),
         }
         Ok(())
     }
@@ -1640,7 +1710,7 @@ pub(crate) struct SingleKeyCountSumMinMaxVectorState {
 }
 
 impl SingleKeyCountSumMinMaxVectorState {
-    pub(crate) fn new(
+    pub(crate) fn new_i32(
         aggregates: Vec<AggregateExpr>,
         decimal_precision: u8,
         decimal_scale: i8,
@@ -1651,6 +1721,23 @@ impl SingleKeyCountSumMinMaxVectorState {
             decimal_scale,
             group_index: SingleKeyCountSumMinMaxIndex::Int32 {
                 groups: DenseI32GroupIndex::default(),
+                null_group: None,
+            },
+            groups: Vec::new(),
+        }
+    }
+
+    pub(crate) fn new_i64(
+        aggregates: Vec<AggregateExpr>,
+        decimal_precision: u8,
+        decimal_scale: i8,
+    ) -> Self {
+        Self {
+            aggregates,
+            decimal_precision,
+            decimal_scale,
+            group_index: SingleKeyCountSumMinMaxIndex::Int64 {
+                groups: AdaptiveCopyGroupIndex::default(),
                 null_group: None,
             },
             groups: Vec::new(),
@@ -1750,30 +1837,141 @@ impl SingleKeyCountSumMinMaxVectorState {
         Ok(())
     }
 
-    pub(crate) fn merge(&mut self, partial: Self) -> Result<()> {
-        let SingleKeyCountSumMinMaxIndex::Int32 { groups: index, .. } = &mut self.group_index
-        else {
-            unreachable!("vector state uses Int32 group index")
+    pub(crate) fn consume_i64_i64_decimal_date_batch(
+        &mut self,
+        batch: BatchView<'_>,
+        filter: &DecimalDateRangeFilter,
+    ) -> Result<()> {
+        let key_values = batch.i64_vector(0).ok_or_else(|| {
+            DodamError::UnsupportedSql(
+                "direct primitive aggregate projected key is not Int64".to_string(),
+            )
+        })?;
+        let sum_values = batch.i64_vector(1).ok_or_else(|| {
+            DodamError::UnsupportedSql(
+                "direct primitive aggregate projected sum input is not Int64".to_string(),
+            )
+        })?;
+        let decimal_values = batch.decimal128_vector(2).ok_or_else(|| {
+            DodamError::UnsupportedSql(
+                "direct primitive aggregate projected min input is not Decimal128".to_string(),
+            )
+        })?;
+        let date_values = batch.date32_vector(3).ok_or_else(|| {
+            DodamError::UnsupportedSql(
+                "direct primitive aggregate projected max input is not Date32".to_string(),
+            )
+        })?;
+        let Some(keys) = key_values.values_if_null_free() else {
+            return Err(DodamError::UnsupportedSql(
+                "direct primitive aggregate requires non-null key".to_string(),
+            ));
         };
-        for partial_group in partial.groups {
-            let GroupValue::Int64(Some(key)) = partial_group.key else {
+        let Some(sums) = sum_values.values_if_null_free() else {
+            return Err(DodamError::UnsupportedSql(
+                "direct primitive aggregate requires non-null sum input".to_string(),
+            ));
+        };
+        let Some(dates) = date_values.values_if_null_free() else {
+            return Err(DodamError::UnsupportedSql(
+                "direct primitive aggregate requires non-null date input".to_string(),
+            ));
+        };
+        let SingleKeyCountSumMinMaxIndex::Int64 { groups: index, .. } = &mut self.group_index
+        else {
+            unreachable!("vector state uses Int64 group index")
+        };
+        if let Some(decimals) = decimal_values.raw_i64_values() {
+            if keys.len() != sums.len() || keys.len() != decimals.len() || keys.len() != dates.len()
+            {
                 return Err(DodamError::UnsupportedSql(
-                    "direct primitive aggregate partial key shape mismatch".to_string(),
+                    "direct primitive aggregate column length mismatch".to_string(),
                 ));
-            };
-            let key = i32::try_from(key).map_err(|_| {
-                DodamError::UnsupportedSql(
-                    "direct primitive aggregate partial key out of Int32 range".to_string(),
-                )
-            })?;
-            let group_id = count_sum_min_max_group_id_for_i32(
-                index,
-                key,
-                &mut self.groups,
-                self.decimal_precision,
-                self.decimal_scale,
-            );
-            self.groups[group_id].merge_group(partial_group);
+            }
+            for row in 0..keys.len() {
+                let decimal = decimals[row];
+                let date = dates[row];
+                if !filter.matches_i64(decimal, date) {
+                    continue;
+                }
+                let group_id = count_sum_min_max_group_id_for_i64(
+                    index,
+                    keys[row],
+                    &mut self.groups,
+                    self.decimal_precision,
+                    self.decimal_scale,
+                );
+                self.groups[group_id].update_raw_non_null(sums[row], i128::from(decimal), date);
+            }
+        } else {
+            let decimals = decimal_values.raw_values();
+            if keys.len() != sums.len() || keys.len() != decimals.len() || keys.len() != dates.len()
+            {
+                return Err(DodamError::UnsupportedSql(
+                    "direct primitive aggregate column length mismatch".to_string(),
+                ));
+            }
+            for row in 0..keys.len() {
+                let decimal = decimals[row];
+                let date = dates[row];
+                if !filter.matches(decimal, date) {
+                    continue;
+                }
+                let group_id = count_sum_min_max_group_id_for_i64(
+                    index,
+                    keys[row],
+                    &mut self.groups,
+                    self.decimal_precision,
+                    self.decimal_scale,
+                );
+                self.groups[group_id].update_raw_non_null(sums[row], decimal, date);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn merge(&mut self, partial: Self) -> Result<()> {
+        match &mut self.group_index {
+            SingleKeyCountSumMinMaxIndex::Int32 { groups: index, .. } => {
+                for partial_group in partial.groups {
+                    let GroupValue::Int64(Some(key)) = partial_group.key else {
+                        return Err(DodamError::UnsupportedSql(
+                            "direct primitive aggregate partial key shape mismatch".to_string(),
+                        ));
+                    };
+                    let key = i32::try_from(key).map_err(|_| {
+                        DodamError::UnsupportedSql(
+                            "direct primitive aggregate partial key out of Int32 range".to_string(),
+                        )
+                    })?;
+                    let group_id = count_sum_min_max_group_id_for_i32(
+                        index,
+                        key,
+                        &mut self.groups,
+                        self.decimal_precision,
+                        self.decimal_scale,
+                    );
+                    self.groups[group_id].merge_group(partial_group);
+                }
+            }
+            SingleKeyCountSumMinMaxIndex::Int64 { groups: index, .. } => {
+                for partial_group in partial.groups {
+                    let GroupValue::Int64(Some(key)) = partial_group.key else {
+                        return Err(DodamError::UnsupportedSql(
+                            "direct primitive aggregate partial key shape mismatch".to_string(),
+                        ));
+                    };
+                    let group_id = count_sum_min_max_group_id_for_i64(
+                        index,
+                        key,
+                        &mut self.groups,
+                        self.decimal_precision,
+                        self.decimal_scale,
+                    );
+                    self.groups[group_id].merge_group(partial_group);
+                }
+            }
+            _ => unreachable!("vector state uses primitive numeric group index"),
         }
         Ok(())
     }
