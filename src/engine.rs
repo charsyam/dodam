@@ -29,8 +29,7 @@ use crate::execution::{
     PredicateSet, Projection, ProjectionExec, RecordBatchSink, ScanExec, ScanMetrics,
     ScanPlanMetrics, SendableBatchStream, SortExec, SortExpr, SortKey, SortMergeJoinExec,
     can_merge_partial_aggregates, collect_aggregates, collect_grouped_aggregates, collect_metrics,
-    collect_partial_aggregate_batch, evaluate_filter_mask, merge_partial_aggregate_metrics,
-    scan_projection, write_stream_to_sink,
+    evaluate_filter_mask, merge_partial_aggregate_metrics, scan_projection, write_stream_to_sink,
 };
 use crate::plan::{
     ExchangeKind, ExecutionGraphPlan, LogicalPlan, LogicalScan, PhysicalExecutionConfig,
@@ -3984,20 +3983,27 @@ impl DodamEngine {
                 batch_size,
                 projection,
                 fused_parquet_aggregate_row_group_chunk(),
-                Vec::<AggregateMetrics>::new,
+                Vec::<RecordBatch>::new,
+                |batch, batches| {
+                    batches.push(batch);
+                    Ok(Some(()))
+                },
                 {
                     let aggregates = aggregates.clone();
                     let group_by = group_by.clone();
-                    move |batch, partials| {
-                        if let Some(metrics) =
-                            collect_partial_aggregate_batch(batch, 1, &group_by, &aggregates)?
-                        {
-                            partials.push(metrics);
+                    move |batches| {
+                        if batches.is_empty() {
+                            return Ok(None);
                         }
-                        Ok(Some(()))
+                        let stream = Box::new(MemoryExec::new(batches)).execute()?;
+                        let metrics = if group_by.is_empty() {
+                            collect_aggregates(stream, 1, &aggregates)?
+                        } else {
+                            collect_grouped_aggregates(stream, 1, &group_by, &aggregates)?
+                        };
+                        Ok(Some(vec![metrics]))
                     }
                 },
-                |partials| Ok(Some(partials)),
             )
             .await?
         else {

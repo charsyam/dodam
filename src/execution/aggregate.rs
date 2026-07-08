@@ -23,6 +23,7 @@ use crate::hash::FastHashMap as AggregateHashMap;
 
 const SMALL_GROUP_LINEAR_LIMIT: usize = 8;
 const TWO_UTF8_SMALL_GROUP_LIMIT: usize = 8;
+const DENSE_I32_GROUP_INDEX_MAX_SLOTS: usize = 65_536;
 
 fn small_group_linear_limit() -> usize {
     std::env::var("DODAM_SMALL_GROUP_LINEAR_LIMIT")
@@ -36,6 +37,14 @@ fn two_utf8_small_group_limit() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(TWO_UTF8_SMALL_GROUP_LIMIT)
+}
+
+fn dense_i32_group_index_max_slots() -> usize {
+    std::env::var("DODAM_DENSE_I32_GROUP_INDEX_MAX_SLOTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DENSE_I32_GROUP_INDEX_MAX_SLOTS)
 }
 
 pub fn collect_aggregates(
@@ -2852,7 +2861,7 @@ enum CountSumGroupIndex {
         null_group: Option<usize>,
     },
     Int32 {
-        groups: AdaptiveCopyGroupIndex<i32>,
+        groups: DenseI32GroupIndex,
         null_group: Option<usize>,
     },
     Int64 {
@@ -2876,7 +2885,7 @@ impl CountSumGroupIndex {
                 null_group: None,
             },
             DataType::Int32 => Self::Int32 {
-                groups: AdaptiveCopyGroupIndex::default(),
+                groups: DenseI32GroupIndex::default(),
                 null_group: None,
             },
             DataType::Int64 => Self::Int64 {
@@ -2995,7 +3004,7 @@ impl CountSumGroupIndex {
 }
 
 fn count_sum_group_id_for_i32(
-    index: &mut AdaptiveCopyGroupIndex<i32>,
+    index: &mut DenseI32GroupIndex,
     key: i32,
     groups: &mut Vec<CountSumGroup>,
     sum_input: &CountSumValueInput<'_>,
@@ -3010,6 +3019,159 @@ fn count_sum_group_id_for_i32(
         sum_input,
     ));
     group_id
+}
+
+enum DenseI32GroupIndex {
+    Small(Vec<(i32, usize)>),
+    Dense { min: i32, slots: Vec<Option<usize>> },
+    Hash(AggregateHashMap<i32, usize>),
+}
+
+impl Default for DenseI32GroupIndex {
+    fn default() -> Self {
+        Self::Small(Vec::new())
+    }
+}
+
+impl DenseI32GroupIndex {
+    fn get(&self, key: i32) -> Option<usize> {
+        match self {
+            Self::Small(groups) => groups
+                .iter()
+                .find_map(|(candidate, group_id)| (*candidate == key).then_some(*group_id)),
+            Self::Dense { min, slots } => {
+                let offset = usize::try_from(key.checked_sub(*min)?).ok()?;
+                slots.get(offset).copied().flatten()
+            }
+            Self::Hash(groups) => groups.get(&key).copied(),
+        }
+    }
+
+    fn insert(&mut self, key: i32, group_id: usize) {
+        match self {
+            Self::Small(groups) if groups.len() < small_group_linear_limit() => {
+                groups.push((key, group_id));
+            }
+            Self::Small(groups) => {
+                let (min, max) = min_max_i32_with_new_key(groups, key);
+                if let Some(slot_count) = dense_i32_slot_count(min, max) {
+                    let mut slots = vec![None; slot_count];
+                    for (existing_key, existing_group_id) in groups.drain(..) {
+                        slots[(existing_key - min) as usize] = Some(existing_group_id);
+                    }
+                    slots[(key - min) as usize] = Some(group_id);
+                    *self = Self::Dense { min, slots };
+                } else {
+                    let mut hash = groups.drain(..).collect::<AggregateHashMap<_, _>>();
+                    hash.insert(key, group_id);
+                    *self = Self::Hash(hash);
+                }
+            }
+            Self::Dense { min, slots } => {
+                if let Some(offset) = key
+                    .checked_sub(*min)
+                    .and_then(|value| usize::try_from(value).ok())
+                    && offset < slots.len()
+                {
+                    slots[offset] = Some(group_id);
+                    return;
+                }
+                if let Some((new_min, new_slots)) = expand_dense_i32_slots(*min, slots, key) {
+                    *min = new_min;
+                    *slots = new_slots;
+                    let offset = usize::try_from(key - *min).expect("dense offset");
+                    slots[offset] = Some(group_id);
+                } else {
+                    let mut hash = AggregateHashMap::default();
+                    for (offset, existing_group_id) in slots.iter().enumerate() {
+                        if let Some(existing_group_id) = existing_group_id {
+                            if let Ok(key) = i32::try_from(i64::from(*min) + offset as i64) {
+                                hash.insert(key, *existing_group_id);
+                            }
+                        }
+                    }
+                    hash.insert(key, group_id);
+                    *self = Self::Hash(hash);
+                }
+            }
+            Self::Hash(groups) => {
+                groups.insert(key, group_id);
+            }
+        }
+    }
+
+    fn iter(&self) -> DenseI32GroupIndexIter<'_> {
+        match self {
+            Self::Small(groups) => DenseI32GroupIndexIter::Small(groups.iter()),
+            Self::Dense { min, slots } => DenseI32GroupIndexIter::Dense {
+                min: *min,
+                offset: 0,
+                slots,
+            },
+            Self::Hash(groups) => DenseI32GroupIndexIter::Hash(groups.iter()),
+        }
+    }
+}
+
+fn min_max_i32_with_new_key(groups: &[(i32, usize)], key: i32) -> (i32, i32) {
+    groups
+        .iter()
+        .fold((key, key), |(min, max), (candidate, _)| {
+            (min.min(*candidate), max.max(*candidate))
+        })
+}
+
+fn dense_i32_slot_count(min: i32, max: i32) -> Option<usize> {
+    let span = i64::from(max) - i64::from(min) + 1;
+    let slots = usize::try_from(span).ok()?;
+    (slots <= dense_i32_group_index_max_slots()).then_some(slots)
+}
+
+fn expand_dense_i32_slots(
+    min: i32,
+    slots: &[Option<usize>],
+    key: i32,
+) -> Option<(i32, Vec<Option<usize>>)> {
+    let old_max = min.checked_add(i32::try_from(slots.len()).ok()?.checked_sub(1)?)?;
+    let new_min = min.min(key);
+    let new_max = old_max.max(key);
+    let slot_count = dense_i32_slot_count(new_min, new_max)?;
+    let mut expanded = vec![None; slot_count];
+    let old_offset = usize::try_from(i64::from(min) - i64::from(new_min)).ok()?;
+    expanded[old_offset..old_offset + slots.len()].copy_from_slice(slots);
+    Some((new_min, expanded))
+}
+
+enum DenseI32GroupIndexIter<'a> {
+    Small(std::slice::Iter<'a, (i32, usize)>),
+    Dense {
+        min: i32,
+        offset: usize,
+        slots: &'a [Option<usize>],
+    },
+    Hash(std::collections::hash_map::Iter<'a, i32, usize>),
+}
+
+impl Iterator for DenseI32GroupIndexIter<'_> {
+    type Item = (i32, usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Small(iter) => iter.next().map(|(key, group_id)| (*key, *group_id)),
+            Self::Dense { min, offset, slots } => {
+                while *offset < slots.len() {
+                    let current = *offset;
+                    *offset += 1;
+                    if let Some(group_id) = slots[current] {
+                        let key = i32::try_from(i64::from(*min) + current as i64).ok()?;
+                        return Some((key, group_id));
+                    }
+                }
+                None
+            }
+            Self::Hash(iter) => iter.next().map(|(key, group_id)| (*key, *group_id)),
+        }
+    }
 }
 
 fn count_sum_group_id_for_i64(
@@ -3849,7 +4011,7 @@ enum SingleKeyCountSumMinMaxIndex {
         null_group: Option<usize>,
     },
     Int32 {
-        groups: AdaptiveCopyGroupIndex<i32>,
+        groups: DenseI32GroupIndex,
         null_group: Option<usize>,
     },
     Int64 {
@@ -3873,7 +4035,7 @@ impl SingleKeyCountSumMinMaxIndex {
                 null_group: None,
             },
             DataType::Int32 => Self::Int32 {
-                groups: AdaptiveCopyGroupIndex::default(),
+                groups: DenseI32GroupIndex::default(),
                 null_group: None,
             },
             DataType::Int64 => Self::Int64 {
@@ -4031,7 +4193,7 @@ fn count_sum_min_max_group_id_for_null(
 }
 
 fn count_sum_min_max_group_id_for_i32(
-    index: &mut AdaptiveCopyGroupIndex<i32>,
+    index: &mut DenseI32GroupIndex,
     key: i32,
     groups: &mut Vec<SingleKeyCountSumMinMaxGroup>,
     decimal_precision: u8,
