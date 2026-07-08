@@ -2097,3 +2097,7 @@ Tried and rejected or neutral:
           - The `count(*) + sum(int) + min(decimal) + max(date32)` fast path now finishes Int32/Int64/UInt64 groups by sorting the existing key-index entries and taking group ids in that order, instead of materializing every `GroupAggregateResult` and sorting via the generic `GroupValue` comparator.
           - Generic benchmark sampled Dodam `~78.4ms` vs DuckDB `~84.2ms` (`~0.93x`). `filter_group_decimal_date` was still in the `~21.4ms` area, so this is a small structural cleanup rather than a large win.
           - Validation: `scripts/check_correctness.sh quick` passed. SF=10 TPC-H regression check sampled Dodam `~4.252s` vs DuckDB `~6.929s` (`~0.614x`) with no slower query across all 22.
+        - Added typed partial merge for the same single-key decimal/date aggregate shape:
+          - Partial grouped aggregate merge now recognizes `GROUP BY one key` with `count(*) + sum(int) + min(decimal) + max(date32)` and merges partial groups through the same typed group/index state instead of `HashMap<Vec<GroupValue>, Vec<AggregateResult>>`.
+          - This avoids vector key allocation/hash and generic aggregate result merging for the generic decimal/date workload. Generic benchmark sampled Dodam `~78.0ms` vs DuckDB `~85.3ms` (`~0.91x`); `filter_group_decimal_date` improved to `~21.1ms` vs DuckDB `~19.0ms`.
+          - Validation: `scripts/check_correctness.sh quick` passed. SF=10 TPC-H regression check sampled Dodam `~4.282s` vs DuckDB `~6.922s` (`~0.619x`) with no slower query across all 22.

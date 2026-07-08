@@ -1040,6 +1040,16 @@ pub fn merge_partial_aggregate_metrics(
     }
 
     let merge_started = Instant::now();
+    if can_use_single_key_count_sum_min_max_path(group_by, aggregates)
+        && let Some(groups) = merge_single_key_count_sum_min_max_partials(&partials, aggregates)?
+    {
+        metrics.aggregate_nanos = partials.iter().fold(0_u64, |nanos, partial| {
+            nanos.saturating_add(partial.aggregate_nanos)
+        });
+        metrics.aggregate_merge_nanos = elapsed_nanos(merge_started);
+        metrics.groups = groups;
+        return Ok(metrics);
+    }
     let mut groups = AggregateHashMap::<Vec<GroupValue>, Vec<AggregateResult>>::default();
     for partial in partials {
         metrics.aggregate_nanos = metrics
@@ -1091,6 +1101,80 @@ pub fn collect_partial_aggregate_batch(
     }
     metrics.aggregate_nanos = elapsed_nanos(aggregate_started);
     Ok(Some(metrics))
+}
+
+fn merge_single_key_count_sum_min_max_partials(
+    partials: &[AggregateMetrics],
+    aggregates: &[AggregateExpr],
+) -> Result<Option<Vec<GroupAggregateResult>>> {
+    let mut index = SingleKeyCountSumMinMaxIndex::Unset;
+    let mut groups = Vec::<SingleKeyCountSumMinMaxGroup>::new();
+    for partial in partials {
+        for group in &partial.groups {
+            let Some(key) = group.keys.first() else {
+                return Ok(None);
+            };
+            let Some((precision, scale)) = decimal_min_result_type(group.values.get(2)) else {
+                return Ok(None);
+            };
+            let group_id = match key {
+                GroupValue::Int64(Some(key)) => {
+                    index.ensure_type(&DataType::Int64);
+                    let SingleKeyCountSumMinMaxIndex::Int64 { groups: index, .. } = &mut index
+                    else {
+                        return Ok(None);
+                    };
+                    count_sum_min_max_group_id_for_i64(index, *key, &mut groups, precision, scale)
+                }
+                GroupValue::Int64(None) => {
+                    index.ensure_type(&DataType::Int64);
+                    let SingleKeyCountSumMinMaxIndex::Int64 { null_group, .. } = &mut index else {
+                        return Ok(None);
+                    };
+                    count_sum_min_max_group_id_for_null(
+                        null_group,
+                        &mut groups,
+                        GroupValue::Int64(None),
+                        precision,
+                        scale,
+                    )
+                }
+                GroupValue::UInt64(Some(key)) => {
+                    index.ensure_type(&DataType::UInt64);
+                    let SingleKeyCountSumMinMaxIndex::UInt64 { groups: index, .. } = &mut index
+                    else {
+                        return Ok(None);
+                    };
+                    count_sum_min_max_group_id_for_u64(index, *key, &mut groups, precision, scale)
+                }
+                GroupValue::UInt64(None) => {
+                    index.ensure_type(&DataType::UInt64);
+                    let SingleKeyCountSumMinMaxIndex::UInt64 { null_group, .. } = &mut index else {
+                        return Ok(None);
+                    };
+                    count_sum_min_max_group_id_for_null(
+                        null_group,
+                        &mut groups,
+                        GroupValue::UInt64(None),
+                        precision,
+                        scale,
+                    )
+                }
+                _ => return Ok(None),
+            };
+            groups[group_id].merge_partial_values(&group.values)?;
+        }
+    }
+    Ok(Some(finish_single_key_count_sum_min_max_groups(
+        index, groups, aggregates,
+    )))
+}
+
+fn decimal_min_result_type(value: Option<&AggregateResult>) -> Option<(u8, i8)> {
+    let AggregateValue::Decimal128(_, precision, scale) = value?.value else {
+        return None;
+    };
+    Some((precision, scale))
 }
 
 pub fn aggregate_metrics_to_batches(
@@ -3744,6 +3828,71 @@ impl SingleKeyCountSumMinMaxGroup {
             Some(current) => current.max(max_value),
             None => max_value,
         });
+    }
+
+    fn merge_partial_values(&mut self, values: &[AggregateResult]) -> Result<()> {
+        let [
+            AggregateResult {
+                value: AggregateValue::Count(count),
+                ..
+            },
+            AggregateResult {
+                value: sum_value, ..
+            },
+            AggregateResult {
+                value: min_value, ..
+            },
+            AggregateResult {
+                value: max_value, ..
+            },
+        ] = values
+        else {
+            return Err(DodamError::InvalidAggregate(
+                "partial count/sum/min/max group shape mismatch".to_string(),
+            ));
+        };
+        self.count = self.count.saturating_add(*count);
+        match sum_value {
+            AggregateValue::Int64(Some(sum)) => {
+                self.sum += *sum;
+                self.sum_count += 1;
+            }
+            AggregateValue::Int64(None) => {}
+            _ => {
+                return Err(DodamError::InvalidAggregate(
+                    "partial count/sum/min/max sum type mismatch".to_string(),
+                ));
+            }
+        }
+        match min_value {
+            AggregateValue::Decimal128(Some(value), _, _) => {
+                self.min_decimal = Some(match self.min_decimal {
+                    Some(current) => current.min(*value),
+                    None => *value,
+                });
+            }
+            AggregateValue::Decimal128(None, _, _) => {}
+            _ => {
+                return Err(DodamError::InvalidAggregate(
+                    "partial count/sum/min/max min type mismatch".to_string(),
+                ));
+            }
+        }
+        match max_value {
+            AggregateValue::Date32(Some(value)) => {
+                self.max_date32 = Some(match self.max_date32 {
+                    Some(current) => current.max(*value),
+                    None => *value,
+                });
+            }
+            AggregateValue::Date32(None) => {}
+            _ => {
+                return Err(DodamError::InvalidAggregate(
+                    "partial count/sum/min/max max type mismatch".to_string(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn finish(self, aggregates: &[AggregateExpr]) -> GroupAggregateResult {
