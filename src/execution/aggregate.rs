@@ -20,6 +20,7 @@ use crate::execution::logical::{
 use crate::execution::metrics::SendableBatchStream;
 use crate::execution::physical::column_index;
 use crate::hash::FastHashMap as AggregateHashMap;
+use crate::vector::BatchView;
 
 const SMALL_GROUP_LINEAR_LIMIT: usize = 8;
 const TWO_UTF8_SMALL_GROUP_LIMIT: usize = 8;
@@ -1318,6 +1319,157 @@ fn decimal_min_result_type(value: Option<&AggregateResult>) -> Option<(u8, i8)> 
         return None;
     };
     Some((precision, scale))
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct DecimalDateRangeFilter {
+    pub(crate) decimal_min: Option<i128>,
+    pub(crate) decimal_max: Option<i128>,
+    pub(crate) date_min: Option<i32>,
+    pub(crate) date_max: Option<i32>,
+}
+
+impl DecimalDateRangeFilter {
+    fn matches(&self, decimal: i128, date: i32) -> bool {
+        self.decimal_min.is_none_or(|min| decimal >= min)
+            && self.decimal_max.is_none_or(|max| decimal <= max)
+            && self.date_min.is_none_or(|min| date >= min)
+            && self.date_max.is_none_or(|max| date <= max)
+    }
+}
+
+pub(crate) struct SingleKeyCountSumMinMaxVectorState {
+    aggregates: Vec<AggregateExpr>,
+    decimal_precision: u8,
+    decimal_scale: i8,
+    group_index: SingleKeyCountSumMinMaxIndex,
+    groups: Vec<SingleKeyCountSumMinMaxGroup>,
+}
+
+impl SingleKeyCountSumMinMaxVectorState {
+    pub(crate) fn new(
+        aggregates: Vec<AggregateExpr>,
+        decimal_precision: u8,
+        decimal_scale: i8,
+    ) -> Self {
+        Self {
+            aggregates,
+            decimal_precision,
+            decimal_scale,
+            group_index: SingleKeyCountSumMinMaxIndex::Int32 {
+                groups: DenseI32GroupIndex::default(),
+                null_group: None,
+            },
+            groups: Vec::new(),
+        }
+    }
+
+    pub(crate) fn consume_i32_i64_decimal_date_batch(
+        &mut self,
+        batch: BatchView<'_>,
+        filter: &DecimalDateRangeFilter,
+    ) -> Result<()> {
+        let key_values = batch.i32_vector(0).ok_or_else(|| {
+            DodamError::UnsupportedSql(
+                "direct primitive aggregate projected key is not Int32".to_string(),
+            )
+        })?;
+        let sum_values = batch.i64_vector(1).ok_or_else(|| {
+            DodamError::UnsupportedSql(
+                "direct primitive aggregate projected sum input is not Int64".to_string(),
+            )
+        })?;
+        let decimal_values = batch.decimal128_vector(2).ok_or_else(|| {
+            DodamError::UnsupportedSql(
+                "direct primitive aggregate projected min input is not Decimal128".to_string(),
+            )
+        })?;
+        let date_values = batch.date32_vector(3).ok_or_else(|| {
+            DodamError::UnsupportedSql(
+                "direct primitive aggregate projected max input is not Date32".to_string(),
+            )
+        })?;
+        let Some(keys) = key_values.values_if_null_free() else {
+            return Err(DodamError::UnsupportedSql(
+                "direct primitive aggregate requires non-null key".to_string(),
+            ));
+        };
+        let Some(sums) = sum_values.values_if_null_free() else {
+            return Err(DodamError::UnsupportedSql(
+                "direct primitive aggregate requires non-null sum input".to_string(),
+            ));
+        };
+        let decimals = decimal_values.raw_values();
+        let Some(dates) = date_values.values_if_null_free() else {
+            return Err(DodamError::UnsupportedSql(
+                "direct primitive aggregate requires non-null date input".to_string(),
+            ));
+        };
+        if keys.len() != sums.len() || keys.len() != decimals.len() || keys.len() != dates.len() {
+            return Err(DodamError::UnsupportedSql(
+                "direct primitive aggregate column length mismatch".to_string(),
+            ));
+        }
+        let SingleKeyCountSumMinMaxIndex::Int32 { groups: index, .. } = &mut self.group_index
+        else {
+            unreachable!("vector state uses Int32 group index")
+        };
+        for row in 0..keys.len() {
+            let decimal = decimals[row];
+            let date = dates[row];
+            if !filter.matches(decimal, date) {
+                continue;
+            }
+            let group_id = count_sum_min_max_group_id_for_i32(
+                index,
+                keys[row],
+                &mut self.groups,
+                self.decimal_precision,
+                self.decimal_scale,
+            );
+            self.groups[group_id].update_raw_non_null(sums[row], decimal, date);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn merge(&mut self, partial: Self) -> Result<()> {
+        let SingleKeyCountSumMinMaxIndex::Int32 { groups: index, .. } = &mut self.group_index
+        else {
+            unreachable!("vector state uses Int32 group index")
+        };
+        for partial_group in partial.groups {
+            let GroupValue::Int64(Some(key)) = partial_group.key else {
+                return Err(DodamError::UnsupportedSql(
+                    "direct primitive aggregate partial key shape mismatch".to_string(),
+                ));
+            };
+            let key = i32::try_from(key).map_err(|_| {
+                DodamError::UnsupportedSql(
+                    "direct primitive aggregate partial key out of Int32 range".to_string(),
+                )
+            })?;
+            let group_id = count_sum_min_max_group_id_for_i32(
+                index,
+                key,
+                &mut self.groups,
+                self.decimal_precision,
+                self.decimal_scale,
+            );
+            self.groups[group_id].merge_group(partial_group);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> AggregateMetrics {
+        AggregateMetrics {
+            groups: finish_single_key_count_sum_min_max_groups(
+                self.group_index,
+                self.groups,
+                &self.aggregates,
+            ),
+            ..AggregateMetrics::default()
+        }
+    }
 }
 
 fn merge_single_key_count_sum_partials(
@@ -4455,6 +4607,38 @@ impl SingleKeyCountSumMinMaxGroup {
             Some(current) => current.max(max_value),
             None => max_value,
         });
+    }
+
+    fn update_raw_non_null(&mut self, sum_value: i64, min_value: i128, max_value: i32) {
+        self.count += 1;
+        self.sum += sum_value;
+        self.sum_count += 1;
+        self.min_decimal = Some(match self.min_decimal {
+            Some(current) => current.min(min_value),
+            None => min_value,
+        });
+        self.max_date32 = Some(match self.max_date32 {
+            Some(current) => current.max(max_value),
+            None => max_value,
+        });
+    }
+
+    fn merge_group(&mut self, partial: Self) {
+        self.count = self.count.saturating_add(partial.count);
+        self.sum = self.sum.saturating_add(partial.sum);
+        self.sum_count = self.sum_count.saturating_add(partial.sum_count);
+        if let Some(value) = partial.min_decimal {
+            self.min_decimal = Some(match self.min_decimal {
+                Some(current) => current.min(value),
+                None => value,
+            });
+        }
+        if let Some(value) = partial.max_date32 {
+            self.max_date32 = Some(match self.max_date32 {
+                Some(current) => current.max(value),
+                None => value,
+            });
+        }
     }
 
     fn merge_partial_values(&mut self, values: &[AggregateResult]) -> Result<()> {

@@ -5,6 +5,7 @@ pub mod metrics;
 pub mod physical;
 pub mod typed_rows;
 
+pub(crate) use aggregate::{DecimalDateRangeFilter, SingleKeyCountSumMinMaxVectorState};
 pub use aggregate::{
     GroupKeyExpr, GroupKeyLiteral, aggregate_metrics_to_batches, can_merge_partial_aggregates,
     collect_aggregates, collect_grouped_aggregates, collect_grouped_aggregates_with_key_exprs,

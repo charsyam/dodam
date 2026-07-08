@@ -23,14 +23,14 @@ use crate::dense::DenseI64BoolLookup;
 use crate::error::{DodamError, Result};
 use crate::execution::metrics::ScanPlanMetricsCounter;
 use crate::execution::{
-    AggregateExpr, AggregateMetrics, AggregateResult, AggregateValue, ComparisonOp, DistinctExec,
-    Expr, FilterExec, FilterExpr, FinalMergeExec, GroupAggregateResult, GroupValue, HashJoinExec,
-    IpcExec, JoinBuildSide, JoinType, LimitExec, LiteralValue, LocalFoldExec, MemoryExec,
-    PartitionedHashJoinExec, PartitionedHashJoinOptions, PhysicalPlan, PredicateSet, Projection,
-    ProjectionExec, RecordBatchSink, ScanExec, ScanMetrics, ScanPlanMetrics, SendableBatchStream,
-    SortExec, SortExpr, SortKey, SortMergeJoinExec, can_merge_partial_aggregates,
-    collect_aggregates, collect_grouped_aggregates, collect_metrics, evaluate_filter_mask,
-    merge_partial_aggregate_metrics, scan_projection, write_stream_to_sink,
+    AggregateExpr, AggregateMetrics, ComparisonOp, DecimalDateRangeFilter, DistinctExec, Expr,
+    FilterExec, FilterExpr, FinalMergeExec, HashJoinExec, IpcExec, JoinBuildSide, JoinType,
+    LimitExec, LiteralValue, LocalFoldExec, MemoryExec, PartitionedHashJoinExec,
+    PartitionedHashJoinOptions, PhysicalPlan, PredicateSet, Projection, ProjectionExec,
+    RecordBatchSink, ScanExec, ScanMetrics, ScanPlanMetrics, SendableBatchStream,
+    SingleKeyCountSumMinMaxVectorState, SortExec, SortExpr, SortKey, SortMergeJoinExec,
+    can_merge_partial_aggregates, collect_aggregates, collect_grouped_aggregates, collect_metrics,
+    evaluate_filter_mask, merge_partial_aggregate_metrics, scan_projection, write_stream_to_sink,
 };
 use crate::plan::{
     ExchangeKind, ExecutionGraphPlan, LogicalPlan, LogicalScan, PhysicalExecutionConfig,
@@ -4092,7 +4092,7 @@ impl DodamEngine {
             },
         ];
         let started = Instant::now();
-        let mut state = DirectCountSumMinMaxState::new(
+        let mut state = SingleKeyCountSumMinMaxVectorState::new(
             aggregates.to_vec(),
             shape.decimal_precision,
             shape.decimal_scale,
@@ -4104,7 +4104,7 @@ impl DodamEngine {
                 batch_size,
                 &row_groups,
                 &specs,
-                |batch| state.consume(batch, &shape.filter),
+                |batch| state.consume_i32_i64_decimal_date_batch(batch, &shape.filter),
             )?
             else {
                 return Ok(None);
@@ -4147,7 +4147,7 @@ impl DodamEngine {
                                 column_type: DirectPrimitiveColumnType::Date32,
                             },
                         ];
-                        let mut state = DirectCountSumMinMaxState::new(
+                        let mut state = SingleKeyCountSumMinMaxVectorState::new(
                             aggregates,
                             shape.decimal_precision,
                             shape.decimal_scale,
@@ -4157,7 +4157,7 @@ impl DodamEngine {
                             batch_size,
                             &row_groups,
                             &specs,
-                            |batch| state.consume(batch, &shape.filter),
+                            |batch| state.consume_i32_i64_decimal_date_batch(batch, &shape.filter),
                         );
                         let _ = sender
                             .send(result.map(|metrics| metrics.map(|metrics| (state, metrics))));
@@ -4169,7 +4169,7 @@ impl DodamEngine {
                 let Some((partial, metrics)) = received? else {
                     return Ok(None);
                 };
-                state.merge(partial);
+                state.merge(partial)?;
                 scan_metrics.row_groups =
                     scan_metrics.row_groups.saturating_add(metrics.row_groups);
                 scan_metrics.batches = scan_metrics.batches.saturating_add(metrics.batches);
@@ -4706,7 +4706,7 @@ struct DirectCountSumMinMaxShape {
     max_date_column: String,
     decimal_precision: u8,
     decimal_scale: i8,
-    filter: DirectPrimitiveAggregateFilter,
+    filter: DecimalDateRangeFilter,
 }
 
 impl DirectCountSumMinMaxShape {
@@ -4734,7 +4734,7 @@ impl DirectCountSumMinMaxShape {
         else {
             return Ok(None);
         };
-        let Some(filter) = DirectPrimitiveAggregateFilter::try_new(
+        let Some(filter) = DecimalDateRangeFilter::try_new(
             filter.expr(),
             min_decimal_column,
             max_date_column,
@@ -4770,15 +4770,7 @@ impl DirectCountSumMinMaxShape {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct DirectPrimitiveAggregateFilter {
-    decimal_min: Option<i128>,
-    decimal_max: Option<i128>,
-    date_min: Option<i32>,
-    date_max: Option<i32>,
-}
-
-impl DirectPrimitiveAggregateFilter {
+impl DecimalDateRangeFilter {
     fn try_new(
         expr: &Expr,
         decimal_column: &str,
@@ -4892,179 +4884,6 @@ impl DirectPrimitiveAggregateFilter {
                 true
             }
             ComparisonOp::NotEq => false,
-        }
-    }
-
-    fn matches(&self, decimal: i128, date: i32) -> bool {
-        self.decimal_min.is_none_or(|min| decimal >= min)
-            && self.decimal_max.is_none_or(|max| decimal <= max)
-            && self.date_min.is_none_or(|min| date >= min)
-            && self.date_max.is_none_or(|max| date <= max)
-    }
-}
-
-#[derive(Debug, Clone)]
-struct DirectCountSumMinMaxState {
-    aggregates: Vec<AggregateExpr>,
-    decimal_precision: u8,
-    decimal_scale: i8,
-    groups: Vec<DirectCountSumMinMaxGroup>,
-    group_index: HashMap<i32, usize>,
-}
-
-#[derive(Debug, Clone)]
-struct DirectCountSumMinMaxGroup {
-    key: i32,
-    count: u64,
-    sum: i64,
-    min_decimal: i128,
-    max_date: i32,
-}
-
-impl DirectCountSumMinMaxState {
-    fn new(aggregates: Vec<AggregateExpr>, decimal_precision: u8, decimal_scale: i8) -> Self {
-        Self {
-            aggregates,
-            decimal_precision,
-            decimal_scale,
-            groups: Vec::new(),
-            group_index: HashMap::new(),
-        }
-    }
-
-    fn merge(&mut self, partial: Self) {
-        for partial_group in partial.groups {
-            let group_index = if let Some(index) = self.group_index.get(&partial_group.key) {
-                *index
-            } else {
-                let index = self.groups.len();
-                self.groups.push(DirectCountSumMinMaxGroup {
-                    key: partial_group.key,
-                    count: 0,
-                    sum: 0,
-                    min_decimal: partial_group.min_decimal,
-                    max_date: partial_group.max_date,
-                });
-                self.group_index.insert(partial_group.key, index);
-                index
-            };
-            let group = &mut self.groups[group_index];
-            group.count = group.count.saturating_add(partial_group.count);
-            group.sum = group.sum.saturating_add(partial_group.sum);
-            group.min_decimal = group.min_decimal.min(partial_group.min_decimal);
-            group.max_date = group.max_date.max(partial_group.max_date);
-        }
-    }
-
-    fn consume(
-        &mut self,
-        batch: BatchView<'_>,
-        filter: &DirectPrimitiveAggregateFilter,
-    ) -> Result<()> {
-        let key_values = batch.i32_vector(0).ok_or_else(|| {
-            DodamError::UnsupportedSql(
-                "direct primitive aggregate projected key is not Int32".to_string(),
-            )
-        })?;
-        let sum_values = batch.i64_vector(1).ok_or_else(|| {
-            DodamError::UnsupportedSql(
-                "direct primitive aggregate projected sum input is not Int64".to_string(),
-            )
-        })?;
-        let decimal_values = batch.decimal128_vector(2).ok_or_else(|| {
-            DodamError::UnsupportedSql(
-                "direct primitive aggregate projected min input is not Decimal128".to_string(),
-            )
-        })?;
-        let date_values = batch.date32_vector(3).ok_or_else(|| {
-            DodamError::UnsupportedSql(
-                "direct primitive aggregate projected max input is not Date32".to_string(),
-            )
-        })?;
-        let Some(keys) = key_values.values_if_null_free() else {
-            return Err(DodamError::UnsupportedSql(
-                "direct primitive aggregate requires non-null key".to_string(),
-            ));
-        };
-        let Some(sums) = sum_values.values_if_null_free() else {
-            return Err(DodamError::UnsupportedSql(
-                "direct primitive aggregate requires non-null sum input".to_string(),
-            ));
-        };
-        let decimals = decimal_values.raw_values();
-        let Some(dates) = date_values.values_if_null_free() else {
-            return Err(DodamError::UnsupportedSql(
-                "direct primitive aggregate requires non-null date input".to_string(),
-            ));
-        };
-        if keys.len() != sums.len() || keys.len() != decimals.len() || keys.len() != dates.len() {
-            return Err(DodamError::UnsupportedSql(
-                "direct primitive aggregate column length mismatch".to_string(),
-            ));
-        }
-        for row in 0..keys.len() {
-            let decimal = decimals[row];
-            let date = dates[row];
-            if !filter.matches(decimal, date) {
-                continue;
-            }
-            let group_index = if let Some(index) = self.group_index.get(&keys[row]) {
-                *index
-            } else {
-                let index = self.groups.len();
-                self.groups.push(DirectCountSumMinMaxGroup {
-                    key: keys[row],
-                    count: 0,
-                    sum: 0,
-                    min_decimal: decimal,
-                    max_date: date,
-                });
-                self.group_index.insert(keys[row], index);
-                index
-            };
-            let group = &mut self.groups[group_index];
-            group.count = group.count.saturating_add(1);
-            group.sum = group.sum.saturating_add(sums[row]);
-            group.min_decimal = group.min_decimal.min(decimal);
-            group.max_date = group.max_date.max(date);
-        }
-        Ok(())
-    }
-
-    fn finish(mut self) -> AggregateMetrics {
-        self.groups.sort_by_key(|group| group.key);
-        let groups = self
-            .groups
-            .into_iter()
-            .map(|group| GroupAggregateResult {
-                keys: vec![GroupValue::Int64(Some(i64::from(group.key)))],
-                values: vec![
-                    AggregateResult {
-                        expr: self.aggregates[0].clone(),
-                        value: AggregateValue::Count(group.count),
-                    },
-                    AggregateResult {
-                        expr: self.aggregates[1].clone(),
-                        value: AggregateValue::Int64(Some(group.sum)),
-                    },
-                    AggregateResult {
-                        expr: self.aggregates[2].clone(),
-                        value: AggregateValue::Decimal128(
-                            Some(group.min_decimal),
-                            self.decimal_precision,
-                            self.decimal_scale,
-                        ),
-                    },
-                    AggregateResult {
-                        expr: self.aggregates[3].clone(),
-                        value: AggregateValue::Date32(Some(group.max_date)),
-                    },
-                ],
-            })
-            .collect();
-        AggregateMetrics {
-            groups,
-            ..AggregateMetrics::default()
         }
     }
 }
