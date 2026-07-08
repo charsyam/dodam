@@ -18750,15 +18750,25 @@ async fn q04_candidate_order_priorities_late(
     start_days: i32,
     end_days: i32,
 ) -> Result<Option<(Vec<u8>, Vec<String>, usize)>> {
+    let predicate_projection =
+        Projection::Columns(vec!["o_orderkey".to_string(), "o_orderdate".to_string()]);
+    let payload_projection = Projection::Columns(vec!["o_orderpriority".to_string()]);
     let Some(chunks) = engine
         .late_materialized_parquet_map_pruned_with_policy_view(
             path,
             batch_size,
-            Projection::Columns(vec!["o_orderkey".to_string(), "o_orderdate".to_string()]),
-            Projection::Columns(vec!["o_orderpriority".to_string()]),
+            predicate_projection.clone(),
+            payload_projection.clone(),
             date_range_pruning_predicates("o_orderdate", start_days, end_days),
             q04_late_candidate_row_group_chunk(),
-            late_materialization_policy_from_env("DODAM_Q04_LATE_MAX_SELECTED_RATIO", 0.60),
+            late_materialization_policy_from_projection_env(
+                &predicate_projection,
+                &payload_projection,
+                "DODAM_Q04_LATE_MAX_SELECTED_RATIO",
+                0.60,
+                None,
+                None,
+            ),
             move || Q04LateCandidateState {
                 start_days,
                 end_days,
@@ -18815,6 +18825,57 @@ fn late_materialization_policy_from_env(
         .filter(|value| value.is_finite())
         .unwrap_or(default_max_selected_ratio);
     LateMaterializationPolicy::selective(max_selected_ratio)
+}
+
+fn late_materialization_policy_from_projection_env(
+    predicate_projection: &Projection,
+    payload_projection: &Projection,
+    selected_ratio_env: &str,
+    default_max_selected_ratio: f64,
+    selector_run_ratio_env: Option<&str>,
+    default_max_selector_run_ratio: Option<f64>,
+) -> LateMaterializationPolicy {
+    let default_max_selected_ratio = late_materialization_projection_selected_ratio(
+        predicate_projection,
+        payload_projection,
+        default_max_selected_ratio,
+    );
+    let max_selected_ratio = std::env::var(selected_ratio_env)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(default_max_selected_ratio);
+    let Some(selector_run_ratio_env) = selector_run_ratio_env else {
+        return LateMaterializationPolicy::selective(max_selected_ratio);
+    };
+    let Some(default_max_selector_run_ratio) = default_max_selector_run_ratio else {
+        return LateMaterializationPolicy::selective(max_selected_ratio);
+    };
+    let max_selector_run_ratio = std::env::var(selector_run_ratio_env)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(default_max_selector_run_ratio);
+    LateMaterializationPolicy::selective_with_selector_run_ratio(
+        max_selected_ratio,
+        max_selector_run_ratio,
+    )
+}
+
+fn late_materialization_projection_selected_ratio(
+    predicate_projection: &Projection,
+    payload_projection: &Projection,
+    default_max_selected_ratio: f64,
+) -> f64 {
+    let predicate_columns = projection_column_count(predicate_projection);
+    let payload_columns = projection_column_count(payload_projection);
+    if predicate_columns == usize::MAX || payload_columns == usize::MAX {
+        return default_max_selected_ratio.min(0.35);
+    }
+    if payload_columns >= predicate_columns.saturating_mul(2).max(1) {
+        return default_max_selected_ratio;
+    }
+    default_max_selected_ratio.min(0.35)
 }
 
 struct Q04LateCandidateState {
@@ -19743,20 +19804,26 @@ async fn q04_count_late_candidate_priorities_late_materialized(
         .map(|(min_key, max_key)| i64_range_pruning_predicates("l_orderkey", min_key, max_key))
         .unwrap_or_default();
     let candidate_priorities = q04_atomic_candidate_priorities(candidate_priorities);
+    let predicate_projection = Projection::Columns(vec!["l_orderkey".to_string()]);
+    let payload_projection = Projection::Columns(vec![
+        "l_commitdate".to_string(),
+        "l_receiptdate".to_string(),
+    ]);
     let Some(chunks) = engine
         .late_materialized_parquet_map_pruned_with_policy_view(
             path,
             batch_size,
-            Projection::Columns(vec!["l_orderkey".to_string()]),
-            Projection::Columns(vec![
-                "l_commitdate".to_string(),
-                "l_receiptdate".to_string(),
-            ]),
+            predicate_projection.clone(),
+            payload_projection.clone(),
             pruning_predicates,
             q04_lineitem_late_materialized_row_group_chunk(),
-            LateMaterializationPolicy::selective_with_selector_run_ratio(
-                q04_lineitem_late_materialized_max_selected_ratio(),
-                q04_lineitem_late_materialized_max_selector_run_ratio(),
+            late_materialization_policy_from_projection_env(
+                &predicate_projection,
+                &payload_projection,
+                "DODAM_Q04_LINEITEM_LATE_MAX_SELECTED_RATIO",
+                0.10,
+                Some("DODAM_Q04_LINEITEM_LATE_MAX_SELECTOR_RUN_RATIO"),
+                Some(0.50),
             ),
             {
                 let candidate_priorities = candidate_priorities.clone();
@@ -19813,22 +19880,6 @@ fn q04_lineitem_late_materialized_row_group_chunk() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(2)
-}
-
-fn q04_lineitem_late_materialized_max_selected_ratio() -> f64 {
-    std::env::var("DODAM_Q04_LINEITEM_LATE_MAX_SELECTED_RATIO")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.10)
-}
-
-fn q04_lineitem_late_materialized_max_selector_run_ratio() -> f64 {
-    std::env::var("DODAM_Q04_LINEITEM_LATE_MAX_SELECTOR_RUN_RATIO")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.50)
 }
 
 struct Q04LineitemLateState {
@@ -27400,6 +27451,14 @@ async fn q19_late_materialized_lineitem_revenue(
     let payload_projection = Projection::Columns(vec!["l_extendedprice".to_string()]);
     let rules_for_state = rules.clone();
     let part_masks_for_state = part_masks.clone();
+    let policy = late_materialization_policy_from_projection_env(
+        &predicate_projection,
+        &payload_projection,
+        "DODAM_Q19_LATE_MAX_SELECTED_RATIO",
+        0.60,
+        None,
+        None,
+    );
     let Some(chunks) = engine
         .late_materialized_parquet_map_pruned_with_policy_view(
             path,
@@ -27408,7 +27467,7 @@ async fn q19_late_materialized_lineitem_revenue(
             payload_projection,
             Vec::new(),
             q19_late_materialized_row_group_chunk(),
-            late_materialization_policy_from_env("DODAM_Q19_LATE_MAX_SELECTED_RATIO", 0.60),
+            policy,
             move || Q19LateState {
                 rules: rules_for_state.clone(),
                 part_masks: part_masks_for_state.clone(),
