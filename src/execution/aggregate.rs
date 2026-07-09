@@ -21,7 +21,10 @@ use crate::execution::metrics::SendableBatchStream;
 use crate::execution::physical::column_index;
 use crate::hash::FastHashMap as AggregateHashMap;
 use crate::vector::dictionary_i32_string_values;
-use crate::vector::{BatchView, DictionaryStringValues, I32VectorView, I64VectorView};
+use crate::vector::{
+    BatchView, Date32VectorView, DictionaryI32View, DictionaryStringValues, I32VectorView,
+    I64VectorView, Utf8VectorView,
+};
 
 const SMALL_GROUP_LINEAR_LIMIT: usize = 8;
 const TWO_UTF8_SMALL_GROUP_LIMIT: usize = 8;
@@ -377,6 +380,50 @@ impl CoalesceKeyCountSumCollector {
         Ok(())
     }
 
+    pub(crate) fn consume_projected_view(
+        &mut self,
+        view: BatchView<'_>,
+        projected_columns: &[String],
+    ) -> Result<()> {
+        if view.num_rows() == 0 {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let bound = match &self.bound_plan {
+            Some(bound) => bound,
+            None => {
+                self.bound_plan = Some(self.plan.bind_projected_columns(projected_columns)?);
+                self.bound_plan
+                    .as_ref()
+                    .expect("bound coalesce aggregate projected plan")
+            }
+        };
+        let Some(reader) = CoalesceKeyCountSumViewReader::new(view, bound) else {
+            if let Some(batch) = view.try_record_batch() {
+                self.bind_nanos = self.bind_nanos.saturating_add(elapsed_nanos_u64(started));
+                return self.consume_batch(batch);
+            }
+            return Err(DodamError::UnsupportedSql(
+                "group expression view aggregate requires integer/date leading keys, coalesce(utf8,literal), and integer sum inputs"
+                    .to_string(),
+            ));
+        };
+        self.bind_nanos = self.bind_nanos.saturating_add(elapsed_nanos_u64(started));
+
+        self.metrics.batches += 1;
+        self.metrics.rows += view.num_rows();
+        let groups = self.groups.get_or_insert_with(|| {
+            CoalesceKeyCountSumGroups::new(
+                self.plan.leading_keys.len(),
+                reader.dense_leading_range(view.num_rows()),
+            )
+        });
+        let started = Instant::now();
+        reader.update_groups(groups, view.num_rows(), self.plan.fallback.as_str());
+        self.update_nanos = self.update_nanos.saturating_add(elapsed_nanos_u64(started));
+        Ok(())
+    }
+
     pub(crate) fn merge_partials(
         partials: Vec<Self>,
         fragments: usize,
@@ -391,16 +438,22 @@ impl CoalesceKeyCountSumCollector {
         aggregates: &[AggregateExpr],
         ordered: bool,
     ) -> Result<AggregateMetrics> {
+        let profile = coalesce_key_count_sum_profile_enabled();
+        let total_started = profile.then(Instant::now);
         let merge_started = Instant::now();
         let mut merged_groups: Option<CoalesceKeyCountSumGroups> = None;
         let mut metrics = AggregateMetrics {
             fragments,
             ..AggregateMetrics::default()
         };
+        let mut bind_nanos = 0_u64;
+        let mut reader_nanos = 0_u64;
         let mut update_nanos = 0_u64;
         for partial in partials {
             metrics.batches = metrics.batches.saturating_add(partial.metrics.batches);
             metrics.rows = metrics.rows.saturating_add(partial.metrics.rows);
+            bind_nanos = bind_nanos.saturating_add(partial.bind_nanos);
+            reader_nanos = reader_nanos.saturating_add(partial.reader_nanos);
             update_nanos = update_nanos.saturating_add(partial.update_nanos);
             let Some(groups) = partial.groups else {
                 continue;
@@ -412,9 +465,26 @@ impl CoalesceKeyCountSumCollector {
         }
         metrics.aggregate_nanos = update_nanos;
         metrics.aggregate_merge_nanos = elapsed_nanos(merge_started);
+        let finish_started = Instant::now();
         metrics.groups = merged_groups
             .map(|groups| groups.finish_with_order(aggregates, ordered))
             .unwrap_or_default();
+        let finish_nanos = elapsed_nanos_u64(finish_started);
+        if profile {
+            eprintln!(
+                "[dodam:coalesce-agg-profile] collector total={:.3}ms bind={:.3}ms reader={:.3}ms update={:.3}ms merge={:.3}ms finish={:.3}ms batches={} rows={} groups={} ordered={}",
+                nanos_to_millis_f64(total_started.map(elapsed_nanos_u64).unwrap_or(0)),
+                nanos_to_millis_f64(bind_nanos),
+                nanos_to_millis_f64(reader_nanos),
+                nanos_to_millis_f64(update_nanos),
+                nanos_to_millis_f64(metrics.aggregate_merge_nanos),
+                nanos_to_millis_f64(finish_nanos),
+                metrics.batches,
+                metrics.rows,
+                metrics.groups.len(),
+                ordered,
+            );
+        }
         Ok(metrics)
     }
 }
@@ -566,6 +636,556 @@ impl CoalesceKeyCountSumPlan {
             coalesce: column_index(batch, &self.coalesce_column)?,
             sum: column_index(batch, &self.sum_column)?,
         })
+    }
+
+    fn bind_projected_columns(&self, columns: &[String]) -> Result<BoundCoalesceKeyCountSumPlan> {
+        Ok(BoundCoalesceKeyCountSumPlan {
+            first: projected_column_index(columns, &self.leading_keys[0])?,
+            second: if self.leading_keys.len() == 2 {
+                Some(projected_column_index(columns, &self.leading_keys[1])?)
+            } else {
+                None
+            },
+            coalesce: projected_column_index(columns, &self.coalesce_column)?,
+            sum: projected_column_index(columns, &self.sum_column)?,
+        })
+    }
+}
+
+fn projected_column_index(columns: &[String], column: &str) -> Result<usize> {
+    columns
+        .iter()
+        .position(|candidate| candidate == column)
+        .ok_or_else(|| {
+            DodamError::UnknownColumn(format!("column {column} not found in aggregate projection"))
+        })
+}
+
+enum CoalesceKeyCountSumViewReader<'a> {
+    TwoInt32 {
+        first: I32VectorView<'a>,
+        coalesce: CoalesceUtf8ViewInput<'a>,
+        sum: I64VectorView<'a>,
+    },
+    TwoInt64 {
+        first: I64VectorView<'a>,
+        coalesce: CoalesceUtf8ViewInput<'a>,
+        sum: I64VectorView<'a>,
+    },
+    ThreeInt32Date {
+        first: I32VectorView<'a>,
+        second: Date32VectorView<'a>,
+        coalesce: CoalesceUtf8ViewInput<'a>,
+        sum: I64VectorView<'a>,
+    },
+    ThreeInt64Date {
+        first: I64VectorView<'a>,
+        second: Date32VectorView<'a>,
+        coalesce: CoalesceUtf8ViewInput<'a>,
+        sum: I64VectorView<'a>,
+    },
+}
+
+impl<'a> CoalesceKeyCountSumViewReader<'a> {
+    fn new(view: BatchView<'a>, bound: &BoundCoalesceKeyCountSumPlan) -> Option<Self> {
+        let coalesce = CoalesceUtf8ViewInput::new(view, bound.coalesce)?;
+        let sum = view.i64_vector(bound.sum)?;
+        match (
+            view.i32_vector(bound.first),
+            view.i64_vector(bound.first),
+            bound.second,
+        ) {
+            (Some(first), _, None) => Some(Self::TwoInt32 {
+                first,
+                coalesce,
+                sum,
+            }),
+            (_, Some(first), None) => Some(Self::TwoInt64 {
+                first,
+                coalesce,
+                sum,
+            }),
+            (Some(first), _, Some(second)) => Some(Self::ThreeInt32Date {
+                first,
+                second: view.date32_vector(second)?,
+                coalesce,
+                sum,
+            }),
+            (_, Some(first), Some(second)) => Some(Self::ThreeInt64Date {
+                first,
+                second: view.date32_vector(second)?,
+                coalesce,
+                sum,
+            }),
+            _ => None,
+        }
+    }
+
+    fn update_groups(
+        &self,
+        groups: &mut CoalesceKeyCountSumGroups,
+        row_count: usize,
+        fallback: &'a str,
+    ) {
+        match self {
+            Self::TwoInt32 {
+                first,
+                coalesce,
+                sum,
+            } if first.values_if_null_free().is_some() => {
+                let first_values = first.values_if_null_free().expect("checked non-null");
+                if let Some(mut cache) = CoalesceStringIdViewCache::new(coalesce, groups, fallback)
+                {
+                    if let Some(sum_values) = sum.values_if_null_free() {
+                        for row in 0..row_count {
+                            let string_id = cache.string_id(coalesce, groups, row);
+                            groups.update_two_non_null_string_id_sum(
+                                first_values[row].into(),
+                                string_id,
+                                sum_values[row],
+                            );
+                        }
+                    } else {
+                        for (row, first) in first_values.iter().copied().enumerate().take(row_count)
+                        {
+                            let string_id = cache.string_id(coalesce, groups, row);
+                            groups.update_two_non_null_string_id(
+                                first.into(),
+                                string_id,
+                                sum_value(sum, row),
+                            );
+                        }
+                    }
+                } else {
+                    for (row, first) in first_values.iter().copied().enumerate().take(row_count) {
+                        groups.update_two_non_null(
+                            first.into(),
+                            coalesce
+                                .key(row, fallback)
+                                .expect("coalesce key is non-null"),
+                            sum_value(sum, row),
+                        );
+                    }
+                }
+            }
+            Self::TwoInt64 {
+                first,
+                coalesce,
+                sum,
+            } if first.values_if_null_free().is_some() => {
+                let first_values = first.values_if_null_free().expect("checked non-null");
+                if let Some(mut cache) = CoalesceStringIdViewCache::new(coalesce, groups, fallback)
+                {
+                    if let Some(sum_values) = sum.values_if_null_free() {
+                        for row in 0..row_count {
+                            let string_id = cache.string_id(coalesce, groups, row);
+                            groups.update_two_non_null_string_id_sum(
+                                first_values[row],
+                                string_id,
+                                sum_values[row],
+                            );
+                        }
+                    } else {
+                        for (row, first) in first_values.iter().copied().enumerate().take(row_count)
+                        {
+                            let string_id = cache.string_id(coalesce, groups, row);
+                            groups.update_two_non_null_string_id(
+                                first,
+                                string_id,
+                                sum_value(sum, row),
+                            );
+                        }
+                    }
+                } else {
+                    for (row, first) in first_values.iter().copied().enumerate().take(row_count) {
+                        groups.update_two_non_null(
+                            first,
+                            coalesce
+                                .key(row, fallback)
+                                .expect("coalesce key is non-null"),
+                            sum_value(sum, row),
+                        );
+                    }
+                }
+            }
+            Self::ThreeInt32Date {
+                first,
+                second,
+                coalesce,
+                sum,
+            } if first.values_if_null_free().is_some()
+                && second.values_if_null_free().is_some() =>
+            {
+                let first_values = first.values_if_null_free().expect("checked non-null");
+                let second_values = second.values_if_null_free().expect("checked non-null");
+                if let Some(mut cache) = CoalesceStringIdViewCache::new(coalesce, groups, fallback)
+                {
+                    if let Some(sum_values) = sum.values_if_null_free() {
+                        for row in 0..row_count {
+                            let string_id = cache.string_id(coalesce, groups, row);
+                            groups.update_three_non_null_string_id_sum(
+                                first_values[row].into(),
+                                second_values[row],
+                                string_id,
+                                sum_values[row],
+                            );
+                        }
+                    } else {
+                        for row in 0..row_count {
+                            let string_id = cache.string_id(coalesce, groups, row);
+                            groups.update_three_non_null_string_id(
+                                first_values[row].into(),
+                                second_values[row],
+                                string_id,
+                                sum_value(sum, row),
+                            );
+                        }
+                    }
+                } else {
+                    for row in 0..row_count {
+                        groups.update_three_non_null(
+                            first_values[row].into(),
+                            second_values[row],
+                            coalesce
+                                .key(row, fallback)
+                                .expect("coalesce key is non-null"),
+                            sum_value(sum, row),
+                        );
+                    }
+                }
+            }
+            Self::ThreeInt64Date {
+                first,
+                second,
+                coalesce,
+                sum,
+            } if first.values_if_null_free().is_some()
+                && second.values_if_null_free().is_some() =>
+            {
+                let first_values = first.values_if_null_free().expect("checked non-null");
+                let second_values = second.values_if_null_free().expect("checked non-null");
+                if let Some(mut cache) = CoalesceStringIdViewCache::new(coalesce, groups, fallback)
+                {
+                    if let Some(sum_values) = sum.values_if_null_free() {
+                        for row in 0..row_count {
+                            let string_id = cache.string_id(coalesce, groups, row);
+                            groups.update_three_non_null_string_id_sum(
+                                first_values[row],
+                                second_values[row],
+                                string_id,
+                                sum_values[row],
+                            );
+                        }
+                    } else {
+                        for row in 0..row_count {
+                            let string_id = cache.string_id(coalesce, groups, row);
+                            groups.update_three_non_null_string_id(
+                                first_values[row],
+                                second_values[row],
+                                string_id,
+                                sum_value(sum, row),
+                            );
+                        }
+                    }
+                } else {
+                    for row in 0..row_count {
+                        groups.update_three_non_null(
+                            first_values[row],
+                            second_values[row],
+                            coalesce
+                                .key(row, fallback)
+                                .expect("coalesce key is non-null"),
+                            sum_value(sum, row),
+                        );
+                    }
+                }
+            }
+            _ => {
+                for row in 0..row_count {
+                    groups.update(self.key(row, fallback), self.sum_value(row));
+                }
+            }
+        }
+    }
+
+    fn key(&self, row: usize, fallback: &'a str) -> CoalesceKeyBorrowed<'a> {
+        match self {
+            Self::TwoInt32 {
+                first, coalesce, ..
+            } => CoalesceKeyBorrowed {
+                first: (!first.is_null(row)).then(|| i64::from(first.value(row))),
+                second: None,
+                third: coalesce.key(row, fallback),
+            },
+            Self::TwoInt64 {
+                first, coalesce, ..
+            } => CoalesceKeyBorrowed {
+                first: (!first.is_null(row)).then(|| first.value(row)),
+                second: None,
+                third: coalesce.key(row, fallback),
+            },
+            Self::ThreeInt32Date {
+                first,
+                second,
+                coalesce,
+                ..
+            } => CoalesceKeyBorrowed {
+                first: (!first.is_null(row)).then(|| i64::from(first.value(row))),
+                second: (!second.is_null(row)).then(|| second.value(row)),
+                third: coalesce.key(row, fallback),
+            },
+            Self::ThreeInt64Date {
+                first,
+                second,
+                coalesce,
+                ..
+            } => CoalesceKeyBorrowed {
+                first: (!first.is_null(row)).then(|| first.value(row)),
+                second: (!second.is_null(row)).then(|| second.value(row)),
+                third: coalesce.key(row, fallback),
+            },
+        }
+    }
+
+    fn sum_value(&self, row: usize) -> Option<i64> {
+        match self {
+            Self::TwoInt32 { sum, .. }
+            | Self::TwoInt64 { sum, .. }
+            | Self::ThreeInt32Date { sum, .. }
+            | Self::ThreeInt64Date { sum, .. } => sum_value(sum, row),
+        }
+    }
+
+    fn dense_leading_range(&self, row_count: usize) -> Option<DenseLeadingRange> {
+        const MAX_DENSE_LEADING_SLOTS: usize = 4096;
+        let (first_min, first_max, second_min, second_max) = match self {
+            Self::TwoInt32 { first, .. } => {
+                let (first_min, first_max) = i32_view_non_null_min_max_as_i64(first, row_count)?;
+                (first_min, first_max, 0, 0)
+            }
+            Self::TwoInt64 { first, .. } => {
+                let (first_min, first_max) = i64_view_non_null_min_max(first, row_count)?;
+                (first_min, first_max, 0, 0)
+            }
+            Self::ThreeInt32Date { first, second, .. } => {
+                let (first_min, first_max) = i32_view_non_null_min_max_as_i64(first, row_count)?;
+                let (second_min, second_max) = date32_view_non_null_min_max(second, row_count)?;
+                (first_min, first_max, second_min, second_max)
+            }
+            Self::ThreeInt64Date { first, second, .. } => {
+                let (first_min, first_max) = i64_view_non_null_min_max(first, row_count)?;
+                let (second_min, second_max) = date32_view_non_null_min_max(second, row_count)?;
+                (first_min, first_max, second_min, second_max)
+            }
+        };
+        let first_len = usize::try_from(first_max.checked_sub(first_min)? + 1).ok()?;
+        let second_len = usize::try_from(second_max.checked_sub(second_min)? + 1).ok()?;
+        if first_len == 0
+            || second_len == 0
+            || first_len.checked_mul(second_len)? > MAX_DENSE_LEADING_SLOTS
+        {
+            return None;
+        }
+        Some(DenseLeadingRange {
+            first_min,
+            first_len,
+            second_min,
+            second_len,
+        })
+    }
+}
+
+fn sum_value(sum: &I64VectorView<'_>, row: usize) -> Option<i64> {
+    (!sum.is_null(row)).then(|| sum.value(row))
+}
+
+fn i32_view_non_null_min_max_as_i64(
+    values: &I32VectorView<'_>,
+    row_count: usize,
+) -> Option<(i64, i64)> {
+    i32_view_non_null_min_max(values, row_count).map(|(min, max)| (i64::from(min), i64::from(max)))
+}
+
+fn i32_view_non_null_min_max(values: &I32VectorView<'_>, row_count: usize) -> Option<(i32, i32)> {
+    let values = values.values_if_null_free()?;
+    let values = values.get(..row_count)?;
+    let mut min = i32::MAX;
+    let mut max = i32::MIN;
+    for value in values {
+        min = min.min(*value);
+        max = max.max(*value);
+    }
+    Some((min, max))
+}
+
+fn i64_view_non_null_min_max(values: &I64VectorView<'_>, row_count: usize) -> Option<(i64, i64)> {
+    let values = values.values_if_null_free()?;
+    let values = values.get(..row_count)?;
+    let mut min = i64::MAX;
+    let mut max = i64::MIN;
+    for value in values {
+        min = min.min(*value);
+        max = max.max(*value);
+    }
+    Some((min, max))
+}
+
+fn date32_view_non_null_min_max(
+    values: &Date32VectorView<'_>,
+    row_count: usize,
+) -> Option<(i32, i32)> {
+    let values = values.values_if_null_free()?;
+    let values = values.get(..row_count)?;
+    let mut min = i32::MAX;
+    let mut max = i32::MIN;
+    for value in values {
+        min = min.min(*value);
+        max = max.max(*value);
+    }
+    Some((min, max))
+}
+
+#[derive(Clone, Copy)]
+enum CoalesceUtf8ViewInput<'a> {
+    Utf8(Utf8VectorView<'a>),
+    DictionaryI32 {
+        dictionary: DictionaryI32View<'a>,
+        values: DictionaryStringValues<'a>,
+    },
+}
+
+impl<'a> CoalesceUtf8ViewInput<'a> {
+    fn new(view: BatchView<'a>, index: usize) -> Option<Self> {
+        if let Some(values) = view.utf8_vector(index) {
+            return Some(Self::Utf8(values));
+        }
+        let dictionary = view.dictionary_i32_view(index)?;
+        let values = dictionary.string_values_for_view()?;
+        Some(Self::DictionaryI32 { dictionary, values })
+    }
+
+    fn key(self, row: usize, fallback: &'a str) -> Option<&'a str> {
+        match self {
+            Self::Utf8(values) => {
+                if values.is_valid(row) {
+                    Some(std::str::from_utf8(values.value_bytes(row)).expect("valid Utf8"))
+                } else {
+                    Some(fallback)
+                }
+            }
+            Self::DictionaryI32 { dictionary, values } => {
+                if dictionary.is_null(row) {
+                    return Some(fallback);
+                }
+                let Ok(id) = usize::try_from(dictionary.keys()[row]) else {
+                    return Some(fallback);
+                };
+                Some(std::str::from_utf8(values.value_bytes(id)).expect("valid Utf8 dictionary"))
+            }
+        }
+    }
+
+    fn dictionary_key(self, row: usize) -> Option<i32> {
+        match self {
+            Self::DictionaryI32 { dictionary, .. } if !dictionary.is_null(row) => {
+                dictionary.keys().get(row).copied()
+            }
+            Self::DictionaryI32 { .. } | Self::Utf8(_) => None,
+        }
+    }
+
+    fn dictionary_value(self, id: usize) -> Option<&'a str> {
+        let Self::DictionaryI32 { values, .. } = self else {
+            return None;
+        };
+        Some(std::str::from_utf8(values.value_bytes(id)).expect("valid Utf8 dictionary"))
+    }
+
+    fn utf8_value(self, row: usize) -> Option<&'a str> {
+        let Self::Utf8(values) = self else {
+            return None;
+        };
+        values
+            .is_valid(row)
+            .then(|| std::str::from_utf8(values.value_bytes(row)).expect("valid Utf8"))
+    }
+
+    fn dictionary_len(self) -> Option<usize> {
+        let Self::DictionaryI32 { values, .. } = self else {
+            return None;
+        };
+        Some(values.len())
+    }
+}
+
+enum CoalesceStringIdViewCache<'a> {
+    Utf8 {
+        fallback_id: u32,
+        ids: AggregateHashMap<&'a str, u32>,
+    },
+    Dictionary {
+        fallback_id: u32,
+        ids: Vec<Option<u32>>,
+    },
+}
+
+impl<'a> CoalesceStringIdViewCache<'a> {
+    fn new(
+        coalesce: &CoalesceUtf8ViewInput<'a>,
+        groups: &mut CoalesceKeyCountSumGroups,
+        fallback: &str,
+    ) -> Option<Self> {
+        let fallback_id = groups.string_id(fallback);
+        match coalesce {
+            CoalesceUtf8ViewInput::Utf8(_) => Some(Self::Utf8 {
+                fallback_id,
+                ids: AggregateHashMap::default(),
+            }),
+            CoalesceUtf8ViewInput::DictionaryI32 { .. } => Some(Self::Dictionary {
+                fallback_id,
+                ids: vec![None; coalesce.dictionary_len()?],
+            }),
+        }
+    }
+
+    fn string_id(
+        &mut self,
+        coalesce: &CoalesceUtf8ViewInput<'a>,
+        groups: &mut CoalesceKeyCountSumGroups,
+        row: usize,
+    ) -> u32 {
+        match self {
+            Self::Utf8 { fallback_id, ids } => {
+                let Some(value) = coalesce.utf8_value(row) else {
+                    return *fallback_id;
+                };
+                if let Some(string_id) = ids.get(value).copied() {
+                    return string_id;
+                }
+                let string_id = groups.string_id(value);
+                ids.insert(value, string_id);
+                string_id
+            }
+            Self::Dictionary { fallback_id, ids } => {
+                let Some(id) = coalesce.dictionary_key(row) else {
+                    return *fallback_id;
+                };
+                let Ok(index) = usize::try_from(id) else {
+                    return *fallback_id;
+                };
+                if let Some(string_id) = ids.get(index).and_then(|id| *id) {
+                    return string_id;
+                }
+                let Some(value) = coalesce.dictionary_value(index) else {
+                    return *fallback_id;
+                };
+                let string_id = groups.string_id(value);
+                if let Some(slot) = ids.get_mut(index) {
+                    *slot = Some(string_id);
+                }
+                string_id
+            }
+        }
     }
 }
 
@@ -1140,6 +1760,29 @@ impl CoalesceKeyCountSumGroups {
         self.groups[group_id].update(sum);
     }
 
+    fn update_three_non_null_string_id_sum(
+        &mut self,
+        first: i64,
+        second: i32,
+        string_id: u32,
+        sum: i64,
+    ) {
+        let third_index = self.index.third_groups_three_non_null(first, second);
+        let group_id = if let Some(group_id) = third_index.non_null.get(string_id) {
+            group_id
+        } else {
+            let group_id = self.groups.len();
+            third_index.non_null.insert(string_id, group_id);
+            self.groups.push(CoalesceKeyCountSumGroup::new(
+                Some(first),
+                Some(second),
+                Some(string_id),
+            ));
+            group_id
+        };
+        self.groups[group_id].update_non_null(sum);
+    }
+
     fn update_two_non_null(&mut self, first: i64, third: &str, sum: Option<i64>) {
         let string_id = self.string_id(third);
         self.update_two_non_null_string_id(first, string_id, sum);
@@ -1160,6 +1803,23 @@ impl CoalesceKeyCountSumGroups {
             group_id
         };
         self.groups[group_id].update(sum);
+    }
+
+    fn update_two_non_null_string_id_sum(&mut self, first: i64, string_id: u32, sum: i64) {
+        let third_index = self.index.third_groups_two_non_null(first);
+        let group_id = if let Some(group_id) = third_index.non_null.get(string_id) {
+            group_id
+        } else {
+            let group_id = self.groups.len();
+            third_index.non_null.insert(string_id, group_id);
+            self.groups.push(CoalesceKeyCountSumGroup::new(
+                Some(first),
+                None,
+                Some(string_id),
+            ));
+            group_id
+        };
+        self.groups[group_id].update_non_null(sum);
     }
 
     fn merge_from(&mut self, other: CoalesceKeyCountSumGroups) -> Result<()> {
@@ -1693,6 +2353,12 @@ impl CoalesceKeyCountSumGroup {
             self.sum += sum;
             self.sum_count += 1;
         }
+    }
+
+    fn update_non_null(&mut self, sum: i64) {
+        self.count += 1;
+        self.sum += sum;
+        self.sum_count += 1;
     }
 
     fn merge_counts(&mut self, count: u64, sum: i64, sum_count: u64) {

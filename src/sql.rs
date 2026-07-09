@@ -46,12 +46,12 @@ use crate::execution::{
     AggregateExpr, AggregateMetrics, AggregateResult, AggregateValue, CoalesceKeyCountSumCollector,
     ComparisonExpr, ComparisonOp, DecimalInput, DistinctExec, Expr, FilterExpr,
     GroupAggregateResult, GroupKeyExpr, GroupKeyLiteral, GroupValue, HashJoinExec, JoinBuildSide,
-    LiteralValue, MemoryExec, PhysicalPlan, Projection, RecordBatchSink, ScanPlanMetrics,
-    SendableBatchStream, SortExpr, SortKey, aggregate_metrics_to_batches, collect_aggregates,
-    collect_grouped_aggregates, collect_grouped_aggregates_with_key_exprs,
+    LiteralValue, MemoryExec, PhysicalPlan, PredicateSet, Projection, RecordBatchSink,
+    ScanPlanMetrics, SendableBatchStream, SortExpr, SortKey, aggregate_metrics_to_batches,
+    collect_aggregates, collect_grouped_aggregates, collect_grouped_aggregates_with_key_exprs,
     decimal_discounted_revenue_raw, decimal_discounted_revenue_raw_i64,
-    decimal_discounted_revenue_scales, decimal_input, evaluate_filter_mask, filter_batch,
-    try_for_each_i64_i64_date32,
+    decimal_discounted_revenue_scales, decimal_input, evaluate_filter_mask,
+    evaluate_projected_view_filter_mask, filter_batch, try_for_each_i64_i64_date32,
 };
 use crate::hash::{FastHashMap, FastHashSet, fast_hash_map, fast_hash_map_with_capacity};
 use crate::optimizer::{JoinInputPlan, plan_join_inputs};
@@ -32343,7 +32343,7 @@ fn join_coalesce_late_left_row_group_chunk() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(2)
+        .unwrap_or(1)
 }
 
 fn join_coalesce_late_left_max_selected_ratio() -> f64 {
@@ -41772,7 +41772,7 @@ async fn try_collect_expression_aggregate_late_materialized(
                 let predicate_columns = predicate_columns.clone();
                 move |view, selection, _collector| {
                     let mask = if let Some(mask) =
-                        evaluate_filter_mask_for_projected_view(view, &predicate_columns, &filter)?
+                        evaluate_projected_view_filter_mask(view, &predicate_columns, &filter)?
                     {
                         mask
                     } else {
@@ -41839,7 +41839,72 @@ async fn try_collect_expression_aggregate_scan_fold(
     if let Some(filter) = filter.as_ref() {
         add_projection_columns(&mut projection, filter.referenced_columns());
     }
+    let Projection::Columns(projected_columns) = &projection else {
+        return Ok(None);
+    };
+    let projected_columns = projected_columns.clone();
     let aggregates = aggregates.to_vec();
+    let dictionary_columns = expression_aggregate_dictionary_columns(&group_keys);
+    if !dictionary_columns.is_empty()
+        && expression_aggregate_dictionary_scan_fold_enabled()
+        && let Some(filter_for_dictionary) = filter.clone()
+    {
+        let predicates = PredicateSet::new(Some(filter_for_dictionary.clone()));
+        let group_keys_for_state = group_keys.clone();
+        let aggregates_for_state = aggregates.clone();
+        if let Some(partials) = engine
+            .parquet_row_group_map_dictionary_columns_pruned_view(
+                path.clone(),
+                batch_size,
+                projection.clone(),
+                dictionary_columns,
+                predicates.pushdown().to_vec(),
+                expression_aggregate_dictionary_scan_fold_row_group_chunk(),
+                move || {
+                    CoalesceKeyCountSumCollector::new(&group_keys_for_state, &aggregates_for_state)
+                        .expect("expression aggregate dictionary scan-fold precondition")
+                },
+                {
+                    let projected_columns = projected_columns.clone();
+                    move |view, collector: &mut CoalesceKeyCountSumCollector| {
+                        let mask = if let Some(mask) = evaluate_projected_view_filter_mask(
+                            view,
+                            &projected_columns,
+                            &filter_for_dictionary,
+                        )? {
+                            mask
+                        } else {
+                            let Some(batch) = view.try_record_batch() else {
+                                return Ok(None);
+                            };
+                            evaluate_filter_mask(batch, &filter_for_dictionary)?
+                        };
+                        if mask.true_count() == 0 {
+                            return Ok(Some(()));
+                        }
+                        let Some(batch) = view.try_record_batch() else {
+                            return Ok(None);
+                        };
+                        let batch = filter_record_batch(batch, &mask)?;
+                        collector
+                            .consume_projected_view(BatchView::new(&batch), &projected_columns)?;
+                        Ok(Some(()))
+                    }
+                },
+                |collector| Ok(Some(collector)),
+            )
+            .await?
+        {
+            return Ok(Some(
+                CoalesceKeyCountSumCollector::merge_partials_with_order(
+                    partials,
+                    1,
+                    &aggregates,
+                    ordered_output,
+                )?,
+            ));
+        }
+    }
     let collector = engine
         .scan_parquet_batches_fold_view(
             path,
@@ -41848,15 +41913,7 @@ async fn try_collect_expression_aggregate_scan_fold(
             projection.clone(),
             filter,
             collector,
-            |view, collector| {
-                let Some(batch) = view.try_record_batch() else {
-                    return Err(DodamError::UnsupportedSql(
-                        "expression aggregate scan-fold requires RecordBatch collector input"
-                            .to_string(),
-                    ));
-                };
-                collector.consume_batch(batch)
-            },
+            move |view, collector| collector.consume_projected_view(view, &projected_columns),
             Ok,
         )
         .await?;
@@ -41870,6 +41927,7 @@ async fn try_collect_expression_aggregate_scan_fold(
     ))
 }
 
+#[allow(dead_code)]
 fn evaluate_filter_mask_for_projected_view(
     view: BatchView<'_>,
     columns: &[String],
@@ -42286,6 +42344,19 @@ fn expression_aggregate_scan_fold_enabled() -> bool {
     std::env::var("DODAM_DISABLE_EXPRESSION_AGG_SCAN_FOLD")
         .map(|value| !matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(true)
+}
+
+fn expression_aggregate_dictionary_scan_fold_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_EXPRESSION_AGG_DICTIONARY_SCAN_FOLD")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn expression_aggregate_dictionary_scan_fold_row_group_chunk() -> usize {
+    std::env::var("DODAM_EXPRESSION_AGG_DICTIONARY_SCAN_FOLD_ROW_GROUP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1)
 }
 
 fn expression_aggregate_late_materialized_enabled() -> bool {

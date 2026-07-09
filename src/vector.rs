@@ -743,7 +743,7 @@ fn string_array_value_bytes<'a>(offsets: &[i32], data: &'a [u8], row: usize) -> 
     &data[start..end]
 }
 
-impl DictionaryI32View<'_> {
+impl<'a> DictionaryI32View<'a> {
     pub(crate) fn keys(&self) -> &[i32] {
         match self {
             Self::Arrow(dictionary) => dictionary.keys().values().as_ref(),
@@ -766,6 +766,10 @@ impl DictionaryI32View<'_> {
     }
 
     pub(crate) fn string_values(&self) -> Option<DictionaryStringValues<'_>> {
+        self.string_values_for_view()
+    }
+
+    pub(crate) fn string_values_for_view(&self) -> Option<DictionaryStringValues<'a>> {
         match self {
             Self::Arrow(dictionary) => dictionary_i32_string_values(dictionary),
             Self::Raw { values, .. } => Some(*values),

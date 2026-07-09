@@ -26,6 +26,7 @@ pub use logical::{
 pub use metrics::{
     RecordBatchSink, ScanMetrics, ScanPlanMetrics, SendableBatchStream, write_stream_to_sink,
 };
+pub(crate) use physical::evaluate_projected_view_filter_mask;
 pub use physical::{
     DirectPrimitiveFoldExec, DistinctExec, FilterExec, FinalMergeExec, HashJoinExec, IpcExec,
     JoinBuildSide, JoinType, LimitExec, LocalFoldExec, MemoryExec, PartitionedHashJoinExec,

@@ -48,7 +48,7 @@ use crate::storage::{
     ParquetFileCache, ParquetMetadataCache, ParquetScanTask, plan_parquet_scan_tasks,
     scan_parquet_primitive_columns_with_store,
 };
-use crate::vector::BatchView;
+use crate::vector::{BatchView, Date32VectorView, I32VectorView, I64VectorView};
 
 pub struct ScanExec {
     fragments: Vec<FileFragment>,
@@ -9094,6 +9094,233 @@ pub fn filter_batch(batch: RecordBatch, filter: &FilterExpr) -> Result<RecordBat
 
 pub fn evaluate_filter_mask(batch: &RecordBatch, filter: &FilterExpr) -> Result<BooleanArray> {
     evaluate_filter(batch, filter.expr())
+}
+
+pub(crate) fn evaluate_projected_view_filter_mask(
+    view: BatchView<'_>,
+    columns: &[String],
+    filter: &FilterExpr,
+) -> Result<Option<BooleanArray>> {
+    evaluate_projected_view_expr_mask(view, columns, filter.expr())
+}
+
+fn evaluate_projected_view_expr_mask(
+    view: BatchView<'_>,
+    columns: &[String],
+    expr: &Expr,
+) -> Result<Option<BooleanArray>> {
+    match expr {
+        Expr::Boolean(value) => Ok(Some(BooleanArray::from(vec![*value; view.num_rows()]))),
+        Expr::Comparison(comparison) => {
+            evaluate_projected_view_comparison_mask(view, columns, comparison)
+        }
+        Expr::InList {
+            column,
+            values,
+            negated,
+            has_null,
+        } => {
+            evaluate_projected_view_in_list_mask(view, columns, column, values, *negated, *has_null)
+        }
+        Expr::Not(expr) => {
+            let Some(mask) = evaluate_projected_view_expr_mask(view, columns, expr)? else {
+                return Ok(None);
+            };
+            Ok(Some(not_mask(&mask)))
+        }
+        Expr::And(left, right) => {
+            let Some(left) = evaluate_projected_view_expr_mask(view, columns, left)? else {
+                return Ok(None);
+            };
+            let Some(right) = evaluate_projected_view_expr_mask(view, columns, right)? else {
+                return Ok(None);
+            };
+            Ok(Some(and_masks(&left, &right)))
+        }
+        Expr::Or(left, right) => {
+            let Some(left) = evaluate_projected_view_expr_mask(view, columns, left)? else {
+                return Ok(None);
+            };
+            let Some(right) = evaluate_projected_view_expr_mask(view, columns, right)? else {
+                return Ok(None);
+            };
+            Ok(Some(or_masks(&left, &right)))
+        }
+        Expr::ColumnComparison { .. } | Expr::Like { .. } | Expr::IsNull { .. } => Ok(None),
+    }
+}
+
+fn evaluate_projected_view_comparison_mask(
+    view: BatchView<'_>,
+    columns: &[String],
+    comparison: &ComparisonExpr,
+) -> Result<Option<BooleanArray>> {
+    if matches!(comparison.value, crate::execution::LiteralValue::Null) {
+        return Ok(Some(BooleanArray::from(vec![None; view.num_rows()])));
+    }
+    let Some(index) = projected_view_column_index(columns, &comparison.column) else {
+        return Ok(None);
+    };
+    if let Some(values) = view.i64_vector(index) {
+        let value = comparison.value.as_i64(&comparison.column)?;
+        return Ok(Some(compare_i64_view(values, comparison.op, value)));
+    }
+    if let Some(values) = view.i32_vector(index) {
+        let value = comparison.value.as_i32(&comparison.column)?;
+        return Ok(Some(compare_i32_view(values, comparison.op, value)));
+    }
+    if let Some(values) = view.date32_vector(index) {
+        let value = date_literal_as_i32(&comparison.value, &comparison.column)?;
+        return Ok(Some(compare_date32_view(values, comparison.op, value)));
+    }
+    Ok(None)
+}
+
+fn evaluate_projected_view_in_list_mask(
+    view: BatchView<'_>,
+    columns: &[String],
+    column: &str,
+    values: &[crate::execution::LiteralValue],
+    negated: bool,
+    has_null: bool,
+) -> Result<Option<BooleanArray>> {
+    let Some(index) = projected_view_column_index(columns, column) else {
+        return Ok(None);
+    };
+    if let Some(probe) = view.i64_vector(index) {
+        let values = values
+            .iter()
+            .filter(|value| !matches!(value, crate::execution::LiteralValue::Null))
+            .map(|value| value.as_i64(column))
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(Some(in_list_i64_view(probe, &values, negated, has_null)));
+    }
+    if let Some(probe) = view.i32_vector(index) {
+        let values = values
+            .iter()
+            .filter(|value| !matches!(value, crate::execution::LiteralValue::Null))
+            .map(|value| value.as_i32(column))
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(Some(in_list_i32_view(probe, &values, negated, has_null)));
+    }
+    Ok(None)
+}
+
+fn projected_view_column_index(columns: &[String], column: &str) -> Option<usize> {
+    columns.iter().position(|candidate| candidate == column)
+}
+
+fn compare_i64_view(values: I64VectorView<'_>, op: ComparisonOp, literal: i64) -> BooleanArray {
+    BooleanArray::from(
+        (0..values.len())
+            .map(|row| {
+                if values.is_null(row) {
+                    None
+                } else {
+                    Some(compare_i64(values.value(row), op, literal))
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn compare_i64(left: i64, op: ComparisonOp, right: i64) -> bool {
+    match op {
+        ComparisonOp::Eq => left == right,
+        ComparisonOp::NotEq => left != right,
+        ComparisonOp::Lt => left < right,
+        ComparisonOp::LtEq => left <= right,
+        ComparisonOp::Gt => left > right,
+        ComparisonOp::GtEq => left >= right,
+    }
+}
+
+fn compare_i32_view(values: I32VectorView<'_>, op: ComparisonOp, literal: i32) -> BooleanArray {
+    BooleanArray::from(
+        (0..values.len())
+            .map(|row| {
+                if values.is_null(row) {
+                    None
+                } else {
+                    Some(compare_i64(
+                        i64::from(values.value(row)),
+                        op,
+                        i64::from(literal),
+                    ))
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn compare_date32_view(
+    values: Date32VectorView<'_>,
+    op: ComparisonOp,
+    literal: i32,
+) -> BooleanArray {
+    BooleanArray::from(
+        (0..values.len())
+            .map(|row| {
+                if values.is_null(row) {
+                    None
+                } else {
+                    Some(compare_i64(
+                        i64::from(values.value(row)),
+                        op,
+                        i64::from(literal),
+                    ))
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn in_list_i64_view(
+    values: I64VectorView<'_>,
+    list: &[i64],
+    negated: bool,
+    has_null: bool,
+) -> BooleanArray {
+    BooleanArray::from(
+        (0..values.len())
+            .map(|row| {
+                if values.is_null(row) {
+                    None
+                } else {
+                    in_list_result(list.contains(&values.value(row)), negated, has_null)
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn in_list_i32_view(
+    values: I32VectorView<'_>,
+    list: &[i32],
+    negated: bool,
+    has_null: bool,
+) -> BooleanArray {
+    BooleanArray::from(
+        (0..values.len())
+            .map(|row| {
+                if values.is_null(row) {
+                    None
+                } else {
+                    in_list_result(list.contains(&values.value(row)), negated, has_null)
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn in_list_result(matched: bool, negated: bool, has_null: bool) -> Option<bool> {
+    if matched {
+        Some(!negated)
+    } else if has_null {
+        None
+    } else {
+        Some(negated)
+    }
 }
 
 fn evaluate_filter(batch: &RecordBatch, expr: &Expr) -> Result<BooleanArray> {
