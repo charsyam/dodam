@@ -28,6 +28,12 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=16 * 1024)
     parser.add_argument(
+        "--fixture-scale",
+        type=int,
+        default=1,
+        help="Scale generic fixture row counts. 1 keeps the historical 600k facts rows.",
+    )
+    parser.add_argument(
         "--dodam-mode",
         choices=["query", "query-file"],
         default="query",
@@ -59,11 +65,15 @@ def main() -> int:
     args = parser.parse_args()
 
     work_dir = Path(args.work_dir)
-    data_dir = work_dir / "data"
+    if args.fixture_scale <= 0:
+        raise SystemExit("--fixture-scale must be positive")
+    data_dir = work_dir / (
+        "data" if args.fixture_scale == 1 else f"data_sf{args.fixture_scale}"
+    )
     output_dir = work_dir / "out"
     data_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
-    ensure_fixture(args.duckdb, data_dir, args.timeout)
+    ensure_fixture(args.duckdb, data_dir, args.timeout, args.fixture_scale)
 
     queries = filter_queries(generic_queries(data_dir), args.only)
     if not queries:
@@ -92,12 +102,14 @@ def main() -> int:
     return 0
 
 
-def ensure_fixture(duckdb: str, data_dir: Path, timeout: float) -> None:
+def ensure_fixture(duckdb: str, data_dir: Path, timeout: float, scale: int) -> None:
     facts = data_dir / "facts.parquet"
     dim = data_dir / "dim.parquet"
     nested = data_dir / "nested.parquet"
     if facts.exists() and dim.exists() and nested.exists():
         return
+    facts_rows = 600_000 * scale
+    nested_rows = 20_000 * scale
     sql = f"""
 COPY (
   SELECT
@@ -108,7 +120,7 @@ COPY (
     CASE WHEN i % 13 = 0 THEN NULL ELSE 'label-' || (i % 64)::VARCHAR END AS label,
     CAST((i % 10000) / 100.0 AS DECIMAL(18,2)) AS amount,
     DATE '2024-01-01' + ((i % 31)::INTEGER) AS event_date
-  FROM range(0, 600000) AS t(i)
+  FROM range(0, {facts_rows}) AS t(i)
 ) TO '{facts}' (FORMAT PARQUET, COMPRESSION ZSTD);
 COPY (
   SELECT
@@ -122,7 +134,7 @@ COPY (
     i::INTEGER AS id,
     [i::INTEGER, (i + 1)::INTEGER, NULL] AS tags,
     struct_pack(rank := (i % 7)::INTEGER, label := 'n-' || (i % 16)::VARCHAR) AS attrs
-  FROM range(0, 20000) AS t(i)
+  FROM range(0, {nested_rows}) AS t(i)
 ) TO '{nested}' (FORMAT PARQUET, COMPRESSION ZSTD);
 """
     completed = subprocess.run(

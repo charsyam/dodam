@@ -2311,11 +2311,10 @@ where
             )
         })?;
     let schema = reader.metadata().file_metadata().schema_descr();
-    for &column_index in &[key_column, sum_column, decimal_column, date_column] {
-        if schema.column(column_index).max_def_level() != 0 {
-            return Ok(None);
-        }
-    }
+    let key_required = schema.column(key_column).max_def_level() == 0;
+    let sum_required = schema.column(sum_column).max_def_level() == 0;
+    let decimal_required = schema.column(decimal_column).max_def_level() == 0;
+    let date_required = schema.column(date_column).max_def_level() == 0;
     let mut metrics = DirectPrimitiveColumnScanMetrics {
         row_groups: row_groups.len(),
         column_read_nanos: vec![0; 4],
@@ -2341,6 +2340,10 @@ where
         };
         let mut decimal_values = Vec::<i64>::with_capacity(batch_size);
         let mut date_values = Vec::<i32>::with_capacity(batch_size);
+        let mut key_def_levels = Vec::<i16>::with_capacity(batch_size);
+        let mut sum_def_levels = Vec::<i16>::with_capacity(batch_size);
+        let mut decimal_def_levels = Vec::<i16>::with_capacity(batch_size);
+        let mut date_def_levels = Vec::<i16>::with_capacity(batch_size);
         let mut selected_keys = Vec::<i32>::with_capacity(batch_size);
         let mut selected_sums = Vec::<i64>::with_capacity(batch_size);
         let mut selected_decimals = Vec::<i64>::with_capacity(batch_size);
@@ -2349,6 +2352,10 @@ where
         loop {
             decimal_values.clear();
             date_values.clear();
+            key_def_levels.clear();
+            sum_def_levels.clear();
+            decimal_def_levels.clear();
+            date_def_levels.clear();
             selected_keys.clear();
             selected_sums.clear();
             selected_decimals.clear();
@@ -2356,24 +2363,36 @@ where
             selected_runs.clear();
             let read_started = Instant::now();
             let decimal_started = Instant::now();
-            let (records, value_count, level_count) =
-                decimal_reader.read_records(batch_size, None, None, &mut decimal_values)?;
+            let (records, value_count, level_count) = decimal_reader.read_records(
+                batch_size,
+                (!decimal_required).then_some(&mut decimal_def_levels),
+                None,
+                &mut decimal_values,
+            )?;
             metrics.add_column_read_nanos(2, elapsed_nanos(decimal_started));
             if records == 0 {
                 metrics.add_read_nanos(elapsed_nanos(read_started));
                 break;
             }
-            if value_count != records || !direct_def_levels_match(level_count, records, true) {
+            if value_count != records
+                || !direct_def_levels_match(level_count, records, decimal_required)
+                || !direct_all_present(decimal_required, &decimal_def_levels)
+            {
                 metrics.add_read_nanos(elapsed_nanos(read_started));
                 return Ok(None);
             }
             let date_started = Instant::now();
-            let (date_records, date_value_count, date_level_count) =
-                date_reader.read_records(records, None, None, &mut date_values)?;
+            let (date_records, date_value_count, date_level_count) = date_reader.read_records(
+                records,
+                (!date_required).then_some(&mut date_def_levels),
+                None,
+                &mut date_values,
+            )?;
             metrics.add_column_read_nanos(3, elapsed_nanos(date_started));
             if date_records != records
                 || date_value_count != records
-                || !direct_def_levels_match(date_level_count, records, true)
+                || !direct_def_levels_match(date_level_count, records, date_required)
+                || !direct_all_present(date_required, &date_def_levels)
             {
                 metrics.add_read_nanos(elapsed_nanos(read_started));
                 return Ok(None);
@@ -2404,17 +2423,24 @@ where
                     &mut key_reader,
                     records,
                     &selected_runs,
+                    key_required,
+                    &mut key_def_levels,
                     &mut selected_keys,
                 )? {
                     metrics.add_read_nanos(elapsed_nanos(read_started));
                     return Ok(None);
                 }
             } else {
-                let (key_records, key_value_count, key_level_count) =
-                    key_reader.read_records(records, None, None, &mut selected_keys)?;
+                let (key_records, key_value_count, key_level_count) = key_reader.read_records(
+                    records,
+                    (!key_required).then_some(&mut key_def_levels),
+                    None,
+                    &mut selected_keys,
+                )?;
                 if key_records != records
                     || key_value_count != records
-                    || !direct_def_levels_match(key_level_count, records, true)
+                    || !direct_def_levels_match(key_level_count, records, key_required)
+                    || !direct_all_present(key_required, &key_def_levels)
                 {
                     metrics.add_read_nanos(elapsed_nanos(read_started));
                     return Ok(None);
@@ -2427,6 +2453,8 @@ where
                     &mut sum_reader,
                     records,
                     &selected_runs,
+                    sum_required,
+                    &mut sum_def_levels,
                     &mut selected_sums,
                 )? {
                     metrics.add_read_nanos(elapsed_nanos(read_started));
@@ -2434,11 +2462,16 @@ where
                 }
                 metrics.selected_payload_batches += 1;
             } else {
-                let (sum_records, sum_value_count, sum_level_count) =
-                    sum_reader.read_records(records, None, None, &mut selected_sums)?;
+                let (sum_records, sum_value_count, sum_level_count) = sum_reader.read_records(
+                    records,
+                    (!sum_required).then_some(&mut sum_def_levels),
+                    None,
+                    &mut selected_sums,
+                )?;
                 if sum_records != records
                     || sum_value_count != records
-                    || !direct_def_levels_match(sum_level_count, records, true)
+                    || !direct_def_levels_match(sum_level_count, records, sum_required)
+                    || !direct_all_present(sum_required, &sum_def_levels)
                 {
                     metrics.add_read_nanos(elapsed_nanos(read_started));
                     return Ok(None);
@@ -2776,6 +2809,8 @@ fn read_i32_selected_runs(
     reader: &mut ColumnReaderImpl<Int32Type>,
     records: usize,
     runs: &[(usize, usize)],
+    required: bool,
+    def_levels: &mut Vec<i16>,
     output: &mut Vec<i32>,
 ) -> Result<bool> {
     let mut cursor = 0usize;
@@ -2783,9 +2818,14 @@ fn read_i32_selected_runs(
         if start > cursor && reader.skip_records(start - cursor)? != start - cursor {
             return Ok(false);
         }
+        def_levels.clear();
         let (read_records, value_count, level_count) =
-            reader.read_records(len, None, None, output)?;
-        if read_records != len || value_count != len || level_count != 0 {
+            reader.read_records(len, (!required).then_some(&mut *def_levels), None, output)?;
+        if read_records != len
+            || value_count != len
+            || !direct_def_levels_match(level_count, len, required)
+            || !direct_all_present(required, def_levels)
+        {
             return Ok(false);
         }
         cursor = start + len;
@@ -2800,6 +2840,8 @@ fn read_i64_selected_runs(
     reader: &mut ColumnReaderImpl<Int64Type>,
     records: usize,
     runs: &[(usize, usize)],
+    required: bool,
+    def_levels: &mut Vec<i16>,
     output: &mut Vec<i64>,
 ) -> Result<bool> {
     let mut cursor = 0usize;
@@ -2807,9 +2849,14 @@ fn read_i64_selected_runs(
         if start > cursor && reader.skip_records(start - cursor)? != start - cursor {
             return Ok(false);
         }
+        def_levels.clear();
         let (read_records, value_count, level_count) =
-            reader.read_records(len, None, None, output)?;
-        if read_records != len || value_count != len || level_count != 0 {
+            reader.read_records(len, (!required).then_some(&mut *def_levels), None, output)?;
+        if read_records != len
+            || value_count != len
+            || !direct_def_levels_match(level_count, len, required)
+            || !direct_all_present(required, def_levels)
+        {
             return Ok(false);
         }
         cursor = start + len;
@@ -2891,6 +2938,10 @@ fn direct_def_levels_match(level_count: usize, record_count: usize, required: bo
     } else {
         level_count == record_count
     }
+}
+
+fn direct_all_present(required: bool, def_levels: &[i16]) -> bool {
+    required || def_levels.iter().all(|level| *level != 0)
 }
 
 fn direct_value_count_matches(value_count: usize, record_count: usize, required: bool) -> bool {
