@@ -514,7 +514,7 @@ pub async fn execute_sql(
                 &group_by,
                 &aggregates,
                 &query.aggregate_expressions,
-                true,
+                query.order_by.is_some(),
             )
             .await?
             {
@@ -528,7 +528,7 @@ pub async fn execute_sql(
                 &group_by,
                 &aggregates,
                 &query.aggregate_expressions,
-                true,
+                query.order_by.is_some(),
             )
             .await?
             {
@@ -32222,7 +32222,7 @@ async fn try_late_join_coalesce_left_aggregate(
                 move || JoinCoalesceLateLeftState {
                     filter: filter.clone(),
                     right_lookup: right_lookup.clone(),
-                    selected_buckets: Vec::new(),
+                    selected_buckets: Vec::with_capacity(batch_size / 2),
                     payload_offset: 0,
                     groups: JoinCoalesceGroupAccumulator::new(),
                     selected_rows: 0,

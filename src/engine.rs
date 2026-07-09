@@ -4975,7 +4975,7 @@ impl DodamEngine {
                 column_read_plan.scan_projection.clone(),
                 dictionary_columns,
                 predicates.pushdown().to_vec(),
-                fused_parquet_aggregate_row_group_chunk(),
+                filtered_dictionary_aggregate_row_group_chunk(),
                 {
                     let aggregates = aggregates.to_vec();
                     let group_by = group_by.to_vec();
@@ -6116,6 +6116,14 @@ fn late_materialized_aggregate_enabled() -> bool {
 fn filtered_dictionary_aggregate_enabled() -> bool {
     !std::env::var("DODAM_DISABLE_FILTERED_DICTIONARY_AGGREGATE")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn filtered_dictionary_aggregate_row_group_chunk() -> usize {
+    std::env::var("DODAM_FILTERED_DICTIONARY_AGG_ROW_GROUP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(fused_parquet_aggregate_row_group_chunk)
 }
 
 fn filtered_count_sum_aggregate_enabled() -> bool {
