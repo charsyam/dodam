@@ -6113,9 +6113,8 @@ fn late_materialized_aggregate_enabled() -> bool {
 }
 
 fn filtered_dictionary_aggregate_enabled() -> bool {
-    std::env::var("DODAM_ENABLE_FILTERED_DICTIONARY_AGGREGATE")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
+    !std::env::var("DODAM_DISABLE_FILTERED_DICTIONARY_AGGREGATE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 fn filtered_count_sum_aggregate_enabled() -> bool {

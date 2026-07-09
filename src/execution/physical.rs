@@ -543,6 +543,27 @@ impl PhysicalPlan for ScanExec {
             }
         }
     }
+
+    fn execute_to_sink(self: Box<Self>, sink: &mut dyn RecordBatchSink) -> Result<ScanPlanMetrics> {
+        let format = scan_format(&self.fragments)?;
+        match format {
+            StorageFormat::Parquet => Box::new(ParquetScanExec::new(
+                self.fragments,
+                self.batch_size,
+                self.projection,
+                self.pruning_predicates,
+                self.row_filter_predicates,
+                self.metadata_cache,
+                self.file_cache,
+                self.object_store,
+                self.preserve_order,
+            ))
+            .execute_to_sink(sink),
+            StorageFormat::Csv | StorageFormat::Json | StorageFormat::ArrowIpc => {
+                Err(DodamError::UnsupportedStorageFormat(format!("{format:?}")))
+            }
+        }
+    }
 }
 
 fn scan_format(fragments: &[FileFragment]) -> Result<StorageFormat> {
@@ -598,6 +619,28 @@ impl ParquetScanExec {
 
 impl PhysicalPlan for ParquetScanExec {
     fn execute(self: Box<Self>) -> Result<SendableBatchStream> {
+        let (stream, metrics) = self.into_stream_parts()?;
+        Ok(SendableBatchStream::new(stream, metrics))
+    }
+
+    fn execute_to_sink(self: Box<Self>, sink: &mut dyn RecordBatchSink) -> Result<ScanPlanMetrics> {
+        let (mut stream, metrics) = self.into_stream_parts()?;
+        for batch in stream.by_ref() {
+            let batch = batch?;
+            sink.write_batch(&batch)?;
+        }
+        sink.finish()?;
+        Ok(metrics.snapshot())
+    }
+}
+
+impl ParquetScanExec {
+    fn into_stream_parts(
+        self: Box<Self>,
+    ) -> Result<(
+        Box<dyn Iterator<Item = Result<RecordBatch>> + Send>,
+        Arc<ScanPlanMetricsCounter>,
+    )> {
         let metrics = Arc::new(ScanPlanMetricsCounter::default());
         let mut tasks = Vec::new();
         let mut row_groups_total = 0;
@@ -631,10 +674,7 @@ impl PhysicalPlan for ParquetScanExec {
         }
 
         if tasks.is_empty() {
-            return Ok(SendableBatchStream::new(
-                Box::new(std::iter::empty()),
-                metrics,
-            ));
+            return Ok((Box::new(std::iter::empty()), metrics));
         }
 
         let pruned_columns = schema_columns_total.saturating_sub(projected_columns_total);
@@ -649,7 +689,7 @@ impl PhysicalPlan for ParquetScanExec {
                 && pruned_columns >= SEQUENTIAL_PARQUET_SCAN_MIN_PRUNED_COLUMNS)
             || small_fixed_width_scan
         {
-            return Ok(SendableBatchStream::new(
+            return Ok((
                 Box::new(SequentialFragmentScanStream {
                     fragments: self.fragments,
                     batch_size: self.batch_size,
@@ -675,7 +715,7 @@ impl PhysicalPlan for ParquetScanExec {
             compressed_bytes_total,
             compressed_bytes_scanned,
         );
-        Ok(SendableBatchStream::new(
+        Ok((
             Box::new(ParallelParquetScanStream::new(
                 tasks,
                 self.batch_size,

@@ -2869,6 +2869,9 @@ pub fn aggregate_metrics_to_batches(
     if group_by.is_empty() {
         return aggregate_values_to_batch(&metrics.values).map(|batch| vec![batch]);
     }
+    if let Some(batch) = count_sum_metrics_to_batch(metrics, group_by, aggregates)? {
+        return Ok(vec![batch]);
+    }
 
     let mut fields = Vec::new();
     let mut columns = Vec::new();
@@ -2898,6 +2901,89 @@ pub fn aggregate_metrics_to_batches(
 
     let schema = Arc::new(Schema::new(fields));
     Ok(vec![RecordBatch::try_new(schema, columns)?])
+}
+
+fn count_sum_metrics_to_batch(
+    metrics: &AggregateMetrics,
+    group_by: &[String],
+    aggregates: &[AggregateExpr],
+) -> Result<Option<RecordBatch>> {
+    if !matches!(
+        aggregates,
+        [
+            AggregateExpr::CountStar | AggregateExpr::Count(_),
+            AggregateExpr::Sum(_)
+        ]
+    ) {
+        return Ok(None);
+    }
+    let mut fields = Vec::with_capacity(group_by.len() + 2);
+    let mut columns = Vec::with_capacity(group_by.len() + 2);
+
+    for (index, column) in group_by.iter().enumerate() {
+        let values = metrics
+            .groups
+            .iter()
+            .map(|group| group.keys.get(index))
+            .collect::<Vec<_>>();
+        let (field, array) = group_values_to_column(column, &values);
+        fields.push(field);
+        columns.push(array);
+    }
+
+    let mut counts = Vec::with_capacity(metrics.groups.len());
+    let mut sums = Vec::with_capacity(metrics.groups.len());
+    let mut sum_is_float = false;
+    for group in &metrics.groups {
+        let Some(count) = group.values.first() else {
+            return Ok(None);
+        };
+        let Some(sum) = group.values.get(1) else {
+            return Ok(None);
+        };
+        match &count.value {
+            AggregateValue::Count(value) => counts.push(Some(*value)),
+            _ => return Ok(None),
+        }
+        match &sum.value {
+            AggregateValue::Int64(value) => sums.push(*value),
+            AggregateValue::Float64(value) => {
+                sum_is_float = true;
+                sums.push(value.map(|value| value as i64));
+            }
+            _ => return Ok(None),
+        }
+    }
+    fields.push(Field::new(
+        aggregates[0].to_string(),
+        DataType::UInt64,
+        true,
+    ));
+    columns.push(Arc::new(UInt64Array::from(counts)));
+    if sum_is_float {
+        let values = metrics
+            .groups
+            .iter()
+            .map(
+                |group| match group.values.get(1).map(|result| &result.value) {
+                    Some(AggregateValue::Float64(value)) => *value,
+                    _ => None,
+                },
+            )
+            .collect::<Vec<_>>();
+        fields.push(Field::new(
+            aggregates[1].to_string(),
+            DataType::Float64,
+            true,
+        ));
+        columns.push(Arc::new(Float64Array::from(values)));
+    } else {
+        fields.push(Field::new(aggregates[1].to_string(), DataType::Int64, true));
+        columns.push(Arc::new(Int64Array::from(sums)));
+    }
+
+    let schema = Arc::new(Schema::new(fields));
+    Ok(Some(RecordBatch::try_new(schema, columns)?))
 }
 
 fn aggregate_values_to_batch(values: &[AggregateResult]) -> Result<RecordBatch> {

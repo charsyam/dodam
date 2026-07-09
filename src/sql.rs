@@ -31917,6 +31917,8 @@ async fn try_execute_join_coalesce_count_sum_aggregate(
         })
         .collect::<Vec<_>>();
     group_results.sort_by(|left, right| compare_join_fused_group_keys(&left.keys, &right.keys));
+    let output =
+        join_coalesce_count_sum_batches(&group_results, &query.group_by, &query.aggregates)?;
     let metrics = AggregateMetrics {
         fragments: 2,
         batches,
@@ -31924,7 +31926,7 @@ async fn try_execute_join_coalesce_count_sum_aggregate(
         groups: group_results,
         ..AggregateMetrics::default()
     };
-    let mut output = aggregate_metrics_to_batches(&metrics, &query.group_by, &query.aggregates)?;
+    let mut output = output;
     output = apply_output_order_limit(output, query.order_by.as_ref(), query.limit, query.offset)?;
     output = rename_output_batches(output, &query.aliases)?;
     let finish_nanos = elapsed_optional_nanos(finish_started);
@@ -31948,6 +31950,85 @@ async fn try_execute_join_coalesce_count_sum_aggregate(
         metrics,
         batches: output,
     }))
+}
+
+fn join_coalesce_count_sum_batches(
+    groups: &[GroupAggregateResult],
+    group_by: &[String],
+    aggregates: &[AggregateExpr],
+) -> Result<Vec<RecordBatch>> {
+    if group_by.len() != 2 || aggregates.len() != 2 {
+        return aggregate_metrics_to_batches(
+            &AggregateMetrics {
+                groups: groups.to_vec(),
+                ..AggregateMetrics::default()
+            },
+            group_by,
+            aggregates,
+        );
+    }
+    let mut bucket_values = Vec::with_capacity(groups.len());
+    let mut class_values = Vec::with_capacity(groups.len());
+    let mut count_values = Vec::with_capacity(groups.len());
+    let mut sum_values = Vec::with_capacity(groups.len());
+    for group in groups {
+        match group.keys.as_slice() {
+            [GroupValue::Int64(bucket), GroupValue::Utf8(class)] => {
+                bucket_values.push(*bucket);
+                class_values.push(class.clone());
+            }
+            _ => {
+                return aggregate_metrics_to_batches(
+                    &AggregateMetrics {
+                        groups: groups.to_vec(),
+                        ..AggregateMetrics::default()
+                    },
+                    group_by,
+                    aggregates,
+                );
+            }
+        }
+        match group.values.as_slice() {
+            [
+                AggregateResult {
+                    value: AggregateValue::Count(count),
+                    ..
+                },
+                AggregateResult {
+                    value: AggregateValue::Int64(sum),
+                    ..
+                },
+            ] => {
+                count_values.push(Some(*count));
+                sum_values.push(*sum);
+            }
+            _ => {
+                return aggregate_metrics_to_batches(
+                    &AggregateMetrics {
+                        groups: groups.to_vec(),
+                        ..AggregateMetrics::default()
+                    },
+                    group_by,
+                    aggregates,
+                );
+            }
+        }
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(group_by[0].clone(), DataType::Int64, true),
+        Field::new(group_by[1].clone(), DataType::Utf8, true),
+        Field::new(aggregates[0].to_string(), DataType::UInt64, true),
+        Field::new(aggregates[1].to_string(), DataType::Int64, true),
+    ]));
+    Ok(vec![RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(bucket_values)),
+            Arc::new(StringArray::from(class_values)),
+            Arc::new(UInt64Array::from(count_values)),
+            Arc::new(Int64Array::from(sum_values)),
+        ],
+    )?])
 }
 
 fn join_profile_enabled_sql() -> bool {
