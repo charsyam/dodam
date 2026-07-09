@@ -32252,27 +32252,48 @@ async fn try_late_join_coalesce_left_aggregate(
                     return Ok(None);
                 };
                 let dense_lookup = state.right_lookup.dense_slices();
-                for row in 0..key.len() {
-                    let Some(bucket) = state.selected_buckets.get(state.payload_offset).copied()
-                    else {
-                        return Err(DodamError::UnsupportedSql(
-                            "join late payload row overflow".to_string(),
-                        ));
-                    };
-                    state.payload_offset += 1;
-                    if key.is_null(row) {
-                        continue;
+                if !key.has_nulls() && !sum.has_nulls() {
+                    for row in 0..key.len() {
+                        let Some(bucket) =
+                            state.selected_buckets.get(state.payload_offset).copied()
+                        else {
+                            return Err(DodamError::UnsupportedSql(
+                                "join late payload row overflow".to_string(),
+                            ));
+                        };
+                        state.payload_offset += 1;
+                        if let Some(class_id) =
+                            state.right_lookup.get_cached(dense_lookup, key.value(row))
+                        {
+                            state
+                                .groups
+                                .update_non_null(bucket, class_id, sum.value(row));
+                        }
                     }
-                    let Some(class_id) =
-                        state.right_lookup.get_cached(dense_lookup, key.value(row))
-                    else {
-                        continue;
-                    };
-                    state.groups.update(
-                        Some(bucket),
-                        class_id,
-                        (!sum.is_null(row)).then(|| sum.value(row)),
-                    );
+                } else {
+                    for row in 0..key.len() {
+                        let Some(bucket) =
+                            state.selected_buckets.get(state.payload_offset).copied()
+                        else {
+                            return Err(DodamError::UnsupportedSql(
+                                "join late payload row overflow".to_string(),
+                            ));
+                        };
+                        state.payload_offset += 1;
+                        if key.is_null(row) {
+                            continue;
+                        }
+                        let Some(class_id) =
+                            state.right_lookup.get_cached(dense_lookup, key.value(row))
+                        else {
+                            continue;
+                        };
+                        state.groups.update(
+                            Some(bucket),
+                            class_id,
+                            (!sum.is_null(row)).then(|| sum.value(row)),
+                        );
+                    }
                 }
                 Ok(Some(()))
             },
@@ -32367,6 +32388,13 @@ impl<'a> DirectI64ishVector<'a> {
         match self {
             Self::I64(values) => values.len(),
             Self::I32(values) => values.len(),
+        }
+    }
+
+    fn has_nulls(&self) -> bool {
+        match self {
+            Self::I64(values) => values.values_if_null_free().is_none(),
+            Self::I32(values) => values.values_if_null_free().is_none(),
         }
     }
 
@@ -40703,9 +40731,86 @@ fn apply_output_order_limit(
     } else {
         concat_batches(&schema, batches.iter())?
     };
+    if output_batch_satisfies_order(&batch, order_by)? {
+        return Ok(limit_batches(vec![batch], limit, offset));
+    }
     let sorted_limit = limit.and_then(|limit| limit.checked_add(offset));
     let sorted = sort_output_batch(&batch, order_by, sorted_limit)?;
     Ok(limit_batches(vec![sorted], limit, offset))
+}
+
+fn output_batch_satisfies_order(batch: &RecordBatch, order_by: &SortKey) -> Result<bool> {
+    let [sort] = order_by.expressions.as_slice() else {
+        return Ok(false);
+    };
+    if sort.descending || sort.nulls_first {
+        return Ok(false);
+    }
+    let index = output_batch_column_index(batch, &sort.column)?;
+    let column = batch.column(index);
+    match column.data_type() {
+        DataType::Int32 => {
+            let values = column
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("Int32 data type");
+            for row in 1..values.len() {
+                if values.is_null(row - 1) || values.is_null(row) {
+                    return Ok(false);
+                }
+                if values.value(row - 1) > values.value(row) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        DataType::Date32 => {
+            let values = column
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .expect("Date32 data type");
+            for row in 1..values.len() {
+                if values.is_null(row - 1) || values.is_null(row) {
+                    return Ok(false);
+                }
+                if values.value(row - 1) > values.value(row) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        DataType::Int64 => {
+            let values = column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 data type");
+            for row in 1..values.len() {
+                if values.is_null(row - 1) || values.is_null(row) {
+                    return Ok(false);
+                }
+                if values.value(row - 1) > values.value(row) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        DataType::Utf8 => {
+            let values = column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("Utf8 data type");
+            for row in 1..values.len() {
+                if values.is_null(row - 1) || values.is_null(row) {
+                    return Ok(false);
+                }
+                if values.value(row - 1) > values.value(row) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 fn apply_aggregate_output_order_limit(
