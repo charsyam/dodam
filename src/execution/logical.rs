@@ -14,6 +14,7 @@ pub struct AggregateMetrics {
     pub aggregate_merge_nanos: u64,
     pub values: Vec<AggregateResult>,
     pub groups: Vec<GroupAggregateResult>,
+    pub output_batches: Option<Vec<RecordBatch>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

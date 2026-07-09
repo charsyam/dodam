@@ -27,6 +27,7 @@ use crate::vector::{
 };
 
 const SMALL_GROUP_LINEAR_LIMIT: usize = 8;
+const SMALL_STRING_ID_CACHE_LIMIT: usize = 16;
 const TWO_UTF8_SMALL_GROUP_LIMIT: usize = 8;
 const DENSE_I32_GROUP_INDEX_MAX_SLOTS: usize = 65_536;
 const DENSE_U32_GROUP_INDEX_MAX_SLOTS: usize = 65_536;
@@ -438,6 +439,19 @@ impl CoalesceKeyCountSumCollector {
         aggregates: &[AggregateExpr],
         ordered: bool,
     ) -> Result<AggregateMetrics> {
+        Self::merge_partials_with_order_and_output(
+            partials, fragments, aggregates, None, ordered, None,
+        )
+    }
+
+    pub(crate) fn merge_partials_with_order_and_output(
+        partials: Vec<Self>,
+        fragments: usize,
+        aggregates: &[AggregateExpr],
+        group_by: Option<&[String]>,
+        ordered: bool,
+        output_limit: Option<usize>,
+    ) -> Result<AggregateMetrics> {
         let profile = coalesce_key_count_sum_profile_enabled();
         let total_started = profile.then(Instant::now);
         let merge_started = Instant::now();
@@ -466,9 +480,29 @@ impl CoalesceKeyCountSumCollector {
         metrics.aggregate_nanos = update_nanos;
         metrics.aggregate_merge_nanos = elapsed_nanos(merge_started);
         let finish_started = Instant::now();
-        metrics.groups = merged_groups
-            .map(|groups| groups.finish_with_order(aggregates, ordered))
-            .unwrap_or_default();
+        if let Some(groups) = merged_groups {
+            let use_direct_output = group_by.is_some_and(|group_by| {
+                coalesce_direct_output_enabled()
+                    && !ordered
+                    && groups.key_len == group_by.len()
+                    && (groups.key_len == 2 || groups.key_len == 3)
+                    && matches!(
+                        aggregates,
+                        [
+                            AggregateExpr::CountStar | AggregateExpr::Count(_),
+                            AggregateExpr::Sum(_)
+                        ]
+                    )
+            });
+            if use_direct_output {
+                let group_by = group_by.expect("checked direct output group_by");
+                let batch = groups.finish_unordered_batch(aggregates, group_by)?;
+                metrics.groups.clear();
+                metrics.output_batches = Some(vec![batch]);
+            } else {
+                metrics.groups = groups.finish_with_order_limit(aggregates, ordered, output_limit);
+            }
+        }
         let finish_nanos = elapsed_nanos_u64(finish_started);
         if profile {
             eprintln!(
@@ -606,6 +640,11 @@ fn collect_coalesce_key_count_sum_groups(
 
 fn coalesce_key_count_sum_profile_enabled() -> bool {
     std::env::var("DODAM_COALESCE_AGG_PROFILE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn coalesce_direct_output_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_COALESCE_DIRECT_OUTPUT")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
@@ -821,14 +860,32 @@ impl<'a> CoalesceKeyCountSumViewReader<'a> {
                 if let Some(mut cache) = CoalesceStringIdViewCache::new(coalesce, groups, fallback)
                 {
                     if let Some(sum_values) = sum.values_if_null_free() {
-                        for row in 0..row_count {
-                            let string_id = cache.string_id(coalesce, groups, row);
-                            groups.update_three_non_null_string_id_sum(
-                                first_values[row].into(),
-                                second_values[row],
-                                string_id,
-                                sum_values[row],
+                        if coalesce_run_aggregate_should_run_i32(
+                            first_values,
+                            second_values,
+                            row_count,
+                            coalesce,
+                            fallback,
+                        ) {
+                            update_three_i32_date_string_id_sum_runs(
+                                first_values,
+                                second_values,
+                                sum_values,
+                                row_count,
+                                coalesce,
+                                &mut cache,
+                                groups,
                             );
+                        } else {
+                            for row in 0..row_count {
+                                let string_id = cache.string_id(coalesce, groups, row);
+                                groups.update_three_non_null_string_id_sum(
+                                    first_values[row].into(),
+                                    second_values[row],
+                                    string_id,
+                                    sum_values[row],
+                                );
+                            }
                         }
                     } else {
                         for row in 0..row_count {
@@ -867,14 +924,32 @@ impl<'a> CoalesceKeyCountSumViewReader<'a> {
                 if let Some(mut cache) = CoalesceStringIdViewCache::new(coalesce, groups, fallback)
                 {
                     if let Some(sum_values) = sum.values_if_null_free() {
-                        for row in 0..row_count {
-                            let string_id = cache.string_id(coalesce, groups, row);
-                            groups.update_three_non_null_string_id_sum(
-                                first_values[row],
-                                second_values[row],
-                                string_id,
-                                sum_values[row],
+                        if coalesce_run_aggregate_should_run_i64(
+                            first_values,
+                            second_values,
+                            row_count,
+                            coalesce,
+                            fallback,
+                        ) {
+                            update_three_i64_date_string_id_sum_runs(
+                                first_values,
+                                second_values,
+                                sum_values,
+                                row_count,
+                                coalesce,
+                                &mut cache,
+                                groups,
                             );
+                        } else {
+                            for row in 0..row_count {
+                                let string_id = cache.string_id(coalesce, groups, row);
+                                groups.update_three_non_null_string_id_sum(
+                                    first_values[row],
+                                    second_values[row],
+                                    string_id,
+                                    sum_values[row],
+                                );
+                            }
                         }
                     } else {
                         for row in 0..row_count {
@@ -999,6 +1074,172 @@ fn sum_value(sum: &I64VectorView<'_>, row: usize) -> Option<i64> {
     (!sum.is_null(row)).then(|| sum.value(row))
 }
 
+fn update_three_i32_date_string_id_sum_runs<'a>(
+    first_values: &[i32],
+    second_values: &[i32],
+    sum_values: &[i64],
+    row_count: usize,
+    coalesce: &CoalesceUtf8ViewInput<'a>,
+    cache: &mut CoalesceStringIdViewCache<'a>,
+    groups: &mut CoalesceKeyCountSumGroups,
+) {
+    let mut row = 0usize;
+    while row < row_count {
+        let first = first_values[row];
+        let second = second_values[row];
+        let string_id = cache.string_id(coalesce, groups, row);
+        let mut count = 1_u64;
+        let mut sum = sum_values[row];
+        row += 1;
+        while row < row_count && first_values[row] == first && second_values[row] == second {
+            let next_string_id = cache.string_id(coalesce, groups, row);
+            if next_string_id != string_id {
+                break;
+            }
+            count += 1;
+            sum = sum.saturating_add(sum_values[row]);
+            row += 1;
+        }
+        groups.merge_three_non_null_string_id_sum(first.into(), second, string_id, count, sum);
+    }
+}
+
+fn update_three_i64_date_string_id_sum_runs<'a>(
+    first_values: &[i64],
+    second_values: &[i32],
+    sum_values: &[i64],
+    row_count: usize,
+    coalesce: &CoalesceUtf8ViewInput<'a>,
+    cache: &mut CoalesceStringIdViewCache<'a>,
+    groups: &mut CoalesceKeyCountSumGroups,
+) {
+    let mut row = 0usize;
+    while row < row_count {
+        let first = first_values[row];
+        let second = second_values[row];
+        let string_id = cache.string_id(coalesce, groups, row);
+        let mut count = 1_u64;
+        let mut sum = sum_values[row];
+        row += 1;
+        while row < row_count && first_values[row] == first && second_values[row] == second {
+            let next_string_id = cache.string_id(coalesce, groups, row);
+            if next_string_id != string_id {
+                break;
+            }
+            count += 1;
+            sum = sum.saturating_add(sum_values[row]);
+            row += 1;
+        }
+        groups.merge_three_non_null_string_id_sum(first, second, string_id, count, sum);
+    }
+}
+
+fn coalesce_run_aggregate_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_COALESCE_RUN_AGGREGATE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn coalesce_run_aggregate_should_run_i32(
+    first_values: &[i32],
+    second_values: &[i32],
+    row_count: usize,
+    coalesce: &CoalesceUtf8ViewInput<'_>,
+    fallback: &str,
+) -> bool {
+    if coalesce_run_aggregate_enabled() {
+        return true;
+    }
+    if !coalesce_adaptive_run_aggregate_enabled() {
+        return false;
+    }
+    coalesce_adjacent_run_ratio_i32(first_values, second_values, row_count, coalesce, fallback)
+        >= coalesce_adaptive_run_min_adjacent_ratio()
+}
+
+fn coalesce_run_aggregate_should_run_i64(
+    first_values: &[i64],
+    second_values: &[i32],
+    row_count: usize,
+    coalesce: &CoalesceUtf8ViewInput<'_>,
+    fallback: &str,
+) -> bool {
+    if coalesce_run_aggregate_enabled() {
+        return true;
+    }
+    if !coalesce_adaptive_run_aggregate_enabled() {
+        return false;
+    }
+    coalesce_adjacent_run_ratio_i64(first_values, second_values, row_count, coalesce, fallback)
+        >= coalesce_adaptive_run_min_adjacent_ratio()
+}
+
+fn coalesce_adjacent_run_ratio_i32(
+    first_values: &[i32],
+    second_values: &[i32],
+    row_count: usize,
+    coalesce: &CoalesceUtf8ViewInput<'_>,
+    fallback: &str,
+) -> f64 {
+    let sample = row_count.min(coalesce_adaptive_run_sample_rows());
+    if sample < 2 {
+        return 0.0;
+    }
+    let mut adjacent = 0usize;
+    for row in 1..sample {
+        if first_values[row] == first_values[row - 1]
+            && second_values[row] == second_values[row - 1]
+            && coalesce.key(row, fallback) == coalesce.key(row - 1, fallback)
+        {
+            adjacent += 1;
+        }
+    }
+    adjacent as f64 / (sample - 1) as f64
+}
+
+fn coalesce_adjacent_run_ratio_i64(
+    first_values: &[i64],
+    second_values: &[i32],
+    row_count: usize,
+    coalesce: &CoalesceUtf8ViewInput<'_>,
+    fallback: &str,
+) -> f64 {
+    let sample = row_count.min(coalesce_adaptive_run_sample_rows());
+    if sample < 2 {
+        return 0.0;
+    }
+    let mut adjacent = 0usize;
+    for row in 1..sample {
+        if first_values[row] == first_values[row - 1]
+            && second_values[row] == second_values[row - 1]
+            && coalesce.key(row, fallback) == coalesce.key(row - 1, fallback)
+        {
+            adjacent += 1;
+        }
+    }
+    adjacent as f64 / (sample - 1) as f64
+}
+
+fn coalesce_adaptive_run_aggregate_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_COALESCE_ADAPTIVE_RUN_AGGREGATE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn coalesce_adaptive_run_sample_rows() -> usize {
+    std::env::var("DODAM_COALESCE_RUN_SAMPLE_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value >= 2)
+        .unwrap_or(4096)
+}
+
+fn coalesce_adaptive_run_min_adjacent_ratio() -> f64 {
+    std::env::var("DODAM_COALESCE_RUN_MIN_ADJACENT_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.35)
+}
+
 fn i32_view_non_null_min_max_as_i64(
     values: &I32VectorView<'_>,
     row_count: usize,
@@ -1121,12 +1362,59 @@ impl<'a> CoalesceUtf8ViewInput<'a> {
 enum CoalesceStringIdViewCache<'a> {
     Utf8 {
         fallback_id: u32,
-        ids: AggregateHashMap<&'a str, u32>,
+        ids: LocalUtf8StringIdCache<'a>,
     },
     Dictionary {
         fallback_id: u32,
         ids: Vec<Option<u32>>,
     },
+}
+
+enum LocalUtf8StringIdCache<'a> {
+    Small(Vec<(&'a str, u32)>),
+    Hash(AggregateHashMap<&'a str, u32>),
+}
+
+impl Default for LocalUtf8StringIdCache<'_> {
+    fn default() -> Self {
+        if small_string_id_cache_enabled() {
+            Self::Small(Vec::new())
+        } else {
+            Self::Hash(AggregateHashMap::default())
+        }
+    }
+}
+
+impl<'a> LocalUtf8StringIdCache<'a> {
+    fn get(&self, value: &str) -> Option<u32> {
+        match self {
+            Self::Small(values) => values
+                .iter()
+                .find_map(|(candidate, string_id)| (*candidate == value).then_some(*string_id)),
+            Self::Hash(values) => values.get(value).copied(),
+        }
+    }
+
+    fn insert(&mut self, value: &'a str, string_id: u32) {
+        match self {
+            Self::Small(values) if values.len() < SMALL_STRING_ID_CACHE_LIMIT => {
+                values.push((value, string_id));
+            }
+            Self::Small(values) => {
+                let mut hash = values.drain(..).collect::<AggregateHashMap<_, _>>();
+                hash.insert(value, string_id);
+                *self = Self::Hash(hash);
+            }
+            Self::Hash(values) => {
+                values.insert(value, string_id);
+            }
+        }
+    }
+}
+
+fn small_string_id_cache_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_SMALL_STRING_ID_CACHE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 impl<'a> CoalesceStringIdViewCache<'a> {
@@ -1139,7 +1427,7 @@ impl<'a> CoalesceStringIdViewCache<'a> {
         match coalesce {
             CoalesceUtf8ViewInput::Utf8(_) => Some(Self::Utf8 {
                 fallback_id,
-                ids: AggregateHashMap::default(),
+                ids: LocalUtf8StringIdCache::default(),
             }),
             CoalesceUtf8ViewInput::DictionaryI32 { .. } => Some(Self::Dictionary {
                 fallback_id,
@@ -1159,7 +1447,7 @@ impl<'a> CoalesceStringIdViewCache<'a> {
                 let Some(value) = coalesce.utf8_value(row) else {
                     return *fallback_id;
                 };
-                if let Some(string_id) = ids.get(value).copied() {
+                if let Some(string_id) = ids.get(value) {
                     return string_id;
                 }
                 let string_id = groups.string_id(value);
@@ -1583,7 +1871,7 @@ impl<'a> CoalesceUtf8Input<'a> {
 enum CoalesceStringIdCache<'a> {
     Utf8 {
         fallback_id: u32,
-        ids: AggregateHashMap<&'a str, u32>,
+        ids: LocalUtf8StringIdCache<'a>,
     },
     Dictionary {
         fallback_id: u32,
@@ -1601,7 +1889,7 @@ impl<'a> CoalesceStringIdCache<'a> {
         match coalesce {
             CoalesceUtf8Input::Utf8(_) => Some(Self::Utf8 {
                 fallback_id,
-                ids: AggregateHashMap::default(),
+                ids: LocalUtf8StringIdCache::default(),
             }),
             CoalesceUtf8Input::DictionaryI32 { values, .. } => Some(Self::Dictionary {
                 fallback_id,
@@ -1621,7 +1909,7 @@ impl<'a> CoalesceStringIdCache<'a> {
                 let Some(value) = coalesce.utf8_value(row) else {
                     return *fallback_id;
                 };
-                if let Some(string_id) = ids.get(value).copied() {
+                if let Some(string_id) = ids.get(value) {
                     return string_id;
                 }
                 let string_id = groups.string_id(value);
@@ -1767,6 +2055,17 @@ impl CoalesceKeyCountSumGroups {
         string_id: u32,
         sum: i64,
     ) {
+        self.merge_three_non_null_string_id_sum(first, second, string_id, 1, sum);
+    }
+
+    fn merge_three_non_null_string_id_sum(
+        &mut self,
+        first: i64,
+        second: i32,
+        string_id: u32,
+        count: u64,
+        sum: i64,
+    ) {
         let third_index = self.index.third_groups_three_non_null(first, second);
         let group_id = if let Some(group_id) = third_index.non_null.get(string_id) {
             group_id
@@ -1780,7 +2079,7 @@ impl CoalesceKeyCountSumGroups {
             ));
             group_id
         };
-        self.groups[group_id].update_non_null(sum);
+        self.groups[group_id].merge_counts(count, sum, count);
     }
 
     fn update_two_non_null(&mut self, first: i64, third: &str, sum: Option<i64>) {
@@ -1901,6 +2200,15 @@ impl CoalesceKeyCountSumGroups {
         aggregates: &[AggregateExpr],
         ordered: bool,
     ) -> Vec<GroupAggregateResult> {
+        self.finish_with_order_limit(aggregates, ordered, None)
+    }
+
+    fn finish_with_order_limit(
+        self,
+        aggregates: &[AggregateExpr],
+        ordered: bool,
+        output_limit: Option<usize>,
+    ) -> Vec<GroupAggregateResult> {
         let Self {
             key_len,
             index,
@@ -1921,6 +2229,7 @@ impl CoalesceKeyCountSumGroups {
                         third_strings,
                         groups,
                         aggregates,
+                        output_limit,
                     );
                 }
                 CoalesceLeadingIndex::DenseThree {
@@ -1934,6 +2243,7 @@ impl CoalesceKeyCountSumGroups {
                         third_strings,
                         groups,
                         aggregates,
+                        output_limit,
                     );
                 }
                 index => {
@@ -1952,7 +2262,82 @@ impl CoalesceKeyCountSumGroups {
         if ordered {
             groups.sort_by(|left, right| compare_group_keys(&left.keys, &right.keys));
         }
+        if let Some(limit) = output_limit {
+            groups.truncate(limit);
+        }
         groups
+    }
+
+    fn finish_unordered_batch(
+        self,
+        aggregates: &[AggregateExpr],
+        group_by: &[String],
+    ) -> Result<RecordBatch> {
+        let Self {
+            key_len,
+            third_strings,
+            groups,
+            ..
+        } = self;
+        let mut first_values = Vec::with_capacity(groups.len());
+        let mut second_values = if key_len == 3 {
+            Vec::with_capacity(groups.len())
+        } else {
+            Vec::new()
+        };
+        let mut third_values = Vec::with_capacity(groups.len());
+        let mut count_values = Vec::with_capacity(groups.len());
+        let mut sum_values = Vec::with_capacity(groups.len());
+        let mut sums_have_nulls = false;
+
+        for group in groups {
+            let third = group
+                .third_string_id
+                .map(|id| third_strings[id as usize].clone());
+            first_values.push(group.first);
+            if key_len == 3 {
+                second_values.push(group.second);
+            }
+            third_values.push(third.clone());
+            count_values.push(group.count);
+            let sum = (group.sum_count != 0).then_some(group.sum);
+            sums_have_nulls |= sum.is_none();
+            sum_values.push(sum);
+        }
+
+        let mut fields = Vec::with_capacity(group_by.len() + 2);
+        let mut columns = Vec::with_capacity(group_by.len() + 2);
+        fields.push(Field::new(group_by[0].clone(), DataType::Int64, true));
+        columns.push(Arc::new(Int64Array::from(first_values)) as ArrayRef);
+        if key_len == 3 {
+            fields.push(Field::new(group_by[1].clone(), DataType::Date32, true));
+            columns.push(Arc::new(Date32Array::from(second_values)) as ArrayRef);
+        }
+        fields.push(Field::new(
+            group_by[key_len - 1].clone(),
+            DataType::Utf8,
+            true,
+        ));
+        columns.push(Arc::new(StringArray::from(third_values)) as ArrayRef);
+        fields.push(Field::new(
+            aggregates[0].to_string(),
+            DataType::UInt64,
+            true,
+        ));
+        columns.push(Arc::new(UInt64Array::from(count_values)) as ArrayRef);
+        fields.push(Field::new(aggregates[1].to_string(), DataType::Int64, true));
+        if sums_have_nulls {
+            columns.push(Arc::new(Int64Array::from(sum_values)) as ArrayRef);
+        } else {
+            columns.push(Arc::new(Int64Array::from(
+                sum_values
+                    .into_iter()
+                    .map(|value| value.expect("all coalesce aggregate sums are non-null"))
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef);
+        }
+
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(Into::into)
     }
 }
 
@@ -1962,15 +2347,19 @@ fn finish_dense_two_ordered_groups(
     third_strings: Vec<String>,
     groups: Vec<CoalesceKeyCountSumGroup>,
     aggregates: &[AggregateExpr],
+    output_limit: Option<usize>,
 ) -> Vec<GroupAggregateResult> {
     let mut groups = groups.into_iter().map(Some).collect::<Vec<_>>();
-    let mut output = Vec::with_capacity(groups.len());
+    let mut output = Vec::with_capacity(output_limit.unwrap_or(groups.len()).min(groups.len()));
     for first_offset in 0..range.first_len {
         let third_groups = &slots[first_offset];
         if let Some(group_id) = third_groups.null_group
             && let Some(group) = groups[group_id].take()
         {
             output.push(group.finish(2, &third_strings, aggregates));
+            if output_limit.is_some_and(|limit| output.len() >= limit) {
+                return output;
+            }
         }
         let mut non_null = third_groups.non_null.iter().collect::<Vec<_>>();
         non_null.sort_by(|(left, _), (right, _)| {
@@ -1979,6 +2368,9 @@ fn finish_dense_two_ordered_groups(
         for (_, group_id) in non_null {
             if let Some(group) = groups[group_id].take() {
                 output.push(group.finish(2, &third_strings, aggregates));
+                if output_limit.is_some_and(|limit| output.len() >= limit) {
+                    return output;
+                }
             }
         }
     }
@@ -1991,9 +2383,10 @@ fn finish_dense_three_ordered_groups(
     third_strings: Vec<String>,
     groups: Vec<CoalesceKeyCountSumGroup>,
     aggregates: &[AggregateExpr],
+    output_limit: Option<usize>,
 ) -> Vec<GroupAggregateResult> {
     let mut groups = groups.into_iter().map(Some).collect::<Vec<_>>();
-    let mut output = Vec::with_capacity(groups.len());
+    let mut output = Vec::with_capacity(output_limit.unwrap_or(groups.len()).min(groups.len()));
     for first_offset in 0..range.first_len {
         for second_offset in 0..range.second_len {
             let slot = first_offset * range.second_len + second_offset;
@@ -2002,6 +2395,9 @@ fn finish_dense_three_ordered_groups(
                 && let Some(group) = groups[group_id].take()
             {
                 output.push(group.finish(3, &third_strings, aggregates));
+                if output_limit.is_some_and(|limit| output.len() >= limit) {
+                    return output;
+                }
             }
             let mut non_null = third_groups.non_null.iter().collect::<Vec<_>>();
             non_null.sort_by(|(left, _), (right, _)| {
@@ -2010,6 +2406,9 @@ fn finish_dense_three_ordered_groups(
             for (_, group_id) in non_null {
                 if let Some(group) = groups[group_id].take() {
                     output.push(group.finish(3, &third_strings, aggregates));
+                    if output_limit.is_some_and(|limit| output.len() >= limit) {
+                        return output;
+                    }
                 }
             }
         }
@@ -2232,6 +2631,15 @@ impl DenseU32GroupIndex {
 
     fn insert(&mut self, key: u32, group_id: usize) {
         match self {
+            Self::Small(groups) if dense_u32_eager_slots_for_key(groups, key).is_some() => {
+                let mut slots =
+                    dense_u32_eager_slots_for_key(groups, key).expect("checked eager dense slots");
+                for (existing_key, existing_group_id) in groups.drain(..) {
+                    slots[existing_key as usize] = Some(existing_group_id);
+                }
+                slots[key as usize] = Some(group_id);
+                *self = Self::Dense(slots);
+            }
             Self::Small(groups) if groups.len() < small_group_linear_limit() => {
                 groups.push((key, group_id));
             }
@@ -2284,6 +2692,29 @@ impl DenseU32GroupIndex {
             Self::Hash(groups) => DenseU32GroupIndexIter::Hash(groups.iter()),
         }
     }
+}
+
+fn dense_u32_eager_slots_for_key(groups: &[(u32, usize)], key: u32) -> Option<Vec<Option<usize>>> {
+    if !dense_u32_eager_enabled() {
+        return None;
+    }
+    let max_key = groups
+        .iter()
+        .fold(key, |max_key, (candidate, _)| max_key.max(*candidate));
+    let max_eager_key = std::env::var("DODAM_DENSE_U32_EAGER_MAX_KEY")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(16);
+    if max_key > max_eager_key {
+        return None;
+    }
+    let slots = usize::try_from(max_key).ok()?.checked_add(1)?;
+    Some(vec![None; slots])
+}
+
+fn dense_u32_eager_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_DENSE_U32_EAGER")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 fn dense_u32_slots_for_new_key(groups: &[(u32, usize)], key: u32) -> Option<Vec<Option<usize>>> {
@@ -2660,36 +3091,77 @@ impl SingleKeyCountSumVectorState {
             unreachable!("vector count/sum state uses Int32 group index")
         };
         if let Some(keys) = key_values.values_if_null_free() {
-            for row in 0..keys.len() {
-                let group_id = count_sum_group_id_for_i32(
-                    index,
-                    keys[row],
-                    &mut self.groups,
-                    &CountSumValueInput::Int64Raw,
-                );
-                self.groups[group_id].update_raw_i64_optional(sums.value(row));
+            let mut group_cache = i32_batch_group_cache(keys);
+            if let Some(sum_values) = sums.non_null_values() {
+                for row in 0..keys.len() {
+                    let group_id = count_sum_group_id_for_i32_cached(
+                        index,
+                        keys[row],
+                        &mut self.groups,
+                        &CountSumValueInput::Int64Raw,
+                        &mut group_cache,
+                    );
+                    self.groups[group_id].update_raw_i64_non_null(sum_values[row]);
+                }
+            } else {
+                for row in 0..keys.len() {
+                    let group_id = count_sum_group_id_for_i32_cached(
+                        index,
+                        keys[row],
+                        &mut self.groups,
+                        &CountSumValueInput::Int64Raw,
+                        &mut group_cache,
+                    );
+                    self.groups[group_id].update_raw_i64_optional(sums.value(row));
+                }
             }
         } else if let Some((keys, def_levels)) = key_values.raw_nullable() {
             let mut value_index = 0usize;
-            for row in 0..def_levels.len() {
-                let group_id = if def_levels[row] == 0 {
-                    count_sum_null_group_id(
-                        null_group,
-                        &mut self.groups,
-                        GroupValue::Int64(None),
-                        &CountSumValueInput::Int64Raw,
-                    )
-                } else {
-                    let key = keys[value_index];
-                    value_index += 1;
-                    count_sum_group_id_for_i32(
-                        index,
-                        key,
-                        &mut self.groups,
-                        &CountSumValueInput::Int64Raw,
-                    )
-                };
-                self.groups[group_id].update_raw_i64_optional(sums.value(row));
+            let mut group_cache = i32_batch_group_cache(keys);
+            if let Some(sum_values) = sums.non_null_values() {
+                for row in 0..def_levels.len() {
+                    let group_id = if def_levels[row] == 0 {
+                        count_sum_null_group_id(
+                            null_group,
+                            &mut self.groups,
+                            GroupValue::Int64(None),
+                            &CountSumValueInput::Int64Raw,
+                        )
+                    } else {
+                        let key = keys[value_index];
+                        value_index += 1;
+                        count_sum_group_id_for_i32_cached(
+                            index,
+                            key,
+                            &mut self.groups,
+                            &CountSumValueInput::Int64Raw,
+                            &mut group_cache,
+                        )
+                    };
+                    self.groups[group_id].update_raw_i64_non_null(sum_values[row]);
+                }
+            } else {
+                for row in 0..def_levels.len() {
+                    let group_id = if def_levels[row] == 0 {
+                        count_sum_null_group_id(
+                            null_group,
+                            &mut self.groups,
+                            GroupValue::Int64(None),
+                            &CountSumValueInput::Int64Raw,
+                        )
+                    } else {
+                        let key = keys[value_index];
+                        value_index += 1;
+                        count_sum_group_id_for_i32_cached(
+                            index,
+                            key,
+                            &mut self.groups,
+                            &CountSumValueInput::Int64Raw,
+                            &mut group_cache,
+                        )
+                    };
+                    self.groups[group_id].update_raw_i64_optional(sums.value(row));
+                }
             }
         }
         Ok(())
@@ -2721,36 +3193,71 @@ impl SingleKeyCountSumVectorState {
             unreachable!("vector count/sum state uses Int64 group index")
         };
         if let Some(keys) = key_values.values_if_null_free() {
-            for row in 0..keys.len() {
-                let group_id = count_sum_group_id_for_i64(
-                    index,
-                    keys[row],
-                    &mut self.groups,
-                    &CountSumValueInput::Int64Raw,
-                );
-                self.groups[group_id].update_raw_i64_optional(sums.value(row));
+            if let Some(sum_values) = sums.non_null_values() {
+                for row in 0..keys.len() {
+                    let group_id = count_sum_group_id_for_i64(
+                        index,
+                        keys[row],
+                        &mut self.groups,
+                        &CountSumValueInput::Int64Raw,
+                    );
+                    self.groups[group_id].update_raw_i64_non_null(sum_values[row]);
+                }
+            } else {
+                for row in 0..keys.len() {
+                    let group_id = count_sum_group_id_for_i64(
+                        index,
+                        keys[row],
+                        &mut self.groups,
+                        &CountSumValueInput::Int64Raw,
+                    );
+                    self.groups[group_id].update_raw_i64_optional(sums.value(row));
+                }
             }
         } else if let Some((keys, def_levels)) = key_values.raw_nullable() {
             let mut value_index = 0usize;
-            for row in 0..def_levels.len() {
-                let group_id = if def_levels[row] == 0 {
-                    count_sum_null_group_id(
-                        null_group,
-                        &mut self.groups,
-                        GroupValue::Int64(None),
-                        &CountSumValueInput::Int64Raw,
-                    )
-                } else {
-                    let key = keys[value_index];
-                    value_index += 1;
-                    count_sum_group_id_for_i64(
-                        index,
-                        key,
-                        &mut self.groups,
-                        &CountSumValueInput::Int64Raw,
-                    )
-                };
-                self.groups[group_id].update_raw_i64_optional(sums.value(row));
+            if let Some(sum_values) = sums.non_null_values() {
+                for row in 0..def_levels.len() {
+                    let group_id = if def_levels[row] == 0 {
+                        count_sum_null_group_id(
+                            null_group,
+                            &mut self.groups,
+                            GroupValue::Int64(None),
+                            &CountSumValueInput::Int64Raw,
+                        )
+                    } else {
+                        let key = keys[value_index];
+                        value_index += 1;
+                        count_sum_group_id_for_i64(
+                            index,
+                            key,
+                            &mut self.groups,
+                            &CountSumValueInput::Int64Raw,
+                        )
+                    };
+                    self.groups[group_id].update_raw_i64_non_null(sum_values[row]);
+                }
+            } else {
+                for row in 0..def_levels.len() {
+                    let group_id = if def_levels[row] == 0 {
+                        count_sum_null_group_id(
+                            null_group,
+                            &mut self.groups,
+                            GroupValue::Int64(None),
+                            &CountSumValueInput::Int64Raw,
+                        )
+                    } else {
+                        let key = keys[value_index];
+                        value_index += 1;
+                        count_sum_group_id_for_i64(
+                            index,
+                            key,
+                            &mut self.groups,
+                            &CountSumValueInput::Int64Raw,
+                        )
+                    };
+                    self.groups[group_id].update_raw_i64_optional(sums.value(row));
+                }
             }
         }
         Ok(())
@@ -2914,6 +3421,13 @@ impl<'a> DirectI64SumInput<'a> {
                     Some(value)
                 }
             }
+        }
+    }
+
+    fn non_null_values(&self) -> Option<&'a [i64]> {
+        match self {
+            Self::NonNull(values) => Some(values),
+            Self::RawNullable { .. } => None,
         }
     }
 }
@@ -3532,6 +4046,9 @@ pub fn aggregate_metrics_to_batches(
     group_by: &[String],
     aggregates: &[AggregateExpr],
 ) -> Result<Vec<RecordBatch>> {
+    if let Some(batches) = &metrics.output_batches {
+        return Ok(batches.clone());
+    }
     if group_by.is_empty() {
         return aggregate_values_to_batch(&metrics.values).map(|batch| vec![batch]);
     }
@@ -3587,18 +4104,14 @@ fn count_sum_metrics_to_batch(
     let mut columns = Vec::with_capacity(group_by.len() + 2);
 
     for (index, column) in group_by.iter().enumerate() {
-        let values = metrics
-            .groups
-            .iter()
-            .map(|group| group.keys.get(index))
-            .collect::<Vec<_>>();
-        let (field, array) = group_values_to_column(column, &values);
+        let (field, array) = group_values_to_column_from_groups(column, &metrics.groups, index);
         fields.push(field);
         columns.push(array);
     }
 
     let mut counts = Vec::with_capacity(metrics.groups.len());
     let mut sums = Vec::with_capacity(metrics.groups.len());
+    let mut sums_have_nulls = false;
     let mut sum_is_float = false;
     for group in &metrics.groups {
         let Some(count) = group.values.first() else {
@@ -3608,13 +4121,17 @@ fn count_sum_metrics_to_batch(
             return Ok(None);
         };
         match &count.value {
-            AggregateValue::Count(value) => counts.push(Some(*value)),
+            AggregateValue::Count(value) => counts.push(*value),
             _ => return Ok(None),
         }
         match &sum.value {
-            AggregateValue::Int64(value) => sums.push(*value),
+            AggregateValue::Int64(value) => {
+                sums_have_nulls |= value.is_none();
+                sums.push(*value);
+            }
             AggregateValue::Float64(value) => {
                 sum_is_float = true;
+                sums_have_nulls |= value.is_none();
                 sums.push(value.map(|value| value as i64));
             }
             _ => return Ok(None),
@@ -3645,11 +4162,124 @@ fn count_sum_metrics_to_batch(
         columns.push(Arc::new(Float64Array::from(values)));
     } else {
         fields.push(Field::new(aggregates[1].to_string(), DataType::Int64, true));
-        columns.push(Arc::new(Int64Array::from(sums)));
+        if sums_have_nulls {
+            columns.push(Arc::new(Int64Array::from(sums)));
+        } else {
+            let values = sums
+                .into_iter()
+                .map(|value| value.expect("all count/sum int sums are non-null"))
+                .collect::<Vec<_>>();
+            columns.push(Arc::new(Int64Array::from(values)));
+        }
     }
 
     let schema = Arc::new(Schema::new(fields));
     Ok(Some(RecordBatch::try_new(schema, columns)?))
+}
+
+fn group_values_to_column_from_groups(
+    name: &str,
+    groups: &[GroupAggregateResult],
+    index: usize,
+) -> (Field, ArrayRef) {
+    let data_type = groups
+        .iter()
+        .find_map(|group| match group.keys.get(index) {
+            Some(GroupValue::Utf8(_)) => Some(DataType::Utf8),
+            Some(GroupValue::Date64(_)) => Some(DataType::Date64),
+            Some(GroupValue::Date32(_)) => Some(DataType::Date32),
+            Some(GroupValue::Decimal128(_, precision, scale)) => {
+                Some(DataType::Decimal128(*precision, *scale))
+            }
+            Some(GroupValue::UInt64(_)) => Some(DataType::UInt64),
+            Some(GroupValue::Int64(_)) => Some(DataType::Int64),
+            None => None,
+        })
+        .unwrap_or(DataType::Int64);
+
+    match data_type {
+        DataType::Utf8 => {
+            let values = groups
+                .iter()
+                .map(|group| match group.keys.get(index) {
+                    Some(GroupValue::Utf8(value)) => value.clone(),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (
+                Field::new(name, DataType::Utf8, true),
+                Arc::new(StringArray::from(values)),
+            )
+        }
+        DataType::Date64 => {
+            let values = groups
+                .iter()
+                .map(|group| match group.keys.get(index) {
+                    Some(GroupValue::Date64(value)) => *value,
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (
+                Field::new(name, DataType::Date64, true),
+                Arc::new(Date64Array::from(values)),
+            )
+        }
+        DataType::Date32 => {
+            let values = groups
+                .iter()
+                .map(|group| match group.keys.get(index) {
+                    Some(GroupValue::Date32(value)) => *value,
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (
+                Field::new(name, DataType::Date32, true),
+                Arc::new(Date32Array::from(values)),
+            )
+        }
+        DataType::Decimal128(precision, scale) => {
+            let values = groups
+                .iter()
+                .map(|group| match group.keys.get(index) {
+                    Some(GroupValue::Decimal128(value, _, _)) => *value,
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let array = Decimal128Array::from(values)
+                .with_precision_and_scale(precision, scale)
+                .expect("valid Decimal128 group values");
+            (
+                Field::new(name, DataType::Decimal128(precision, scale), true),
+                Arc::new(array),
+            )
+        }
+        DataType::UInt64 => {
+            let values = groups
+                .iter()
+                .map(|group| match group.keys.get(index) {
+                    Some(GroupValue::UInt64(value)) => *value,
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (
+                Field::new(name, DataType::UInt64, true),
+                Arc::new(UInt64Array::from(values)),
+            )
+        }
+        _ => {
+            let values = groups
+                .iter()
+                .map(|group| match group.keys.get(index) {
+                    Some(GroupValue::Int64(value)) => *value,
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (
+                Field::new(name, DataType::Int64, true),
+                Arc::new(Int64Array::from(values)),
+            )
+        }
+    }
 }
 
 fn aggregate_values_to_batch(values: &[AggregateResult]) -> Result<RecordBatch> {
@@ -6035,6 +6665,71 @@ fn count_sum_group_id_for_i32(
     group_id
 }
 
+struct I32BatchGroupCache {
+    min: i32,
+    slots: Vec<Option<usize>>,
+}
+
+fn i32_batch_group_cache(keys: &[i32]) -> Option<I32BatchGroupCache> {
+    if !i32_batch_group_cache_enabled() {
+        return None;
+    }
+    if keys.len() < 1024 {
+        return None;
+    }
+    let mut min = i32::MAX;
+    let mut max = i32::MIN;
+    for key in keys {
+        min = min.min(*key);
+        max = max.max(*key);
+    }
+    let slot_count = dense_i32_slot_count(min, max)?;
+    (slot_count <= i32_batch_group_cache_max_slots()).then(|| I32BatchGroupCache {
+        min,
+        slots: vec![None; slot_count],
+    })
+}
+
+fn i32_batch_group_cache_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_I32_BATCH_GROUP_CACHE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn i32_batch_group_cache_max_slots() -> usize {
+    std::env::var("DODAM_I32_BATCH_GROUP_CACHE_MAX_SLOTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4096)
+}
+
+fn count_sum_group_id_for_i32_cached(
+    index: &mut DenseI32GroupIndex,
+    key: i32,
+    groups: &mut Vec<CountSumGroup>,
+    sum_input: &CountSumValueInput<'_>,
+    cache: &mut Option<I32BatchGroupCache>,
+) -> usize {
+    let Some(cache) = cache else {
+        return count_sum_group_id_for_i32(index, key, groups, sum_input);
+    };
+    let Some(offset) = key
+        .checked_sub(cache.min)
+        .and_then(|value| usize::try_from(value).ok())
+    else {
+        return count_sum_group_id_for_i32(index, key, groups, sum_input);
+    };
+    let Some(slot) = cache.slots.get_mut(offset) else {
+        return count_sum_group_id_for_i32(index, key, groups, sum_input);
+    };
+    if let Some(group_id) = *slot {
+        return group_id;
+    }
+    let group_id = count_sum_group_id_for_i32(index, key, groups, sum_input);
+    *slot = Some(group_id);
+    group_id
+}
+
 enum DenseI32GroupIndex {
     Small(Vec<(i32, usize)>),
     Dense { min: i32, slots: Vec<Option<usize>> },
@@ -6341,6 +7036,12 @@ impl CountSumGroup {
             self.sum_i64 = self.sum_i64.saturating_add(value);
             self.sum_count += 1;
         }
+    }
+
+    fn update_raw_i64_non_null(&mut self, value: i64) {
+        self.count += 1;
+        self.sum_i64 = self.sum_i64.saturating_add(value);
+        self.sum_count += 1;
     }
 
     fn merge_group(&mut self, partial: Self) {

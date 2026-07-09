@@ -40,6 +40,21 @@ def main() -> int:
         help="Use one DuckDB process per sample, or one .timer-enabled SQL file process per query.",
     )
     parser.add_argument("--json-out", default="")
+    parser.add_argument(
+        "--dodam-parquet-options",
+        default="",
+        help="Extra Dodam COPY FORMAT PARQUET options, for example: COMPRESSION uncompressed, ROW_GROUP_SIZE 65536",
+    )
+    parser.add_argument(
+        "--duckdb-parquet-options",
+        default="",
+        help="Extra DuckDB COPY FORMAT PARQUET options.",
+    )
+    parser.add_argument(
+        "--only",
+        default="",
+        help="Comma-separated query names to run. Matches are case-insensitive.",
+    )
     parser.add_argument("--timeout", type=float, default=120.0)
     args = parser.parse_args()
 
@@ -50,7 +65,9 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     ensure_fixture(args.duckdb, data_dir, args.timeout)
 
-    queries = generic_queries(data_dir)
+    queries = filter_queries(generic_queries(data_dir), args.only)
+    if not queries:
+        raise SystemExit(f"no generic queries matched --only {args.only!r}")
     report = []
     for query in queries:
         dodam_samples = run_dodam(args, query, output_dir / "dodam")
@@ -178,6 +195,13 @@ def generic_queries(data_dir: Path) -> list[GenericQuery]:
     ]
 
 
+def filter_queries(queries: list[GenericQuery], only: str) -> list[GenericQuery]:
+    filters = [item.strip().lower() for item in only.split(",") if item.strip()]
+    if not filters:
+        return queries
+    return [query for query in queries if query.name.lower() in filters]
+
+
 def run_dodam(args, query: GenericQuery, output_dir: Path) -> list[float]:
     output_dir.mkdir(parents=True, exist_ok=True)
     if args.dodam_mode == "query-file":
@@ -185,7 +209,7 @@ def run_dodam(args, query: GenericQuery, output_dir: Path) -> list[float]:
     samples = []
     for repeat in range(args.repeats):
         output = output_dir / f"{query.name}-{repeat}.parquet"
-        sql = f"COPY ({query.dodam_sql}) TO '{output}' (FORMAT PARQUET)"
+        sql = f"COPY ({query.dodam_sql}) TO '{output}' ({copy_parquet_options(args.dodam_parquet_options)})"
         started = time.perf_counter()
         completed = subprocess.run(
             [args.dodam, "query", sql, "--batch-size", str(args.batch_size)],
@@ -209,7 +233,9 @@ def run_dodam_query_file(args, query: GenericQuery, output_dir: Path) -> list[fl
     statements = []
     for repeat in range(total_runs):
         output = output_dir / f"{query.name}-{repeat}.parquet"
-        statements.append(f"COPY ({query.dodam_sql}) TO '{output}' (FORMAT PARQUET);")
+        statements.append(
+            f"COPY ({query.dodam_sql}) TO '{output}' ({copy_parquet_options(args.dodam_parquet_options)});"
+        )
     sql_file.write_text("\n".join(statements) + "\n")
     env = os.environ.copy()
     env["DODAM_PROFILE_COPY"] = "1"
@@ -239,7 +265,7 @@ def run_duckdb(args, query: GenericQuery, output_dir: Path) -> list[float]:
     samples = []
     for repeat in range(args.repeats):
         output = output_dir / f"{query.name}-{repeat}.parquet"
-        sql = f"COPY ({query.duckdb_sql}) TO '{output}' (FORMAT PARQUET)"
+        sql = f"COPY ({query.duckdb_sql}) TO '{output}' ({copy_parquet_options(args.duckdb_parquet_options)})"
         started = time.perf_counter()
         completed = subprocess.run(
             [args.duckdb, "-c", sql],
@@ -263,7 +289,9 @@ def run_duckdb_query_file(args, query: GenericQuery, output_dir: Path) -> list[f
     statements = [".timer on"]
     for repeat in range(total_runs):
         output = output_dir / f"{query.name}-{repeat}.parquet"
-        statements.append(f"COPY ({query.duckdb_sql}) TO '{output}' (FORMAT PARQUET);")
+        statements.append(
+            f"COPY ({query.duckdb_sql}) TO '{output}' ({copy_parquet_options(args.duckdb_parquet_options)});"
+        )
     sql_file.write_text("\n".join(statements) + "\n")
     started = time.perf_counter()
     with sql_file.open("r") as stdin:
@@ -285,6 +313,14 @@ def run_duckdb_query_file(args, query: GenericQuery, output_dir: Path) -> list[f
         # mode usable as a total-process smoke measurement instead of failing.
         return [elapsed / total_runs for _ in range(total_runs)]
     return samples
+
+
+def copy_parquet_options(extra_options: str) -> str:
+    options = "FORMAT PARQUET"
+    extra_options = extra_options.strip()
+    if extra_options:
+        options = f"{options}, {extra_options}"
+    return options
 
 
 def median_after_warmup(samples: list[float], warmup: int) -> float:

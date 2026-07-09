@@ -515,6 +515,12 @@ pub async fn execute_sql(
                 &aggregates,
                 &query.aggregate_expressions,
                 query.order_by.is_some(),
+                expression_aggregate_output_limit(
+                    &group_by,
+                    query.order_by.as_ref(),
+                    query.limit,
+                    query.offset,
+                ),
             )
             .await?
             {
@@ -529,6 +535,12 @@ pub async fn execute_sql(
                 &aggregates,
                 &query.aggregate_expressions,
                 query.order_by.is_some(),
+                expression_aggregate_output_limit(
+                    &group_by,
+                    query.order_by.as_ref(),
+                    query.limit,
+                    query.offset,
+                ),
             )
             .await?
             {
@@ -3114,6 +3126,22 @@ async fn try_execute_projection_expression_sql(
                 .collect(),
         );
     }
+    if projection_requires_expression
+        && !filter_requires_expression
+        && let Some(filter) = filter.clone()
+        && let Some(mut batches) = try_late_materialized_projection_expression(
+            engine,
+            path.path.clone(),
+            batch_size,
+            filter,
+            scan_projection.clone(),
+            &parsed_projection.expressions,
+        )
+        .await?
+    {
+        batches = apply_output_order_limit(batches, order_by.as_ref(), limit, 0)?;
+        return Ok(Some(QueryOutput::Scan { batches }));
+    }
     let stream = if filter_requires_expression {
         engine
             .scan_parquet_batches(path.path, batch_size, None, scan_projection, None)
@@ -3146,6 +3174,114 @@ async fn try_execute_projection_expression_sql(
         rename_output_batches(batches, &parsed_projection.aliases)?
     };
     Ok(Some(QueryOutput::Scan { batches }))
+}
+
+async fn try_late_materialized_projection_expression(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    filter: FilterExpr,
+    payload_projection: Projection,
+    expressions: &[ProjectionExpression],
+) -> Result<Option<Vec<RecordBatch>>> {
+    if !late_projection_enabled() {
+        return Ok(None);
+    }
+    let predicate_columns = filter.referenced_columns();
+    let predicate_projection = Projection::Columns(predicate_columns.clone());
+    let predicates = PredicateSet::new(Some(filter.clone()));
+    let expressions = expressions.to_vec();
+    let Some(chunks) = engine
+        .late_materialized_parquet_map_pruned_with_policy_view(
+            path,
+            batch_size,
+            predicate_projection,
+            payload_projection,
+            predicates.pushdown().to_vec(),
+            late_projection_row_group_chunk(),
+            LateMaterializationPolicy::selective_with_selector_run_ratio(
+                late_projection_max_selected_ratio(),
+                late_projection_max_selector_run_ratio(),
+            ),
+            Vec::<RecordBatch>::new,
+            {
+                let filter = filter.clone();
+                let predicate_columns = predicate_columns.clone();
+                move |view, selection, _state: &mut Vec<RecordBatch>| {
+                    let mask = if let Some(mask) =
+                        evaluate_projected_view_filter_mask(view, &predicate_columns, &filter)?
+                    {
+                        mask
+                    } else {
+                        let Some(batch) = view.try_record_batch() else {
+                            return Ok(None);
+                        };
+                        evaluate_filter_mask(batch, &filter)?
+                    };
+                    selection.push_selected_rows(mask.len(), |row| {
+                        mask.is_valid(row) && mask.value(row)
+                    });
+                    Ok(Some(()))
+                }
+            },
+            move |view, state: &mut Vec<RecordBatch>| {
+                let Some(batch) = view.try_record_batch() else {
+                    return Ok(None);
+                };
+                state.push(batch.clone());
+                Ok(Some(()))
+            },
+            {
+                let expressions = expressions.clone();
+                move |state, _metrics| {
+                    if state.is_empty() {
+                        return Ok(None);
+                    }
+                    Ok(Some(apply_output_expression_projection(
+                        state,
+                        &expressions,
+                    )?))
+                }
+            },
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let mut batches = Vec::new();
+    for chunk in chunks {
+        batches.extend(chunk.output);
+    }
+    Ok(Some(batches))
+}
+
+fn late_projection_enabled() -> bool {
+    !std::env::var("DODAM_DISABLE_LATE_PROJECTION")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn late_projection_row_group_chunk() -> usize {
+    std::env::var("DODAM_LATE_PROJECTION_ROW_GROUP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2)
+}
+
+fn late_projection_max_selected_ratio() -> f64 {
+    std::env::var("DODAM_LATE_PROJECTION_MAX_SELECTED_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.35)
+}
+
+fn late_projection_max_selector_run_ratio() -> f64 {
+    std::env::var("DODAM_LATE_PROJECTION_MAX_SELECTOR_RUN_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.25)
 }
 
 fn projection_requires_expression_path(expressions: &[ProjectionExpression]) -> bool {
@@ -41730,6 +41866,7 @@ async fn try_collect_expression_aggregate_late_materialized(
     aggregates: &[AggregateExpr],
     expressions: &[ProjectionExpression],
     ordered_output: bool,
+    output_limit: Option<usize>,
 ) -> Result<Option<AggregateMetrics>> {
     if !expression_aggregate_late_materialized_enabled() {
         return Ok(None);
@@ -41745,6 +41882,10 @@ async fn try_collect_expression_aggregate_late_materialized(
     }
     let payload_projection =
         expression_aggregate_payload_projection(&group_keys, aggregates, expressions);
+    let Projection::Columns(payload_projected_columns) = &payload_projection else {
+        return Ok(None);
+    };
+    let payload_projected_columns = payload_projected_columns.clone();
     let predicate_columns = filter.referenced_columns();
     let predicate_projection = Projection::Columns(predicate_columns.clone());
     let aggregates = aggregates.to_vec();
@@ -41770,7 +41911,15 @@ async fn try_collect_expression_aggregate_late_materialized(
             {
                 let filter = filter.clone();
                 let predicate_columns = predicate_columns.clone();
-                move |view, selection, _collector| {
+                move |view, selection, _collector: &mut CoalesceKeyCountSumCollector| {
+                    if push_projected_view_filter_selection(
+                        view,
+                        &predicate_columns,
+                        &filter,
+                        selection,
+                    )? {
+                        return Ok(Some(()));
+                    }
                     let mask = if let Some(mask) =
                         evaluate_projected_view_filter_mask(view, &predicate_columns, &filter)?
                     {
@@ -41787,12 +41936,19 @@ async fn try_collect_expression_aggregate_late_materialized(
                     Ok(Some(()))
                 }
             },
-            |view, collector| {
-                let Some(batch) = view.try_record_batch() else {
-                    return Ok(None);
-                };
-                collector.consume_batch(batch)?;
-                Ok(Some(()))
+            {
+                let payload_projected_columns = payload_projected_columns.clone();
+                move |view, collector: &mut CoalesceKeyCountSumCollector| {
+                    if expression_aggregate_late_view_payload_enabled() {
+                        collector.consume_projected_view(view, &payload_projected_columns)?;
+                    } else {
+                        let Some(batch) = view.try_record_batch() else {
+                            return Ok(None);
+                        };
+                        collector.consume_batch(batch)?;
+                    }
+                    Ok(Some(()))
+                }
             },
             |collector, _metrics| Ok(Some(collector)),
         )
@@ -41802,14 +41958,19 @@ async fn try_collect_expression_aggregate_late_materialized(
     };
     let collectors = partials
         .into_iter()
-        .map(|partial| partial.output)
+        .map(|partial| {
+            log_expression_aggregate_late_profile(&partial.metrics);
+            partial.output
+        })
         .collect::<Vec<_>>();
     Ok(Some(
-        CoalesceKeyCountSumCollector::merge_partials_with_order(
+        CoalesceKeyCountSumCollector::merge_partials_with_order_and_output(
             collectors,
             1,
             &aggregates,
+            Some(group_by),
             ordered_output,
+            output_limit,
         )?,
     ))
 }
@@ -41825,6 +41986,7 @@ async fn try_collect_expression_aggregate_scan_fold(
     aggregates: &[AggregateExpr],
     expressions: &[ProjectionExpression],
     ordered_output: bool,
+    output_limit: Option<usize>,
 ) -> Result<Option<AggregateMetrics>> {
     if !expression_aggregate_scan_fold_enabled() {
         return Ok(None);
@@ -41896,11 +42058,13 @@ async fn try_collect_expression_aggregate_scan_fold(
             .await?
         {
             return Ok(Some(
-                CoalesceKeyCountSumCollector::merge_partials_with_order(
+                CoalesceKeyCountSumCollector::merge_partials_with_order_and_output(
                     partials,
                     1,
                     &aggregates,
+                    Some(group_by),
                     ordered_output,
+                    output_limit,
                 )?,
             ));
         }
@@ -41918,13 +42082,42 @@ async fn try_collect_expression_aggregate_scan_fold(
         )
         .await?;
     Ok(Some(
-        CoalesceKeyCountSumCollector::merge_partials_with_order(
+        CoalesceKeyCountSumCollector::merge_partials_with_order_and_output(
             vec![collector],
             1,
             &aggregates,
+            Some(group_by),
             ordered_output,
+            output_limit,
         )?,
     ))
+}
+
+fn expression_aggregate_output_limit(
+    group_by: &[String],
+    order_by: Option<&SortKey>,
+    limit: Option<usize>,
+    offset: usize,
+) -> Option<usize> {
+    let limit = limit?;
+    if offset != 0 || !aggregate_order_by_prefix_matches(group_by, order_by) {
+        return None;
+    }
+    Some(limit)
+}
+
+fn aggregate_order_by_prefix_matches(group_by: &[String], order_by: Option<&SortKey>) -> bool {
+    let Some(order_by) = order_by else {
+        return false;
+    };
+    if order_by.expressions.is_empty() || order_by.expressions.len() > group_by.len() {
+        return false;
+    }
+    order_by
+        .expressions
+        .iter()
+        .zip(group_by)
+        .all(|(sort, group)| !sort.descending && !sort.nulls_first && sort.column == *group)
 }
 
 #[allow(dead_code)]
@@ -41934,6 +42127,155 @@ fn evaluate_filter_mask_for_projected_view(
     filter: &FilterExpr,
 ) -> Result<Option<BooleanArray>> {
     evaluate_expr_mask_for_projected_view(view, columns, filter.expr())
+}
+
+fn push_projected_view_filter_selection(
+    view: BatchView<'_>,
+    columns: &[String],
+    filter: &FilterExpr,
+    selection: &mut LateSelectionBuilder,
+) -> Result<bool> {
+    if !std::env::var("DODAM_ENABLE_DIRECT_LATE_SELECTION")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return Ok(false);
+    }
+    push_projected_view_expr_selection(view, columns, filter.expr(), selection)
+}
+
+fn push_projected_view_expr_selection(
+    view: BatchView<'_>,
+    columns: &[String],
+    expr: &Expr,
+    selection: &mut LateSelectionBuilder,
+) -> Result<bool> {
+    match expr {
+        Expr::Boolean(value) => {
+            let value = value.unwrap_or(false);
+            selection.push_selected_rows(view.num_rows(), |_| value);
+            Ok(true)
+        }
+        Expr::Comparison(comparison) => {
+            push_comparison_selection_for_projected_view(view, columns, comparison, selection)
+        }
+        Expr::InList {
+            column,
+            values,
+            negated,
+            has_null,
+        } => push_in_list_selection_for_projected_view(
+            view, columns, column, values, *negated, *has_null, selection,
+        ),
+        Expr::Not(_)
+        | Expr::And(_, _)
+        | Expr::Or(_, _)
+        | Expr::ColumnComparison { .. }
+        | Expr::Like { .. }
+        | Expr::IsNull { .. } => Ok(false),
+    }
+}
+
+fn push_comparison_selection_for_projected_view(
+    view: BatchView<'_>,
+    columns: &[String],
+    comparison: &ComparisonExpr,
+    selection: &mut LateSelectionBuilder,
+) -> Result<bool> {
+    if matches!(comparison.value, LiteralValue::Null) {
+        selection.push_selected_rows(view.num_rows(), |_| false);
+        return Ok(true);
+    }
+    let Some(index) = projected_view_column_index(columns, &comparison.column) else {
+        return Ok(false);
+    };
+    if let Some(values) = view.i64_vector(index) {
+        let literal = comparison.value.as_i64(&comparison.column)?;
+        selection.push_selected_rows(values.len(), |row| {
+            !values.is_null(row) && compare_i64(values.value(row), comparison.op, literal)
+        });
+        return Ok(true);
+    }
+    if let Some(values) = view.i32_vector(index) {
+        let literal = comparison.value.as_i32(&comparison.column)?;
+        selection.push_selected_rows(values.len(), |row| {
+            !values.is_null(row) && compare_i32(values.value(row), comparison.op, literal)
+        });
+        return Ok(true);
+    }
+    if let Some(values) = view.date32_vector(index) {
+        let Some(literal) = literal_as_date32_for_type(&comparison.value)? else {
+            return Ok(false);
+        };
+        selection.push_selected_rows(values.len(), |row| {
+            !values.is_null(row) && compare_i32(values.value(row), comparison.op, literal)
+        });
+        return Ok(true);
+    }
+    if let Some(values) = view.decimal128_vector(index) {
+        let Some(literal) = literal_to_decimal_scaled(&comparison.value, values.scale_i64())?
+        else {
+            return Ok(false);
+        };
+        if let Some(raw) = values.raw_i64_values() {
+            selection.push_selected_rows(raw.len(), |row| {
+                !values.is_null(row) && compare_i128(i128::from(raw[row]), comparison.op, literal)
+            });
+        } else {
+            let raw = values.raw_values();
+            selection.push_selected_rows(raw.len(), |row| {
+                !values.is_null(row) && compare_i128(raw[row], comparison.op, literal)
+            });
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn push_in_list_selection_for_projected_view(
+    view: BatchView<'_>,
+    columns: &[String],
+    column: &str,
+    values: &[LiteralValue],
+    negated: bool,
+    has_null: bool,
+    selection: &mut LateSelectionBuilder,
+) -> Result<bool> {
+    let Some(index) = projected_view_column_index(columns, column) else {
+        return Ok(false);
+    };
+    if let Some(probe) = view.i64_vector(index) {
+        let values = values
+            .iter()
+            .filter(|value| !matches!(value, LiteralValue::Null))
+            .map(|value| value.as_i64(column))
+            .collect::<Result<Vec<_>>>()?;
+        selection.push_selected_rows(probe.len(), |row| {
+            if probe.is_null(row) {
+                false
+            } else {
+                in_list_result(values.contains(&probe.value(row)), negated, has_null)
+                    .unwrap_or(false)
+            }
+        });
+        return Ok(true);
+    }
+    if let Some(probe) = view.i32_vector(index) {
+        let values = values
+            .iter()
+            .filter(|value| !matches!(value, LiteralValue::Null))
+            .map(|value| value.as_i32(column))
+            .collect::<Result<Vec<_>>>()?;
+        selection.push_selected_rows(probe.len(), |row| {
+            if probe.is_null(row) {
+                false
+            } else {
+                in_list_result(values.contains(&probe.value(row)), negated, has_null)
+                    .unwrap_or(false)
+            }
+        });
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn evaluate_expr_mask_for_projected_view(
@@ -42364,6 +42706,11 @@ fn expression_aggregate_late_materialized_enabled() -> bool {
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
+fn expression_aggregate_late_view_payload_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_EXPRESSION_AGG_LATE_VIEW_PAYLOAD")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
 fn expression_aggregate_late_row_group_chunk() -> usize {
     std::env::var("DODAM_EXPRESSION_AGG_LATE_ROW_GROUP_CHUNK")
         .ok()
@@ -42385,7 +42732,29 @@ fn expression_aggregate_late_max_selector_run_ratio() -> f64 {
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite())
-        .unwrap_or(1.25)
+        .unwrap_or(0.90)
+}
+
+fn log_expression_aggregate_late_profile(metrics: &LateMaterializedMetrics) {
+    if !std::env::var("DODAM_COALESCE_AGG_PROFILE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return;
+    }
+    let ratio = if metrics.total_rows == 0 {
+        0.0
+    } else {
+        metrics.selected_rows as f64 / metrics.total_rows as f64
+    };
+    let run_ratio = if metrics.total_rows == 0 {
+        0.0
+    } else {
+        metrics.selector_runs as f64 / metrics.total_rows as f64
+    };
+    eprintln!(
+        "[dodam:coalesce-agg-profile] late rows={} selected={} ratio={:.6} selector_runs={} run_ratio={:.6}",
+        metrics.total_rows, metrics.selected_rows, ratio, metrics.selector_runs, run_ratio
+    );
 }
 
 fn expression_aggregate_payload_projection(
@@ -42564,6 +42933,7 @@ fn group_key_literal(value: &LiteralValue) -> GroupKeyLiteral {
 
 #[derive(Clone)]
 enum EvaluatedScalar {
+    Array(ArrayRef),
     Int64(Vec<Option<i64>>),
     Float64(Vec<Option<f64>>),
     Decimal128 {
@@ -42580,6 +42950,7 @@ enum EvaluatedScalar {
 impl EvaluatedScalar {
     fn len(&self) -> usize {
         match self {
+            Self::Array(array) => array.len(),
             Self::Int64(values) => values.len(),
             Self::Float64(values) => values.len(),
             Self::Decimal128 { values, .. } => values.len(),
@@ -42592,6 +42963,7 @@ impl EvaluatedScalar {
 
     fn data_type(&self) -> DataType {
         match self {
+            Self::Array(array) => array.data_type().clone(),
             Self::Int64(_) => DataType::Int64,
             Self::Float64(_) => DataType::Float64,
             Self::Decimal128 {
@@ -42606,6 +42978,7 @@ impl EvaluatedScalar {
 
     fn is_nullable(&self) -> bool {
         match self {
+            Self::Array(array) => array.null_count() > 0,
             Self::Int64(values) => values.iter().any(Option::is_none),
             Self::Float64(values) => values.iter().any(Option::is_none),
             Self::Decimal128 { values, .. } => values.iter().any(Option::is_none),
@@ -42618,6 +42991,7 @@ impl EvaluatedScalar {
 
     fn into_array(self, _rows: usize) -> ArrayRef {
         match self {
+            Self::Array(array) => array,
             Self::Int64(values) => Arc::new(Int64Array::from(values)) as ArrayRef,
             Self::Float64(values) => Arc::new(Float64Array::from(values)) as ArrayRef,
             Self::Decimal128 {
@@ -42795,10 +43169,10 @@ fn column_literal_coalesce(
         if !matches!(literal, LiteralValue::Null) {
             return Ok(Some(evaluated_literal(literal, batch.num_rows())));
         }
-        return Ok(Some(evaluated_array(array.as_ref())?));
+        return Ok(Some(EvaluatedScalar::Array(array.clone())));
     }
     if array.null_count() == 0 || matches!(literal, LiteralValue::Null) {
-        return Ok(Some(evaluated_array(array.as_ref())?));
+        return Ok(Some(EvaluatedScalar::Array(array.clone())));
     }
     coalesce_array_with_literal(array.as_ref(), literal)
 }
@@ -42811,6 +43185,20 @@ fn coalesce_array_with_literal(
         DataType::Int32 => {
             let values = array.as_any().downcast_ref::<Int32Array>().expect("Int32");
             let literal = literal_as_i64_for_type(literal)?;
+            if let Some(literal) = literal {
+                let values = (0..values.len())
+                    .map(|row| {
+                        if values.is_valid(row) {
+                            i64::from(values.value(row))
+                        } else {
+                            literal
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                return Ok(Some(EvaluatedScalar::Array(Arc::new(Int64Array::from(
+                    values,
+                )))));
+            }
             Ok(Some(EvaluatedScalar::Int64(
                 (0..values.len())
                     .map(|row| {
@@ -42826,6 +43214,20 @@ fn coalesce_array_with_literal(
         DataType::Int64 => {
             let values = array.as_any().downcast_ref::<Int64Array>().expect("Int64");
             let literal = literal_as_i64_for_type(literal)?;
+            if let Some(literal) = literal {
+                let values = (0..values.len())
+                    .map(|row| {
+                        if values.is_valid(row) {
+                            values.value(row)
+                        } else {
+                            literal
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                return Ok(Some(EvaluatedScalar::Array(Arc::new(Int64Array::from(
+                    values,
+                )))));
+            }
             Ok(Some(EvaluatedScalar::Int64(
                 (0..values.len())
                     .map(|row| {
@@ -42844,6 +43246,20 @@ fn coalesce_array_with_literal(
                 .downcast_ref::<Float64Array>()
                 .expect("Float64");
             let literal = literal_as_f64_for_type(literal)?;
+            if let Some(literal) = literal {
+                let values = (0..values.len())
+                    .map(|row| {
+                        if values.is_valid(row) {
+                            values.value(row)
+                        } else {
+                            literal
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                return Ok(Some(EvaluatedScalar::Array(Arc::new(Float64Array::from(
+                    values,
+                )))));
+            }
             Ok(Some(EvaluatedScalar::Float64(
                 (0..values.len())
                     .map(|row| {
@@ -42862,6 +43278,20 @@ fn coalesce_array_with_literal(
                 .downcast_ref::<BooleanArray>()
                 .expect("Boolean");
             let literal = literal_as_bool_for_type(literal)?;
+            if let Some(literal) = literal {
+                let values = (0..values.len())
+                    .map(|row| {
+                        if values.is_valid(row) {
+                            values.value(row)
+                        } else {
+                            literal
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                return Ok(Some(EvaluatedScalar::Array(Arc::new(BooleanArray::from(
+                    values,
+                )))));
+            }
             Ok(Some(EvaluatedScalar::Boolean(
                 (0..values.len())
                     .map(|row| {
@@ -42880,6 +43310,20 @@ fn coalesce_array_with_literal(
                 .downcast_ref::<Date32Array>()
                 .expect("Date32");
             let literal = literal_as_date32_for_type(literal)?;
+            if let Some(literal) = literal {
+                let values = (0..values.len())
+                    .map(|row| {
+                        if values.is_valid(row) {
+                            values.value(row)
+                        } else {
+                            literal
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                return Ok(Some(EvaluatedScalar::Array(Arc::new(Date32Array::from(
+                    values,
+                )))));
+            }
             Ok(Some(EvaluatedScalar::Date32(
                 (0..values.len())
                     .map(|row| {
@@ -42898,6 +43342,21 @@ fn coalesce_array_with_literal(
                 .downcast_ref::<Decimal128Array>()
                 .expect("Decimal128");
             let literal = literal_as_decimal128_for_type(literal, *precision, *scale)?;
+            if let Some(literal) = literal {
+                let values = (0..values.len())
+                    .map(|row| {
+                        if values.is_valid(row) {
+                            values.value(row)
+                        } else {
+                            literal
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let array = Decimal128Array::from(values)
+                    .with_precision_and_scale(*precision, *scale)
+                    .expect("valid Decimal128 coalesce result");
+                return Ok(Some(EvaluatedScalar::Array(Arc::new(array))));
+            }
             Ok(Some(EvaluatedScalar::Decimal128 {
                 values: (0..values.len())
                     .map(|row| {
@@ -42915,6 +43374,20 @@ fn coalesce_array_with_literal(
         DataType::Utf8 => {
             let values = array.as_any().downcast_ref::<StringArray>().expect("Utf8");
             let literal = literal_as_utf8_for_type(literal)?;
+            if let Some(literal) = literal {
+                let values = (0..values.len())
+                    .map(|row| {
+                        if values.is_valid(row) {
+                            values.value(row).to_string()
+                        } else {
+                            literal.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                return Ok(Some(EvaluatedScalar::Array(Arc::new(StringArray::from(
+                    values,
+                )))));
+            }
             Ok(Some(EvaluatedScalar::Utf8(
                 (0..values.len())
                     .map(|row| {
@@ -43385,6 +43858,9 @@ enum ScalarValue {
 
 fn scalar_value_at(value: &EvaluatedScalar, row: usize) -> Result<Option<ScalarValue>> {
     Ok(match value {
+        EvaluatedScalar::Array(array) => {
+            return scalar_value_at(&evaluated_array(array.as_ref())?, row);
+        }
         EvaluatedScalar::Int64(values) => values[row].map(ScalarValue::Int64),
         EvaluatedScalar::Float64(values) => values[row].map(ScalarValue::Float64),
         EvaluatedScalar::Decimal128 {
@@ -43463,6 +43939,21 @@ enum EvaluatedScalarKind {
 
 fn evaluated_scalar_kind(value: &EvaluatedScalar) -> Option<EvaluatedScalarKind> {
     Some(match value {
+        EvaluatedScalar::Array(array) => match array.data_type() {
+            DataType::Int32 | DataType::Int64 => EvaluatedScalarKind::Int64,
+            DataType::Float64 => EvaluatedScalarKind::Float64,
+            DataType::Utf8 => EvaluatedScalarKind::Utf8,
+            DataType::Boolean => EvaluatedScalarKind::Boolean,
+            DataType::Date32 => EvaluatedScalarKind::Date32,
+            DataType::Timestamp(TimeUnit::Millisecond, _) | DataType::Date64 => {
+                EvaluatedScalarKind::TimestampMillisecond
+            }
+            DataType::Decimal128(precision, scale) => EvaluatedScalarKind::Decimal128 {
+                precision: *precision,
+                scale: *scale,
+            },
+            _ => return None,
+        },
         EvaluatedScalar::Int64(_) => EvaluatedScalarKind::Int64,
         EvaluatedScalar::Float64(_) => EvaluatedScalarKind::Float64,
         EvaluatedScalar::Decimal128 {
@@ -43502,6 +43993,11 @@ fn set_scalar_value_from(
     source: Option<&EvaluatedScalar>,
 ) -> Result<()> {
     match output {
+        EvaluatedScalar::Array(_) => {
+            return Err(DodamError::UnsupportedSql(
+                "CASE output cannot be an array-backed scalar".to_string(),
+            ));
+        }
         EvaluatedScalar::Int64(values) => {
             values[row] = source
                 .map(|source| scalar_value_as_i64(source, row))
@@ -43554,6 +44050,9 @@ fn set_scalar_value_from(
 
 fn scalar_value_as_i64(value: &EvaluatedScalar, row: usize) -> Result<Option<i64>> {
     match value {
+        EvaluatedScalar::Array(array) => {
+            scalar_value_as_i64(&evaluated_array(array.as_ref())?, row)
+        }
         EvaluatedScalar::Int64(values) => Ok(values[row]),
         _ => Err(DodamError::UnsupportedSql(
             "CASE result type mismatch".to_string(),
@@ -43563,6 +44062,9 @@ fn scalar_value_as_i64(value: &EvaluatedScalar, row: usize) -> Result<Option<i64
 
 fn scalar_value_as_f64(value: &EvaluatedScalar, row: usize) -> Result<Option<f64>> {
     match value {
+        EvaluatedScalar::Array(array) => {
+            scalar_value_as_f64(&evaluated_array(array.as_ref())?, row)
+        }
         EvaluatedScalar::Int64(values) => Ok(values[row].map(|value| value as f64)),
         EvaluatedScalar::Float64(values) => Ok(values[row]),
         EvaluatedScalar::Decimal128 { values, scale, .. } => {
@@ -43582,6 +44084,9 @@ fn scalar_value_as_decimal128(
     scale: i8,
 ) -> Result<Option<i128>> {
     match value {
+        EvaluatedScalar::Array(array) => {
+            scalar_value_as_decimal128(&evaluated_array(array.as_ref())?, row, precision, scale)
+        }
         EvaluatedScalar::Decimal128 {
             values,
             precision: value_precision,
@@ -43595,6 +44100,9 @@ fn scalar_value_as_decimal128(
 
 fn scalar_value_as_utf8(value: &EvaluatedScalar, row: usize) -> Result<Option<String>> {
     match value {
+        EvaluatedScalar::Array(array) => {
+            scalar_value_as_utf8(&evaluated_array(array.as_ref())?, row)
+        }
         EvaluatedScalar::Int64(values) => Ok(values[row].map(|value| value.to_string())),
         EvaluatedScalar::Float64(values) => Ok(values[row].map(format_f64_for_sql_varchar)),
         EvaluatedScalar::Decimal128 { values, scale, .. } => {
@@ -43611,6 +44119,9 @@ fn scalar_value_as_utf8(value: &EvaluatedScalar, row: usize) -> Result<Option<St
 
 fn scalar_value_as_bool(value: &EvaluatedScalar, row: usize) -> Result<Option<bool>> {
     match value {
+        EvaluatedScalar::Array(array) => {
+            scalar_value_as_bool(&evaluated_array(array.as_ref())?, row)
+        }
         EvaluatedScalar::Boolean(values) => Ok(values[row]),
         _ => Err(DodamError::UnsupportedSql(
             "CASE result type mismatch".to_string(),
@@ -43620,6 +44131,9 @@ fn scalar_value_as_bool(value: &EvaluatedScalar, row: usize) -> Result<Option<bo
 
 fn scalar_value_as_date32(value: &EvaluatedScalar, row: usize) -> Result<Option<i32>> {
     match value {
+        EvaluatedScalar::Array(array) => {
+            scalar_value_as_date32(&evaluated_array(array.as_ref())?, row)
+        }
         EvaluatedScalar::Date32(values) => Ok(values[row]),
         _ => Err(DodamError::UnsupportedSql(
             "CASE result type mismatch".to_string(),
@@ -43629,6 +44143,9 @@ fn scalar_value_as_date32(value: &EvaluatedScalar, row: usize) -> Result<Option<
 
 fn scalar_value_as_timestamp_millis(value: &EvaluatedScalar, row: usize) -> Result<Option<i64>> {
     match value {
+        EvaluatedScalar::Array(array) => {
+            scalar_value_as_timestamp_millis(&evaluated_array(array.as_ref())?, row)
+        }
         EvaluatedScalar::TimestampMillisecond(values) => Ok(values[row]),
         _ => Err(DodamError::UnsupportedSql(
             "CASE result type mismatch".to_string(),
@@ -43638,81 +44155,7 @@ fn scalar_value_as_timestamp_millis(value: &EvaluatedScalar, row: usize) -> Resu
 
 fn evaluated_column(batch: &RecordBatch, column: &str) -> Result<EvaluatedScalar> {
     let index = output_batch_column_index(batch, column)?;
-    let array = batch.column(index);
-    match array.data_type() {
-        DataType::Int32 => {
-            let values = array.as_any().downcast_ref::<Int32Array>().expect("Int32");
-            Ok(EvaluatedScalar::Int64(
-                values.iter().map(|value| value.map(i64::from)).collect(),
-            ))
-        }
-        DataType::Int64 => {
-            let values = array.as_any().downcast_ref::<Int64Array>().expect("Int64");
-            Ok(EvaluatedScalar::Int64(values.iter().collect()))
-        }
-        DataType::Float64 => {
-            let values = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .expect("Float64");
-            Ok(EvaluatedScalar::Float64(values.iter().collect()))
-        }
-        DataType::Decimal128(precision, scale) => {
-            let values = array
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .expect("Decimal128");
-            Ok(EvaluatedScalar::Decimal128 {
-                values: values.iter().collect(),
-                precision: *precision,
-                scale: *scale,
-            })
-        }
-        DataType::Utf8 => {
-            let values = array.as_any().downcast_ref::<StringArray>().expect("Utf8");
-            Ok(EvaluatedScalar::Utf8(
-                values
-                    .iter()
-                    .map(|value| value.map(str::to_string))
-                    .collect(),
-            ))
-        }
-        DataType::Boolean => {
-            let values = array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .expect("Boolean");
-            Ok(EvaluatedScalar::Boolean(values.iter().collect()))
-        }
-        DataType::Date32 => {
-            let values = array
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .expect("Date32");
-            Ok(EvaluatedScalar::Date32(values.iter().collect()))
-        }
-        DataType::Date64 => {
-            let values = array
-                .as_any()
-                .downcast_ref::<Date64Array>()
-                .expect("Date64");
-            Ok(EvaluatedScalar::TimestampMillisecond(
-                values.iter().collect(),
-            ))
-        }
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            let values = array
-                .as_any()
-                .downcast_ref::<TimestampMillisecondArray>()
-                .expect("TimestampMillisecond");
-            Ok(EvaluatedScalar::TimestampMillisecond(
-                values.iter().collect(),
-            ))
-        }
-        data_type => Err(DodamError::UnsupportedSql(format!(
-            "projection expression column type {data_type} is not supported yet"
-        ))),
-    }
+    Ok(EvaluatedScalar::Array(batch.column(index).clone()))
 }
 
 fn evaluated_struct_field(
@@ -43978,6 +44421,8 @@ fn compare_evaluated_scalars(
     op: &BinaryOperator,
     right: EvaluatedScalar,
 ) -> Result<Vec<Option<bool>>> {
+    let left = materialize_array_scalar(left)?;
+    let right = materialize_array_scalar(right)?;
     match (&left, &right) {
         (EvaluatedScalar::Utf8(_), _) | (_, EvaluatedScalar::Utf8(_)) => {
             let left = scalar_as_utf8(left)?;
@@ -44064,6 +44509,13 @@ fn compare_evaluated_scalars(
     }
 }
 
+fn materialize_array_scalar(value: EvaluatedScalar) -> Result<EvaluatedScalar> {
+    match value {
+        EvaluatedScalar::Array(array) => evaluated_array(array.as_ref()),
+        other => Ok(other),
+    }
+}
+
 fn compare_optional_values<T: Ord>(
     left: Option<T>,
     op: &BinaryOperator,
@@ -44104,6 +44556,7 @@ fn compare_optional_f64(
 
 fn scalar_null_mask(value: EvaluatedScalar) -> Vec<bool> {
     match value {
+        EvaluatedScalar::Array(array) => (0..array.len()).map(|row| array.is_null(row)).collect(),
         EvaluatedScalar::Int64(values) => values.into_iter().map(|value| value.is_none()).collect(),
         EvaluatedScalar::Float64(values) => {
             values.into_iter().map(|value| value.is_none()).collect()
@@ -44129,6 +44582,8 @@ fn evaluate_binary_scalar(
     op: &BinaryOperator,
     right: EvaluatedScalar,
 ) -> Result<EvaluatedScalar> {
+    let left = materialize_array_scalar(left)?;
+    let right = materialize_array_scalar(right)?;
     match (&left, &right) {
         (
             EvaluatedScalar::Decimal128 {
@@ -44259,6 +44714,7 @@ fn evaluate_binary_scalar(
 
 fn scalar_as_i64(value: EvaluatedScalar) -> Result<Vec<Option<i64>>> {
     match value {
+        EvaluatedScalar::Array(array) => scalar_as_i64(evaluated_array(array.as_ref())?),
         EvaluatedScalar::Int64(values) => Ok(values),
         EvaluatedScalar::Date32(values) => Ok(values
             .into_iter()
@@ -44274,6 +44730,7 @@ fn scalar_as_i64(value: EvaluatedScalar) -> Result<Vec<Option<i64>>> {
 
 fn scalar_as_f64(value: EvaluatedScalar) -> Result<Vec<Option<f64>>> {
     match value {
+        EvaluatedScalar::Array(array) => scalar_as_f64(evaluated_array(array.as_ref())?),
         EvaluatedScalar::Int64(values) => Ok(values
             .into_iter()
             .map(|value| value.map(|value| value as f64))
@@ -44303,11 +44760,13 @@ fn scalar_as_f64(value: EvaluatedScalar) -> Result<Vec<Option<f64>>> {
 
 fn cast_evaluated_scalar(value: EvaluatedScalar, target: &str) -> Result<EvaluatedScalar> {
     let target = target.to_ascii_lowercase();
+    let value = materialize_array_scalar(value)?;
     if matches!(
         target.as_str(),
         "varchar" | "text" | "string" | "char" | "character varying"
     ) {
         return Ok(EvaluatedScalar::Utf8(match value {
+            EvaluatedScalar::Array(_) => unreachable!("array scalar was materialized before cast"),
             EvaluatedScalar::Int64(values) => values
                 .into_iter()
                 .map(|value| value.map(|value| value.to_string()))
@@ -44340,6 +44799,7 @@ fn cast_evaluated_scalar(value: EvaluatedScalar, target: &str) -> Result<Evaluat
     }
     if matches!(target.as_str(), "bigint" | "int8" | "integer" | "int") {
         return Ok(EvaluatedScalar::Int64(match value {
+            EvaluatedScalar::Array(_) => unreachable!("array scalar was materialized before cast"),
             EvaluatedScalar::Int64(values) => values,
             EvaluatedScalar::Float64(values) => values
                 .into_iter()
@@ -44379,6 +44839,7 @@ fn cast_evaluated_scalar(value: EvaluatedScalar, target: &str) -> Result<Evaluat
     }
     if matches!(target.as_str(), "double" | "float8" | "float" | "real") {
         return Ok(EvaluatedScalar::Float64(match value {
+            EvaluatedScalar::Array(_) => unreachable!("array scalar was materialized before cast"),
             EvaluatedScalar::Int64(values) => values
                 .into_iter()
                 .map(|value| value.map(|value| value as f64))
@@ -44664,6 +45125,8 @@ fn coalesce_evaluated_scalar(
     left: EvaluatedScalar,
     right: EvaluatedScalar,
 ) -> Result<EvaluatedScalar> {
+    let left = materialize_array_scalar(left)?;
+    let right = materialize_array_scalar(right)?;
     match (left, right) {
         (EvaluatedScalar::Utf8(left), right) => {
             let right = scalar_as_utf8(right)?;
@@ -44724,6 +45187,7 @@ fn coalesce_evaluated_scalar(
 
 fn scalar_as_utf8(value: EvaluatedScalar) -> Result<Vec<Option<String>>> {
     Ok(match value {
+        EvaluatedScalar::Array(array) => return scalar_as_utf8(evaluated_array(array.as_ref())?),
         EvaluatedScalar::Utf8(values) => values,
         EvaluatedScalar::Int64(values) => values
             .into_iter()

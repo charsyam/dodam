@@ -359,6 +359,7 @@ where
         else {
             return Ok(None);
         };
+        log_direct_primitive_exec_profile(&path, &columns, &metrics);
         return Ok(Some((state, metrics)));
     }
 
@@ -407,7 +408,56 @@ where
         merge(&mut state, partial)?;
         scan_metrics.merge_from(metrics);
     }
+    log_direct_primitive_exec_profile(&path, &columns, &scan_metrics);
     Ok(Some((state, scan_metrics)))
+}
+
+fn log_direct_primitive_exec_profile(
+    path: &PathBuf,
+    columns: &[(String, DirectPrimitiveColumnType)],
+    metrics: &crate::storage::DirectPrimitiveColumnScanMetrics,
+) {
+    if !std::env::var("DODAM_DIRECT_PRIMITIVE_PROFILE")
+        .or_else(|_| std::env::var("DODAM_TPCH_PROFILE"))
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return;
+    }
+    let table = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("scan");
+    let columns = columns
+        .iter()
+        .map(|(column, _)| column.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let column_read = metrics
+        .column_read_nanos
+        .iter()
+        .enumerate()
+        .map(|(index, nanos)| format!("{index}:{:.3}", nanos_to_millis(*nanos)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let selected_ratio = if metrics.rows == 0 {
+        0.0
+    } else {
+        metrics.selected_rows as f64 / metrics.rows as f64
+    };
+    eprintln!(
+        "[dodam:direct-primitive-profile] {table}[{columns}]: row_groups={} rows={} batches={} read={:.3} ms consume={:.3} ms column_read=[{}] selected_rows={} selected_ratio={:.3} selected_runs={} selected_batches={} full_batches={}",
+        metrics.row_groups,
+        metrics.rows,
+        metrics.batches,
+        nanos_to_millis(metrics.read_nanos),
+        nanos_to_millis(metrics.consume_nanos),
+        column_read,
+        metrics.selected_rows,
+        selected_ratio,
+        metrics.selected_runs,
+        metrics.selected_payload_batches,
+        metrics.full_payload_batches,
+    );
 }
 
 fn borrowed_direct_primitive_specs(
