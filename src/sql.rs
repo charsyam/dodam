@@ -506,7 +506,20 @@ pub async fn execute_sql(
         let aggregates = query.aggregates.clone();
         let group_by = query.group_by.clone();
         let metrics = if !query.aggregate_expressions.is_empty() {
-            if let Some(metrics) = try_collect_expression_aggregate_scan_fold(
+            if let Some(metrics) = try_collect_expression_aggregate_late_materialized(
+                engine,
+                query.path.clone(),
+                batch_size,
+                query.filter.clone(),
+                &group_by,
+                &aggregates,
+                &query.aggregate_expressions,
+                true,
+            )
+            .await?
+            {
+                metrics
+            } else if let Some(metrics) = try_collect_expression_aggregate_scan_fold(
                 engine,
                 query.path.clone(),
                 batch_size,
@@ -41522,6 +41535,92 @@ fn collect_aggregates_with_optional_expression_views(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn try_collect_expression_aggregate_late_materialized(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    filter: Option<FilterExpr>,
+    group_by: &[String],
+    aggregates: &[AggregateExpr],
+    expressions: &[ProjectionExpression],
+    ordered_output: bool,
+) -> Result<Option<AggregateMetrics>> {
+    if !expression_aggregate_late_materialized_enabled() {
+        return Ok(None);
+    }
+    let Some(filter) = filter else {
+        return Ok(None);
+    };
+    let Some(group_keys) = group_key_exprs_for_aggregate(group_by, aggregates, expressions) else {
+        return Ok(None);
+    };
+    if CoalesceKeyCountSumCollector::new(&group_keys, aggregates).is_none() {
+        return Ok(None);
+    }
+    let payload_projection =
+        expression_aggregate_payload_projection(&group_keys, aggregates, expressions);
+    let predicate_projection = Projection::Columns(filter.referenced_columns());
+    let aggregates = aggregates.to_vec();
+    let group_keys_for_state = group_keys.clone();
+    let aggregates_for_state = aggregates.clone();
+    let Some(partials) = engine
+        .late_materialized_parquet_map_pruned_with_policy_view_dictionary_columns(
+            path,
+            batch_size,
+            predicate_projection,
+            payload_projection,
+            expression_aggregate_dictionary_columns(&group_keys),
+            Vec::new(),
+            expression_aggregate_late_row_group_chunk(),
+            LateMaterializationPolicy::selective_with_selector_run_ratio(
+                expression_aggregate_late_max_selected_ratio(),
+                expression_aggregate_late_max_selector_run_ratio(),
+            ),
+            move || {
+                CoalesceKeyCountSumCollector::new(&group_keys_for_state, &aggregates_for_state)
+                    .expect("expression aggregate late materialization precondition")
+            },
+            {
+                let filter = filter.clone();
+                move |view, selection, _collector| {
+                    let Some(batch) = view.try_record_batch() else {
+                        return Ok(None);
+                    };
+                    let mask = evaluate_filter_mask(batch, &filter)?;
+                    selection.push_selected_rows(mask.len(), |row| {
+                        mask.is_valid(row) && mask.value(row)
+                    });
+                    Ok(Some(()))
+                }
+            },
+            |view, collector| {
+                let Some(batch) = view.try_record_batch() else {
+                    return Ok(None);
+                };
+                collector.consume_batch(batch)?;
+                Ok(Some(()))
+            },
+            |collector, _metrics| Ok(Some(collector)),
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let collectors = partials
+        .into_iter()
+        .map(|partial| partial.output)
+        .collect::<Vec<_>>();
+    Ok(Some(
+        CoalesceKeyCountSumCollector::merge_partials_with_order(
+            collectors,
+            1,
+            &aggregates,
+            ordered_output,
+        )?,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn try_collect_expression_aggregate_scan_fold(
     engine: &DodamEngine,
     path: PathBuf,
@@ -41640,6 +41739,129 @@ fn expression_aggregate_scan_fold_enabled() -> bool {
     std::env::var("DODAM_DISABLE_EXPRESSION_AGG_SCAN_FOLD")
         .map(|value| !matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(true)
+}
+
+fn expression_aggregate_late_materialized_enabled() -> bool {
+    !std::env::var("DODAM_DISABLE_EXPRESSION_AGG_LATE_MATERIALIZE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn expression_aggregate_late_row_group_chunk() -> usize {
+    std::env::var("DODAM_EXPRESSION_AGG_LATE_ROW_GROUP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2)
+}
+
+fn expression_aggregate_late_max_selected_ratio() -> f64 {
+    std::env::var("DODAM_EXPRESSION_AGG_LATE_MAX_SELECTED_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.75)
+}
+
+fn expression_aggregate_late_max_selector_run_ratio() -> f64 {
+    std::env::var("DODAM_EXPRESSION_AGG_LATE_MAX_SELECTOR_RUN_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(1.25)
+}
+
+fn expression_aggregate_payload_projection(
+    group_keys: &[GroupKeyExpr],
+    aggregates: &[AggregateExpr],
+    expressions: &[ProjectionExpression],
+) -> Projection {
+    let mut columns = Vec::new();
+    for group_key in group_keys {
+        match group_key {
+            GroupKeyExpr::Column(column) => add_column_once(&mut columns, column.clone()),
+            GroupKeyExpr::CoalesceLiteral { column, .. } => {
+                add_column_once(&mut columns, column.clone())
+            }
+        }
+    }
+    for aggregate in aggregates {
+        if let AggregateExpr::Sum(column)
+        | AggregateExpr::Min(column)
+        | AggregateExpr::Max(column)
+        | AggregateExpr::Avg(column) = aggregate
+        {
+            add_column_once(&mut columns, column.clone());
+        }
+    }
+    for expression in expressions {
+        add_scalar_expression_columns(&mut columns, &expression.expr);
+    }
+    Projection::Columns(columns)
+}
+
+fn add_scalar_expression_columns(columns: &mut Vec<String>, expression: &ScalarSqlExpression) {
+    match expression {
+        ScalarSqlExpression::Column(column)
+        | ScalarSqlExpression::StructField { column, .. }
+        | ScalarSqlExpression::ListLength { column, .. } => {
+            add_column_once(columns, column.clone());
+        }
+        ScalarSqlExpression::ListIndex { column, index, .. } => {
+            add_column_once(columns, column.clone());
+            add_scalar_expression_columns(columns, index);
+        }
+        ScalarSqlExpression::Literal(_) => {}
+        ScalarSqlExpression::Binary { left, right, .. } => {
+            add_scalar_expression_columns(columns, left);
+            add_scalar_expression_columns(columns, right);
+        }
+        ScalarSqlExpression::Cast { expr, .. }
+        | ScalarSqlExpression::Lower(expr)
+        | ScalarSqlExpression::Upper(expr)
+        | ScalarSqlExpression::Length(expr)
+        | ScalarSqlExpression::ExtractYear(expr) => add_scalar_expression_columns(columns, expr),
+        ScalarSqlExpression::Coalesce(values) => {
+            for value in values {
+                add_scalar_expression_columns(columns, value);
+            }
+        }
+        ScalarSqlExpression::Substring {
+            expr,
+            start,
+            length,
+        } => {
+            add_scalar_expression_columns(columns, expr);
+            add_scalar_expression_columns(columns, start);
+            if let Some(length) = length {
+                add_scalar_expression_columns(columns, length);
+            }
+        }
+        ScalarSqlExpression::Case {
+            results,
+            else_result,
+            ..
+        } => {
+            for result in results {
+                add_scalar_expression_columns(columns, result);
+            }
+            if let Some(else_result) = else_result {
+                add_scalar_expression_columns(columns, else_result);
+            }
+        }
+    }
+}
+
+fn expression_aggregate_dictionary_columns(group_keys: &[GroupKeyExpr]) -> Vec<String> {
+    group_keys
+        .iter()
+        .filter_map(|group_key| match group_key {
+            GroupKeyExpr::CoalesceLiteral {
+                column,
+                fallback: GroupKeyLiteral::Utf8(_),
+            } => Some(column.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn expression_aggregate_row_group_map_chunk() -> usize {
