@@ -382,6 +382,15 @@ impl CoalesceKeyCountSumCollector {
         fragments: usize,
         aggregates: &[AggregateExpr],
     ) -> Result<AggregateMetrics> {
+        Self::merge_partials_with_order(partials, fragments, aggregates, true)
+    }
+
+    pub(crate) fn merge_partials_with_order(
+        partials: Vec<Self>,
+        fragments: usize,
+        aggregates: &[AggregateExpr],
+        ordered: bool,
+    ) -> Result<AggregateMetrics> {
         let merge_started = Instant::now();
         let mut merged_groups: Option<CoalesceKeyCountSumGroups> = None;
         let mut metrics = AggregateMetrics {
@@ -404,7 +413,7 @@ impl CoalesceKeyCountSumCollector {
         metrics.aggregate_nanos = update_nanos;
         metrics.aggregate_merge_nanos = elapsed_nanos(merge_started);
         metrics.groups = merged_groups
-            .map(|groups| groups.finish(aggregates))
+            .map(|groups| groups.finish_with_order(aggregates, ordered))
             .unwrap_or_default();
         Ok(metrics)
     }
@@ -1224,6 +1233,14 @@ impl CoalesceKeyCountSumGroups {
     }
 
     fn finish(self, aggregates: &[AggregateExpr]) -> Vec<GroupAggregateResult> {
+        self.finish_with_order(aggregates, true)
+    }
+
+    fn finish_with_order(
+        self,
+        aggregates: &[AggregateExpr],
+        ordered: bool,
+    ) -> Vec<GroupAggregateResult> {
         let Self {
             key_len,
             index,
@@ -1231,36 +1248,40 @@ impl CoalesceKeyCountSumGroups {
             third_strings,
             groups,
         } = self;
-        match index {
-            CoalesceLeadingIndex::DenseTwo {
-                range,
-                slots,
-                fallback,
-            } if key_len == 2 && fallback.is_empty() => {
-                return finish_dense_two_ordered_groups(
+        if ordered {
+            match index {
+                CoalesceLeadingIndex::DenseTwo {
                     range,
                     slots,
-                    third_strings,
-                    groups,
-                    aggregates,
-                );
-            }
-            CoalesceLeadingIndex::DenseThree {
-                range,
-                slots,
-                fallback,
-            } if key_len == 3 && fallback.is_empty() => {
-                return finish_dense_three_ordered_groups(
+                    fallback,
+                } if key_len == 2 && fallback.is_empty() => {
+                    return finish_dense_two_ordered_groups(
+                        range,
+                        slots,
+                        third_strings,
+                        groups,
+                        aggregates,
+                    );
+                }
+                CoalesceLeadingIndex::DenseThree {
                     range,
                     slots,
-                    third_strings,
-                    groups,
-                    aggregates,
-                );
+                    fallback,
+                } if key_len == 3 && fallback.is_empty() => {
+                    return finish_dense_three_ordered_groups(
+                        range,
+                        slots,
+                        third_strings,
+                        groups,
+                        aggregates,
+                    );
+                }
+                index => {
+                    let _ = index;
+                }
             }
-            index => {
-                let _ = index;
-            }
+        } else {
+            let _ = index;
         }
         let _ = third_string_ids;
         let _ = third_strings;
@@ -1268,7 +1289,9 @@ impl CoalesceKeyCountSumGroups {
             .into_iter()
             .map(|group| group.finish(key_len, &third_strings, aggregates))
             .collect::<Vec<_>>();
-        groups.sort_by(|left, right| compare_group_keys(&left.keys, &right.keys));
+        if ordered {
+            groups.sort_by(|left, right| compare_group_keys(&left.keys, &right.keys));
+        }
         groups
     }
 }

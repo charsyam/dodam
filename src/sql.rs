@@ -515,6 +515,7 @@ pub async fn execute_sql(
                 &group_by,
                 &aggregates,
                 &query.aggregate_expressions,
+                true,
             )
             .await?
             {
@@ -31772,18 +31773,41 @@ async fn try_execute_join_coalesce_count_sum_aggregate(
         left_sum.clone(),
     ]));
     let left_scan_started = profile.then(Instant::now);
-    let left_direct = try_direct_join_coalesce_left_aggregate(
+    let left_late = try_late_join_coalesce_left_aggregate(
         engine,
-        &query.path,
+        query.path.clone(),
         batch_size,
         join_plan.left_filter.as_ref(),
         &left_key,
         &left_group,
         &left_sum,
-        &right_lookup.lookup,
-    )?;
+        right_lookup.lookup.clone(),
+    )
+    .await?;
+    let left_direct = if left_late.is_some() {
+        None
+    } else {
+        try_direct_join_coalesce_left_aggregate(
+            engine,
+            &query.path,
+            batch_size,
+            join_plan.left_filter.as_ref(),
+            &left_key,
+            &left_group,
+            &left_sum,
+            &right_lookup.lookup,
+        )?
+    };
     let (groups, rows, batches, left_scan_nanos, aggregate_nanos) =
-        if let Some(left_direct) = left_direct {
+        if let Some(left_late) = left_late {
+            (
+                left_late.groups.into_iter().collect::<Vec<_>>(),
+                left_late.rows,
+                left_late.batches,
+                elapsed_optional_nanos(left_scan_started),
+                left_late.aggregate_nanos,
+            )
+        } else if let Some(left_direct) = left_direct {
             (
                 left_direct.groups.into_iter().collect::<Vec<_>>(),
                 left_direct.rows,
@@ -31802,6 +31826,7 @@ async fn try_execute_join_coalesce_count_sum_aggregate(
                 )
                 .await?;
             let aggregate_started = profile.then(Instant::now);
+            let right_dense_lookup = right_lookup.lookup.dense_slices();
             let mut groups = JoinCoalesceGroupAccumulator::new();
             let mut rows = 0usize;
             let mut batches = 0usize;
@@ -31815,18 +31840,32 @@ async fn try_execute_join_coalesce_count_sum_aggregate(
                 let key = i64_array_like(&batch, &left_key)?;
                 let group = i64_array_like(&batch, &left_group)?;
                 let sum = i64_array_like(&batch, &left_sum)?;
-                for row in 0..batch.num_rows() {
-                    if key.is_null(row) {
-                        continue;
+                if !key.has_nulls() && !group.has_nulls() && !sum.has_nulls() {
+                    for row in 0..batch.num_rows() {
+                        if let Some(class_id) = right_lookup
+                            .lookup
+                            .get_cached(right_dense_lookup, key.value(row))
+                        {
+                            groups.update_non_null(group.value(row), class_id, sum.value(row));
+                        }
                     }
-                    let Some(&class_id) = right_lookup.lookup.get(&key.value(row)) else {
-                        continue;
-                    };
-                    groups.update(
-                        (!group.is_null(row)).then(|| group.value(row)),
-                        class_id,
-                        (!sum.is_null(row)).then(|| sum.value(row)),
-                    );
+                } else {
+                    for row in 0..batch.num_rows() {
+                        if key.is_null(row) {
+                            continue;
+                        }
+                        let Some(class_id) = right_lookup
+                            .lookup
+                            .get_cached(right_dense_lookup, key.value(row))
+                        else {
+                            continue;
+                        };
+                        groups.update(
+                            (!group.is_null(row)).then(|| group.value(row)),
+                            class_id,
+                            (!sum.is_null(row)).then(|| sum.value(row)),
+                        );
+                    }
                 }
             }
             let left_scan_nanos = elapsed_optional_nanos(left_scan_started);
@@ -31955,6 +31994,16 @@ struct DirectJoinCoalesceLeftAggregate {
     aggregate_nanos: u64,
 }
 
+struct JoinCoalesceLateLeftState {
+    filter: DirectI64Filter,
+    right_lookup: AdaptiveI64Map<usize>,
+    selected_buckets: Vec<i64>,
+    payload_offset: usize,
+    groups: JoinCoalesceGroupAccumulator,
+    selected_rows: usize,
+    batches: usize,
+}
+
 enum JoinCoalesceGroupAccumulator {
     Small(Vec<((Option<i64>, usize), (u64, i64))>),
     Hash(FastHashMap<(Option<i64>, usize), (u64, i64)>),
@@ -31968,32 +32017,64 @@ impl JoinCoalesceGroupAccumulator {
     }
 
     fn update(&mut self, bucket: Option<i64>, class_id: usize, sum: Option<i64>) {
+        self.update_entry((bucket, class_id), sum.unwrap_or(0), sum.is_some());
+    }
+
+    fn update_non_null(&mut self, bucket: i64, class_id: usize, sum: i64) {
+        self.update_entry((Some(bucket), class_id), sum, true);
+    }
+
+    fn add_counts(&mut self, key: (Option<i64>, usize), count: u64, sum: i64) {
         match self {
             Self::Small(groups) => {
-                if let Some((_, value)) =
-                    groups
-                        .iter_mut()
-                        .find(|((existing_bucket, existing_class_id), _)| {
-                            *existing_bucket == bucket && *existing_class_id == class_id
-                        })
-                {
-                    update_join_coalesce_group_value(value, sum);
-                    return;
+                for (existing_key, value) in groups.iter_mut() {
+                    if *existing_key == key {
+                        value.0 = value.0.saturating_add(count);
+                        value.1 = value.1.saturating_add(sum);
+                        return;
+                    }
                 }
                 if groups.len() < Self::SMALL_LIMIT {
-                    let mut value = (0, 0);
-                    update_join_coalesce_group_value(&mut value, sum);
-                    groups.push(((bucket, class_id), value));
+                    groups.push((key, (count, sum)));
                     return;
                 }
                 let mut hash = groups.drain(..).collect::<FastHashMap<_, _>>();
-                let entry = hash.entry((bucket, class_id)).or_insert((0, 0));
-                update_join_coalesce_group_value(entry, sum);
+                let entry = hash.entry(key).or_insert((0, 0));
+                entry.0 = entry.0.saturating_add(count);
+                entry.1 = entry.1.saturating_add(sum);
                 *self = Self::Hash(hash);
             }
             Self::Hash(groups) => {
-                let entry = groups.entry((bucket, class_id)).or_insert((0, 0));
-                update_join_coalesce_group_value(entry, sum);
+                let entry = groups.entry(key).or_insert((0, 0));
+                entry.0 = entry.0.saturating_add(count);
+                entry.1 = entry.1.saturating_add(sum);
+            }
+        }
+    }
+
+    fn update_entry(&mut self, key: (Option<i64>, usize), sum: i64, has_sum: bool) {
+        match self {
+            Self::Small(groups) => {
+                for (existing_key, value) in groups.iter_mut() {
+                    if *existing_key == key {
+                        update_join_coalesce_group_value(value, sum, has_sum);
+                        return;
+                    }
+                }
+                if groups.len() < Self::SMALL_LIMIT {
+                    let mut value = (0, 0);
+                    update_join_coalesce_group_value(&mut value, sum, has_sum);
+                    groups.push((key, value));
+                    return;
+                }
+                let mut hash = groups.drain(..).collect::<FastHashMap<_, _>>();
+                let entry = hash.entry(key).or_insert((0, 0));
+                update_join_coalesce_group_value(entry, sum, has_sum);
+                *self = Self::Hash(hash);
+            }
+            Self::Hash(groups) => {
+                let entry = groups.entry(key).or_insert((0, 0));
+                update_join_coalesce_group_value(entry, sum, has_sum);
             }
         }
     }
@@ -32006,13 +32087,159 @@ impl JoinCoalesceGroupAccumulator {
     }
 }
 
-fn update_join_coalesce_group_value(value: &mut (u64, i64), sum: Option<i64>) {
+fn update_join_coalesce_group_value(value: &mut (u64, i64), sum: i64, has_sum: bool) {
     value.0 = value.0.saturating_add(1);
-    if let Some(sum) = sum {
+    if has_sum {
         value.1 = value.1.saturating_add(sum);
     }
 }
 
+async fn try_late_join_coalesce_left_aggregate(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    filter: Option<&FilterExpr>,
+    key_column: &str,
+    group_column: &str,
+    sum_column: &str,
+    right_lookup: AdaptiveI64Map<usize>,
+) -> Result<Option<DirectJoinCoalesceLeftAggregate>> {
+    if !join_coalesce_late_left_enabled() {
+        return Ok(None);
+    }
+    let Some(filter) = direct_join_left_i64_filter(filter, group_column)? else {
+        return Ok(None);
+    };
+    let key_column = key_column.to_string();
+    let group_column = group_column.to_string();
+    let sum_column = sum_column.to_string();
+    let Some(chunks) = engine
+        .late_materialized_parquet_map_pruned_with_policy_view(
+            path,
+            batch_size,
+            Projection::Columns(vec![group_column.clone()]),
+            Projection::Columns(vec![key_column.clone(), sum_column.clone()]),
+            Vec::new(),
+            join_coalesce_late_left_row_group_chunk(),
+            LateMaterializationPolicy::selective(join_coalesce_late_left_max_selected_ratio()),
+            {
+                let right_lookup = right_lookup.clone();
+                let filter = filter.clone();
+                move || JoinCoalesceLateLeftState {
+                    filter: filter.clone(),
+                    right_lookup: right_lookup.clone(),
+                    selected_buckets: Vec::new(),
+                    payload_offset: 0,
+                    groups: JoinCoalesceGroupAccumulator::new(),
+                    selected_rows: 0,
+                    batches: 0,
+                }
+            },
+            |view, selection, state| {
+                let Some(group) = DirectI64ishVector::from_batch(view, 0) else {
+                    return Ok(None);
+                };
+                state.batches = state.batches.saturating_add(1);
+                selection.push_selected_rows(group.len(), |row| {
+                    let selected = state.filter.matches(&group, row);
+                    if selected {
+                        state.selected_rows = state.selected_rows.saturating_add(1);
+                        state.selected_buckets.push(group.value(row));
+                    }
+                    selected
+                });
+                Ok(Some(()))
+            },
+            |view, state| {
+                let Some(key) = DirectI64ishVector::from_batch(view, 0) else {
+                    return Ok(None);
+                };
+                let Some(sum) = DirectI64ishVector::from_batch(view, 1) else {
+                    return Ok(None);
+                };
+                let dense_lookup = state.right_lookup.dense_slices();
+                for row in 0..key.len() {
+                    let Some(bucket) = state.selected_buckets.get(state.payload_offset).copied()
+                    else {
+                        return Err(DodamError::UnsupportedSql(
+                            "join late payload row overflow".to_string(),
+                        ));
+                    };
+                    state.payload_offset += 1;
+                    if key.is_null(row) {
+                        continue;
+                    }
+                    let Some(class_id) =
+                        state.right_lookup.get_cached(dense_lookup, key.value(row))
+                    else {
+                        continue;
+                    };
+                    state.groups.update(
+                        Some(bucket),
+                        class_id,
+                        (!sum.is_null(row)).then(|| sum.value(row)),
+                    );
+                }
+                Ok(Some(()))
+            },
+            |state, _metrics| {
+                if state.payload_offset != state.selected_buckets.len() {
+                    return Err(DodamError::UnsupportedSql(
+                        "join late payload row mismatch".to_string(),
+                    ));
+                }
+                Ok(Some(DirectJoinCoalesceLeftAggregate {
+                    groups: state.groups.into_entries().into_iter().collect(),
+                    rows: state.selected_rows,
+                    batches: state.batches,
+                    aggregate_nanos: 0,
+                }))
+            },
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let mut groups = JoinCoalesceGroupAccumulator::new();
+    let mut rows = 0usize;
+    let mut batches = 0usize;
+    for chunk in chunks {
+        rows = rows.saturating_add(chunk.output.rows);
+        batches = batches.saturating_add(chunk.output.batches);
+        for (key, (count, sum)) in chunk.output.groups {
+            groups.add_counts(key, count, sum);
+        }
+    }
+    Ok(Some(DirectJoinCoalesceLeftAggregate {
+        groups: groups.into_entries().into_iter().collect(),
+        rows,
+        batches,
+        aggregate_nanos: 0,
+    }))
+}
+
+fn join_coalesce_late_left_enabled() -> bool {
+    !std::env::var("DODAM_DISABLE_JOIN_COALESCE_LATE_LEFT")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn join_coalesce_late_left_row_group_chunk() -> usize {
+    std::env::var("DODAM_JOIN_COALESCE_LATE_LEFT_ROW_GROUP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2)
+}
+
+fn join_coalesce_late_left_max_selected_ratio() -> f64 {
+    std::env::var("DODAM_JOIN_COALESCE_LATE_LEFT_MAX_SELECTED_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.50)
+}
+
+#[derive(Clone)]
 enum DirectI64Filter {
     All,
     None,
@@ -32072,7 +32299,7 @@ fn try_direct_join_coalesce_left_aggregate(
     key_column: &str,
     group_column: &str,
     sum_column: &str,
-    right_lookup: &FastHashMap<i64, usize>,
+    right_lookup: &AdaptiveI64Map<usize>,
 ) -> Result<Option<DirectJoinCoalesceLeftAggregate>> {
     if !direct_join_coalesce_left_aggregate_enabled() {
         return Ok(None);
@@ -32169,7 +32396,7 @@ fn try_direct_join_coalesce_left_aggregate(
                     if key.is_null(row) {
                         continue;
                     }
-                    let Some(&class_id) = right_lookup.get(&key.value(row)) else {
+                    let Some(class_id) = right_lookup.get(key.value(row)) else {
                         continue;
                     };
                     let entry = groups
@@ -32234,7 +32461,7 @@ fn direct_join_left_i64_filter(
 }
 
 struct UniqueI64ToUtf8IdLookup {
-    lookup: FastHashMap<i64, usize>,
+    lookup: AdaptiveI64Map<usize>,
     values: Vec<Option<String>>,
 }
 
@@ -32267,6 +32494,7 @@ fn build_unique_i64_to_utf8_id_lookup(
             }
         }
     }
+    let lookup = AdaptiveI64Map::from_hash(lookup);
     Ok(Some(UniqueI64ToUtf8IdLookup { lookup, values }))
 }
 
@@ -32298,6 +32526,13 @@ enum I64LikeColumn<'a> {
 }
 
 impl I64LikeColumn<'_> {
+    fn has_nulls(&self) -> bool {
+        match self {
+            Self::Int32(values) => values.null_count() > 0,
+            Self::Int64(values) => values.null_count() > 0,
+        }
+    }
+
     fn is_null(&self, row: usize) -> bool {
         match self {
             Self::Int32(values) => values.is_null(row),
@@ -41296,6 +41531,7 @@ async fn try_collect_expression_aggregate_scan_fold(
     group_by: &[String],
     aggregates: &[AggregateExpr],
     expressions: &[ProjectionExpression],
+    ordered_output: bool,
 ) -> Result<Option<AggregateMetrics>> {
     if !expression_aggregate_scan_fold_enabled() {
         return Ok(None);
@@ -41323,11 +41559,14 @@ async fn try_collect_expression_aggregate_scan_fold(
             Ok,
         )
         .await?;
-    Ok(Some(CoalesceKeyCountSumCollector::merge_partials(
-        vec![collector],
-        1,
-        &aggregates,
-    )?))
+    Ok(Some(
+        CoalesceKeyCountSumCollector::merge_partials_with_order(
+            vec![collector],
+            1,
+            &aggregates,
+            ordered_output,
+        )?,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
