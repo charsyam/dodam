@@ -5717,8 +5717,14 @@ fn direct_primitive_profile_enabled() -> bool {
 }
 
 fn direct_selection_fold_enabled() -> bool {
-    std::env::var("DODAM_DIRECT_SELECTION_FOLD")
+    if std::env::var("DODAM_DISABLE_DIRECT_SELECTION_FOLD")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return false;
+    }
+    std::env::var("DODAM_DIRECT_SELECTION_FOLD")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(true)
 }
 
 fn option_i128_to_i64(value: Option<i128>) -> Result<Option<i64>> {

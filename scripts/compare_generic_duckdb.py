@@ -204,6 +204,11 @@ def generic_queries(data_dir: Path) -> list[GenericQuery]:
             f"SELECT bucket, count(*), sum(value), min(amount), max(event_date) FROM '{facts}' WHERE amount >= '10.00' AND event_date <= '2024-01-20' GROUP BY bucket",
             f"SELECT bucket, count(*), sum(value), min(amount), max(event_date) FROM read_parquet('{facts}') WHERE amount >= '10.00' AND event_date <= '2024-01-20' GROUP BY bucket",
         ),
+        GenericQuery(
+            "low_selectivity_decimal_date_group",
+            f"SELECT bucket, count(*), sum(value), min(amount), max(event_date) FROM '{facts}' WHERE amount < '1.00' GROUP BY bucket",
+            f"SELECT bucket, count(*), sum(value), min(amount), max(event_date) FROM read_parquet('{facts}') WHERE amount < '1.00' GROUP BY bucket",
+        ),
     ]
 
 
