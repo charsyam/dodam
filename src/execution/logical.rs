@@ -1,3 +1,5 @@
+use arrow::record_batch::RecordBatch;
+
 use crate::error::{DodamError, Result};
 use crate::execution::metrics::{
     RecordBatchSink, ScanPlanMetrics, SendableBatchStream, write_stream_to_sink,
@@ -234,6 +236,18 @@ impl SortExpr {
 
 pub trait PhysicalPlan: Send {
     fn execute(self: Box<Self>) -> Result<SendableBatchStream>;
+
+    fn for_each_batch(
+        self: Box<Self>,
+        consumer: &mut dyn FnMut(&RecordBatch) -> Result<()>,
+    ) -> Result<ScanPlanMetrics> {
+        let stream = self.execute()?;
+        let (mut stream, metrics) = stream.into_parts();
+        for batch in stream.by_ref() {
+            consumer(&batch?)?;
+        }
+        Ok(metrics.snapshot())
+    }
 
     fn execute_to_sink(self: Box<Self>, sink: &mut dyn RecordBatchSink) -> Result<ScanPlanMetrics> {
         let stream = self.execute()?;

@@ -564,6 +564,30 @@ impl PhysicalPlan for ScanExec {
             }
         }
     }
+
+    fn for_each_batch(
+        self: Box<Self>,
+        consumer: &mut dyn FnMut(&RecordBatch) -> Result<()>,
+    ) -> Result<ScanPlanMetrics> {
+        let format = scan_format(&self.fragments)?;
+        match format {
+            StorageFormat::Parquet => Box::new(ParquetScanExec::new(
+                self.fragments,
+                self.batch_size,
+                self.projection,
+                self.pruning_predicates,
+                self.row_filter_predicates,
+                self.metadata_cache,
+                self.file_cache,
+                self.object_store,
+                self.preserve_order,
+            ))
+            .for_each_batch(consumer),
+            StorageFormat::Csv | StorageFormat::Json | StorageFormat::ArrowIpc => {
+                Err(DodamError::UnsupportedStorageFormat(format!("{format:?}")))
+            }
+        }
+    }
 }
 
 fn scan_format(fragments: &[FileFragment]) -> Result<StorageFormat> {
@@ -630,6 +654,17 @@ impl PhysicalPlan for ParquetScanExec {
             sink.write_batch(&batch)?;
         }
         sink.finish()?;
+        Ok(metrics.snapshot())
+    }
+
+    fn for_each_batch(
+        self: Box<Self>,
+        consumer: &mut dyn FnMut(&RecordBatch) -> Result<()>,
+    ) -> Result<ScanPlanMetrics> {
+        let (mut stream, metrics) = self.into_stream_parts()?;
+        for batch in stream.by_ref() {
+            consumer(&batch?)?;
+        }
         Ok(metrics.snapshot())
     }
 }

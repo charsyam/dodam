@@ -1418,15 +1418,16 @@ impl DodamEngine {
         C: FnMut(&RecordBatch, &mut S) -> Result<()>,
         F: FnOnce(S) -> Result<O>,
     {
-        let mut stream = self
-            .scan_parquet_batches(path, batch_size, limit, projection, filter)
-            .await?;
-        while let Some(batch) = stream.next() {
-            let batch = batch?;
-            if batch.num_rows() > 0 {
-                consume(&batch, &mut state)?;
-            }
-        }
+        let source = self.plan_table_source(path).await?;
+        let plan =
+            self.plan_table_source_scan(source, batch_size, limit, projection, filter, None)?;
+        self.build_physical_scan_plan(plan)
+            .for_each_batch(&mut |batch| {
+                if batch.num_rows() > 0 {
+                    consume(batch, &mut state)?;
+                }
+                Ok(())
+            })?;
         finish(state)
     }
 
