@@ -174,6 +174,13 @@ pub(crate) enum Date32VectorView<'a> {
 }
 
 impl<'a> Date32VectorView<'a> {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Arrow(values) => values.len(),
+            Self::Raw(values) => values.len(),
+        }
+    }
+
     pub(crate) fn is_null(&self, row: usize) -> bool {
         match self {
             Self::Arrow(values) => values.is_null(row),

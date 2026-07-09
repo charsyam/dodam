@@ -1403,6 +1403,7 @@ impl DodamEngine {
         self.scan_table_source_batches(source, batch_size, limit, projection, filter, None)
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn scan_parquet_batches_fold<S, C, F, O>(
         &self,
         path: PathBuf,
@@ -1425,6 +1426,34 @@ impl DodamEngine {
             .for_each_batch(&mut |batch| {
                 if batch.num_rows() > 0 {
                     consume(batch, &mut state)?;
+                }
+                Ok(())
+            })?;
+        finish(state)
+    }
+
+    pub(crate) async fn scan_parquet_batches_fold_view<S, C, F, O>(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        limit: Option<usize>,
+        projection: Projection,
+        filter: Option<FilterExpr>,
+        mut state: S,
+        mut consume: C,
+        finish: F,
+    ) -> Result<O>
+    where
+        C: for<'a> FnMut(BatchView<'a>, &mut S) -> Result<()>,
+        F: FnOnce(S) -> Result<O>,
+    {
+        let source = self.plan_table_source(path).await?;
+        let plan =
+            self.plan_table_source_scan(source, batch_size, limit, projection, filter, None)?;
+        self.build_physical_scan_plan(plan)
+            .for_each_batch(&mut |batch| {
+                if batch.num_rows() > 0 {
+                    consume(BatchView::new(batch), &mut state)?;
                 }
                 Ok(())
             })?;
@@ -6123,7 +6152,7 @@ fn filtered_dictionary_aggregate_row_group_chunk() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or_else(fused_parquet_aggregate_row_group_chunk)
+        .unwrap_or(1)
 }
 
 fn filtered_count_sum_aggregate_enabled() -> bool {

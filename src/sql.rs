@@ -41745,7 +41745,8 @@ async fn try_collect_expression_aggregate_late_materialized(
     }
     let payload_projection =
         expression_aggregate_payload_projection(&group_keys, aggregates, expressions);
-    let predicate_projection = Projection::Columns(filter.referenced_columns());
+    let predicate_columns = filter.referenced_columns();
+    let predicate_projection = Projection::Columns(predicate_columns.clone());
     let aggregates = aggregates.to_vec();
     let group_keys_for_state = group_keys.clone();
     let aggregates_for_state = aggregates.clone();
@@ -41768,11 +41769,18 @@ async fn try_collect_expression_aggregate_late_materialized(
             },
             {
                 let filter = filter.clone();
+                let predicate_columns = predicate_columns.clone();
                 move |view, selection, _collector| {
-                    let Some(batch) = view.try_record_batch() else {
-                        return Ok(None);
+                    let mask = if let Some(mask) =
+                        evaluate_filter_mask_for_projected_view(view, &predicate_columns, &filter)?
+                    {
+                        mask
+                    } else {
+                        let Some(batch) = view.try_record_batch() else {
+                            return Ok(None);
+                        };
+                        evaluate_filter_mask(batch, &filter)?
                     };
-                    let mask = evaluate_filter_mask(batch, &filter)?;
                     selection.push_selected_rows(mask.len(), |row| {
                         mask.is_valid(row) && mask.value(row)
                     });
@@ -41833,14 +41841,22 @@ async fn try_collect_expression_aggregate_scan_fold(
     }
     let aggregates = aggregates.to_vec();
     let collector = engine
-        .scan_parquet_batches_fold(
+        .scan_parquet_batches_fold_view(
             path,
             batch_size,
             None,
-            projection,
+            projection.clone(),
             filter,
             collector,
-            |batch, collector| collector.consume_batch(batch),
+            |view, collector| {
+                let Some(batch) = view.try_record_batch() else {
+                    return Err(DodamError::UnsupportedSql(
+                        "expression aggregate scan-fold requires RecordBatch collector input"
+                            .to_string(),
+                    ));
+                };
+                collector.consume_batch(batch)
+            },
             Ok,
         )
         .await?;
@@ -41852,6 +41868,351 @@ async fn try_collect_expression_aggregate_scan_fold(
             ordered_output,
         )?,
     ))
+}
+
+fn evaluate_filter_mask_for_projected_view(
+    view: BatchView<'_>,
+    columns: &[String],
+    filter: &FilterExpr,
+) -> Result<Option<BooleanArray>> {
+    evaluate_expr_mask_for_projected_view(view, columns, filter.expr())
+}
+
+fn evaluate_expr_mask_for_projected_view(
+    view: BatchView<'_>,
+    columns: &[String],
+    expr: &Expr,
+) -> Result<Option<BooleanArray>> {
+    match expr {
+        Expr::Boolean(value) => Ok(Some(BooleanArray::from(vec![*value; view.num_rows()]))),
+        Expr::Comparison(comparison) => {
+            evaluate_comparison_mask_for_projected_view(view, columns, comparison)
+        }
+        Expr::InList {
+            column,
+            values,
+            negated,
+            has_null,
+        } => evaluate_in_list_mask_for_projected_view(
+            view, columns, column, values, *negated, *has_null,
+        ),
+        Expr::Not(expr) => {
+            let Some(mask) = evaluate_expr_mask_for_projected_view(view, columns, expr)? else {
+                return Ok(None);
+            };
+            Ok(Some(boolean_not(&mask)))
+        }
+        Expr::And(left, right) => {
+            let Some(left) = evaluate_expr_mask_for_projected_view(view, columns, left)? else {
+                return Ok(None);
+            };
+            let Some(right) = evaluate_expr_mask_for_projected_view(view, columns, right)? else {
+                return Ok(None);
+            };
+            Ok(Some(boolean_and(&left, &right)))
+        }
+        Expr::Or(left, right) => {
+            let Some(left) = evaluate_expr_mask_for_projected_view(view, columns, left)? else {
+                return Ok(None);
+            };
+            let Some(right) = evaluate_expr_mask_for_projected_view(view, columns, right)? else {
+                return Ok(None);
+            };
+            Ok(Some(boolean_or(&left, &right)))
+        }
+        Expr::ColumnComparison { .. } | Expr::Like { .. } | Expr::IsNull { .. } => Ok(None),
+    }
+}
+
+fn evaluate_comparison_mask_for_projected_view(
+    view: BatchView<'_>,
+    columns: &[String],
+    comparison: &ComparisonExpr,
+) -> Result<Option<BooleanArray>> {
+    if matches!(comparison.value, LiteralValue::Null) {
+        return Ok(Some(BooleanArray::from(vec![None; view.num_rows()])));
+    }
+    let Some(index) = projected_view_column_index(columns, &comparison.column) else {
+        return Ok(None);
+    };
+    if let Some(values) = view.i64_vector(index) {
+        let value = comparison.value.as_i64(&comparison.column)?;
+        return Ok(Some(compare_i64_view(values, comparison.op, value)));
+    }
+    if let Some(values) = view.i32_vector(index) {
+        let value = comparison.value.as_i32(&comparison.column)?;
+        return Ok(Some(compare_i32_view(values, comparison.op, value)));
+    }
+    if let Some(values) = view.date32_vector(index) {
+        let Some(value) = literal_as_date32_for_type(&comparison.value)? else {
+            return Ok(None);
+        };
+        return Ok(Some(compare_date32_view(values, comparison.op, value)));
+    }
+    if let Some(values) = view.decimal128_vector(index) {
+        let Some(value) = literal_to_decimal_scaled(&comparison.value, values.scale_i64())? else {
+            return Ok(None);
+        };
+        return Ok(Some(compare_decimal128_view(values, comparison.op, value)));
+    }
+    Ok(None)
+}
+
+fn evaluate_in_list_mask_for_projected_view(
+    view: BatchView<'_>,
+    columns: &[String],
+    column: &str,
+    values: &[LiteralValue],
+    negated: bool,
+    has_null: bool,
+) -> Result<Option<BooleanArray>> {
+    let Some(index) = projected_view_column_index(columns, column) else {
+        return Ok(None);
+    };
+    if let Some(probe) = view.i64_vector(index) {
+        let values = values
+            .iter()
+            .filter(|value| !matches!(value, LiteralValue::Null))
+            .map(|value| value.as_i64(column))
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(Some(in_list_i64_view(probe, &values, negated, has_null)));
+    }
+    if let Some(probe) = view.i32_vector(index) {
+        let values = values
+            .iter()
+            .filter(|value| !matches!(value, LiteralValue::Null))
+            .map(|value| value.as_i32(column))
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(Some(in_list_i32_view(probe, &values, negated, has_null)));
+    }
+    Ok(None)
+}
+
+fn projected_view_column_index(columns: &[String], column: &str) -> Option<usize> {
+    columns.iter().position(|candidate| candidate == column)
+}
+
+fn compare_i64_view(values: I64VectorView<'_>, op: ComparisonOp, literal: i64) -> BooleanArray {
+    BooleanArray::from(
+        (0..values.len())
+            .map(|row| {
+                if values.is_null(row) {
+                    None
+                } else {
+                    Some(compare_i64(values.value(row), op, literal))
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn compare_i32_view(values: I32VectorView<'_>, op: ComparisonOp, literal: i32) -> BooleanArray {
+    BooleanArray::from(
+        (0..values.len())
+            .map(|row| {
+                if values.is_null(row) {
+                    None
+                } else {
+                    Some(compare_i32(values.value(row), op, literal))
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn compare_date32_view(
+    values: Date32VectorView<'_>,
+    op: ComparisonOp,
+    literal: i32,
+) -> BooleanArray {
+    BooleanArray::from(
+        (0..values.len())
+            .map(|row| {
+                if values.is_null(row) {
+                    None
+                } else {
+                    Some(compare_i32(values.value(row), op, literal))
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn compare_decimal128_view(
+    values: Decimal128VectorView<'_>,
+    op: ComparisonOp,
+    literal: i128,
+) -> BooleanArray {
+    BooleanArray::from(
+        (0..values_len_decimal128(values))
+            .map(|row| {
+                if values.is_null(row) {
+                    None
+                } else if let Some(raw) = values.raw_i64_values() {
+                    Some(compare_i128(i128::from(raw[row]), op, literal))
+                } else {
+                    Some(compare_i128(values.raw_values()[row], op, literal))
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn values_len_decimal128(values: Decimal128VectorView<'_>) -> usize {
+    if let Some(values) = values.raw_i64_values() {
+        values.len()
+    } else {
+        values.raw_values().len()
+    }
+}
+
+fn in_list_i64_view(
+    values: I64VectorView<'_>,
+    list: &[i64],
+    negated: bool,
+    has_null: bool,
+) -> BooleanArray {
+    BooleanArray::from(
+        (0..values.len())
+            .map(|row| {
+                if values.is_null(row) {
+                    None
+                } else {
+                    let matched = list.contains(&values.value(row));
+                    in_list_result(matched, negated, has_null)
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn in_list_i32_view(
+    values: I32VectorView<'_>,
+    list: &[i32],
+    negated: bool,
+    has_null: bool,
+) -> BooleanArray {
+    BooleanArray::from(
+        (0..values.len())
+            .map(|row| {
+                if values.is_null(row) {
+                    None
+                } else {
+                    let matched = list.contains(&values.value(row));
+                    in_list_result(matched, negated, has_null)
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn in_list_result(matched: bool, negated: bool, has_null: bool) -> Option<bool> {
+    if matched {
+        Some(!negated)
+    } else if has_null {
+        None
+    } else {
+        Some(negated)
+    }
+}
+
+fn compare_i64(left: i64, op: ComparisonOp, right: i64) -> bool {
+    match op {
+        ComparisonOp::Eq => left == right,
+        ComparisonOp::NotEq => left != right,
+        ComparisonOp::Lt => left < right,
+        ComparisonOp::LtEq => left <= right,
+        ComparisonOp::Gt => left > right,
+        ComparisonOp::GtEq => left >= right,
+    }
+}
+
+fn compare_i32(left: i32, op: ComparisonOp, right: i32) -> bool {
+    compare_i64(i64::from(left), op, i64::from(right))
+}
+
+fn compare_i128(left: i128, op: ComparisonOp, right: i128) -> bool {
+    match op {
+        ComparisonOp::Eq => left == right,
+        ComparisonOp::NotEq => left != right,
+        ComparisonOp::Lt => left < right,
+        ComparisonOp::LtEq => left <= right,
+        ComparisonOp::Gt => left > right,
+        ComparisonOp::GtEq => left >= right,
+    }
+}
+
+fn literal_to_decimal_scaled(
+    value: &LiteralValue,
+    scale_factor: Option<i64>,
+) -> Result<Option<i128>> {
+    let Some(scale_factor) = scale_factor else {
+        return Ok(None);
+    };
+    match value {
+        LiteralValue::Null => Ok(None),
+        LiteralValue::Int64(value) => Ok(i128::from(*value)
+            .checked_mul(i128::from(scale_factor))
+            .map(Some)
+            .unwrap_or(None)),
+        LiteralValue::Float64(value) => {
+            decimal_literal_to_scaled_factor(&value.to_string(), scale_factor)
+        }
+        LiteralValue::Utf8(value) => decimal_literal_to_scaled_factor(value, scale_factor),
+        LiteralValue::Boolean(_) => Ok(None),
+    }
+}
+
+fn decimal_literal_to_scaled_factor(value: &str, scale_factor: i64) -> Result<Option<i128>> {
+    let Some(scale_digits) = decimal_scale_digits(scale_factor) else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    let negative = value.starts_with('-');
+    let unsigned = value.strip_prefix(['-', '+']).unwrap_or(value);
+    let (whole, fractional) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    if whole.is_empty() || !whole.chars().all(|ch| ch.is_ascii_digit()) {
+        return Ok(None);
+    }
+    if !fractional.chars().all(|ch| ch.is_ascii_digit()) {
+        return Ok(None);
+    }
+    let mut scaled = whole
+        .parse::<i128>()
+        .map_err(|_| DodamError::InvalidCast(format!("decimal literal {value} is out of range")))?;
+    scaled = scaled
+        .checked_mul(i128::from(scale_factor))
+        .ok_or_else(|| DodamError::InvalidCast("decimal literal overflow".to_string()))?;
+    let kept = &fractional[..fractional.len().min(scale_digits)];
+    let mut frac = if kept.is_empty() {
+        0
+    } else {
+        kept.parse::<i128>().map_err(|_| {
+            DodamError::InvalidCast(format!("decimal literal {value} is out of range"))
+        })?
+    };
+    for _ in kept.len()..scale_digits {
+        frac *= 10;
+    }
+    scaled = scaled
+        .checked_add(frac)
+        .ok_or_else(|| DodamError::InvalidCast("decimal literal overflow".to_string()))?;
+    Ok(Some(if negative { -scaled } else { scaled }))
+}
+
+fn decimal_scale_digits(mut scale_factor: i64) -> Option<usize> {
+    if scale_factor <= 0 {
+        return None;
+    }
+    let mut digits = 0usize;
+    while scale_factor > 1 {
+        if scale_factor % 10 != 0 {
+            return None;
+        }
+        scale_factor /= 10;
+        digits += 1;
+    }
+    Some(digits)
 }
 
 #[allow(clippy::too_many_arguments)]
