@@ -23,19 +23,20 @@ use crate::dense::DenseI64BoolLookup;
 use crate::error::{DodamError, Result};
 use crate::execution::metrics::ScanPlanMetricsCounter;
 use crate::execution::{
-    AggregateExpr, AggregateMetrics, ComparisonOp, DecimalDateRangeFilter, DistinctExec, Expr,
-    FilterExec, FilterExpr, FinalMergeExec, HashJoinExec, IpcExec, JoinBuildSide, JoinType,
-    LimitExec, LiteralValue, LocalFoldExec, MemoryExec, PartitionedHashJoinExec,
-    PartitionedHashJoinOptions, PhysicalPlan, PredicateSet, Projection, ProjectionExec,
-    RecordBatchSink, ScanExec, ScanMetrics, ScanPlanMetrics, SendableBatchStream,
-    SingleKeyCountSumMinMaxVectorState, SingleKeyCountSumVectorState, SortExec, SortExpr, SortKey,
-    SortMergeJoinExec, can_merge_partial_aggregates, collect_aggregates,
-    collect_grouped_aggregates, collect_metrics, evaluate_filter_mask,
-    merge_partial_aggregate_metrics, scan_projection, write_stream_to_sink,
+    AggregateExpr, AggregateMetrics, ComparisonExpr, ComparisonOp, DecimalDateRangeFilter,
+    DirectPrimitiveFoldExec, DistinctExec, Expr, FilterExec, FilterExpr, FinalMergeExec,
+    GroupAggregateResult, HashJoinExec, IpcExec, JoinBuildSide, JoinType, LimitExec, LiteralValue,
+    LocalFoldExec, MemoryExec, PartitionedHashJoinExec, PartitionedHashJoinOptions, PhysicalPlan,
+    PredicateSet, Projection, ProjectionExec, RecordBatchSink, ScanExec, ScanMetrics,
+    ScanPlanMetrics, SendableBatchStream, SingleKeyCountSumBatchAccumulator,
+    SingleKeyCountSumMinMaxVectorState, SortExec, SortExpr, SortKey, SortMergeJoinExec,
+    can_merge_partial_aggregates, collect_aggregates, collect_grouped_aggregates, collect_metrics,
+    evaluate_filter_mask, merge_partial_aggregate_metrics, scan_projection, write_stream_to_sink,
 };
 use crate::plan::{
-    ExchangeKind, ExecutionGraphPlan, LogicalPlan, LogicalScan, PhysicalExecutionConfig,
-    PhysicalJoinStrategy, PhysicalOperator, PhysicalPlanNode, PlanTableSource, TaskInput, TaskPlan,
+    DirectPrimitiveFoldMode, ExchangeKind, ExecutionGraphPlan, LogicalPlan, LogicalScan,
+    PhysicalExecutionConfig, PhysicalJoinStrategy, PhysicalOperator, PhysicalPlanNode,
+    PlanTableSource, TaskInput, TaskPlan,
 };
 use crate::storage::{
     DirectByteArrayPayloadReader, DirectColumnScanMetrics, DirectI64I32I32ScanMetrics,
@@ -44,7 +45,9 @@ use crate::storage::{
     ParquetFileCache, ParquetFileCacheStats, ParquetMetadataCache,
     parquet_row_group_count_with_store, plan_parquet_scan_tasks, read_parquet_file_statistics,
     read_parquet_i64_column_constant, read_parquet_i64_column_max,
+    scan_parquet_i32_i64_byte_array_columns_with_store,
     scan_parquet_i32_i64_decimal_i32_selected_with_store,
+    scan_parquet_i32_i64_dictionary_id_columns_with_store,
     scan_parquet_i64_byte_array_payload_columns_with_store,
     scan_parquet_primitive_columns_with_store,
 };
@@ -86,10 +89,10 @@ enum DirectPrimitiveKeyType {
 }
 
 impl DirectPrimitiveKeyType {
-    fn column_type(self) -> DirectPrimitiveColumnType {
+    fn column_type_descriptor(self) -> &'static str {
         match self {
-            Self::I32 => DirectPrimitiveColumnType::I32,
-            Self::I64 => DirectPrimitiveColumnType::I64,
+            Self::I32 => "i32",
+            Self::I64 => "i64",
         }
     }
 }
@@ -110,6 +113,223 @@ impl OwnedDirectPrimitiveColumnSpec {
             })
             .collect()
     }
+}
+
+#[derive(Debug, Clone)]
+struct DirectUtf8CountSumShape {
+    predicate_column: String,
+    group_column: String,
+    sum_column: String,
+    op: ComparisonOp,
+    value: i32,
+}
+
+#[derive(Default)]
+struct DirectUtf8CountSumState {
+    groups: HashMap<Vec<u8>, (u64, i64)>,
+    null_group: Option<(u64, i64)>,
+    local_dictionary_groups: Vec<(u64, i64)>,
+    local_dictionary_touched: Vec<usize>,
+    batches: usize,
+    rows: usize,
+}
+
+impl DirectUtf8CountSumState {
+    fn consume(
+        &mut self,
+        predicate_values: &[i32],
+        sum_values: &[i64],
+        group_def_levels: &[i16],
+        group_values: &[parquet::data_type::ByteArray],
+        shape: &DirectUtf8CountSumShape,
+    ) {
+        self.batches += 1;
+        let mut group_index = 0usize;
+        for row in 0..predicate_values.len() {
+            let group_is_null = group_def_levels[row] == 0;
+            if !direct_i32_predicate_matches(predicate_values[row], shape.op, shape.value) {
+                if !group_is_null {
+                    group_index += 1;
+                }
+                continue;
+            }
+            self.rows += 1;
+            if group_is_null {
+                let entry = self.null_group.get_or_insert((0, 0));
+                entry.0 = entry.0.saturating_add(1);
+                entry.1 = entry.1.saturating_add(sum_values[row]);
+            } else {
+                let group = group_values[group_index].data().to_vec();
+                group_index += 1;
+                let entry = self.groups.entry(group).or_insert((0, 0));
+                entry.0 = entry.0.saturating_add(1);
+                entry.1 = entry.1.saturating_add(sum_values[row]);
+            }
+        }
+    }
+
+    fn consume_dictionary_ids(
+        &mut self,
+        predicate_values: &[i32],
+        sum_values: &[i64],
+        group_def_levels: Option<&[i16]>,
+        group_ids: &[i32],
+        dictionary: &[bytes::Bytes],
+        shape: &DirectUtf8CountSumShape,
+    ) {
+        self.batches += 1;
+        let mut group_index = 0usize;
+        if self.local_dictionary_groups.len() < dictionary.len() {
+            self.local_dictionary_groups
+                .resize(dictionary.len(), (0, 0));
+        }
+        self.local_dictionary_touched.clear();
+        for row in 0..predicate_values.len() {
+            let group_is_null = group_def_levels.is_some_and(|levels| levels[row] == 0);
+            if !direct_i32_predicate_matches(predicate_values[row], shape.op, shape.value) {
+                if !group_is_null {
+                    group_index += 1;
+                }
+                continue;
+            }
+            self.rows += 1;
+            if group_is_null {
+                let entry = self.null_group.get_or_insert((0, 0));
+                entry.0 = entry.0.saturating_add(1);
+                entry.1 = entry.1.saturating_add(sum_values[row]);
+            } else {
+                let id = group_ids[group_index] as usize;
+                group_index += 1;
+                let entry = &mut self.local_dictionary_groups[id];
+                if entry.0 == 0 {
+                    self.local_dictionary_touched.push(id);
+                }
+                entry.0 = entry.0.saturating_add(1);
+                entry.1 = entry.1.saturating_add(sum_values[row]);
+            }
+        }
+        for &id in &self.local_dictionary_touched {
+            let entry = &mut self.local_dictionary_groups[id];
+            let (count, sum) = *entry;
+            *entry = (0, 0);
+            let entry = self.groups.entry(dictionary[id].to_vec()).or_insert((0, 0));
+            entry.0 = entry.0.saturating_add(count);
+            entry.1 = entry.1.saturating_add(sum);
+        }
+    }
+
+    fn finish(
+        self,
+        fragments: usize,
+        count_expr: AggregateExpr,
+        sum_expr: AggregateExpr,
+    ) -> Result<AggregateMetrics> {
+        let mut groups =
+            Vec::with_capacity(self.groups.len() + usize::from(self.null_group.is_some()));
+        if let Some((count, sum)) = self.null_group {
+            groups.push(GroupAggregateResult {
+                keys: vec![crate::execution::GroupValue::Utf8(None)],
+                values: vec![
+                    crate::execution::AggregateResult {
+                        expr: count_expr.clone(),
+                        value: crate::execution::AggregateValue::Count(count),
+                    },
+                    crate::execution::AggregateResult {
+                        expr: sum_expr.clone(),
+                        value: crate::execution::AggregateValue::Int64(Some(sum)),
+                    },
+                ],
+            });
+        }
+        for (key, (count, sum)) in self.groups {
+            let key = String::from_utf8(key).map_err(|_| {
+                DodamError::UnsupportedSql("invalid UTF8 group key in direct aggregate".to_string())
+            })?;
+            groups.push(GroupAggregateResult {
+                keys: vec![crate::execution::GroupValue::Utf8(Some(key))],
+                values: vec![
+                    crate::execution::AggregateResult {
+                        expr: count_expr.clone(),
+                        value: crate::execution::AggregateValue::Count(count),
+                    },
+                    crate::execution::AggregateResult {
+                        expr: sum_expr.clone(),
+                        value: crate::execution::AggregateValue::Int64(Some(sum)),
+                    },
+                ],
+            });
+        }
+        groups.sort_by(|left, right| direct_utf8_group_key_cmp(&left.keys[0], &right.keys[0]));
+        Ok(AggregateMetrics {
+            fragments,
+            batches: self.batches,
+            rows: self.rows,
+            groups,
+            ..AggregateMetrics::default()
+        })
+    }
+}
+
+fn direct_utf8_group_key_cmp(
+    left: &crate::execution::GroupValue,
+    right: &crate::execution::GroupValue,
+) -> std::cmp::Ordering {
+    match (left, right) {
+        (crate::execution::GroupValue::Utf8(None), crate::execution::GroupValue::Utf8(None)) => {
+            std::cmp::Ordering::Equal
+        }
+        (crate::execution::GroupValue::Utf8(None), _) => std::cmp::Ordering::Less,
+        (_, crate::execution::GroupValue::Utf8(None)) => std::cmp::Ordering::Greater,
+        (
+            crate::execution::GroupValue::Utf8(Some(left)),
+            crate::execution::GroupValue::Utf8(Some(right)),
+        ) => left.cmp(right),
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+fn direct_i32_predicate_matches(value: i32, op: ComparisonOp, bound: i32) -> bool {
+    match op {
+        ComparisonOp::Eq => value == bound,
+        ComparisonOp::NotEq => value != bound,
+        ComparisonOp::Lt => value < bound,
+        ComparisonOp::LtEq => value <= bound,
+        ComparisonOp::Gt => value > bound,
+        ComparisonOp::GtEq => value >= bound,
+    }
+}
+
+fn direct_i32_utf8_count_sum_shape(
+    aggregates: &[AggregateExpr],
+    group_by: &[String],
+    filter: &FilterExpr,
+) -> Result<Option<DirectUtf8CountSumShape>> {
+    if group_by.len() != 1 {
+        return Ok(None);
+    }
+    let [
+        AggregateExpr::CountStar | AggregateExpr::Count(_),
+        AggregateExpr::Sum(sum_column),
+    ] = aggregates
+    else {
+        return Ok(None);
+    };
+    let Expr::Comparison(ComparisonExpr { column, op, value }) = filter.expr() else {
+        return Ok(None);
+    };
+    let LiteralValue::Int64(value) = value else {
+        return Ok(None);
+    };
+    let Ok(value) = i32::try_from(*value) else {
+        return Ok(None);
+    };
+    Ok(Some(DirectUtf8CountSumShape {
+        predicate_column: column.clone(),
+        group_column: group_by[0].clone(),
+        sum_column: sum_column.clone(),
+        op: *op,
+        value,
+    }))
 }
 
 #[derive(Debug, Clone)]
@@ -522,6 +742,7 @@ pub struct AggregatePlan {
     pub aggregates: Vec<AggregateExpr>,
     pub group_by: Vec<String>,
     pub column_read_plan: AggregateColumnReadPlan,
+    pub direct_physical: Option<PhysicalPlanNode>,
 }
 
 impl AggregatePlan {
@@ -538,6 +759,9 @@ impl AggregatePlan {
     }
 
     pub fn to_plan_node(&self) -> PhysicalPlanNode {
+        if let Some(plan) = &self.direct_physical {
+            return plan.clone();
+        }
         let local_fold = PhysicalPlanNode::new("LocalFoldExec")
             .attr(
                 "mode",
@@ -825,6 +1049,34 @@ impl DodamEngine {
         )
     }
 
+    pub(crate) fn scan_parquet_primitive_columns_parallel_view_fold<S, Init, Consume, Merge>(
+        &self,
+        path: impl Into<PathBuf>,
+        batch_size: usize,
+        row_groups: Vec<usize>,
+        columns: Vec<(String, DirectPrimitiveColumnType)>,
+        init: Init,
+        consume: Consume,
+        merge: Merge,
+    ) -> Result<Option<(S, DirectPrimitiveColumnScanMetrics)>>
+    where
+        S: Send,
+        Init: Fn() -> S + Sync,
+        Consume: for<'a> Fn(&mut S, BatchView<'a>) -> Result<()> + Sync,
+        Merge: Fn(&mut S, S) -> Result<()> + Sync,
+    {
+        let columns = columns
+            .into_iter()
+            .map(|(name, column_type)| OwnedDirectPrimitiveColumnSpec { name, column_type })
+            .collect();
+        self.scan_parquet_primitive_columns_parallel_fold(
+            DirectPrimitiveFoldPlan::new(path, batch_size, row_groups, columns),
+            init,
+            consume,
+            merge,
+        )
+    }
+
     fn scan_parquet_primitive_columns_parallel_fold<S, Init, Consume, Merge>(
         &self,
         plan: DirectPrimitiveFoldPlan,
@@ -896,34 +1148,7 @@ impl DodamEngine {
                 return Ok(None);
             };
             merge(&mut state, partial)?;
-            scan_metrics.row_groups = scan_metrics.row_groups.saturating_add(metrics.row_groups);
-            scan_metrics.batches = scan_metrics.batches.saturating_add(metrics.batches);
-            scan_metrics.rows = scan_metrics.rows.saturating_add(metrics.rows);
-            scan_metrics.read_nanos = scan_metrics.read_nanos.saturating_add(metrics.read_nanos);
-            scan_metrics.consume_nanos = scan_metrics
-                .consume_nanos
-                .saturating_add(metrics.consume_nanos);
-            scan_metrics.selected_rows = scan_metrics
-                .selected_rows
-                .saturating_add(metrics.selected_rows);
-            scan_metrics.selected_runs = scan_metrics
-                .selected_runs
-                .saturating_add(metrics.selected_runs);
-            scan_metrics.full_payload_batches = scan_metrics
-                .full_payload_batches
-                .saturating_add(metrics.full_payload_batches);
-            scan_metrics.selected_payload_batches = scan_metrics
-                .selected_payload_batches
-                .saturating_add(metrics.selected_payload_batches);
-            if scan_metrics.column_read_nanos.len() < metrics.column_read_nanos.len() {
-                scan_metrics
-                    .column_read_nanos
-                    .resize(metrics.column_read_nanos.len(), 0);
-            }
-            for (index, nanos) in metrics.column_read_nanos.iter().enumerate() {
-                scan_metrics.column_read_nanos[index] =
-                    scan_metrics.column_read_nanos[index].saturating_add(*nanos);
-            }
+            scan_metrics.merge_from(metrics);
         }
         log_direct_primitive_fold_profile(&plan.path, &plan.columns, &scan_metrics);
         Ok(Some((state, scan_metrics)))
@@ -999,34 +1224,7 @@ impl DodamEngine {
                 return Ok(None);
             };
             merge(&mut state, partial)?;
-            scan_metrics.row_groups = scan_metrics.row_groups.saturating_add(metrics.row_groups);
-            scan_metrics.batches = scan_metrics.batches.saturating_add(metrics.batches);
-            scan_metrics.rows = scan_metrics.rows.saturating_add(metrics.rows);
-            scan_metrics.read_nanos = scan_metrics.read_nanos.saturating_add(metrics.read_nanos);
-            scan_metrics.consume_nanos = scan_metrics
-                .consume_nanos
-                .saturating_add(metrics.consume_nanos);
-            scan_metrics.selected_rows = scan_metrics
-                .selected_rows
-                .saturating_add(metrics.selected_rows);
-            scan_metrics.selected_runs = scan_metrics
-                .selected_runs
-                .saturating_add(metrics.selected_runs);
-            scan_metrics.full_payload_batches = scan_metrics
-                .full_payload_batches
-                .saturating_add(metrics.full_payload_batches);
-            scan_metrics.selected_payload_batches = scan_metrics
-                .selected_payload_batches
-                .saturating_add(metrics.selected_payload_batches);
-            if scan_metrics.column_read_nanos.len() < metrics.column_read_nanos.len() {
-                scan_metrics
-                    .column_read_nanos
-                    .resize(metrics.column_read_nanos.len(), 0);
-            }
-            for (index, nanos) in metrics.column_read_nanos.iter().enumerate() {
-                scan_metrics.column_read_nanos[index] =
-                    scan_metrics.column_read_nanos[index].saturating_add(*nanos);
-            }
+            scan_metrics.merge_from(metrics);
         }
         let profile_columns = columns
             .iter()
@@ -1059,6 +1257,59 @@ impl DodamEngine {
             self.object_store.as_ref(),
             consume,
         )
+    }
+
+    pub(crate) fn scan_parquet_i32_i64_byte_array_columns<F>(
+        &self,
+        path: impl AsRef<Path>,
+        batch_size: usize,
+        row_groups: &[usize],
+        columns: [&str; 3],
+        consume: F,
+    ) -> Result<Option<DirectColumnScanMetrics>>
+    where
+        F: FnMut(&[i32], &[i64], &[i16], &[parquet::data_type::ByteArray]) -> Result<Option<()>>,
+    {
+        scan_parquet_i32_i64_byte_array_columns_with_store(
+            path.as_ref(),
+            batch_size,
+            row_groups,
+            columns,
+            self.file_cache.clone(),
+            self.object_store.as_ref(),
+            consume,
+        )
+    }
+
+    pub(crate) fn scan_parquet_i32_i64_dictionary_id_columns<F>(
+        &self,
+        path: &Path,
+        batch_size: usize,
+        row_groups: &[usize],
+        columns: [&str; 3],
+        consume: F,
+    ) -> Result<Option<DirectColumnScanMetrics>>
+    where
+        F: FnMut(&[i32], &[i64], Option<&[i16]>, &[i32], &[bytes::Bytes]) -> Result<Option<()>>,
+    {
+        let planning_start = Instant::now();
+        let metrics = scan_parquet_i32_i64_dictionary_id_columns_with_store(
+            path,
+            batch_size,
+            row_groups,
+            columns,
+            self.file_cache.clone(),
+            self.object_store.as_ref(),
+            consume,
+        )?;
+        if let Some(metrics) = metrics {
+            let planning_nanos = elapsed_nanos(planning_start.elapsed());
+            return Ok(Some(DirectColumnScanMetrics {
+                read_nanos: metrics.read_nanos.saturating_add(planning_nanos),
+                ..metrics
+            }));
+        }
+        Ok(None)
     }
 
     pub async fn scan_parquet(
@@ -1150,6 +1401,33 @@ impl DodamEngine {
     ) -> Result<SendableBatchStream> {
         let source = self.plan_table_source(path).await?;
         self.scan_table_source_batches(source, batch_size, limit, projection, filter, None)
+    }
+
+    pub(crate) async fn scan_parquet_batches_fold<S, C, F, O>(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        limit: Option<usize>,
+        projection: Projection,
+        filter: Option<FilterExpr>,
+        mut state: S,
+        mut consume: C,
+        finish: F,
+    ) -> Result<O>
+    where
+        C: FnMut(&RecordBatch, &mut S) -> Result<()>,
+        F: FnOnce(S) -> Result<O>,
+    {
+        let mut stream = self
+            .scan_parquet_batches(path, batch_size, limit, projection, filter)
+            .await?;
+        while let Some(batch) = stream.next() {
+            let batch = batch?;
+            if batch.num_rows() > 0 {
+                consume(&batch, &mut state)?;
+            }
+        }
+        finish(state)
     }
 
     pub async fn scan_parquet_batches_pruned(
@@ -1991,6 +2269,70 @@ impl DodamEngine {
             + Sync
             + 'static,
     {
+        self.late_materialized_parquet_map_pruned_with_policy_view_dictionary_columns(
+            path,
+            batch_size,
+            predicate_projection,
+            payload_projection,
+            Vec::new(),
+            pruning_predicates,
+            row_group_chunk,
+            policy,
+            build_state,
+            build_selection,
+            consume_payload,
+            finish,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn late_materialized_parquet_map_pruned_with_policy_view_dictionary_columns<
+        State,
+        Output,
+        BuildState,
+        BuildSelection,
+        ConsumePayload,
+        Finish,
+    >(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        predicate_projection: Projection,
+        payload_projection: Projection,
+        payload_dictionary_columns: Vec<String>,
+        pruning_predicates: Vec<Expr>,
+        row_group_chunk: usize,
+        policy: LateMaterializationPolicy,
+        build_state: BuildState,
+        build_selection: BuildSelection,
+        consume_payload: ConsumePayload,
+        finish: Finish,
+    ) -> Result<Option<Vec<LateMaterializedChunkResult<Output>>>>
+    where
+        State: Send + 'static,
+        Output: Send + 'static,
+        BuildState: Fn() -> State + Clone + Send + Sync + 'static,
+        BuildSelection: for<'a> FnMut(
+                BatchView<'a>,
+                &mut LateSelectionBuilder,
+                &mut State,
+            ) -> Result<Option<()>>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        ConsumePayload: for<'a> FnMut(BatchView<'a>, &mut State) -> Result<Option<()>>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        Finish: Fn(State, LateMaterializedMetrics) -> Result<Option<Output>>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
         let source = self.plan_table_source(path.clone()).await?;
         if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
             return Ok(None);
@@ -2052,6 +2394,7 @@ impl DodamEngine {
             let path = local_path.clone();
             let predicate_projection = predicate_projection.clone();
             let payload_projection = payload_projection.clone();
+            let payload_dictionary_columns = payload_dictionary_columns.clone();
             let metadata_cache = self.metadata_cache.clone();
             let file_cache = self.file_cache.clone();
             let object_store = self.object_store.clone();
@@ -2066,6 +2409,7 @@ impl DodamEngine {
                     row_groups,
                     &predicate_projection,
                     &payload_projection,
+                    &payload_dictionary_columns,
                     &metadata_cache,
                     file_cache,
                     object_store.as_ref(),
@@ -3928,6 +4272,24 @@ impl DodamEngine {
                 Ok(Box::new(FinalMergeExec::new(input, group_by, aggregates)))
             }
             (
+                PhysicalOperator::DirectPrimitiveFold,
+                Some(PhysicalExecutionConfig::DirectPrimitiveFold {
+                    path,
+                    batch_size,
+                    row_groups,
+                    columns,
+                    mode,
+                }),
+            ) => Ok(Box::new(DirectPrimitiveFoldExec::new(
+                path,
+                batch_size,
+                row_groups,
+                columns,
+                mode,
+                self.file_cache.clone(),
+                self.object_store.clone(),
+            ))),
+            (
                 PhysicalOperator::HashJoin,
                 Some(PhysicalExecutionConfig::HashJoin {
                     left_keys,
@@ -4253,6 +4615,42 @@ impl DodamEngine {
             {
                 return Ok(Some(metrics));
             }
+            if let Some(metrics) = self
+                .try_direct_i32_utf8_count_sum_aggregate(
+                    path.clone(),
+                    batch_size,
+                    &aggregates,
+                    &group_by,
+                    &filter,
+                )
+                .await?
+            {
+                return Ok(Some(metrics));
+            }
+            if let Some(metrics) = self
+                .try_filtered_count_sum_aggregate(
+                    path.clone(),
+                    batch_size,
+                    &aggregates,
+                    &group_by,
+                    &filter,
+                )
+                .await?
+            {
+                return Ok(Some(metrics));
+            }
+            if let Some(metrics) = self
+                .try_filtered_dictionary_count_sum_aggregate(
+                    path.clone(),
+                    batch_size,
+                    &aggregates,
+                    &group_by,
+                    &filter,
+                )
+                .await?
+            {
+                return Ok(Some(metrics));
+            }
             return self
                 .try_late_materialized_parquet_aggregate(
                     path, batch_size, aggregates, group_by, filter,
@@ -4330,122 +4728,38 @@ impl DodamEngine {
             return Ok(None);
         };
         let source = self.plan_table_source(path.clone()).await?;
-        if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
+        let Some(node) = self.try_build_direct_primitive_fold_node(
+            &source,
+            batch_size,
+            aggregates,
+            group_by,
+            Some(filter),
+        )?
+        else {
             return Ok(None);
-        }
-        let local_path = source.fragments[0].parquet_local_path()?.to_path_buf();
-        let projection = Projection::Columns(shape.projection_columns());
-        let predicates = PredicateSet::new(Some(filter.clone()));
-        let task_plan = plan_parquet_scan_tasks(
-            &local_path,
-            &projection,
-            predicates.pushdown(),
-            &self.metadata_cache,
-            self.object_store.as_ref(),
-        )?;
-        if task_plan.tasks.is_empty() {
-            return Ok(Some(AggregateMetrics {
-                fragments: 1,
-                ..AggregateMetrics::default()
-            }));
-        }
-        let row_groups = task_plan
-            .tasks
-            .iter()
-            .map(|task| task.row_group)
-            .collect::<Vec<_>>();
-        let started = Instant::now();
-        let columns = vec![
-            OwnedDirectPrimitiveColumnSpec {
-                name: shape.key_column.clone(),
-                column_type: shape.key_type.column_type(),
-            },
-            OwnedDirectPrimitiveColumnSpec {
-                name: shape.sum_column.clone(),
-                column_type: DirectPrimitiveColumnType::I64,
-            },
-            OwnedDirectPrimitiveColumnSpec {
-                name: shape.min_decimal_column.clone(),
-                column_type: DirectPrimitiveColumnType::Decimal128Int64Raw {
-                    precision: shape.decimal_precision,
-                    scale: shape.decimal_scale,
-                },
-            },
-            OwnedDirectPrimitiveColumnSpec {
-                name: shape.max_date_column.clone(),
-                column_type: DirectPrimitiveColumnType::Date32,
-            },
-        ];
-        let scan_result = if direct_selection_fold_enabled()
-            && matches!(shape.key_type, DirectPrimitiveKeyType::I32)
-        {
-            self.scan_parquet_i32_i64_decimal_i32_selected_fold(
-                &local_path,
-                batch_size,
-                &row_groups,
-                [
-                    shape.key_column.as_str(),
-                    shape.sum_column.as_str(),
-                    shape.min_decimal_column.as_str(),
-                    shape.max_date_column.as_str(),
-                ],
-                shape.decimal_precision,
-                shape.decimal_scale,
-                shape.filter,
-                || {
-                    SingleKeyCountSumMinMaxVectorState::new_i32(
-                        aggregates.to_vec(),
-                        shape.decimal_precision,
-                        shape.decimal_scale,
-                    )
-                },
-                |state, batch| state.consume_i32_i64_decimal_date_batch(batch, &shape.filter),
-                |state, partial| state.merge(partial),
-            )?
-        } else {
-            None
         };
-        let (state, scan_metrics) = if let Some(result) = scan_result {
-            result
+        let local_path = source.fragments[0].parquet_local_path()?.to_path_buf();
+        let row_groups = direct_primitive_fold_row_groups(&node)?;
+        let started = Instant::now();
+        let scan_result = self.try_selected_payload_count_sum_min_max_metrics(
+            &local_path,
+            batch_size,
+            &row_groups,
+            &shape,
+            aggregates,
+        )?;
+        let mut metrics = if let Some((state, scan_metrics)) = scan_result {
+            let mut metrics = state.finish();
+            metrics.fragments = 1;
+            metrics.batches = scan_metrics.batches;
+            metrics.rows = scan_metrics.rows;
+            metrics
         } else {
-            let Some(result) = self.scan_parquet_primitive_columns_parallel_fold(
-                DirectPrimitiveFoldPlan::new(
-                    local_path.clone(),
-                    batch_size,
-                    row_groups.clone(),
-                    columns,
-                ),
-                || match shape.key_type {
-                    DirectPrimitiveKeyType::I32 => SingleKeyCountSumMinMaxVectorState::new_i32(
-                        aggregates.to_vec(),
-                        shape.decimal_precision,
-                        shape.decimal_scale,
-                    ),
-                    DirectPrimitiveKeyType::I64 => SingleKeyCountSumMinMaxVectorState::new_i64(
-                        aggregates.to_vec(),
-                        shape.decimal_precision,
-                        shape.decimal_scale,
-                    ),
-                },
-                |state, batch| match shape.key_type {
-                    DirectPrimitiveKeyType::I32 => {
-                        state.consume_i32_i64_decimal_date_batch(batch, &shape.filter)
-                    }
-                    DirectPrimitiveKeyType::I64 => {
-                        state.consume_i64_i64_decimal_date_batch(batch, &shape.filter)
-                    }
-                },
-                |state, partial| state.merge(partial),
-            )?
-            else {
+            let Some(metrics) = self.try_execute_direct_primitive_fold_metrics(node)? else {
                 return Ok(None);
             };
-            result
+            metrics
         };
-        let mut metrics = state.finish();
-        metrics.fragments = 1;
-        metrics.batches = scan_metrics.batches;
-        metrics.rows = scan_metrics.rows;
         metrics.aggregate_nanos = elapsed_nanos(started.elapsed());
         log_aggregate_profile(
             "direct_primitive_count_sum_min_max",
@@ -4462,75 +4776,469 @@ impl DodamEngine {
         aggregates: &[AggregateExpr],
         group_by: &[String],
     ) -> Result<Option<AggregateMetrics>> {
-        let Some(shape) = DirectCountSumShape::try_new(aggregates, group_by, self, &path)? else {
-            return Ok(None);
-        };
         let source = self.plan_table_source(path.clone()).await?;
-        if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
-            return Ok(None);
-        }
-        let local_path = source.fragments[0].parquet_local_path()?.to_path_buf();
-        let projection = Projection::Columns(shape.projection_columns());
-        let task_plan = plan_parquet_scan_tasks(
-            &local_path,
-            &projection,
-            &[],
-            &self.metadata_cache,
-            self.object_store.as_ref(),
-        )?;
-        if task_plan.tasks.is_empty() {
-            return Ok(Some(AggregateMetrics {
-                fragments: 1,
-                ..AggregateMetrics::default()
-            }));
-        }
-        let row_groups = task_plan
-            .tasks
-            .iter()
-            .map(|task| task.row_group)
-            .collect::<Vec<_>>();
-        let columns = vec![
-            OwnedDirectPrimitiveColumnSpec {
-                name: shape.key_column.clone(),
-                column_type: shape.key_type.column_type(),
-            },
-            OwnedDirectPrimitiveColumnSpec {
-                name: shape.sum_column.clone(),
-                column_type: DirectPrimitiveColumnType::I64,
-            },
-        ];
-        let started = Instant::now();
-        let Some((state, scan_metrics)) = self.scan_parquet_primitive_columns_parallel_fold(
-            DirectPrimitiveFoldPlan::new(
-                local_path.clone(),
-                batch_size,
-                row_groups.clone(),
-                columns,
-            ),
-            || match shape.key_type {
-                DirectPrimitiveKeyType::I32 => {
-                    SingleKeyCountSumVectorState::new_i32(aggregates[1].clone())
-                }
-                DirectPrimitiveKeyType::I64 => {
-                    SingleKeyCountSumVectorState::new_i64(aggregates[1].clone())
-                }
-            },
-            |state, batch| match shape.key_type {
-                DirectPrimitiveKeyType::I32 => state.consume_i32_i64_batch(batch),
-                DirectPrimitiveKeyType::I64 => state.consume_i64_i64_batch(batch),
-            },
-            |state, partial| state.merge(partial),
+        let Some(node) = self.try_build_direct_primitive_fold_node(
+            &source, batch_size, aggregates, group_by, None,
         )?
         else {
             return Ok(None);
         };
-        let mut metrics = state.finish();
-        metrics.fragments = 1;
-        metrics.batches = scan_metrics.batches;
-        metrics.rows = scan_metrics.rows;
+        let started = Instant::now();
+        let Some(mut metrics) = self.try_execute_direct_primitive_fold_metrics(node)? else {
+            return Ok(None);
+        };
         metrics.aggregate_nanos = elapsed_nanos(started.elapsed());
         log_aggregate_profile("direct_primitive_count_sum", &metrics, started.elapsed());
         Ok(Some(metrics))
+    }
+
+    async fn try_direct_i32_utf8_count_sum_aggregate(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        aggregates: &[AggregateExpr],
+        group_by: &[String],
+        filter: &FilterExpr,
+    ) -> Result<Option<AggregateMetrics>> {
+        if !direct_i32_utf8_count_sum_aggregate_enabled() {
+            return Ok(None);
+        }
+        let Some(shape) = direct_i32_utf8_count_sum_shape(aggregates, group_by, filter)? else {
+            return Ok(None);
+        };
+        let source = self.plan_table_source(path).await?;
+        if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
+            return Ok(None);
+        }
+        let local_path = source.fragments[0].parquet_local_path()?.to_path_buf();
+        let projection = Projection::Columns(vec![
+            shape.predicate_column.clone(),
+            shape.sum_column.clone(),
+            shape.group_column.clone(),
+        ]);
+        let predicates = PredicateSet::new(Some(filter.clone()));
+        let row_groups =
+            self.direct_primitive_row_groups(&local_path, &projection, predicates.pushdown())?;
+        let mut state = DirectUtf8CountSumState::default();
+        let started = Instant::now();
+        let scan_result = self.scan_parquet_i32_i64_dictionary_id_columns(
+            &local_path,
+            batch_size,
+            &row_groups,
+            [
+                shape.predicate_column.as_str(),
+                shape.sum_column.as_str(),
+                shape.group_column.as_str(),
+            ],
+            |predicate_values, sum_values, group_def_levels, group_ids, dictionary| {
+                state.consume_dictionary_ids(
+                    predicate_values,
+                    sum_values,
+                    group_def_levels,
+                    group_ids,
+                    dictionary,
+                    &shape,
+                );
+                Ok(Some(()))
+            },
+        )?;
+        let scan_metrics = if let Some(scan_metrics) = scan_result {
+            scan_metrics
+        } else {
+            let Some(scan_metrics) = self.scan_parquet_i32_i64_byte_array_columns(
+                &local_path,
+                batch_size,
+                &row_groups,
+                [
+                    shape.predicate_column.as_str(),
+                    shape.sum_column.as_str(),
+                    shape.group_column.as_str(),
+                ],
+                |predicate_values, sum_values, group_def_levels, group_values| {
+                    state.consume(
+                        predicate_values,
+                        sum_values,
+                        group_def_levels,
+                        group_values,
+                        &shape,
+                    );
+                    Ok(Some(()))
+                },
+            )?
+            else {
+                return Ok(None);
+            };
+            scan_metrics
+        };
+        let mut metrics = state.finish(1, aggregates[0].clone(), aggregates[1].clone())?;
+        metrics.batches = scan_metrics.batches;
+        metrics.aggregate_nanos = elapsed_nanos(started.elapsed());
+        log_aggregate_profile(
+            "direct_i32_utf8_count_sum_aggregate",
+            &metrics,
+            started.elapsed(),
+        );
+        Ok(Some(metrics))
+    }
+
+    async fn try_filtered_count_sum_aggregate(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        aggregates: &[AggregateExpr],
+        group_by: &[String],
+        filter: &FilterExpr,
+    ) -> Result<Option<AggregateMetrics>> {
+        if !filtered_count_sum_aggregate_enabled() {
+            return Ok(None);
+        }
+        if SingleKeyCountSumBatchAccumulator::try_new(1, group_by, aggregates).is_none() {
+            return Ok(None);
+        }
+        let column_read_plan = aggregate_column_read_plan(aggregates, group_by, Some(filter));
+        if matches!(column_read_plan.scan_projection, Projection::All) {
+            return Ok(None);
+        }
+        let predicates = PredicateSet::new(Some(filter.clone()));
+        let Some(partials) = self
+            .parquet_row_group_map_pruned_view(
+                path,
+                batch_size,
+                column_read_plan.scan_projection.clone(),
+                predicates.pushdown().to_vec(),
+                fused_parquet_aggregate_row_group_chunk(),
+                {
+                    let aggregates = aggregates.to_vec();
+                    let group_by = group_by.to_vec();
+                    move || {
+                        SingleKeyCountSumBatchAccumulator::try_new(1, &group_by, &aggregates)
+                            .expect("filtered count/sum aggregate shape checked")
+                    }
+                },
+                {
+                    let filter = filter.clone();
+                    move |view, state| {
+                        let Some(batch) = view.try_record_batch() else {
+                            return Err(DodamError::UnsupportedSql(
+                                "filtered count/sum aggregate requires RecordBatch".to_string(),
+                            ));
+                        };
+                        let mask = evaluate_filter_mask(batch, &filter)?;
+                        if !state.consume_filtered_batch(batch, &mask)? {
+                            return Ok(None);
+                        }
+                        Ok(Some(()))
+                    }
+                },
+                |state| Ok(Some(vec![state.finish()])),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let partials = partials.into_iter().flatten().collect::<Vec<_>>();
+        if partials.is_empty() {
+            return Ok(None);
+        }
+        let started = Instant::now();
+        let metrics = merge_partial_aggregate_metrics(partials, 1, group_by, aggregates)?;
+        log_aggregate_profile("filtered_count_sum_aggregate", &metrics, started.elapsed());
+        Ok(Some(metrics))
+    }
+
+    async fn try_filtered_dictionary_count_sum_aggregate(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        aggregates: &[AggregateExpr],
+        group_by: &[String],
+        filter: &FilterExpr,
+    ) -> Result<Option<AggregateMetrics>> {
+        if !filtered_dictionary_aggregate_enabled() {
+            return Ok(None);
+        }
+        let dictionary_columns =
+            late_materialized_aggregate_dictionary_columns(aggregates, group_by);
+        if dictionary_columns.is_empty() {
+            return Ok(None);
+        }
+        let column_read_plan = aggregate_column_read_plan(aggregates, group_by, Some(filter));
+        if matches!(column_read_plan.scan_projection, Projection::All) {
+            return Ok(None);
+        }
+        let predicates = PredicateSet::new(Some(filter.clone()));
+        let Some(partials) = self
+            .parquet_row_group_map_dictionary_columns_pruned_view(
+                path,
+                batch_size,
+                column_read_plan.scan_projection.clone(),
+                dictionary_columns,
+                predicates.pushdown().to_vec(),
+                fused_parquet_aggregate_row_group_chunk(),
+                {
+                    let aggregates = aggregates.to_vec();
+                    let group_by = group_by.to_vec();
+                    move || {
+                        SingleKeyCountSumBatchAccumulator::try_new(1, &group_by, &aggregates)
+                            .expect("filtered dictionary aggregate shape checked")
+                    }
+                },
+                {
+                    let filter = filter.clone();
+                    move |view, state| {
+                        let Some(batch) = view.try_record_batch() else {
+                            return Err(DodamError::UnsupportedSql(
+                                "filtered dictionary aggregate requires RecordBatch".to_string(),
+                            ));
+                        };
+                        let mask = evaluate_filter_mask(batch, &filter)?;
+                        if !state.consume_filtered_batch(batch, &mask)? {
+                            return Ok(None);
+                        }
+                        Ok(Some(()))
+                    }
+                },
+                |state| Ok(Some(vec![state.finish()])),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let partials = partials.into_iter().flatten().collect::<Vec<_>>();
+        if partials.is_empty() {
+            return Ok(None);
+        }
+        let started = Instant::now();
+        let metrics = merge_partial_aggregate_metrics(partials, 1, group_by, aggregates)?;
+        log_aggregate_profile(
+            "filtered_dictionary_count_sum_aggregate",
+            &metrics,
+            started.elapsed(),
+        );
+        Ok(Some(metrics))
+    }
+
+    fn try_build_direct_primitive_fold_node(
+        &self,
+        source: &TableScanSource,
+        batch_size: usize,
+        aggregates: &[AggregateExpr],
+        group_by: &[String],
+        filter: Option<&FilterExpr>,
+    ) -> Result<Option<PhysicalPlanNode>> {
+        if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
+            log_optimizer_rule_trace(
+                "direct_primitive_fold",
+                "reject",
+                "requires single-fragment parquet source",
+            );
+            return Ok(None);
+        }
+        let local_path = source.fragments[0].parquet_local_path()?.to_path_buf();
+        if let Some(filter) = filter {
+            let Some(shape) = DirectCountSumMinMaxShape::try_new(
+                aggregates,
+                group_by,
+                filter,
+                self,
+                &local_path,
+            )?
+            else {
+                log_optimizer_rule_trace(
+                    "direct_primitive_fold",
+                    "reject",
+                    "unsupported filtered count/sum/min/max shape",
+                );
+                return Ok(None);
+            };
+            let projection = Projection::Columns(shape.projection_columns());
+            let predicates = PredicateSet::new(Some(filter.clone()));
+            let row_groups =
+                self.direct_primitive_row_groups(&local_path, &projection, predicates.pushdown())?;
+            let decimal_min = option_i128_to_i64(shape.filter.decimal_min)?;
+            let decimal_max = option_i128_to_i64(shape.filter.decimal_max)?;
+            let node = PhysicalPlanNode::new("DirectPrimitiveFoldExec")
+                .attr("mode", "single_key_count_sum_min_max")
+                .attr("rule", "direct_primitive_fold")
+                .attr("group_by", shape.key_column.clone())
+                .attr("row_groups", row_groups.len())
+                .attr(
+                    "columns",
+                    format!("[{}]", shape.projection_columns().join(",")),
+                )
+                .execution(PhysicalExecutionConfig::DirectPrimitiveFold {
+                    path: local_path,
+                    batch_size,
+                    row_groups,
+                    columns: vec![
+                        (
+                            shape.key_column.clone(),
+                            shape.key_type.column_type_descriptor().to_string(),
+                        ),
+                        (shape.sum_column.clone(), "i64".to_string()),
+                        (
+                            shape.min_decimal_column.clone(),
+                            format!(
+                                "decimal128_i64_raw:{}:{}",
+                                shape.decimal_precision, shape.decimal_scale
+                            ),
+                        ),
+                        (shape.max_date_column.clone(), "date32".to_string()),
+                    ],
+                    mode: DirectPrimitiveFoldMode::SingleKeyCountSumMinMax {
+                        group_by: shape.key_column.clone(),
+                        key_type: shape.key_type.column_type_descriptor().to_string(),
+                        aggregates: aggregates.to_vec(),
+                        decimal_precision: shape.decimal_precision,
+                        decimal_scale: shape.decimal_scale,
+                        decimal_min,
+                        decimal_max,
+                        date_min: shape.filter.date_min,
+                        date_max: shape.filter.date_max,
+                    },
+                });
+            log_optimizer_rule_trace(
+                "direct_primitive_fold",
+                "accept",
+                "single-key count/sum/min/max primitive aggregate",
+            );
+            return Ok(Some(node));
+        }
+
+        let Some(shape) = DirectCountSumShape::try_new(aggregates, group_by, self, &local_path)?
+        else {
+            log_optimizer_rule_trace(
+                "direct_primitive_fold",
+                "reject",
+                "unsupported count/sum shape",
+            );
+            return Ok(None);
+        };
+        let projection = Projection::Columns(shape.projection_columns());
+        let row_groups = self.direct_primitive_row_groups(&local_path, &projection, &[])?;
+        let node = PhysicalPlanNode::new("DirectPrimitiveFoldExec")
+            .attr("mode", "single_key_count_sum")
+            .attr("rule", "direct_primitive_fold")
+            .attr("group_by", shape.key_column.clone())
+            .attr("row_groups", row_groups.len())
+            .attr(
+                "columns",
+                format!("[{}]", shape.projection_columns().join(",")),
+            )
+            .execution(PhysicalExecutionConfig::DirectPrimitiveFold {
+                path: local_path,
+                batch_size,
+                row_groups,
+                columns: vec![
+                    (
+                        shape.key_column.clone(),
+                        shape.key_type.column_type_descriptor().to_string(),
+                    ),
+                    (shape.sum_column.clone(), "i64".to_string()),
+                ],
+                mode: DirectPrimitiveFoldMode::SingleKeyCountSum {
+                    group_by: shape.key_column.clone(),
+                    key_type: shape.key_type.column_type_descriptor().to_string(),
+                    count: shape.count_expr.clone(),
+                    sum: aggregates[1].clone(),
+                },
+            });
+        log_optimizer_rule_trace(
+            "direct_primitive_fold",
+            "accept",
+            "single-key count/sum primitive aggregate",
+        );
+        Ok(Some(node))
+    }
+
+    fn try_selected_payload_count_sum_min_max_metrics(
+        &self,
+        local_path: &Path,
+        batch_size: usize,
+        row_groups: &[usize],
+        shape: &DirectCountSumMinMaxShape,
+        aggregates: &[AggregateExpr],
+    ) -> Result<
+        Option<(
+            SingleKeyCountSumMinMaxVectorState,
+            DirectPrimitiveColumnScanMetrics,
+        )>,
+    > {
+        if !direct_selection_fold_enabled()
+            || !matches!(shape.key_type, DirectPrimitiveKeyType::I32)
+        {
+            return Ok(None);
+        }
+        self.scan_parquet_i32_i64_decimal_i32_selected_fold(
+            local_path,
+            batch_size,
+            row_groups,
+            [
+                shape.key_column.as_str(),
+                shape.sum_column.as_str(),
+                shape.min_decimal_column.as_str(),
+                shape.max_date_column.as_str(),
+            ],
+            shape.decimal_precision,
+            shape.decimal_scale,
+            shape.filter,
+            || {
+                SingleKeyCountSumMinMaxVectorState::new_i32(
+                    aggregates.to_vec(),
+                    shape.decimal_precision,
+                    shape.decimal_scale,
+                )
+            },
+            |state, batch| state.consume_i32_i64_decimal_date_batch(batch, &shape.filter),
+            |state, partial| state.merge(partial),
+        )
+    }
+
+    fn direct_primitive_row_groups(
+        &self,
+        local_path: &Path,
+        projection: &Projection,
+        pushdown_predicates: &[Expr],
+    ) -> Result<Vec<usize>> {
+        Ok(plan_parquet_scan_tasks(
+            local_path,
+            projection,
+            pushdown_predicates,
+            &self.metadata_cache,
+            self.object_store.as_ref(),
+        )?
+        .tasks
+        .iter()
+        .map(|task| task.row_group)
+        .collect())
+    }
+
+    fn try_execute_direct_primitive_fold_metrics(
+        &self,
+        node: PhysicalPlanNode,
+    ) -> Result<Option<AggregateMetrics>> {
+        let Some(PhysicalExecutionConfig::DirectPrimitiveFold {
+            path,
+            batch_size,
+            row_groups,
+            columns,
+            mode,
+        }) = node.execution_config().cloned()
+        else {
+            return Err(DodamError::UnsupportedSql(
+                "DirectPrimitiveFoldExec node is missing execution config".to_string(),
+            ));
+        };
+        DirectPrimitiveFoldExec::new(
+            path,
+            batch_size,
+            row_groups,
+            columns,
+            mode,
+            self.file_cache.clone(),
+            self.object_store.clone(),
+        )
+        .try_execute_metrics()
     }
 
     fn parquet_decimal128_type(
@@ -4595,12 +5303,16 @@ impl DodamEngine {
             return Ok(None);
         }
         log_aggregate_column_read_plan(&column_read_plan);
+        let payload_dictionary_columns =
+            late_materialized_aggregate_dictionary_columns(&aggregates, &group_by);
         let Some(partials) = self
-            .late_materialized_parquet_map_with_policy(
+            .late_materialized_parquet_map_pruned_with_policy_view_dictionary_columns(
                 path,
                 batch_size,
                 column_read_plan.predicate_projection.clone(),
                 column_read_plan.payload_projection.clone(),
+                payload_dictionary_columns,
+                Vec::new(),
                 late_materialized_aggregate_row_group_chunk(),
                 LateMaterializationPolicy::selective_with_selector_run_ratio(
                     late_materialized_aggregate_max_selected_ratio(),
@@ -4609,7 +5321,13 @@ impl DodamEngine {
                 Vec::<RecordBatch>::new,
                 {
                     let filter = filter.clone();
-                    move |batch, selection, _batches| {
+                    move |view, selection, _batches| {
+                        let Some(batch) = view.try_record_batch() else {
+                            return Err(DodamError::UnsupportedSql(
+                                "late materialized aggregate selection requires RecordBatch"
+                                    .to_string(),
+                            ));
+                        };
                         let mask = evaluate_filter_mask(&batch, &filter)?;
                         for row in 0..mask.len() {
                             selection.push(mask.is_valid(row) && mask.value(row));
@@ -4617,8 +5335,13 @@ impl DodamEngine {
                         Ok(Some(()))
                     }
                 },
-                |batch, batches| {
-                    batches.push(batch);
+                |view, batches| {
+                    let Some(batch) = view.try_record_batch() else {
+                        return Err(DodamError::UnsupportedSql(
+                            "late materialized aggregate payload requires RecordBatch".to_string(),
+                        ));
+                    };
+                    batches.push(batch.clone());
                     Ok(Some(()))
                 },
                 {
@@ -4661,6 +5384,18 @@ impl DodamEngine {
         filter: Option<FilterExpr>,
     ) -> Result<AggregatePlan> {
         let column_read_plan = aggregate_column_read_plan(&aggregates, &group_by, filter.as_ref());
+        let direct_physical =
+            if fused_parquet_aggregate_enabled() && can_merge_partial_aggregates(&aggregates) {
+                self.try_build_direct_primitive_fold_node(
+                    &source,
+                    batch_size,
+                    &aggregates,
+                    &group_by,
+                    filter.as_ref(),
+                )?
+            } else {
+                None
+            };
         let plan = self.plan_table_scan(
             source,
             batch_size,
@@ -4675,6 +5410,7 @@ impl DodamEngine {
             aggregates,
             group_by,
             column_read_plan,
+            direct_physical,
         })
     }
 
@@ -4687,22 +5423,34 @@ impl DodamEngine {
         filter: Option<FilterExpr>,
     ) -> Result<AggregatePlan> {
         let column_read_plan = aggregate_column_read_plan(&aggregates, &group_by, filter.as_ref());
-        let scan = self
-            .plan_parquet_scan(
-                path,
-                batch_size,
-                None,
-                column_read_plan.payload_projection.clone(),
-                filter,
-                None,
-            )
-            .await?;
+        let source = self.plan_table_source(path).await?;
+        let direct_physical =
+            if fused_parquet_aggregate_enabled() && can_merge_partial_aggregates(&aggregates) {
+                self.try_build_direct_primitive_fold_node(
+                    &source,
+                    batch_size,
+                    &aggregates,
+                    &group_by,
+                    filter.as_ref(),
+                )?
+            } else {
+                None
+            };
+        let scan = self.plan_table_scan(
+            source,
+            batch_size,
+            None,
+            column_read_plan.payload_projection.clone(),
+            filter,
+            None,
+        )?;
         log_aggregate_column_read_plan(&column_read_plan);
         Ok(AggregatePlan {
             scan,
             aggregates,
             group_by,
             column_read_plan,
+            direct_physical,
         })
     }
 
@@ -4735,6 +5483,17 @@ impl DodamEngine {
 
     fn execute_aggregate_plan(&self, plan: AggregatePlan) -> Result<AggregateMetrics> {
         let started = Instant::now();
+        if let Some(node) = plan.direct_physical.clone()
+            && let Some(mut metrics) = self.try_execute_direct_primitive_fold_metrics(node)?
+        {
+            metrics.aggregate_nanos = elapsed_nanos(started.elapsed());
+            log_aggregate_profile(
+                "aggregate_plan_direct_primitive",
+                &metrics,
+                started.elapsed(),
+            );
+            return Ok(metrics);
+        }
         let fragment_count = plan.scan.source.fragments.len();
         let stream = self.execute_scan_plan(plan.scan)?;
         let metrics = if plan.group_by.is_empty() {
@@ -4944,6 +5703,17 @@ fn option_i128_to_i64(value: Option<i128>) -> Result<Option<i64>> {
         .transpose()
 }
 
+fn direct_primitive_fold_row_groups(node: &PhysicalPlanNode) -> Result<Vec<usize>> {
+    let Some(PhysicalExecutionConfig::DirectPrimitiveFold { row_groups, .. }) =
+        node.execution_config()
+    else {
+        return Err(DodamError::UnsupportedSql(
+            "DirectPrimitiveFoldExec node is missing execution config".to_string(),
+        ));
+    };
+    Ok(row_groups.clone())
+}
+
 fn log_direct_primitive_fold_profile(
     path: &Path,
     columns: &[OwnedDirectPrimitiveColumnSpec],
@@ -5130,6 +5900,7 @@ fn average_nanos_millis(nanos: u64, count: usize) -> f64 {
 struct DirectCountSumShape {
     key_column: String,
     key_type: DirectPrimitiveKeyType,
+    count_expr: AggregateExpr,
     sum_column: String,
 }
 
@@ -5143,10 +5914,20 @@ impl DirectCountSumShape {
         let [key_column] = group_by else {
             return Ok(None);
         };
-        let [AggregateExpr::CountStar, AggregateExpr::Sum(sum_column)] = aggregates else {
+        let [
+            count_expr @ (AggregateExpr::CountStar | AggregateExpr::Count(_)),
+            AggregateExpr::Sum(sum_column),
+        ] = aggregates
+        else {
             return Ok(None);
         };
         if sum_column == key_column {
+            return Ok(None);
+        }
+        if let AggregateExpr::Count(count_column) = count_expr
+            && count_column != key_column
+            && count_column != sum_column
+        {
             return Ok(None);
         }
         let Some(key_type) = engine.parquet_primitive_key_type(path, key_column)? else {
@@ -5155,6 +5936,7 @@ impl DirectCountSumShape {
         Ok(Some(Self {
             key_column: key_column.clone(),
             key_type,
+            count_expr: count_expr.clone(),
             sum_column: sum_column.clone(),
         }))
     }
@@ -5330,11 +6112,58 @@ fn late_materialized_aggregate_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn filtered_dictionary_aggregate_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_FILTERED_DICTIONARY_AGGREGATE")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn filtered_count_sum_aggregate_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_FILTERED_COUNT_SUM_AGGREGATE")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn direct_i32_utf8_count_sum_aggregate_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_DIRECT_I32_UTF8_COUNT_SUM_AGGREGATE")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn late_materialized_aggregate_dictionary_columns(
+    aggregates: &[AggregateExpr],
+    group_by: &[String],
+) -> Vec<String> {
+    if group_by.len() == 1
+        && matches!(
+            aggregates,
+            [
+                AggregateExpr::CountStar | AggregateExpr::Count(_),
+                AggregateExpr::Sum(_)
+            ]
+        )
+    {
+        return group_by.to_vec();
+    }
+    Vec::new()
+}
+
 fn aggregate_profile_enabled() -> bool {
     std::env::var("DODAM_AGGREGATE_PROFILE")
         .or_else(|_| std::env::var("DODAM_GENERIC_PROFILE"))
         .or_else(|_| std::env::var("DODAM_TPCH_PROFILE"))
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn optimizer_trace_enabled() -> bool {
+    std::env::var("DODAM_OPTIMIZER_TRACE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn log_optimizer_rule_trace(rule: &str, decision: &str, reason: &str) {
+    if optimizer_trace_enabled() {
+        eprintln!("[dodam:optimizer] rule={rule} decision={decision} reason=\"{reason}\"");
+    }
 }
 
 fn log_aggregate_profile(label: &str, metrics: &AggregateMetrics, total: Duration) {
@@ -6251,6 +7080,7 @@ fn late_materialized_chunk_view<State, Output, BuildSelection, ConsumePayload, F
     row_groups: Vec<usize>,
     predicate_projection: &Projection,
     payload_projection: &Projection,
+    payload_dictionary_columns: &[String],
     metadata_cache: &ParquetMetadataCache,
     file_cache: Arc<ParquetFileCache>,
     object_store: &dyn ObjectStore,
@@ -6287,16 +7117,30 @@ where
         return Ok(None);
     }
     if let Some(row_selection) = row_selection {
-        let mut payload_reader = ParquetBatchReader::try_new_with_row_groups_selection(
-            path,
-            batch_size,
-            payload_projection,
-            row_groups,
-            row_selection,
-            metadata_cache,
-            file_cache,
-            object_store,
-        )?;
+        let mut payload_reader = if payload_dictionary_columns.is_empty() {
+            ParquetBatchReader::try_new_with_row_groups_selection(
+                path,
+                batch_size,
+                payload_projection,
+                row_groups,
+                row_selection,
+                metadata_cache,
+                file_cache,
+                object_store,
+            )?
+        } else {
+            ParquetBatchReader::try_new_with_row_groups_selection_dictionary_columns(
+                path,
+                batch_size,
+                payload_projection,
+                row_groups,
+                row_selection,
+                payload_dictionary_columns,
+                metadata_cache,
+                file_cache,
+                object_store,
+            )?
+        };
         while let Some(batch) = payload_reader.next() {
             let batch = batch?;
             if consume_payload(BatchView::new(&batch), &mut state)?.is_none() {
@@ -6804,6 +7648,7 @@ fn q14_late_materialized_promo_revenue_chunk(
         row_groups,
         &predicate_projection,
         &payload_projection,
+        &[],
         metadata_cache,
         file_cache,
         object_store,
@@ -7023,6 +7868,7 @@ fn q06_late_materialized_revenue_sum_chunk(
         row_groups,
         &predicate_projection,
         &payload_projection,
+        &[],
         metadata_cache,
         file_cache,
         object_store,

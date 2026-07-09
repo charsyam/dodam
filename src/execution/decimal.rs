@@ -73,6 +73,16 @@ pub fn decimal_discounted_revenue_raw(
 }
 
 #[inline]
+pub fn decimal_discounted_revenue_raw_i64(
+    extendedprice: i64,
+    discount: i64,
+    discount_scale: f64,
+    revenue_scale: f64,
+) -> f64 {
+    (extendedprice as f64) * (discount_scale - discount as f64) * revenue_scale
+}
+
+#[inline]
 fn decimal_scale_factor(scale: i8) -> f64 {
     10_f64.powi(i32::from(scale))
 }

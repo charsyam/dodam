@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
+import re
 import statistics
 import subprocess
 import time
@@ -25,6 +27,18 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=7)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=16 * 1024)
+    parser.add_argument(
+        "--dodam-mode",
+        choices=["query", "query-file"],
+        default="query",
+        help="Use one Dodam process per sample, or one query-file process per query.",
+    )
+    parser.add_argument(
+        "--duckdb-mode",
+        choices=["query", "query-file"],
+        default="query",
+        help="Use one DuckDB process per sample, or one .timer-enabled SQL file process per query.",
+    )
     parser.add_argument("--json-out", default="")
     parser.add_argument("--timeout", type=float, default=120.0)
     args = parser.parse_args()
@@ -166,6 +180,8 @@ def generic_queries(data_dir: Path) -> list[GenericQuery]:
 
 def run_dodam(args, query: GenericQuery, output_dir: Path) -> list[float]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.dodam_mode == "query-file":
+        return run_dodam_query_file(args, query, output_dir)
     samples = []
     for repeat in range(args.repeats):
         output = output_dir / f"{query.name}-{repeat}.parquet"
@@ -184,8 +200,42 @@ def run_dodam(args, query: GenericQuery, output_dir: Path) -> list[float]:
     return samples
 
 
+COPY_PROFILE_RE = re.compile(r"copy_profile total=(\d+)us")
+
+
+def run_dodam_query_file(args, query: GenericQuery, output_dir: Path) -> list[float]:
+    total_runs = args.repeats
+    sql_file = output_dir / f"{query.name}.sql"
+    statements = []
+    for repeat in range(total_runs):
+        output = output_dir / f"{query.name}-{repeat}.parquet"
+        statements.append(f"COPY ({query.dodam_sql}) TO '{output}' (FORMAT PARQUET);")
+    sql_file.write_text("\n".join(statements) + "\n")
+    env = os.environ.copy()
+    env["DODAM_PROFILE_COPY"] = "1"
+    completed = subprocess.run(
+        [args.dodam, "query-file", str(sql_file), "--batch-size", str(args.batch_size)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=args.timeout * max(1, total_runs),
+        env=env,
+    )
+    if completed.returncode != 0:
+        raise SystemExit(completed.stderr or completed.stdout)
+    samples = [int(match) / 1_000_000 for match in COPY_PROFILE_RE.findall(completed.stderr)]
+    if len(samples) != total_runs:
+        raise SystemExit(
+            f"expected {total_runs} Dodam copy_profile samples for {query.name}, got {len(samples)}\n"
+            f"stderr:\n{completed.stderr}"
+        )
+    return samples
+
+
 def run_duckdb(args, query: GenericQuery, output_dir: Path) -> list[float]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.duckdb_mode == "query-file":
+        return run_duckdb_query_file(args, query, output_dir)
     samples = []
     for repeat in range(args.repeats):
         output = output_dir / f"{query.name}-{repeat}.parquet"
@@ -201,6 +251,39 @@ def run_duckdb(args, query: GenericQuery, output_dir: Path) -> list[float]:
         samples.append(time.perf_counter() - started)
         if completed.returncode != 0:
             raise SystemExit(completed.stderr or completed.stdout)
+    return samples
+
+
+DUCKDB_TIMER_RE = re.compile(r"Run Time \(s\): real ([0-9.]+)")
+
+
+def run_duckdb_query_file(args, query: GenericQuery, output_dir: Path) -> list[float]:
+    total_runs = args.repeats
+    sql_file = output_dir / f"{query.name}.sql"
+    statements = [".timer on"]
+    for repeat in range(total_runs):
+        output = output_dir / f"{query.name}-{repeat}.parquet"
+        statements.append(f"COPY ({query.duckdb_sql}) TO '{output}' (FORMAT PARQUET);")
+    sql_file.write_text("\n".join(statements) + "\n")
+    started = time.perf_counter()
+    with sql_file.open("r") as stdin:
+        completed = subprocess.run(
+            [args.duckdb],
+            stdin=stdin,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=args.timeout * max(1, total_runs),
+        )
+    elapsed = time.perf_counter() - started
+    if completed.returncode != 0:
+        raise SystemExit(completed.stderr or completed.stdout)
+    output = completed.stdout + completed.stderr
+    samples = [float(match) for match in DUCKDB_TIMER_RE.findall(output)]
+    if len(samples) != total_runs:
+        # Some DuckDB builds suppress .timer for non-interactive COPY. Keep this
+        # mode usable as a total-process smoke measurement instead of failing.
+        return [elapsed / total_runs for _ in range(total_runs)]
     return samples
 
 

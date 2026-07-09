@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::hash::BuildHasher;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -43,20 +43,21 @@ use crate::engine::{
 use crate::error::{DodamError, Result};
 use crate::execution::JoinType;
 use crate::execution::{
-    AggregateExpr, AggregateMetrics, AggregateResult, AggregateValue, ComparisonExpr, ComparisonOp,
-    DecimalInput, DistinctExec, Expr, FilterExpr, GroupAggregateResult, GroupKeyExpr,
-    GroupKeyLiteral, GroupValue, HashJoinExec, JoinBuildSide, LiteralValue, MemoryExec,
-    PhysicalPlan, Projection, RecordBatchSink, ScanPlanMetrics, SendableBatchStream, SortExpr,
-    SortKey, aggregate_metrics_to_batches, collect_aggregates, collect_grouped_aggregates,
-    collect_grouped_aggregates_with_key_exprs, decimal_discounted_revenue_raw,
+    AggregateExpr, AggregateMetrics, AggregateResult, AggregateValue, CoalesceKeyCountSumCollector,
+    ComparisonExpr, ComparisonOp, DecimalInput, DistinctExec, Expr, FilterExpr,
+    GroupAggregateResult, GroupKeyExpr, GroupKeyLiteral, GroupValue, HashJoinExec, JoinBuildSide,
+    LiteralValue, MemoryExec, PhysicalPlan, Projection, RecordBatchSink, ScanPlanMetrics,
+    SendableBatchStream, SortExpr, SortKey, aggregate_metrics_to_batches, collect_aggregates,
+    collect_grouped_aggregates, collect_grouped_aggregates_with_key_exprs,
+    decimal_discounted_revenue_raw, decimal_discounted_revenue_raw_i64,
     decimal_discounted_revenue_scales, decimal_input, evaluate_filter_mask, filter_batch,
     try_for_each_i64_i64_date32,
 };
 use crate::hash::{FastHashMap, FastHashSet, fast_hash_map, fast_hash_map_with_capacity};
-use crate::optimizer::plan_join_inputs;
+use crate::optimizer::{JoinInputPlan, plan_join_inputs};
 use crate::storage::{
-    DirectColumnScanMetrics, DirectI64I32I32ScanMetrics, DirectPrimitiveColumnScanMetrics,
-    DirectPrimitiveColumnSpec, DirectPrimitiveColumnType,
+    DirectColumnScanMetrics, DirectI64I32I32ScanMetrics, DirectPrimitiveColumnSpec,
+    DirectPrimitiveColumnType,
 };
 use crate::vector::{
     BatchConsumer, BatchView, Date32VectorView, Decimal128VectorView, DictionaryI32View,
@@ -365,6 +366,14 @@ pub async fn execute_sql(
             &join.right_alias,
             &join.right_keys,
         );
+        if is_aggregate
+            && let Some(output) = try_execute_join_coalesce_count_sum_aggregate(
+                engine, &query, &join, &join_plan, batch_size,
+            )
+            .await?
+        {
+            return Ok(output);
+        }
         let output_projection = pushed_join_output_projection(&query)?;
         let output_projection_is_final = output_projection == query.projection;
         let stream = engine
@@ -497,22 +506,50 @@ pub async fn execute_sql(
         let aggregates = query.aggregates.clone();
         let group_by = query.group_by.clone();
         let metrics = if !query.aggregate_expressions.is_empty() {
-            let stream = engine
-                .scan_parquet_batches(
-                    query.path,
-                    batch_size,
-                    None,
-                    query.projection.clone(),
-                    query.filter,
-                )
-                .await?;
-            collect_aggregates_with_optional_expression_views(
-                stream,
-                1,
+            if let Some(metrics) = try_collect_expression_aggregate_scan_fold(
+                engine,
+                query.path.clone(),
+                batch_size,
+                query.projection.clone(),
+                query.filter.clone(),
                 &group_by,
                 &aggregates,
                 &query.aggregate_expressions,
-            )?
+            )
+            .await?
+            {
+                metrics
+            } else if let Some(metrics) = try_collect_expression_aggregate_row_group_map(
+                engine,
+                query.path.clone(),
+                batch_size,
+                query.projection.clone(),
+                query.filter.clone(),
+                &group_by,
+                &aggregates,
+                &query.aggregate_expressions,
+            )
+            .await?
+            {
+                metrics
+            } else {
+                let stream = engine
+                    .scan_parquet_batches(
+                        query.path,
+                        batch_size,
+                        None,
+                        query.projection.clone(),
+                        query.filter,
+                    )
+                    .await?;
+                collect_aggregates_with_optional_expression_views(
+                    stream,
+                    1,
+                    &group_by,
+                    &aggregates,
+                    &query.aggregate_expressions,
+                )?
+            }
         } else if query.group_by.is_empty() {
             engine
                 .aggregate_parquet(query.path, batch_size, aggregates.clone(), query.filter)
@@ -15743,10 +15780,27 @@ fn q15_revenue_by_supplier_view_into(
         ) && extendedprices.null_count() == 0
             && discounts.null_count() == 0
         {
-            let extendedprice_values = extendedprices.raw_values();
-            let discount_values = discounts.raw_values();
             let discount_scale = discounts.scale();
             let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
+            if let (Some(extendedprice_values), Some(discount_values)) =
+                (extendedprices.raw_i64_values(), discounts.raw_i64_values())
+            {
+                for row in 0..view.num_rows() {
+                    let shipdate = shipdate_values[row];
+                    if shipdate >= start_days && shipdate < end_days {
+                        *revenues.entry(suppkey_values[row]).or_insert(0.0) +=
+                            decimal_discounted_revenue_raw_i64(
+                                extendedprice_values[row],
+                                discount_values[row],
+                                discount_scale,
+                                revenue_scale,
+                            );
+                    }
+                }
+                return Ok(());
+            }
+            let extendedprice_values = extendedprices.raw_values();
+            let discount_values = discounts.raw_values();
             for row in 0..view.num_rows() {
                 let shipdate = shipdate_values[row];
                 if shipdate >= start_days && shipdate < end_days {
@@ -22325,14 +22379,6 @@ fn q06_direct_primitive_enabled() -> bool {
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
-fn q06_direct_primitive_row_group_chunk() -> usize {
-    std::env::var("DODAM_Q06_DIRECT_ROW_GROUP_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(4)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn q06_revenue_sum_direct_primitive(
     engine: &DodamEngine,
@@ -22346,106 +22392,37 @@ fn q06_revenue_sum_direct_primitive(
 ) -> Result<Option<(f64, u64)>> {
     let started = tpch_profile_start();
     let row_groups = (0..engine.parquet_row_group_count(&path)?).collect::<Vec<_>>();
-    let chunks = row_groups
-        .chunks(q06_direct_primitive_row_group_chunk())
-        .map(|chunk| chunk.to_vec())
-        .collect::<Vec<_>>();
-    let partials = chunks
-        .into_par_iter()
-        .map(|row_groups| {
-            q06_revenue_sum_direct_primitive_chunk(
-                engine,
-                path.clone(),
-                batch_size,
-                row_groups,
-                start_days,
-                end_days,
-                discount_low,
-                discount_high,
-                quantity_limit,
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut total = (0.0, 0_u64);
-    let mut metrics = DirectPrimitiveColumnScanMetrics::default();
-    for partial in partials {
-        let Some((partial, partial_metrics)) = partial else {
-            return Ok(None);
-        };
-        total.0 += partial.0;
-        total.1 += partial.1;
-        metrics.row_groups = metrics
-            .row_groups
-            .saturating_add(partial_metrics.row_groups);
-        metrics.batches = metrics.batches.saturating_add(partial_metrics.batches);
-        metrics.rows = metrics.rows.saturating_add(partial_metrics.rows);
-        metrics.read_nanos = metrics
-            .read_nanos
-            .saturating_add(partial_metrics.read_nanos);
-        metrics.consume_nanos = metrics
-            .consume_nanos
-            .saturating_add(partial_metrics.consume_nanos);
-    }
-    if let Some(started) = started {
-        eprintln!(
-            "[dodam:tpch-profile] Q06 direct_primitive: total={:.3} ms row_groups={} batches={} rows={} read={:.3} ms consume={:.3} ms",
-            started.elapsed().as_secs_f64() * 1000.0,
-            metrics.row_groups,
-            metrics.batches,
-            metrics.rows,
-            sql_nanos_to_millis(metrics.read_nanos),
-            sql_nanos_to_millis(metrics.consume_nanos),
-        );
-    }
-    Ok(Some(total))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn q06_revenue_sum_direct_primitive_chunk(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-    row_groups: Vec<usize>,
-    start_days: i32,
-    end_days: i32,
-    discount_low: f64,
-    discount_high: f64,
-    quantity_limit: f64,
-) -> Result<Option<((f64, u64), DirectPrimitiveColumnScanMetrics)>> {
-    let specs = [
-        DirectPrimitiveColumnSpec {
-            name: "l_shipdate",
-            column_type: DirectPrimitiveColumnType::Date32,
-        },
-        DirectPrimitiveColumnSpec {
-            name: "l_discount",
-            column_type: DirectPrimitiveColumnType::Decimal128Int64 {
+    let columns = vec![
+        ("l_shipdate".to_string(), DirectPrimitiveColumnType::Date32),
+        (
+            "l_discount".to_string(),
+            DirectPrimitiveColumnType::Decimal128Int64Raw {
                 precision: 15,
                 scale: 2,
             },
-        },
-        DirectPrimitiveColumnSpec {
-            name: "l_quantity",
-            column_type: DirectPrimitiveColumnType::Decimal128Int64 {
+        ),
+        (
+            "l_quantity".to_string(),
+            DirectPrimitiveColumnType::Decimal128Int64Raw {
                 precision: 15,
                 scale: 2,
             },
-        },
-        DirectPrimitiveColumnSpec {
-            name: "l_extendedprice",
-            column_type: DirectPrimitiveColumnType::Decimal128Int64 {
+        ),
+        (
+            "l_extendedprice".to_string(),
+            DirectPrimitiveColumnType::Decimal128Int64Raw {
                 precision: 15,
                 scale: 2,
             },
-        },
+        ),
     ];
-    let mut total = Some((0.0, 0_u64));
-    let Some(metrics) = engine.scan_parquet_primitive_columns_view(
-        &path,
+    let Some((total, metrics)) = engine.scan_parquet_primitive_columns_parallel_view_fold(
+        path.clone(),
         batch_size,
-        &row_groups,
-        &specs,
-        |view| {
+        row_groups,
+        columns,
+        || Some((0.0, 0_u64)),
+        |total, view| {
             let batch = q06_revenue_sum_view(
                 view,
                 start_days,
@@ -22458,7 +22435,16 @@ fn q06_revenue_sum_direct_primitive_chunk(
                 total.0 += batch.0;
                 total.1 += batch.1;
             } else {
-                total = None;
+                *total = None;
+            }
+            Ok(())
+        },
+        |total, partial| {
+            if let (Some(total), Some(partial)) = (total.as_mut(), partial) {
+                total.0 += partial.0;
+                total.1 += partial.1;
+            } else {
+                *total = None;
             }
             Ok(())
         },
@@ -22466,7 +22452,21 @@ fn q06_revenue_sum_direct_primitive_chunk(
     else {
         return Ok(None);
     };
-    Ok(total.map(|total| (total, metrics)))
+    let Some(total) = total else {
+        return Ok(None);
+    };
+    if let Some(started) = started {
+        eprintln!(
+            "[dodam:tpch-profile] Q06 direct_primitive: total={:.3} ms row_groups={} batches={} rows={} read={:.3} ms consume={:.3} ms",
+            started.elapsed().as_secs_f64() * 1000.0,
+            metrics.row_groups,
+            metrics.batches,
+            metrics.rows,
+            sql_nanos_to_millis(metrics.read_nanos),
+            sql_nanos_to_millis(metrics.consume_nanos),
+        );
+    }
+    Ok(Some(total))
 }
 
 fn q06_row_filter_enabled() -> bool {
@@ -22597,6 +22597,15 @@ fn q06_filtered_revenue_sum_vectors(
     if discounts.null_count() == 0 && extendedprices.null_count() == 0 {
         let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
         if discounts.precision() <= 18 && extendedprices.precision() <= 18 {
+            if let (Some(discounts), Some(extendedprices)) =
+                (discounts.raw_i64_values(), extendedprices.raw_i64_values())
+            {
+                for (&discount, &extendedprice) in discounts.iter().zip(extendedprices) {
+                    sum += (extendedprice * discount) as f64 * revenue_scale;
+                    count += 1;
+                }
+                return Ok(Some((sum, count)));
+            }
             for (&discount, &extendedprice) in discounts
                 .raw_values()
                 .iter()
@@ -22800,13 +22809,31 @@ fn q06_revenue_sum_vector_views(
         let discount_high_raw = scaled_f64_to_i128(discount_high, discounts.scale());
         let quantity_limit_raw = scaled_f64_to_i128(quantity_limit, quantities.scale());
         let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
-        let discount_values = discounts.raw_values();
-        let quantity_values = quantities.raw_values();
-        let extendedprice_values = extendedprices.raw_values();
         if discounts.precision() <= 18
             && quantities.precision() <= 18
             && extendedprices.precision() <= 18
         {
+            if let (Some(discount_values), Some(quantity_values), Some(extendedprice_values)) = (
+                discounts.raw_i64_values(),
+                quantities.raw_i64_values(),
+                extendedprices.raw_i64_values(),
+            ) {
+                return Ok(Some(vector_q06_revenue_sum_i64_raw(
+                    shipdate_values,
+                    discount_values,
+                    quantity_values,
+                    extendedprice_values,
+                    start_days,
+                    end_days,
+                    discount_low_raw as i64,
+                    discount_high_raw as i64,
+                    quantity_limit_raw as i64,
+                    revenue_scale,
+                )));
+            }
+            let discount_values = discounts.raw_values();
+            let quantity_values = quantities.raw_values();
+            let extendedprice_values = extendedprices.raw_values();
             return Ok(Some(vector_q06_revenue_sum_i64(
                 shipdate_values,
                 discount_values,
@@ -22820,6 +22847,9 @@ fn q06_revenue_sum_vector_views(
                 revenue_scale,
             )));
         }
+        let discount_values = discounts.raw_values();
+        let quantity_values = quantities.raw_values();
+        let extendedprice_values = extendedprices.raw_values();
         let mut sum = 0.0;
         let mut count = 0_u64;
         for row in 0..shipdate_values.len() {
@@ -22862,6 +22892,38 @@ fn q06_revenue_sum_vector_views(
         count += 1;
     }
     Ok(Some((sum, count)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn vector_q06_revenue_sum_i64_raw(
+    shipdates: &[i32],
+    discounts: &[i64],
+    quantities: &[i64],
+    extendedprices: &[i64],
+    start_days: i32,
+    end_days: i32,
+    discount_low_raw: i64,
+    discount_high_raw: i64,
+    quantity_limit_raw: i64,
+    revenue_scale: f64,
+) -> (f64, u64) {
+    let mut sum = 0.0;
+    let mut count = 0_u64;
+    for row in 0..shipdates.len() {
+        let shipdate = shipdates[row];
+        let discount = discounts[row];
+        if shipdate < start_days
+            || shipdate >= end_days
+            || discount < discount_low_raw
+            || discount > discount_high_raw
+            || quantities[row] >= quantity_limit_raw
+        {
+            continue;
+        }
+        sum += (extendedprices[row] * discount) as f64 * revenue_scale;
+        count += 1;
+    }
+    (sum, count)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -27619,9 +27681,42 @@ fn q19_late_build_selection_vector_typed(
     }
     let raw_rules =
         q19_raw_line_rules_cached(&state.rules, quantities.scale(), &mut state.raw_rule_cache);
+    let part_masks_dense = state.part_masks.dense_slices();
+    if let (Some(quantity_values), Some(discount_values)) =
+        (quantities.raw_i64_values(), discounts.raw_i64_values())
+    {
+        selection.push_selected_rows(partkeys.len(), |row| {
+            if partkeys.is_null(row)
+                || quantities.is_null(row)
+                || discounts.is_null(row)
+                || shipmodes.is_null(row)
+                || shipinstructs.is_null(row)
+            {
+                return false;
+            }
+            let selected = if let Some(mask) = state
+                .part_masks
+                .get_cached(part_masks_dense, partkeys.value(row))
+            {
+                q19_rule_matches_lineitem_raw(
+                    raw_rules,
+                    mask,
+                    i128::from(quantity_values[row]),
+                    shipmodes.value_bytes(row),
+                    shipinstructs.value_bytes(row),
+                )
+            } else {
+                false
+            };
+            if selected {
+                state.selected_discounts.push(discount_values[row]);
+            }
+            selected
+        });
+        return Ok(Some(()));
+    }
     let quantity_values = quantities.raw_values();
     let discount_values = discounts.raw_values();
-    let part_masks_dense = state.part_masks.dense_slices();
     selection.push_selected_rows(partkeys.len(), |row| {
         if partkeys.is_null(row)
             || quantities.is_null(row)
@@ -27725,6 +27820,24 @@ fn q19_late_consume_payload_vector(
         .discount_scale
         .ok_or_else(|| DodamError::UnsupportedSql("Q19 missing discount scale".to_string()))?;
     let revenue_scale = 1.0 / ((price_scale as f64) * (discount_scale as f64));
+    if let Some(extendedprices) = extendedprices.raw_i64_values() {
+        for &extendedprice in extendedprices {
+            let discount = *state
+                .selected_discounts
+                .get(state.discount_offset)
+                .ok_or_else(|| {
+                    DodamError::UnsupportedSql("Q19 row selection payload mismatch".to_string())
+                })?;
+            state.sum += decimal_discounted_revenue_raw_i64(
+                extendedprice,
+                discount,
+                discount_scale as f64,
+                revenue_scale,
+            );
+            state.discount_offset += 1;
+        }
+        return Ok(Some(()));
+    }
     for &extendedprice in extendedprices.raw_values() {
         let discount = *state
             .selected_discounts
@@ -27946,6 +28059,52 @@ fn q19_lineitem_revenue_vector_typed(
     let raw_rules = q19_raw_line_rules_cached(rules, quantities.scale(), raw_rule_cache);
     let discount_one_raw = scaled_f64_to_i128(1.0, discounts.scale());
     let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
+    if let (Some(quantity_values), Some(extendedprice_values), Some(discount_values)) = (
+        quantities.raw_i64_values(),
+        extendedprices.raw_i64_values(),
+        discounts.raw_i64_values(),
+    ) {
+        let discount_one_raw = discount_one_raw as i64;
+        for row in 0..partkeys.len() {
+            if partkeys.is_null(row)
+                || quantities.is_null(row)
+                || extendedprices.is_null(row)
+                || discounts.is_null(row)
+                || shipmodes.is_null(row)
+                || shipinstructs.is_null(row)
+            {
+                if let Some(profile) = profile.as_deref_mut() {
+                    profile.record(false);
+                }
+                continue;
+            }
+            let selected = if let Some(mask) = part_masks.get(partkeys.value(row)) {
+                q19_rule_matches_lineitem_raw(
+                    raw_rules,
+                    mask,
+                    i128::from(quantity_values[row]),
+                    shipmodes.value_bytes(row),
+                    shipinstructs.value_bytes(row),
+                )
+            } else {
+                false
+            };
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.record(selected);
+            }
+            if !selected {
+                continue;
+            }
+            sum += decimal_discounted_revenue_raw_i64(
+                extendedprice_values[row],
+                discount_values[row],
+                discount_one_raw as f64,
+                revenue_scale,
+            );
+            count += 1;
+        }
+        return Ok((sum, count));
+    }
     let quantity_values = quantities.raw_values();
     let extendedprice_values = extendedprices.raw_values();
     let discount_values = discounts.raw_values();
@@ -31407,6 +31566,14 @@ async fn execute_parsed_join_query(
         &join.right_alias,
         &join.right_keys,
     );
+    if is_aggregate
+        && let Some(output) = try_execute_join_coalesce_count_sum_aggregate(
+            engine, &query, &join, &join_plan, batch_size,
+        )
+        .await?
+    {
+        return Ok(Some(output));
+    }
     let output_projection = pushed_join_output_projection(&query)?;
     let output_projection_is_final = output_projection == query.projection;
     let stream = engine
@@ -31502,6 +31669,686 @@ async fn execute_parsed_join_query(
         batches = rename_output_batches(batches, &query.aliases)?;
     }
     Ok(Some(QueryOutput::Scan { batches }))
+}
+
+async fn try_execute_join_coalesce_count_sum_aggregate(
+    engine: &DodamEngine,
+    query: &SqlQuery,
+    join: &SqlJoin,
+    join_plan: &JoinInputPlan,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let profile = join_profile_enabled_sql();
+    let total_started = profile.then(Instant::now);
+    if !join_coalesce_count_sum_fusion_enabled() {
+        return Ok(None);
+    }
+    if join.join_type != JoinType::Inner
+        || join.left_keys.len() != 1
+        || join.right_keys.len() != 1
+        || query.having.is_some()
+        || query.distinct
+        || query.expression_filter.is_some()
+    {
+        trace_join_coalesce_fusion("reject", "unsupported join shape");
+        return Ok(None);
+    }
+    let [AggregateExpr::CountStar, AggregateExpr::Sum(sum_column)] = query.aggregates.as_slice()
+    else {
+        trace_join_coalesce_fusion("reject", "unsupported aggregate list");
+        return Ok(None);
+    };
+    let Some(group_keys) = group_key_exprs_for_aggregate(
+        &query.group_by,
+        &query.aggregates,
+        &query.aggregate_expressions,
+    ) else {
+        trace_join_coalesce_fusion("reject", "unsupported group expression list");
+        return Ok(None);
+    };
+    let [
+        GroupKeyExpr::Column(left_group_column),
+        GroupKeyExpr::CoalesceLiteral {
+            column: right_payload_column,
+            fallback: GroupKeyLiteral::Utf8(fallback),
+        },
+    ] = group_keys.as_slice()
+    else {
+        trace_join_coalesce_fusion("reject", "unsupported group key shape");
+        return Ok(None);
+    };
+    trace_join_coalesce_fusion(
+        "candidate",
+        &format!(
+            "left_group={} right_payload={} sum={} group_by=[{}] aliases=[{}]",
+            left_group_column,
+            right_payload_column,
+            sum_column,
+            query.group_by.join(","),
+            query
+                .aliases
+                .iter()
+                .map(|(left, right)| format!("{left}->{right}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    );
+    if !join_column_belongs_to(left_group_column, &join.left_alias)
+        || !join_column_belongs_to(sum_column, &join.left_alias)
+        || !join_column_belongs_to(right_payload_column, &join.right_alias)
+    {
+        trace_join_coalesce_fusion("reject", "columns do not belong to expected join sides");
+        return Ok(None);
+    }
+
+    let right_key = strip_column_prefix(&join.right_keys[0], &join.right_alias);
+    let right_payload = strip_column_prefix(right_payload_column, &join.right_alias);
+    let right_scan_started = profile.then(Instant::now);
+    let right_batches = scan_join_side_batches(
+        engine,
+        &join.right,
+        batch_size,
+        join_plan.right_filter.as_ref(),
+        Projection::Columns(vec![right_key.clone(), right_payload.clone()]),
+    )
+    .await?;
+    let right_scan_nanos = elapsed_optional_nanos(right_scan_started);
+    let right_lookup_started = profile.then(Instant::now);
+    let Some(right_lookup) =
+        build_unique_i64_to_utf8_id_lookup(&right_batches, &right_key, &right_payload)?
+    else {
+        trace_join_coalesce_fusion("reject", "right join key is not unique");
+        return Ok(None);
+    };
+    let right_lookup_nanos = elapsed_optional_nanos(right_lookup_started);
+    let right_values = right_lookup.values;
+
+    let left_key = strip_column_prefix(&join.left_keys[0], &join.left_alias);
+    let left_group = strip_column_prefix(left_group_column, &join.left_alias);
+    let left_sum = strip_column_prefix(sum_column, &join.left_alias);
+    let left_projection = Projection::Columns(unique_columns([
+        left_key.clone(),
+        left_group.clone(),
+        left_sum.clone(),
+    ]));
+    let left_scan_started = profile.then(Instant::now);
+    let left_direct = try_direct_join_coalesce_left_aggregate(
+        engine,
+        &query.path,
+        batch_size,
+        join_plan.left_filter.as_ref(),
+        &left_key,
+        &left_group,
+        &left_sum,
+        &right_lookup.lookup,
+    )?;
+    let (groups, rows, batches, left_scan_nanos, aggregate_nanos) =
+        if let Some(left_direct) = left_direct {
+            (
+                left_direct.groups.into_iter().collect::<Vec<_>>(),
+                left_direct.rows,
+                left_direct.batches,
+                elapsed_optional_nanos(left_scan_started),
+                left_direct.aggregate_nanos,
+            )
+        } else {
+            let mut left_stream = engine
+                .scan_parquet_batches(
+                    query.path.clone(),
+                    batch_size,
+                    None,
+                    left_projection,
+                    join_plan.left_filter.clone(),
+                )
+                .await?;
+            let aggregate_started = profile.then(Instant::now);
+            let mut groups = JoinCoalesceGroupAccumulator::new();
+            let mut rows = 0usize;
+            let mut batches = 0usize;
+            while let Some(batch) = left_stream.next() {
+                let batch = batch?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                batches += 1;
+                rows = rows.saturating_add(batch.num_rows());
+                let key = i64_array_like(&batch, &left_key)?;
+                let group = i64_array_like(&batch, &left_group)?;
+                let sum = i64_array_like(&batch, &left_sum)?;
+                for row in 0..batch.num_rows() {
+                    if key.is_null(row) {
+                        continue;
+                    }
+                    let Some(&class_id) = right_lookup.lookup.get(&key.value(row)) else {
+                        continue;
+                    };
+                    groups.update(
+                        (!group.is_null(row)).then(|| group.value(row)),
+                        class_id,
+                        (!sum.is_null(row)).then(|| sum.value(row)),
+                    );
+                }
+            }
+            let left_scan_nanos = elapsed_optional_nanos(left_scan_started);
+            (
+                groups.into_entries(),
+                rows,
+                batches,
+                left_scan_nanos,
+                elapsed_optional_nanos(aggregate_started),
+            )
+        };
+
+    let finish_started = profile.then(Instant::now);
+    let mut group_results = groups
+        .into_iter()
+        .map(|((bucket, class_id), (count, sum))| GroupAggregateResult {
+            keys: vec![
+                GroupValue::Int64(bucket),
+                GroupValue::Utf8(Some(
+                    right_values[class_id]
+                        .as_deref()
+                        .unwrap_or(fallback)
+                        .to_string(),
+                )),
+            ],
+            values: vec![
+                AggregateResult {
+                    expr: AggregateExpr::CountStar,
+                    value: AggregateValue::Count(count),
+                },
+                AggregateResult {
+                    expr: AggregateExpr::Sum(sum_column.clone()),
+                    value: AggregateValue::Int64(Some(sum)),
+                },
+            ],
+        })
+        .collect::<Vec<_>>();
+    group_results.sort_by(|left, right| compare_join_fused_group_keys(&left.keys, &right.keys));
+    let metrics = AggregateMetrics {
+        fragments: 2,
+        batches,
+        rows,
+        groups: group_results,
+        ..AggregateMetrics::default()
+    };
+    let mut output = aggregate_metrics_to_batches(&metrics, &query.group_by, &query.aggregates)?;
+    output = apply_output_order_limit(output, query.order_by.as_ref(), query.limit, query.offset)?;
+    output = rename_output_batches(output, &query.aliases)?;
+    let finish_nanos = elapsed_optional_nanos(finish_started);
+    if profile {
+        eprintln!(
+            "[dodam:join-fusion-profile] total={:.3}ms right_scan={:.3}ms right_lookup={:.3}ms left_scan={:.3}ms aggregate={:.3}ms finish={:.3}ms left_batches={} right_batches={} left_rows={} groups={}",
+            sql_nanos_to_millis(elapsed_optional_nanos(total_started)),
+            sql_nanos_to_millis(right_scan_nanos),
+            sql_nanos_to_millis(right_lookup_nanos),
+            sql_nanos_to_millis(left_scan_nanos),
+            sql_nanos_to_millis(aggregate_nanos),
+            sql_nanos_to_millis(finish_nanos),
+            batches,
+            right_batches.len(),
+            rows,
+            metrics.groups.len(),
+        );
+    }
+    trace_join_coalesce_fusion("accept", "unique right-key coalesce count/sum aggregate");
+    Ok(Some(QueryOutput::Aggregate {
+        metrics,
+        batches: output,
+    }))
+}
+
+fn join_profile_enabled_sql() -> bool {
+    std::env::var("DODAM_JOIN_PROFILE").is_ok_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn elapsed_optional_nanos(started: Option<Instant>) -> u64 {
+    started
+        .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
+fn join_coalesce_count_sum_fusion_enabled() -> bool {
+    !std::env::var("DODAM_DISABLE_JOIN_COALESCE_COUNT_SUM_FUSION")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn trace_join_coalesce_fusion(decision: &str, reason: &str) {
+    if std::env::var("DODAM_OPTIMIZER_TRACE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        eprintln!(
+            "[dodam:optimizer] rule=join_coalesce_count_sum_fusion decision={} reason=\"{}\"",
+            decision, reason
+        );
+    }
+}
+
+async fn scan_join_side_batches(
+    engine: &DodamEngine,
+    table: &SqlTableRef,
+    batch_size: usize,
+    filter: Option<&FilterExpr>,
+    projection: Projection,
+) -> Result<Vec<RecordBatch>> {
+    let stream = engine
+        .scan_parquet_batches(
+            table.path.clone(),
+            batch_size,
+            None,
+            projection,
+            filter.cloned(),
+        )
+        .await?;
+    collect_batches(stream)
+}
+
+struct DirectJoinCoalesceLeftAggregate {
+    groups: FastHashMap<(Option<i64>, usize), (u64, i64)>,
+    rows: usize,
+    batches: usize,
+    aggregate_nanos: u64,
+}
+
+enum JoinCoalesceGroupAccumulator {
+    Small(Vec<((Option<i64>, usize), (u64, i64))>),
+    Hash(FastHashMap<(Option<i64>, usize), (u64, i64)>),
+}
+
+impl JoinCoalesceGroupAccumulator {
+    const SMALL_LIMIT: usize = 64;
+
+    fn new() -> Self {
+        Self::Small(Vec::new())
+    }
+
+    fn update(&mut self, bucket: Option<i64>, class_id: usize, sum: Option<i64>) {
+        match self {
+            Self::Small(groups) => {
+                if let Some((_, value)) =
+                    groups
+                        .iter_mut()
+                        .find(|((existing_bucket, existing_class_id), _)| {
+                            *existing_bucket == bucket && *existing_class_id == class_id
+                        })
+                {
+                    update_join_coalesce_group_value(value, sum);
+                    return;
+                }
+                if groups.len() < Self::SMALL_LIMIT {
+                    let mut value = (0, 0);
+                    update_join_coalesce_group_value(&mut value, sum);
+                    groups.push(((bucket, class_id), value));
+                    return;
+                }
+                let mut hash = groups.drain(..).collect::<FastHashMap<_, _>>();
+                let entry = hash.entry((bucket, class_id)).or_insert((0, 0));
+                update_join_coalesce_group_value(entry, sum);
+                *self = Self::Hash(hash);
+            }
+            Self::Hash(groups) => {
+                let entry = groups.entry((bucket, class_id)).or_insert((0, 0));
+                update_join_coalesce_group_value(entry, sum);
+            }
+        }
+    }
+
+    fn into_entries(self) -> Vec<((Option<i64>, usize), (u64, i64))> {
+        match self {
+            Self::Small(groups) => groups,
+            Self::Hash(groups) => groups.into_iter().collect(),
+        }
+    }
+}
+
+fn update_join_coalesce_group_value(value: &mut (u64, i64), sum: Option<i64>) {
+    value.0 = value.0.saturating_add(1);
+    if let Some(sum) = sum {
+        value.1 = value.1.saturating_add(sum);
+    }
+}
+
+enum DirectI64Filter {
+    All,
+    None,
+    In(FastHashSet<i64>),
+}
+
+impl DirectI64Filter {
+    fn matches(&self, value: &DirectI64ishVector<'_>, row: usize) -> bool {
+        match self {
+            Self::All => true,
+            Self::None => false,
+            Self::In(values) => !value.is_null(row) && values.contains(&value.value(row)),
+        }
+    }
+}
+
+enum DirectI64ishVector<'a> {
+    I64(I64VectorView<'a>),
+    I32(I32VectorView<'a>),
+}
+
+impl<'a> DirectI64ishVector<'a> {
+    fn from_batch(batch: BatchView<'a>, index: usize) -> Option<Self> {
+        batch
+            .i64_vector(index)
+            .map(Self::I64)
+            .or_else(|| batch.i32_vector(index).map(Self::I32))
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::I64(values) => values.len(),
+            Self::I32(values) => values.len(),
+        }
+    }
+
+    fn is_null(&self, row: usize) -> bool {
+        match self {
+            Self::I64(values) => values.is_null(row),
+            Self::I32(values) => values.is_null(row),
+        }
+    }
+
+    fn value(&self, row: usize) -> i64 {
+        match self {
+            Self::I64(values) => values.value(row),
+            Self::I32(values) => i64::from(values.value(row)),
+        }
+    }
+}
+
+fn try_direct_join_coalesce_left_aggregate(
+    engine: &DodamEngine,
+    path: &Path,
+    batch_size: usize,
+    filter: Option<&FilterExpr>,
+    key_column: &str,
+    group_column: &str,
+    sum_column: &str,
+    right_lookup: &FastHashMap<i64, usize>,
+) -> Result<Option<DirectJoinCoalesceLeftAggregate>> {
+    if !direct_join_coalesce_left_aggregate_enabled() {
+        return Ok(None);
+    }
+    let Some(filter) = direct_join_left_i64_filter(filter, group_column)? else {
+        return Ok(None);
+    };
+    let row_groups = (0..engine.parquet_row_group_count(path)?).collect::<Vec<_>>();
+    let candidates = [
+        [
+            DirectPrimitiveColumnType::I64,
+            DirectPrimitiveColumnType::I64,
+            DirectPrimitiveColumnType::I64,
+        ],
+        [
+            DirectPrimitiveColumnType::I64,
+            DirectPrimitiveColumnType::I32,
+            DirectPrimitiveColumnType::I64,
+        ],
+        [
+            DirectPrimitiveColumnType::I32,
+            DirectPrimitiveColumnType::I64,
+            DirectPrimitiveColumnType::I64,
+        ],
+        [
+            DirectPrimitiveColumnType::I32,
+            DirectPrimitiveColumnType::I32,
+            DirectPrimitiveColumnType::I64,
+        ],
+        [
+            DirectPrimitiveColumnType::I64,
+            DirectPrimitiveColumnType::I64,
+            DirectPrimitiveColumnType::I32,
+        ],
+        [
+            DirectPrimitiveColumnType::I64,
+            DirectPrimitiveColumnType::I32,
+            DirectPrimitiveColumnType::I32,
+        ],
+        [
+            DirectPrimitiveColumnType::I32,
+            DirectPrimitiveColumnType::I64,
+            DirectPrimitiveColumnType::I32,
+        ],
+        [
+            DirectPrimitiveColumnType::I32,
+            DirectPrimitiveColumnType::I32,
+            DirectPrimitiveColumnType::I32,
+        ],
+    ];
+    for [key_type, group_type, sum_type] in candidates {
+        let specs = [
+            DirectPrimitiveColumnSpec {
+                name: key_column,
+                column_type: key_type,
+            },
+            DirectPrimitiveColumnSpec {
+                name: group_column,
+                column_type: group_type,
+            },
+            DirectPrimitiveColumnSpec {
+                name: sum_column,
+                column_type: sum_type,
+            },
+        ];
+        let mut groups = FastHashMap::<(Option<i64>, usize), (u64, i64)>::default();
+        let mut rows = 0usize;
+        let scanned = engine.scan_parquet_primitive_columns_view(
+            path,
+            batch_size,
+            &row_groups,
+            &specs,
+            |batch| {
+                let Some(key) = DirectI64ishVector::from_batch(batch, 0) else {
+                    return Err(DodamError::UnsupportedSql(
+                        "direct join fusion key column is not i64-like".to_string(),
+                    ));
+                };
+                let Some(group) = DirectI64ishVector::from_batch(batch, 1) else {
+                    return Err(DodamError::UnsupportedSql(
+                        "direct join fusion group column is not i64-like".to_string(),
+                    ));
+                };
+                let Some(sum) = DirectI64ishVector::from_batch(batch, 2) else {
+                    return Err(DodamError::UnsupportedSql(
+                        "direct join fusion sum column is not i64-like".to_string(),
+                    ));
+                };
+                for row in 0..key.len() {
+                    if !filter.matches(&group, row) {
+                        continue;
+                    }
+                    rows = rows.saturating_add(1);
+                    if key.is_null(row) {
+                        continue;
+                    }
+                    let Some(&class_id) = right_lookup.get(&key.value(row)) else {
+                        continue;
+                    };
+                    let entry = groups
+                        .entry(((!group.is_null(row)).then(|| group.value(row)), class_id))
+                        .or_insert((0, 0));
+                    entry.0 = entry.0.saturating_add(1);
+                    if !sum.is_null(row) {
+                        entry.1 = entry.1.saturating_add(sum.value(row));
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        if let Some(metrics) = scanned {
+            trace_join_coalesce_fusion(
+                "accept-direct-left",
+                &format!(
+                    "types={key_type:?}/{group_type:?}/{sum_type:?} rows={} batches={}",
+                    rows, metrics.batches
+                ),
+            );
+            return Ok(Some(DirectJoinCoalesceLeftAggregate {
+                groups,
+                rows,
+                batches: metrics.batches,
+                aggregate_nanos: metrics.consume_nanos,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn direct_join_coalesce_left_aggregate_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_DIRECT_JOIN_COALESCE_LEFT_AGGREGATE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn direct_join_left_i64_filter(
+    filter: Option<&FilterExpr>,
+    group_column: &str,
+) -> Result<Option<DirectI64Filter>> {
+    let Some(filter) = filter else {
+        return Ok(Some(DirectI64Filter::All));
+    };
+    match filter.expr() {
+        Expr::Boolean(Some(true)) => Ok(Some(DirectI64Filter::All)),
+        Expr::Boolean(Some(false) | None) => Ok(Some(DirectI64Filter::None)),
+        Expr::InList {
+            column,
+            values,
+            negated: false,
+            has_null: false,
+        } if column == group_column => {
+            let mut set = FastHashSet::default();
+            for value in values {
+                set.insert(value.as_i64(column)?);
+            }
+            Ok(Some(DirectI64Filter::In(set)))
+        }
+        _ => Ok(None),
+    }
+}
+
+struct UniqueI64ToUtf8IdLookup {
+    lookup: FastHashMap<i64, usize>,
+    values: Vec<Option<String>>,
+}
+
+fn build_unique_i64_to_utf8_id_lookup(
+    batches: &[RecordBatch],
+    key_column: &str,
+    value_column: &str,
+) -> Result<Option<UniqueI64ToUtf8IdLookup>> {
+    let mut lookup = FastHashMap::default();
+    let mut value_ids = FastHashMap::<Option<String>, usize>::default();
+    let mut values = Vec::<Option<String>>::new();
+    for batch in batches {
+        let key = i64_array_like(batch, key_column)?;
+        let value = string_array(batch, value_column)?;
+        for row in 0..batch.num_rows() {
+            if key.is_null(row) {
+                continue;
+            }
+            let payload = (!value.is_null(row)).then(|| value.value(row).to_string());
+            let value_id = if let Some(value_id) = value_ids.get(&payload).copied() {
+                value_id
+            } else {
+                let value_id = values.len();
+                values.push(payload.clone());
+                value_ids.insert(payload, value_id);
+                value_id
+            };
+            if lookup.insert(key.value(row), value_id).is_some() {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(UniqueI64ToUtf8IdLookup { lookup, values }))
+}
+
+fn i64_array_like<'a>(batch: &'a RecordBatch, column: &str) -> Result<I64LikeColumn<'a>> {
+    let index = batch_column_index(batch, column)?;
+    let array = batch.column(index);
+    match array.data_type() {
+        DataType::Int32 => Ok(I64LikeColumn::Int32(
+            array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("Int32 data type"),
+        )),
+        DataType::Int64 => Ok(I64LikeColumn::Int64(
+            array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 data type"),
+        )),
+        other => Err(DodamError::UnsupportedSql(format!(
+            "join aggregate fusion requires integer column {column}, got {other:?}"
+        ))),
+    }
+}
+
+enum I64LikeColumn<'a> {
+    Int32(&'a Int32Array),
+    Int64(&'a Int64Array),
+}
+
+impl I64LikeColumn<'_> {
+    fn is_null(&self, row: usize) -> bool {
+        match self {
+            Self::Int32(values) => values.is_null(row),
+            Self::Int64(values) => values.is_null(row),
+        }
+    }
+
+    fn value(&self, row: usize) -> i64 {
+        match self {
+            Self::Int32(values) => i64::from(values.value(row)),
+            Self::Int64(values) => values.value(row),
+        }
+    }
+}
+
+fn string_array<'a>(batch: &'a RecordBatch, column: &str) -> Result<&'a StringArray> {
+    let index = batch_column_index(batch, column)?;
+    batch
+        .column(index)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| DodamError::UnsupportedSql(format!("{column} must be Utf8")))
+}
+
+fn unique_columns(columns: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut output = Vec::new();
+    for column in columns {
+        add_column_once(&mut output, column);
+    }
+    output
+}
+
+fn join_column_belongs_to(column: &str, alias: &str) -> bool {
+    column
+        .strip_prefix(alias)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .is_some()
+}
+
+fn compare_join_fused_group_keys(left: &[GroupValue], right: &[GroupValue]) -> std::cmp::Ordering {
+    for (left, right) in left.iter().zip(right.iter()) {
+        let ordering = match (left, right) {
+            (GroupValue::Int64(left), GroupValue::Int64(right)) => left.cmp(right),
+            (GroupValue::Utf8(left), GroupValue::Utf8(right)) => left.cmp(right),
+            _ => std::cmp::Ordering::Equal,
+        };
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    left.len().cmp(&right.len())
 }
 
 fn same_join_column(left: &str, right: &str) -> bool {
@@ -40437,6 +41284,131 @@ fn collect_aggregates_with_optional_expression_views(
     let metrics = collect_grouped_aggregates(stream, fragments, group_by, aggregates)?;
     generic_profile_elapsed("aggregate grouped append/fold", started);
     Ok(metrics)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn try_collect_expression_aggregate_scan_fold(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    projection: Projection,
+    filter: Option<FilterExpr>,
+    group_by: &[String],
+    aggregates: &[AggregateExpr],
+    expressions: &[ProjectionExpression],
+) -> Result<Option<AggregateMetrics>> {
+    if !expression_aggregate_scan_fold_enabled() {
+        return Ok(None);
+    }
+    let Some(group_keys) = group_key_exprs_for_aggregate(group_by, aggregates, expressions) else {
+        return Ok(None);
+    };
+    let Some(collector) = CoalesceKeyCountSumCollector::new(&group_keys, aggregates) else {
+        return Ok(None);
+    };
+    let mut projection = projection;
+    if let Some(filter) = filter.as_ref() {
+        add_projection_columns(&mut projection, filter.referenced_columns());
+    }
+    let aggregates = aggregates.to_vec();
+    let collector = engine
+        .scan_parquet_batches_fold(
+            path,
+            batch_size,
+            None,
+            projection,
+            filter,
+            collector,
+            |batch, collector| collector.consume_batch(batch),
+            Ok,
+        )
+        .await?;
+    Ok(Some(CoalesceKeyCountSumCollector::merge_partials(
+        vec![collector],
+        1,
+        &aggregates,
+    )?))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn try_collect_expression_aggregate_row_group_map(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    projection: Projection,
+    filter: Option<FilterExpr>,
+    group_by: &[String],
+    aggregates: &[AggregateExpr],
+    expressions: &[ProjectionExpression],
+) -> Result<Option<AggregateMetrics>> {
+    if !expression_aggregate_row_group_map_enabled() {
+        return Ok(None);
+    }
+    let Some(group_keys) = group_key_exprs_for_aggregate(group_by, aggregates, expressions) else {
+        return Ok(None);
+    };
+    let mut projection = projection;
+    if let Some(filter) = filter.as_ref() {
+        add_projection_columns(&mut projection, filter.referenced_columns());
+    }
+    let aggregates = aggregates.to_vec();
+    let group_keys_for_state = group_keys.clone();
+    let aggregates_for_state = aggregates.clone();
+    let Some(partials) = engine
+        .parquet_row_group_map_pruned(
+            path,
+            batch_size,
+            projection,
+            Vec::new(),
+            expression_aggregate_row_group_map_chunk(),
+            move || {
+                CoalesceKeyCountSumCollector::new(&group_keys_for_state, &aggregates_for_state)
+                    .expect("expression aggregate row-group map precondition")
+            },
+            {
+                let filter = filter.clone();
+                move |batch, collector: &mut CoalesceKeyCountSumCollector| {
+                    let batch = if let Some(filter) = filter.as_ref() {
+                        filter_batch(batch, filter)?
+                    } else {
+                        batch
+                    };
+                    if batch.num_rows() > 0 {
+                        collector.consume_batch(&batch)?;
+                    }
+                    Ok(Some(()))
+                }
+            },
+            |collector| Ok(Some(collector)),
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(CoalesceKeyCountSumCollector::merge_partials(
+        partials,
+        1,
+        &aggregates,
+    )?))
+}
+
+fn expression_aggregate_row_group_map_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_EXPRESSION_AGG_ROW_GROUP_MAP")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn expression_aggregate_scan_fold_enabled() -> bool {
+    std::env::var("DODAM_DISABLE_EXPRESSION_AGG_SCAN_FOLD")
+        .map(|value| !matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(true)
+}
+
+fn expression_aggregate_row_group_map_chunk() -> usize {
+    std::env::var("DODAM_EXPRESSION_AGG_ROW_GROUP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(scan_aggregate_row_group_chunk)
 }
 
 fn generic_profile_start() -> Option<Instant> {

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float64Array, Int32Array,
-    Int64Array, ListArray, StringArray, StructArray, TimestampMillisecondArray,
+    Int64Array, ListArray, StringArray, StructArray, TimestampMillisecondArray, UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Int32Type, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -12,6 +12,7 @@ use dodam::catalog::{
 };
 use dodam::engine::DodamEngine;
 use dodam::execution::{AggregateExpr, AggregateValue, FilterExpr, Projection, SortExpr};
+use dodam::plan::{DirectPrimitiveFoldMode, PhysicalExecutionConfig, PhysicalPlanNode};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
@@ -40,6 +41,202 @@ async fn rejects_non_parquet_table_scan_source_for_parquet_scan() {
     };
 
     assert!(error.to_string().contains("unsupported storage format"));
+}
+
+#[tokio::test]
+async fn direct_primitive_fold_exec_runs_count_sum() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let path = tempdir.path().join("group.parquet");
+    write_group_fast_path_parquet(&path);
+
+    let plan = PhysicalPlanNode::new("DirectPrimitiveFoldExec").execution(
+        PhysicalExecutionConfig::DirectPrimitiveFold {
+            path: path.clone(),
+            batch_size: 2,
+            row_groups: vec![0, 1],
+            columns: vec![
+                ("bucket".to_string(), "i32".to_string()),
+                ("value".to_string(), "i64".to_string()),
+            ],
+            mode: DirectPrimitiveFoldMode::SingleKeyCountSum {
+                group_by: "bucket".to_string(),
+                key_type: "i32".to_string(),
+                count: AggregateExpr::CountStar,
+                sum: AggregateExpr::Sum("value".to_string()),
+            },
+        },
+    );
+
+    let mut stream = DodamEngine::default()
+        .build_physical_plan_node(plan)
+        .expect("physical plan")
+        .execute()
+        .expect("execute");
+    let batch = stream
+        .next()
+        .expect("output batch")
+        .expect("output batch ok");
+    assert!(stream.next().is_none());
+    let buckets = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("bucket output");
+    let counts = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("count output");
+    let sums = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("sum output");
+    assert_eq!(buckets.values(), &[1, 2]);
+    assert_eq!(counts.values(), &[2, 3]);
+    assert_eq!(sums.values(), &[30, 45]);
+}
+
+#[tokio::test]
+async fn direct_primitive_fold_exec_runs_count_column_sum() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let path = tempdir.path().join("group.parquet");
+    write_group_fast_path_parquet(&path);
+
+    let plan = PhysicalPlanNode::new("DirectPrimitiveFoldExec").execution(
+        PhysicalExecutionConfig::DirectPrimitiveFold {
+            path: path.clone(),
+            batch_size: 2,
+            row_groups: vec![0, 1],
+            columns: vec![
+                ("bucket".to_string(), "i32".to_string()),
+                ("value".to_string(), "i64".to_string()),
+            ],
+            mode: DirectPrimitiveFoldMode::SingleKeyCountSum {
+                group_by: "bucket".to_string(),
+                key_type: "i32".to_string(),
+                count: AggregateExpr::Count("value".to_string()),
+                sum: AggregateExpr::Sum("value".to_string()),
+            },
+        },
+    );
+
+    let mut stream = DodamEngine::default()
+        .build_physical_plan_node(plan)
+        .expect("physical plan")
+        .execute()
+        .expect("execute");
+    let batch = stream.next().expect("batch").expect("batch result");
+    let bucket = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("bucket");
+    let count = numeric_count_values(batch.column(1));
+    let sum = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("sum");
+
+    assert_eq!(bucket.values(), &[1, 2]);
+    assert_eq!(count, vec![2, 3]);
+    assert_eq!(sum.values(), &[30, 45]);
+}
+
+fn numeric_count_values(array: &arrow::array::ArrayRef) -> Vec<u64> {
+    if let Some(values) = array.as_any().downcast_ref::<UInt64Array>() {
+        return values.values().to_vec();
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
+        return values
+            .values()
+            .iter()
+            .map(|value| u64::try_from(*value).expect("non-negative count"))
+            .collect();
+    }
+    panic!(
+        "count output must be UInt64 or Int64, got {:?}",
+        array.data_type()
+    );
+}
+
+#[tokio::test]
+async fn direct_primitive_fold_exec_runs_count_sum_min_max() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let path = tempdir.path().join("minmax.parquet");
+    write_direct_minmax_parquet(&path);
+
+    let plan = PhysicalPlanNode::new("DirectPrimitiveFoldExec").execution(
+        PhysicalExecutionConfig::DirectPrimitiveFold {
+            path: path.clone(),
+            batch_size: 3,
+            row_groups: vec![0, 1],
+            columns: vec![
+                ("bucket".to_string(), "i32".to_string()),
+                ("value".to_string(), "i64".to_string()),
+                ("amount".to_string(), "decimal128_i64_raw:15:2".to_string()),
+                ("event_date".to_string(), "date32".to_string()),
+            ],
+            mode: DirectPrimitiveFoldMode::SingleKeyCountSumMinMax {
+                group_by: "bucket".to_string(),
+                key_type: "i32".to_string(),
+                aggregates: vec![
+                    AggregateExpr::CountStar,
+                    AggregateExpr::Sum("value".to_string()),
+                    AggregateExpr::Min("amount".to_string()),
+                    AggregateExpr::Max("event_date".to_string()),
+                ],
+                decimal_precision: 15,
+                decimal_scale: 2,
+                decimal_min: Some(1_000),
+                decimal_max: Some(4_000),
+                date_min: Some(10),
+                date_max: Some(30),
+            },
+        },
+    );
+
+    let mut stream = DodamEngine::default()
+        .build_physical_plan_node(plan)
+        .expect("physical plan")
+        .execute()
+        .expect("execute");
+    let batch = stream
+        .next()
+        .expect("output batch")
+        .expect("output batch ok");
+    assert!(stream.next().is_none());
+    let buckets = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("bucket output");
+    let counts = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("count output");
+    let sums = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("sum output");
+    let min_amounts = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("min amount output");
+    let max_dates = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .expect("max date output");
+    assert_eq!(buckets.values(), &[1, 2]);
+    assert_eq!(counts.values(), &[2, 2]);
+    assert_eq!(sums.values(), &[30, 20]);
+    assert_eq!(min_amounts.values(), &[1_000, 2_500]);
+    assert_eq!(max_dates.values(), &[20, 25]);
 }
 
 #[tokio::test]
@@ -1410,6 +1607,39 @@ fn write_group_fast_path_parquet(path: &std::path::Path) {
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(buckets), Arc::new(values), Arc::new(payloads)],
+    )
+    .expect("record batch");
+
+    let file = File::create(path).expect("create parquet file");
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(3))
+        .build();
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props)).expect("parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+}
+
+fn write_direct_minmax_parquet(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("bucket", DataType::Int32, false),
+        Field::new("value", DataType::Int64, false),
+        Field::new("amount", DataType::Decimal128(15, 2), false),
+        Field::new("event_date", DataType::Date32, false),
+    ]));
+    let buckets = Int32Array::from_iter_values([1, 1, 1, 2, 2, 2]);
+    let values = Int64Array::from_iter_values([10, 20, 30, 5, 15, 25]);
+    let amounts = Decimal128Array::from_iter_values([1_000, 2_000, 5_000, 2_500, 3_500, 4_500])
+        .with_precision_and_scale(15, 2)
+        .expect("decimal scale");
+    let dates = Date32Array::from_iter_values([10, 20, 40, 15, 25, 35]);
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(buckets),
+            Arc::new(values),
+            Arc::new(amounts),
+            Arc::new(dates),
+        ],
     )
     .expect("record batch");
 

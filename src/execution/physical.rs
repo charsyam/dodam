@@ -10,15 +10,15 @@ use std::time::{Duration, Instant};
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Date64Array, Decimal128Array,
-    Float64Array, Float64Builder, Int32Array, Int32Builder, Int64Array, Int64Builder, Scalar,
-    StringArray, StringBuilder, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray, UInt32Array, UInt32Builder, UInt64Array,
-    UInt64Builder, new_null_array,
+    DictionaryArray, Float64Array, Float64Builder, Int32Array, Int32Builder, Int64Array,
+    Int64Builder, Scalar, StringArray, StringBuilder, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt32Array,
+    UInt32Builder, UInt64Array, UInt64Builder, new_null_array,
 };
 use arrow::compute::filter_record_batch;
 use arrow::compute::kernels::boolean::{and_kleene, is_not_null, is_null, not, or_kleene};
 use arrow::compute::kernels::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::datatypes::{DataType, Field, Int32Type, Schema, TimeUnit};
 use arrow::ipc::reader::FileReader as IpcFileReader;
 use arrow::ipc::writer::FileWriter as IpcFileWriter;
 use arrow::record_batch::RecordBatch;
@@ -31,20 +31,24 @@ use memchr::memmem::Finder;
 use crate::catalog::{FileFragment, StorageFormat};
 use crate::error::{DodamError, Result};
 use crate::execution::logical::{
-    AggregateExpr, ComparisonExpr, ComparisonOp, Expr, FilterExpr, PhysicalPlan, Projection,
-    SortExpr, SortKey,
+    AggregateExpr, AggregateMetrics, ComparisonExpr, ComparisonOp, Expr, FilterExpr, PhysicalPlan,
+    Projection, SortExpr, SortKey,
 };
 use crate::execution::metrics::{
     RecordBatchSink, ScanMetrics, ScanPlanMetrics, ScanPlanMetricsCounter, SendableBatchStream,
 };
 use crate::execution::{
+    DecimalDateRangeFilter, SingleKeyCountSumMinMaxVectorState, SingleKeyCountSumVectorState,
     aggregate_metrics_to_batches, collect_aggregates, collect_grouped_aggregates,
 };
 use crate::hash::{FastHashMap as JoinKeyHashMap, FastHashSet as JoinKeyHashSet};
+use crate::plan::DirectPrimitiveFoldMode;
 use crate::storage::{
-    ObjectStore, ParquetBatchReader, ParquetFileCache, ParquetMetadataCache, ParquetScanTask,
-    plan_parquet_scan_tasks,
+    DirectPrimitiveColumnSpec, DirectPrimitiveColumnType, ObjectStore, ParquetBatchReader,
+    ParquetFileCache, ParquetMetadataCache, ParquetScanTask, plan_parquet_scan_tasks,
+    scan_parquet_primitive_columns_with_store,
 };
+use crate::vector::BatchView;
 
 pub struct ScanExec {
     fragments: Vec<FileFragment>,
@@ -72,6 +76,16 @@ pub struct FinalMergeExec {
     input: Box<dyn PhysicalPlan>,
     group_by: Vec<String>,
     aggregates: Vec<AggregateExpr>,
+}
+
+pub struct DirectPrimitiveFoldExec {
+    path: PathBuf,
+    batch_size: usize,
+    row_groups: Vec<usize>,
+    columns: Vec<(String, String)>,
+    mode: DirectPrimitiveFoldMode,
+    file_cache: Arc<ParquetFileCache>,
+    object_store: Arc<dyn ObjectStore>,
 }
 
 impl MemoryExec {
@@ -131,6 +145,317 @@ impl PhysicalPlan for FinalMergeExec {
         Ok(SendableBatchStream::from_batches(
             aggregate_metrics_to_batches(&metrics, &self.group_by, &self.aggregates)?,
         ))
+    }
+}
+
+impl DirectPrimitiveFoldExec {
+    pub fn new(
+        path: PathBuf,
+        batch_size: usize,
+        row_groups: Vec<usize>,
+        columns: Vec<(String, String)>,
+        mode: DirectPrimitiveFoldMode,
+        file_cache: Arc<ParquetFileCache>,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> Self {
+        Self {
+            path,
+            batch_size,
+            row_groups,
+            columns,
+            mode,
+            file_cache,
+            object_store,
+        }
+    }
+}
+
+impl PhysicalPlan for DirectPrimitiveFoldExec {
+    fn execute(self: Box<Self>) -> Result<SendableBatchStream> {
+        let (group_by, aggregates) = self.output_shape();
+        let metrics = self.execute_metrics()?;
+        let batches = aggregate_metrics_to_batches(&metrics, &group_by, &aggregates)?;
+        Ok(SendableBatchStream::from_batches(batches))
+    }
+}
+
+impl DirectPrimitiveFoldExec {
+    fn output_shape(&self) -> (Vec<String>, Vec<AggregateExpr>) {
+        match &self.mode {
+            DirectPrimitiveFoldMode::SingleKeyCountSum {
+                group_by,
+                count,
+                sum,
+                ..
+            } => (vec![group_by.clone()], vec![count.clone(), sum.clone()]),
+            DirectPrimitiveFoldMode::SingleKeyCountSumMinMax {
+                group_by,
+                aggregates,
+                ..
+            } => (vec![group_by.clone()], aggregates.clone()),
+        }
+    }
+
+    pub(crate) fn execute_metrics(self) -> Result<AggregateMetrics> {
+        self.try_execute_metrics()?.ok_or_else(|| {
+            DodamError::UnsupportedSql(
+                "DirectPrimitiveFoldExec primitive scan contract was not satisfied".to_string(),
+            )
+        })
+    }
+
+    pub(crate) fn try_execute_metrics(self) -> Result<Option<AggregateMetrics>> {
+        let columns = self
+            .columns
+            .iter()
+            .map(|(name, column_type)| {
+                Ok((
+                    name.clone(),
+                    parse_direct_primitive_column_type(column_type)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        match self.mode {
+            DirectPrimitiveFoldMode::SingleKeyCountSum {
+                key_type,
+                count,
+                sum,
+                ..
+            } => {
+                let Some((state, scan_metrics)) = scan_direct_primitive_parallel_fold(
+                    self.path,
+                    self.batch_size,
+                    self.row_groups,
+                    columns,
+                    self.file_cache,
+                    self.object_store,
+                    || match key_type.as_str() {
+                        "i32" | "I32" | "int32" | "Int32" => Ok(
+                            SingleKeyCountSumVectorState::new_i32(count.clone(), sum.clone()),
+                        ),
+                        "i64" | "I64" | "int64" | "Int64" => Ok(
+                            SingleKeyCountSumVectorState::new_i64(count.clone(), sum.clone()),
+                        ),
+                        _ => Err(DodamError::UnsupportedSql(format!(
+                            "unsupported DirectPrimitiveFoldExec count/sum key type: {key_type}"
+                        ))),
+                    },
+                    |state, batch| match key_type.as_str() {
+                        "i32" | "I32" | "int32" | "Int32" => state.consume_i32_i64_batch(batch),
+                        "i64" | "I64" | "int64" | "Int64" => state.consume_i64_i64_batch(batch),
+                        _ => unreachable!("key type checked before scan"),
+                    },
+                    |state, partial| state.merge(partial),
+                )?
+                else {
+                    return Ok(None);
+                };
+                let mut metrics = state.finish();
+                metrics.fragments = 1;
+                metrics.batches = scan_metrics.batches;
+                metrics.rows = scan_metrics.rows;
+                Ok(Some(metrics))
+            }
+            DirectPrimitiveFoldMode::SingleKeyCountSumMinMax {
+                key_type,
+                aggregates,
+                decimal_precision,
+                decimal_scale,
+                decimal_min,
+                decimal_max,
+                date_min,
+                date_max,
+                ..
+            } => {
+                let filter = DecimalDateRangeFilter {
+                    decimal_min: decimal_min.map(i128::from),
+                    decimal_max: decimal_max.map(i128::from),
+                    date_min,
+                    date_max,
+                };
+                let Some((state, scan_metrics)) = scan_direct_primitive_parallel_fold(
+                    self.path,
+                    self.batch_size,
+                    self.row_groups,
+                    columns,
+                    self.file_cache,
+                    self.object_store,
+                    || match key_type.as_str() {
+                        "i32" | "I32" | "int32" | "Int32" => {
+                            Ok(SingleKeyCountSumMinMaxVectorState::new_i32(
+                                aggregates.clone(),
+                                decimal_precision,
+                                decimal_scale,
+                            ))
+                        }
+                        "i64" | "I64" | "int64" | "Int64" => {
+                            Ok(SingleKeyCountSumMinMaxVectorState::new_i64(
+                                aggregates.clone(),
+                                decimal_precision,
+                                decimal_scale,
+                            ))
+                        }
+                        _ => Err(DodamError::UnsupportedSql(format!(
+                            "unsupported DirectPrimitiveFoldExec count/sum/min/max key type: {key_type}"
+                        ))),
+                    },
+                    |state, batch| match key_type.as_str() {
+                        "i32" | "I32" | "int32" | "Int32" => {
+                            state.consume_i32_i64_decimal_date_batch(batch, &filter)
+                        }
+                        "i64" | "I64" | "int64" | "Int64" => {
+                            state.consume_i64_i64_decimal_date_batch(batch, &filter)
+                        }
+                        _ => unreachable!("key type checked before scan"),
+                    },
+                    |state, partial| state.merge(partial),
+                )?
+                else {
+                    return Ok(None);
+                };
+                let mut metrics = state.finish();
+                metrics.fragments = 1;
+                metrics.batches = scan_metrics.batches;
+                metrics.rows = scan_metrics.rows;
+                Ok(Some(metrics))
+            }
+        }
+    }
+}
+
+fn scan_direct_primitive_parallel_fold<S, Init, Consume, Merge>(
+    path: PathBuf,
+    batch_size: usize,
+    row_groups: Vec<usize>,
+    columns: Vec<(String, DirectPrimitiveColumnType)>,
+    file_cache: Arc<ParquetFileCache>,
+    object_store: Arc<dyn ObjectStore>,
+    init: Init,
+    consume: Consume,
+    merge: Merge,
+) -> Result<Option<(S, crate::storage::DirectPrimitiveColumnScanMetrics)>>
+where
+    S: Send,
+    Init: Fn() -> Result<S> + Sync,
+    Consume: for<'a> Fn(&mut S, BatchView<'a>) -> Result<()> + Sync,
+    Merge: Fn(&mut S, S) -> Result<()> + Sync,
+{
+    let mut state = init()?;
+    let mut scan_metrics = crate::storage::DirectPrimitiveColumnScanMetrics::default();
+    if row_groups.is_empty() {
+        return Ok(Some((state, scan_metrics)));
+    }
+    if row_groups.len() <= 1 {
+        let specs = borrowed_direct_primitive_specs(&columns);
+        let Some(metrics) = scan_parquet_primitive_columns_with_store(
+            &path,
+            batch_size,
+            &row_groups,
+            &specs,
+            file_cache,
+            object_store.as_ref(),
+            |columns| consume(&mut state, BatchView::from_raw_columns(columns)),
+        )?
+        else {
+            return Ok(None);
+        };
+        return Ok(Some((state, metrics)));
+    }
+
+    let workers = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .min(row_groups.len());
+    let chunk_size = row_groups.len().div_ceil(workers).max(1);
+    let (sender, receiver) = mpsc::channel();
+    std::thread::scope(|scope| {
+        for row_group_chunk in row_groups.chunks(chunk_size) {
+            let sender = sender.clone();
+            let path = path.clone();
+            let columns = columns.clone();
+            let row_groups = row_group_chunk.to_vec();
+            let file_cache = file_cache.clone();
+            let object_store = object_store.clone();
+            let init = &init;
+            let consume = &consume;
+            scope.spawn(move || {
+                let result: Result<Option<(S, crate::storage::DirectPrimitiveColumnScanMetrics)>> =
+                    (|| {
+                        let mut state = init()?;
+                        let specs = borrowed_direct_primitive_specs(&columns);
+                        let metrics = scan_parquet_primitive_columns_with_store(
+                            &path,
+                            batch_size,
+                            &row_groups,
+                            &specs,
+                            file_cache,
+                            object_store.as_ref(),
+                            |columns| consume(&mut state, BatchView::from_raw_columns(columns)),
+                        )?;
+                        Ok(metrics.map(|metrics| (state, metrics)))
+                    })();
+                let _ = sender.send(result);
+            });
+        }
+    });
+    drop(sender);
+
+    for received in receiver {
+        let Some((partial, metrics)) = received? else {
+            return Ok(None);
+        };
+        merge(&mut state, partial)?;
+        scan_metrics.merge_from(metrics);
+    }
+    Ok(Some((state, scan_metrics)))
+}
+
+fn borrowed_direct_primitive_specs(
+    columns: &[(String, DirectPrimitiveColumnType)],
+) -> Vec<DirectPrimitiveColumnSpec<'_>> {
+    columns
+        .iter()
+        .map(|(name, column_type)| DirectPrimitiveColumnSpec {
+            name: name.as_str(),
+            column_type: *column_type,
+        })
+        .collect()
+}
+
+fn parse_direct_primitive_column_type(input: &str) -> Result<DirectPrimitiveColumnType> {
+    match input {
+        "i64" | "I64" | "int64" | "Int64" => Ok(DirectPrimitiveColumnType::I64),
+        "i32" | "I32" | "int32" | "Int32" => Ok(DirectPrimitiveColumnType::I32),
+        "date32" | "Date32" => Ok(DirectPrimitiveColumnType::Date32),
+        input if input.starts_with("decimal128_i64_raw:") => {
+            let mut parts = input.split(':');
+            let _kind = parts.next();
+            let precision = parts
+                .next()
+                .and_then(|value| value.parse::<u8>().ok())
+                .ok_or_else(|| {
+                    DodamError::UnsupportedSql(format!(
+                        "invalid direct primitive decimal precision: {input}"
+                    ))
+                })?;
+            let scale = parts
+                .next()
+                .and_then(|value| value.parse::<i8>().ok())
+                .ok_or_else(|| {
+                    DodamError::UnsupportedSql(format!(
+                        "invalid direct primitive decimal scale: {input}"
+                    ))
+                })?;
+            if parts.next().is_some() {
+                return Err(DodamError::UnsupportedSql(format!(
+                    "invalid direct primitive decimal type: {input}"
+                )));
+            }
+            Ok(DirectPrimitiveColumnType::Decimal128Int64Raw { precision, scale })
+        }
+        _ => Err(DodamError::UnsupportedSql(format!(
+            "unsupported direct primitive column type: {input}"
+        ))),
     }
 }
 
@@ -1231,6 +1556,7 @@ impl PhysicalPlan for HashJoinExec {
                 matched_build: None,
                 emitted_unmatched_build: false,
                 probe_template: None,
+                profile_logged: false,
             }),
             metrics,
         ))
@@ -1505,6 +1831,7 @@ struct HashJoinStream {
     matched_build: Option<MatchedBuildTracker>,
     emitted_unmatched_build: bool,
     probe_template: Option<RecordBatch>,
+    profile_logged: bool,
 }
 
 impl Iterator for HashJoinStream {
@@ -1523,6 +1850,7 @@ impl Iterator for HashJoinStream {
                         Err(error) => return Some(Err(error)),
                     };
                     if left.is_empty() {
+                        self.log_profile_once();
                         return None;
                     }
                     let mode = if self.join_type == JoinType::Semi {
@@ -1544,6 +1872,7 @@ impl Iterator for HashJoinStream {
                         Err(error) => return Some(Err(error)),
                     };
                     if right.is_empty() {
+                        self.log_profile_once();
                         return None;
                     }
                     let mode = if self.join_type == JoinType::Semi {
@@ -1664,8 +1993,44 @@ impl Iterator for HashJoinStream {
             Err(error) => return Some(Err(error)),
         }
 
+        self.log_profile_once();
         None
     }
+}
+
+impl HashJoinStream {
+    fn log_profile_once(&mut self) {
+        if self.profile_logged || !join_profile_enabled() {
+            return;
+        }
+        self.profile_logged = true;
+        let metrics = self.metrics.snapshot();
+        eprintln!(
+            "[dodam:join-profile] build_rows={} probe_rows={} output_rows={} build={:.3}ms materialize={:.3}ms peak_build_bytes={} bloom_filtered={} spills={} spill_bytes={}",
+            metrics.join_build_rows,
+            metrics.join_probe_rows,
+            metrics.join_output_rows,
+            nanos_to_millis(metrics.join_build_nanos),
+            nanos_to_millis(metrics.join_materialize_nanos),
+            metrics.join_peak_build_bytes,
+            metrics.join_bloom_filtered_rows,
+            metrics.join_spill_files,
+            metrics.join_spill_bytes,
+        );
+    }
+}
+
+fn join_profile_enabled() -> bool {
+    std::env::var("DODAM_JOIN_PROFILE").is_ok_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn nanos_to_millis(nanos: u64) -> f64 {
+    nanos as f64 / 1_000_000.0
 }
 
 struct PartitionedHashJoinStream {
@@ -7764,6 +8129,34 @@ fn try_gather_build_column(
                 }
             }
             Ok(Some(Arc::new(builder.finish())))
+        }
+        DataType::Dictionary(key_type, value_type)
+            if matches!(
+                (&**key_type, &**value_type),
+                (DataType::Int32, DataType::Utf8)
+            ) =>
+        {
+            let arrays = build_column_arrays::<DictionaryArray<Int32Type>>(build, column_index)?;
+            if arrays.len() != 1 {
+                return Ok(None);
+            }
+            let array = arrays[0];
+            let mut builder = Int32Builder::with_capacity(refs.len());
+            for row_ref in refs {
+                if row_ref.batch != 0 {
+                    return Ok(None);
+                }
+                let row = row_ref.row as usize;
+                if array.is_null(row) {
+                    builder.append_null();
+                } else {
+                    builder.append_value(array.keys().value(row));
+                }
+            }
+            Ok(Some(Arc::new(DictionaryArray::new(
+                builder.finish(),
+                array.values().clone(),
+            ))))
         }
         DataType::Boolean => {
             let arrays = build_column_arrays::<BooleanArray>(build, column_index)?;

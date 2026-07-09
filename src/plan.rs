@@ -95,6 +95,7 @@ pub enum PhysicalOperator {
     Aggregate,
     LocalFold,
     FinalMerge,
+    DirectPrimitiveFold,
     HashJoin,
     PartitionedHashJoin,
     SortMergeJoin,
@@ -143,6 +144,13 @@ pub enum PhysicalExecutionConfig {
         group_by: Vec<String>,
         aggregates: Vec<AggregateExpr>,
     },
+    DirectPrimitiveFold {
+        path: std::path::PathBuf,
+        batch_size: usize,
+        row_groups: Vec<usize>,
+        columns: Vec<(String, String)>,
+        mode: DirectPrimitiveFoldMode,
+    },
     HashJoin {
         left_keys: Vec<String>,
         right_keys: Vec<String>,
@@ -167,6 +175,27 @@ pub enum PhysicalExecutionConfig {
         right_key: String,
         left_prefix: String,
         right_prefix: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DirectPrimitiveFoldMode {
+    SingleKeyCountSum {
+        group_by: String,
+        key_type: String,
+        count: AggregateExpr,
+        sum: AggregateExpr,
+    },
+    SingleKeyCountSumMinMax {
+        group_by: String,
+        key_type: String,
+        aggregates: Vec<AggregateExpr>,
+        decimal_precision: u8,
+        decimal_scale: i8,
+        decimal_min: Option<i64>,
+        decimal_max: Option<i64>,
+        date_min: Option<i32>,
+        date_max: Option<i32>,
     },
 }
 
@@ -931,6 +960,7 @@ impl PhysicalOperator {
             "AggregateExec" => Self::Aggregate,
             "LocalFoldExec" => Self::LocalFold,
             "FinalMergeExec" => Self::FinalMerge,
+            "DirectPrimitiveFoldExec" => Self::DirectPrimitiveFold,
             "JoinExec" => Self::HashJoin,
             "PartitionedHashJoinExec" => Self::PartitionedHashJoin,
             "SortMergeJoinExec" => Self::SortMergeJoin,
@@ -954,6 +984,7 @@ impl PhysicalOperator {
             Self::Aggregate => "AggregateExec",
             Self::LocalFold => "LocalFoldExec",
             Self::FinalMerge => "FinalMergeExec",
+            Self::DirectPrimitiveFold => "DirectPrimitiveFoldExec",
             Self::HashJoin => "JoinExec",
             Self::PartitionedHashJoin => "PartitionedHashJoinExec",
             Self::SortMergeJoin => "SortMergeJoinExec",
@@ -1008,6 +1039,8 @@ fn aggregate_exprs_display(aggregates: &[AggregateExpr]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     fn empty_scan() -> LogicalPlan {
@@ -1187,6 +1220,58 @@ mod tests {
                     partition: 3,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn direct_primitive_fold_node_preserves_execution_config() {
+        let node = PhysicalPlanNode::new("DirectPrimitiveFoldExec")
+            .attr("mode", "count_sum")
+            .execution(PhysicalExecutionConfig::DirectPrimitiveFold {
+                path: PathBuf::from("facts.parquet"),
+                batch_size: 16 * 1024,
+                row_groups: vec![0, 2, 4],
+                columns: vec![
+                    ("bucket".to_string(), "i32".to_string()),
+                    ("value".to_string(), "i64".to_string()),
+                ],
+                mode: DirectPrimitiveFoldMode::SingleKeyCountSum {
+                    group_by: "bucket".to_string(),
+                    key_type: "i32".to_string(),
+                    count: AggregateExpr::CountStar,
+                    sum: AggregateExpr::Sum("value".to_string()),
+                },
+            });
+
+        assert_eq!(node.operator(), &PhysicalOperator::DirectPrimitiveFold);
+        let Some(PhysicalExecutionConfig::DirectPrimitiveFold {
+            path,
+            batch_size,
+            row_groups,
+            columns,
+            mode,
+        }) = node.execution_config()
+        else {
+            panic!("direct primitive fold config");
+        };
+        assert_eq!(path, &PathBuf::from("facts.parquet"));
+        assert_eq!(*batch_size, 16 * 1024);
+        assert_eq!(row_groups, &vec![0, 2, 4]);
+        assert_eq!(
+            columns,
+            &vec![
+                ("bucket".to_string(), "i32".to_string()),
+                ("value".to_string(), "i64".to_string())
+            ]
+        );
+        assert_eq!(
+            mode,
+            &DirectPrimitiveFoldMode::SingleKeyCountSum {
+                group_by: "bucket".to_string(),
+                key_type: "i32".to_string(),
+                count: AggregateExpr::CountStar,
+                sum: AggregateExpr::Sum("value".to_string())
+            }
         );
     }
 

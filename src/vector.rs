@@ -22,7 +22,15 @@ enum BatchViewInner<'a> {
 #[derive(Clone, Copy)]
 pub(crate) enum RawColumnView<'a> {
     I64(&'a [i64]),
+    I64Nullable {
+        values: &'a [i64],
+        def_levels: &'a [i16],
+    },
     I32(&'a [i32]),
+    I32Nullable {
+        values: &'a [i32],
+        def_levels: &'a [i16],
+    },
     Date32(&'a [i32]),
     #[allow(dead_code)]
     Decimal128 {
@@ -55,6 +63,10 @@ pub(crate) enum DictionaryI32View<'a> {
 pub(crate) enum I64VectorView<'a> {
     Arrow(&'a Int64Array),
     Raw(&'a [i64]),
+    RawNullable {
+        values: &'a [i64],
+        def_levels: &'a [i16],
+    },
 }
 
 impl<'a> I64VectorView<'a> {
@@ -62,6 +74,7 @@ impl<'a> I64VectorView<'a> {
         match self {
             Self::Arrow(values) => values.len(),
             Self::Raw(values) => values.len(),
+            Self::RawNullable { def_levels, .. } => def_levels.len(),
         }
     }
 
@@ -69,6 +82,7 @@ impl<'a> I64VectorView<'a> {
         match self {
             Self::Arrow(values) => values.is_null(row),
             Self::Raw(_) => false,
+            Self::RawNullable { def_levels, .. } => def_levels[row] == 0,
         }
     }
 
@@ -76,6 +90,10 @@ impl<'a> I64VectorView<'a> {
         match self {
             Self::Arrow(values) => values.value(row),
             Self::Raw(values) => values[row],
+            Self::RawNullable { values, def_levels } => {
+                let value_index = nullable_value_index(def_levels, row);
+                values[value_index]
+            }
         }
     }
 
@@ -83,6 +101,14 @@ impl<'a> I64VectorView<'a> {
         match self {
             Self::Arrow(values) => (values.null_count() == 0).then(|| values.values().as_ref()),
             Self::Raw(values) => Some(values),
+            Self::RawNullable { .. } => None,
+        }
+    }
+
+    pub(crate) fn raw_nullable(&self) -> Option<(&'a [i64], &'a [i16])> {
+        match self {
+            Self::RawNullable { values, def_levels } => Some((values, def_levels)),
+            _ => None,
         }
     }
 }
@@ -91,13 +117,26 @@ impl<'a> I64VectorView<'a> {
 pub(crate) enum I32VectorView<'a> {
     Arrow(&'a Int32Array),
     Raw(&'a [i32]),
+    RawNullable {
+        values: &'a [i32],
+        def_levels: &'a [i16],
+    },
 }
 
 impl<'a> I32VectorView<'a> {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Arrow(values) => values.len(),
+            Self::Raw(values) => values.len(),
+            Self::RawNullable { def_levels, .. } => def_levels.len(),
+        }
+    }
+
     pub(crate) fn is_null(&self, row: usize) -> bool {
         match self {
             Self::Arrow(values) => values.is_null(row),
             Self::Raw(_) => false,
+            Self::RawNullable { def_levels, .. } => def_levels[row] == 0,
         }
     }
 
@@ -105,6 +144,10 @@ impl<'a> I32VectorView<'a> {
         match self {
             Self::Arrow(values) => values.value(row),
             Self::Raw(values) => values[row],
+            Self::RawNullable { values, def_levels } => {
+                let value_index = nullable_value_index(def_levels, row);
+                values[value_index]
+            }
         }
     }
 
@@ -112,6 +155,14 @@ impl<'a> I32VectorView<'a> {
         match self {
             Self::Arrow(values) => (values.null_count() == 0).then(|| values.values().as_ref()),
             Self::Raw(values) => Some(values),
+            Self::RawNullable { .. } => None,
+        }
+    }
+
+    pub(crate) fn raw_nullable(&self) -> Option<(&'a [i32], &'a [i16])> {
+        match self {
+            Self::RawNullable { values, def_levels } => Some((values, def_levels)),
+            _ => None,
         }
     }
 }
@@ -373,7 +424,13 @@ impl<'a> BatchView<'a> {
     pub(crate) fn i64_vector(&self, index: usize) -> Option<I64VectorView<'a>> {
         match self.inner {
             BatchViewInner::RecordBatch(_) => self.i64(index).map(I64VectorView::Arrow),
-            BatchViewInner::RawColumns(_) => self.raw_i64(index).map(I64VectorView::Raw),
+            BatchViewInner::RawColumns(_) => match self.raw_column(index)? {
+                RawColumnView::I64(values) => Some(I64VectorView::Raw(values)),
+                RawColumnView::I64Nullable { values, def_levels } => {
+                    Some(I64VectorView::RawNullable { values, def_levels })
+                }
+                _ => None,
+            },
         }
     }
 
@@ -392,6 +449,9 @@ impl<'a> BatchView<'a> {
             BatchViewInner::RecordBatch(_) => self.i32(index).map(I32VectorView::Arrow),
             BatchViewInner::RawColumns(_) => match self.raw_column(index)? {
                 RawColumnView::I32(values) => Some(I32VectorView::Raw(values)),
+                RawColumnView::I32Nullable { values, def_levels } => {
+                    Some(I32VectorView::RawNullable { values, def_levels })
+                }
                 _ => None,
             },
         }
@@ -476,12 +536,21 @@ impl RawColumnView<'_> {
     fn len(&self) -> usize {
         match self {
             Self::I64(values) => values.len(),
+            Self::I64Nullable { def_levels, .. } => def_levels.len(),
             Self::I32(values) | Self::Date32(values) => values.len(),
+            Self::I32Nullable { def_levels, .. } => def_levels.len(),
             Self::Decimal128 { values, .. } => values.len(),
             Self::Decimal128I64 { values, .. } => values.len(),
             Self::DictionaryI32 { keys, .. } => keys.len(),
         }
     }
+}
+
+fn nullable_value_index(def_levels: &[i16], row: usize) -> usize {
+    def_levels[..row]
+        .iter()
+        .filter(|level| **level != 0)
+        .count()
 }
 
 #[inline]
@@ -506,7 +575,7 @@ pub(crate) enum DictionaryStringValues<'a> {
     LargeUtf8(&'a LargeStringArray),
 }
 
-impl DictionaryStringValues<'_> {
+impl<'a> DictionaryStringValues<'a> {
     pub(crate) fn len(&self) -> usize {
         match self {
             Self::Utf8(values) => values.len(),
@@ -514,7 +583,7 @@ impl DictionaryStringValues<'_> {
         }
     }
 
-    pub(crate) fn value_bytes(&self, index: usize) -> &[u8] {
+    pub(crate) fn value_bytes(&self, index: usize) -> &'a [u8] {
         match self {
             Self::Utf8(values) => {
                 let offsets = values.value_offsets();

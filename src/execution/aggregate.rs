@@ -4,11 +4,11 @@ use std::sync::{Arc, mpsc};
 use std::time::Instant;
 
 use arrow::array::{
-    Array, ArrayRef, Date32Array, Date64Array, Decimal128Array, Float64Array, Int32Array,
-    Int64Array, StringArray, TimestampMillisecondArray, UInt64Array,
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Decimal128Array, DictionaryArray,
+    Float64Array, Int32Array, Int64Array, StringArray, TimestampMillisecondArray, UInt64Array,
 };
 use arrow::compute::kernels::aggregate::{max, max_string, min, min_string, sum};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::datatypes::{DataType, Field, Int32Type, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use arrow_row::{OwnedRow, RowConverter, SortField};
 
@@ -20,7 +20,8 @@ use crate::execution::logical::{
 use crate::execution::metrics::SendableBatchStream;
 use crate::execution::physical::column_index;
 use crate::hash::FastHashMap as AggregateHashMap;
-use crate::vector::BatchView;
+use crate::vector::dictionary_i32_string_values;
+use crate::vector::{BatchView, DictionaryStringValues, I32VectorView, I64VectorView};
 
 const SMALL_GROUP_LINEAR_LIMIT: usize = 8;
 const TWO_UTF8_SMALL_GROUP_LIMIT: usize = 8;
@@ -312,6 +313,103 @@ pub fn collect_grouped_aggregates_with_key_exprs(
     Ok(None)
 }
 
+pub(crate) struct CoalesceKeyCountSumCollector {
+    plan: CoalesceKeyCountSumPlan,
+    bound_plan: Option<BoundCoalesceKeyCountSumPlan>,
+    groups: Option<CoalesceKeyCountSumGroups>,
+    metrics: AggregateMetrics,
+    bind_nanos: u64,
+    reader_nanos: u64,
+    update_nanos: u64,
+}
+
+impl CoalesceKeyCountSumCollector {
+    pub(crate) fn new(group_keys: &[GroupKeyExpr], aggregates: &[AggregateExpr]) -> Option<Self> {
+        Some(Self {
+            plan: CoalesceKeyCountSumPlan::new(group_keys, aggregates)?,
+            bound_plan: None,
+            groups: None,
+            metrics: AggregateMetrics::default(),
+            bind_nanos: 0,
+            reader_nanos: 0,
+            update_nanos: 0,
+        })
+    }
+
+    pub(crate) fn consume_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        self.metrics.batches += 1;
+        self.metrics.rows += batch.num_rows();
+        let bound = match &self.bound_plan {
+            Some(bound) => bound,
+            None => {
+                let started = Instant::now();
+                self.bound_plan = Some(self.plan.bind(batch)?);
+                self.bind_nanos = self.bind_nanos.saturating_add(elapsed_nanos_u64(started));
+                self.bound_plan
+                    .as_ref()
+                    .expect("bound coalesce aggregate plan")
+            }
+        };
+        let first = batch.column(bound.first);
+        let second = bound.second.map(|index| batch.column(index));
+        let coalesce = batch.column(bound.coalesce);
+        let sum = batch.column(bound.sum);
+        let started = Instant::now();
+        let Some(reader) = CoalesceKeyCountSumReader::new(first, second, coalesce, sum) else {
+            return Err(DodamError::UnsupportedSql(
+                "group expression view aggregate requires integer/date leading keys, coalesce(utf8,literal), and integer sum inputs"
+                    .to_string(),
+            ));
+        };
+        self.reader_nanos = self.reader_nanos.saturating_add(elapsed_nanos_u64(started));
+        let groups = self.groups.get_or_insert_with(|| {
+            CoalesceKeyCountSumGroups::new(
+                self.plan.leading_keys.len(),
+                reader.dense_leading_range(batch.num_rows()),
+            )
+        });
+        let started = Instant::now();
+        reader.update_groups(groups, batch.num_rows(), self.plan.fallback.as_str());
+        self.update_nanos = self.update_nanos.saturating_add(elapsed_nanos_u64(started));
+        Ok(())
+    }
+
+    pub(crate) fn merge_partials(
+        partials: Vec<Self>,
+        fragments: usize,
+        aggregates: &[AggregateExpr],
+    ) -> Result<AggregateMetrics> {
+        let merge_started = Instant::now();
+        let mut merged_groups: Option<CoalesceKeyCountSumGroups> = None;
+        let mut metrics = AggregateMetrics {
+            fragments,
+            ..AggregateMetrics::default()
+        };
+        let mut update_nanos = 0_u64;
+        for partial in partials {
+            metrics.batches = metrics.batches.saturating_add(partial.metrics.batches);
+            metrics.rows = metrics.rows.saturating_add(partial.metrics.rows);
+            update_nanos = update_nanos.saturating_add(partial.update_nanos);
+            let Some(groups) = partial.groups else {
+                continue;
+            };
+            match &mut merged_groups {
+                Some(merged) => merged.merge_from(groups)?,
+                None => merged_groups = Some(groups),
+            }
+        }
+        metrics.aggregate_nanos = update_nanos;
+        metrics.aggregate_merge_nanos = elapsed_nanos(merge_started);
+        metrics.groups = merged_groups
+            .map(|groups| groups.finish(aggregates))
+            .unwrap_or_default();
+        Ok(metrics)
+    }
+}
+
 struct CoalesceKeyCountSumPlan {
     leading_keys: Vec<String>,
     coalesce_column: String,
@@ -355,6 +453,12 @@ fn collect_coalesce_key_count_sum_groups(
     aggregates: &[AggregateExpr],
     plan: CoalesceKeyCountSumPlan,
 ) -> Result<AggregateMetrics> {
+    let profile = coalesce_key_count_sum_profile_enabled();
+    let total_started = profile.then(Instant::now);
+    let mut bind_nanos = 0_u64;
+    let mut reader_nanos = 0_u64;
+    let mut update_nanos = 0_u64;
+    let mut finish_nanos = 0_u64;
     let mut bound_plan = None;
     let mut groups = None;
     let mut metrics = AggregateMetrics {
@@ -372,7 +476,9 @@ fn collect_coalesce_key_count_sum_groups(
         let bound = match &bound_plan {
             Some(bound) => bound,
             None => {
+                let started = Instant::now();
                 bound_plan = Some(plan.bind(&batch)?);
+                bind_nanos = bind_nanos.saturating_add(elapsed_nanos_u64(started));
                 bound_plan.as_ref().expect("bound coalesce aggregate plan")
             }
         };
@@ -380,24 +486,56 @@ fn collect_coalesce_key_count_sum_groups(
         let second = bound.second.map(|index| batch.column(index));
         let coalesce = batch.column(bound.coalesce);
         let sum = batch.column(bound.sum);
+        let started = Instant::now();
         let Some(reader) = CoalesceKeyCountSumReader::new(first, second, coalesce, sum) else {
             return Err(DodamError::UnsupportedSql(
                 "group expression view aggregate requires integer/date leading keys, coalesce(utf8,literal), and integer sum inputs"
                     .to_string(),
             ));
         };
+        reader_nanos = reader_nanos.saturating_add(elapsed_nanos_u64(started));
         let groups = groups.get_or_insert_with(|| {
             CoalesceKeyCountSumGroups::new(
                 plan.leading_keys.len(),
                 reader.dense_leading_range(batch.num_rows()),
             )
         });
+        let started = Instant::now();
         reader.update_groups(groups, batch.num_rows(), plan.fallback.as_str());
+        update_nanos = update_nanos.saturating_add(elapsed_nanos_u64(started));
     }
+    let started = Instant::now();
     metrics.groups = groups
         .map(|groups| groups.finish(aggregates))
         .unwrap_or_default();
+    finish_nanos = finish_nanos.saturating_add(elapsed_nanos_u64(started));
+    if profile {
+        eprintln!(
+            "[dodam:coalesce-agg-profile] total={:.3}ms bind={:.3}ms reader={:.3}ms update={:.3}ms finish={:.3}ms batches={} rows={} groups={}",
+            nanos_to_millis_f64(total_started.map(elapsed_nanos_u64).unwrap_or(0)),
+            nanos_to_millis_f64(bind_nanos),
+            nanos_to_millis_f64(reader_nanos),
+            nanos_to_millis_f64(update_nanos),
+            nanos_to_millis_f64(finish_nanos),
+            metrics.batches,
+            metrics.rows,
+            metrics.groups.len(),
+        );
+    }
     Ok(metrics)
+}
+
+fn coalesce_key_count_sum_profile_enabled() -> bool {
+    std::env::var("DODAM_COALESCE_AGG_PROFILE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn elapsed_nanos_u64(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
+fn nanos_to_millis_f64(nanos: u64) -> f64 {
+    nanos as f64 / 1_000_000.0
 }
 
 struct BoundCoalesceKeyCountSumPlan {
@@ -425,24 +563,24 @@ impl CoalesceKeyCountSumPlan {
 enum CoalesceKeyCountSumReader<'a> {
     TwoInt32 {
         first: &'a Int32Array,
-        coalesce: &'a StringArray,
+        coalesce: CoalesceUtf8Input<'a>,
         sum: Int64LikeArray<'a>,
     },
     TwoInt64 {
         first: &'a Int64Array,
-        coalesce: &'a StringArray,
+        coalesce: CoalesceUtf8Input<'a>,
         sum: Int64LikeArray<'a>,
     },
     ThreeInt32Date {
         first: &'a Int32Array,
         second: &'a Date32Array,
-        coalesce: &'a StringArray,
+        coalesce: CoalesceUtf8Input<'a>,
         sum: Int64LikeArray<'a>,
     },
     ThreeInt64Date {
         first: &'a Int64Array,
         second: &'a Date32Array,
-        coalesce: &'a StringArray,
+        coalesce: CoalesceUtf8Input<'a>,
         sum: Int64LikeArray<'a>,
     },
 }
@@ -454,7 +592,7 @@ impl<'a> CoalesceKeyCountSumReader<'a> {
         coalesce: &'a ArrayRef,
         sum: &'a ArrayRef,
     ) -> Option<Self> {
-        let coalesce = coalesce.as_any().downcast_ref::<StringArray>()?;
+        let coalesce = CoalesceUtf8Input::new(coalesce)?;
         let sum = Int64LikeArray::new(sum)?;
         match (first.data_type(), second.map(|array| array.data_type())) {
             (DataType::Int32, None) => Some(Self::TwoInt32 {
@@ -490,14 +628,14 @@ impl<'a> CoalesceKeyCountSumReader<'a> {
             } => CoalesceKeyBorrowed {
                 first: first.is_valid(row).then(|| i64::from(first.value(row))),
                 second: None,
-                third: coalesce_key(coalesce, row, fallback),
+                third: coalesce.key(row, fallback),
             },
             Self::TwoInt64 {
                 first, coalesce, ..
             } => CoalesceKeyBorrowed {
                 first: first.is_valid(row).then(|| first.value(row)),
                 second: None,
-                third: coalesce_key(coalesce, row, fallback),
+                third: coalesce.key(row, fallback),
             },
             Self::ThreeInt32Date {
                 first,
@@ -507,7 +645,7 @@ impl<'a> CoalesceKeyCountSumReader<'a> {
             } => CoalesceKeyBorrowed {
                 first: first.is_valid(row).then(|| i64::from(first.value(row))),
                 second: second.is_valid(row).then(|| second.value(row)),
-                third: coalesce_key(coalesce, row, fallback),
+                third: coalesce.key(row, fallback),
             },
             Self::ThreeInt64Date {
                 first,
@@ -517,7 +655,7 @@ impl<'a> CoalesceKeyCountSumReader<'a> {
             } => CoalesceKeyBorrowed {
                 first: first.is_valid(row).then(|| first.value(row)),
                 second: second.is_valid(row).then(|| second.value(row)),
-                third: coalesce_key(coalesce, row, fallback),
+                third: coalesce.key(row, fallback),
             },
         }
     }
@@ -538,19 +676,85 @@ impl<'a> CoalesceKeyCountSumReader<'a> {
         fallback: &'a str,
     ) {
         match self {
+            Self::TwoInt32 {
+                first,
+                coalesce,
+                sum,
+            } if first.null_count() == 0 => {
+                if let Some(mut cache) = CoalesceStringIdCache::new(coalesce, groups, fallback) {
+                    for row in 0..row_count {
+                        let string_id = cache.string_id(coalesce, groups, row);
+                        groups.update_two_non_null_string_id(
+                            first.value(row).into(),
+                            string_id,
+                            sum.value(row),
+                        );
+                    }
+                } else {
+                    for row in 0..row_count {
+                        groups.update_two_non_null(
+                            i64::from(first.value(row)),
+                            coalesce
+                                .key(row, fallback)
+                                .expect("coalesce key is non-null"),
+                            sum.value(row),
+                        );
+                    }
+                }
+            }
+            Self::TwoInt64 {
+                first,
+                coalesce,
+                sum,
+            } if first.null_count() == 0 => {
+                if let Some(mut cache) = CoalesceStringIdCache::new(coalesce, groups, fallback) {
+                    for row in 0..row_count {
+                        let string_id = cache.string_id(coalesce, groups, row);
+                        groups.update_two_non_null_string_id(
+                            first.value(row),
+                            string_id,
+                            sum.value(row),
+                        );
+                    }
+                } else {
+                    for row in 0..row_count {
+                        groups.update_two_non_null(
+                            first.value(row),
+                            coalesce
+                                .key(row, fallback)
+                                .expect("coalesce key is non-null"),
+                            sum.value(row),
+                        );
+                    }
+                }
+            }
             Self::ThreeInt32Date {
                 first,
                 second,
                 coalesce,
                 sum,
             } if first.null_count() == 0 && second.null_count() == 0 => {
-                for row in 0..row_count {
-                    groups.update_three_non_null(
-                        i64::from(first.value(row)),
-                        second.value(row),
-                        coalesce_key(coalesce, row, fallback).expect("coalesce key is non-null"),
-                        sum.value(row),
-                    );
+                if let Some(mut cache) = CoalesceStringIdCache::new(coalesce, groups, fallback) {
+                    for row in 0..row_count {
+                        let string_id = cache.string_id(coalesce, groups, row);
+                        groups.update_three_non_null_string_id(
+                            first.value(row).into(),
+                            second.value(row),
+                            string_id,
+                            sum.value(row),
+                        );
+                    }
+                } else {
+                    for row in 0..row_count {
+                        groups.update_three_non_null(
+                            i64::from(first.value(row)),
+                            second.value(row),
+                            coalesce
+                                .key(row, fallback)
+                                .expect("coalesce key is non-null"),
+                            sum.value(row),
+                        );
+                    }
                 }
             }
             Self::ThreeInt64Date {
@@ -559,13 +763,27 @@ impl<'a> CoalesceKeyCountSumReader<'a> {
                 coalesce,
                 sum,
             } if first.null_count() == 0 && second.null_count() == 0 => {
-                for row in 0..row_count {
-                    groups.update_three_non_null(
-                        first.value(row),
-                        second.value(row),
-                        coalesce_key(coalesce, row, fallback).expect("coalesce key is non-null"),
-                        sum.value(row),
-                    );
+                if let Some(mut cache) = CoalesceStringIdCache::new(coalesce, groups, fallback) {
+                    for row in 0..row_count {
+                        let string_id = cache.string_id(coalesce, groups, row);
+                        groups.update_three_non_null_string_id(
+                            first.value(row),
+                            second.value(row),
+                            string_id,
+                            sum.value(row),
+                        );
+                    }
+                } else {
+                    for row in 0..row_count {
+                        groups.update_three_non_null(
+                            first.value(row),
+                            second.value(row),
+                            coalesce
+                                .key(row, fallback)
+                                .expect("coalesce key is non-null"),
+                            sum.value(row),
+                        );
+                    }
                 }
             }
             _ => {
@@ -579,6 +797,14 @@ impl<'a> CoalesceKeyCountSumReader<'a> {
     fn dense_leading_range(&self, row_count: usize) -> Option<DenseLeadingRange> {
         const MAX_DENSE_LEADING_SLOTS: usize = 4096;
         let (first_min, first_max, second_min, second_max) = match self {
+            Self::TwoInt32 { first, .. } => {
+                let (first_min, first_max) = int32_non_null_min_max_as_i64(first, row_count)?;
+                (first_min, first_max, 0, 0)
+            }
+            Self::TwoInt64 { first, .. } => {
+                let (first_min, first_max) = int64_non_null_min_max(first, row_count)?;
+                (first_min, first_max, 0, 0)
+            }
             Self::ThreeInt32Date { first, second, .. } => {
                 let (first_min, first_max) = int32_non_null_min_max_as_i64(first, row_count)?;
                 let (second_min, second_max) = date32_non_null_min_max(second, row_count)?;
@@ -589,7 +815,6 @@ impl<'a> CoalesceKeyCountSumReader<'a> {
                 let (second_min, second_max) = date32_non_null_min_max(second, row_count)?;
                 (first_min, first_max, second_min, second_max)
             }
-            _ => return None,
         };
         let first_len = usize::try_from(first_max.checked_sub(first_min)? + 1).ok()?;
         let second_len = usize::try_from(second_max.checked_sub(second_min)? + 1).ok()?;
@@ -654,6 +879,149 @@ fn date32_non_null_min_max(values: &Date32Array, row_count: usize) -> Option<(i3
     Some((min, max))
 }
 
+#[derive(Clone, Copy)]
+enum CoalesceUtf8Input<'a> {
+    Utf8(&'a StringArray),
+    DictionaryI32 {
+        keys: &'a DictionaryArray<Int32Type>,
+        values: DictionaryStringValues<'a>,
+    },
+}
+
+impl<'a> CoalesceUtf8Input<'a> {
+    fn new(array: &'a ArrayRef) -> Option<Self> {
+        if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
+            return Some(Self::Utf8(values));
+        }
+        if let DataType::Dictionary(key, value) = array.data_type()
+            && matches!(&**key, DataType::Int32)
+            && matches!(&**value, DataType::Utf8 | DataType::LargeUtf8)
+        {
+            let keys = array
+                .as_any()
+                .downcast_ref::<DictionaryArray<Int32Type>>()?;
+            return Some(Self::DictionaryI32 {
+                keys,
+                values: dictionary_i32_string_values(keys)?,
+            });
+        }
+        None
+    }
+
+    fn key(self, row: usize, fallback: &'a str) -> Option<&'a str> {
+        match self {
+            Self::Utf8(values) => coalesce_key(values, row, fallback),
+            Self::DictionaryI32 { keys, values } => {
+                if keys.is_null(row) {
+                    return Some(fallback);
+                }
+                let Ok(id) = usize::try_from(keys.keys().value(row)) else {
+                    return Some(fallback);
+                };
+                Some(
+                    std::str::from_utf8(values.value_bytes(id))
+                        .expect("Arrow dictionary Utf8 value should be valid UTF8"),
+                )
+            }
+        }
+    }
+
+    fn dictionary_key(self, row: usize) -> Option<i32> {
+        match self {
+            Self::DictionaryI32 { keys, .. } if keys.is_valid(row) => Some(keys.keys().value(row)),
+            Self::DictionaryI32 { .. } | Self::Utf8(_) => None,
+        }
+    }
+
+    fn dictionary_value(self, id: usize) -> Option<&'a str> {
+        match self {
+            Self::DictionaryI32 { values, .. } => Some(
+                std::str::from_utf8(values.value_bytes(id))
+                    .expect("Arrow dictionary Utf8 value should be valid UTF8"),
+            ),
+            Self::Utf8(_) => None,
+        }
+    }
+
+    fn utf8_value(self, row: usize) -> Option<&'a str> {
+        match self {
+            Self::Utf8(values) if values.is_valid(row) => Some(values.value(row)),
+            Self::Utf8(_) | Self::DictionaryI32 { .. } => None,
+        }
+    }
+}
+
+enum CoalesceStringIdCache<'a> {
+    Utf8 {
+        fallback_id: u32,
+        ids: AggregateHashMap<&'a str, u32>,
+    },
+    Dictionary {
+        fallback_id: u32,
+        ids: Vec<Option<u32>>,
+    },
+}
+
+impl<'a> CoalesceStringIdCache<'a> {
+    fn new(
+        coalesce: &CoalesceUtf8Input<'a>,
+        groups: &mut CoalesceKeyCountSumGroups,
+        fallback: &str,
+    ) -> Option<Self> {
+        let fallback_id = groups.string_id(fallback);
+        match coalesce {
+            CoalesceUtf8Input::Utf8(_) => Some(Self::Utf8 {
+                fallback_id,
+                ids: AggregateHashMap::default(),
+            }),
+            CoalesceUtf8Input::DictionaryI32 { values, .. } => Some(Self::Dictionary {
+                fallback_id,
+                ids: vec![None; values.len()],
+            }),
+        }
+    }
+
+    fn string_id(
+        &mut self,
+        coalesce: &CoalesceUtf8Input<'a>,
+        groups: &mut CoalesceKeyCountSumGroups,
+        row: usize,
+    ) -> u32 {
+        match self {
+            Self::Utf8 { fallback_id, ids } => {
+                let Some(value) = coalesce.utf8_value(row) else {
+                    return *fallback_id;
+                };
+                if let Some(string_id) = ids.get(value).copied() {
+                    return string_id;
+                }
+                let string_id = groups.string_id(value);
+                ids.insert(value, string_id);
+                string_id
+            }
+            Self::Dictionary { fallback_id, ids } => {
+                let Some(id) = coalesce.dictionary_key(row) else {
+                    return *fallback_id;
+                };
+                let Ok(index) = usize::try_from(id) else {
+                    return *fallback_id;
+                };
+                if let Some(string_id) = ids.get(index).and_then(|id| *id) {
+                    return string_id;
+                }
+                let Some(value) = coalesce.dictionary_value(index) else {
+                    return *fallback_id;
+                };
+                let string_id = groups.string_id(value);
+                if let Some(slot) = ids.get_mut(index) {
+                    *slot = Some(string_id);
+                }
+                string_id
+            }
+        }
+    }
+}
+
 fn coalesce_key<'a>(values: &'a StringArray, row: usize, fallback: &'a str) -> Option<&'a str> {
     if values.is_valid(row) {
         Some(values.value(row))
@@ -687,19 +1055,21 @@ impl CoalesceKeyCountSumGroups {
         }
     }
 
+    fn string_id(&mut self, value: &str) -> u32 {
+        if let Some(string_id) = self.third_string_ids.get(value).copied() {
+            string_id
+        } else {
+            let string_id =
+                u32::try_from(self.third_strings.len()).expect("too many string groups");
+            self.third_string_ids.insert(value.to_string(), string_id);
+            self.third_strings.push(value.to_string());
+            string_id
+        }
+    }
+
     fn update(&mut self, key: CoalesceKeyBorrowed<'_>, sum: Option<i64>) {
         let string_id = match key.third {
-            Some(value) => Some(
-                if let Some(string_id) = self.third_string_ids.get(value).copied() {
-                    string_id
-                } else {
-                    let string_id =
-                        u32::try_from(self.third_strings.len()).expect("too many string groups");
-                    self.third_string_ids.insert(value.to_string(), string_id);
-                    self.third_strings.push(value.to_string());
-                    string_id
-                },
-            ),
+            Some(value) => Some(self.string_id(value)),
             None => None,
         };
         let third_index = self.index.third_groups(key.first, key.second);
@@ -734,15 +1104,17 @@ impl CoalesceKeyCountSumGroups {
     }
 
     fn update_three_non_null(&mut self, first: i64, second: i32, third: &str, sum: Option<i64>) {
-        let string_id = if let Some(string_id) = self.third_string_ids.get(third).copied() {
-            string_id
-        } else {
-            let string_id =
-                u32::try_from(self.third_strings.len()).expect("too many string groups");
-            self.third_string_ids.insert(third.to_string(), string_id);
-            self.third_strings.push(third.to_string());
-            string_id
-        };
+        let string_id = self.string_id(third);
+        self.update_three_non_null_string_id(first, second, string_id, sum);
+    }
+
+    fn update_three_non_null_string_id(
+        &mut self,
+        first: i64,
+        second: i32,
+        string_id: u32,
+        sum: Option<i64>,
+    ) {
         let third_index = self.index.third_groups_three_non_null(first, second);
         let group_id = if let Some(group_id) = third_index.non_null.get(string_id) {
             group_id
@@ -759,6 +1131,98 @@ impl CoalesceKeyCountSumGroups {
         self.groups[group_id].update(sum);
     }
 
+    fn update_two_non_null(&mut self, first: i64, third: &str, sum: Option<i64>) {
+        let string_id = self.string_id(third);
+        self.update_two_non_null_string_id(first, string_id, sum);
+    }
+
+    fn update_two_non_null_string_id(&mut self, first: i64, string_id: u32, sum: Option<i64>) {
+        let third_index = self.index.third_groups_two_non_null(first);
+        let group_id = if let Some(group_id) = third_index.non_null.get(string_id) {
+            group_id
+        } else {
+            let group_id = self.groups.len();
+            third_index.non_null.insert(string_id, group_id);
+            self.groups.push(CoalesceKeyCountSumGroup::new(
+                Some(first),
+                None,
+                Some(string_id),
+            ));
+            group_id
+        };
+        self.groups[group_id].update(sum);
+    }
+
+    fn merge_from(&mut self, other: CoalesceKeyCountSumGroups) -> Result<()> {
+        if self.key_len != other.key_len {
+            return Err(DodamError::UnsupportedSql(
+                "coalesce aggregate partial key shape mismatch".to_string(),
+            ));
+        }
+        for group in other.groups {
+            let third_string_id = match group.third_string_id {
+                Some(id) => {
+                    let value = other.third_strings.get(id as usize).ok_or_else(|| {
+                        DodamError::UnsupportedSql(
+                            "coalesce aggregate partial string id mismatch".to_string(),
+                        )
+                    })?;
+                    Some(self.string_id(value))
+                }
+                None => None,
+            };
+            self.merge_group_counts(
+                group.first,
+                group.second,
+                third_string_id,
+                group.count,
+                group.sum,
+                group.sum_count,
+            );
+        }
+        Ok(())
+    }
+
+    fn merge_group_counts(
+        &mut self,
+        first: Option<i64>,
+        second: Option<i32>,
+        third_string_id: Option<u32>,
+        count: u64,
+        sum: i64,
+        sum_count: u64,
+    ) {
+        let third_index = self.index.third_groups(first, second);
+        let group_id = match third_string_id {
+            Some(string_id) => {
+                if let Some(group_id) = third_index.non_null.get(string_id) {
+                    group_id
+                } else {
+                    let group_id = self.groups.len();
+                    third_index.non_null.insert(string_id, group_id);
+                    self.groups.push(CoalesceKeyCountSumGroup::new(
+                        first,
+                        second,
+                        Some(string_id),
+                    ));
+                    group_id
+                }
+            }
+            None => {
+                if let Some(group_id) = third_index.null_group {
+                    group_id
+                } else {
+                    let group_id = self.groups.len();
+                    third_index.null_group = Some(group_id);
+                    self.groups
+                        .push(CoalesceKeyCountSumGroup::new(first, second, None));
+                    group_id
+                }
+            }
+        };
+        self.groups[group_id].merge_counts(count, sum, sum_count);
+    }
+
     fn finish(self, aggregates: &[AggregateExpr]) -> Vec<GroupAggregateResult> {
         let Self {
             key_len,
@@ -767,23 +1231,39 @@ impl CoalesceKeyCountSumGroups {
             third_strings,
             groups,
         } = self;
-        let can_finish_ordered = key_len == 3
-            && matches!(
-                &index,
-                CoalesceLeadingIndex::DenseThree { fallback, .. } if fallback.is_empty()
-            );
-        if can_finish_ordered && let CoalesceLeadingIndex::DenseThree { range, slots, .. } = index {
-            return finish_dense_three_ordered_groups(
+        match index {
+            CoalesceLeadingIndex::DenseTwo {
                 range,
                 slots,
-                third_strings,
-                groups,
-                aggregates,
-            );
+                fallback,
+            } if key_len == 2 && fallback.is_empty() => {
+                return finish_dense_two_ordered_groups(
+                    range,
+                    slots,
+                    third_strings,
+                    groups,
+                    aggregates,
+                );
+            }
+            CoalesceLeadingIndex::DenseThree {
+                range,
+                slots,
+                fallback,
+            } if key_len == 3 && fallback.is_empty() => {
+                return finish_dense_three_ordered_groups(
+                    range,
+                    slots,
+                    third_strings,
+                    groups,
+                    aggregates,
+                );
+            }
+            index => {
+                let _ = index;
+            }
         }
         let _ = third_string_ids;
         let _ = third_strings;
-        let _ = index;
         let mut groups = groups
             .into_iter()
             .map(|group| group.finish(key_len, &third_strings, aggregates))
@@ -791,6 +1271,35 @@ impl CoalesceKeyCountSumGroups {
         groups.sort_by(|left, right| compare_group_keys(&left.keys, &right.keys));
         groups
     }
+}
+
+fn finish_dense_two_ordered_groups(
+    range: DenseLeadingRange,
+    slots: Vec<CoalesceThirdGroups>,
+    third_strings: Vec<String>,
+    groups: Vec<CoalesceKeyCountSumGroup>,
+    aggregates: &[AggregateExpr],
+) -> Vec<GroupAggregateResult> {
+    let mut groups = groups.into_iter().map(Some).collect::<Vec<_>>();
+    let mut output = Vec::with_capacity(groups.len());
+    for first_offset in 0..range.first_len {
+        let third_groups = &slots[first_offset];
+        if let Some(group_id) = third_groups.null_group
+            && let Some(group) = groups[group_id].take()
+        {
+            output.push(group.finish(2, &third_strings, aggregates));
+        }
+        let mut non_null = third_groups.non_null.iter().collect::<Vec<_>>();
+        non_null.sort_by(|(left, _), (right, _)| {
+            third_strings[*left as usize].cmp(&third_strings[*right as usize])
+        });
+        for (_, group_id) in non_null {
+            if let Some(group) = groups[group_id].take() {
+                output.push(group.finish(2, &third_strings, aggregates));
+            }
+        }
+    }
+    output
 }
 
 fn finish_dense_three_ordered_groups(
@@ -835,6 +1344,11 @@ struct DenseLeadingRange {
 
 enum CoalesceLeadingIndex {
     Hash(AggregateHashMap<Option<i64>, CoalesceSecondGroups>),
+    DenseTwo {
+        range: DenseLeadingRange,
+        slots: Vec<CoalesceThirdGroups>,
+        fallback: AggregateHashMap<Option<i64>, CoalesceSecondGroups>,
+    },
     DenseThree {
         range: DenseLeadingRange,
         slots: Vec<CoalesceThirdGroups>,
@@ -844,6 +1358,17 @@ enum CoalesceLeadingIndex {
 
 impl CoalesceLeadingIndex {
     fn new(leading_key_count: usize, dense_range: Option<DenseLeadingRange>) -> Self {
+        if leading_key_count == 1
+            && let Some(range) = dense_range
+        {
+            return Self::DenseTwo {
+                range,
+                slots: (0..range.first_len)
+                    .map(|_| CoalesceThirdGroups::default())
+                    .collect(),
+                fallback: AggregateHashMap::default(),
+            };
+        }
         if leading_key_count == 2
             && let Some(range) = dense_range
         {
@@ -870,6 +1395,24 @@ impl CoalesceLeadingIndex {
                 .index
                 .entry(second)
                 .or_default(),
+            Self::DenseTwo {
+                range,
+                slots,
+                fallback,
+            } => {
+                if second.is_none()
+                    && let Some(first) = first
+                    && let Some(slot) = dense_first_slot(*range, first)
+                {
+                    return &mut slots[slot];
+                }
+                fallback
+                    .entry(first)
+                    .or_default()
+                    .index
+                    .entry(second)
+                    .or_default()
+            }
             Self::DenseThree {
                 range,
                 slots,
@@ -887,6 +1430,38 @@ impl CoalesceLeadingIndex {
                     .entry(second)
                     .or_default()
             }
+        }
+    }
+
+    fn third_groups_two_non_null(&mut self, first: i64) -> &mut CoalesceThirdGroups {
+        match self {
+            Self::Hash(index) => index
+                .entry(Some(first))
+                .or_default()
+                .index
+                .entry(None)
+                .or_default(),
+            Self::DenseTwo {
+                range,
+                slots,
+                fallback,
+            } => {
+                if let Some(slot) = dense_first_slot(*range, first) {
+                    return &mut slots[slot];
+                }
+                fallback
+                    .entry(Some(first))
+                    .or_default()
+                    .index
+                    .entry(None)
+                    .or_default()
+            }
+            Self::DenseThree { fallback, .. } => fallback
+                .entry(Some(first))
+                .or_default()
+                .index
+                .entry(None)
+                .or_default(),
         }
     }
 
@@ -913,8 +1488,19 @@ impl CoalesceLeadingIndex {
                     .entry(Some(second))
                     .or_default()
             }
+            Self::DenseTwo { fallback, .. } => fallback
+                .entry(Some(first))
+                .or_default()
+                .index
+                .entry(Some(second))
+                .or_default(),
         }
     }
+}
+
+fn dense_first_slot(range: DenseLeadingRange, first: i64) -> Option<usize> {
+    let first_offset = usize::try_from(first.checked_sub(range.first_min)?).ok()?;
+    (first_offset < range.first_len).then_some(first_offset)
 }
 
 fn dense_leading_slot(range: DenseLeadingRange, first: i64, second: i32) -> Option<usize> {
@@ -1084,6 +1670,12 @@ impl CoalesceKeyCountSumGroup {
             self.sum += sum;
             self.sum_count += 1;
         }
+    }
+
+    fn merge_counts(&mut self, count: u64, sum: i64, sum_count: u64) {
+        self.count = self.count.saturating_add(count);
+        self.sum = self.sum.saturating_add(sum);
+        self.sum_count = self.sum_count.saturating_add(sum_count);
     }
 
     fn finish(
@@ -1322,14 +1914,16 @@ fn decimal_min_result_type(value: Option<&AggregateResult>) -> Option<(u8, i8)> 
 }
 
 pub(crate) struct SingleKeyCountSumVectorState {
+    count_expr: AggregateExpr,
     sum_expr: AggregateExpr,
     group_index: CountSumGroupIndex,
     groups: Vec<CountSumGroup>,
 }
 
 impl SingleKeyCountSumVectorState {
-    pub(crate) fn new_i32(sum_expr: AggregateExpr) -> Self {
+    pub(crate) fn new_i32(count_expr: AggregateExpr, sum_expr: AggregateExpr) -> Self {
         Self {
+            count_expr,
             sum_expr,
             group_index: CountSumGroupIndex::Int32 {
                 groups: DenseI32GroupIndex::default(),
@@ -1339,8 +1933,9 @@ impl SingleKeyCountSumVectorState {
         }
     }
 
-    pub(crate) fn new_i64(sum_expr: AggregateExpr) -> Self {
+    pub(crate) fn new_i64(count_expr: AggregateExpr, sum_expr: AggregateExpr) -> Self {
         Self {
+            count_expr,
             sum_expr,
             group_index: CountSumGroupIndex::Int64 {
                 groups: AdaptiveCopyGroupIndex::default(),
@@ -1361,32 +1956,52 @@ impl SingleKeyCountSumVectorState {
                 "direct primitive count/sum projected sum input is not Int64".to_string(),
             )
         })?;
-        let Some(keys) = key_values.values_if_null_free() else {
+        if key_values.values_if_null_free().is_none() && key_values.raw_nullable().is_none() {
             return Err(DodamError::UnsupportedSql(
-                "direct primitive count/sum requires non-null key".to_string(),
-            ));
-        };
-        let Some(sums) = sum_values.values_if_null_free() else {
-            return Err(DodamError::UnsupportedSql(
-                "direct primitive count/sum requires non-null sum input".to_string(),
-            ));
-        };
-        if keys.len() != sums.len() {
-            return Err(DodamError::UnsupportedSql(
-                "direct primitive count/sum column length mismatch".to_string(),
+                "direct primitive count/sum requires raw nullable or non-null key".to_string(),
             ));
         }
-        let CountSumGroupIndex::Int32 { groups: index, .. } = &mut self.group_index else {
+        let row_count = direct_count_sum_row_count_i32(key_values)?;
+        let mut sums = DirectI64SumInput::try_new(sum_values, row_count)?;
+        let CountSumGroupIndex::Int32 {
+            groups: index,
+            null_group,
+        } = &mut self.group_index
+        else {
             unreachable!("vector count/sum state uses Int32 group index")
         };
-        for row in 0..keys.len() {
-            let group_id = count_sum_group_id_for_i32(
-                index,
-                keys[row],
-                &mut self.groups,
-                &CountSumValueInput::Int64Raw,
-            );
-            self.groups[group_id].update_raw_i64_non_null(sums[row]);
+        if let Some(keys) = key_values.values_if_null_free() {
+            for row in 0..keys.len() {
+                let group_id = count_sum_group_id_for_i32(
+                    index,
+                    keys[row],
+                    &mut self.groups,
+                    &CountSumValueInput::Int64Raw,
+                );
+                self.groups[group_id].update_raw_i64_optional(sums.value(row));
+            }
+        } else if let Some((keys, def_levels)) = key_values.raw_nullable() {
+            let mut value_index = 0usize;
+            for row in 0..def_levels.len() {
+                let group_id = if def_levels[row] == 0 {
+                    count_sum_null_group_id(
+                        null_group,
+                        &mut self.groups,
+                        GroupValue::Int64(None),
+                        &CountSumValueInput::Int64Raw,
+                    )
+                } else {
+                    let key = keys[value_index];
+                    value_index += 1;
+                    count_sum_group_id_for_i32(
+                        index,
+                        key,
+                        &mut self.groups,
+                        &CountSumValueInput::Int64Raw,
+                    )
+                };
+                self.groups[group_id].update_raw_i64_optional(sums.value(row));
+            }
         }
         Ok(())
     }
@@ -1402,72 +2017,117 @@ impl SingleKeyCountSumVectorState {
                 "direct primitive count/sum projected sum input is not Int64".to_string(),
             )
         })?;
-        let Some(keys) = key_values.values_if_null_free() else {
+        if key_values.values_if_null_free().is_none() && key_values.raw_nullable().is_none() {
             return Err(DodamError::UnsupportedSql(
-                "direct primitive count/sum requires non-null key".to_string(),
-            ));
-        };
-        let Some(sums) = sum_values.values_if_null_free() else {
-            return Err(DodamError::UnsupportedSql(
-                "direct primitive count/sum requires non-null sum input".to_string(),
-            ));
-        };
-        if keys.len() != sums.len() {
-            return Err(DodamError::UnsupportedSql(
-                "direct primitive count/sum column length mismatch".to_string(),
+                "direct primitive count/sum requires raw nullable or non-null key".to_string(),
             ));
         }
-        let CountSumGroupIndex::Int64 { groups: index, .. } = &mut self.group_index else {
+        let row_count = direct_count_sum_row_count_i64(key_values)?;
+        let mut sums = DirectI64SumInput::try_new(sum_values, row_count)?;
+        let CountSumGroupIndex::Int64 {
+            groups: index,
+            null_group,
+        } = &mut self.group_index
+        else {
             unreachable!("vector count/sum state uses Int64 group index")
         };
-        for row in 0..keys.len() {
-            let group_id = count_sum_group_id_for_i64(
-                index,
-                keys[row],
-                &mut self.groups,
-                &CountSumValueInput::Int64Raw,
-            );
-            self.groups[group_id].update_raw_i64_non_null(sums[row]);
+        if let Some(keys) = key_values.values_if_null_free() {
+            for row in 0..keys.len() {
+                let group_id = count_sum_group_id_for_i64(
+                    index,
+                    keys[row],
+                    &mut self.groups,
+                    &CountSumValueInput::Int64Raw,
+                );
+                self.groups[group_id].update_raw_i64_optional(sums.value(row));
+            }
+        } else if let Some((keys, def_levels)) = key_values.raw_nullable() {
+            let mut value_index = 0usize;
+            for row in 0..def_levels.len() {
+                let group_id = if def_levels[row] == 0 {
+                    count_sum_null_group_id(
+                        null_group,
+                        &mut self.groups,
+                        GroupValue::Int64(None),
+                        &CountSumValueInput::Int64Raw,
+                    )
+                } else {
+                    let key = keys[value_index];
+                    value_index += 1;
+                    count_sum_group_id_for_i64(
+                        index,
+                        key,
+                        &mut self.groups,
+                        &CountSumValueInput::Int64Raw,
+                    )
+                };
+                self.groups[group_id].update_raw_i64_optional(sums.value(row));
+            }
         }
         Ok(())
     }
 
     pub(crate) fn merge(&mut self, partial: Self) -> Result<()> {
         match &mut self.group_index {
-            CountSumGroupIndex::Int32 { groups: index, .. } => {
+            CountSumGroupIndex::Int32 {
+                groups: index,
+                null_group,
+            } => {
                 for partial_group in partial.groups {
-                    let GroupValue::Int64(Some(key)) = partial_group.key else {
-                        return Err(DodamError::UnsupportedSql(
-                            "direct primitive count/sum partial key shape mismatch".to_string(),
-                        ));
+                    let group_id = match partial_group.key.clone() {
+                        GroupValue::Int64(Some(key)) => {
+                            let key = i32::try_from(key).map_err(|_| {
+                                DodamError::UnsupportedSql(
+                                    "direct primitive count/sum partial key out of Int32 range"
+                                        .to_string(),
+                                )
+                            })?;
+                            count_sum_group_id_for_i32(
+                                index,
+                                key,
+                                &mut self.groups,
+                                &CountSumValueInput::Int64Raw,
+                            )
+                        }
+                        GroupValue::Int64(None) => count_sum_null_group_id(
+                            null_group,
+                            &mut self.groups,
+                            GroupValue::Int64(None),
+                            &CountSumValueInput::Int64Raw,
+                        ),
+                        _ => {
+                            return Err(DodamError::UnsupportedSql(
+                                "direct primitive count/sum partial key shape mismatch".to_string(),
+                            ));
+                        }
                     };
-                    let key = i32::try_from(key).map_err(|_| {
-                        DodamError::UnsupportedSql(
-                            "direct primitive count/sum partial key out of Int32 range".to_string(),
-                        )
-                    })?;
-                    let group_id = count_sum_group_id_for_i32(
-                        index,
-                        key,
-                        &mut self.groups,
-                        &CountSumValueInput::Int64Raw,
-                    );
                     self.groups[group_id].merge_group(partial_group);
                 }
             }
-            CountSumGroupIndex::Int64 { groups: index, .. } => {
+            CountSumGroupIndex::Int64 {
+                groups: index,
+                null_group,
+            } => {
                 for partial_group in partial.groups {
-                    let GroupValue::Int64(Some(key)) = partial_group.key else {
-                        return Err(DodamError::UnsupportedSql(
-                            "direct primitive count/sum partial key shape mismatch".to_string(),
-                        ));
+                    let group_id = match partial_group.key.clone() {
+                        GroupValue::Int64(Some(key)) => count_sum_group_id_for_i64(
+                            index,
+                            key,
+                            &mut self.groups,
+                            &CountSumValueInput::Int64Raw,
+                        ),
+                        GroupValue::Int64(None) => count_sum_null_group_id(
+                            null_group,
+                            &mut self.groups,
+                            GroupValue::Int64(None),
+                            &CountSumValueInput::Int64Raw,
+                        ),
+                        _ => {
+                            return Err(DodamError::UnsupportedSql(
+                                "direct primitive count/sum partial key shape mismatch".to_string(),
+                            ));
+                        }
                     };
-                    let group_id = count_sum_group_id_for_i64(
-                        index,
-                        key,
-                        &mut self.groups,
-                        &CountSumValueInput::Int64Raw,
-                    );
                     self.groups[group_id].merge_group(partial_group);
                 }
             }
@@ -1478,8 +2138,93 @@ impl SingleKeyCountSumVectorState {
 
     pub(crate) fn finish(self) -> AggregateMetrics {
         AggregateMetrics {
-            groups: finish_count_sum_groups(self.group_index, self.groups, self.sum_expr),
+            groups: finish_count_sum_groups(
+                self.group_index,
+                self.groups,
+                self.count_expr,
+                self.sum_expr,
+            ),
             ..AggregateMetrics::default()
+        }
+    }
+}
+
+fn direct_count_sum_row_count_i32(key_values: I32VectorView<'_>) -> Result<usize> {
+    if let Some(keys) = key_values.values_if_null_free() {
+        return Ok(keys.len());
+    }
+    if let Some((_, def_levels)) = key_values.raw_nullable() {
+        return Ok(def_levels.len());
+    }
+    Err(DodamError::UnsupportedSql(
+        "direct primitive count/sum requires raw nullable or non-null key".to_string(),
+    ))
+}
+
+fn direct_count_sum_row_count_i64(key_values: I64VectorView<'_>) -> Result<usize> {
+    if let Some(keys) = key_values.values_if_null_free() {
+        return Ok(keys.len());
+    }
+    if let Some((_, def_levels)) = key_values.raw_nullable() {
+        return Ok(def_levels.len());
+    }
+    Err(DodamError::UnsupportedSql(
+        "direct primitive count/sum requires raw nullable or non-null key".to_string(),
+    ))
+}
+
+enum DirectI64SumInput<'a> {
+    NonNull(&'a [i64]),
+    RawNullable {
+        values: &'a [i64],
+        def_levels: &'a [i16],
+        value_index: usize,
+    },
+}
+
+impl<'a> DirectI64SumInput<'a> {
+    fn try_new(sum_values: I64VectorView<'a>, row_count: usize) -> Result<Self> {
+        if let Some(values) = sum_values.values_if_null_free() {
+            if values.len() != row_count {
+                return Err(DodamError::UnsupportedSql(
+                    "direct primitive count/sum column length mismatch".to_string(),
+                ));
+            }
+            return Ok(Self::NonNull(values));
+        }
+        if let Some((values, def_levels)) = sum_values.raw_nullable() {
+            if def_levels.len() != row_count {
+                return Err(DodamError::UnsupportedSql(
+                    "direct primitive count/sum column length mismatch".to_string(),
+                ));
+            }
+            return Ok(Self::RawNullable {
+                values,
+                def_levels,
+                value_index: 0,
+            });
+        }
+        Err(DodamError::UnsupportedSql(
+            "direct primitive count/sum requires raw nullable or non-null sum input".to_string(),
+        ))
+    }
+
+    fn value(&mut self, row: usize) -> Option<i64> {
+        match self {
+            Self::NonNull(values) => Some(values[row]),
+            Self::RawNullable {
+                values,
+                def_levels,
+                value_index,
+            } => {
+                if def_levels[row] == 0 {
+                    None
+                } else {
+                    let value = values[*value_index];
+                    *value_index += 1;
+                    Some(value)
+                }
+            }
         }
     }
 }
@@ -2088,6 +2833,7 @@ fn merge_single_key_count_sum_partials(
     Ok(Some(finish_count_sum_groups(
         index,
         groups,
+        aggregates[0].clone(),
         aggregates[1].clone(),
     )))
 }
@@ -2844,10 +3590,19 @@ fn collect_three_key_count_sum_groups(
             );
         };
 
-        for row in 0..batch.num_rows() {
-            let key = keys.key(row);
-            let group_id = group_index.group_id(key, &mut groups);
-            groups[group_id].update(&sum_values, row);
+        if let Some(dictionary_len) = keys.dictionary_len() {
+            let mut dictionary_cache = vec![None; dictionary_len];
+            for row in 0..batch.num_rows() {
+                let key = keys.key(row);
+                let group_id = group_index.group_id_cached(key, &mut groups, &mut dictionary_cache);
+                groups[group_id].update(&sum_values, row);
+            }
+        } else {
+            for row in 0..batch.num_rows() {
+                let key = keys.key(row);
+                let group_id = group_index.group_id(key, &mut groups);
+                groups[group_id].update(&sum_values, row);
+            }
         }
     }
 
@@ -2863,6 +3618,18 @@ fn collect_three_key_count_sum_groups(
 enum ThreeKeyCountSumReader<'a> {
     Int32DateUtf8(&'a Int32Array, &'a Date32Array, &'a StringArray),
     Int64DateUtf8(&'a Int64Array, &'a Date32Array, &'a StringArray),
+    Int32DateDictionaryUtf8(
+        &'a Int32Array,
+        &'a Date32Array,
+        &'a DictionaryArray<Int32Type>,
+        DictionaryStringValues<'a>,
+    ),
+    Int64DateDictionaryUtf8(
+        &'a Int64Array,
+        &'a Date32Array,
+        &'a DictionaryArray<Int32Type>,
+        DictionaryStringValues<'a>,
+    ),
 }
 
 impl<'a> ThreeKeyCountSumReader<'a> {
@@ -2878,6 +3645,32 @@ impl<'a> ThreeKeyCountSumReader<'a> {
                 second.as_any().downcast_ref::<Date32Array>()?,
                 third.as_any().downcast_ref::<StringArray>()?,
             )),
+            (DataType::Int32, DataType::Date32, DataType::Dictionary(key, value))
+                if matches!((&**key, &**value), (DataType::Int32, DataType::Utf8)) =>
+            {
+                let third = third
+                    .as_any()
+                    .downcast_ref::<DictionaryArray<Int32Type>>()?;
+                Some(Self::Int32DateDictionaryUtf8(
+                    first.as_any().downcast_ref::<Int32Array>()?,
+                    second.as_any().downcast_ref::<Date32Array>()?,
+                    third,
+                    dictionary_i32_string_values(third)?,
+                ))
+            }
+            (DataType::Int64, DataType::Date32, DataType::Dictionary(key, value))
+                if matches!((&**key, &**value), (DataType::Int32, DataType::Utf8)) =>
+            {
+                let third = third
+                    .as_any()
+                    .downcast_ref::<DictionaryArray<Int32Type>>()?;
+                Some(Self::Int64DateDictionaryUtf8(
+                    first.as_any().downcast_ref::<Int64Array>()?,
+                    second.as_any().downcast_ref::<Date32Array>()?,
+                    third,
+                    dictionary_i32_string_values(third)?,
+                ))
+            }
             _ => None,
         }
     }
@@ -2887,13 +3680,35 @@ impl<'a> ThreeKeyCountSumReader<'a> {
             Self::Int32DateUtf8(first, second, third) => ThreeKeyCountSumBorrowedKey {
                 first: first.is_valid(row).then(|| i64::from(first.value(row))),
                 second: second.is_valid(row).then(|| second.value(row)),
-                third: third.is_valid(row).then(|| third.value(row)),
+                third: Utf8KeyRef::from_option(third.is_valid(row).then(|| third.value(row))),
             },
             Self::Int64DateUtf8(first, second, third) => ThreeKeyCountSumBorrowedKey {
                 first: first.is_valid(row).then(|| first.value(row)),
                 second: second.is_valid(row).then(|| second.value(row)),
-                third: third.is_valid(row).then(|| third.value(row)),
+                third: Utf8KeyRef::from_option(third.is_valid(row).then(|| third.value(row))),
             },
+            Self::Int32DateDictionaryUtf8(first, second, third, dictionary_values) => {
+                ThreeKeyCountSumBorrowedKey {
+                    first: first.is_valid(row).then(|| i64::from(first.value(row))),
+                    second: second.is_valid(row).then(|| second.value(row)),
+                    third: dictionary_utf8_key(third, *dictionary_values, row),
+                }
+            }
+            Self::Int64DateDictionaryUtf8(first, second, third, dictionary_values) => {
+                ThreeKeyCountSumBorrowedKey {
+                    first: first.is_valid(row).then(|| first.value(row)),
+                    second: second.is_valid(row).then(|| second.value(row)),
+                    third: dictionary_utf8_key(third, *dictionary_values, row),
+                }
+            }
+        }
+    }
+
+    fn dictionary_len(&self) -> Option<usize> {
+        match self {
+            Self::Int32DateDictionaryUtf8(_, _, _, values)
+            | Self::Int64DateDictionaryUtf8(_, _, _, values) => Some(values.len()),
+            _ => None,
         }
     }
 }
@@ -2901,7 +3716,48 @@ impl<'a> ThreeKeyCountSumReader<'a> {
 struct ThreeKeyCountSumBorrowedKey<'a> {
     first: Option<i64>,
     second: Option<i32>,
-    third: Option<&'a str>,
+    third: Utf8KeyRef<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum Utf8KeyRef<'a> {
+    Null,
+    Str(&'a str),
+    Dictionary { id: usize, value: &'a str },
+}
+
+impl<'a> Utf8KeyRef<'a> {
+    fn from_option(value: Option<&'a str>) -> Self {
+        value.map(Self::Str).unwrap_or(Self::Null)
+    }
+
+    fn as_option_str(self) -> Option<&'a str> {
+        match self {
+            Self::Null => None,
+            Self::Str(value) | Self::Dictionary { value, .. } => Some(value),
+        }
+    }
+
+    fn to_owned_string(self) -> Option<String> {
+        self.as_option_str().map(str::to_string)
+    }
+}
+
+fn dictionary_utf8_key<'a>(
+    values: &'a DictionaryArray<Int32Type>,
+    dictionary_values: DictionaryStringValues<'a>,
+    row: usize,
+) -> Utf8KeyRef<'a> {
+    if values.is_null(row) {
+        return Utf8KeyRef::Null;
+    }
+    let id = values.keys().value(row);
+    let Ok(id) = usize::try_from(id) else {
+        return Utf8KeyRef::Null;
+    };
+    let value = std::str::from_utf8(dictionary_values.value_bytes(id))
+        .expect("Arrow dictionary Utf8 value should be valid UTF8");
+    Utf8KeyRef::Dictionary { id, value }
 }
 
 #[derive(Default)]
@@ -2927,16 +3783,52 @@ impl ThreeKeyCountSumIndex {
             .second
             .entry(key.second)
             .or_default();
-        if let Some(group_id) = third.lookup(key.third) {
+        if let Some(group_id) = third.lookup_key(key.third) {
             return group_id;
         }
         let group_id = groups.len();
-        third.insert(key.third, group_id);
+        third.insert_key(key.third, group_id);
         groups.push(ThreeKeyCountSumGroup::new(vec![
             GroupValue::Int64(key.first),
             GroupValue::Date32(key.second),
-            GroupValue::Utf8(key.third.map(str::to_string)),
+            GroupValue::Utf8(key.third.to_owned_string()),
         ]));
+        group_id
+    }
+
+    fn group_id_cached(
+        &mut self,
+        key: ThreeKeyCountSumBorrowedKey<'_>,
+        groups: &mut Vec<ThreeKeyCountSumGroup>,
+        cache: &mut [Option<usize>],
+    ) -> usize {
+        let Utf8KeyRef::Dictionary { id, .. } = key.third else {
+            return self.group_id(key, groups);
+        };
+        let third = self
+            .first
+            .entry(key.first)
+            .or_default()
+            .second
+            .entry(key.second)
+            .or_default();
+        if let Some(group_id) = cache[id] {
+            if third.contains_group(group_id) {
+                return group_id;
+            }
+        }
+        if let Some(group_id) = third.lookup_key(key.third) {
+            cache[id] = Some(group_id);
+            return group_id;
+        }
+        let group_id = groups.len();
+        third.insert_key(key.third, group_id);
+        groups.push(ThreeKeyCountSumGroup::new(vec![
+            GroupValue::Int64(key.first),
+            GroupValue::Date32(key.second),
+            GroupValue::Utf8(key.third.to_owned_string()),
+        ]));
+        cache[id] = Some(group_id);
         group_id
     }
 }
@@ -3028,16 +3920,30 @@ fn collect_two_key_count_sum_groups(
         let sum_input = CountSumValueInput::new(sum_column, &sum_expr)?;
 
         group_index.ensure_shape(&key_reader)?;
-        for row in 0..batch.num_rows() {
-            let key = key_reader.key(row);
-            let group_id = group_index.group_id(key, &mut groups, &sum_input)?;
-            groups[group_id].update(&sum_input, row);
+        if let Some(dictionary_len) = key_reader.dictionary_len() {
+            let mut dictionary_cache = vec![None; dictionary_len];
+            for row in 0..batch.num_rows() {
+                let key = key_reader.key(row);
+                let group_id = group_index.group_id_cached(
+                    key,
+                    &mut groups,
+                    &sum_input,
+                    &mut dictionary_cache,
+                )?;
+                groups[group_id].update(&sum_input, row);
+            }
+        } else {
+            for row in 0..batch.num_rows() {
+                let key = key_reader.key(row);
+                let group_id = group_index.group_id(key, &mut groups, &sum_input)?;
+                groups[group_id].update(&sum_input, row);
+            }
         }
     }
 
     let mut group_results = groups
         .into_iter()
-        .map(|group| group.finish(sum_expr.clone()))
+        .map(|group| group.finish(AggregateExpr::CountStar, sum_expr.clone()))
         .collect::<Vec<_>>();
     group_results.sort_by(|left, right| compare_group_keys(&left.keys, &right.keys));
     metrics.groups = group_results;
@@ -3049,6 +3955,26 @@ enum TwoKeyCountSumReader<'a> {
     Int64Utf8(&'a Int64Array, &'a StringArray),
     Utf8Int32(&'a StringArray, &'a Int32Array),
     Utf8Int64(&'a StringArray, &'a Int64Array),
+    Int32DictionaryUtf8(
+        &'a Int32Array,
+        &'a DictionaryArray<Int32Type>,
+        DictionaryStringValues<'a>,
+    ),
+    Int64DictionaryUtf8(
+        &'a Int64Array,
+        &'a DictionaryArray<Int32Type>,
+        DictionaryStringValues<'a>,
+    ),
+    DictionaryUtf8Int32(
+        &'a DictionaryArray<Int32Type>,
+        DictionaryStringValues<'a>,
+        &'a Int32Array,
+    ),
+    DictionaryUtf8Int64(
+        &'a DictionaryArray<Int32Type>,
+        DictionaryStringValues<'a>,
+        &'a Int64Array,
+    ),
 }
 
 impl<'a> TwoKeyCountSumReader<'a> {
@@ -3070,14 +3996,68 @@ impl<'a> TwoKeyCountSumReader<'a> {
                 first.as_any().downcast_ref::<StringArray>()?,
                 second.as_any().downcast_ref::<Int64Array>()?,
             )),
+            (DataType::Int32, DataType::Dictionary(key, value))
+                if matches!((&**key, &**value), (DataType::Int32, DataType::Utf8)) =>
+            {
+                let second = second
+                    .as_any()
+                    .downcast_ref::<DictionaryArray<Int32Type>>()?;
+                Some(Self::Int32DictionaryUtf8(
+                    first.as_any().downcast_ref::<Int32Array>()?,
+                    second,
+                    dictionary_i32_string_values(second)?,
+                ))
+            }
+            (DataType::Int64, DataType::Dictionary(key, value))
+                if matches!((&**key, &**value), (DataType::Int32, DataType::Utf8)) =>
+            {
+                let second = second
+                    .as_any()
+                    .downcast_ref::<DictionaryArray<Int32Type>>()?;
+                Some(Self::Int64DictionaryUtf8(
+                    first.as_any().downcast_ref::<Int64Array>()?,
+                    second,
+                    dictionary_i32_string_values(second)?,
+                ))
+            }
+            (DataType::Dictionary(key, value), DataType::Int32)
+                if matches!((&**key, &**value), (DataType::Int32, DataType::Utf8)) =>
+            {
+                let first = first
+                    .as_any()
+                    .downcast_ref::<DictionaryArray<Int32Type>>()?;
+                Some(Self::DictionaryUtf8Int32(
+                    first,
+                    dictionary_i32_string_values(first)?,
+                    second.as_any().downcast_ref::<Int32Array>()?,
+                ))
+            }
+            (DataType::Dictionary(key, value), DataType::Int64)
+                if matches!((&**key, &**value), (DataType::Int32, DataType::Utf8)) =>
+            {
+                let first = first
+                    .as_any()
+                    .downcast_ref::<DictionaryArray<Int32Type>>()?;
+                Some(Self::DictionaryUtf8Int64(
+                    first,
+                    dictionary_i32_string_values(first)?,
+                    second.as_any().downcast_ref::<Int64Array>()?,
+                ))
+            }
             _ => None,
         }
     }
 
     fn shape(&self) -> TwoKeyCountSumShape {
         match self {
-            Self::Int32Utf8(_, _) | Self::Int64Utf8(_, _) => TwoKeyCountSumShape::IntUtf8,
-            Self::Utf8Int32(_, _) | Self::Utf8Int64(_, _) => TwoKeyCountSumShape::Utf8Int,
+            Self::Int32Utf8(_, _)
+            | Self::Int64Utf8(_, _)
+            | Self::Int32DictionaryUtf8(_, _, _)
+            | Self::Int64DictionaryUtf8(_, _, _) => TwoKeyCountSumShape::IntUtf8,
+            Self::Utf8Int32(_, _)
+            | Self::Utf8Int64(_, _)
+            | Self::DictionaryUtf8Int32(_, _, _)
+            | Self::DictionaryUtf8Int64(_, _, _) => TwoKeyCountSumShape::Utf8Int,
         }
     }
 
@@ -3085,20 +4065,54 @@ impl<'a> TwoKeyCountSumReader<'a> {
         match self {
             Self::Int32Utf8(first, second) => TwoKeyCountSumBorrowedKey::IntUtf8(
                 first.is_valid(row).then(|| i64::from(first.value(row))),
-                second.is_valid(row).then(|| second.value(row)),
+                Utf8KeyRef::from_option(second.is_valid(row).then(|| second.value(row))),
             ),
             Self::Int64Utf8(first, second) => TwoKeyCountSumBorrowedKey::IntUtf8(
                 first.is_valid(row).then(|| first.value(row)),
-                second.is_valid(row).then(|| second.value(row)),
+                Utf8KeyRef::from_option(second.is_valid(row).then(|| second.value(row))),
             ),
             Self::Utf8Int32(first, second) => TwoKeyCountSumBorrowedKey::Utf8Int(
-                first.is_valid(row).then(|| first.value(row)),
+                Utf8KeyRef::from_option(first.is_valid(row).then(|| first.value(row))),
                 second.is_valid(row).then(|| i64::from(second.value(row))),
             ),
             Self::Utf8Int64(first, second) => TwoKeyCountSumBorrowedKey::Utf8Int(
-                first.is_valid(row).then(|| first.value(row)),
+                Utf8KeyRef::from_option(first.is_valid(row).then(|| first.value(row))),
                 second.is_valid(row).then(|| second.value(row)),
             ),
+            Self::Int32DictionaryUtf8(first, second, dictionary_values) => {
+                TwoKeyCountSumBorrowedKey::IntUtf8(
+                    first.is_valid(row).then(|| i64::from(first.value(row))),
+                    dictionary_utf8_key(second, *dictionary_values, row),
+                )
+            }
+            Self::Int64DictionaryUtf8(first, second, dictionary_values) => {
+                TwoKeyCountSumBorrowedKey::IntUtf8(
+                    first.is_valid(row).then(|| first.value(row)),
+                    dictionary_utf8_key(second, *dictionary_values, row),
+                )
+            }
+            Self::DictionaryUtf8Int32(first, dictionary_values, second) => {
+                TwoKeyCountSumBorrowedKey::Utf8Int(
+                    dictionary_utf8_key(first, *dictionary_values, row),
+                    second.is_valid(row).then(|| i64::from(second.value(row))),
+                )
+            }
+            Self::DictionaryUtf8Int64(first, dictionary_values, second) => {
+                TwoKeyCountSumBorrowedKey::Utf8Int(
+                    dictionary_utf8_key(first, *dictionary_values, row),
+                    second.is_valid(row).then(|| second.value(row)),
+                )
+            }
+        }
+    }
+
+    fn dictionary_len(&self) -> Option<usize> {
+        match self {
+            Self::Int32DictionaryUtf8(_, _, values)
+            | Self::Int64DictionaryUtf8(_, _, values)
+            | Self::DictionaryUtf8Int32(_, values, _)
+            | Self::DictionaryUtf8Int64(_, values, _) => Some(values.len()),
+            _ => None,
         }
     }
 }
@@ -3110,8 +4124,8 @@ enum TwoKeyCountSumShape {
 }
 
 enum TwoKeyCountSumBorrowedKey<'a> {
-    IntUtf8(Option<i64>, Option<&'a str>),
-    Utf8Int(Option<&'a str>, Option<i64>),
+    IntUtf8(Option<i64>, Utf8KeyRef<'a>),
+    Utf8Int(Utf8KeyRef<'a>, Option<i64>),
 }
 
 enum TwoKeyCountSumIndex {
@@ -3167,18 +4181,18 @@ impl TwoKeyCountSumIndex {
         match (self, key) {
             (Self::IntUtf8(index), TwoKeyCountSumBorrowedKey::IntUtf8(first, second)) => {
                 let second_index = index.entry(first).or_default();
-                if let Some(group_id) = second_index.lookup(second) {
+                if let Some(group_id) = second_index.lookup_key(second) {
                     return Ok(group_id);
                 }
                 let group_id = Self::push_group(
                     groups,
                     vec![
                         GroupValue::Int64(first),
-                        GroupValue::Utf8(second.map(str::to_string)),
+                        GroupValue::Utf8(second.to_owned_string()),
                     ],
                     sum_input,
                 );
-                second_index.insert(second, group_id);
+                second_index.insert_key(second, group_id);
                 Ok(group_id)
             }
             (
@@ -3189,7 +4203,7 @@ impl TwoKeyCountSumIndex {
                 TwoKeyCountSumBorrowedKey::Utf8Int(first, second),
             ) => {
                 let second_index = match first {
-                    Some(first) => {
+                    Utf8KeyRef::Str(first) | Utf8KeyRef::Dictionary { value: first, .. } => {
                         if !first_groups.contains_key(first) {
                             first_groups.insert(first.to_string(), IntSecondGroupIndex::default());
                         }
@@ -3197,7 +4211,7 @@ impl TwoKeyCountSumIndex {
                             .get_mut(first)
                             .expect("inserted utf8 first-key group")
                     }
-                    None => null_first,
+                    Utf8KeyRef::Null => null_first,
                 };
                 if let Some(group_id) = second_index.lookup(second) {
                     return Ok(group_id);
@@ -3205,7 +4219,7 @@ impl TwoKeyCountSumIndex {
                 let group_id = Self::push_group(
                     groups,
                     vec![
-                        GroupValue::Utf8(first.map(str::to_string)),
+                        GroupValue::Utf8(first.to_owned_string()),
                         GroupValue::Int64(second),
                     ],
                     sum_input,
@@ -3216,6 +4230,91 @@ impl TwoKeyCountSumIndex {
             _ => Err(DodamError::TypeMismatch(
                 "mixed two-key aggregate key shape mismatch".to_string(),
             )),
+        }
+    }
+
+    fn group_id_cached(
+        &mut self,
+        key: TwoKeyCountSumBorrowedKey<'_>,
+        groups: &mut Vec<TwoKeyCountSumGroup>,
+        sum_input: &CountSumValueInput<'_>,
+        cache: &mut [Option<usize>],
+    ) -> Result<usize> {
+        match key {
+            TwoKeyCountSumBorrowedKey::IntUtf8(
+                first,
+                second @ Utf8KeyRef::Dictionary { id, .. },
+            ) => {
+                let second_index = match self {
+                    Self::IntUtf8(index) => index.entry(first).or_default(),
+                    _ => {
+                        return Err(DodamError::TypeMismatch(
+                            "mixed two-key aggregate key shape mismatch".to_string(),
+                        ));
+                    }
+                };
+                if let Some(group_id) = cache[id] {
+                    if second_index.contains_group(group_id) {
+                        return Ok(group_id);
+                    }
+                }
+                if let Some(group_id) = second_index.lookup_key(second) {
+                    cache[id] = Some(group_id);
+                    return Ok(group_id);
+                }
+                let group_id = Self::push_group(
+                    groups,
+                    vec![
+                        GroupValue::Int64(first),
+                        GroupValue::Utf8(second.to_owned_string()),
+                    ],
+                    sum_input,
+                );
+                second_index.insert_key(second, group_id);
+                cache[id] = Some(group_id);
+                Ok(group_id)
+            }
+            TwoKeyCountSumBorrowedKey::Utf8Int(
+                first @ Utf8KeyRef::Dictionary { id, value },
+                second,
+            ) => {
+                let second_index = match self {
+                    Self::Utf8Int { first_groups, .. } => {
+                        if !first_groups.contains_key(value) {
+                            first_groups.insert(value.to_string(), IntSecondGroupIndex::default());
+                        }
+                        first_groups
+                            .get_mut(value)
+                            .expect("inserted utf8 first-key group")
+                    }
+                    _ => {
+                        return Err(DodamError::TypeMismatch(
+                            "mixed two-key aggregate key shape mismatch".to_string(),
+                        ));
+                    }
+                };
+                if let Some(group_id) = cache[id] {
+                    if second_index.contains_group(group_id) {
+                        return Ok(group_id);
+                    }
+                }
+                if let Some(group_id) = second_index.lookup(second) {
+                    cache[id] = Some(group_id);
+                    return Ok(group_id);
+                }
+                let group_id = Self::push_group(
+                    groups,
+                    vec![
+                        GroupValue::Utf8(first.to_owned_string()),
+                        GroupValue::Int64(second),
+                    ],
+                    sum_input,
+                );
+                second_index.insert(second, group_id);
+                cache[id] = Some(group_id);
+                Ok(group_id)
+            }
+            key => self.group_id(key, groups, sum_input),
         }
     }
 
@@ -3238,6 +4337,10 @@ impl Utf8SecondGroupIndex {
         }
     }
 
+    fn lookup_key(&self, value: Utf8KeyRef<'_>) -> Option<usize> {
+        self.lookup(value.as_option_str())
+    }
+
     fn insert(&mut self, value: Option<&str>, group_id: usize) {
         match value {
             Some(value) => {
@@ -3248,6 +4351,14 @@ impl Utf8SecondGroupIndex {
             }
         }
     }
+
+    fn insert_key(&mut self, value: Utf8KeyRef<'_>, group_id: usize) {
+        self.insert(value.as_option_str(), group_id);
+    }
+
+    fn contains_group(&self, group_id: usize) -> bool {
+        self.null_group == Some(group_id) || self.non_null.values().any(|value| *value == group_id)
+    }
 }
 
 impl IntSecondGroupIndex {
@@ -3257,6 +4368,10 @@ impl IntSecondGroupIndex {
 
     fn insert(&mut self, value: Option<i64>, group_id: usize) {
         self.groups.insert(value, group_id);
+    }
+
+    fn contains_group(&self, group_id: usize) -> bool {
+        self.groups.values().any(|value| *value == group_id)
     }
 }
 
@@ -3300,7 +4415,7 @@ impl TwoKeyCountSumGroup {
         }
     }
 
-    fn finish(self, sum_expr: AggregateExpr) -> GroupAggregateResult {
+    fn finish(self, count_expr: AggregateExpr, sum_expr: AggregateExpr) -> GroupAggregateResult {
         let sum_value = if self.sum_count == 0 {
             if self.sum_is_float {
                 AggregateValue::Float64(None)
@@ -3316,7 +4431,7 @@ impl TwoKeyCountSumGroup {
             keys: self.keys,
             values: vec![
                 AggregateResult {
-                    expr: AggregateExpr::CountStar,
+                    expr: count_expr,
                     value: AggregateValue::Count(self.count),
                 },
                 AggregateResult {
@@ -3559,7 +4674,7 @@ fn collect_single_key_count_sum_groups(
         }
     }
 
-    metrics.groups = finish_count_sum_groups(group_index, groups, sum_expr);
+    metrics.groups = finish_count_sum_groups(group_index, groups, aggregates[0].clone(), sum_expr);
     Ok(metrics)
 }
 
@@ -3586,8 +4701,71 @@ fn collect_single_key_count_sum_batch_results(
     Ok(finish_count_sum_groups(
         group_index,
         groups,
+        aggregates[0].clone(),
         aggregates[1].clone(),
     ))
+}
+
+pub struct SingleKeyCountSumBatchAccumulator {
+    group_by: Vec<String>,
+    count_expr: AggregateExpr,
+    sum_expr: AggregateExpr,
+    group_index: CountSumGroupIndex,
+    groups: Vec<CountSumGroup>,
+    metrics: AggregateMetrics,
+}
+
+impl SingleKeyCountSumBatchAccumulator {
+    pub fn try_new(
+        fragments: usize,
+        group_by: &[String],
+        aggregates: &[AggregateExpr],
+    ) -> Option<Self> {
+        if !can_use_single_key_count_sum_path(group_by, aggregates) {
+            return None;
+        }
+        Some(Self {
+            group_by: group_by.to_vec(),
+            count_expr: aggregates[0].clone(),
+            sum_expr: aggregates[1].clone(),
+            group_index: CountSumGroupIndex::Unset,
+            groups: Vec::new(),
+            metrics: AggregateMetrics {
+                fragments,
+                ..AggregateMetrics::default()
+            },
+        })
+    }
+
+    pub fn consume_filtered_batch(
+        &mut self,
+        batch: &RecordBatch,
+        mask: &BooleanArray,
+    ) -> Result<bool> {
+        if batch.num_rows() == 0 {
+            return Ok(true);
+        }
+        self.metrics.batches += 1;
+        self.metrics.rows += selected_mask_count(mask);
+        update_single_key_count_sum_groups_filtered(
+            batch,
+            mask,
+            &self.group_by,
+            &self.sum_expr,
+            &mut self.group_index,
+            &mut self.groups,
+        )
+    }
+
+    pub fn finish(mut self) -> AggregateMetrics {
+        self.metrics.groups = finish_count_sum_groups(
+            self.group_index,
+            self.groups,
+            self.count_expr,
+            self.sum_expr,
+        );
+        self.metrics
+    }
 }
 
 fn update_single_key_count_sum_groups(
@@ -3601,10 +4779,7 @@ fn update_single_key_count_sum_groups(
         unreachable!("count/sum fast path precondition");
     };
     let key_column = batch.column(column_index(batch, &group_by[0])?);
-    if !matches!(
-        key_column.data_type(),
-        DataType::Utf8 | DataType::Int32 | DataType::Int64 | DataType::UInt64
-    ) {
+    if !count_sum_key_type_supported(key_column.data_type()) {
         return Ok(false);
     }
     group_index.ensure_type(key_column.data_type());
@@ -3612,6 +4787,33 @@ fn update_single_key_count_sum_groups(
     let sum_column = batch.column(column_index(batch, sum_column)?);
     let sum_input = CountSumValueInput::new(sum_column, &sum_expr)?;
     group_index.update_batch(key_column, groups, &sum_input)
+}
+
+fn update_single_key_count_sum_groups_filtered(
+    batch: &RecordBatch,
+    mask: &BooleanArray,
+    group_by: &[String],
+    sum_expr: &AggregateExpr,
+    group_index: &mut CountSumGroupIndex,
+    groups: &mut Vec<CountSumGroup>,
+) -> Result<bool> {
+    let AggregateExpr::Sum(sum_column) = sum_expr else {
+        unreachable!("count/sum fast path precondition");
+    };
+    let key_column = batch.column(column_index(batch, &group_by[0])?);
+    if !count_sum_key_type_supported(key_column.data_type()) {
+        return Ok(false);
+    }
+    group_index.ensure_type(key_column.data_type());
+    let sum_column = batch.column(column_index(batch, sum_column)?);
+    let sum_input = CountSumValueInput::new(sum_column, sum_expr)?;
+    group_index.update_batch_filtered(key_column, mask, groups, &sum_input)
+}
+
+fn selected_mask_count(mask: &BooleanArray) -> usize {
+    (0..mask.len())
+        .filter(|row| mask.is_valid(*row) && mask.value(*row))
+        .count()
 }
 
 enum CountSumValueInput<'a> {
@@ -3677,7 +4879,7 @@ impl CountSumGroupIndex {
             return;
         }
         *self = match data_type {
-            DataType::Utf8 => Self::Utf8 {
+            DataType::Utf8 | DataType::Dictionary(_, _) => Self::Utf8 {
                 groups: AggregateHashMap::default(),
                 null_group: None,
             },
@@ -3705,35 +4907,36 @@ impl CountSumGroupIndex {
     ) -> Result<bool> {
         match self {
             Self::Utf8 { groups, null_group } => {
-                let values = key_column
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .expect("Utf8 group key");
-                for row in 0..values.len() {
-                    let group_id = if values.is_null(row) {
-                        count_sum_null_group_id(
-                            null_group,
-                            groups_out,
-                            GroupValue::Utf8(None),
-                            sum_input,
-                        )
-                    } else {
-                        let key = values.value(row);
-                        if let Some(group_id) = groups.get(key).copied() {
-                            group_id
-                        } else {
-                            let group_id = groups_out.len();
-                            groups.insert(key.to_string(), group_id);
-                            groups_out.push(CountSumGroup::new(
-                                GroupValue::Utf8(Some(key.to_string())),
+                if let Some(values) = key_column.as_any().downcast_ref::<StringArray>() {
+                    for row in 0..values.len() {
+                        let group_id = if values.is_null(row) {
+                            count_sum_null_group_id(
+                                null_group,
+                                groups_out,
+                                GroupValue::Utf8(None),
                                 sum_input,
-                            ));
-                            group_id
-                        }
-                    };
-                    groups_out[group_id].update(sum_input, row);
+                            )
+                        } else {
+                            count_sum_group_id_for_utf8(
+                                groups,
+                                values.value(row),
+                                groups_out,
+                                sum_input,
+                            )
+                        };
+                        groups_out[group_id].update(sum_input, row);
+                    }
+                    return Ok(true);
                 }
-                Ok(true)
+                let Some(values) = key_column
+                    .as_any()
+                    .downcast_ref::<DictionaryArray<Int32Type>>()
+                else {
+                    return Ok(false);
+                };
+                update_count_sum_dictionary_utf8_groups(
+                    values, groups, null_group, groups_out, sum_input,
+                )
             }
             Self::Int32 { groups, null_group } => {
                 let values = key_column
@@ -3798,6 +5001,245 @@ impl CountSumGroupIndex {
             Self::Unset => unreachable!("group index type should be initialized"),
         }
     }
+
+    fn update_batch_filtered(
+        &mut self,
+        key_column: &ArrayRef,
+        mask: &BooleanArray,
+        groups_out: &mut Vec<CountSumGroup>,
+        sum_input: &CountSumValueInput<'_>,
+    ) -> Result<bool> {
+        match self {
+            Self::Utf8 { groups, null_group } => {
+                if let Some(values) = key_column.as_any().downcast_ref::<StringArray>() {
+                    for row in 0..values.len() {
+                        if !mask.is_valid(row) || !mask.value(row) {
+                            continue;
+                        }
+                        let group_id = if values.is_null(row) {
+                            count_sum_null_group_id(
+                                null_group,
+                                groups_out,
+                                GroupValue::Utf8(None),
+                                sum_input,
+                            )
+                        } else {
+                            count_sum_group_id_for_utf8(
+                                groups,
+                                values.value(row),
+                                groups_out,
+                                sum_input,
+                            )
+                        };
+                        groups_out[group_id].update(sum_input, row);
+                    }
+                    return Ok(true);
+                }
+                let Some(values) = key_column
+                    .as_any()
+                    .downcast_ref::<DictionaryArray<Int32Type>>()
+                else {
+                    return Ok(false);
+                };
+                update_count_sum_dictionary_utf8_groups_filtered(
+                    values, mask, groups, null_group, groups_out, sum_input,
+                )
+            }
+            Self::Int32 { groups, null_group } => {
+                let values = key_column
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("Int32 group key");
+                for row in 0..values.len() {
+                    if !mask.is_valid(row) || !mask.value(row) {
+                        continue;
+                    }
+                    let group_id = if values.is_null(row) {
+                        count_sum_null_group_id(
+                            null_group,
+                            groups_out,
+                            GroupValue::Int64(None),
+                            sum_input,
+                        )
+                    } else {
+                        count_sum_group_id_for_i32(groups, values.value(row), groups_out, sum_input)
+                    };
+                    groups_out[group_id].update(sum_input, row);
+                }
+                Ok(true)
+            }
+            Self::Int64 { groups, null_group } => {
+                let values = key_column
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64 group key");
+                for row in 0..values.len() {
+                    if !mask.is_valid(row) || !mask.value(row) {
+                        continue;
+                    }
+                    let group_id = if values.is_null(row) {
+                        count_sum_null_group_id(
+                            null_group,
+                            groups_out,
+                            GroupValue::Int64(None),
+                            sum_input,
+                        )
+                    } else {
+                        count_sum_group_id_for_i64(groups, values.value(row), groups_out, sum_input)
+                    };
+                    groups_out[group_id].update(sum_input, row);
+                }
+                Ok(true)
+            }
+            Self::UInt64 { groups, null_group } => {
+                let values = key_column
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .expect("UInt64 group key");
+                for row in 0..values.len() {
+                    if !mask.is_valid(row) || !mask.value(row) {
+                        continue;
+                    }
+                    let group_id = if values.is_null(row) {
+                        count_sum_null_group_id(
+                            null_group,
+                            groups_out,
+                            GroupValue::UInt64(None),
+                            sum_input,
+                        )
+                    } else {
+                        count_sum_group_id_for_u64(groups, values.value(row), groups_out, sum_input)
+                    };
+                    groups_out[group_id].update(sum_input, row);
+                }
+                Ok(true)
+            }
+            Self::Unset => unreachable!("group index type should be initialized"),
+        }
+    }
+}
+
+fn count_sum_key_type_supported(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Utf8 | DataType::Int32 | DataType::Int64 | DataType::UInt64 => true,
+        DataType::Dictionary(key_type, value_type) => {
+            matches!(
+                (&**key_type, &**value_type),
+                (DataType::Int32, DataType::Utf8)
+            )
+        }
+        _ => false,
+    }
+}
+
+fn update_count_sum_dictionary_utf8_groups(
+    values: &DictionaryArray<Int32Type>,
+    groups: &mut AggregateHashMap<String, usize>,
+    null_group: &mut Option<usize>,
+    groups_out: &mut Vec<CountSumGroup>,
+    sum_input: &CountSumValueInput<'_>,
+) -> Result<bool> {
+    let Some(dictionary_values) = dictionary_i32_string_values(values) else {
+        return Ok(false);
+    };
+    let keys = values.keys().values().as_ref();
+    let mut group_ids = vec![None; dictionary_values.len()];
+    for row in 0..values.len() {
+        let group_id = if values.is_null(row) {
+            count_sum_null_group_id(null_group, groups_out, GroupValue::Utf8(None), sum_input)
+        } else {
+            count_sum_group_id_for_dictionary_utf8_cached(
+                groups,
+                &dictionary_values,
+                keys[row],
+                &mut group_ids,
+                groups_out,
+                sum_input,
+            )?
+        };
+        groups_out[group_id].update(sum_input, row);
+    }
+    Ok(true)
+}
+
+fn update_count_sum_dictionary_utf8_groups_filtered(
+    values: &DictionaryArray<Int32Type>,
+    mask: &BooleanArray,
+    groups: &mut AggregateHashMap<String, usize>,
+    null_group: &mut Option<usize>,
+    groups_out: &mut Vec<CountSumGroup>,
+    sum_input: &CountSumValueInput<'_>,
+) -> Result<bool> {
+    let Some(dictionary_values) = dictionary_i32_string_values(values) else {
+        return Ok(false);
+    };
+    let keys = values.keys().values().as_ref();
+    let mut group_ids = vec![None; dictionary_values.len()];
+    for row in 0..values.len() {
+        if !mask.is_valid(row) || !mask.value(row) {
+            continue;
+        }
+        let group_id = if values.is_null(row) {
+            count_sum_null_group_id(null_group, groups_out, GroupValue::Utf8(None), sum_input)
+        } else {
+            count_sum_group_id_for_dictionary_utf8_cached(
+                groups,
+                &dictionary_values,
+                keys[row],
+                &mut group_ids,
+                groups_out,
+                sum_input,
+            )?
+        };
+        groups_out[group_id].update(sum_input, row);
+    }
+    Ok(true)
+}
+
+fn count_sum_group_id_for_utf8(
+    index: &mut AggregateHashMap<String, usize>,
+    key: &str,
+    groups: &mut Vec<CountSumGroup>,
+    sum_input: &CountSumValueInput<'_>,
+) -> usize {
+    if let Some(group_id) = index.get(key).copied() {
+        return group_id;
+    }
+    let group_id = groups.len();
+    index.insert(key.to_string(), group_id);
+    groups.push(CountSumGroup::new(
+        GroupValue::Utf8(Some(key.to_string())),
+        sum_input,
+    ));
+    group_id
+}
+
+fn count_sum_group_id_for_dictionary_utf8_cached(
+    index: &mut AggregateHashMap<String, usize>,
+    dictionary_values: &DictionaryStringValues<'_>,
+    key: i32,
+    cached_group_ids: &mut [Option<usize>],
+    groups: &mut Vec<CountSumGroup>,
+    sum_input: &CountSumValueInput<'_>,
+) -> Result<usize> {
+    let key_index = usize::try_from(key).map_err(|_| {
+        DodamError::UnsupportedSql("negative dictionary key in Utf8 aggregate".to_string())
+    })?;
+    if key_index >= dictionary_values.len() {
+        return Err(DodamError::UnsupportedSql(
+            "dictionary key out of range in Utf8 aggregate".to_string(),
+        ));
+    }
+    if let Some(group_id) = cached_group_ids[key_index] {
+        return Ok(group_id);
+    }
+    let key_bytes = dictionary_values.value_bytes(key_index);
+    let key = std::str::from_utf8(key_bytes).map_err(|_| {
+        DodamError::UnsupportedSql("invalid UTF8 dictionary value in aggregate".to_string())
+    })?;
+    let group_id = count_sum_group_id_for_utf8(index, key, groups, sum_input);
+    cached_group_ids[key_index] = Some(group_id);
+    Ok(group_id)
 }
 
 fn count_sum_group_id_for_i32(
@@ -4118,10 +5560,12 @@ impl CountSumGroup {
         }
     }
 
-    fn update_raw_i64_non_null(&mut self, value: i64) {
+    fn update_raw_i64_optional(&mut self, value: Option<i64>) {
         self.count += 1;
-        self.sum_i64 = self.sum_i64.saturating_add(value);
-        self.sum_count += 1;
+        if let Some(value) = value {
+            self.sum_i64 = self.sum_i64.saturating_add(value);
+            self.sum_count += 1;
+        }
     }
 
     fn merge_group(&mut self, partial: Self) {
@@ -4159,7 +5603,7 @@ impl CountSumGroup {
         Ok(())
     }
 
-    fn finish(self, sum_expr: AggregateExpr) -> GroupAggregateResult {
+    fn finish(self, count_expr: AggregateExpr, sum_expr: AggregateExpr) -> GroupAggregateResult {
         let sum_value = if self.sum_count == 0 {
             if self.sum_is_float {
                 AggregateValue::Float64(None)
@@ -4175,7 +5619,7 @@ impl CountSumGroup {
             keys: vec![self.key],
             values: vec![
                 AggregateResult {
-                    expr: AggregateExpr::CountStar,
+                    expr: count_expr,
                     value: AggregateValue::Count(self.count),
                 },
                 AggregateResult {
@@ -4190,25 +5634,32 @@ impl CountSumGroup {
 fn finish_count_sum_groups(
     group_index: CountSumGroupIndex,
     groups: Vec<CountSumGroup>,
+    count_expr: AggregateExpr,
     sum_expr: AggregateExpr,
 ) -> Vec<GroupAggregateResult> {
     match group_index {
         CountSumGroupIndex::Int32 {
             groups: index,
             null_group,
-        } => finish_ordered_count_sum_groups(index.iter(), null_group, groups, sum_expr),
+        } => {
+            finish_ordered_count_sum_groups(index.iter(), null_group, groups, count_expr, sum_expr)
+        }
         CountSumGroupIndex::Int64 {
             groups: index,
             null_group,
-        } => finish_ordered_count_sum_groups(index.iter(), null_group, groups, sum_expr),
+        } => {
+            finish_ordered_count_sum_groups(index.iter(), null_group, groups, count_expr, sum_expr)
+        }
         CountSumGroupIndex::UInt64 {
             groups: index,
             null_group,
-        } => finish_ordered_count_sum_groups(index.iter(), null_group, groups, sum_expr),
+        } => {
+            finish_ordered_count_sum_groups(index.iter(), null_group, groups, count_expr, sum_expr)
+        }
         _ => {
             let mut group_results = groups
                 .into_iter()
-                .map(|group| group.finish(sum_expr.clone()))
+                .map(|group| group.finish(count_expr.clone(), sum_expr.clone()))
                 .collect::<Vec<_>>();
             group_results.sort_by(|left, right| compare_group_keys(&left.keys, &right.keys));
             group_results
@@ -4220,6 +5671,7 @@ fn finish_ordered_count_sum_groups<K, I>(
     index: I,
     null_group: Option<usize>,
     groups: Vec<CountSumGroup>,
+    count_expr: AggregateExpr,
     sum_expr: AggregateExpr,
 ) -> Vec<GroupAggregateResult>
 where
@@ -4233,11 +5685,11 @@ where
     if let Some(group_id) = null_group
         && let Some(group) = groups.get_mut(group_id).and_then(Option::take)
     {
-        results.push(group.finish(sum_expr.clone()));
+        results.push(group.finish(count_expr.clone(), sum_expr.clone()));
     }
     for (_, group_id) in entries {
         if let Some(group) = groups.get_mut(group_id).and_then(Option::take) {
-            results.push(group.finish(sum_expr.clone()));
+            results.push(group.finish(count_expr.clone(), sum_expr.clone()));
         }
     }
     results

@@ -17,7 +17,7 @@ pub fn plan_join_inputs(
     right_alias: &str,
     right_keys: &[String],
 ) -> JoinInputPlan {
-    JoinInputPlan {
+    let plan = JoinInputPlan {
         left_projection: join_side_projection(projection, filter, order_by, left_alias, left_keys),
         right_projection: join_side_projection(
             projection,
@@ -28,7 +28,26 @@ pub fn plan_join_inputs(
         ),
         left_filter: filter.and_then(|filter| join_side_filter(filter, left_alias)),
         right_filter: filter.and_then(|filter| join_side_filter(filter, right_alias)),
+    };
+    log_join_input_plan(left_alias, right_alias, &plan);
+    plan
+}
+
+fn log_join_input_plan(left_alias: &str, right_alias: &str, plan: &JoinInputPlan) {
+    if !std::env::var("DODAM_OPTIMIZER_TRACE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return;
     }
+    eprintln!(
+        "[dodam:optimizer] rule=join_input_pushdown decision=plan left_alias={} right_alias={} left_projection={} right_projection={} left_filter={} right_filter={}",
+        left_alias,
+        right_alias,
+        projection_display(&plan.left_projection),
+        projection_display(&plan.right_projection),
+        plan.left_filter.is_some(),
+        plan.right_filter.is_some(),
+    );
 }
 
 fn join_side_projection(
@@ -73,6 +92,13 @@ fn add_join_side_column(columns: &mut Vec<String>, qualified_column: &str, prefi
 fn add_column_once(columns: &mut Vec<String>, column: String) {
     if !columns.iter().any(|existing| existing == &column) {
         columns.push(column);
+    }
+}
+
+fn projection_display(projection: &Projection) -> String {
+    match projection {
+        Projection::All => "*".to_string(),
+        Projection::Columns(columns) => format!("[{}]", columns.join(",")),
     }
 }
 
