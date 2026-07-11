@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
@@ -7,9 +8,9 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Decimal128Array, DictionaryArray,
-    Float64Array, Int32Array, Int64Array, ListArray, StringArray, StructArray,
-    TimestampMillisecondArray, UInt64Array,
+    Array, ArrayRef, BooleanArray, BooleanBufferBuilder, BooleanBuilder, Date32Array, Date64Array,
+    Decimal128Array, DictionaryArray, Float64Array, Int32Array, Int64Array, ListArray, StringArray,
+    StructArray, TimestampMillisecondArray, UInt32Array, UInt64Array,
 };
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Int32Type, Schema, TimeUnit};
@@ -25,8 +26,8 @@ use sqlparser::ast::{
     AccessExpr, BinaryOperator, DateTimeField, Distinct, DuplicateTreatment, Expr as SqlExpr,
     FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator,
     LimitClause, ObjectName, ObjectNamePart, OrderByKind, Query, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, SetExpr, Statement, Subscript, TableFactor, UnaryOperator,
-    Value, WindowType,
+    SelectItemQualifiedWildcardKind, SetExpr, SetOperator, SetQuantifier, Statement, Subscript,
+    TableFactor, UnaryOperator, Value, WindowType,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -38,32 +39,34 @@ use crate::dense::{
 use crate::engine::{
     DodamEngine, JoinAlgorithm, JoinParquetRequest, LateMaterializationPolicy,
     LateMaterializedMetrics, LateSelectionBuilder, OrderedRowGroupBoundary, OrderedRowGroupChunk,
-    merge_ordered_row_group_chunks,
+    RowGroupBatchScanProfile, merge_ordered_row_group_chunks,
 };
 use crate::error::{DodamError, Result};
 use crate::execution::JoinType;
 use crate::execution::{
     AggregateExpr, AggregateMetrics, AggregateResult, AggregateValue, CoalesceKeyCountSumCollector,
-    ComparisonExpr, ComparisonOp, DecimalInput, DistinctExec, Expr, FilterExpr,
-    GroupAggregateResult, GroupKeyExpr, GroupKeyLiteral, GroupValue, HashJoinExec, JoinBuildSide,
-    LiteralValue, MemoryExec, PhysicalPlan, PredicateSet, Projection, RecordBatchSink,
-    ScanPlanMetrics, SendableBatchStream, SortExpr, SortKey, aggregate_metrics_to_batches,
-    collect_aggregates, collect_grouped_aggregates, collect_grouped_aggregates_with_key_exprs,
-    decimal_discounted_revenue_raw, decimal_discounted_revenue_raw_i64,
-    decimal_discounted_revenue_scales, decimal_input, evaluate_filter_mask,
-    evaluate_projected_view_filter_mask, filter_batch, try_for_each_i64_i64_date32,
+    ComparisonExpr, ComparisonOp, DecimalDateRangeFilter, DecimalInput, DistinctExec, Expr,
+    FilterExpr, GroupAggregateResult, GroupKeyExpr, GroupKeyLiteral, GroupValue, HashJoinExec,
+    JoinBuildSide, LiteralValue, MemoryExec, PhysicalPlan, PredicateSet, Projection,
+    RecordBatchSink, ScanPlanMetrics, SendableBatchStream, SortExpr, SortKey,
+    aggregate_metrics_to_batches, collect_aggregates, collect_grouped_aggregates,
+    collect_grouped_aggregates_with_key_exprs, decimal_discounted_revenue_raw,
+    decimal_discounted_revenue_raw_i64, decimal_discounted_revenue_scales, decimal_input,
+    evaluate_filter_mask, evaluate_projected_view_filter_mask, filter_batch,
+    try_for_each_i64_i64_date32,
 };
 use crate::hash::{FastHashMap, FastHashSet, fast_hash_map, fast_hash_map_with_capacity};
 use crate::optimizer::{JoinInputPlan, plan_join_inputs};
 use crate::storage::{
-    DirectColumnScanMetrics, DirectI64I32I32ScanMetrics, DirectPrimitiveColumnSpec,
-    DirectPrimitiveColumnType,
+    DirectColumnScanMetrics, DirectI64I32I32ScanMetrics, DirectPrimitiveColumnScanMetrics,
+    DirectPrimitiveColumnSpec, DirectPrimitiveColumnType,
 };
 use crate::vector::{
     BatchConsumer, BatchView, Date32VectorView, Decimal128VectorView, DictionaryI32View,
     DictionaryStringValues, I32VectorView, I64VectorView, SelectionVector, Utf8VectorView,
     consume_record_batch, dictionary_i32_view_match_flags, dictionary_i32_view_match_index,
-    store_i64_keys_matching_dictionary_target, store_i64_keys_matching_utf8_target,
+    read_i32_le_unaligned, read_i64_le_unaligned, store_i64_keys_matching_dictionary_target,
+    store_i64_keys_matching_utf8_target,
 };
 
 fn tpch_profile_enabled() -> bool {
@@ -198,6 +201,9 @@ pub async fn execute_sql(
 ) -> Result<QueryOutput> {
     if let Some(plan) = explain_sql(engine, sql, batch_size).await? {
         return Ok(QueryOutput::Explain { plan });
+    }
+    if let Some(output) = try_execute_set_operation_sql(engine, sql, batch_size).await? {
+        return Ok(output);
     }
     if let Some(output) = try_execute_q15_top_supplier_fast(engine, sql, batch_size).await? {
         return Ok(output);
@@ -506,7 +512,26 @@ pub async fn execute_sql(
         let aggregates = query.aggregates.clone();
         let group_by = query.group_by.clone();
         let metrics = if !query.aggregate_expressions.is_empty() {
-            if let Some(metrics) = try_collect_expression_aggregate_late_materialized(
+            if let Some(metrics) = try_collect_expression_aggregate_fused_dictionary_selected(
+                engine,
+                query.path.clone(),
+                batch_size,
+                query.filter.clone(),
+                &group_by,
+                &aggregates,
+                &query.aggregate_expressions,
+                query.order_by.is_some(),
+                expression_aggregate_output_limit(
+                    &group_by,
+                    query.order_by.as_ref(),
+                    query.limit,
+                    query.offset,
+                ),
+            )
+            .await?
+            {
+                metrics
+            } else if let Some(metrics) = try_collect_expression_aggregate_late_materialized(
                 engine,
                 query.path.clone(),
                 batch_size,
@@ -648,6 +673,1485 @@ pub async fn execute_sql(
         apply_output_order_limit(collect_batches(stream)?, None, query.limit, query.offset)?;
     let batches = rename_output_batches(batches, &query.aliases)?;
     Ok(QueryOutput::Scan { batches })
+}
+
+async fn try_execute_set_operation_sql(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    if !query_contains_set_operation(query.body.as_ref()) {
+        return Ok(None);
+    }
+    let order_by = parse_order_by(query, &[], &[], None)?;
+    let limit = parse_limit(query)?;
+    let offset = parse_offset(query)?;
+    if let Some(batches) = try_execute_same_source_union_all_monotonic_topk(
+        engine,
+        query.body.as_ref(),
+        batch_size,
+        order_by.as_ref(),
+        limit,
+        offset,
+    )
+    .await?
+    {
+        return Ok(Some(QueryOutput::Scan { batches }));
+    }
+    if let Some(mut batches) =
+        try_execute_same_source_union_all_scan(engine, query.body.as_ref(), batch_size).await?
+    {
+        batches = apply_output_order_limit(batches, order_by.as_ref(), limit, offset)?;
+        return Ok(Some(QueryOutput::Scan { batches }));
+    }
+    let child_topk = if offset == 0 {
+        order_by.as_ref().zip(limit)
+    } else {
+        None
+    };
+    let mut batches = Box::pin(execute_union_all_set_expr(
+        engine,
+        query.body.as_ref(),
+        batch_size,
+        child_topk,
+    ))
+    .await?;
+    batches = apply_output_order_limit(batches, order_by.as_ref(), limit, offset)?;
+    Ok(Some(QueryOutput::Scan { batches }))
+}
+
+async fn try_execute_same_source_union_all_monotonic_topk(
+    engine: &DodamEngine,
+    expr: &SetExpr,
+    batch_size: usize,
+    order_by: Option<&SortKey>,
+    limit: Option<usize>,
+    offset: usize,
+) -> Result<Option<Vec<RecordBatch>>> {
+    let (Some(order_by), Some(limit)) = (order_by, limit) else {
+        return Ok(None);
+    };
+    if offset != 0 || limit == 0 {
+        return Ok(None);
+    }
+    let [sort] = order_by.expressions.as_slice() else {
+        return Ok(None);
+    };
+    if !sort.descending || sort.nulls_first {
+        return Ok(None);
+    }
+    let Some(shared) = plan_same_source_union_all_scan(expr)? else {
+        return Ok(None);
+    };
+    if let Some(mut batches) =
+        try_row_group_ordered_desc_sort(engine, &shared, order_by, &sort.column, batch_size, limit)
+            .await?
+    {
+        batches = apply_output_projection(batches, &shared.projection)?;
+        batches = rename_output_batches(batches, &shared.aliases)?;
+        return Ok(Some(batches));
+    }
+    if let Some(mut batches) =
+        try_reverse_row_group_desc_tail_topk(engine, &shared, &sort.column, batch_size, limit)
+            .await?
+    {
+        batches = apply_output_order_limit(batches, Some(order_by), Some(limit), 0)?;
+        batches = apply_output_projection(batches, &shared.projection)?;
+        batches = rename_output_batches(batches, &shared.aliases)?;
+        return Ok(Some(batches));
+    }
+    if let Some(mut batches) = try_same_source_union_all_streaming_desc_topk(
+        engine,
+        &shared,
+        &sort.column,
+        batch_size,
+        limit,
+    )
+    .await?
+    {
+        batches = apply_output_projection(batches, &shared.projection)?;
+        batches = rename_output_batches(batches, &shared.aliases)?;
+        return Ok(Some(batches));
+    }
+    let stream = engine
+        .scan_parquet_filtered_batches_preserve_order(
+            shared.path,
+            batch_size,
+            shared.projection,
+            Some(shared.filter),
+        )
+        .await?;
+    let Some(mut batches) = collect_monotonic_desc_tail_topk(stream, &sort.column, limit)? else {
+        return Ok(None);
+    };
+    batches = rename_output_batches(batches, &shared.aliases)?;
+    batches = apply_output_order_limit(batches, Some(order_by), Some(limit), 0)?;
+    Ok(Some(batches))
+}
+
+async fn try_row_group_ordered_desc_sort(
+    engine: &DodamEngine,
+    shared: &SameSourceUnionAllScan,
+    order_by: &SortKey,
+    sort_column: &str,
+    batch_size: usize,
+    limit: usize,
+) -> Result<Option<Vec<RecordBatch>>> {
+    if limit <= reverse_row_group_topk_max_limit_rows() {
+        return Ok(None);
+    }
+    if !engine
+        .parquet_row_groups_monotonic_by_column(shared.path.clone(), sort_column)
+        .await?
+    {
+        return Ok(None);
+    }
+    let row_group_count = engine.parquet_row_group_count(&shared.path)?;
+    if row_group_count == 0 {
+        return Ok(Some(Vec::new()));
+    }
+
+    let mut scan_projection = shared.projection.clone();
+    add_projection_columns(&mut scan_projection, shared.filter.referenced_columns());
+    for sort in &order_by.expressions {
+        add_projection_columns(&mut scan_projection, vec![sort.column.clone()]);
+    }
+
+    if row_group_ordered_desc_bulk_global_sort_enabled() {
+        let row_groups = (0..row_group_count).rev().collect::<Vec<_>>();
+        let batches = engine
+            .scan_parquet_row_group_batches(
+                shared.path.clone(),
+                batch_size,
+                scan_projection,
+                row_groups,
+            )
+            .await?;
+        let mut filtered = Vec::new();
+        for batch in batches {
+            let batch = filter_batch(batch, &shared.filter)?;
+            if batch.num_rows() > 0 {
+                filtered.push(batch);
+            }
+        }
+        return Ok(Some(apply_output_order_limit(
+            filtered,
+            Some(order_by),
+            Some(limit),
+            0,
+        )?));
+    }
+
+    if row_group_ordered_desc_parallel_enabled() && row_group_count > 1 {
+        let row_group_batch_size = row_group_ordered_sort_batch_size(batch_size);
+        let mut handles = Vec::with_capacity(row_group_count);
+        for row_group in (0..row_group_count).rev() {
+            let engine = engine.clone();
+            let path = shared.path.clone();
+            let scan_projection = scan_projection.clone();
+            let filter = shared.filter.clone();
+            let order_by = order_by.clone();
+            let sort_column = sort_column.to_string();
+            handles.push(tokio::task::spawn(async move {
+                scan_filter_sort_ordered_row_group(
+                    &engine,
+                    path,
+                    row_group_batch_size,
+                    scan_projection,
+                    row_group,
+                    &filter,
+                    &order_by,
+                    &sort_column,
+                )
+                .await
+            }));
+        }
+        let mut output = Vec::new();
+        let mut rows = 0usize;
+        for handle in handles {
+            let sorted = handle
+                .await
+                .map_err(|error| DodamError::UnsupportedSql(error.to_string()))??;
+            for batch in sorted {
+                rows += batch.num_rows();
+                output.push(batch);
+            }
+            if rows >= limit {
+                break;
+            }
+        }
+        return Ok(Some(limit_batches(output, Some(limit), 0)));
+    }
+
+    let mut output = Vec::new();
+    let mut rows = 0usize;
+    let row_group_batch_size = row_group_ordered_sort_batch_size(batch_size);
+    for row_group in (0..row_group_count).rev() {
+        let sorted = scan_filter_sort_ordered_row_group(
+            engine,
+            shared.path.clone(),
+            row_group_batch_size,
+            scan_projection.clone(),
+            row_group,
+            &shared.filter,
+            order_by,
+            sort_column,
+        )
+        .await?;
+        for batch in sorted {
+            rows += batch.num_rows();
+            output.push(batch);
+        }
+        if rows >= limit {
+            break;
+        }
+    }
+    Ok(Some(limit_batches(output, Some(limit), 0)))
+}
+
+async fn scan_filter_sort_ordered_row_group(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    projection: Projection,
+    row_group: usize,
+    filter: &FilterExpr,
+    order_by: &SortKey,
+    sort_column: &str,
+) -> Result<Vec<RecordBatch>> {
+    let profile = ordered_sink_profile_enabled();
+    let total_started = profile.then(Instant::now);
+    let scan_started = profile.then(Instant::now);
+    let batches = engine
+        .scan_parquet_row_group_batches(path, batch_size, projection, vec![row_group])
+        .await?;
+    let scan_elapsed = scan_started.map(|started| started.elapsed());
+    let post_started = profile.then(Instant::now);
+    if let Some(sorted) =
+        reverse_filter_ascending_batches_if_ordered(&batches, sort_column, filter)?
+    {
+        print_ordered_row_group_profile(
+            total_started,
+            scan_elapsed,
+            post_started.map(|started| started.elapsed()),
+            row_group,
+            sorted.iter().map(RecordBatch::num_rows).sum(),
+            sorted.len(),
+            "reverse-filter",
+        );
+        return Ok(sorted);
+    }
+    let mut filtered = Vec::new();
+    for batch in batches {
+        let batch = filter_batch(batch, filter)?;
+        if batch.num_rows() > 0 {
+            filtered.push(batch);
+        }
+    }
+    if filtered.is_empty() {
+        print_ordered_row_group_profile(
+            total_started,
+            scan_elapsed,
+            post_started.map(|started| started.elapsed()),
+            row_group,
+            0,
+            0,
+            "empty",
+        );
+        return Ok(Vec::new());
+    }
+    let result = match reverse_ascending_primitive_batches_if_ordered(&filtered, sort_column)? {
+        Some(sorted) => Ok(sorted),
+        None => apply_output_order_limit(filtered, Some(order_by), None, 0),
+    }?;
+    print_ordered_row_group_profile(
+        total_started,
+        scan_elapsed,
+        post_started.map(|started| started.elapsed()),
+        row_group,
+        result.iter().map(RecordBatch::num_rows).sum(),
+        result.len(),
+        "filter-sort",
+    );
+    Ok(result)
+}
+
+fn row_group_ordered_desc_parallel_enabled() -> bool {
+    std::env::var("DODAM_ROW_GROUP_ORDERED_DESC_PARALLEL")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn print_ordered_row_group_profile(
+    total_started: Option<Instant>,
+    scan_elapsed: Option<Duration>,
+    post_elapsed: Option<Duration>,
+    row_group: usize,
+    rows: usize,
+    batches: usize,
+    mode: &str,
+) {
+    let Some(total_started) = total_started else {
+        return;
+    };
+    eprintln!(
+        "[dodam:ordered-row-group-profile] row_group={} mode={} total={}us scan={}us post={}us rows={} batches={}",
+        row_group,
+        mode,
+        total_started.elapsed().as_micros(),
+        scan_elapsed
+            .map(|duration| duration.as_micros())
+            .unwrap_or(0),
+        post_elapsed
+            .map(|duration| duration.as_micros())
+            .unwrap_or(0),
+        rows,
+        batches
+    );
+}
+
+fn reverse_filter_ascending_batches_if_ordered(
+    batches: &[RecordBatch],
+    sort_column: &str,
+    filter: &FilterExpr,
+) -> Result<Option<Vec<RecordBatch>>> {
+    let mut previous_last: Option<i128> = None;
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let index = output_batch_column_index(batch, sort_column)?;
+        let Some((first, last)) = numeric_column_ascending_bounds(batch.column(index))? else {
+            return Ok(None);
+        };
+        if previous_last.is_some_and(|previous| previous > first) {
+            return Ok(None);
+        }
+        previous_last = Some(last);
+    }
+
+    let mut output = Vec::new();
+    for batch in batches.iter().rev() {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        if let Some(batch) = reverse_primitive_in_list_selected_batch(batch, filter)? {
+            if batch.num_rows() > 0 {
+                output.push(batch);
+            }
+            continue;
+        }
+        let indices = match reverse_simple_in_list_indices(batch, filter)? {
+            Some(indices) => indices,
+            None if reverse_filter_ordered_batches_disabled() => return Ok(None),
+            None => {
+                let mask = evaluate_filter_mask(batch, filter)?;
+                let mut indices = Vec::new();
+                for row in (0..batch.num_rows()).rev() {
+                    if !mask.is_null(row) && mask.value(row) {
+                        indices.push(row as u32);
+                    }
+                }
+                indices
+            }
+        };
+        if indices.is_empty() {
+            continue;
+        }
+        output.push(take_record_batch(batch, &UInt32Array::from(indices))?);
+    }
+    Ok(Some(output))
+}
+
+fn reverse_primitive_in_list_selected_batch(
+    batch: &RecordBatch,
+    filter: &FilterExpr,
+) -> Result<Option<RecordBatch>> {
+    if !reverse_primitive_in_list_ordered_batches_enabled() {
+        return Ok(None);
+    }
+    reverse_primitive_in_list_selected_batch_unchecked(batch, filter)
+}
+
+fn reverse_primitive_in_list_selected_batch_unchecked(
+    batch: &RecordBatch,
+    filter: &FilterExpr,
+) -> Result<Option<RecordBatch>> {
+    let Some(indices) = reverse_simple_in_list_indices_unchecked(batch, filter)? else {
+        return Ok(None);
+    };
+    if indices.is_empty() {
+        return Ok(Some(RecordBatch::new_empty(batch.schema())));
+    }
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for column in batch.columns() {
+        let Some(array) = gather_primitive_array(column, &indices) else {
+            return Ok(None);
+        };
+        columns.push(array);
+    }
+    Ok(Some(RecordBatch::try_new(batch.schema(), columns)?))
+}
+
+fn gather_primitive_array(column: &ArrayRef, indices: &[u32]) -> Option<ArrayRef> {
+    if column.null_count() != 0 {
+        return None;
+    }
+    match column.data_type() {
+        DataType::Int32 => {
+            let values = column.as_any().downcast_ref::<Int32Array>()?;
+            let mut output = Vec::with_capacity(indices.len());
+            for &index in indices {
+                output.push(values.value(index as usize));
+            }
+            Some(Arc::new(Int32Array::from(output)))
+        }
+        DataType::Int64 => {
+            let values = column.as_any().downcast_ref::<Int64Array>()?;
+            let mut output = Vec::with_capacity(indices.len());
+            for &index in indices {
+                output.push(values.value(index as usize));
+            }
+            Some(Arc::new(Int64Array::from(output)))
+        }
+        DataType::UInt64 => {
+            let values = column.as_any().downcast_ref::<UInt64Array>()?;
+            let mut output = Vec::with_capacity(indices.len());
+            for &index in indices {
+                output.push(values.value(index as usize));
+            }
+            Some(Arc::new(UInt64Array::from(output)))
+        }
+        DataType::Float64 => {
+            let values = column.as_any().downcast_ref::<Float64Array>()?;
+            let mut output = Vec::with_capacity(indices.len());
+            for &index in indices {
+                output.push(values.value(index as usize));
+            }
+            Some(Arc::new(Float64Array::from(output)))
+        }
+        DataType::Date32 => {
+            let values = column.as_any().downcast_ref::<Date32Array>()?;
+            let mut output = Vec::with_capacity(indices.len());
+            for &index in indices {
+                output.push(values.value(index as usize));
+            }
+            Some(Arc::new(Date32Array::from(output)))
+        }
+        _ => None,
+    }
+}
+
+fn reverse_simple_in_list_indices(
+    batch: &RecordBatch,
+    filter: &FilterExpr,
+) -> Result<Option<Vec<u32>>> {
+    if !reverse_in_list_ordered_batches_enabled() {
+        return Ok(None);
+    }
+    reverse_simple_in_list_indices_unchecked(batch, filter)
+}
+
+fn reverse_simple_in_list_indices_unchecked(
+    batch: &RecordBatch,
+    filter: &FilterExpr,
+) -> Result<Option<Vec<u32>>> {
+    let Expr::InList {
+        column,
+        values,
+        negated,
+        ..
+    } = filter.expr()
+    else {
+        return Ok(None);
+    };
+    if *negated {
+        return Ok(None);
+    }
+    let column_index = output_batch_column_index(batch, column)?;
+    let array = batch.column(column_index);
+    match array.data_type() {
+        DataType::Int32 => {
+            let values = values
+                .iter()
+                .map(|value| value.as_i32(column))
+                .collect::<Result<Vec<_>>>()?;
+            let values_array = array.as_any().downcast_ref::<Int32Array>().expect("Int32");
+            let mut indices = Vec::new();
+            for row in (0..values_array.len()).rev() {
+                if !values_array.is_null(row)
+                    && values.iter().any(|value| *value == values_array.value(row))
+                {
+                    indices.push(row as u32);
+                }
+            }
+            Ok(Some(indices))
+        }
+        DataType::Int64 => {
+            let values = values
+                .iter()
+                .map(|value| value.as_i64(column))
+                .collect::<Result<Vec<_>>>()?;
+            let values_array = array.as_any().downcast_ref::<Int64Array>().expect("Int64");
+            let mut indices = Vec::new();
+            for row in (0..values_array.len()).rev() {
+                if !values_array.is_null(row)
+                    && values.iter().any(|value| *value == values_array.value(row))
+                {
+                    indices.push(row as u32);
+                }
+            }
+            Ok(Some(indices))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn reverse_primitive_in_list_ordered_batches_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_REVERSE_PRIMITIVE_IN_LIST_ORDERED_BATCHES")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn reverse_in_list_ordered_batches_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_REVERSE_IN_LIST_ORDERED_BATCHES")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn reverse_filter_ordered_batches_disabled() -> bool {
+    std::env::var("DODAM_DISABLE_REVERSE_FILTER_ORDERED_BATCHES")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
+        .unwrap_or(true)
+}
+
+fn row_group_ordered_sort_batch_size(default_batch_size: usize) -> usize {
+    std::env::var("DODAM_ROW_GROUP_ORDERED_SORT_BATCH_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| default_batch_size.max(value))
+        .unwrap_or(default_batch_size)
+}
+
+fn reverse_ascending_primitive_batches_if_ordered(
+    batches: &[RecordBatch],
+    sort_column: &str,
+) -> Result<Option<Vec<RecordBatch>>> {
+    if row_group_primitive_reverse_materialization_disabled() {
+        return Ok(None);
+    }
+    let mut previous_last: Option<i128> = None;
+    for batch in batches {
+        if !record_batch_supports_fast_reverse(batch) {
+            return Ok(None);
+        }
+        let index = output_batch_column_index(batch, sort_column)?;
+        let Some((first, last)) = numeric_column_ascending_bounds(batch.column(index))? else {
+            return Ok(None);
+        };
+        if previous_last.is_some_and(|previous| previous > first) {
+            return Ok(None);
+        }
+        previous_last = Some(last);
+    }
+
+    let mut output = Vec::with_capacity(batches.len());
+    for batch in batches.iter().rev() {
+        let Some(reversed) = reverse_primitive_record_batch_rows(batch)? else {
+            return Ok(None);
+        };
+        output.push(reversed);
+    }
+    Ok(Some(output))
+}
+
+fn row_group_primitive_reverse_materialization_disabled() -> bool {
+    std::env::var("DODAM_DISABLE_ROW_GROUP_PRIMITIVE_REVERSE_MATERIALIZATION")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
+        .unwrap_or(true)
+}
+
+fn row_group_ordered_desc_bulk_global_sort_enabled() -> bool {
+    std::env::var("DODAM_ROW_GROUP_ORDERED_DESC_BULK_GLOBAL_SORT")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn record_batch_supports_fast_reverse(batch: &RecordBatch) -> bool {
+    batch
+        .columns()
+        .iter()
+        .all(|column| primitive_array_supports_fast_reverse(column))
+}
+
+fn primitive_array_supports_fast_reverse(column: &ArrayRef) -> bool {
+    column.null_count() == 0
+        && matches!(
+            column.data_type(),
+            DataType::Int32
+                | DataType::Int64
+                | DataType::UInt64
+                | DataType::Float64
+                | DataType::Date32
+        )
+}
+
+fn reverse_primitive_record_batch_rows(batch: &RecordBatch) -> Result<Option<RecordBatch>> {
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for column in batch.columns() {
+        let Some(reversed) = reverse_primitive_array(column) else {
+            return Ok(None);
+        };
+        columns.push(reversed);
+    }
+    Ok(Some(RecordBatch::try_new(batch.schema(), columns)?))
+}
+
+fn reverse_primitive_array(column: &ArrayRef) -> Option<ArrayRef> {
+    if column.null_count() != 0 {
+        return None;
+    }
+    match column.data_type() {
+        DataType::Int32 => {
+            let values = column.as_any().downcast_ref::<Int32Array>()?;
+            let mut output = Vec::with_capacity(values.len());
+            for row in (0..values.len()).rev() {
+                output.push(values.value(row));
+            }
+            Some(Arc::new(Int32Array::from(output)))
+        }
+        DataType::Int64 => {
+            let values = column.as_any().downcast_ref::<Int64Array>()?;
+            let mut output = Vec::with_capacity(values.len());
+            for row in (0..values.len()).rev() {
+                output.push(values.value(row));
+            }
+            Some(Arc::new(Int64Array::from(output)))
+        }
+        DataType::UInt64 => {
+            let values = column.as_any().downcast_ref::<UInt64Array>()?;
+            let mut output = Vec::with_capacity(values.len());
+            for row in (0..values.len()).rev() {
+                output.push(values.value(row));
+            }
+            Some(Arc::new(UInt64Array::from(output)))
+        }
+        DataType::Float64 => {
+            let values = column.as_any().downcast_ref::<Float64Array>()?;
+            let mut output = Vec::with_capacity(values.len());
+            for row in (0..values.len()).rev() {
+                output.push(values.value(row));
+            }
+            Some(Arc::new(Float64Array::from(output)))
+        }
+        DataType::Date32 => {
+            let values = column.as_any().downcast_ref::<Date32Array>()?;
+            let mut output = Vec::with_capacity(values.len());
+            for row in (0..values.len()).rev() {
+                output.push(values.value(row));
+            }
+            Some(Arc::new(Date32Array::from(output)))
+        }
+        _ => None,
+    }
+}
+
+async fn try_reverse_row_group_desc_tail_topk(
+    engine: &DodamEngine,
+    shared: &SameSourceUnionAllScan,
+    sort_column: &str,
+    batch_size: usize,
+    limit: usize,
+) -> Result<Option<Vec<RecordBatch>>> {
+    if limit > reverse_row_group_topk_max_limit_rows() {
+        return Ok(None);
+    }
+    if !engine
+        .parquet_row_groups_monotonic_by_column(shared.path.clone(), sort_column)
+        .await?
+    {
+        return Ok(None);
+    }
+    let row_group_count = engine.parquet_row_group_count(&shared.path)?;
+    if row_group_count == 0 {
+        return Ok(Some(Vec::new()));
+    }
+
+    let mut scan_projection = shared.projection.clone();
+    add_projection_columns(&mut scan_projection, shared.filter.referenced_columns());
+    add_projection_columns(&mut scan_projection, vec![sort_column.to_string()]);
+
+    let mut suffix = Vec::new();
+    let mut suffix_rows = 0usize;
+    for row_group in (0..row_group_count).rev() {
+        let batches = engine
+            .scan_parquet_row_group_batches(
+                shared.path.clone(),
+                batch_size,
+                scan_projection.clone(),
+                vec![row_group],
+            )
+            .await?;
+        let mut filtered = Vec::new();
+        for batch in batches {
+            let batch = filter_batch(batch, &shared.filter)?;
+            if batch.num_rows() > 0 {
+                filtered.push(batch);
+            }
+        }
+        suffix_rows += filtered.iter().map(RecordBatch::num_rows).sum::<usize>();
+        suffix.splice(0..0, filtered);
+        if suffix_rows >= limit {
+            break;
+        }
+    }
+    Ok(Some(suffix))
+}
+
+fn reverse_row_group_topk_max_limit_rows() -> usize {
+    std::env::var("DODAM_REVERSE_ROW_GROUP_TOPK_MAX_LIMIT_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(65_536)
+}
+
+fn collect_monotonic_desc_tail_topk(
+    mut stream: SendableBatchStream,
+    sort_column: &str,
+    limit: usize,
+) -> Result<Option<Vec<RecordBatch>>> {
+    let mut tail = VecDeque::new();
+    let mut tail_rows = 0usize;
+    let mut previous_last = None;
+
+    for batch in stream.by_ref() {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let index = output_batch_column_index(&batch, sort_column)?;
+        let column = batch.column(index);
+        let Some((first, last)) = numeric_column_ascending_bounds(column)? else {
+            return Ok(None);
+        };
+        if previous_last.is_some_and(|previous| previous > first) {
+            return Ok(None);
+        }
+        previous_last = Some(last);
+        tail_rows += batch.num_rows();
+        tail.push_back(batch);
+        while tail_rows > limit {
+            let excess = tail_rows - limit;
+            let front_rows = tail.front().map(RecordBatch::num_rows).unwrap_or(0);
+            if excess >= front_rows {
+                tail.pop_front();
+                tail_rows -= front_rows;
+            } else if let Some(front) = tail.pop_front() {
+                let kept = front.slice(excess, front_rows - excess);
+                tail_rows -= excess;
+                tail.push_front(kept);
+            }
+        }
+    }
+    if tail.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    Ok(Some(tail.into_iter().collect()))
+}
+
+async fn try_same_source_union_all_streaming_desc_topk(
+    engine: &DodamEngine,
+    shared: &SameSourceUnionAllScan,
+    sort_column: &str,
+    batch_size: usize,
+    limit: usize,
+) -> Result<Option<Vec<RecordBatch>>> {
+    if limit > reverse_row_group_topk_max_limit_rows() {
+        return Ok(None);
+    }
+
+    let mut scan_projection = shared.projection.clone();
+    add_projection_columns(&mut scan_projection, shared.filter.referenced_columns());
+    add_projection_columns(&mut scan_projection, vec![sort_column.to_string()]);
+
+    let mut stream = engine
+        .scan_parquet_batches(
+            shared.path.clone(),
+            batch_size,
+            None,
+            scan_projection,
+            Some(shared.filter.clone()),
+        )
+        .await?;
+    let mut batches = Vec::new();
+    let mut heap = BinaryHeap::<Reverse<(i128, u64, usize, u32)>>::with_capacity(limit + 1);
+    let mut sequence = 0u64;
+
+    for batch in stream.by_ref() {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let key_index = output_batch_column_index(&batch, sort_column)?;
+        let key_column = batch.column(key_index);
+        if !topk_sort_key_type_supported(key_column.data_type()) {
+            return Ok(None);
+        }
+        let batch_index = batches.len();
+        if !update_streaming_desc_topk_heap(
+            key_column,
+            batch_index,
+            limit,
+            &mut sequence,
+            &mut heap,
+        )? {
+            return Ok(None);
+        }
+        batches.push(batch);
+    }
+
+    if heap.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    let mut selected = heap
+        .into_iter()
+        .map(|Reverse(item)| item)
+        .collect::<Vec<_>>();
+    selected.sort_unstable_by(|left, right| right.cmp(left));
+    let batch = materialize_topk_selected_rows(&batches, &selected)?;
+    Ok(Some(vec![batch]))
+}
+
+fn update_streaming_desc_topk_heap(
+    key_column: &ArrayRef,
+    batch_index: usize,
+    limit: usize,
+    sequence: &mut u64,
+    heap: &mut BinaryHeap<Reverse<(i128, u64, usize, u32)>>,
+) -> Result<bool> {
+    match key_column.data_type() {
+        DataType::Int32 => {
+            let values = key_column
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("Int32 data type");
+            update_streaming_desc_topk_heap_typed(
+                values.len(),
+                |row| (!values.is_null(row)).then(|| i128::from(values.value(row))),
+                batch_index,
+                limit,
+                sequence,
+                heap,
+            )
+        }
+        DataType::Int64 => {
+            let values = key_column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 data type");
+            update_streaming_desc_topk_heap_typed(
+                values.len(),
+                |row| (!values.is_null(row)).then(|| i128::from(values.value(row))),
+                batch_index,
+                limit,
+                sequence,
+                heap,
+            )
+        }
+        DataType::UInt64 => {
+            let values = key_column
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("UInt64 data type");
+            update_streaming_desc_topk_heap_typed(
+                values.len(),
+                |row| (!values.is_null(row)).then(|| i128::from(values.value(row))),
+                batch_index,
+                limit,
+                sequence,
+                heap,
+            )
+        }
+        DataType::Date32 => {
+            let values = key_column
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .expect("Date32 data type");
+            update_streaming_desc_topk_heap_typed(
+                values.len(),
+                |row| (!values.is_null(row)).then(|| i128::from(values.value(row))),
+                batch_index,
+                limit,
+                sequence,
+                heap,
+            )
+        }
+        data_type => Err(DodamError::UnsupportedSql(format!(
+            "unsupported streaming top-k sort type: {data_type:?}"
+        ))),
+    }
+}
+
+fn update_streaming_desc_topk_heap_typed<F>(
+    rows: usize,
+    mut key_at: F,
+    batch_index: usize,
+    limit: usize,
+    sequence: &mut u64,
+    heap: &mut BinaryHeap<Reverse<(i128, u64, usize, u32)>>,
+) -> Result<bool>
+where
+    F: FnMut(usize) -> Option<i128>,
+{
+    let mut threshold = (heap.len() == limit)
+        .then(|| heap.peek().map(|worst| worst.0))
+        .flatten();
+    for row in 0..rows {
+        let Some(key) = key_at(row) else {
+            return Ok(false);
+        };
+        if let Some(worst) = threshold
+            && key < worst.0
+        {
+            *sequence = (*sequence).wrapping_add(1);
+            continue;
+        }
+        let item = (key, *sequence, batch_index, row as u32);
+        *sequence = (*sequence).wrapping_add(1);
+        if heap.len() < limit {
+            heap.push(Reverse(item));
+            if heap.len() == limit {
+                threshold = heap.peek().map(|worst| worst.0);
+            }
+        } else {
+            let mut replaced = false;
+            {
+                if let Some(mut worst) = heap.peek_mut()
+                    && item > worst.0
+                {
+                    *worst = Reverse(item);
+                    replaced = true;
+                }
+            }
+            if replaced {
+                threshold = heap.peek().map(|worst| worst.0);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn materialize_topk_selected_rows(
+    batches: &[RecordBatch],
+    selected: &[(i128, u64, usize, u32)],
+) -> Result<RecordBatch> {
+    if selected.is_empty() {
+        let schema = batches
+            .first()
+            .map(RecordBatch::schema)
+            .unwrap_or_else(|| Arc::new(Schema::empty()));
+        return Ok(RecordBatch::new_empty(schema));
+    }
+    if let Some(batch) = gather_topk_selected_record_batch(batches, selected)? {
+        return Ok(batch);
+    }
+    let mut chunks = Vec::with_capacity(selected.len());
+    for &(_, _, batch_index, row) in selected {
+        chunks.push(batches[batch_index].slice(row as usize, 1));
+    }
+    let schema = chunks[0].schema();
+    Ok(concat_batches(&schema, chunks.iter())?)
+}
+
+fn gather_topk_selected_record_batch(
+    batches: &[RecordBatch],
+    selected: &[(i128, u64, usize, u32)],
+) -> Result<Option<RecordBatch>> {
+    let Some(first_batch) = batches.first() else {
+        return Ok(None);
+    };
+    let schema = first_batch.schema();
+    let mut columns = Vec::with_capacity(first_batch.num_columns());
+    for column_index in 0..first_batch.num_columns() {
+        let Some(column) = gather_topk_selected_array(batches, selected, column_index) else {
+            return Ok(None);
+        };
+        columns.push(column);
+    }
+    Ok(Some(RecordBatch::try_new(schema, columns)?))
+}
+
+fn gather_topk_selected_array(
+    batches: &[RecordBatch],
+    selected: &[(i128, u64, usize, u32)],
+    column_index: usize,
+) -> Option<ArrayRef> {
+    let data_type = batches.first()?.column(column_index).data_type().clone();
+    if batches
+        .iter()
+        .any(|batch| batch.column(column_index).data_type() != &data_type)
+    {
+        return None;
+    }
+
+    match data_type {
+        DataType::Boolean => {
+            let mut output = Vec::with_capacity(selected.len());
+            for &(_, _, batch_index, row) in selected {
+                let values = batches[batch_index]
+                    .column(column_index)
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()?;
+                let row = row as usize;
+                output.push((!values.is_null(row)).then(|| values.value(row)));
+            }
+            Some(Arc::new(BooleanArray::from(output)))
+        }
+        DataType::Int32 => {
+            let mut output = Vec::with_capacity(selected.len());
+            for &(_, _, batch_index, row) in selected {
+                let values = batches[batch_index]
+                    .column(column_index)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()?;
+                let row = row as usize;
+                output.push((!values.is_null(row)).then(|| values.value(row)));
+            }
+            Some(Arc::new(Int32Array::from(output)))
+        }
+        DataType::Int64 => {
+            let mut output = Vec::with_capacity(selected.len());
+            for &(_, _, batch_index, row) in selected {
+                let values = batches[batch_index]
+                    .column(column_index)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()?;
+                let row = row as usize;
+                output.push((!values.is_null(row)).then(|| values.value(row)));
+            }
+            Some(Arc::new(Int64Array::from(output)))
+        }
+        DataType::UInt64 => {
+            let mut output = Vec::with_capacity(selected.len());
+            for &(_, _, batch_index, row) in selected {
+                let values = batches[batch_index]
+                    .column(column_index)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()?;
+                let row = row as usize;
+                output.push((!values.is_null(row)).then(|| values.value(row)));
+            }
+            Some(Arc::new(UInt64Array::from(output)))
+        }
+        DataType::Float64 => {
+            let mut output = Vec::with_capacity(selected.len());
+            for &(_, _, batch_index, row) in selected {
+                let values = batches[batch_index]
+                    .column(column_index)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()?;
+                let row = row as usize;
+                output.push((!values.is_null(row)).then(|| values.value(row)));
+            }
+            Some(Arc::new(Float64Array::from(output)))
+        }
+        DataType::Date32 => {
+            let mut output = Vec::with_capacity(selected.len());
+            for &(_, _, batch_index, row) in selected {
+                let values = batches[batch_index]
+                    .column(column_index)
+                    .as_any()
+                    .downcast_ref::<Date32Array>()?;
+                let row = row as usize;
+                output.push((!values.is_null(row)).then(|| values.value(row)));
+            }
+            Some(Arc::new(Date32Array::from(output)))
+        }
+        _ => None,
+    }
+}
+
+fn topk_sort_key_type_supported(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int32 | DataType::Int64 | DataType::UInt64 | DataType::Date32
+    )
+}
+
+fn numeric_column_ascending_bounds(column: &ArrayRef) -> Result<Option<(i128, i128)>> {
+    match column.data_type() {
+        DataType::Int32 => {
+            let values = column
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("Int32 data type");
+            primitive_ascending_bounds(values.len(), |row| {
+                (!values.is_null(row)).then(|| i128::from(values.value(row)))
+            })
+        }
+        DataType::Int64 => {
+            let values = column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 data type");
+            primitive_ascending_bounds(values.len(), |row| {
+                (!values.is_null(row)).then(|| i128::from(values.value(row)))
+            })
+        }
+        DataType::UInt64 => {
+            let values = column
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("UInt64 data type");
+            primitive_ascending_bounds(values.len(), |row| {
+                (!values.is_null(row)).then(|| i128::from(values.value(row)))
+            })
+        }
+        DataType::Date32 => {
+            let values = column
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .expect("Date32 data type");
+            primitive_ascending_bounds(values.len(), |row| {
+                (!values.is_null(row)).then(|| i128::from(values.value(row)))
+            })
+        }
+        _ => Ok(None),
+    }
+}
+
+fn primitive_ascending_bounds<F>(len: usize, mut value: F) -> Result<Option<(i128, i128)>>
+where
+    F: FnMut(usize) -> Option<i128>,
+{
+    if len == 0 {
+        return Ok(None);
+    }
+    let Some(first) = value(0) else {
+        return Ok(None);
+    };
+    let mut previous = first;
+    for row in 1..len {
+        let Some(current) = value(row) else {
+            return Ok(None);
+        };
+        if previous > current {
+            return Ok(None);
+        }
+        previous = current;
+    }
+    Ok(Some((first, previous)))
+}
+
+async fn try_execute_same_source_union_all_scan(
+    engine: &DodamEngine,
+    expr: &SetExpr,
+    batch_size: usize,
+) -> Result<Option<Vec<RecordBatch>>> {
+    let Some(shared) = plan_same_source_union_all_scan(expr)? else {
+        return Ok(None);
+    };
+    let stream = engine
+        .scan_parquet_batches(
+            shared.path,
+            batch_size,
+            None,
+            shared.projection,
+            Some(shared.filter),
+        )
+        .await?;
+    let batches = rename_output_batches(collect_batches(stream)?, &shared.aliases)?;
+    Ok(Some(batches))
+}
+
+fn plan_same_source_union_all_scan(expr: &SetExpr) -> Result<Option<SameSourceUnionAllScan>> {
+    let mut operands = Vec::new();
+    if !collect_union_all_operand_queries(expr, &mut operands)? || operands.len() < 2 {
+        return Ok(None);
+    }
+    let Some(shared) = same_source_disjoint_union_all_plan(&operands) else {
+        return Ok(None);
+    };
+    Ok(Some(shared))
+}
+
+struct SameSourceUnionAllScan {
+    path: PathBuf,
+    projection: Projection,
+    aliases: Vec<(String, String)>,
+    filter: FilterExpr,
+}
+
+fn collect_union_all_operand_queries(expr: &SetExpr, output: &mut Vec<SqlQuery>) -> Result<bool> {
+    match expr {
+        SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } if *op == SetOperator::Union && *set_quantifier == SetQuantifier::All => {
+            Ok(collect_union_all_operand_queries(left.as_ref(), output)?
+                && collect_union_all_operand_queries(right.as_ref(), output)?)
+        }
+        SetExpr::SetOperation { .. } => Ok(false),
+        SetExpr::Query(query) => {
+            if query_contains_set_operation(query.body.as_ref()) {
+                return collect_union_all_operand_queries(query.body.as_ref(), output);
+            }
+            if query.order_by.is_some()
+                || query.limit_clause.is_some()
+                || parse_offset(query)? != 0
+                || query.fetch.is_some()
+                || !query.locks.is_empty()
+            {
+                return Ok(false);
+            }
+            output.push(parse_sql(&query.to_string())?);
+            Ok(true)
+        }
+        SetExpr::Select(_) => {
+            output.push(parse_sql(&expr.to_string())?);
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn same_source_disjoint_union_all_plan(operands: &[SqlQuery]) -> Option<SameSourceUnionAllScan> {
+    let first = operands.first()?;
+    if !same_source_union_all_operand_supported(first) {
+        return None;
+    }
+    let (equality_column, first_value) = equality_literal_filter(first.filter.as_ref()?)?;
+    let mut values = vec![first_value];
+    for operand in operands.iter().skip(1) {
+        if !same_source_union_all_operand_supported(operand)
+            || operand.path != first.path
+            || operand.projection != first.projection
+            || operand.aliases != first.aliases
+        {
+            return None;
+        }
+        let (column, value) = equality_literal_filter(operand.filter.as_ref()?)?;
+        if column != equality_column || values.iter().any(|existing| existing == &value) {
+            return None;
+        }
+        values.push(value);
+    }
+    Some(SameSourceUnionAllScan {
+        path: first.path.clone(),
+        projection: first.projection.clone(),
+        aliases: first.aliases.clone(),
+        filter: FilterExpr::new(Expr::InList {
+            column: equality_column,
+            values,
+            negated: false,
+            has_null: false,
+        }),
+    })
+}
+
+fn same_source_union_all_operand_supported(query: &SqlQuery) -> bool {
+    query.join.is_none()
+        && query.expression_filter.is_none()
+        && query.having.is_none()
+        && query.order_by.is_none()
+        && query.limit.is_none()
+        && query.offset == 0
+        && !query.distinct
+        && query.aggregates.is_empty()
+        && query.aggregate_expressions.is_empty()
+        && projection_expressions_are_plain_columns(&query.expressions)
+        && query.group_by.is_empty()
+        && query.qualified_wildcards.is_empty()
+}
+
+fn projection_expressions_are_plain_columns(expressions: &[ProjectionExpression]) -> bool {
+    expressions
+        .iter()
+        .all(|expression| matches!(expression.expr, ScalarSqlExpression::Column(_)))
+}
+
+fn equality_literal_filter(filter: &FilterExpr) -> Option<(String, LiteralValue)> {
+    match filter.expr() {
+        Expr::Comparison(comparison)
+            if comparison.op == ComparisonOp::Eq
+                && !matches!(comparison.value, LiteralValue::Null) =>
+        {
+            Some((comparison.column.clone(), comparison.value.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn query_contains_set_operation(expr: &SetExpr) -> bool {
+    match expr {
+        SetExpr::SetOperation { .. } => true,
+        SetExpr::Query(query) => query_contains_set_operation(query.body.as_ref()),
+        _ => false,
+    }
+}
+
+async fn execute_union_all_set_expr(
+    engine: &DodamEngine,
+    expr: &SetExpr,
+    batch_size: usize,
+    child_topk: Option<(&SortKey, usize)>,
+) -> Result<Vec<RecordBatch>> {
+    match expr {
+        SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } if *op == SetOperator::Union && *set_quantifier == SetQuantifier::All => {
+            let mut left_batches = Box::pin(execute_union_all_set_expr(
+                engine,
+                left.as_ref(),
+                batch_size,
+                child_topk,
+            ))
+            .await?;
+            let right_batches = Box::pin(execute_union_all_set_expr(
+                engine,
+                right.as_ref(),
+                batch_size,
+                child_topk,
+            ))
+            .await?;
+            append_union_all_batches(&mut left_batches, right_batches)?;
+            Ok(left_batches)
+        }
+        SetExpr::SetOperation {
+            op, set_quantifier, ..
+        } => Err(DodamError::UnsupportedSql(format!(
+            "{op} {set_quantifier} is not supported yet"
+        ))),
+        SetExpr::Query(query) => {
+            if query_contains_set_operation(query.body.as_ref()) {
+                return Box::pin(execute_union_all_set_expr(
+                    engine,
+                    query.body.as_ref(),
+                    batch_size,
+                    child_topk,
+                ))
+                .await;
+            }
+            if query.order_by.is_some()
+                || query.limit_clause.is_some()
+                || query.fetch.is_some()
+                || !query.locks.is_empty()
+            {
+                return Err(DodamError::UnsupportedSql(
+                    "ORDER BY, LIMIT, FETCH, and locking clauses inside UNION ALL operands are not supported yet"
+                        .to_string(),
+                ));
+            }
+            let sql = union_all_operand_sql_with_child_topk(&query.to_string(), child_topk);
+            query_output_batches(Box::pin(execute_sql(engine, &sql, batch_size)).await?)
+        }
+        SetExpr::Select(_) => {
+            let sql = union_all_operand_sql_with_child_topk(&expr.to_string(), child_topk);
+            query_output_batches(Box::pin(execute_sql(engine, &sql, batch_size)).await?)
+        }
+        other => Err(DodamError::UnsupportedSql(format!(
+            "unsupported UNION ALL operand: {other}"
+        ))),
+    }
+}
+
+fn union_all_operand_sql_with_child_topk(
+    sql: &str,
+    child_topk: Option<(&SortKey, usize)>,
+) -> String {
+    let Some((order_by, limit)) = child_topk else {
+        return sql.to_string();
+    };
+    format!("{sql} ORDER BY {} LIMIT {limit}", sort_key_to_sql(order_by))
+}
+
+fn sort_key_to_sql(order_by: &SortKey) -> String {
+    order_by
+        .expressions
+        .iter()
+        .map(|sort| {
+            let mut sql = sort.column.clone();
+            if sort.descending {
+                sql.push_str(" DESC");
+            } else {
+                sql.push_str(" ASC");
+            }
+            if sort.nulls_first {
+                sql.push_str(" NULLS FIRST");
+            }
+            sql
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn append_union_all_batches(
+    output: &mut Vec<RecordBatch>,
+    mut batches: Vec<RecordBatch>,
+) -> Result<()> {
+    let Some(output_schema) = output
+        .iter()
+        .find(|batch| batch.num_columns() > 0 || batch.num_rows() > 0)
+        .map(RecordBatch::schema)
+        .or_else(|| batches.first().map(RecordBatch::schema))
+    else {
+        output.append(&mut batches);
+        return Ok(());
+    };
+    validate_union_all_batches(&output_schema, output)?;
+    validate_union_all_batches(&output_schema, &batches)?;
+    output.extend(
+        batches
+            .into_iter()
+            .map(|batch| align_union_all_batch_schema(batch, output_schema.clone()))
+            .collect::<Result<Vec<_>>>()?,
+    );
+    Ok(())
+}
+
+fn validate_union_all_batches(schema: &Arc<Schema>, batches: &[RecordBatch]) -> Result<()> {
+    for batch in batches {
+        if batch.num_columns() != schema.fields().len() {
+            return Err(DodamError::UnsupportedSql(format!(
+                "UNION ALL column count mismatch: expected {}, got {}",
+                schema.fields().len(),
+                batch.num_columns()
+            )));
+        }
+        for (index, (expected, actual)) in schema
+            .fields()
+            .iter()
+            .zip(batch.schema().fields())
+            .enumerate()
+        {
+            if expected.data_type() != actual.data_type() {
+                return Err(DodamError::UnsupportedSql(format!(
+                    "UNION ALL column {} type mismatch: expected {}, got {}",
+                    index + 1,
+                    expected.data_type(),
+                    actual.data_type()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn align_union_all_batch_schema(batch: RecordBatch, schema: Arc<Schema>) -> Result<RecordBatch> {
+    if batch.schema().fields() == schema.fields() {
+        return Ok(batch);
+    }
+    Ok(RecordBatch::try_new(schema, batch.columns().to_vec())?)
 }
 
 async fn try_execute_exists_subquery_sql(
@@ -3142,28 +4646,121 @@ async fn try_execute_projection_expression_sql(
         batches = apply_output_order_limit(batches, order_by.as_ref(), limit, 0)?;
         return Ok(Some(QueryOutput::Scan { batches }));
     }
-    let stream = if filter_requires_expression {
-        engine
-            .scan_parquet_batches(path.path, batch_size, None, scan_projection, None)
-            .await?
-    } else if let Some(order_by) = order_by.clone() {
-        engine
-            .scan_parquet_ordered_batches_by(
-                path.path,
-                batch_size,
-                limit,
-                scan_projection,
-                filter,
-                order_by,
+    let (stream, expression_filter_stream_limited) = if filter_requires_expression {
+        if let (Some(selection), Some(limit)) = (select.selection.as_ref(), limit) {
+            let auto_exact_monotonic_order_column =
+                expression_filter_exact_monotonic_stream_limit_auto_enabled()
+                    .then(|| monotonic_stream_limit_column(order_by.as_ref()))
+                    .flatten();
+            if expression_filter_stream_limit_enabled()
+                || auto_exact_monotonic_order_column.is_some()
+            {
+                let monotonic_order_column =
+                    auto_exact_monotonic_order_column.clone().or_else(|| {
+                        expression_filter_monotonic_stream_limit_enabled()
+                            .then(|| monotonic_stream_limit_column(order_by.as_ref()))
+                            .flatten()
+                    });
+                let use_monotonic_stream = if let Some(column) = monotonic_order_column.as_ref() {
+                    if expression_filter_exact_monotonic_stream_limit_enabled()
+                        || auto_exact_monotonic_order_column.is_some()
+                    {
+                        engine
+                            .parquet_row_groups_monotonic_by_column(path.path.clone(), column)
+                            .await?
+                            && engine
+                                .parquet_column_monotonic_by_scan(
+                                    path.path.clone(),
+                                    column,
+                                    batch_size,
+                                )
+                                .await?
+                    } else {
+                        engine
+                            .parquet_row_groups_monotonic_by_column(path.path.clone(), column)
+                            .await?
+                    }
+                } else {
+                    false
+                };
+                let stream = if use_monotonic_stream {
+                    engine
+                        .scan_parquet_batches(path.path, batch_size, None, scan_projection, None)
+                        .await?
+                } else if auto_exact_monotonic_order_column.is_some() {
+                    engine
+                        .scan_parquet_batches(path.path, batch_size, None, scan_projection, None)
+                        .await?
+                } else if let Some(order_by) = order_by.clone() {
+                    engine
+                        .scan_parquet_ordered_batches_by(
+                            path.path,
+                            batch_size,
+                            None,
+                            scan_projection,
+                            None,
+                            order_by,
+                        )
+                        .await?
+                } else {
+                    engine
+                        .scan_parquet_batches(path.path, batch_size, None, scan_projection, None)
+                        .await?
+                };
+                if use_monotonic_stream || auto_exact_monotonic_order_column.is_none() {
+                    let batches = collect_expression_filtered_limit_batches(
+                        stream,
+                        selection,
+                        path.alias.as_deref(),
+                        limit,
+                    )?;
+                    (SendableBatchStream::from_batches(batches), true)
+                } else {
+                    (stream, false)
+                }
+            } else {
+                (
+                    engine
+                        .scan_parquet_batches(path.path, batch_size, None, scan_projection, None)
+                        .await?,
+                    false,
+                )
+            }
+        } else {
+            (
+                engine
+                    .scan_parquet_batches(path.path, batch_size, None, scan_projection, None)
+                    .await?,
+                false,
             )
-            .await?
+        }
+    } else if let Some(order_by) = order_by.clone() {
+        (
+            engine
+                .scan_parquet_ordered_batches_by(
+                    path.path,
+                    batch_size,
+                    limit,
+                    scan_projection,
+                    filter,
+                    order_by,
+                )
+                .await?,
+            false,
+        )
     } else {
-        engine
-            .scan_parquet_batches(path.path, batch_size, limit, scan_projection, filter)
-            .await?
+        (
+            engine
+                .scan_parquet_batches(path.path, batch_size, limit, scan_projection, filter)
+                .await?,
+            false,
+        )
     };
     let mut batches = collect_batches(stream)?;
-    if filter_requires_expression && let Some(selection) = select.selection.as_ref() {
+    if filter_requires_expression
+        && !expression_filter_stream_limited
+        && let Some(selection) = select.selection.as_ref()
+    {
         batches = apply_output_expression_filter(batches, selection, path.alias.as_deref())?;
         batches = apply_output_order_limit(batches, order_by.as_ref(), limit, 0)?;
     }
@@ -3265,7 +4862,7 @@ fn late_projection_row_group_chunk() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(2)
+        .unwrap_or(4)
 }
 
 fn late_projection_max_selected_ratio() -> f64 {
@@ -3282,6 +4879,33 @@ fn late_projection_max_selector_run_ratio() -> f64 {
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite())
         .unwrap_or(0.25)
+}
+
+fn expression_filter_stream_limit_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_EXPRESSION_FILTER_STREAM_LIMIT")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn expression_filter_monotonic_stream_limit_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_EXPRESSION_FILTER_MONOTONIC_STREAM_LIMIT")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn expression_filter_exact_monotonic_stream_limit_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_EXPRESSION_FILTER_EXACT_MONOTONIC_STREAM_LIMIT")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn expression_filter_exact_monotonic_stream_limit_auto_enabled() -> bool {
+    !std::env::var("DODAM_DISABLE_EXPRESSION_FILTER_EXACT_MONOTONIC_AUTO")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn monotonic_stream_limit_column(order_by: Option<&SortKey>) -> Option<String> {
+    let [sort] = order_by?.expressions.as_slice() else {
+        return None;
+    };
+    (!sort.descending && !sort.nulls_first).then(|| sort.column.clone())
 }
 
 fn projection_requires_expression_path(expressions: &[ProjectionExpression]) -> bool {
@@ -35289,6 +36913,11 @@ pub async fn try_execute_sql_to_sink(
     if explain_sql(engine, sql, batch_size).await?.is_some() {
         return Ok(None);
     }
+    if let Some(metrics) =
+        try_execute_set_operation_sql_to_sink(engine, sql, batch_size, sink).await?
+    {
+        return Ok(Some(metrics));
+    }
     let Some(request) = plan_direct_join_sink_request(sql, batch_size)? else {
         return Ok(None);
     };
@@ -35306,6 +36935,14 @@ pub async fn execute_sql_to_result_sink(
     let mut profile = SqlSinkExecutionProfile::default();
     if options.allow_direct_or_streaming && explain_sql(engine, sql, batch_size).await?.is_none() {
         let direct_started = Instant::now();
+        if let Some(metrics) =
+            try_execute_set_operation_sql_to_sink(engine, sql, batch_size, sink.record_batch_sink())
+                .await?
+        {
+            profile.direct_sink = Some(direct_started.elapsed());
+            profile.scan_plan_metrics = Some(metrics);
+            return Ok(profile);
+        }
         if let Some(request) = plan_direct_join_sink_request(sql, batch_size)? {
             let plan = engine.plan_parquet_join(request).await?;
             let metrics = engine.write_join_plan_to_sink(plan, sink.record_batch_sink())?;
@@ -35329,10 +36966,996 @@ pub async fn execute_sql_to_result_sink(
     Ok(profile)
 }
 
+async fn try_execute_set_operation_sql_to_sink(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+    sink: &mut dyn RecordBatchSink,
+) -> Result<Option<ScanPlanMetrics>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    if !query_contains_set_operation(query.body.as_ref()) {
+        return Ok(None);
+    }
+    if query.fetch.is_some() || !query.locks.is_empty() {
+        return Ok(None);
+    }
+    let order_by = parse_order_by(query, &[], &[], None)?;
+    let limit = parse_limit(query)?;
+    let offset = parse_offset(query)?;
+
+    if order_by.is_some() || limit.is_some() || offset != 0 {
+        if try_write_same_source_union_all_ordered_desc_to_sink(
+            engine,
+            query.body.as_ref(),
+            batch_size,
+            order_by.as_ref(),
+            limit,
+            offset,
+            sink,
+        )
+        .await?
+        {
+            sink.finish()?;
+            return Ok(Some(ScanPlanMetrics::default()));
+        }
+        return Ok(None);
+    }
+
+    if let Some(shared) = plan_same_source_union_all_scan(query.body.as_ref())? {
+        let mut stream = engine
+            .scan_parquet_batches(
+                shared.path,
+                batch_size,
+                None,
+                shared.projection,
+                Some(shared.filter),
+            )
+            .await?;
+        for batch in stream.by_ref() {
+            let batch = batch?;
+            if shared.aliases.is_empty() {
+                sink.write_batch(&batch)?;
+            } else {
+                for renamed in rename_output_batches(vec![batch], &shared.aliases)? {
+                    sink.write_batch(&renamed)?;
+                }
+            }
+        }
+        sink.finish()?;
+        return Ok(Some(stream.into_scan_plan_metrics()));
+    }
+
+    let mut state = UnionAllSinkState::default();
+    Box::pin(write_union_all_set_expr_to_sink(
+        engine,
+        query.body.as_ref(),
+        batch_size,
+        sink,
+        &mut state,
+    ))
+    .await?;
+    sink.finish()?;
+    Ok(Some(ScanPlanMetrics::default()))
+}
+
+async fn try_write_same_source_union_all_ordered_desc_to_sink(
+    engine: &DodamEngine,
+    expr: &SetExpr,
+    batch_size: usize,
+    order_by: Option<&SortKey>,
+    limit: Option<usize>,
+    offset: usize,
+    sink: &mut dyn RecordBatchSink,
+) -> Result<bool> {
+    let (Some(order_by), Some(limit)) = (order_by, limit) else {
+        return Ok(false);
+    };
+    if offset != 0 || limit == 0 {
+        return Ok(false);
+    }
+    let [sort] = order_by.expressions.as_slice() else {
+        return Ok(false);
+    };
+    if !sort.descending || sort.nulls_first {
+        return Ok(false);
+    }
+    let Some(shared) = plan_same_source_union_all_scan(expr)? else {
+        return Ok(false);
+    };
+    if !engine
+        .parquet_row_groups_monotonic_by_column(shared.path.clone(), &sort.column)
+        .await?
+    {
+        return Ok(false);
+    }
+    let row_group_count = engine.parquet_row_group_count(&shared.path)?;
+    if row_group_count == 0 {
+        return Ok(true);
+    }
+
+    let mut scan_projection = shared.projection.clone();
+    add_projection_columns(&mut scan_projection, shared.filter.referenced_columns());
+    for sort in &order_by.expressions {
+        add_projection_columns(&mut scan_projection, vec![sort.column.clone()]);
+    }
+
+    if try_write_same_source_union_all_ordered_desc_primitive_to_sink(
+        engine,
+        &shared,
+        batch_size,
+        &scan_projection,
+        &sort.column,
+        limit,
+        row_group_count,
+        sink,
+    )? {
+        return Ok(true);
+    }
+
+    if try_write_same_source_union_all_ordered_desc_chunked_to_sink(
+        engine,
+        &shared,
+        batch_size,
+        &scan_projection,
+        order_by,
+        limit,
+        sink,
+        row_group_count,
+    )
+    .await?
+    {
+        return Ok(true);
+    }
+
+    let row_group_batch_size = row_group_ordered_sort_batch_size(batch_size);
+    let mut written = 0usize;
+    let profile = ordered_sink_profile_enabled();
+    let total_started = profile.then(Instant::now);
+    let mut scan_sort_elapsed = Duration::ZERO;
+    let mut sink_write_elapsed = Duration::ZERO;
+    let mut row_groups_scanned = 0usize;
+    let mut batches_written = 0usize;
+    for row_group in (0..row_group_count).rev() {
+        let scan_sort_started = profile.then(Instant::now);
+        let sorted = scan_filter_sort_ordered_row_group(
+            engine,
+            shared.path.clone(),
+            row_group_batch_size,
+            scan_projection.clone(),
+            row_group,
+            &shared.filter,
+            order_by,
+            &sort.column,
+        )
+        .await?;
+        if let Some(started) = scan_sort_started {
+            scan_sort_elapsed += started.elapsed();
+            row_groups_scanned += 1;
+        }
+        for batch in sorted {
+            if written >= limit {
+                print_ordered_sink_profile(
+                    total_started,
+                    scan_sort_elapsed,
+                    sink_write_elapsed,
+                    row_groups_scanned,
+                    batches_written,
+                    written,
+                );
+                return Ok(true);
+            }
+            let remaining = limit - written;
+            let batch = if batch.num_rows() > remaining {
+                batch.slice(0, remaining)
+            } else {
+                batch
+            };
+            written += batch.num_rows();
+            let sink_write_started = profile.then(Instant::now);
+            write_same_source_batch_to_sink(batch, &scan_projection, &shared, sink)?;
+            if let Some(started) = sink_write_started {
+                sink_write_elapsed += started.elapsed();
+                batches_written += 1;
+            }
+            if written >= limit {
+                print_ordered_sink_profile(
+                    total_started,
+                    scan_sort_elapsed,
+                    sink_write_elapsed,
+                    row_groups_scanned,
+                    batches_written,
+                    written,
+                );
+                return Ok(true);
+            }
+        }
+    }
+    print_ordered_sink_profile(
+        total_started,
+        scan_sort_elapsed,
+        sink_write_elapsed,
+        row_groups_scanned,
+        batches_written,
+        written,
+    );
+    Ok(true)
+}
+
+async fn try_write_same_source_union_all_ordered_desc_chunked_to_sink(
+    engine: &DodamEngine,
+    shared: &SameSourceUnionAllScan,
+    batch_size: usize,
+    scan_projection: &Projection,
+    order_by: &SortKey,
+    limit: usize,
+    sink: &mut dyn RecordBatchSink,
+    row_group_count: usize,
+) -> Result<bool> {
+    let chunk_size = ordered_sink_row_group_chunk_size(limit, row_group_count);
+    if chunk_size <= 1 {
+        return Ok(false);
+    }
+    let mut written = 0usize;
+    let profile = ordered_sink_profile_enabled();
+    let total_started = profile.then(Instant::now);
+    let mut scan_elapsed = Duration::ZERO;
+    let mut filter_elapsed = Duration::ZERO;
+    let mut sort_elapsed = Duration::ZERO;
+    let mut write_elapsed = Duration::ZERO;
+    let mut scan_profile = RowGroupBatchScanProfile::default();
+    let mut chunks = 0usize;
+    let mut batches_written = 0usize;
+    let row_groups = (0..row_group_count).rev().collect::<Vec<_>>();
+    for chunk in row_groups.chunks(chunk_size) {
+        if written >= limit {
+            print_ordered_chunked_sink_profile(
+                total_started,
+                scan_elapsed,
+                filter_elapsed,
+                sort_elapsed,
+                write_elapsed,
+                chunks,
+                batches_written,
+                written,
+                chunk_size,
+                &scan_profile,
+            );
+            return Ok(true);
+        }
+        chunks += 1;
+        let scan_started = profile.then(Instant::now);
+        let use_row_filter = ordered_sink_row_filter_enabled();
+        let (batches, profile_metrics) = if use_row_filter {
+            engine
+                .scan_parquet_row_group_batches_filtered_profiled(
+                    shared.path.clone(),
+                    batch_size,
+                    scan_projection.clone(),
+                    chunk.to_vec(),
+                    vec![shared.filter.expr().clone()],
+                )
+                .await?
+        } else {
+            engine
+                .scan_parquet_row_group_batches_profiled(
+                    shared.path.clone(),
+                    batch_size,
+                    scan_projection.clone(),
+                    chunk.to_vec(),
+                )
+                .await?
+        };
+        scan_profile.merge_from(profile_metrics);
+        if let Some(started) = scan_started {
+            scan_elapsed += started.elapsed();
+        }
+        let filter_started = profile.then(Instant::now);
+        let sort_column = order_by
+            .expressions
+            .first()
+            .map(|sort| sort.column.as_str())
+            .unwrap_or_default();
+        let filtered = if use_row_filter {
+            batches
+                .into_iter()
+                .filter(|batch| batch.num_rows() > 0)
+                .collect::<Vec<_>>()
+        } else {
+            let mut filtered = Vec::new();
+            for batch in batches {
+                let batch = filter_batch(batch, &shared.filter)?;
+                if batch.num_rows() > 0 {
+                    filtered.push(batch);
+                }
+            }
+            filtered
+        };
+        if let Some(started) = filter_started {
+            filter_elapsed += started.elapsed();
+        }
+        if filtered.is_empty() {
+            continue;
+        }
+        let sort_started = profile.then(Instant::now);
+        let sorted = match reverse_ascending_primitive_runs_if_ordered(&filtered, sort_column)? {
+            Some(sorted) => sorted,
+            None => apply_output_order_limit(filtered, Some(order_by), None, 0)?,
+        };
+        if let Some(started) = sort_started {
+            sort_elapsed += started.elapsed();
+        }
+        for batch in sorted {
+            if written >= limit {
+                print_ordered_chunked_sink_profile(
+                    total_started,
+                    scan_elapsed,
+                    filter_elapsed,
+                    sort_elapsed,
+                    write_elapsed,
+                    chunks,
+                    batches_written,
+                    written,
+                    chunk_size,
+                    &scan_profile,
+                );
+                return Ok(true);
+            }
+            let remaining = limit - written;
+            let batch = if batch.num_rows() > remaining {
+                batch.slice(0, remaining)
+            } else {
+                batch
+            };
+            written += batch.num_rows();
+            let write_started = profile.then(Instant::now);
+            write_same_source_batch_to_sink(batch, scan_projection, shared, sink)?;
+            if let Some(started) = write_started {
+                write_elapsed += started.elapsed();
+                batches_written += 1;
+            }
+        }
+    }
+    print_ordered_chunked_sink_profile(
+        total_started,
+        scan_elapsed,
+        filter_elapsed,
+        sort_elapsed,
+        write_elapsed,
+        chunks,
+        batches_written,
+        written,
+        chunk_size,
+        &scan_profile,
+    );
+    Ok(true)
+}
+
+fn reverse_ascending_primitive_runs_if_ordered(
+    batches: &[RecordBatch],
+    sort_column: &str,
+) -> Result<Option<Vec<RecordBatch>>> {
+    if sort_column.is_empty() || batches.is_empty() {
+        return Ok(None);
+    }
+    if !batches.iter().all(record_batch_supports_fast_reverse) {
+        return Ok(None);
+    }
+    let mut runs = Vec::<(usize, usize)>::new();
+    let mut run_start = 0usize;
+    let mut previous_last: Option<i128> = None;
+    for (index, batch) in batches.iter().enumerate() {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let column_index = output_batch_column_index(batch, sort_column)?;
+        let Some((first, last)) = numeric_column_ascending_bounds(batch.column(column_index))?
+        else {
+            return Ok(None);
+        };
+        if previous_last.is_some_and(|previous| previous > first) {
+            if run_start == index {
+                return Ok(None);
+            }
+            runs.push((run_start, index));
+            run_start = index;
+        }
+        previous_last = Some(last);
+    }
+    if run_start < batches.len() {
+        runs.push((run_start, batches.len()));
+    }
+    if runs.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let mut output = Vec::new();
+    for (start, end) in runs {
+        for batch in batches[start..end].iter().rev() {
+            let Some(reversed) = reverse_primitive_record_batch_rows(batch)? else {
+                return Ok(None);
+            };
+            if reversed.num_rows() > 0 {
+                output.push(reversed);
+            }
+        }
+    }
+    Ok(Some(output))
+}
+
+fn ordered_sink_row_filter_enabled() -> bool {
+    std::env::var("DODAM_ORDERED_SINK_ROW_FILTER")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn ordered_sink_row_group_chunk_size(limit: usize, row_group_count: usize) -> usize {
+    std::env::var("DODAM_ORDERED_SINK_ROW_GROUP_CHUNK_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            if limit <= reverse_row_group_topk_max_limit_rows() {
+                1
+            } else if row_group_count >= 96 {
+                8
+            } else if row_group_count >= 24 {
+                4
+            } else if row_group_count >= 8 {
+                2
+            } else {
+                1
+            }
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_ordered_chunked_sink_profile(
+    total_started: Option<Instant>,
+    scan_elapsed: Duration,
+    filter_elapsed: Duration,
+    sort_elapsed: Duration,
+    write_elapsed: Duration,
+    chunks: usize,
+    batches: usize,
+    rows: usize,
+    chunk_size: usize,
+    scan_profile: &RowGroupBatchScanProfile,
+) {
+    let Some(total_started) = total_started else {
+        return;
+    };
+    eprintln!(
+        "[dodam:ordered-chunked-sink-profile] total={}us scan={}us filter={}us sort={}us write={}us chunks={} chunk_size={} batches={} rows={} metadata={}us planning={}us next={}us next_avg={}us next_p95={}us next_max={}us next_calls={} eof_calls={} scan_batches={} scan_rows={} row_groups={}/{} projected_columns={} bytes={}/{} zero_batches={}",
+        total_started.elapsed().as_micros(),
+        scan_elapsed.as_micros(),
+        filter_elapsed.as_micros(),
+        sort_elapsed.as_micros(),
+        write_elapsed.as_micros(),
+        chunks,
+        chunk_size,
+        batches,
+        rows,
+        scan_profile.metadata_nanos / 1_000,
+        scan_profile.planning_nanos / 1_000,
+        scan_profile.next_nanos / 1_000,
+        if scan_profile.next_calls == 0 {
+            0
+        } else {
+            (scan_profile.next_nanos / scan_profile.next_calls as u64) / 1_000
+        },
+        scan_profile.p95_next_nanos / 1_000,
+        scan_profile.max_next_nanos / 1_000,
+        scan_profile.next_calls,
+        scan_profile.eof_calls,
+        scan_profile.output_batches,
+        scan_profile.output_rows,
+        scan_profile.row_groups_scanned,
+        scan_profile.row_groups_total,
+        scan_profile.projected_columns,
+        scan_profile.compressed_bytes_scanned,
+        scan_profile.compressed_bytes_total,
+        scan_profile.zero_row_batches,
+    );
+}
+
+fn try_write_same_source_union_all_ordered_desc_primitive_to_sink(
+    engine: &DodamEngine,
+    shared: &SameSourceUnionAllScan,
+    batch_size: usize,
+    scan_projection: &Projection,
+    sort_column: &str,
+    limit: usize,
+    row_group_count: usize,
+    sink: &mut dyn RecordBatchSink,
+) -> Result<bool> {
+    if !ordered_primitive_sink_enabled(limit) {
+        return Ok(false);
+    }
+    let Projection::Columns(columns) = scan_projection else {
+        return Ok(false);
+    };
+    let Expr::InList {
+        column: filter_column,
+        values,
+        negated,
+        ..
+    } = shared.filter.expr()
+    else {
+        return Ok(false);
+    };
+    if *negated || !columns.iter().any(|column| column == sort_column) {
+        return Ok(false);
+    }
+    let Some(column_types) = engine.parquet_direct_primitive_column_types(&shared.path, columns)?
+    else {
+        return Ok(false);
+    };
+    if !column_types.iter().all(|column_type| {
+        matches!(
+            column_type,
+            DirectPrimitiveColumnType::I32 | DirectPrimitiveColumnType::I64
+        )
+    }) {
+        return Ok(false);
+    }
+    let Some(filter_index) = columns.iter().position(|column| column == filter_column) else {
+        return Ok(false);
+    };
+    let filter_values = match column_types[filter_index] {
+        DirectPrimitiveColumnType::I32 => PrimitiveFilterValues::I32(
+            values
+                .iter()
+                .map(|value| value.as_i32(filter_column))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        DirectPrimitiveColumnType::I64 => PrimitiveFilterValues::I64(
+            values
+                .iter()
+                .map(|value| value.as_i64(filter_column))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        DirectPrimitiveColumnType::Date32
+        | DirectPrimitiveColumnType::Decimal128Int64 { .. }
+        | DirectPrimitiveColumnType::Decimal128Int64Raw { .. } => return Ok(false),
+    };
+    let specs = columns
+        .iter()
+        .zip(column_types.iter())
+        .map(|(name, column_type)| DirectPrimitiveColumnSpec {
+            name,
+            column_type: *column_type,
+        })
+        .collect::<Vec<_>>();
+    let schema = Arc::new(Schema::new(
+        columns
+            .iter()
+            .zip(column_types.iter())
+            .map(|(name, column_type)| {
+                let data_type = match column_type {
+                    DirectPrimitiveColumnType::I32 => DataType::Int32,
+                    DirectPrimitiveColumnType::I64 => DataType::Int64,
+                    DirectPrimitiveColumnType::Date32 => DataType::Date32,
+                    DirectPrimitiveColumnType::Decimal128Int64 { precision, scale }
+                    | DirectPrimitiveColumnType::Decimal128Int64Raw { precision, scale } => {
+                        DataType::Decimal128(*precision, *scale)
+                    }
+                };
+                Field::new(name, data_type, false)
+            })
+            .collect::<Vec<_>>(),
+    ));
+    let mut written = 0usize;
+    let mut primitive_metrics = DirectPrimitiveColumnScanMetrics::default();
+    let profile = ordered_sink_profile_enabled();
+    let total_started = profile.then(Instant::now);
+    let mut write_elapsed = Duration::ZERO;
+    let mut batches_written = 0usize;
+    let row_groups = (0..row_group_count).rev().collect::<Vec<_>>();
+    let chunk_size = ordered_sink_row_group_chunk_size(limit, row_group_count).max(1);
+    for chunk in row_groups.chunks(chunk_size) {
+        let mut chunk_batches = Vec::new();
+        for &row_group in chunk {
+            let mut row_group_batches = Vec::new();
+            let metrics = if ordered_primitive_sink_page_reader_enabled() {
+                engine.scan_parquet_primitive_columns_page_view(
+                    &shared.path,
+                    batch_size,
+                    &[row_group],
+                    &specs,
+                    |view| {
+                        if written >= limit {
+                            return Ok(());
+                        }
+                        if let Some(batch) = primitive_ordered_selected_batch(
+                            view,
+                            &column_types,
+                            filter_index,
+                            &filter_values,
+                            schema.clone(),
+                        )? && batch.num_rows() > 0
+                        {
+                            row_group_batches.push(batch);
+                        }
+                        Ok(())
+                    },
+                )?
+            } else {
+                engine.scan_parquet_primitive_columns_view(
+                    &shared.path,
+                    batch_size,
+                    &[row_group],
+                    &specs,
+                    |view| {
+                        if written >= limit {
+                            return Ok(());
+                        }
+                        if let Some(batch) = primitive_ordered_selected_batch(
+                            view,
+                            &column_types,
+                            filter_index,
+                            &filter_values,
+                            schema.clone(),
+                        )? && batch.num_rows() > 0
+                        {
+                            row_group_batches.push(batch);
+                        }
+                        Ok(())
+                    },
+                )?
+            };
+            if let Some(metrics) = metrics {
+                primitive_metrics.merge_from(metrics);
+            }
+            chunk_batches.extend(row_group_batches.into_iter().rev());
+            if written
+                + chunk_batches
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum::<usize>()
+                >= limit
+            {
+                break;
+            }
+        }
+        if chunk_batches.is_empty() {
+            continue;
+        }
+        let schema = chunk_batches[0].schema();
+        let batch = if chunk_batches.len() == 1 {
+            chunk_batches[0].clone()
+        } else {
+            concat_batches(&schema, chunk_batches.iter())?
+        };
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let remaining = limit - written;
+        let batch = if batch.num_rows() > remaining {
+            batch.slice(0, remaining)
+        } else {
+            batch
+        };
+        written += batch.num_rows();
+        let write_started = profile.then(Instant::now);
+        write_same_source_batch_to_sink(batch, scan_projection, shared, sink)?;
+        if let Some(started) = write_started {
+            write_elapsed += started.elapsed();
+            batches_written += 1;
+        }
+        if written >= limit {
+            print_ordered_primitive_sink_profile(
+                total_started,
+                &primitive_metrics,
+                write_elapsed,
+                batches_written,
+                written,
+            );
+            return Ok(true);
+        }
+    }
+    print_ordered_primitive_sink_profile(
+        total_started,
+        &primitive_metrics,
+        write_elapsed,
+        batches_written,
+        written,
+    );
+    Ok(true)
+}
+
+enum PrimitiveFilterValues {
+    I32(Vec<i32>),
+    I64(Vec<i64>),
+}
+
+fn ordered_primitive_sink_enabled(limit: usize) -> bool {
+    if std::env::var("DODAM_ENABLE_ORDERED_PRIMITIVE_SINK")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return true;
+    }
+    if std::env::var("DODAM_DISABLE_ORDERED_PRIMITIVE_SINK_AUTO")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return false;
+    }
+    limit <= ordered_primitive_sink_auto_max_limit_rows()
+}
+
+fn ordered_primitive_sink_auto_max_limit_rows() -> usize {
+    std::env::var("DODAM_ORDERED_PRIMITIVE_SINK_AUTO_MAX_LIMIT_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(16 * 1024)
+}
+
+fn ordered_primitive_sink_page_reader_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_ORDERED_PRIMITIVE_PAGE_READER")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn print_ordered_primitive_sink_profile(
+    total_started: Option<Instant>,
+    metrics: &DirectPrimitiveColumnScanMetrics,
+    write_elapsed: Duration,
+    batches: usize,
+    rows: usize,
+) {
+    let Some(total_started) = total_started else {
+        return;
+    };
+    let column_read = metrics
+        .column_read_nanos
+        .iter()
+        .map(|nanos| format!("{:.3}", (*nanos as f64) / 1_000_000.0))
+        .collect::<Vec<_>>()
+        .join(",");
+    eprintln!(
+        "[dodam:ordered-primitive-sink-profile] total={}us read={:.3}ms consume={:.3}ms write={}us row_groups={} batches={} rows={} column_read_ms=[{}]",
+        total_started.elapsed().as_micros(),
+        (metrics.read_nanos as f64) / 1_000_000.0,
+        (metrics.consume_nanos as f64) / 1_000_000.0,
+        write_elapsed.as_micros(),
+        metrics.row_groups,
+        batches,
+        rows,
+        column_read,
+    );
+}
+
+fn primitive_ordered_selected_batch(
+    view: BatchView<'_>,
+    column_types: &[DirectPrimitiveColumnType],
+    filter_index: usize,
+    filter_values: &PrimitiveFilterValues,
+    schema: Arc<Schema>,
+) -> Result<Option<RecordBatch>> {
+    let mut selected = Vec::new();
+    match filter_values {
+        PrimitiveFilterValues::I32(values) => {
+            if !matches!(column_types[filter_index], DirectPrimitiveColumnType::I32) {
+                return Ok(None);
+            }
+            let Some(column) = view.i32_vector(filter_index) else {
+                return Ok(None);
+            };
+            for row in (0..view.num_rows()).rev() {
+                if !column.is_null(row) && values.iter().any(|value| *value == column.value(row)) {
+                    selected.push(row as u32);
+                }
+            }
+        }
+        PrimitiveFilterValues::I64(values) => {
+            if !matches!(column_types[filter_index], DirectPrimitiveColumnType::I64) {
+                return Ok(None);
+            }
+            let Some(column) = view.i64_vector(filter_index) else {
+                return Ok(None);
+            };
+            for row in (0..view.num_rows()).rev() {
+                if !column.is_null(row) && values.iter().any(|value| *value == column.value(row)) {
+                    selected.push(row as u32);
+                }
+            }
+        }
+    }
+    if selected.is_empty() {
+        return Ok(Some(RecordBatch::new_empty(schema)));
+    }
+    let mut arrays = Vec::with_capacity(column_types.len());
+    for (index, column_type) in column_types.iter().enumerate() {
+        match column_type {
+            DirectPrimitiveColumnType::I32 => {
+                let Some(column) = view.i32_vector(index) else {
+                    return Ok(None);
+                };
+                let mut output = Vec::with_capacity(selected.len());
+                for row in &selected {
+                    let row = *row as usize;
+                    if column.is_null(row) {
+                        return Ok(None);
+                    }
+                    output.push(column.value(row));
+                }
+                arrays.push(Arc::new(Int32Array::from(output)) as ArrayRef);
+            }
+            DirectPrimitiveColumnType::I64 => {
+                let Some(column) = view.i64_vector(index) else {
+                    return Ok(None);
+                };
+                let mut output = Vec::with_capacity(selected.len());
+                for row in &selected {
+                    let row = *row as usize;
+                    if column.is_null(row) {
+                        return Ok(None);
+                    }
+                    output.push(column.value(row));
+                }
+                arrays.push(Arc::new(Int64Array::from(output)) as ArrayRef);
+            }
+            DirectPrimitiveColumnType::Date32
+            | DirectPrimitiveColumnType::Decimal128Int64 { .. }
+            | DirectPrimitiveColumnType::Decimal128Int64Raw { .. } => return Ok(None),
+        }
+    }
+    Ok(Some(RecordBatch::try_new(schema, arrays)?))
+}
+
+fn ordered_sink_profile_enabled() -> bool {
+    std::env::var("DODAM_PROFILE_ORDERED_SINK")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn print_ordered_sink_profile(
+    total_started: Option<Instant>,
+    scan_sort_elapsed: Duration,
+    sink_write_elapsed: Duration,
+    row_groups: usize,
+    batches: usize,
+    rows: usize,
+) {
+    let Some(total_started) = total_started else {
+        return;
+    };
+    eprintln!(
+        "[dodam:ordered-sink-profile] total={}us scan_sort={}us sink_write={}us row_groups={} batches={} rows={}",
+        total_started.elapsed().as_micros(),
+        scan_sort_elapsed.as_micros(),
+        sink_write_elapsed.as_micros(),
+        row_groups,
+        batches,
+        rows
+    );
+}
+
+fn write_same_source_batch_to_sink(
+    batch: RecordBatch,
+    scan_projection: &Projection,
+    shared: &SameSourceUnionAllScan,
+    sink: &mut dyn RecordBatchSink,
+) -> Result<()> {
+    if scan_projection == &shared.projection && shared.aliases.is_empty() {
+        sink.write_batch(&batch)?;
+        return Ok(());
+    }
+    let batches = apply_output_projection(vec![batch], &shared.projection)?;
+    let batches = rename_output_batches(batches, &shared.aliases)?;
+    for batch in batches {
+        sink.write_batch(&batch)?;
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct UnionAllSinkState {
+    schema: Option<Arc<Schema>>,
+}
+
+async fn write_union_all_set_expr_to_sink(
+    engine: &DodamEngine,
+    expr: &SetExpr,
+    batch_size: usize,
+    sink: &mut dyn RecordBatchSink,
+    state: &mut UnionAllSinkState,
+) -> Result<()> {
+    match expr {
+        SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } if *op == SetOperator::Union && *set_quantifier == SetQuantifier::All => {
+            Box::pin(write_union_all_set_expr_to_sink(
+                engine,
+                left.as_ref(),
+                batch_size,
+                sink,
+                state,
+            ))
+            .await?;
+            Box::pin(write_union_all_set_expr_to_sink(
+                engine,
+                right.as_ref(),
+                batch_size,
+                sink,
+                state,
+            ))
+            .await
+        }
+        SetExpr::SetOperation {
+            op, set_quantifier, ..
+        } => Err(DodamError::UnsupportedSql(format!(
+            "{op} {set_quantifier} is not supported yet"
+        ))),
+        SetExpr::Query(query) => {
+            if query_contains_set_operation(query.body.as_ref()) {
+                return Box::pin(write_union_all_set_expr_to_sink(
+                    engine,
+                    query.body.as_ref(),
+                    batch_size,
+                    sink,
+                    state,
+                ))
+                .await;
+            }
+            if query.order_by.is_some()
+                || query.limit_clause.is_some()
+                || query.fetch.is_some()
+                || !query.locks.is_empty()
+            {
+                return Err(DodamError::UnsupportedSql(
+                    "ORDER BY, LIMIT, FETCH, and locking clauses inside UNION ALL operands are not supported yet"
+                        .to_string(),
+                ));
+            }
+            let batches = query_output_batches(
+                Box::pin(execute_sql(engine, &query.to_string(), batch_size)).await?,
+            )?;
+            write_union_all_batches_to_sink(batches, sink, state)
+        }
+        SetExpr::Select(_) => {
+            let batches = query_output_batches(
+                Box::pin(execute_sql(engine, &expr.to_string(), batch_size)).await?,
+            )?;
+            write_union_all_batches_to_sink(batches, sink, state)
+        }
+        other => Err(DodamError::UnsupportedSql(format!(
+            "unsupported UNION ALL operand: {other}"
+        ))),
+    }
+}
+
+fn write_union_all_batches_to_sink(
+    batches: Vec<RecordBatch>,
+    sink: &mut dyn RecordBatchSink,
+    state: &mut UnionAllSinkState,
+) -> Result<()> {
+    for batch in batches {
+        let schema = if let Some(schema) = &state.schema {
+            schema.clone()
+        } else {
+            let schema = batch.schema();
+            state.schema = Some(schema.clone());
+            schema
+        };
+        validate_union_all_batches(&schema, std::slice::from_ref(&batch))?;
+        let batch = align_union_all_batch_schema(batch, schema)?;
+        sink.write_batch(&batch)?;
+    }
+    Ok(())
+}
+
 fn plan_direct_join_sink_request(
     sql: &str,
     batch_size: usize,
 ) -> Result<Option<JoinParquetRequest>> {
+    if sql_uses_set_operation(sql)? {
+        return Ok(None);
+    }
     if sql_uses_materialized_subquery(sql)?
         || sql_uses_multi_comma_join(sql)?
         || sql_uses_expression_predicate(sql)?
@@ -35341,6 +37964,16 @@ fn plan_direct_join_sink_request(
     }
     let query = parse_sql(sql)?;
     direct_join_sink_request(query, batch_size)
+}
+
+fn sql_uses_set_operation(sql: &str) -> Result<bool> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(false);
+    };
+    Ok(query_contains_set_operation(query.body.as_ref()))
 }
 
 fn direct_join_sink_request(
@@ -40794,6 +43427,38 @@ fn collect_batches(mut stream: SendableBatchStream) -> Result<Vec<RecordBatch>> 
     Ok(batches)
 }
 
+fn collect_expression_filtered_limit_batches(
+    mut stream: SendableBatchStream,
+    predicate: &SqlExpr,
+    table_alias: Option<&str>,
+    limit: usize,
+) -> Result<Vec<RecordBatch>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut batches = Vec::new();
+    let mut remaining = limit;
+    for batch in stream.by_ref() {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let mut filtered = apply_output_expression_filter(vec![batch], predicate, table_alias)?;
+        for batch in filtered.drain(..) {
+            if remaining == 0 {
+                return Ok(batches);
+            }
+            if batch.num_rows() > remaining {
+                batches.push(batch.slice(0, remaining));
+                return Ok(batches);
+            }
+            remaining -= batch.num_rows();
+            batches.push(batch);
+        }
+    }
+    Ok(batches)
+}
+
 fn apply_output_filter_stream(
     stream: SendableBatchStream,
     filter: Option<FilterExpr>,
@@ -41068,7 +43733,31 @@ fn sort_output_batch(
         })
         .collect::<Result<Vec<_>>>()?;
     let indices = lexsort_to_indices(&sort_columns, limit)?;
+    if let Some(batch) = take_primitive_record_batch_by_indices(batch, &indices)? {
+        return Ok(batch);
+    }
     Ok(take_record_batch(batch, &indices)?)
+}
+
+fn take_primitive_record_batch_by_indices(
+    batch: &RecordBatch,
+    indices: &UInt32Array,
+) -> Result<Option<RecordBatch>> {
+    if indices.null_count() != 0 || batch.num_rows() == 0 {
+        return Ok(None);
+    }
+    let mut raw_indices = Vec::with_capacity(indices.len());
+    for row in 0..indices.len() {
+        raw_indices.push(indices.value(row));
+    }
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for column in batch.columns() {
+        let Some(array) = gather_primitive_array(column, &raw_indices) else {
+            return Ok(None);
+        };
+        columns.push(array);
+    }
+    Ok(Some(RecordBatch::try_new(batch.schema(), columns)?))
 }
 
 fn limit_batches(
@@ -41903,10 +44592,15 @@ async fn try_collect_expression_aggregate_late_materialized(
             LateMaterializationPolicy::selective_with_selector_run_ratio(
                 expression_aggregate_late_max_selected_ratio(),
                 expression_aggregate_late_max_selector_run_ratio(),
-            ),
+            )
+            .with_io_cost_gate(!ordered_output && expression_aggregate_late_io_cost_gate_enabled()),
             move || {
-                CoalesceKeyCountSumCollector::new(&group_keys_for_state, &aggregates_for_state)
-                    .expect("expression aggregate late materialization precondition")
+                CoalesceKeyCountSumCollector::new_with_composite_hash(
+                    &group_keys_for_state,
+                    &aggregates_for_state,
+                    !ordered_output,
+                )
+                .expect("expression aggregate late materialization precondition")
             },
             {
                 let filter = filter.clone();
@@ -41939,7 +44633,9 @@ async fn try_collect_expression_aggregate_late_materialized(
             {
                 let payload_projected_columns = payload_projected_columns.clone();
                 move |view, collector: &mut CoalesceKeyCountSumCollector| {
-                    if expression_aggregate_late_view_payload_enabled() {
+                    if expression_aggregate_late_view_payload_enabled()
+                        || view.num_rows() <= expression_aggregate_late_view_payload_max_rows()
+                    {
                         collector.consume_projected_view(view, &payload_projected_columns)?;
                     } else {
                         let Some(batch) = view.try_record_batch() else {
@@ -41976,6 +44672,130 @@ async fn try_collect_expression_aggregate_late_materialized(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn try_collect_expression_aggregate_fused_dictionary_selected(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    filter: Option<FilterExpr>,
+    group_by: &[String],
+    aggregates: &[AggregateExpr],
+    expressions: &[ProjectionExpression],
+    ordered_output: bool,
+    output_limit: Option<usize>,
+) -> Result<Option<AggregateMetrics>> {
+    let Some(filter) = filter else {
+        return Ok(None);
+    };
+    let Some(group_keys) = group_key_exprs_for_aggregate(group_by, aggregates, expressions) else {
+        return Ok(None);
+    };
+    let [
+        GroupKeyExpr::Column(first_column),
+        GroupKeyExpr::Column(second_column),
+        GroupKeyExpr::CoalesceLiteral {
+            column: dictionary_column,
+            fallback: GroupKeyLiteral::Utf8(fallback),
+        },
+    ] = group_keys.as_slice()
+    else {
+        return Ok(None);
+    };
+    let [AggregateExpr::CountStar, AggregateExpr::Sum(sum_column)] = aggregates else {
+        return Ok(None);
+    };
+    let Some((decimal_column, _precision, _decimal_scale, decimal_filter)) =
+        expression_aggregate_decimal_filter(engine, &path, &filter).await?
+    else {
+        return Ok(None);
+    };
+    let forced_fused_selected = fused_dictionary_selected_aggregate_enabled();
+    let auto_fused_selected = !forced_fused_selected
+        && fused_dictionary_selected_aggregate_auto_accepts(
+            engine,
+            &path,
+            &decimal_column,
+            &decimal_filter,
+        )?;
+    if !forced_fused_selected && !auto_fused_selected {
+        return Ok(None);
+    }
+    let row_groups = (0..engine.parquet_row_group_count(&path)?).collect::<Vec<_>>();
+    let group_keys_for_state = group_keys.clone();
+    let aggregates_for_state = aggregates.to_vec();
+    let decimal_min = option_i128_to_i64_local(decimal_filter.decimal_min)?;
+    let decimal_max = option_i128_to_i64_local(decimal_filter.decimal_max)?;
+    let Some((collector, scan_metrics)) = engine
+        .scan_parquet_i32_i32_dictionary_i64_decimal_selected_fold(
+            path,
+            batch_size,
+            &row_groups,
+            [
+                first_column.as_str(),
+                second_column.as_str(),
+                dictionary_column.as_str(),
+                sum_column.as_str(),
+                decimal_column.as_str(),
+            ],
+            fallback.as_bytes(),
+            decimal_min,
+            decimal_max,
+            auto_fused_selected.then(fused_dictionary_selected_auto_workers),
+            || {
+                CoalesceKeyCountSumCollector::new_with_composite_hash(
+                    &group_keys_for_state,
+                    &aggregates_for_state,
+                    !ordered_output,
+                )
+                .expect("fused dictionary selected aggregate precondition")
+            },
+            |collector, batch| {
+                if let Some((chunks, selected_rows)) = batch.sum_chunks() {
+                    collector.consume_i32_date_dictionary_i64_sum_chunks(
+                        batch.first(),
+                        batch.second(),
+                        batch.dictionary_ids(),
+                        batch.dictionary(),
+                        chunks,
+                        selected_rows,
+                    )
+                } else if let Some(selection) = batch.selection() {
+                    collector.consume_i32_date_dictionary_i64_masked(
+                        batch.first(),
+                        batch.second(),
+                        batch.dictionary_ids(),
+                        batch.dictionary(),
+                        batch.sums(),
+                        selection,
+                    )
+                } else {
+                    collector.consume_i32_date_dictionary_i64_slices(
+                        batch.first(),
+                        batch.second(),
+                        batch.dictionary_ids(),
+                        batch.dictionary(),
+                        batch.sums(),
+                    )
+                }
+            },
+            |collector, partial| collector.merge_partial(partial),
+        )?
+    else {
+        return Ok(None);
+    };
+    let _ = scan_metrics;
+    Ok(Some(
+        CoalesceKeyCountSumCollector::merge_partials_with_order_and_output(
+            vec![collector],
+            1,
+            aggregates,
+            Some(group_by),
+            ordered_output,
+            output_limit,
+        )?,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn try_collect_expression_aggregate_scan_fold(
     engine: &DodamEngine,
     path: PathBuf,
@@ -41994,7 +44814,11 @@ async fn try_collect_expression_aggregate_scan_fold(
     let Some(group_keys) = group_key_exprs_for_aggregate(group_by, aggregates, expressions) else {
         return Ok(None);
     };
-    let Some(collector) = CoalesceKeyCountSumCollector::new(&group_keys, aggregates) else {
+    let Some(collector) = CoalesceKeyCountSumCollector::new_with_composite_hash(
+        &group_keys,
+        aggregates,
+        !ordered_output,
+    ) else {
         return Ok(None);
     };
     let mut projection = projection;
@@ -42023,8 +44847,12 @@ async fn try_collect_expression_aggregate_scan_fold(
                 predicates.pushdown().to_vec(),
                 expression_aggregate_dictionary_scan_fold_row_group_chunk(),
                 move || {
-                    CoalesceKeyCountSumCollector::new(&group_keys_for_state, &aggregates_for_state)
-                        .expect("expression aggregate dictionary scan-fold precondition")
+                    CoalesceKeyCountSumCollector::new_with_composite_hash(
+                        &group_keys_for_state,
+                        &aggregates_for_state,
+                        !ordered_output,
+                    )
+                    .expect("expression aggregate dictionary scan-fold precondition")
                 },
                 {
                     let projected_columns = projected_columns.clone();
@@ -42044,12 +44872,7 @@ async fn try_collect_expression_aggregate_scan_fold(
                         if mask.true_count() == 0 {
                             return Ok(Some(()));
                         }
-                        let Some(batch) = view.try_record_batch() else {
-                            return Ok(None);
-                        };
-                        let batch = filter_record_batch(batch, &mask)?;
-                        collector
-                            .consume_projected_view(BatchView::new(&batch), &projected_columns)?;
+                        collector.consume_projected_view_masked(view, &projected_columns, &mask)?;
                         Ok(Some(()))
                     }
                 },
@@ -42253,8 +45076,11 @@ fn push_in_list_selection_for_projected_view(
             if probe.is_null(row) {
                 false
             } else {
-                in_list_result(values.contains(&probe.value(row)), negated, has_null)
-                    .unwrap_or(false)
+                selected_in_list_result(
+                    small_in_list_match_i64(probe.value(row), &values),
+                    negated,
+                    has_null,
+                )
             }
         });
         return Ok(true);
@@ -42269,8 +45095,11 @@ fn push_in_list_selection_for_projected_view(
             if probe.is_null(row) {
                 false
             } else {
-                in_list_result(values.contains(&probe.value(row)), negated, has_null)
-                    .unwrap_or(false)
+                selected_in_list_result(
+                    small_in_list_match_i32(probe.value(row), &values),
+                    negated,
+                    has_null,
+                )
             }
         });
         return Ok(true);
@@ -42393,31 +45222,47 @@ fn projected_view_column_index(columns: &[String], column: &str) -> Option<usize
 }
 
 fn compare_i64_view(values: I64VectorView<'_>, op: ComparisonOp, literal: i64) -> BooleanArray {
-    BooleanArray::from(
-        (0..values.len())
-            .map(|row| {
-                if values.is_null(row) {
-                    None
-                } else {
-                    Some(compare_i64(values.value(row), op, literal))
-                }
-            })
-            .collect::<Vec<_>>(),
-    )
+    if let Some(raw) = values.values_if_null_free() {
+        return boolean_array_no_nulls_from_len(raw.len(), |row| {
+            compare_i64(raw[row], op, literal)
+        });
+    }
+    if let Some((data, len)) = values.raw_bytes() {
+        return boolean_array_no_nulls_from_i64_bytes(data, len, |value| {
+            compare_i64(value, op, literal)
+        });
+    }
+    let mut output = BooleanBuilder::with_capacity(values.len());
+    for row in 0..values.len() {
+        if values.is_null(row) {
+            output.append_null();
+        } else {
+            output.append_value(compare_i64(values.value(row), op, literal));
+        }
+    }
+    output.finish()
 }
 
 fn compare_i32_view(values: I32VectorView<'_>, op: ComparisonOp, literal: i32) -> BooleanArray {
-    BooleanArray::from(
-        (0..values.len())
-            .map(|row| {
-                if values.is_null(row) {
-                    None
-                } else {
-                    Some(compare_i32(values.value(row), op, literal))
-                }
-            })
-            .collect::<Vec<_>>(),
-    )
+    if let Some(raw) = values.values_if_null_free() {
+        return boolean_array_no_nulls_from_len(raw.len(), |row| {
+            compare_i32(raw[row], op, literal)
+        });
+    }
+    if let Some((data, len)) = values.raw_bytes() {
+        return boolean_array_no_nulls_from_i32_bytes(data, len, |value| {
+            compare_i32(value, op, literal)
+        });
+    }
+    let mut output = BooleanBuilder::with_capacity(values.len());
+    for row in 0..values.len() {
+        if values.is_null(row) {
+            output.append_null();
+        } else {
+            output.append_value(compare_i32(values.value(row), op, literal));
+        }
+    }
+    output.finish()
 }
 
 fn compare_date32_view(
@@ -42425,17 +45270,25 @@ fn compare_date32_view(
     op: ComparisonOp,
     literal: i32,
 ) -> BooleanArray {
-    BooleanArray::from(
-        (0..values.len())
-            .map(|row| {
-                if values.is_null(row) {
-                    None
-                } else {
-                    Some(compare_i32(values.value(row), op, literal))
-                }
-            })
-            .collect::<Vec<_>>(),
-    )
+    if let Some(raw) = values.values_if_null_free() {
+        return boolean_array_no_nulls_from_len(raw.len(), |row| {
+            compare_i32(raw[row], op, literal)
+        });
+    }
+    if let Some((data, len)) = values.raw_bytes() {
+        return boolean_array_no_nulls_from_i32_bytes(data, len, |value| {
+            compare_i32(value, op, literal)
+        });
+    }
+    let mut output = BooleanBuilder::with_capacity(values.len());
+    for row in 0..values.len() {
+        if values.is_null(row) {
+            output.append_null();
+        } else {
+            output.append_value(compare_i32(values.value(row), op, literal));
+        }
+    }
+    output.finish()
 }
 
 fn compare_decimal128_view(
@@ -42443,19 +45296,26 @@ fn compare_decimal128_view(
     op: ComparisonOp,
     literal: i128,
 ) -> BooleanArray {
-    BooleanArray::from(
-        (0..values_len_decimal128(values))
-            .map(|row| {
-                if values.is_null(row) {
-                    None
-                } else if let Some(raw) = values.raw_i64_values() {
-                    Some(compare_i128(i128::from(raw[row]), op, literal))
-                } else {
-                    Some(compare_i128(values.raw_values()[row], op, literal))
-                }
-            })
-            .collect::<Vec<_>>(),
-    )
+    let mut output = BooleanBuilder::with_capacity(values_len_decimal128(values));
+    if let Some(raw) = values.raw_i64_values() {
+        for row in 0..raw.len() {
+            if values.is_null(row) {
+                output.append_null();
+            } else {
+                output.append_value(compare_i128(i128::from(raw[row]), op, literal));
+            }
+        }
+    } else {
+        let raw = values.raw_values();
+        for row in 0..raw.len() {
+            if values.is_null(row) {
+                output.append_null();
+            } else {
+                output.append_value(compare_i128(raw[row], op, literal));
+            }
+        }
+    }
+    output.finish()
 }
 
 fn values_len_decimal128(values: Decimal128VectorView<'_>) -> usize {
@@ -42472,18 +45332,30 @@ fn in_list_i64_view(
     negated: bool,
     has_null: bool,
 ) -> BooleanArray {
-    BooleanArray::from(
-        (0..values.len())
-            .map(|row| {
-                if values.is_null(row) {
-                    None
-                } else {
-                    let matched = list.contains(&values.value(row));
-                    in_list_result(matched, negated, has_null)
-                }
-            })
-            .collect::<Vec<_>>(),
-    )
+    if !has_null && let Some(raw) = values.values_if_null_free() {
+        return boolean_array_no_nulls_from_len(raw.len(), |row| {
+            selected_in_list_result(small_in_list_match_i64(raw[row], list), negated, false)
+        });
+    }
+    if !has_null && let Some((data, len)) = values.raw_bytes() {
+        return boolean_array_no_nulls_from_i64_bytes(data, len, |value| {
+            selected_in_list_result(small_in_list_match_i64(value, list), negated, false)
+        });
+    }
+    let mut output = BooleanBuilder::with_capacity(values.len());
+    for row in 0..values.len() {
+        if values.is_null(row) {
+            output.append_null();
+            continue;
+        }
+        append_in_list_result(
+            &mut output,
+            small_in_list_match_i64(values.value(row), list),
+            negated,
+            has_null,
+        );
+    }
+    output.finish()
 }
 
 fn in_list_i32_view(
@@ -42492,28 +45364,114 @@ fn in_list_i32_view(
     negated: bool,
     has_null: bool,
 ) -> BooleanArray {
-    BooleanArray::from(
-        (0..values.len())
-            .map(|row| {
-                if values.is_null(row) {
-                    None
-                } else {
-                    let matched = list.contains(&values.value(row));
-                    in_list_result(matched, negated, has_null)
-                }
-            })
-            .collect::<Vec<_>>(),
-    )
+    if !has_null && let Some(raw) = values.values_if_null_free() {
+        return boolean_array_no_nulls_from_len(raw.len(), |row| {
+            selected_in_list_result(small_in_list_match_i32(raw[row], list), negated, false)
+        });
+    }
+    if !has_null && let Some((data, len)) = values.raw_bytes() {
+        return boolean_array_no_nulls_from_i32_bytes(data, len, |value| {
+            selected_in_list_result(small_in_list_match_i32(value, list), negated, false)
+        });
+    }
+    let mut output = BooleanBuilder::with_capacity(values.len());
+    for row in 0..values.len() {
+        if values.is_null(row) {
+            output.append_null();
+            continue;
+        }
+        append_in_list_result(
+            &mut output,
+            small_in_list_match_i32(values.value(row), list),
+            negated,
+            has_null,
+        );
+    }
+    output.finish()
 }
 
-fn in_list_result(matched: bool, negated: bool, has_null: bool) -> Option<bool> {
-    if matched {
-        Some(!negated)
-    } else if has_null {
-        None
-    } else {
-        Some(negated)
+fn small_in_list_match_i64(value: i64, list: &[i64]) -> bool {
+    match list {
+        [] => false,
+        [a] => value == *a,
+        [a, b] => value == *a || value == *b,
+        [a, b, c] => value == *a || value == *b || value == *c,
+        [a, b, c, d] => value == *a || value == *b || value == *c || value == *d,
+        _ => list.contains(&value),
     }
+}
+
+fn small_in_list_match_i32(value: i32, list: &[i32]) -> bool {
+    match list {
+        [] => false,
+        [a] => value == *a,
+        [a, b] => value == *a || value == *b,
+        [a, b, c] => value == *a || value == *b || value == *c,
+        [a, b, c, d] => value == *a || value == *b || value == *c || value == *d,
+        _ => list.contains(&value),
+    }
+}
+
+fn append_in_list_result(
+    output: &mut BooleanBuilder,
+    matched: bool,
+    negated: bool,
+    has_null: bool,
+) {
+    if matched {
+        output.append_value(!negated);
+    } else if has_null {
+        output.append_null();
+    } else {
+        output.append_value(negated);
+    }
+}
+
+fn selected_in_list_result(matched: bool, negated: bool, has_null: bool) -> bool {
+    if matched {
+        !negated
+    } else if has_null {
+        false
+    } else {
+        negated
+    }
+}
+
+fn boolean_array_no_nulls_from_len(
+    len: usize,
+    mut value_at: impl FnMut(usize) -> bool,
+) -> BooleanArray {
+    let mut values = BooleanBufferBuilder::new(len);
+    for row in 0..len {
+        values.append(value_at(row));
+    }
+    BooleanArray::new(values.build(), None)
+}
+
+fn boolean_array_no_nulls_from_i32_bytes(
+    data: &[u8],
+    len: usize,
+    mut value_at: impl FnMut(i32) -> bool,
+) -> BooleanArray {
+    debug_assert!(data.len() >= len.saturating_mul(std::mem::size_of::<i32>()));
+    let mut values = BooleanBufferBuilder::new(len);
+    for row in 0..len {
+        values.append(value_at(read_i32_le_unaligned(data, row)));
+    }
+    BooleanArray::new(values.build(), None)
+}
+
+fn boolean_array_no_nulls_from_i64_bytes(
+    data: &[u8],
+    len: usize,
+    mut value_at: impl FnMut(i64) -> bool,
+) -> BooleanArray {
+    debug_assert!(data.len() >= len.saturating_mul(std::mem::size_of::<i64>()));
+    let mut values = BooleanBufferBuilder::new(len);
+    for row in 0..len {
+        values.append(value_at(read_i64_le_unaligned(data, row)));
+    }
+    BooleanArray::new(values.build(), None)
 }
 
 fn compare_i64(left: i64, op: ComparisonOp, right: i64) -> bool {
@@ -42693,6 +45651,74 @@ fn expression_aggregate_dictionary_scan_fold_enabled() -> bool {
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
+fn fused_dictionary_selected_aggregate_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_FUSED_DICTIONARY_SELECTED_AGG")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn fused_dictionary_selected_aggregate_auto_accepts(
+    engine: &DodamEngine,
+    path: &Path,
+    decimal_column: &str,
+    decimal_filter: &DecimalDateRangeFilter,
+) -> Result<bool> {
+    if std::env::var("DODAM_DISABLE_FUSED_DICTIONARY_SELECTED_AUTO")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return Ok(false);
+    }
+    let Some((column_min, column_max)) =
+        engine.parquet_i128_column_min_max(path, decimal_column)?
+    else {
+        return Ok(false);
+    };
+    let Some(domain_len) = column_max
+        .checked_sub(column_min)
+        .and_then(|value| value.checked_add(1))
+    else {
+        return Ok(false);
+    };
+    if domain_len <= 0 {
+        return Ok(false);
+    }
+    let filter_min = decimal_filter
+        .decimal_min
+        .unwrap_or(column_min)
+        .max(column_min);
+    let filter_max = decimal_filter
+        .decimal_max
+        .unwrap_or(column_max)
+        .min(column_max);
+    if filter_min > filter_max {
+        return Ok(true);
+    }
+    let Some(selected_len) = filter_max
+        .checked_sub(filter_min)
+        .and_then(|value| value.checked_add(1))
+    else {
+        return Ok(false);
+    };
+    let estimated_ratio = selected_len as f64 / domain_len as f64;
+    Ok(estimated_ratio <= fused_dictionary_selected_auto_max_estimated_ratio())
+}
+
+fn fused_dictionary_selected_auto_max_estimated_ratio() -> f64 {
+    std::env::var("DODAM_FUSED_DICT_SELECTED_AUTO_MAX_ESTIMATED_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.05)
+        .clamp(0.0, 1.0)
+}
+
+fn fused_dictionary_selected_auto_workers() -> usize {
+    std::env::var("DODAM_FUSED_DICT_SELECTED_AUTO_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(8)
+}
+
 fn expression_aggregate_dictionary_scan_fold_row_group_chunk() -> usize {
     std::env::var("DODAM_EXPRESSION_AGG_DICTIONARY_SCAN_FOLD_ROW_GROUP_CHUNK")
         .ok()
@@ -42709,6 +45735,18 @@ fn expression_aggregate_late_materialized_enabled() -> bool {
 fn expression_aggregate_late_view_payload_enabled() -> bool {
     std::env::var("DODAM_ENABLE_EXPRESSION_AGG_LATE_VIEW_PAYLOAD")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn expression_aggregate_late_view_payload_max_rows() -> usize {
+    if std::env::var("DODAM_DISABLE_EXPRESSION_AGG_SMALL_LATE_VIEW_PAYLOAD")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return 0;
+    }
+    std::env::var("DODAM_EXPRESSION_AGG_LATE_VIEW_PAYLOAD_MAX_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(131_072)
 }
 
 fn expression_aggregate_late_row_group_chunk() -> usize {
@@ -42733,6 +45771,11 @@ fn expression_aggregate_late_max_selector_run_ratio() -> f64 {
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite())
         .unwrap_or(0.90)
+}
+
+fn expression_aggregate_late_io_cost_gate_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_EXPRESSION_AGG_LATE_IO_COST_GATE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 fn log_expression_aggregate_late_profile(metrics: &LateMaterializedMetrics) {
@@ -42784,6 +45827,42 @@ fn expression_aggregate_payload_projection(
         add_scalar_expression_columns(&mut columns, &expression.expr);
     }
     Projection::Columns(columns)
+}
+
+async fn expression_aggregate_decimal_filter(
+    engine: &DodamEngine,
+    path: &Path,
+    filter: &FilterExpr,
+) -> Result<Option<(String, u8, i8, DecimalDateRangeFilter)>> {
+    let mut matches = Vec::new();
+    for column in filter.referenced_columns() {
+        let Some((precision, scale)) = engine.parquet_decimal128_type(path, &column)? else {
+            continue;
+        };
+        let Some(range) =
+            DecimalDateRangeFilter::try_new(filter.expr(), &column, "__dodam_no_date__", scale)?
+        else {
+            continue;
+        };
+        matches.push((column, precision, scale, range));
+    }
+    if matches.len() == 1 {
+        Ok(matches.pop())
+    } else {
+        Ok(None)
+    }
+}
+
+fn option_i128_to_i64_local(value: Option<i128>) -> Result<Option<i64>> {
+    value
+        .map(|value| {
+            i64::try_from(value).map_err(|_| {
+                DodamError::UnsupportedSql(
+                    "direct selected dictionary decimal bound out of i64 range".to_string(),
+                )
+            })
+        })
+        .transpose()
 }
 
 fn add_scalar_expression_columns(columns: &mut Vec<String>, expression: &ScalarSqlExpression) {
@@ -45428,5 +48507,39 @@ mod tests {
                 "{sql}"
             );
         }
+    }
+
+    #[test]
+    fn same_source_union_all_plan_accepts_disjoint_equality_filters() {
+        let dialect = GenericDialect {};
+        let statements = Parser::parse_sql(
+            &dialect,
+            "SELECT id, bucket, value FROM '/tmp/facts.parquet' WHERE bucket = 1 \
+             UNION ALL \
+             SELECT id, bucket, value FROM '/tmp/facts.parquet' WHERE bucket = 7",
+        )
+        .expect("query should parse");
+        let [Statement::Query(query)] = statements.as_slice() else {
+            panic!("expected query");
+        };
+
+        let mut operands = Vec::new();
+        assert!(
+            collect_union_all_operand_queries(query.body.as_ref(), &mut operands)
+                .expect("operands should parse")
+        );
+        let plan =
+            same_source_disjoint_union_all_plan(&operands).expect("shared scan should be planned");
+
+        assert_eq!(plan.path, PathBuf::from("/tmp/facts.parquet"));
+        assert_eq!(
+            plan.projection,
+            Projection::Columns(vec![
+                "id".to_string(),
+                "bucket".to_string(),
+                "value".to_string()
+            ])
+        );
+        assert!(matches!(plan.filter.expr(), Expr::InList { .. }));
     }
 }

@@ -9,9 +9,9 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Date64Array, Decimal128Array,
-    DictionaryArray, Float64Array, Float64Builder, Int32Array, Int32Builder, Int64Array,
-    Int64Builder, Scalar, StringArray, StringBuilder, TimestampMicrosecondArray,
+    Array, ArrayRef, BooleanArray, BooleanBufferBuilder, BooleanBuilder, Date32Array, Date64Array,
+    Decimal128Array, DictionaryArray, Float64Array, Float64Builder, Int32Array, Int32Builder,
+    Int64Array, Int64Builder, Scalar, StringArray, StringBuilder, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt32Array,
     UInt32Builder, UInt64Array, UInt64Builder, new_null_array,
 };
@@ -44,11 +44,41 @@ use crate::execution::{
 use crate::hash::{FastHashMap as JoinKeyHashMap, FastHashSet as JoinKeyHashSet};
 use crate::plan::DirectPrimitiveFoldMode;
 use crate::storage::{
-    DirectPrimitiveColumnSpec, DirectPrimitiveColumnType, ObjectStore, ParquetBatchReader,
-    ParquetFileCache, ParquetMetadataCache, ParquetScanTask, plan_parquet_scan_tasks,
+    DirectPrimitiveColumnSpec, DirectPrimitiveColumnType, DirectPrimitiveCountSumPageBatch,
+    ObjectStore, ParquetBatchReader, ParquetFileCache, ParquetMetadataCache, ParquetScanTask,
+    plan_parquet_scan_tasks, read_parquet_i32_column_min_max_for_row_groups_with_store,
     scan_parquet_primitive_columns_with_store,
+    scan_parquet_primitive_columns_with_store_page_reader,
+    scan_parquet_required_primitive_count_sum_pages_with_store,
 };
-use crate::vector::{BatchView, Date32VectorView, I32VectorView, I64VectorView};
+use crate::vector::{
+    BatchView, Date32VectorView, I32VectorView, I64VectorView, read_i32_le_unaligned,
+    read_i64_le_unaligned,
+};
+
+fn partition_row_groups_balanced(row_groups: &[usize], partitions: usize) -> Vec<Vec<usize>> {
+    if !std::env::var("DODAM_ENABLE_BALANCED_DIRECT_PRIMITIVE_PARTITIONS")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        let partitions = partitions.min(row_groups.len()).max(1);
+        let chunk_size = row_groups.len().div_ceil(partitions).max(1);
+        return row_groups
+            .chunks(chunk_size)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+    }
+    let partitions = partitions.min(row_groups.len()).max(1);
+    let base = row_groups.len() / partitions;
+    let remainder = row_groups.len() % partitions;
+    let mut output = Vec::with_capacity(partitions);
+    let mut cursor = 0usize;
+    for partition in 0..partitions {
+        let len = base + usize::from(partition < remainder);
+        output.push(row_groups[cursor..cursor + len].to_vec());
+        cursor += len;
+    }
+    output
+}
 
 pub struct ScanExec {
     fragments: Vec<FileFragment>,
@@ -222,6 +252,34 @@ impl DirectPrimitiveFoldExec {
                 sum,
                 ..
             } => {
+                let i32_dense_range = direct_primitive_i32_dense_range(
+                    &self.path,
+                    &self.row_groups,
+                    &columns,
+                    self.file_cache.clone(),
+                    self.object_store.as_ref(),
+                    key_type.as_str(),
+                )?;
+                if direct_primitive_count_sum_page_operator_enabled()
+                    && let Some((state, scan_metrics)) = scan_direct_primitive_count_sum_page_fold(
+                        self.path.clone(),
+                        self.batch_size,
+                        self.row_groups.clone(),
+                        columns.clone(),
+                        self.file_cache.clone(),
+                        self.object_store.clone(),
+                        key_type.as_str(),
+                        count.clone(),
+                        sum.clone(),
+                        i32_dense_range,
+                    )?
+                {
+                    let mut metrics = state.finish();
+                    metrics.fragments = 1;
+                    metrics.batches = scan_metrics.batches;
+                    metrics.rows = scan_metrics.rows;
+                    return Ok(Some(metrics));
+                }
                 let Some((state, scan_metrics)) = scan_direct_primitive_parallel_fold(
                     self.path,
                     self.batch_size,
@@ -229,10 +287,21 @@ impl DirectPrimitiveFoldExec {
                     columns,
                     self.file_cache,
                     self.object_store,
+                    true,
                     || match key_type.as_str() {
-                        "i32" | "I32" | "int32" | "Int32" => Ok(
-                            SingleKeyCountSumVectorState::new_i32(count.clone(), sum.clone()),
-                        ),
+                        "i32" | "I32" | "int32" | "Int32" => {
+                            Ok(if let Some((min, max)) = i32_dense_range {
+                                SingleKeyCountSumVectorState::new_i32_with_dense_range(
+                                    count.clone(),
+                                    sum.clone(),
+                                    min,
+                                    max,
+                                    direct_primitive_stats_dense_i32_max_slots(),
+                                )
+                            } else {
+                                SingleKeyCountSumVectorState::new_i32(count.clone(), sum.clone())
+                            })
+                        }
                         "i64" | "I64" | "int64" | "Int64" => Ok(
                             SingleKeyCountSumVectorState::new_i64(count.clone(), sum.clone()),
                         ),
@@ -280,6 +349,7 @@ impl DirectPrimitiveFoldExec {
                     columns,
                     self.file_cache,
                     self.object_store,
+                    false,
                     || match key_type.as_str() {
                         "i32" | "I32" | "int32" | "Int32" => {
                             Ok(SingleKeyCountSumMinMaxVectorState::new_i32(
@@ -323,6 +393,148 @@ impl DirectPrimitiveFoldExec {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn scan_direct_primitive_count_sum_page_fold(
+    path: PathBuf,
+    batch_size: usize,
+    row_groups: Vec<usize>,
+    columns: Vec<(String, DirectPrimitiveColumnType)>,
+    file_cache: Arc<ParquetFileCache>,
+    object_store: Arc<dyn ObjectStore>,
+    key_type: &str,
+    count: AggregateExpr,
+    sum: AggregateExpr,
+    i32_dense_range: Option<(i32, i32)>,
+) -> Result<
+    Option<(
+        SingleKeyCountSumVectorState,
+        crate::storage::DirectPrimitiveColumnScanMetrics,
+    )>,
+> {
+    let init = || match key_type {
+        "i32" | "I32" | "int32" | "Int32" => Ok(if let Some((min, max)) = i32_dense_range {
+            SingleKeyCountSumVectorState::new_i32_with_dense_range(
+                count.clone(),
+                sum.clone(),
+                min,
+                max,
+                direct_primitive_stats_dense_i32_max_slots(),
+            )
+        } else {
+            SingleKeyCountSumVectorState::new_i32(count.clone(), sum.clone())
+        }),
+        "i64" | "I64" | "int64" | "Int64" => Ok(SingleKeyCountSumVectorState::new_i64(
+            count.clone(),
+            sum.clone(),
+        )),
+        _ => Err(DodamError::UnsupportedSql(format!(
+            "unsupported DirectPrimitiveFoldExec count/sum key type: {key_type}"
+        ))),
+    };
+    let consume = |state: &mut SingleKeyCountSumVectorState,
+                   batch: DirectPrimitiveCountSumPageBatch<'_>|
+     -> Result<()> {
+        match batch {
+            DirectPrimitiveCountSumPageBatch::I32I64 { keys, sums, rows } => {
+                state.consume_i32_i64_page_bytes(keys, sums, rows)
+            }
+            DirectPrimitiveCountSumPageBatch::I64I64 { keys, sums, rows } => {
+                state.consume_i64_i64_page_bytes(keys, sums, rows)
+            }
+        }
+    };
+    let mut state = init()?;
+    let mut scan_metrics = crate::storage::DirectPrimitiveColumnScanMetrics::default();
+    if row_groups.is_empty() {
+        return Ok(Some((state, scan_metrics)));
+    }
+    if row_groups.len() <= 1 {
+        let specs = borrowed_direct_primitive_specs(&columns);
+        let Some(metrics) = scan_parquet_required_primitive_count_sum_pages_with_store(
+            &path,
+            batch_size,
+            &row_groups,
+            &specs,
+            file_cache,
+            object_store.as_ref(),
+            |batch| consume(&mut state, batch),
+        )?
+        else {
+            return Ok(None);
+        };
+        log_direct_primitive_exec_profile(&path, &columns, &metrics);
+        return Ok(Some((state, metrics)));
+    }
+    let workers = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .min(row_groups.len());
+    let (sender, receiver) = mpsc::channel();
+    let row_group_partitions = partition_row_groups_balanced(&row_groups, workers);
+    std::thread::scope(|scope| {
+        for row_group_partition in row_group_partitions {
+            let sender = sender.clone();
+            let path = path.clone();
+            let columns = columns.clone();
+            let row_groups = row_group_partition;
+            let file_cache = file_cache.clone();
+            let object_store = object_store.clone();
+            let count = count.clone();
+            let sum = sum.clone();
+            scope.spawn(move || {
+                let result: Result<
+                    Option<(
+                        SingleKeyCountSumVectorState,
+                        crate::storage::DirectPrimitiveColumnScanMetrics,
+                    )>,
+                > = (|| {
+                    let mut state = match key_type {
+                        "i32" | "I32" | "int32" | "Int32" => {
+                            if let Some((min, max)) = i32_dense_range {
+                                SingleKeyCountSumVectorState::new_i32_with_dense_range(
+                                    count,
+                                    sum,
+                                    min,
+                                    max,
+                                    direct_primitive_stats_dense_i32_max_slots(),
+                                )
+                            } else {
+                                SingleKeyCountSumVectorState::new_i32(count, sum)
+                            }
+                        }
+                        "i64" | "I64" | "int64" | "Int64" => {
+                            SingleKeyCountSumVectorState::new_i64(count, sum)
+                        }
+                        _ => return Ok(None),
+                    };
+                    let specs = borrowed_direct_primitive_specs(&columns);
+                    let metrics = scan_parquet_required_primitive_count_sum_pages_with_store(
+                        &path,
+                        batch_size,
+                        &row_groups,
+                        &specs,
+                        file_cache,
+                        object_store.as_ref(),
+                        |batch| consume(&mut state, batch),
+                    )?;
+                    Ok(metrics.map(|metrics| (state, metrics)))
+                })();
+                let _ = sender.send(result);
+            });
+        }
+    });
+    drop(sender);
+    for received in receiver {
+        let Some((partial, metrics)) = received? else {
+            return Ok(None);
+        };
+        state.merge(partial)?;
+        scan_metrics.merge_from(metrics);
+    }
+    log_direct_primitive_exec_profile(&path, &columns, &scan_metrics);
+    Ok(Some((state, scan_metrics)))
+}
+
 fn scan_direct_primitive_parallel_fold<S, Init, Consume, Merge>(
     path: PathBuf,
     batch_size: usize,
@@ -330,6 +542,7 @@ fn scan_direct_primitive_parallel_fold<S, Init, Consume, Merge>(
     columns: Vec<(String, DirectPrimitiveColumnType)>,
     file_cache: Arc<ParquetFileCache>,
     object_store: Arc<dyn ObjectStore>,
+    force_page_reader: bool,
     init: Init,
     consume: Consume,
     merge: Merge,
@@ -347,16 +560,28 @@ where
     }
     if row_groups.len() <= 1 {
         let specs = borrowed_direct_primitive_specs(&columns);
-        let Some(metrics) = scan_parquet_primitive_columns_with_store(
-            &path,
-            batch_size,
-            &row_groups,
-            &specs,
-            file_cache,
-            object_store.as_ref(),
-            |columns| consume(&mut state, BatchView::from_raw_columns(columns)),
-        )?
-        else {
+        let metrics = if force_page_reader {
+            scan_parquet_primitive_columns_with_store_page_reader(
+                &path,
+                batch_size,
+                &row_groups,
+                &specs,
+                file_cache,
+                object_store.as_ref(),
+                |columns| consume(&mut state, BatchView::from_raw_columns(columns)),
+            )?
+        } else {
+            scan_parquet_primitive_columns_with_store(
+                &path,
+                batch_size,
+                &row_groups,
+                &specs,
+                file_cache,
+                object_store.as_ref(),
+                |columns| consume(&mut state, BatchView::from_raw_columns(columns)),
+            )?
+        };
+        let Some(metrics) = metrics else {
             return Ok(None);
         };
         log_direct_primitive_exec_profile(&path, &columns, &metrics);
@@ -367,14 +592,14 @@ where
         .map(usize::from)
         .unwrap_or(4)
         .min(row_groups.len());
-    let chunk_size = row_groups.len().div_ceil(workers).max(1);
     let (sender, receiver) = mpsc::channel();
+    let row_group_partitions = partition_row_groups_balanced(&row_groups, workers);
     std::thread::scope(|scope| {
-        for row_group_chunk in row_groups.chunks(chunk_size) {
+        for row_group_partition in row_group_partitions {
             let sender = sender.clone();
             let path = path.clone();
             let columns = columns.clone();
-            let row_groups = row_group_chunk.to_vec();
+            let row_groups = row_group_partition;
             let file_cache = file_cache.clone();
             let object_store = object_store.clone();
             let init = &init;
@@ -384,15 +609,27 @@ where
                     (|| {
                         let mut state = init()?;
                         let specs = borrowed_direct_primitive_specs(&columns);
-                        let metrics = scan_parquet_primitive_columns_with_store(
-                            &path,
-                            batch_size,
-                            &row_groups,
-                            &specs,
-                            file_cache,
-                            object_store.as_ref(),
-                            |columns| consume(&mut state, BatchView::from_raw_columns(columns)),
-                        )?;
+                        let metrics = if force_page_reader {
+                            scan_parquet_primitive_columns_with_store_page_reader(
+                                &path,
+                                batch_size,
+                                &row_groups,
+                                &specs,
+                                file_cache,
+                                object_store.as_ref(),
+                                |columns| consume(&mut state, BatchView::from_raw_columns(columns)),
+                            )?
+                        } else {
+                            scan_parquet_primitive_columns_with_store(
+                                &path,
+                                batch_size,
+                                &row_groups,
+                                &specs,
+                                file_cache,
+                                object_store.as_ref(),
+                                |columns| consume(&mut state, BatchView::from_raw_columns(columns)),
+                            )?
+                        };
                         Ok(metrics.map(|metrics| (state, metrics)))
                     })();
                 let _ = sender.send(result);
@@ -445,7 +682,7 @@ fn log_direct_primitive_exec_profile(
         metrics.selected_rows as f64 / metrics.rows as f64
     };
     eprintln!(
-        "[dodam:direct-primitive-profile] {table}[{columns}]: row_groups={} rows={} batches={} read={:.3} ms consume={:.3} ms column_read=[{}] selected_rows={} selected_ratio={:.3} selected_runs={} selected_batches={} full_batches={}",
+        "[dodam:direct-primitive-profile] {table}[{columns}]: row_groups={} rows={} batches={} read={:.3} ms consume={:.3} ms column_read=[{}] selected_rows={} selected_ratio={:.3} selected_runs={} selected_batches={} full_batches={} selected_skip_calls={} selected_skipped_rows={} selected_read_calls={} selected_read_rows={}",
         metrics.row_groups,
         metrics.rows,
         metrics.batches,
@@ -457,7 +694,72 @@ fn log_direct_primitive_exec_profile(
         metrics.selected_runs,
         metrics.selected_payload_batches,
         metrics.full_payload_batches,
+        metrics.selected_skip_calls,
+        metrics.selected_skipped_rows,
+        metrics.selected_read_calls,
+        metrics.selected_read_rows,
     );
+}
+
+fn direct_primitive_count_sum_page_operator_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_PRIMITIVE_PAGE_AGG_OPERATOR")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn direct_primitive_i32_dense_range(
+    path: &PathBuf,
+    row_groups: &[usize],
+    columns: &[(String, DirectPrimitiveColumnType)],
+    file_cache: Arc<ParquetFileCache>,
+    object_store: &dyn ObjectStore,
+    key_type: &str,
+) -> Result<Option<(i32, i32)>> {
+    if !direct_primitive_stats_dense_i32_enabled()
+        || !matches!(key_type, "i32" | "I32" | "int32" | "Int32")
+    {
+        return Ok(None);
+    }
+    let Some((key_column, DirectPrimitiveColumnType::I32)) = columns.first() else {
+        return Ok(None);
+    };
+    let Some((min, max)) = read_parquet_i32_column_min_max_for_row_groups_with_store(
+        path,
+        key_column,
+        row_groups,
+        file_cache,
+        object_store,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(slot_count) = i32_range_slot_count(min, max) else {
+        return Ok(None);
+    };
+    if slot_count > direct_primitive_stats_dense_i32_max_slots() {
+        return Ok(None);
+    }
+    Ok(Some((min, max)))
+}
+
+fn direct_primitive_stats_dense_i32_enabled() -> bool {
+    !std::env::var("DODAM_DISABLE_DIRECT_PRIMITIVE_STATS_DENSE_I32")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn direct_primitive_stats_dense_i32_max_slots() -> usize {
+    std::env::var("DODAM_DIRECT_PRIMITIVE_STATS_DENSE_I32_MAX_SLOTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1_000_000)
+}
+
+fn i32_range_slot_count(min: i32, max: i32) -> Option<usize> {
+    if max < min {
+        return None;
+    }
+    let width = i64::from(max) - i64::from(min) + 1;
+    usize::try_from(width).ok()
 }
 
 fn borrowed_direct_primitive_specs(
@@ -6484,6 +6786,64 @@ fn probe_i32_dense_unique_hash_join_batches(
     )?;
     metrics.add_join_probe_rows(probe.num_rows());
 
+    if key_array.null_count() == 0 {
+        let key_values = key_array.values();
+        let mut block_start = 0usize;
+        while block_start < probe.num_rows() {
+            let block_len = (probe.num_rows() - block_start).min(64);
+            for lane in 0..block_len {
+                let probe_row = block_start + lane;
+                let Some(build_ref) = i32_dense_rows.get(key_values[probe_row]) else {
+                    bloom_filtered_rows += 1;
+                    push_unmatched_probe_match(
+                        &context,
+                        probe_row,
+                        join_type,
+                        &mut unmatched_probe_indices,
+                        &mut output,
+                    )?;
+                    continue;
+                };
+                if let Some(matched_build) = matched_build.as_deref_mut() {
+                    matched_build.mark_i32_key(key_values[probe_row]);
+                }
+                let probe_row = u32::try_from(probe_row).map_err(|_| {
+                    DodamError::UnsupportedSql(
+                        "hash join currently supports up to u32::MAX rows per side".to_string(),
+                    )
+                })?;
+                probe_indices.push(probe_row);
+                build_refs.push(build_ref);
+                if probe_indices.len() >= JOIN_OUTPUT_CHUNK_ROWS {
+                    output.push(materialize_hash_join_pairs(
+                        &context,
+                        &probe_indices,
+                        &build_refs,
+                    )?);
+                    probe_indices.clear();
+                    build_refs.clear();
+                }
+            }
+            block_start += block_len;
+        }
+        metrics.add_join_bloom_filtered_rows(bloom_filtered_rows);
+
+        if !probe_indices.is_empty() {
+            output.push(materialize_hash_join_pairs(
+                &context,
+                &probe_indices,
+                &build_refs,
+            )?);
+        }
+        if !unmatched_probe_indices.is_empty() {
+            output.push(materialize_unmatched_probe_matches(
+                &context,
+                &unmatched_probe_indices,
+            )?);
+        }
+        return Ok(output);
+    }
+
     for probe_row in 0..probe.num_rows() {
         if key_array.is_null(probe_row) {
             push_unmatched_probe_match(
@@ -6591,6 +6951,62 @@ fn probe_i32_unique_hash_join_batches(
         metrics,
     )?;
     metrics.add_join_probe_rows(probe.num_rows());
+
+    if key_array.null_count() == 0 {
+        let key_values = key_array.values();
+        let mut block_start = 0usize;
+        while block_start < probe.num_rows() {
+            let block_len = (probe.num_rows() - block_start).min(64);
+            for lane in 0..block_len {
+                let probe_row = block_start + lane;
+                let Some(build_ref) = i32_unique_rows.get(&key_values[probe_row]).copied() else {
+                    bloom_filtered_rows += 1;
+                    push_unmatched_probe_if_outer(
+                        probe,
+                        build,
+                        probe_row,
+                        build_side,
+                        join_type,
+                        left_prefix,
+                        right_prefix,
+                        metrics,
+                        &mut output,
+                    )?;
+                    continue;
+                };
+                if let Some(matched_build) = matched_build.as_deref_mut() {
+                    matched_build.mark_ref(build_ref);
+                }
+                let probe_row = u32::try_from(probe_row).map_err(|_| {
+                    DodamError::UnsupportedSql(
+                        "hash join currently supports up to u32::MAX rows per side".to_string(),
+                    )
+                })?;
+                probe_indices.push(probe_row);
+                build_refs.push(build_ref);
+                if probe_indices.len() >= JOIN_OUTPUT_CHUNK_ROWS {
+                    output.push(materialize_hash_join_pairs(
+                        &context,
+                        &probe_indices,
+                        &build_refs,
+                    )?);
+                    probe_indices.clear();
+                    build_refs.clear();
+                }
+            }
+            block_start += block_len;
+        }
+        metrics.add_join_bloom_filtered_rows(bloom_filtered_rows);
+
+        if !probe_indices.is_empty() {
+            output.push(materialize_hash_join_pairs(
+                &context,
+                &probe_indices,
+                &build_refs,
+            )?);
+        }
+        return Ok(output);
+    }
 
     for probe_row in 0..probe.num_rows() {
         if key_array.is_null(probe_row) {
@@ -9261,17 +9677,25 @@ fn projected_view_column_index(columns: &[String], column: &str) -> Option<usize
 }
 
 fn compare_i64_view(values: I64VectorView<'_>, op: ComparisonOp, literal: i64) -> BooleanArray {
-    BooleanArray::from(
-        (0..values.len())
-            .map(|row| {
-                if values.is_null(row) {
-                    None
-                } else {
-                    Some(compare_i64(values.value(row), op, literal))
-                }
-            })
-            .collect::<Vec<_>>(),
-    )
+    if let Some(raw) = values.values_if_null_free() {
+        return boolean_array_no_nulls_from_len(raw.len(), |row| {
+            compare_i64(raw[row], op, literal)
+        });
+    }
+    if let Some((data, len)) = values.raw_bytes() {
+        return boolean_array_no_nulls_from_i64_bytes(data, len, |value| {
+            compare_i64(value, op, literal)
+        });
+    }
+    let mut output = BooleanBuilder::with_capacity(values.len());
+    for row in 0..values.len() {
+        if values.is_null(row) {
+            output.append_null();
+        } else {
+            output.append_value(compare_i64(values.value(row), op, literal));
+        }
+    }
+    output.finish()
 }
 
 fn compare_i64(left: i64, op: ComparisonOp, right: i64) -> bool {
@@ -9286,21 +9710,29 @@ fn compare_i64(left: i64, op: ComparisonOp, right: i64) -> bool {
 }
 
 fn compare_i32_view(values: I32VectorView<'_>, op: ComparisonOp, literal: i32) -> BooleanArray {
-    BooleanArray::from(
-        (0..values.len())
-            .map(|row| {
-                if values.is_null(row) {
-                    None
-                } else {
-                    Some(compare_i64(
-                        i64::from(values.value(row)),
-                        op,
-                        i64::from(literal),
-                    ))
-                }
-            })
-            .collect::<Vec<_>>(),
-    )
+    if let Some(raw) = values.values_if_null_free() {
+        return boolean_array_no_nulls_from_len(raw.len(), |row| {
+            compare_i64(i64::from(raw[row]), op, i64::from(literal))
+        });
+    }
+    if let Some((data, len)) = values.raw_bytes() {
+        return boolean_array_no_nulls_from_i32_bytes(data, len, |value| {
+            compare_i64(i64::from(value), op, i64::from(literal))
+        });
+    }
+    let mut output = BooleanBuilder::with_capacity(values.len());
+    for row in 0..values.len() {
+        if values.is_null(row) {
+            output.append_null();
+        } else {
+            output.append_value(compare_i64(
+                i64::from(values.value(row)),
+                op,
+                i64::from(literal),
+            ));
+        }
+    }
+    output.finish()
 }
 
 fn compare_date32_view(
@@ -9308,21 +9740,29 @@ fn compare_date32_view(
     op: ComparisonOp,
     literal: i32,
 ) -> BooleanArray {
-    BooleanArray::from(
-        (0..values.len())
-            .map(|row| {
-                if values.is_null(row) {
-                    None
-                } else {
-                    Some(compare_i64(
-                        i64::from(values.value(row)),
-                        op,
-                        i64::from(literal),
-                    ))
-                }
-            })
-            .collect::<Vec<_>>(),
-    )
+    if let Some(raw) = values.values_if_null_free() {
+        return boolean_array_no_nulls_from_len(raw.len(), |row| {
+            compare_i64(i64::from(raw[row]), op, i64::from(literal))
+        });
+    }
+    if let Some((data, len)) = values.raw_bytes() {
+        return boolean_array_no_nulls_from_i32_bytes(data, len, |value| {
+            compare_i64(i64::from(value), op, i64::from(literal))
+        });
+    }
+    let mut output = BooleanBuilder::with_capacity(values.len());
+    for row in 0..values.len() {
+        if values.is_null(row) {
+            output.append_null();
+        } else {
+            output.append_value(compare_i64(
+                i64::from(values.value(row)),
+                op,
+                i64::from(literal),
+            ));
+        }
+    }
+    output.finish()
 }
 
 fn in_list_i64_view(
@@ -9331,17 +9771,30 @@ fn in_list_i64_view(
     negated: bool,
     has_null: bool,
 ) -> BooleanArray {
-    BooleanArray::from(
-        (0..values.len())
-            .map(|row| {
-                if values.is_null(row) {
-                    None
-                } else {
-                    in_list_result(list.contains(&values.value(row)), negated, has_null)
-                }
-            })
-            .collect::<Vec<_>>(),
-    )
+    if !has_null && let Some(raw) = values.values_if_null_free() {
+        return boolean_array_no_nulls_from_len(raw.len(), |row| {
+            selected_in_list_result(small_in_list_match_i64(raw[row], list), negated, false)
+        });
+    }
+    if !has_null && let Some((data, len)) = values.raw_bytes() {
+        return boolean_array_no_nulls_from_i64_bytes(data, len, |value| {
+            selected_in_list_result(small_in_list_match_i64(value, list), negated, false)
+        });
+    }
+    let mut output = BooleanBuilder::with_capacity(values.len());
+    for row in 0..values.len() {
+        if values.is_null(row) {
+            output.append_null();
+            continue;
+        }
+        append_in_list_result(
+            &mut output,
+            small_in_list_match_i64(values.value(row), list),
+            negated,
+            has_null,
+        );
+    }
+    output.finish()
 }
 
 fn in_list_i32_view(
@@ -9350,26 +9803,244 @@ fn in_list_i32_view(
     negated: bool,
     has_null: bool,
 ) -> BooleanArray {
-    BooleanArray::from(
-        (0..values.len())
-            .map(|row| {
-                if values.is_null(row) {
-                    None
-                } else {
-                    in_list_result(list.contains(&values.value(row)), negated, has_null)
-                }
-            })
-            .collect::<Vec<_>>(),
-    )
+    if !has_null && let Some(raw) = values.values_if_null_free() {
+        return boolean_array_no_nulls_from_len(raw.len(), |row| {
+            selected_in_list_result(small_in_list_match_i32(raw[row], list), negated, false)
+        });
+    }
+    if !has_null && let Some((data, len)) = values.raw_bytes() {
+        return boolean_array_no_nulls_from_i32_bytes(data, len, |value| {
+            selected_in_list_result(small_in_list_match_i32(value, list), negated, false)
+        });
+    }
+    let mut output = BooleanBuilder::with_capacity(values.len());
+    for row in 0..values.len() {
+        if values.is_null(row) {
+            output.append_null();
+            continue;
+        }
+        append_in_list_result(
+            &mut output,
+            small_in_list_match_i32(values.value(row), list),
+            negated,
+            has_null,
+        );
+    }
+    output.finish()
 }
 
-fn in_list_result(matched: bool, negated: bool, has_null: bool) -> Option<bool> {
+fn small_in_list_match_i64(value: i64, list: &[i64]) -> bool {
+    match list {
+        [] => false,
+        [a] => value == *a,
+        [a, b] => value == *a || value == *b,
+        [a, b, c] => value == *a || value == *b || value == *c,
+        [a, b, c, d] => value == *a || value == *b || value == *c || value == *d,
+        _ => list.contains(&value),
+    }
+}
+
+fn small_in_list_match_i32(value: i32, list: &[i32]) -> bool {
+    match list {
+        [] => false,
+        [a] => value == *a,
+        [a, b] => value == *a || value == *b,
+        [a, b, c] => value == *a || value == *b || value == *c,
+        [a, b, c, d] => value == *a || value == *b || value == *c || value == *d,
+        _ => list.contains(&value),
+    }
+}
+
+fn append_in_list_result(
+    output: &mut BooleanBuilder,
+    matched: bool,
+    negated: bool,
+    has_null: bool,
+) {
     if matched {
-        Some(!negated)
+        output.append_value(!negated);
     } else if has_null {
-        None
+        output.append_null();
     } else {
-        Some(negated)
+        output.append_value(negated);
+    }
+}
+
+fn selected_in_list_result(matched: bool, negated: bool, has_null: bool) -> bool {
+    if matched {
+        !negated
+    } else if has_null {
+        false
+    } else {
+        negated
+    }
+}
+
+fn boolean_array_no_nulls_from_len(
+    len: usize,
+    mut value_at: impl FnMut(usize) -> bool,
+) -> BooleanArray {
+    let mut values = BooleanBufferBuilder::new(len);
+    let mut row = 0usize;
+    while row + 64 <= len {
+        let mut mask = 0u64;
+        for lane in 0..64 {
+            if value_at(row + lane) {
+                mask |= 1u64 << lane;
+            }
+        }
+        append_boolean_mask_word(&mut values, 64, mask);
+        row += 64;
+    }
+    if row < len {
+        let tail = len - row;
+        let mut mask = 0u64;
+        for lane in 0..tail {
+            if value_at(row + lane) {
+                mask |= 1u64 << lane;
+            }
+        }
+        append_boolean_mask_word(&mut values, tail, mask);
+    }
+    BooleanArray::new(values.build(), None)
+}
+
+fn boolean_array_no_nulls_from_i32_bytes(
+    data: &[u8],
+    len: usize,
+    mut value_at: impl FnMut(i32) -> bool,
+) -> BooleanArray {
+    debug_assert!(data.len() >= len.saturating_mul(std::mem::size_of::<i32>()));
+    let mut values = BooleanBufferBuilder::new(len);
+    let mut row = 0usize;
+    while row + 64 <= len {
+        let mut mask = 0u64;
+        for lane in 0..64 {
+            if value_at(read_i32_le_unaligned(data, row + lane)) {
+                mask |= 1u64 << lane;
+            }
+        }
+        append_boolean_mask_word(&mut values, 64, mask);
+        row += 64;
+    }
+    if row < len {
+        let tail = len - row;
+        let mut mask = 0u64;
+        for lane in 0..tail {
+            if value_at(read_i32_le_unaligned(data, row + lane)) {
+                mask |= 1u64 << lane;
+            }
+        }
+        append_boolean_mask_word(&mut values, tail, mask);
+    }
+    BooleanArray::new(values.build(), None)
+}
+
+fn boolean_array_no_nulls_from_i64_bytes(
+    data: &[u8],
+    len: usize,
+    mut value_at: impl FnMut(i64) -> bool,
+) -> BooleanArray {
+    debug_assert!(data.len() >= len.saturating_mul(std::mem::size_of::<i64>()));
+    let mut values = BooleanBufferBuilder::new(len);
+    let mut row = 0usize;
+    while row + 64 <= len {
+        let mut mask = 0u64;
+        for lane in 0..64 {
+            if value_at(read_i64_le_unaligned(data, row + lane)) {
+                mask |= 1u64 << lane;
+            }
+        }
+        append_boolean_mask_word(&mut values, 64, mask);
+        row += 64;
+    }
+    if row < len {
+        let tail = len - row;
+        let mut mask = 0u64;
+        for lane in 0..tail {
+            if value_at(read_i64_le_unaligned(data, row + lane)) {
+                mask |= 1u64 << lane;
+            }
+        }
+        append_boolean_mask_word(&mut values, tail, mask);
+    }
+    BooleanArray::new(values.build(), None)
+}
+
+fn append_boolean_mask_word(values: &mut BooleanBufferBuilder, len: usize, mask: u64) {
+    debug_assert!(len <= 64);
+    if len == 0 {
+        return;
+    }
+    let valid_mask = if len == 64 {
+        u64::MAX
+    } else {
+        (1u64 << len) - 1
+    };
+    let mask = mask & valid_mask;
+    if mask == 0 {
+        values.append_n(len, false);
+    } else if mask == valid_mask {
+        values.append_n(len, true);
+    } else {
+        values.append_packed_range(0..len, &mask.to_le_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Array;
+
+    #[test]
+    fn no_null_boolean_mask_from_len_preserves_tail_bits() {
+        for len in [0usize, 1, 2, 63, 64, 65, 127, 128, 129] {
+            let mask = boolean_array_no_nulls_from_len(len, |row| {
+                row == 0 || row + 1 == len || row % 7 == 3
+            });
+            assert_eq!(mask.len(), len);
+            assert_eq!(mask.null_count(), 0);
+            for row in 0..len {
+                assert_eq!(
+                    mask.value(row),
+                    row == 0 || row + 1 == len || row % 7 == 3,
+                    "len={len} row={row}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_null_boolean_mask_from_raw_i32_i64_preserves_tail_bits() {
+        for len in [1usize, 63, 64, 65, 129] {
+            let i32_bytes = (0..len)
+                .flat_map(|row| ((row as i32) - 37).to_le_bytes())
+                .collect::<Vec<_>>();
+            let i32_mask =
+                boolean_array_no_nulls_from_i32_bytes(&i32_bytes, len, |value| value % 5 == 0);
+            assert_eq!(i32_mask.len(), len);
+            assert_eq!(i32_mask.null_count(), 0);
+            for row in 0..len {
+                let value = row as i32 - 37;
+                assert_eq!(
+                    i32_mask.value(row),
+                    value % 5 == 0,
+                    "i32 len={len} row={row}"
+                );
+            }
+
+            let i64_bytes = (0..len)
+                .flat_map(|row| ((row as i64) * 13 - 101).to_le_bytes())
+                .collect::<Vec<_>>();
+            let i64_mask =
+                boolean_array_no_nulls_from_i64_bytes(&i64_bytes, len, |value| value >= 0);
+            assert_eq!(i64_mask.len(), len);
+            assert_eq!(i64_mask.null_count(), 0);
+            for row in 0..len {
+                let value = row as i64 * 13 - 101;
+                assert_eq!(i64_mask.value(row), value >= 0, "i64 len={len} row={row}");
+            }
+        }
     }
 }
 

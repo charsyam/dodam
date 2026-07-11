@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{Array, Date32Array, Decimal128Array, Int64Array, UInt32Array};
@@ -39,17 +39,23 @@ use crate::plan::{
     PlanTableSource, TaskInput, TaskPlan,
 };
 use crate::storage::{
-    DirectByteArrayPayloadReader, DirectColumnScanMetrics, DirectI64I32I32ScanMetrics,
+    DirectByteArrayPayloadReader, DirectColumnScanMetrics, DirectI32I32DictionaryI64SelectedBatch,
+    DirectI32I64DecimalI32SelectedBatch, DirectI64I32I32ScanMetrics,
     DirectPrimitiveColumnScanMetrics, DirectPrimitiveColumnSpec, DirectPrimitiveColumnType,
     I64BloomPredicate, LocalFileSystemObjectStore, ObjectStore, ParquetBatchReader,
     ParquetFileCache, ParquetFileCacheStats, ParquetMetadataCache,
-    parquet_row_group_count_with_store, plan_parquet_scan_tasks, read_parquet_file_statistics,
+    parquet_column_monotonic_by_scan, parquet_row_group_count_with_store,
+    parquet_row_groups_monotonic_by_column, plan_parquet_scan_tasks, read_parquet_file_statistics,
     read_parquet_i64_column_constant, read_parquet_i64_column_max,
+    read_parquet_i128_column_min_max,
+    scan_parquet_i32_i32_dictionary_i64_decimal_selected_typed_with_store,
     scan_parquet_i32_i64_byte_array_columns_with_store,
+    scan_parquet_i32_i64_decimal_i32_selected_typed_with_store,
     scan_parquet_i32_i64_decimal_i32_selected_with_store,
     scan_parquet_i32_i64_dictionary_id_columns_with_store,
     scan_parquet_i64_byte_array_payload_columns_with_store,
     scan_parquet_primitive_columns_with_store,
+    scan_parquet_primitive_columns_with_store_page_reader,
 };
 use crate::vector::{BatchView, Date32VectorView, Decimal128VectorView, I64VectorView};
 
@@ -59,8 +65,17 @@ const LOCAL_SHUFFLE_FILE_TARGET_BYTES: u64 = 64 * 1024 * 1024;
 pub struct DodamEngine {
     metadata_cache: Arc<ParquetMetadataCache>,
     file_cache: Arc<ParquetFileCache>,
+    i128_column_min_max_cache: Arc<Mutex<HashMap<I128ColumnMinMaxCacheKey, Option<(i128, i128)>>>>,
     object_store: Arc<dyn ObjectStore>,
     catalog_root: PathBuf,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct I128ColumnMinMaxCacheKey {
+    path: PathBuf,
+    len: u64,
+    modified_nanos: Option<u128>,
+    column: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +97,51 @@ pub struct LocalExecutionGraphOutput {
     pub stage_metrics: Vec<LocalStageExecutionMetrics>,
 }
 
+#[derive(Debug, Default, Clone)]
+pub(crate) struct RowGroupBatchScanProfile {
+    pub projected_columns: usize,
+    pub row_groups_total: usize,
+    pub row_groups_scanned: usize,
+    pub compressed_bytes_total: u64,
+    pub compressed_bytes_scanned: u64,
+    pub metadata_nanos: u64,
+    pub planning_nanos: u64,
+    pub next_nanos: u64,
+    pub max_next_nanos: u64,
+    pub p95_next_nanos: u64,
+    pub next_calls: usize,
+    pub eof_calls: usize,
+    pub output_batches: usize,
+    pub output_rows: usize,
+    pub zero_row_batches: usize,
+}
+
+impl RowGroupBatchScanProfile {
+    pub(crate) fn merge_from(&mut self, other: Self) {
+        self.projected_columns = self.projected_columns.max(other.projected_columns);
+        self.row_groups_total = self.row_groups_total.max(other.row_groups_total);
+        self.row_groups_scanned = self
+            .row_groups_scanned
+            .saturating_add(other.row_groups_scanned);
+        self.compressed_bytes_total = self
+            .compressed_bytes_total
+            .max(other.compressed_bytes_total);
+        self.compressed_bytes_scanned = self
+            .compressed_bytes_scanned
+            .saturating_add(other.compressed_bytes_scanned);
+        self.metadata_nanos = self.metadata_nanos.saturating_add(other.metadata_nanos);
+        self.planning_nanos = self.planning_nanos.saturating_add(other.planning_nanos);
+        self.next_nanos = self.next_nanos.saturating_add(other.next_nanos);
+        self.max_next_nanos = self.max_next_nanos.max(other.max_next_nanos);
+        self.p95_next_nanos = self.p95_next_nanos.max(other.p95_next_nanos);
+        self.next_calls = self.next_calls.saturating_add(other.next_calls);
+        self.eof_calls = self.eof_calls.saturating_add(other.eof_calls);
+        self.output_batches = self.output_batches.saturating_add(other.output_batches);
+        self.output_rows = self.output_rows.saturating_add(other.output_rows);
+        self.zero_row_batches = self.zero_row_batches.saturating_add(other.zero_row_batches);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectPrimitiveKeyType {
     I32,
@@ -95,6 +155,43 @@ impl DirectPrimitiveKeyType {
             Self::I64 => "i64",
         }
     }
+}
+
+fn partition_row_groups_balanced(row_groups: &[usize], partitions: usize) -> Vec<Vec<usize>> {
+    if !std::env::var("DODAM_ENABLE_BALANCED_DIRECT_PRIMITIVE_PARTITIONS")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        let partitions = partitions.min(row_groups.len()).max(1);
+        let chunk_size = row_groups.len().div_ceil(partitions).max(1);
+        return row_groups
+            .chunks(chunk_size)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+    }
+    let partitions = partitions.min(row_groups.len()).max(1);
+    let base = row_groups.len() / partitions;
+    let remainder = row_groups.len() % partitions;
+    let mut output = Vec::with_capacity(partitions);
+    let mut cursor = 0usize;
+    for partition in 0..partitions {
+        let len = base + usize::from(partition < remainder);
+        output.push(row_groups[cursor..cursor + len].to_vec());
+        cursor += len;
+    }
+    output
+}
+
+fn fused_dictionary_selected_workers(row_groups: usize) -> usize {
+    let default_workers = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .min(row_groups.max(1));
+    std::env::var("DODAM_FUSED_DICT_SELECTED_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default_workers)
+        .min(row_groups.max(1))
 }
 
 #[derive(Debug, Clone)]
@@ -963,6 +1060,7 @@ impl Default for DodamEngine {
         Self {
             metadata_cache: Arc::new(ParquetMetadataCache::default()),
             file_cache: Arc::new(ParquetFileCache::default()),
+            i128_column_min_max_cache: Arc::new(Mutex::new(HashMap::new())),
             object_store: Arc::new(LocalFileSystemObjectStore),
             catalog_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
@@ -991,12 +1089,42 @@ impl DodamEngine {
         self.file_cache.stats()
     }
 
-    pub(crate) fn parquet_row_group_count(&self, path: impl AsRef<Path>) -> Result<usize> {
+    pub fn parquet_row_group_count(&self, path: impl AsRef<Path>) -> Result<usize> {
         parquet_row_group_count_with_store(
             path.as_ref(),
             self.file_cache.clone(),
             self.object_store.as_ref(),
         )
+    }
+
+    pub(crate) fn parquet_direct_primitive_column_types(
+        &self,
+        path: impl AsRef<Path>,
+        columns: &[String],
+    ) -> Result<Option<Vec<DirectPrimitiveColumnType>>> {
+        let file = self.object_store.open(path.as_ref())?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let parquet_columns = reader
+            .metadata()
+            .file_metadata()
+            .schema_descr()
+            .columns()
+            .to_vec();
+        columns
+            .iter()
+            .map(|name| {
+                let Some(column) = parquet_columns.iter().find(|column| column.name() == name)
+                else {
+                    return Ok(None);
+                };
+                let column_type = match column.physical_type() {
+                    parquet::basic::Type::INT32 => DirectPrimitiveColumnType::I32,
+                    parquet::basic::Type::INT64 => DirectPrimitiveColumnType::I64,
+                    _ => return Ok(None),
+                };
+                Ok(Some(column_type))
+            })
+            .collect()
     }
 
     pub(crate) fn scan_parquet_i64_i32_i32_columns_view<F>(
@@ -1039,6 +1167,28 @@ impl DodamEngine {
         F: for<'a> FnMut(BatchView<'a>) -> Result<()>,
     {
         scan_parquet_primitive_columns_with_store(
+            path.as_ref(),
+            batch_size,
+            row_groups,
+            columns,
+            self.file_cache.clone(),
+            self.object_store.as_ref(),
+            move |columns| consume(BatchView::from_raw_columns(columns)),
+        )
+    }
+
+    pub(crate) fn scan_parquet_primitive_columns_page_view<F>(
+        &self,
+        path: impl AsRef<Path>,
+        batch_size: usize,
+        row_groups: &[usize],
+        columns: &[DirectPrimitiveColumnSpec<'_>],
+        mut consume: F,
+    ) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
+    where
+        F: for<'a> FnMut(BatchView<'a>) -> Result<()>,
+    {
+        scan_parquet_primitive_columns_with_store_page_reader(
             path.as_ref(),
             batch_size,
             row_groups,
@@ -1115,15 +1265,15 @@ impl DodamEngine {
             .map(usize::from)
             .unwrap_or(4)
             .min(plan.row_groups.len());
-        let chunk_size = plan.row_groups.len().div_ceil(workers).max(1);
         let (sender, receiver) = mpsc::channel();
+        let row_group_partitions = partition_row_groups_balanced(&plan.row_groups, workers);
         std::thread::scope(|scope| {
-            for row_group_chunk in plan.row_groups.chunks(chunk_size) {
+            for row_group_partition in row_group_partitions {
                 let sender = sender.clone();
                 let engine = self.clone();
                 let path = plan.path.clone();
                 let columns = plan.columns.clone();
-                let row_groups = row_group_chunk.to_vec();
+                let row_groups = row_group_partition;
                 let init = &init;
                 let consume = &consume;
                 scope.spawn(move || {
@@ -1155,7 +1305,7 @@ impl DodamEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn scan_parquet_i32_i64_decimal_i32_selected_fold<S, Init, Consume, Merge>(
+    fn scan_parquet_i32_i64_decimal_i32_selected_batch_fold<S, Init, Consume, Merge>(
         &self,
         path: impl AsRef<Path>,
         batch_size: usize,
@@ -1182,18 +1332,15 @@ impl DodamEngine {
         if row_groups.is_empty() {
             return Ok(Some((state, scan_metrics)));
         }
-        let workers = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(4)
-            .min(row_groups.len());
-        let chunk_size = row_groups.len().div_ceil(workers).max(1);
+        let workers = fused_dictionary_selected_workers(row_groups.len());
         let (sender, receiver) = mpsc::channel();
+        let row_group_partitions = partition_row_groups_balanced(row_groups, workers);
         std::thread::scope(|scope| {
-            for row_group_chunk in row_groups.chunks(chunk_size) {
+            for row_group_partition in row_group_partitions {
                 let sender = sender.clone();
                 let engine = self.clone();
                 let path = path.to_path_buf();
-                let row_groups = row_group_chunk.to_vec();
+                let row_groups = row_group_partition;
                 let init = &init;
                 let consume = &consume;
                 scope.spawn(move || {
@@ -1213,6 +1360,176 @@ impl DodamEngine {
                         engine.object_store.as_ref(),
                         |columns| consume(&mut state, BatchView::from_raw_columns(columns)),
                     );
+                    let _ =
+                        sender.send(result.map(|metrics| metrics.map(|metrics| (state, metrics))));
+                });
+            }
+        });
+        drop(sender);
+        for received in receiver {
+            let Some((partial, metrics)) = received? else {
+                return Ok(None);
+            };
+            merge(&mut state, partial)?;
+            scan_metrics.merge_from(metrics);
+        }
+        let profile_columns = columns
+            .iter()
+            .map(|name| OwnedDirectPrimitiveColumnSpec {
+                name: (*name).to_string(),
+                column_type: DirectPrimitiveColumnType::I64,
+            })
+            .collect::<Vec<_>>();
+        log_direct_primitive_fold_profile(path, &profile_columns, &scan_metrics);
+        Ok(Some((state, scan_metrics)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_parquet_i32_i64_decimal_i32_selected_typed_fold<S, Init, Consume, Merge>(
+        &self,
+        path: impl AsRef<Path>,
+        batch_size: usize,
+        row_groups: &[usize],
+        columns: [&str; 4],
+        decimal_precision: u8,
+        decimal_scale: i8,
+        filter: DecimalDateRangeFilter,
+        init: Init,
+        consume: Consume,
+        merge: Merge,
+    ) -> Result<Option<(S, DirectPrimitiveColumnScanMetrics)>>
+    where
+        S: Send,
+        Init: Fn() -> S + Sync,
+        Consume: for<'a> Fn(&mut S, DirectI32I64DecimalI32SelectedBatch<'a>) -> Result<()> + Sync,
+        Merge: Fn(&mut S, S) -> Result<()> + Sync,
+    {
+        let decimal_min = option_i128_to_i64(filter.decimal_min)?;
+        let decimal_max = option_i128_to_i64(filter.decimal_max)?;
+        let path = path.as_ref();
+        let mut state = init();
+        let mut scan_metrics = DirectPrimitiveColumnScanMetrics::default();
+        if row_groups.is_empty() {
+            return Ok(Some((state, scan_metrics)));
+        }
+        let workers = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4)
+            .min(row_groups.len());
+        let (sender, receiver) = mpsc::channel();
+        let row_group_partitions = partition_row_groups_balanced(row_groups, workers);
+        std::thread::scope(|scope| {
+            for row_group_partition in row_group_partitions {
+                let sender = sender.clone();
+                let engine = self.clone();
+                let path = path.to_path_buf();
+                let row_groups = row_group_partition;
+                let init = &init;
+                let consume = &consume;
+                scope.spawn(move || {
+                    let mut state = init();
+                    let result = scan_parquet_i32_i64_decimal_i32_selected_typed_with_store(
+                        &path,
+                        batch_size,
+                        &row_groups,
+                        columns,
+                        decimal_precision,
+                        decimal_scale,
+                        decimal_min,
+                        decimal_max,
+                        filter.date_min,
+                        filter.date_max,
+                        engine.file_cache.clone(),
+                        engine.object_store.as_ref(),
+                        |batch| consume(&mut state, batch),
+                    );
+                    let _ =
+                        sender.send(result.map(|metrics| metrics.map(|metrics| (state, metrics))));
+                });
+            }
+        });
+        drop(sender);
+        for received in receiver {
+            let Some((partial, metrics)) = received? else {
+                return Ok(None);
+            };
+            merge(&mut state, partial)?;
+            scan_metrics.merge_from(metrics);
+        }
+        let profile_columns = columns
+            .iter()
+            .map(|name| OwnedDirectPrimitiveColumnSpec {
+                name: (*name).to_string(),
+                column_type: DirectPrimitiveColumnType::I64,
+            })
+            .collect::<Vec<_>>();
+        log_direct_primitive_fold_profile(path, &profile_columns, &scan_metrics);
+        Ok(Some((state, scan_metrics)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn scan_parquet_i32_i32_dictionary_i64_decimal_selected_fold<
+        S,
+        Init,
+        Consume,
+        Merge,
+    >(
+        &self,
+        path: impl AsRef<Path>,
+        batch_size: usize,
+        row_groups: &[usize],
+        columns: [&str; 5],
+        fallback: &[u8],
+        decimal_min: Option<i64>,
+        decimal_max: Option<i64>,
+        workers_override: Option<usize>,
+        init: Init,
+        consume: Consume,
+        merge: Merge,
+    ) -> Result<Option<(S, DirectPrimitiveColumnScanMetrics)>>
+    where
+        S: Send,
+        Init: Fn() -> S + Sync,
+        Consume:
+            for<'a> Fn(&mut S, DirectI32I32DictionaryI64SelectedBatch<'a>) -> Result<()> + Sync,
+        Merge: Fn(&mut S, S) -> Result<()> + Sync,
+    {
+        let path = path.as_ref();
+        let mut state = init();
+        let mut scan_metrics = DirectPrimitiveColumnScanMetrics::default();
+        if row_groups.is_empty() {
+            return Ok(Some((state, scan_metrics)));
+        }
+        let workers = workers_override
+            .filter(|workers| *workers > 0)
+            .unwrap_or_else(|| fused_dictionary_selected_workers(row_groups.len()))
+            .min(row_groups.len().max(1));
+        let (sender, receiver) = mpsc::channel();
+        let row_group_partitions = partition_row_groups_balanced(row_groups, workers);
+        std::thread::scope(|scope| {
+            for row_group_partition in row_group_partitions {
+                let sender = sender.clone();
+                let engine = self.clone();
+                let path = path.to_path_buf();
+                let row_groups = row_group_partition;
+                let fallback = fallback.to_vec();
+                let init = &init;
+                let consume = &consume;
+                scope.spawn(move || {
+                    let mut state = init();
+                    let result =
+                        scan_parquet_i32_i32_dictionary_i64_decimal_selected_typed_with_store(
+                            &path,
+                            batch_size,
+                            &row_groups,
+                            columns,
+                            &fallback,
+                            decimal_min,
+                            decimal_max,
+                            engine.file_cache.clone(),
+                            engine.object_store.as_ref(),
+                            |batch| consume(&mut state, batch),
+                        );
                     let _ =
                         sender.send(result.map(|metrics| metrics.map(|metrics| (state, metrics))));
                 });
@@ -1546,6 +1863,134 @@ impl DodamEngine {
         self.execute_scan_plan(plan)
     }
 
+    pub async fn scan_parquet_filtered_batches_preserve_order(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        projection: Projection,
+        filter: Option<FilterExpr>,
+    ) -> Result<SendableBatchStream> {
+        let source = self.plan_table_source(path).await?;
+        let mut plan =
+            self.plan_table_source_scan(source, batch_size, None, projection, filter, None)?;
+        plan.preserve_order = true;
+        self.execute_scan_plan(plan)
+    }
+
+    pub async fn scan_parquet_row_group_batches(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        projection: Projection,
+        row_groups: Vec<usize>,
+    ) -> Result<Vec<RecordBatch>> {
+        self.scan_parquet_row_group_batches_profiled(path, batch_size, projection, row_groups)
+            .await
+            .map(|(batches, _)| batches)
+    }
+
+    pub(crate) async fn scan_parquet_row_group_batches_profiled(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        projection: Projection,
+        row_groups: Vec<usize>,
+    ) -> Result<(Vec<RecordBatch>, RowGroupBatchScanProfile)> {
+        self.scan_parquet_row_group_batches_profiled_inner(
+            path,
+            batch_size,
+            projection,
+            row_groups,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub(crate) async fn scan_parquet_row_group_batches_filtered_profiled(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        projection: Projection,
+        row_groups: Vec<usize>,
+        row_filter_predicates: Vec<Expr>,
+    ) -> Result<(Vec<RecordBatch>, RowGroupBatchScanProfile)> {
+        self.scan_parquet_row_group_batches_profiled_inner(
+            path,
+            batch_size,
+            projection,
+            row_groups,
+            row_filter_predicates,
+        )
+        .await
+    }
+
+    async fn scan_parquet_row_group_batches_profiled_inner(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        projection: Projection,
+        row_groups: Vec<usize>,
+        row_filter_predicates: Vec<Expr>,
+    ) -> Result<(Vec<RecordBatch>, RowGroupBatchScanProfile)> {
+        if row_groups.is_empty() {
+            return Ok((Vec::new(), RowGroupBatchScanProfile::default()));
+        }
+        let source = self.plan_table_source(path).await?;
+        if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
+            return Err(DodamError::UnsupportedSql(
+                "row-group scan requires a single parquet source".to_string(),
+            ));
+        }
+        let local_path = source.fragments[0].parquet_local_path()?;
+        let mut reader = if row_filter_predicates.is_empty() {
+            ParquetBatchReader::try_new_with_row_groups(
+                local_path,
+                batch_size,
+                &projection,
+                row_groups,
+                &self.metadata_cache,
+                self.file_cache.clone(),
+                self.object_store.as_ref(),
+            )?
+        } else {
+            ParquetBatchReader::try_new_with_row_groups_filtered(
+                local_path,
+                batch_size,
+                &projection,
+                row_groups,
+                &row_filter_predicates,
+                &self.metadata_cache,
+                self.file_cache.clone(),
+                self.object_store.as_ref(),
+            )?
+        };
+        let mut batches = Vec::new();
+        while let Some(batch) = reader.next() {
+            let batch = batch?;
+            if batch.num_rows() > 0 {
+                batches.push(batch);
+            }
+        }
+        let profile = RowGroupBatchScanProfile {
+            projected_columns: reader.projected_columns(),
+            row_groups_total: reader.row_groups_total(),
+            row_groups_scanned: reader.row_groups_scanned(),
+            compressed_bytes_total: reader.compressed_bytes_total(),
+            compressed_bytes_scanned: reader.compressed_bytes_scanned(),
+            metadata_nanos: reader.metadata_nanos(),
+            planning_nanos: reader.planning_nanos(),
+            next_nanos: reader.next_nanos(),
+            max_next_nanos: reader.max_next_nanos(),
+            p95_next_nanos: reader.p95_next_nanos(),
+            next_calls: reader.next_calls(),
+            eof_calls: reader.eof_calls(),
+            output_batches: reader.output_batches(),
+            output_rows: reader.output_rows(),
+            zero_row_batches: reader.zero_row_batches(),
+        };
+        Ok((batches, profile))
+    }
+
     pub async fn parquet_i64_column_max(&self, path: PathBuf, column: &str) -> Result<Option<i64>> {
         let source = self.plan_table_source(path).await?;
         if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
@@ -1571,6 +2016,42 @@ impl DodamEngine {
         read_parquet_i64_column_constant(
             source.fragments[0].parquet_local_path()?,
             column,
+            &self.metadata_cache,
+            self.object_store.as_ref(),
+        )
+    }
+
+    pub async fn parquet_row_groups_monotonic_by_column(
+        &self,
+        path: PathBuf,
+        column: &str,
+    ) -> Result<bool> {
+        let source = self.plan_table_source(path).await?;
+        if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
+            return Ok(false);
+        }
+        parquet_row_groups_monotonic_by_column(
+            source.fragments[0].parquet_local_path()?,
+            column,
+            &self.metadata_cache,
+            self.object_store.as_ref(),
+        )
+    }
+
+    pub async fn parquet_column_monotonic_by_scan(
+        &self,
+        path: PathBuf,
+        column: &str,
+        batch_size: usize,
+    ) -> Result<bool> {
+        let source = self.plan_table_source(path).await?;
+        if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
+            return Ok(false);
+        }
+        parquet_column_monotonic_by_scan(
+            source.fragments[0].parquet_local_path()?,
+            column,
+            batch_size,
             &self.metadata_cache,
             self.object_store.as_ref(),
         )
@@ -2383,6 +2864,21 @@ impl DodamEngine {
         if row_groups.is_empty() {
             return Ok(Some(Vec::new()));
         }
+        let (predicate_compressed_bytes, payload_compressed_bytes) = if policy.io_cost_gate {
+            (
+                plan.compressed_bytes_scanned,
+                plan_parquet_scan_tasks(
+                    &local_path,
+                    &payload_projection,
+                    &pruning_predicates,
+                    &self.metadata_cache,
+                    self.object_store.as_ref(),
+                )?
+                .compressed_bytes_scanned,
+            )
+        } else {
+            (0, 0)
+        };
         let payload_columns = match &payload_projection {
             Projection::All => source
                 .schema
@@ -2410,7 +2906,12 @@ impl DodamEngine {
             else {
                 return Ok(None);
             };
-            if !policy.accepts(&sample_metrics) {
+            if !late_materialization_policy_accepts_with_io(
+                policy,
+                &sample_metrics,
+                predicate_compressed_bytes,
+                payload_compressed_bytes,
+            ) {
                 return Ok(None);
             }
         }
@@ -2444,6 +2945,8 @@ impl DodamEngine {
                     file_cache,
                     object_store.as_ref(),
                     policy,
+                    predicate_compressed_bytes,
+                    payload_compressed_bytes,
                     build_state(),
                     build_selection,
                     consume_payload,
@@ -5199,16 +5702,46 @@ impl DodamEngine {
         {
             return Ok(None);
         }
-        self.scan_parquet_i32_i64_decimal_i32_selected_fold(
+        let columns = [
+            shape.key_column.as_str(),
+            shape.sum_column.as_str(),
+            shape.min_decimal_column.as_str(),
+            shape.max_date_column.as_str(),
+        ];
+        if decimal_date_selected_typed_agg_enabled() {
+            return self.scan_parquet_i32_i64_decimal_i32_selected_typed_fold(
+                local_path,
+                batch_size,
+                row_groups,
+                columns,
+                shape.decimal_precision,
+                shape.decimal_scale,
+                shape.filter,
+                || {
+                    SingleKeyCountSumMinMaxVectorState::new_i32(
+                        aggregates.to_vec(),
+                        shape.decimal_precision,
+                        shape.decimal_scale,
+                    )
+                },
+                |state, batch| {
+                    state.consume_i32_i64_decimal_date_slices(
+                        batch.keys,
+                        batch.sums,
+                        batch.decimals,
+                        batch.dates,
+                        &shape.filter,
+                        batch.predicate_applied,
+                    )
+                },
+                |state, partial| state.merge(partial),
+            );
+        }
+        self.scan_parquet_i32_i64_decimal_i32_selected_batch_fold(
             local_path,
             batch_size,
             row_groups,
-            [
-                shape.key_column.as_str(),
-                shape.sum_column.as_str(),
-                shape.min_decimal_column.as_str(),
-                shape.max_date_column.as_str(),
-            ],
+            columns,
             shape.decimal_precision,
             shape.decimal_scale,
             shape.filter,
@@ -5271,24 +5804,60 @@ impl DodamEngine {
         .try_execute_metrics()
     }
 
-    fn parquet_decimal128_type(
+    pub(crate) fn parquet_decimal128_type(
         &self,
         path: impl AsRef<Path>,
         column: &str,
     ) -> Result<Option<(u8, i8)>> {
         let path = path.as_ref();
-        let file = self.object_store.open(path)?;
         let metadata = self
             .metadata_cache
             .get_with_store(path, self.object_store.as_ref())?;
-        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata);
-        let Ok(field) = builder.schema().field_with_name(column) else {
+        let Ok(field) = metadata.schema().field_with_name(column) else {
             return Ok(None);
         };
         match field.data_type() {
             DataType::Decimal128(precision, scale) => Ok(Some((*precision, *scale))),
             _ => Ok(None),
         }
+    }
+
+    pub(crate) fn parquet_i128_column_min_max(
+        &self,
+        path: impl AsRef<Path>,
+        column: &str,
+    ) -> Result<Option<(i128, i128)>> {
+        let path = path.as_ref();
+        let object_metadata = self.object_store.metadata(path)?;
+        let key = I128ColumnMinMaxCacheKey {
+            path: path.to_path_buf(),
+            len: object_metadata.len,
+            modified_nanos: object_metadata
+                .modified
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos()),
+            column: column.to_string(),
+        };
+        if let Some(value) = self
+            .i128_column_min_max_cache
+            .lock()
+            .expect("i128 column min/max cache lock")
+            .get(&key)
+            .copied()
+        {
+            return Ok(value);
+        }
+        let value = read_parquet_i128_column_min_max(
+            path,
+            column,
+            &self.metadata_cache,
+            self.object_store.as_ref(),
+        )?;
+        self.i128_column_min_max_cache
+            .lock()
+            .expect("i128 column min/max cache lock")
+            .insert(key, value);
+        Ok(value)
     }
 
     fn parquet_primitive_key_type(
@@ -5727,6 +6296,11 @@ fn direct_selection_fold_enabled() -> bool {
         .unwrap_or(true)
 }
 
+fn decimal_date_selected_typed_agg_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_DECIMAL_DATE_SELECTED_TYPED_AGG")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
 fn option_i128_to_i64(value: Option<i128>) -> Result<Option<i64>> {
     value
         .map(|value| {
@@ -5780,18 +6354,25 @@ fn log_direct_primitive_fold_profile(
         metrics.selected_rows as f64 / metrics.rows as f64
     };
     eprintln!(
-        "[dodam:direct-primitive-profile] {table}[{columns}]: row_groups={} rows={} batches={} read={:.3} ms consume={:.3} ms column_read=[{}] selected_rows={} selected_ratio={:.3} selected_runs={} selected_batches={} full_batches={}",
+        "[dodam:direct-primitive-profile] {table}[{columns}]: row_groups={} rows={} batches={} read={:.3} ms consume={:.3} ms column_read=[{}] selected_predicate={:.3} ms selected_payload={:.3} ms selected_dictionary={:.3} ms selected_rows={} selected_ratio={:.3} selected_runs={} selected_batches={} full_batches={} selected_skip_calls={} selected_skipped_rows={} selected_read_calls={} selected_read_rows={}",
         metrics.row_groups,
         metrics.rows,
         metrics.batches,
         nanos_to_millis(metrics.read_nanos),
         nanos_to_millis(metrics.consume_nanos),
         column_read,
+        nanos_to_millis(metrics.selected_predicate_nanos),
+        nanos_to_millis(metrics.selected_payload_nanos),
+        nanos_to_millis(metrics.selected_dictionary_nanos),
         metrics.selected_rows,
         selected_ratio,
         metrics.selected_runs,
         metrics.selected_payload_batches,
         metrics.full_payload_batches,
+        metrics.selected_skip_calls,
+        metrics.selected_skipped_rows,
+        metrics.selected_read_calls,
+        metrics.selected_read_rows,
     );
 }
 
@@ -6828,6 +7409,7 @@ pub struct LateMaterializationPolicy {
     max_selected_ratio: Option<f64>,
     max_selector_run_ratio: Option<f64>,
     max_selector_runs_per_selected: Option<f64>,
+    io_cost_gate: bool,
 }
 
 impl LateMaterializationPolicy {
@@ -6836,6 +7418,7 @@ impl LateMaterializationPolicy {
             max_selected_ratio: None,
             max_selector_run_ratio: None,
             max_selector_runs_per_selected: None,
+            io_cost_gate: false,
         }
     }
 
@@ -6844,6 +7427,7 @@ impl LateMaterializationPolicy {
             max_selected_ratio: Some(max_selected_ratio.clamp(0.0, 1.0)),
             max_selector_run_ratio: None,
             max_selector_runs_per_selected: None,
+            io_cost_gate: false,
         }
     }
 
@@ -6855,6 +7439,7 @@ impl LateMaterializationPolicy {
             max_selected_ratio: Some(max_selected_ratio.clamp(0.0, 1.0)),
             max_selector_run_ratio: Some(max_selector_run_ratio.clamp(0.0, 1.0)),
             max_selector_runs_per_selected: None,
+            io_cost_gate: false,
         }
     }
 
@@ -6865,15 +7450,19 @@ impl LateMaterializationPolicy {
         self
     }
 
-    fn accepts(&self, metrics: &LateMaterializedMetrics) -> bool {
+    pub fn with_io_cost_gate(mut self, enabled: bool) -> Self {
+        self.io_cost_gate = enabled;
+        self
+    }
+
+    fn accepts_selected_ratio(&self, selected_ratio: f64) -> bool {
+        self.max_selected_ratio
+            .is_none_or(|max_selected_ratio| selected_ratio <= max_selected_ratio)
+    }
+
+    fn accepts_selector_shape(&self, metrics: &LateMaterializedMetrics) -> bool {
         if metrics.total_rows == 0 {
             return true;
-        }
-        if let Some(max_selected_ratio) = self.max_selected_ratio {
-            let selected_ratio = metrics.selected_rows as f64 / metrics.total_rows as f64;
-            if selected_ratio > max_selected_ratio {
-                return false;
-            }
         }
         if let Some(max_selector_run_ratio) = self.max_selector_run_ratio {
             let selector_run_ratio = metrics.selector_runs as f64 / metrics.total_rows as f64;
@@ -6899,6 +7488,72 @@ impl LateMaterializationPolicy {
             || self.max_selector_run_ratio.is_some()
             || self.max_selector_runs_per_selected.is_some()
     }
+}
+
+fn late_materialization_policy_accepts_with_io(
+    policy: LateMaterializationPolicy,
+    metrics: &LateMaterializedMetrics,
+    predicate_compressed_bytes: u64,
+    payload_compressed_bytes: u64,
+) -> bool {
+    if metrics.total_rows == 0 {
+        return true;
+    }
+    if !policy.has_selectivity_gate() {
+        return true;
+    }
+    if !policy.accepts_selector_shape(metrics) {
+        return false;
+    }
+    if !policy.io_cost_gate {
+        return policy.accepts_selected_ratio(late_materialization_selected_ratio(metrics));
+    }
+    let selected_ratio = late_materialization_selected_ratio(metrics);
+    let io_saving = late_materialization_estimated_io_saving(
+        selected_ratio,
+        predicate_compressed_bytes,
+        payload_compressed_bytes,
+    );
+    let min_io_saving = late_materialization_min_estimated_io_saving_ratio();
+    if policy.accepts_selected_ratio(selected_ratio) {
+        return io_saving >= min_io_saving;
+    }
+    late_materialization_io_override_enabled() && io_saving >= min_io_saving
+}
+
+fn late_materialization_selected_ratio(metrics: &LateMaterializedMetrics) -> f64 {
+    if metrics.total_rows == 0 {
+        0.0
+    } else {
+        metrics.selected_rows as f64 / metrics.total_rows as f64
+    }
+}
+
+fn late_materialization_estimated_io_saving(
+    selected_ratio: f64,
+    predicate_compressed_bytes: u64,
+    payload_compressed_bytes: u64,
+) -> f64 {
+    let full = predicate_compressed_bytes.saturating_add(payload_compressed_bytes) as f64;
+    if full <= 0.0 {
+        return 0.0;
+    }
+    let late = predicate_compressed_bytes as f64 + payload_compressed_bytes as f64 * selected_ratio;
+    ((full - late) / full).clamp(0.0, 1.0)
+}
+
+fn late_materialization_min_estimated_io_saving_ratio() -> f64 {
+    std::env::var("DODAM_LATE_MIN_ESTIMATED_IO_SAVING_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.05)
+        .clamp(0.0, 1.0)
+}
+
+fn late_materialization_io_override_enabled() -> bool {
+    !std::env::var("DODAM_DISABLE_LATE_IO_OVERRIDE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 pub struct LateMaterializedChunkResult<T> {
@@ -7128,6 +7783,8 @@ fn late_materialized_chunk_view<State, Output, BuildSelection, ConsumePayload, F
     file_cache: Arc<ParquetFileCache>,
     object_store: &dyn ObjectStore,
     policy: LateMaterializationPolicy,
+    predicate_compressed_bytes: u64,
+    payload_compressed_bytes: u64,
     mut state: State,
     mut build_selection: BuildSelection,
     mut consume_payload: ConsumePayload,
@@ -7156,7 +7813,12 @@ where
         }
     }
     let (row_selection, metrics) = selection_builder.finish();
-    if !policy.accepts(&metrics) {
+    if !late_materialization_policy_accepts_with_io(
+        policy,
+        &metrics,
+        predicate_compressed_bytes,
+        payload_compressed_bytes,
+    ) {
         return Ok(None);
     }
     if let Some(row_selection) = row_selection {
@@ -7696,6 +8358,8 @@ fn q14_late_materialized_promo_revenue_chunk(
         file_cache,
         object_store,
         LateMaterializationPolicy::always(),
+        0,
+        0,
         state,
         |view, selection, _state| {
             q14_build_date_selection_view(view, start_days, end_days, selection)
@@ -7916,6 +8580,8 @@ fn q06_late_materialized_revenue_sum_chunk(
         file_cache,
         object_store,
         LateMaterializationPolicy::always(),
+        0,
+        0,
         state,
         |view, selection, state| {
             q06_build_selection_view(

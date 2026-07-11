@@ -49,8 +49,8 @@ impl Default for ParquetCopyOptions {
         Self {
             compression: Compression::SNAPPY,
             dictionary_enabled: false,
-            max_row_group_rows: Some(64 * 1024),
-            write_batch_size: 32 * 1024,
+            max_row_group_rows: Some(256 * 1024),
+            write_batch_size: 64 * 1024,
             data_page_row_count_limit: 32 * 1024,
         }
     }

@@ -202,6 +202,28 @@ async fn executes_derived_table_join_sql() {
 }
 
 #[tokio::test]
+async fn executes_union_all_sql() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let path = tempdir.path().join("part-000.parquet");
+    write_test_parquet(&path);
+
+    let sql = format!(
+        "SELECT id AS value FROM '{}' WHERE id < 2 UNION ALL SELECT id AS value FROM '{}' WHERE id >= 4 ORDER BY value",
+        path.display(),
+        path.display()
+    );
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute union all sql");
+
+    let QueryOutput::Scan { batches } = output else {
+        panic!("expected scan output");
+    };
+    assert_eq!(batches[0].schema().field(0).name(), "value");
+    assert_eq!(ids_from_batches(&batches), vec![0, 1, 4, 5]);
+}
+
+#[tokio::test]
 async fn executes_aggregate_over_derived_table_join_sql() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let path = tempdir.path().join("part-000.parquet");

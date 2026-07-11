@@ -62,6 +62,11 @@ def main() -> int:
         help="Comma-separated query names to run. Matches are case-insensitive.",
     )
     parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument(
+        "--show-stderr",
+        action="store_true",
+        help="Print Dodam/DuckDB stderr for profiling runs.",
+    )
     args = parser.parse_args()
 
     work_dir = Path(args.work_dir)
@@ -104,9 +109,10 @@ def main() -> int:
 
 def ensure_fixture(duckdb: str, data_dir: Path, timeout: float, scale: int) -> None:
     facts = data_dir / "facts.parquet"
+    facts_scrambled = data_dir / "facts_scrambled.parquet"
     dim = data_dir / "dim.parquet"
     nested = data_dir / "nested.parquet"
-    if facts.exists() and dim.exists() and nested.exists():
+    if facts.exists() and facts_scrambled.exists() and dim.exists() and nested.exists():
         return
     facts_rows = 600_000 * scale
     nested_rows = 20_000 * scale
@@ -122,6 +128,17 @@ COPY (
     DATE '2024-01-01' + ((i % 31)::INTEGER) AS event_date
   FROM range(0, {facts_rows}) AS t(i)
 ) TO '{facts}' (FORMAT PARQUET, COMPRESSION ZSTD);
+COPY (
+  SELECT
+    ((i * 15485863) % {facts_rows})::INTEGER AS id,
+    CASE WHEN i % 17 = 0 THEN NULL ELSE (i % 1000)::INTEGER END AS key,
+    (i % 10)::INTEGER AS bucket,
+    (i * 3 % 100000)::BIGINT AS value,
+    CASE WHEN i % 13 = 0 THEN NULL ELSE 'label-' || (i % 64)::VARCHAR END AS label,
+    CAST((i % 10000) / 100.0 AS DECIMAL(18,2)) AS amount,
+    DATE '2024-01-01' + ((i % 31)::INTEGER) AS event_date
+  FROM range(0, {facts_rows}) AS t(i)
+) TO '{facts_scrambled}' (FORMAT PARQUET, COMPRESSION ZSTD);
 COPY (
   SELECT
     i::INTEGER AS key,
@@ -151,6 +168,7 @@ COPY (
 
 def generic_queries(data_dir: Path) -> list[GenericQuery]:
     facts = data_dir / "facts.parquet"
+    facts_scrambled = data_dir / "facts_scrambled.parquet"
     dim = data_dir / "dim.parquet"
     nested = data_dir / "nested.parquet"
     return [
@@ -209,7 +227,37 @@ def generic_queries(data_dir: Path) -> list[GenericQuery]:
             f"SELECT bucket, count(*), sum(value), min(amount), max(event_date) FROM '{facts}' WHERE amount < '1.00' GROUP BY bucket",
             f"SELECT bucket, count(*), sum(value), min(amount), max(event_date) FROM read_parquet('{facts}') WHERE amount < '1.00' GROUP BY bucket",
         ),
+        GenericQuery(
+            "low_selectivity_three_key_expression_group_no_order",
+            f"SELECT bucket, event_date, coalesce(label, 'missing') AS label_or_missing, count(*), sum(value) FROM '{facts}' WHERE amount < '1.00' GROUP BY bucket, event_date, coalesce(label, 'missing')",
+            f"SELECT bucket, event_date, coalesce(label, 'missing') AS label_or_missing, count(*), sum(value) FROM read_parquet('{facts}') WHERE amount < '1.00' GROUP BY bucket, event_date, coalesce(label, 'missing')",
+        ),
+        GenericQuery(
+            "union_all_append",
+            f"SELECT id, bucket, value FROM '{facts}' WHERE bucket = 1 UNION ALL SELECT id, bucket, value FROM '{facts}' WHERE bucket = 7",
+            f"SELECT id, bucket, value FROM read_parquet('{facts}') WHERE bucket = 1 UNION ALL SELECT id, bucket, value FROM read_parquet('{facts}') WHERE bucket = 7",
+        ),
+        GenericQuery(
+            "union_all_order_limit",
+            f"SELECT id, bucket, value FROM '{facts}' WHERE bucket = 1 UNION ALL SELECT id, bucket, value FROM '{facts}' WHERE bucket = 7 ORDER BY id DESC LIMIT 5000",
+            f"SELECT id, bucket, value FROM read_parquet('{facts}') WHERE bucket = 1 UNION ALL SELECT id, bucket, value FROM read_parquet('{facts}') WHERE bucket = 7 ORDER BY id DESC LIMIT 5000",
+        ),
+        GenericQuery(
+            "union_all_order_limit_full_read",
+            f"SELECT id, bucket, value FROM '{facts}' WHERE bucket = 1 UNION ALL SELECT id, bucket, value FROM '{facts}' WHERE bucket = 7 ORDER BY id DESC LIMIT {120_000 * data_scale_from_path(data_dir)}",
+            f"SELECT id, bucket, value FROM read_parquet('{facts}') WHERE bucket = 1 UNION ALL SELECT id, bucket, value FROM read_parquet('{facts}') WHERE bucket = 7 ORDER BY id DESC LIMIT {120_000 * data_scale_from_path(data_dir)}",
+        ),
+        GenericQuery(
+            "union_all_order_limit_scrambled",
+            f"SELECT id, bucket, value FROM '{facts_scrambled}' WHERE bucket = 1 UNION ALL SELECT id, bucket, value FROM '{facts_scrambled}' WHERE bucket = 7 ORDER BY id DESC LIMIT 5000",
+            f"SELECT id, bucket, value FROM read_parquet('{facts_scrambled}') WHERE bucket = 1 UNION ALL SELECT id, bucket, value FROM read_parquet('{facts_scrambled}') WHERE bucket = 7 ORDER BY id DESC LIMIT 5000",
+        ),
     ]
+
+
+def data_scale_from_path(data_dir: Path) -> int:
+    match = re.search(r"data_sf(\d+)$", data_dir.name)
+    return int(match.group(1)) if match else 1
 
 
 def filter_queries(queries: list[GenericQuery], only: str) -> list[GenericQuery]:
@@ -236,6 +284,8 @@ def run_dodam(args, query: GenericQuery, output_dir: Path) -> list[float]:
             timeout=args.timeout,
         )
         samples.append(time.perf_counter() - started)
+        if args.show_stderr and completed.stderr:
+            print(completed.stderr, end="")
         if completed.returncode != 0:
             raise SystemExit(completed.stderr or completed.stdout)
     return samples
@@ -266,6 +316,8 @@ def run_dodam_query_file(args, query: GenericQuery, output_dir: Path) -> list[fl
     )
     if completed.returncode != 0:
         raise SystemExit(completed.stderr or completed.stdout)
+    if args.show_stderr and completed.stderr:
+        print(completed.stderr, end="")
     samples = [int(match) / 1_000_000 for match in COPY_PROFILE_RE.findall(completed.stderr)]
     if len(samples) != total_runs:
         raise SystemExit(
@@ -292,6 +344,8 @@ def run_duckdb(args, query: GenericQuery, output_dir: Path) -> list[float]:
             timeout=args.timeout,
         )
         samples.append(time.perf_counter() - started)
+        if args.show_stderr and completed.stderr:
+            print(completed.stderr, end="")
         if completed.returncode != 0:
             raise SystemExit(completed.stderr or completed.stdout)
     return samples
@@ -323,6 +377,8 @@ def run_duckdb_query_file(args, query: GenericQuery, output_dir: Path) -> list[f
     elapsed = time.perf_counter() - started
     if completed.returncode != 0:
         raise SystemExit(completed.stderr or completed.stdout)
+    if args.show_stderr and completed.stderr:
+        print(completed.stderr, end="")
     output = completed.stdout + completed.stderr
     samples = [float(match) for match in DUCKDB_TIMER_RE.findall(output)]
     if len(samples) != total_runs:

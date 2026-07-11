@@ -577,6 +577,46 @@ async fn duckdb_differential_order_limit() {
 }
 
 #[tokio::test]
+async fn duckdb_differential_union_all() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let facts_path = tempdir.path().join("facts.parquet");
+    write_facts_parquet(&facts_path);
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id AS value, payload FROM '{}' WHERE id <= 2 UNION ALL SELECT id AS value, payload FROM '{}' WHERE id >= 5 ORDER BY value",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id AS value, payload FROM read_parquet('{}') WHERE id <= 2 UNION ALL SELECT id AS value, payload FROM read_parquet('{}') WHERE id >= 5 ORDER BY value",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, key, value FROM '{}' WHERE key = 1 UNION ALL SELECT id, key, value FROM '{}' WHERE key = 3 ORDER BY id DESC LIMIT 4",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id, key, value FROM read_parquet('{}') WHERE key = 1 UNION ALL SELECT id, key, value FROM read_parquet('{}') WHERE key = 3 ORDER BY id DESC LIMIT 4",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn duckdb_differential_derived_tables() {
     let Some(_duckdb) = DuckDbGuard::new() else {
         return;
@@ -947,6 +987,29 @@ async fn duckdb_differential_grouped_coalesce_expression_aggregates() {
             "SELECT f.key, COALESCE(d.name, 'missing') AS name_text, count(*), sum(f.value) FROM read_parquet('{}') f JOIN read_parquet('{}') d ON f.key = d.key GROUP BY f.key, COALESCE(d.name, 'missing') ORDER BY f.key, name_text",
             facts_path.display(),
             dim_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn duckdb_differential_large_grouped_coalesce_expression_aggregate() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let path = tempdir.path().join("large_coalesce_group.parquet");
+    write_large_coalesce_group_parquet(&path);
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT bucket, day, COALESCE(label, 'missing') AS label_text, count(*), sum(amount) FROM '{}' WHERE amount >= -50 GROUP BY bucket, day, COALESCE(label, 'missing') ORDER BY bucket, day, label_text",
+            path.display()
+        ),
+        &format!(
+            "SELECT bucket, day, COALESCE(label, 'missing') AS label_text, count(*), sum(amount) FROM read_parquet('{}') WHERE amount >= -50 GROUP BY bucket, day, COALESCE(label, 'missing') ORDER BY bucket, day, label_text",
+            path.display()
         ),
         tempdir.path(),
     )
@@ -3381,6 +3444,37 @@ fn write_aggregate_nulls_parquet(path: &Path) {
     );
 }
 
+fn write_large_coalesce_group_parquet(path: &Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("bucket", DataType::Int32, false),
+        Field::new("day", DataType::Date32, false),
+        Field::new("label", DataType::Utf8, true),
+        Field::new("amount", DataType::Int64, false),
+    ]));
+    let rows = 131_072usize;
+    let base_day = date_days(2024, 1, 1);
+    let buckets = Int32Array::from_iter_values((0..rows).map(|row| (row % 64) as i32));
+    let days = Date32Array::from_iter_values((0..rows).map(|row| base_day + (row % 31) as i32));
+    let labels = StringArray::from_iter((0..rows).map(|row| match row % 9 {
+        0 => None,
+        1 | 4 | 7 => Some("alpha"),
+        2 | 5 => Some("beta"),
+        _ => Some("gamma"),
+    }));
+    let amounts = Int64Array::from_iter_values((0..rows).map(|row| (row as i64 % 257) - 128));
+    write_parquet_with_row_group_rows(
+        path,
+        schema,
+        vec![
+            Arc::new(buckets),
+            Arc::new(days),
+            Arc::new(labels),
+            Arc::new(amounts),
+        ],
+        rows,
+    );
+}
+
 fn write_csv_values_parquet(path: &Path) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
@@ -3628,9 +3722,18 @@ fn date_days(year: i32, month: u32, day: u32) -> i32 {
 }
 
 fn write_parquet(path: &Path, schema: Arc<Schema>, columns: Vec<ArrayRef>) {
+    write_parquet_with_row_group_rows(path, schema, columns, 3);
+}
+
+fn write_parquet_with_row_group_rows(
+    path: &Path,
+    schema: Arc<Schema>,
+    columns: Vec<ArrayRef>,
+    row_group_rows: usize,
+) {
     let batch = RecordBatch::try_new(schema.clone(), columns).expect("record batch");
     let props = WriterProperties::builder()
-        .set_max_row_group_row_count(Some(3))
+        .set_max_row_group_row_count(Some(row_group_rows))
         .set_compression(Compression::SNAPPY)
         .build();
     let file = File::create(path).expect("create parquet file");
