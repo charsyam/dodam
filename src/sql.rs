@@ -58,7 +58,8 @@ use crate::execution::{
 use crate::hash::{FastHashMap, FastHashSet, fast_hash_map, fast_hash_map_with_capacity};
 use crate::optimizer::{JoinInputPlan, plan_join_inputs};
 use crate::storage::{
-    DirectColumnScanMetrics, DirectI64I32I32ScanMetrics, DirectPrimitiveColumnScanMetrics,
+    DirectColumnScanMetrics, DirectI64I32I32ScanMetrics, DirectOrderedPrimitiveBatch,
+    DirectOrderedPrimitiveColumnValues, DirectPrimitiveColumnScanMetrics,
     DirectPrimitiveColumnSpec, DirectPrimitiveColumnType,
 };
 use crate::vector::{
@@ -37555,6 +37556,89 @@ fn try_write_same_source_union_all_ordered_desc_primitive_to_sink(
     let mut batches_written = 0usize;
     let row_groups = (0..row_group_count).rev().collect::<Vec<_>>();
     let chunk_size = ordered_sink_row_group_chunk_size(limit, row_group_count).max(1);
+    if ordered_primitive_fused_page_decoder_enabled() {
+        let filter_i32_values;
+        let filter_i64_values;
+        let (filter_i32, filter_i64) = match &filter_values {
+            PrimitiveFilterValues::I32(values) => {
+                filter_i32_values = values.clone();
+                (&filter_i32_values[..], &[][..])
+            }
+            PrimitiveFilterValues::I64(values) => {
+                filter_i64_values = values.clone();
+                (&[][..], &filter_i64_values[..])
+            }
+        };
+        let mut fused_batches = Vec::new();
+        let mut fused_metrics = DirectPrimitiveColumnScanMetrics::default();
+        let mut fused_supported = true;
+        for chunk in row_groups.chunks(chunk_size) {
+            let mut chunk_batches = Vec::new();
+            let metrics = match engine.scan_parquet_required_plain_primitive_in_list_desc(
+                &shared.path,
+                batch_size,
+                chunk,
+                &specs,
+                filter_index,
+                filter_i32,
+                filter_i64,
+                |batch| {
+                    let batch =
+                        direct_ordered_primitive_batch_to_record_batch(batch, schema.clone())?;
+                    if batch.num_rows() > 0 {
+                        chunk_batches.push(batch);
+                    }
+                    Ok(())
+                },
+            )? {
+                Some(metrics) => metrics,
+                None => {
+                    fused_supported = false;
+                    break;
+                }
+            };
+            fused_metrics.merge_from(metrics);
+            if chunk_batches.is_empty() {
+                continue;
+            }
+            let schema = chunk_batches[0].schema();
+            let batch = if chunk_batches.len() == 1 {
+                chunk_batches[0].clone()
+            } else {
+                concat_batches(&schema, chunk_batches.iter())?
+            };
+            fused_batches.push(batch);
+        }
+        if fused_supported {
+            primitive_metrics.merge_from(fused_metrics);
+            for batch in fused_batches {
+                let remaining = limit - written;
+                let batch = if batch.num_rows() > remaining {
+                    batch.slice(0, remaining)
+                } else {
+                    batch
+                };
+                written += batch.num_rows();
+                let write_started = profile.then(Instant::now);
+                write_same_source_batch_to_sink(batch, scan_projection, shared, sink)?;
+                if let Some(started) = write_started {
+                    write_elapsed += started.elapsed();
+                    batches_written += 1;
+                }
+                if written >= limit {
+                    break;
+                }
+            }
+            print_ordered_primitive_sink_profile(
+                total_started,
+                &primitive_metrics,
+                write_elapsed,
+                batches_written,
+                written,
+            );
+            return Ok(true);
+        }
+    }
     for chunk in row_groups.chunks(chunk_size) {
         let mut chunk_batches = Vec::new();
         for &row_group in chunk {
@@ -37671,6 +37755,25 @@ enum PrimitiveFilterValues {
     I64(Vec<i64>),
 }
 
+fn direct_ordered_primitive_batch_to_record_batch(
+    batch: DirectOrderedPrimitiveBatch,
+    schema: Arc<Schema>,
+) -> Result<RecordBatch> {
+    let columns = batch
+        .columns
+        .into_iter()
+        .map(|column| match column {
+            DirectOrderedPrimitiveColumnValues::I32(values) => {
+                Arc::new(Int32Array::from(values)) as ArrayRef
+            }
+            DirectOrderedPrimitiveColumnValues::I64(values) => {
+                Arc::new(Int64Array::from(values)) as ArrayRef
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(RecordBatch::try_new(schema, columns)?)
+}
+
 fn ordered_primitive_sink_enabled(limit: usize) -> bool {
     if std::env::var("DODAM_ENABLE_ORDERED_PRIMITIVE_SINK")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
@@ -37691,6 +37794,11 @@ fn ordered_primitive_sink_auto_max_limit_rows() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(16 * 1024)
+}
+
+fn ordered_primitive_fused_page_decoder_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_ORDERED_PRIMITIVE_FUSED_PAGE_DECODER")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 fn ordered_primitive_sink_page_reader_enabled() -> bool {
@@ -37734,6 +37842,15 @@ fn primitive_ordered_selected_batch(
     filter_values: &PrimitiveFilterValues,
     schema: Arc<Schema>,
 ) -> Result<Option<RecordBatch>> {
+    if let Some(batch) = primitive_ordered_selected_batch_null_free_fast(
+        view,
+        column_types,
+        filter_index,
+        filter_values,
+        schema.clone(),
+    )? {
+        return Ok(Some(batch));
+    }
     let mut selected = Vec::new();
     match filter_values {
         PrimitiveFilterValues::I32(values) => {
@@ -37803,6 +37920,158 @@ fn primitive_ordered_selected_batch(
         }
     }
     Ok(Some(RecordBatch::try_new(schema, arrays)?))
+}
+
+#[derive(Clone, Copy)]
+enum NullFreePrimitiveColumn<'a> {
+    I32(&'a [i32]),
+    I64(&'a [i64]),
+}
+
+enum PrimitiveColumnOutput {
+    I32(Vec<i32>),
+    I64(Vec<i64>),
+}
+
+fn primitive_ordered_selected_batch_null_free_fast(
+    view: BatchView<'_>,
+    column_types: &[DirectPrimitiveColumnType],
+    filter_index: usize,
+    filter_values: &PrimitiveFilterValues,
+    schema: Arc<Schema>,
+) -> Result<Option<RecordBatch>> {
+    if filter_index >= column_types.len() {
+        return Ok(None);
+    }
+    let row_count = view.num_rows();
+    let mut columns = Vec::with_capacity(column_types.len());
+    for (index, column_type) in column_types.iter().enumerate() {
+        match column_type {
+            DirectPrimitiveColumnType::I32 => {
+                let Some(column) = view.i32_vector(index) else {
+                    return Ok(None);
+                };
+                let Some(values) = column.values_if_null_free() else {
+                    return Ok(None);
+                };
+                columns.push(NullFreePrimitiveColumn::I32(values));
+            }
+            DirectPrimitiveColumnType::I64 => {
+                let Some(column) = view.i64_vector(index) else {
+                    return Ok(None);
+                };
+                let Some(values) = column.values_if_null_free() else {
+                    return Ok(None);
+                };
+                columns.push(NullFreePrimitiveColumn::I64(values));
+            }
+            DirectPrimitiveColumnType::Date32
+            | DirectPrimitiveColumnType::Decimal128Int64 { .. }
+            | DirectPrimitiveColumnType::Decimal128Int64Raw { .. } => return Ok(None),
+        }
+    }
+    if columns.iter().any(|column| match column {
+        NullFreePrimitiveColumn::I32(values) => values.len() != row_count,
+        NullFreePrimitiveColumn::I64(values) => values.len() != row_count,
+    }) {
+        return Ok(None);
+    }
+    let mut output = column_types
+        .iter()
+        .map(|column_type| match column_type {
+            DirectPrimitiveColumnType::I32 => {
+                PrimitiveColumnOutput::I32(Vec::with_capacity(row_count / 4 + 1))
+            }
+            DirectPrimitiveColumnType::I64 => {
+                PrimitiveColumnOutput::I64(Vec::with_capacity(row_count / 4 + 1))
+            }
+            _ => unreachable!("checked primitive ordered column type"),
+        })
+        .collect::<Vec<_>>();
+    match (filter_values, columns[filter_index]) {
+        (PrimitiveFilterValues::I32(values), NullFreePrimitiveColumn::I32(filter_column)) => {
+            for row in (0..row_count).rev() {
+                let value = filter_column[row];
+                if !small_i32_in_list(value, values) {
+                    continue;
+                }
+                push_null_free_primitive_row(&columns, &mut output, row)?;
+            }
+        }
+        (PrimitiveFilterValues::I64(values), NullFreePrimitiveColumn::I64(filter_column)) => {
+            for row in (0..row_count).rev() {
+                let value = filter_column[row];
+                if !small_i64_in_list(value, values) {
+                    continue;
+                }
+                push_null_free_primitive_row(&columns, &mut output, row)?;
+            }
+        }
+        _ => return Ok(None),
+    }
+    let selected_rows = output
+        .first()
+        .map(|column| match column {
+            PrimitiveColumnOutput::I32(values) => values.len(),
+            PrimitiveColumnOutput::I64(values) => values.len(),
+        })
+        .unwrap_or(0);
+    if selected_rows == 0 {
+        return Ok(Some(RecordBatch::new_empty(schema)));
+    }
+    let arrays = output
+        .into_iter()
+        .map(|column| match column {
+            PrimitiveColumnOutput::I32(values) => Arc::new(Int32Array::from(values)) as ArrayRef,
+            PrimitiveColumnOutput::I64(values) => Arc::new(Int64Array::from(values)) as ArrayRef,
+        })
+        .collect::<Vec<_>>();
+    Ok(Some(RecordBatch::try_new(schema, arrays)?))
+}
+
+fn push_null_free_primitive_row(
+    columns: &[NullFreePrimitiveColumn<'_>],
+    output: &mut [PrimitiveColumnOutput],
+    row: usize,
+) -> Result<()> {
+    for (column, output) in columns.iter().zip(output.iter_mut()) {
+        match (column, output) {
+            (NullFreePrimitiveColumn::I32(values), PrimitiveColumnOutput::I32(output)) => {
+                output.push(values[row]);
+            }
+            (NullFreePrimitiveColumn::I64(values), PrimitiveColumnOutput::I64(output)) => {
+                output.push(values[row]);
+            }
+            _ => {
+                return Err(DodamError::UnsupportedSql(
+                    "primitive ordered fast path column type mismatch".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn small_i32_in_list(value: i32, values: &[i32]) -> bool {
+    match values {
+        [] => false,
+        [a] => value == *a,
+        [a, b] => value == *a || value == *b,
+        [a, b, c] => value == *a || value == *b || value == *c,
+        [a, b, c, d] => value == *a || value == *b || value == *c || value == *d,
+        _ => values.contains(&value),
+    }
+}
+
+fn small_i64_in_list(value: i64, values: &[i64]) -> bool {
+    match values {
+        [] => false,
+        [a] => value == *a,
+        [a, b] => value == *a || value == *b,
+        [a, b, c] => value == *a || value == *b || value == *c,
+        [a, b, c, d] => value == *a || value == *b || value == *c || value == *d,
+        _ => values.contains(&value),
+    }
 }
 
 fn ordered_sink_profile_enabled() -> bool {

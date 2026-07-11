@@ -40,7 +40,7 @@ use crate::plan::{
 };
 use crate::storage::{
     DirectByteArrayPayloadReader, DirectColumnScanMetrics, DirectI32I32DictionaryI64SelectedBatch,
-    DirectI32I64DecimalI32SelectedBatch, DirectI64I32I32ScanMetrics,
+    DirectI32I64DecimalI32SelectedBatch, DirectI64I32I32ScanMetrics, DirectOrderedPrimitiveBatch,
     DirectPrimitiveColumnScanMetrics, DirectPrimitiveColumnSpec, DirectPrimitiveColumnType,
     I64BloomPredicate, LocalFileSystemObjectStore, ObjectStore, ParquetBatchReader,
     ParquetFileCache, ParquetFileCacheStats, ParquetMetadataCache,
@@ -56,6 +56,7 @@ use crate::storage::{
     scan_parquet_i64_byte_array_payload_columns_with_store,
     scan_parquet_primitive_columns_with_store,
     scan_parquet_primitive_columns_with_store_page_reader,
+    scan_parquet_required_plain_primitive_in_list_desc_with_store,
 };
 use crate::vector::{BatchView, Date32VectorView, Decimal128VectorView, I64VectorView};
 
@@ -1196,6 +1197,35 @@ impl DodamEngine {
             self.file_cache.clone(),
             self.object_store.as_ref(),
             move |columns| consume(BatchView::from_raw_columns(columns)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn scan_parquet_required_plain_primitive_in_list_desc<F>(
+        &self,
+        path: impl AsRef<Path>,
+        batch_size: usize,
+        row_groups: &[usize],
+        columns: &[DirectPrimitiveColumnSpec<'_>],
+        filter_index: usize,
+        filter_i32_values: &[i32],
+        filter_i64_values: &[i64],
+        consume: F,
+    ) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
+    where
+        F: FnMut(DirectOrderedPrimitiveBatch) -> Result<()>,
+    {
+        scan_parquet_required_plain_primitive_in_list_desc_with_store(
+            path.as_ref(),
+            batch_size,
+            row_groups,
+            columns,
+            filter_index,
+            filter_i32_values,
+            filter_i64_values,
+            self.file_cache.clone(),
+            self.object_store.as_ref(),
+            consume,
         )
     }
 

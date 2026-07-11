@@ -1460,6 +1460,24 @@ pub(crate) enum DirectPrimitiveCountSumPageBatch<'a> {
     },
 }
 
+pub(crate) enum DirectOrderedPrimitiveColumnValues {
+    I32(Vec<i32>),
+    I64(Vec<i64>),
+}
+
+impl DirectOrderedPrimitiveColumnValues {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::I32(values) => values.len(),
+            Self::I64(values) => values.len(),
+        }
+    }
+}
+
+pub(crate) struct DirectOrderedPrimitiveBatch {
+    pub(crate) columns: Vec<DirectOrderedPrimitiveColumnValues>,
+}
+
 impl DirectPrimitiveColumnScanMetrics {
     pub(crate) fn merge_from(&mut self, other: Self) {
         self.row_groups = self.row_groups.saturating_add(other.row_groups);
@@ -1986,6 +2004,99 @@ fn read_byte_array_dictionary_ids_for_row_group(
         return Ok(None);
     }
     Ok(Some((def_levels, ids, dictionary)))
+}
+
+fn read_i32_dictionary_ids_for_row_group(
+    row_group: &dyn parquet::file::reader::RowGroupReader,
+    column: usize,
+) -> Result<Option<(Vec<i32>, Vec<i32>)>> {
+    let column_desc = row_group.metadata().schema_descr().column(column);
+    if column_desc.physical_type() != ParquetPhysicalType::INT32
+        || column_desc.max_rep_level() != 0
+        || column_desc.max_def_level() != 0
+    {
+        return Ok(None);
+    }
+    let row_count = usize::try_from(row_group.metadata().num_rows())
+        .map_err(|_| DodamError::UnsupportedSql("row group row count out of range".to_string()))?;
+    let mut page_reader = row_group.get_column_page_reader(column)?;
+    let mut dictionary: Option<Vec<i32>> = None;
+    let mut ids = Vec::<i32>::with_capacity(row_count);
+    let mut rows = 0usize;
+    while let Some(page) = page_reader.get_next_page()? {
+        match page {
+            Page::DictionaryPage {
+                buf,
+                num_values,
+                encoding,
+                ..
+            } => {
+                if encoding != Encoding::PLAIN || dictionary.is_some() {
+                    return Ok(None);
+                }
+                let mut values = Vec::with_capacity(num_values as usize);
+                decode_plain_i32_values(buf, num_values as usize, &mut values)?;
+                if values.len() != num_values as usize {
+                    return Ok(None);
+                }
+                dictionary = Some(values);
+            }
+            Page::DataPage {
+                buf,
+                num_values,
+                encoding,
+                ..
+            } => {
+                if !matches!(
+                    encoding,
+                    Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
+                ) {
+                    return Ok(None);
+                }
+                let Some(dictionary) = dictionary.as_ref() else {
+                    return Ok(None);
+                };
+                decode_dictionary_indices(buf, num_values as usize, dictionary.len(), &mut ids)?;
+                rows = rows.saturating_add(num_values as usize);
+            }
+            Page::DataPageV2 {
+                buf,
+                num_values,
+                encoding,
+                rep_levels_byte_len,
+                def_levels_byte_len,
+                ..
+            } => {
+                if !matches!(
+                    encoding,
+                    Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
+                ) {
+                    return Ok(None);
+                }
+                let Some(dictionary) = dictionary.as_ref() else {
+                    return Ok(None);
+                };
+                let value_start = (rep_levels_byte_len + def_levels_byte_len) as usize;
+                if value_start > buf.len() {
+                    return Ok(None);
+                }
+                decode_dictionary_indices(
+                    buf.slice(value_start..),
+                    num_values as usize,
+                    dictionary.len(),
+                    &mut ids,
+                )?;
+                rows = rows.saturating_add(num_values as usize);
+            }
+        }
+    }
+    let Some(dictionary) = dictionary else {
+        return Ok(None);
+    };
+    if rows != row_count || ids.len() != row_count {
+        return Ok(None);
+    }
+    Ok(Some((ids, dictionary)))
 }
 
 fn read_byte_array_dictionary_ids_selected_for_row_group(
@@ -3628,6 +3739,50 @@ where
 {
     scan_parquet_primitive_columns_with_store_impl(
         path, batch_size, row_groups, columns, file_cache, store, true, consume,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scan_parquet_required_plain_primitive_in_list_desc_with_store<F>(
+    path: &Path,
+    batch_size: usize,
+    row_groups: &[usize],
+    columns: &[DirectPrimitiveColumnSpec<'_>],
+    filter_index: usize,
+    filter_i32_values: &[i32],
+    filter_i64_values: &[i64],
+    file_cache: Arc<ParquetFileCache>,
+    store: &dyn ObjectStore,
+    mut consume: F,
+) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
+where
+    F: FnMut(DirectOrderedPrimitiveBatch) -> Result<()>,
+{
+    if file_cache.enabled() {
+        let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
+        let reader = SerializedFileReader::new(reader)?;
+        return scan_parquet_required_plain_primitive_in_list_desc_reader(
+            reader,
+            batch_size,
+            row_groups,
+            columns,
+            filter_index,
+            filter_i32_values,
+            filter_i64_values,
+            &mut consume,
+        );
+    }
+    let file = store.open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    scan_parquet_required_plain_primitive_in_list_desc_reader(
+        reader,
+        batch_size,
+        row_groups,
+        columns,
+        filter_index,
+        filter_i32_values,
+        filter_i64_values,
+        &mut consume,
     )
 }
 
@@ -5372,6 +5527,248 @@ where
         }
     }
     Ok(Some(metrics))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_parquet_required_plain_primitive_in_list_desc_reader<R, F>(
+    reader: SerializedFileReader<R>,
+    batch_size: usize,
+    row_groups: &[usize],
+    columns: &[DirectPrimitiveColumnSpec<'_>],
+    filter_index: usize,
+    filter_i32_values: &[i32],
+    filter_i64_values: &[i64],
+    consume: &mut F,
+) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
+where
+    R: ChunkReader + 'static,
+    F: FnMut(DirectOrderedPrimitiveBatch) -> Result<()>,
+{
+    if columns.is_empty() || filter_index >= columns.len() {
+        return Ok(None);
+    }
+    if columns.iter().any(|column| {
+        !matches!(
+            column.column_type,
+            DirectPrimitiveColumnType::I32 | DirectPrimitiveColumnType::I64
+        )
+    }) {
+        return Ok(None);
+    }
+    let names = columns.iter().map(|column| column.name).collect::<Vec<_>>();
+    let Some(column_indices) = parquet_column_indices_by_name(&reader, &names) else {
+        return Ok(None);
+    };
+    let schema = reader.metadata().file_metadata().schema_descr();
+    for (column, &column_index) in columns.iter().zip(column_indices.iter()) {
+        let parquet_column = schema.column(column_index);
+        if parquet_column.max_rep_level() != 0
+            || parquet_column.max_def_level() != 0
+            || !direct_primitive_page_column_type_matches(
+                parquet_column.physical_type(),
+                column.column_type,
+            )
+        {
+            return Ok(None);
+        }
+    }
+
+    let mut metrics = DirectPrimitiveColumnScanMetrics {
+        row_groups: row_groups.len(),
+        column_read_nanos: vec![0; columns.len()],
+        ..DirectPrimitiveColumnScanMetrics::default()
+    };
+    for &row_group_index in row_groups {
+        let row_group = reader.get_row_group(row_group_index)?;
+        let row_count = usize::try_from(row_group.metadata().num_rows()).map_err(|_| {
+            DodamError::UnsupportedSql("row group row count out of range".to_string())
+        })?;
+        let filter_dictionary = if matches!(
+            columns[filter_index].column_type,
+            DirectPrimitiveColumnType::I32
+        ) {
+            read_i32_dictionary_ids_for_row_group(&*row_group, column_indices[filter_index])?
+        } else {
+            None
+        };
+        let mut cursors = Vec::with_capacity(columns.len());
+        for (index, (column, &column_index)) in
+            columns.iter().zip(column_indices.iter()).enumerate()
+        {
+            if filter_dictionary.is_some() && index == filter_index {
+                cursors.push(None);
+                continue;
+            }
+            let page_reader = row_group.get_column_page_reader(column_index)?;
+            cursors.push(Some(RequiredPlainPrimitivePageCursor::new(
+                page_reader,
+                column.column_type,
+            )));
+        }
+        let mut rows_read = 0usize;
+        while rows_read < row_count {
+            let read_started = Instant::now();
+            let mut records = batch_size.min(row_count - rows_read);
+            for (index, cursor) in cursors.iter_mut().enumerate() {
+                let Some(cursor) = cursor else {
+                    continue;
+                };
+                let column_started = Instant::now();
+                let loaded = cursor.ensure_page()?;
+                metrics.add_column_read_nanos(index, elapsed_nanos(column_started));
+                if !loaded {
+                    metrics.add_read_nanos(elapsed_nanos(read_started));
+                    return Ok(None);
+                }
+                records = records.min(cursor.available_rows());
+            }
+            metrics.add_read_nanos(elapsed_nanos(read_started));
+            if records == 0 {
+                return Ok(None);
+            }
+            if let Some((ids, _)) = filter_dictionary.as_ref()
+                && rows_read + records > ids.len()
+            {
+                return Ok(None);
+            }
+            let consume_started = Instant::now();
+            let mut output = columns
+                .iter()
+                .map(|column| match column.column_type {
+                    DirectPrimitiveColumnType::I32 => {
+                        DirectOrderedPrimitiveColumnValues::I32(Vec::new())
+                    }
+                    DirectPrimitiveColumnType::I64 => {
+                        DirectOrderedPrimitiveColumnValues::I64(Vec::new())
+                    }
+                    _ => unreachable!("checked primitive ordered column type"),
+                })
+                .collect::<Vec<_>>();
+            for row in (0..records).rev() {
+                let selected = match columns[filter_index].column_type {
+                    DirectPrimitiveColumnType::I32 => {
+                        let value = if let Some((ids, dictionary)) = filter_dictionary.as_ref() {
+                            let Some(id) = ids.get(rows_read + row).copied() else {
+                                return Ok(None);
+                            };
+                            let Ok(id) = usize::try_from(id) else {
+                                return Ok(None);
+                            };
+                            let Some(value) = dictionary.get(id).copied() else {
+                                return Ok(None);
+                            };
+                            value
+                        } else {
+                            let Some(cursor) = cursors[filter_index].as_ref() else {
+                                return Ok(None);
+                            };
+                            let Some(bytes) = cursor.raw_bytes(records) else {
+                                return Ok(None);
+                            };
+                            read_i32_from_plain_bytes(bytes, row)?
+                        };
+                        filter_i32_values.contains(&value)
+                    }
+                    DirectPrimitiveColumnType::I64 => {
+                        let Some(cursor) = cursors[filter_index].as_ref() else {
+                            return Ok(None);
+                        };
+                        let Some(bytes) = cursor.raw_bytes(records) else {
+                            return Ok(None);
+                        };
+                        let value = read_i64_from_plain_bytes(bytes, row)?;
+                        filter_i64_values.contains(&value)
+                    }
+                    _ => return Ok(None),
+                };
+                if !selected {
+                    continue;
+                }
+                for (index, column) in columns.iter().enumerate() {
+                    match (&mut output[index], column.column_type) {
+                        (
+                            DirectOrderedPrimitiveColumnValues::I32(values),
+                            DirectPrimitiveColumnType::I32,
+                        ) => {
+                            if let Some((ids, dictionary)) = filter_dictionary.as_ref()
+                                && index == filter_index
+                            {
+                                let Some(id) = ids.get(rows_read + row).copied() else {
+                                    return Ok(None);
+                                };
+                                let Ok(id) = usize::try_from(id) else {
+                                    return Ok(None);
+                                };
+                                let Some(value) = dictionary.get(id).copied() else {
+                                    return Ok(None);
+                                };
+                                values.push(value);
+                            } else {
+                                let Some(cursor) = cursors[index].as_ref() else {
+                                    return Ok(None);
+                                };
+                                let Some(bytes) = cursor.raw_bytes(records) else {
+                                    return Ok(None);
+                                };
+                                values.push(read_i32_from_plain_bytes(bytes, row)?);
+                            }
+                        }
+                        (
+                            DirectOrderedPrimitiveColumnValues::I64(values),
+                            DirectPrimitiveColumnType::I64,
+                        ) => {
+                            let Some(cursor) = cursors[index].as_ref() else {
+                                return Ok(None);
+                            };
+                            let Some(bytes) = cursor.raw_bytes(records) else {
+                                return Ok(None);
+                            };
+                            values.push(read_i64_from_plain_bytes(bytes, row)?);
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+            }
+            let selected_rows = output
+                .first()
+                .map(DirectOrderedPrimitiveColumnValues::len)
+                .unwrap_or(0);
+            if selected_rows > 0 {
+                metrics.selected_rows = metrics.selected_rows.saturating_add(selected_rows);
+                consume(DirectOrderedPrimitiveBatch { columns: output })?;
+            }
+            metrics.add_consume_nanos(elapsed_nanos(consume_started));
+            for cursor in &mut cursors {
+                if let Some(cursor) = cursor {
+                    cursor.advance(records);
+                }
+            }
+            rows_read += records;
+            metrics.batches += 1;
+            metrics.rows = metrics.rows.saturating_add(records);
+        }
+    }
+    Ok(Some(metrics))
+}
+
+fn read_i32_from_plain_bytes(bytes: &[u8], row: usize) -> Result<i32> {
+    let start = row.saturating_mul(std::mem::size_of::<i32>());
+    let end = start.saturating_add(std::mem::size_of::<i32>());
+    let chunk = bytes.get(start..end).ok_or_else(|| {
+        DodamError::UnsupportedSql("plain i32 byte range out of bounds".to_string())
+    })?;
+    Ok(i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+}
+
+fn read_i64_from_plain_bytes(bytes: &[u8], row: usize) -> Result<i64> {
+    let start = row.saturating_mul(std::mem::size_of::<i64>());
+    let end = start.saturating_add(std::mem::size_of::<i64>());
+    let chunk = bytes.get(start..end).ok_or_else(|| {
+        DodamError::UnsupportedSql("plain i64 byte range out of bounds".to_string())
+    })?;
+    Ok(i64::from_le_bytes([
+        chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+    ]))
 }
 
 fn scan_parquet_required_primitive_count_sum_pages_reader<R, F>(
