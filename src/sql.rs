@@ -253,6 +253,11 @@ pub async fn execute_sql(
         return Ok(output);
     }
     if let Some(output) =
+        try_execute_order_priority_exists_count_sql(engine, sql, batch_size).await?
+    {
+        return Ok(output);
+    }
+    if let Some(output) =
         try_execute_derived_prefix_avg_anti_join_aggregate_sql(engine, sql, batch_size).await?
     {
         return Ok(output);
@@ -24878,6 +24883,65 @@ fn q04_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
         && selection.contains("exists")
         && selection.contains("l_orderkey = o_orderkey")
         && selection.contains("l_commitdate < l_receiptdate")
+}
+
+async fn try_execute_order_priority_exists_count_sql(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let Some(selection) = select.selection.as_ref() else {
+        return Ok(None);
+    };
+    if !q04_shape(select, query, selection) {
+        return Ok(None);
+    }
+    reject_query_features(query)?;
+    reject_select_features(select)?;
+    let orders = parse_from(select)?;
+    if !table_ref_alias_or_name(&orders).eq_ignore_ascii_case("orders") {
+        return Ok(None);
+    }
+    let Some(lineitem_path) = q04_lineitem_path(selection)? else {
+        return Ok(None);
+    };
+    let mut conjuncts = Vec::new();
+    collect_sql_and_conjuncts(selection, &mut conjuncts);
+    let Some((start_days, end_days)) = date_range_bounds(&conjuncts, "o_orderdate")? else {
+        return Ok(None);
+    };
+
+    let stage = tpch_profile_start();
+    let (mut candidate_priorities, priority_labels, candidate_count) =
+        q04_candidate_order_priorities(engine, orders.path, batch_size, start_days, end_days)
+            .await?;
+    tpch_profile_elapsed("Q04 candidate orders", stage);
+    if candidate_count == 0 || priority_labels.is_empty() {
+        return Ok(Some(q04_output(Vec::new())?));
+    }
+
+    let stage = tpch_profile_start();
+    let counts = q04_count_late_candidate_priorities(
+        engine,
+        lineitem_path,
+        batch_size,
+        &mut candidate_priorities,
+        candidate_count,
+        priority_labels.len(),
+    )
+    .await?;
+    tpch_profile_elapsed("Q04 late lineitem priorities", stage);
+    let rows = q04_priority_count_rows(priority_labels, counts);
+    Ok(Some(q04_output(rows)?))
 }
 
 fn q04_lineitem_path(selection: &SqlExpr) -> Result<Option<PathBuf>> {
