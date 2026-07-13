@@ -2105,15 +2105,21 @@ where
                         && key_ids.len() == row_count
                         && mode_ids.len() == row_count
                     {
+                        let selected_offsets =
+                            materialize_selected_u32_offsets(&selected_runs, selected_rows)?;
                         let mut keys = Vec::<i64>::with_capacity(selected_rows);
-                        compact_i64_dictionary_selected_runs(
+                        compact_i64_dictionary_selected_offsets(
                             &key_ids,
                             &key_dictionary,
-                            &selected_runs,
+                            &selected_offsets,
                             &mut keys,
                         )?;
                         let mut selected_mode_ids = Vec::<i32>::with_capacity(selected_rows);
-                        compact_selected_i32(&mode_ids, &selected_runs, &mut selected_mode_ids);
+                        compact_selected_i32_offsets(
+                            &mode_ids,
+                            &selected_offsets,
+                            &mut selected_mode_ids,
+                        )?;
                         Some((keys, selected_mode_ids, mode_dictionary))
                     } else {
                         None
@@ -2298,6 +2304,70 @@ fn compact_i64_dictionary_selected_runs(
             };
             output.push(*value);
         }
+    }
+    Ok(())
+}
+
+fn materialize_selected_u32_offsets(
+    runs: &[(usize, usize)],
+    selected_rows: usize,
+) -> Result<Vec<u32>> {
+    let mut offsets = Vec::with_capacity(selected_rows);
+    for &(start, len) in runs {
+        let end = start.checked_add(len).ok_or_else(|| {
+            DodamError::UnsupportedSql("selected run end is out of range".to_string())
+        })?;
+        if end > usize::try_from(u32::MAX).unwrap_or(usize::MAX) {
+            return Err(DodamError::UnsupportedSql(
+                "selected offset is out of u32 range".to_string(),
+            ));
+        }
+        offsets.extend((start..end).map(|offset| offset as u32));
+    }
+    if offsets.len() != selected_rows {
+        return Err(DodamError::UnsupportedSql(
+            "selected offset count mismatch".to_string(),
+        ));
+    }
+    Ok(offsets)
+}
+
+fn compact_i64_dictionary_selected_offsets(
+    ids: &[i32],
+    dictionary: &[i64],
+    offsets: &[u32],
+    output: &mut Vec<i64>,
+) -> Result<()> {
+    for &offset in offsets {
+        let Some(&id) = ids.get(offset as usize) else {
+            return Err(DodamError::UnsupportedSql(
+                "selected i64 dictionary offset is out of range".to_string(),
+            ));
+        };
+        let id = usize::try_from(id)
+            .map_err(|_| DodamError::UnsupportedSql("negative i64 dictionary id".to_string()))?;
+        let Some(value) = dictionary.get(id) else {
+            return Err(DodamError::UnsupportedSql(
+                "i64 dictionary id is out of range".to_string(),
+            ));
+        };
+        output.push(*value);
+    }
+    Ok(())
+}
+
+fn compact_selected_i32_offsets(
+    values: &[i32],
+    offsets: &[u32],
+    output: &mut Vec<i32>,
+) -> Result<()> {
+    for &offset in offsets {
+        let Some(&value) = values.get(offset as usize) else {
+            return Err(DodamError::UnsupportedSql(
+                "selected i32 offset is out of range".to_string(),
+            ));
+        };
+        output.push(value);
     }
     Ok(())
 }
