@@ -145,6 +145,7 @@ pub enum SelectedPayloadDecision {
     SelectedRatio,
     FragmentedRuns,
     RowGroupSpread,
+    PayloadColumns,
 }
 
 impl SelectedPayloadDecision {
@@ -159,6 +160,7 @@ impl SelectedPayloadDecision {
             Self::SelectedRatio => "selected-ratio",
             Self::FragmentedRuns => "fragmented-runs",
             Self::RowGroupSpread => "row-group-spread",
+            Self::PayloadColumns => "payload-columns",
         }
     }
 }

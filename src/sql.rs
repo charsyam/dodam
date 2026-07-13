@@ -2190,8 +2190,14 @@ fn primitive_topk_selected_payload_enabled() -> bool {
 }
 
 fn primitive_topk_selected_payload_auto_enabled() -> bool {
-    std::env::var("DODAM_ENABLE_PRIMITIVE_TOPK_SELECTED_PAYLOAD_AUTO")
+    if std::env::var("DODAM_DISABLE_PRIMITIVE_TOPK_SELECTED_PAYLOAD_AUTO")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return false;
+    }
+    std::env::var("DODAM_ENABLE_PRIMITIVE_TOPK_SELECTED_PAYLOAD_AUTO")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
+        .unwrap_or(true)
 }
 
 fn primitive_topk_fused_selected_page_reader_enabled() -> bool {
@@ -2221,6 +2227,18 @@ fn primitive_topk_selected_payload_precheck_accepts(
             "precheck",
         );
         return Ok(true);
+    }
+    if require_stats && missing_payload_columns < primitive_topk_selected_payload_min_auto_columns()
+    {
+        log_primitive_topk_selected_payload_spread(
+            limit,
+            0,
+            total_row_groups,
+            missing_payload_columns,
+            SelectedPayloadDecision::PayloadColumns,
+            "precheck",
+        );
+        return Ok(false);
     }
     let Some(ranges) = engine.parquet_primitive_column_min_max_by_row_group(path, sort_column)?
     else {
@@ -2341,9 +2359,22 @@ fn primitive_topk_selected_payload_max_row_groups() -> usize {
         .unwrap_or(16)
 }
 
+fn primitive_topk_selected_payload_min_auto_columns() -> usize {
+    std::env::var("DODAM_PRIMITIVE_TOPK_SELECTED_PAYLOAD_MIN_AUTO_COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(2)
+}
+
 fn primitive_topk_selected_payload_spread_gate_enabled() -> bool {
-    std::env::var("DODAM_ENABLE_PRIMITIVE_TOPK_SELECTED_PAYLOAD_SPREAD_GATE")
+    if std::env::var("DODAM_DISABLE_PRIMITIVE_TOPK_SELECTED_PAYLOAD_SPREAD_GATE")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return false;
+    }
+    std::env::var("DODAM_ENABLE_PRIMITIVE_TOPK_SELECTED_PAYLOAD_SPREAD_GATE")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
+        .unwrap_or(true)
 }
 
 fn log_primitive_topk_selected_payload_spread(
@@ -3181,8 +3212,14 @@ fn primitive_topk_row_refs_enabled() -> bool {
 }
 
 fn primitive_topk_fused_filter_threshold_enabled() -> bool {
-    std::env::var("DODAM_ENABLE_PRIMITIVE_TOPK_FUSED_FILTER_THRESHOLD")
+    if std::env::var("DODAM_DISABLE_PRIMITIVE_TOPK_FUSED_FILTER_THRESHOLD")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return false;
+    }
+    std::env::var("DODAM_ENABLE_PRIMITIVE_TOPK_FUSED_FILTER_THRESHOLD")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
+        .unwrap_or(true)
 }
 
 fn null_free_primitive_columns_for_topk<'a>(
