@@ -28,6 +28,7 @@ pub(super) fn read_plain_i64_selected_runs(
     let mut page_row_start = 0usize;
     let mut run_cursor = 0usize;
     let mut def_levels = Vec::<i16>::new();
+    let mut present_prefix = Vec::<usize>::new();
     while let Some(page) = page_reader.get_next_page()? {
         match page {
             Page::DictionaryPage { .. } => return Ok(None),
@@ -70,6 +71,7 @@ pub(super) fn read_plain_i64_selected_runs(
                         runs,
                         &def_levels,
                         column_desc.max_def_level(),
+                        &mut present_prefix,
                         output,
                         metrics,
                     )?;
@@ -141,6 +143,7 @@ pub(super) fn read_plain_i64_selected_runs(
                             runs,
                             &def_levels,
                             column_desc.max_def_level(),
+                            &mut present_prefix,
                             output,
                             metrics,
                         )?;
@@ -188,6 +191,7 @@ where
     let mut page_row_start = 0usize;
     let mut run_cursor = 0usize;
     let mut def_levels = Vec::<i16>::new();
+    let mut present_prefix = Vec::<usize>::new();
     let mut scratch = Vec::<i64>::new();
     while let Some(page) = page_reader.get_next_page()? {
         match page {
@@ -232,6 +236,7 @@ where
                         &selected_prefix,
                         &def_levels,
                         column_desc.max_def_level(),
+                        &mut present_prefix,
                         &mut scratch,
                         &mut consume,
                     )?;
@@ -294,6 +299,7 @@ where
                         &selected_prefix,
                         &def_levels,
                         column_desc.max_def_level(),
+                        &mut present_prefix,
                         &mut scratch,
                         &mut consume,
                     )?;
@@ -327,6 +333,17 @@ fn selected_run_prefixes(runs: &[(usize, usize)]) -> Vec<usize> {
         selected = selected.saturating_add(len);
     }
     prefixes
+}
+
+fn build_present_prefix(def_levels: &[i16], max_def_level: i16, present_prefix: &mut Vec<usize>) {
+    present_prefix.clear();
+    present_prefix.reserve(def_levels.len() + 1);
+    present_prefix.push(0);
+    let mut present = 0usize;
+    for &level in def_levels {
+        present += usize::from(level == max_def_level);
+        present_prefix.push(present);
+    }
 }
 
 fn copy_selected_i64_required_page(
@@ -421,16 +438,15 @@ fn copy_selected_i64_nullable_page(
     runs: &[(usize, usize)],
     def_levels: &[i16],
     max_def_level: i16,
+    present_prefix: &mut Vec<usize>,
     output: &mut Vec<i64>,
     metrics: &mut DirectPrimitiveColumnScanMetrics,
 ) -> Result<()> {
     if def_levels.len() != page_rows {
         return Ok(());
     }
-    let present_values = def_levels
-        .iter()
-        .filter(|level| **level == max_def_level)
-        .count();
+    build_present_prefix(def_levels, max_def_level, present_prefix);
+    let present_values = present_prefix[page_rows];
     let value_bytes = present_values.saturating_mul(std::mem::size_of::<i64>());
     if value_start.saturating_add(value_bytes) > buf.len() {
         return Err(DodamError::UnsupportedSql(
@@ -448,17 +464,11 @@ fn copy_selected_i64_nullable_page(
         }
         let local_start = run_start.max(page_row_start) - page_row_start;
         let local_end = run_end.min(page_row_end) - page_row_start;
-        if def_levels[local_start..local_end]
-            .iter()
-            .any(|level| *level != max_def_level)
-        {
+        let rows = local_end - local_start;
+        if present_prefix[local_end] - present_prefix[local_start] != rows {
             return Ok(());
         }
-        let present_before = def_levels[..local_start]
-            .iter()
-            .filter(|level| **level == max_def_level)
-            .count();
-        let rows = local_end - local_start;
+        let present_before = present_prefix[local_start];
         let byte_start = value_start + present_before * std::mem::size_of::<i64>();
         metrics.add_selected_read(rows);
         copy_selected_i64_values(buf, byte_start, rows, output);
@@ -476,6 +486,7 @@ fn copy_selected_i64_nullable_page_to_sink<F>(
     selected_prefix: &[usize],
     def_levels: &[i16],
     max_def_level: i16,
+    present_prefix: &mut Vec<usize>,
     scratch: &mut Vec<i64>,
     consume: &mut F,
 ) -> Result<()>
@@ -485,10 +496,8 @@ where
     if def_levels.len() != page_rows {
         return Ok(());
     }
-    let present_values = def_levels
-        .iter()
-        .filter(|level| **level == max_def_level)
-        .count();
+    build_present_prefix(def_levels, max_def_level, present_prefix);
+    let present_values = present_prefix[page_rows];
     let value_bytes = present_values.saturating_mul(std::mem::size_of::<i64>());
     if value_start.saturating_add(value_bytes) > buf.len() {
         return Err(DodamError::UnsupportedSql(
@@ -508,21 +517,15 @@ where
         }
         let local_start = run_start.max(page_row_start) - page_row_start;
         let local_end = run_end.min(page_row_end) - page_row_start;
-        if def_levels[local_start..local_end]
-            .iter()
-            .any(|level| *level != max_def_level)
-        {
+        let rows = local_end - local_start;
+        if present_prefix[local_end] - present_prefix[local_start] != rows {
             return Ok(());
         }
         if first_selected_offset.is_none() {
             first_selected_offset =
                 Some(selected_prefix[run_index] + local_start + page_row_start - run_start);
         }
-        let present_before = def_levels[..local_start]
-            .iter()
-            .filter(|level| **level == max_def_level)
-            .count();
-        let rows = local_end - local_start;
+        let present_before = present_prefix[local_start];
         let byte_start = value_start + present_before * std::mem::size_of::<i64>();
         copy_selected_i64_values(buf, byte_start, rows, scratch);
     }
