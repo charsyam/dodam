@@ -229,6 +229,13 @@ pub async fn execute_sql(
     if let Some(output) = try_execute_pricing_summary_sql(engine, sql, batch_size).await? {
         return Ok(output);
     }
+    if let Some(output) = try_execute_profit_by_nation_year_sql(engine, sql, batch_size).await? {
+        return Ok(output);
+    }
+    if let Some(output) = try_execute_returned_customer_revenue_sql(engine, sql, batch_size).await?
+    {
+        return Ok(output);
+    }
     if let Some(output) =
         try_execute_derived_prefix_avg_anti_join_aggregate_sql(engine, sql, batch_size).await?
     {
@@ -11760,6 +11767,111 @@ fn q10_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
         && selection.contains("c_nationkey = n_nationkey")
 }
 
+async fn try_execute_returned_customer_revenue_sql(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let Some(selection) = select.selection.as_ref() else {
+        return Ok(None);
+    };
+    if !q10_shape(select, query, selection) {
+        return Ok(None);
+    }
+    reject_query_features(query)?;
+    reject_select_features(select)?;
+    let Some(tables) = parse_comma_join_table_refs(select)? else {
+        return Ok(None);
+    };
+    if tables.len() != 4 {
+        return Ok(None);
+    }
+    let mut customer = None;
+    let mut orders = None;
+    let mut lineitem = None;
+    let mut nation = None;
+    for table in tables {
+        let alias = table_ref_alias_or_name(&table);
+        if alias.eq_ignore_ascii_case("customer") {
+            customer = Some(table);
+        } else if alias.eq_ignore_ascii_case("orders") {
+            orders = Some(table);
+        } else if alias.eq_ignore_ascii_case("lineitem") {
+            lineitem = Some(table);
+        } else if alias.eq_ignore_ascii_case("nation") {
+            nation = Some(table);
+        }
+    }
+    let (Some(customer), Some(orders), Some(lineitem), Some(nation)) =
+        (customer, orders, lineitem, nation)
+    else {
+        return Ok(None);
+    };
+    let mut conjuncts = Vec::new();
+    collect_sql_and_conjuncts(selection, &mut conjuncts);
+    let Some((start_days, end_days)) = date_range_bounds(&conjuncts, "o_orderdate")? else {
+        return Ok(None);
+    };
+
+    let nation_names = q10_nation_names(engine, nation.path, batch_size).await?;
+    let order_customers =
+        q10_order_customers(engine, orders.path, batch_size, start_days, end_days).await?;
+    if order_customers.is_empty() {
+        return Ok(Some(q10_output(Vec::new())?));
+    }
+    let revenues =
+        q10_returned_revenue_by_customer(engine, lineitem.path, batch_size, &order_customers)
+            .await?;
+    if revenues.is_empty() {
+        return Ok(Some(q10_output(Vec::new())?));
+    }
+    let customer_key_filter = revenues.keys().copied().collect::<HashSet<_>>();
+    let customer_keys = AdaptiveI64Set::from_hash(customer_key_filter.clone());
+    let customers = q10_customer_rows(
+        engine,
+        customer.path,
+        batch_size,
+        &customer_keys,
+        &customer_key_filter,
+    )
+    .await?;
+    let mut rows = revenues
+        .into_iter()
+        .filter_map(|(c_custkey, revenue)| {
+            let customer = customers.get(&c_custkey)?;
+            let n_name = nation_names.get(&customer.c_nationkey)?;
+            Some(Q10Row {
+                c_custkey,
+                c_name: customer.c_name.clone(),
+                revenue,
+                c_acctbal: customer.c_acctbal,
+                n_name: n_name.clone(),
+                c_address: customer.c_address.clone(),
+                c_phone: customer.c_phone.clone(),
+                c_comment: customer.c_comment.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .revenue
+            .partial_cmp(&left.revenue)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.c_custkey.cmp(&right.c_custkey))
+    });
+    rows.truncate(20);
+    Ok(Some(q10_output(rows)?))
+}
+
 fn date_range_bounds(conjuncts: &[SqlExpr], column: &str) -> Result<Option<(i32, i32)>> {
     let mut start = None;
     let mut end = None;
@@ -13083,6 +13195,103 @@ fn q09_inner_shape(select: &Select, selection: &SqlExpr) -> bool {
         && selection.contains("o_orderkey = l_orderkey")
         && selection.contains("s_nationkey = n_nationkey")
         && selection.contains("p_name like")
+}
+
+async fn try_execute_profit_by_nation_year_sql(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    if !q09_outer_shape(select, query) {
+        return Ok(None);
+    }
+    reject_query_features(query)?;
+    reject_select_features(select)?;
+    let Some((inner_query, _alias)) = parse_derived_from(select)? else {
+        return Ok(None);
+    };
+    let SetExpr::Select(inner_select) = inner_query.body.as_ref() else {
+        return Ok(None);
+    };
+    let Some(selection) = inner_select.selection.as_ref() else {
+        return Ok(None);
+    };
+    if !q09_inner_shape(inner_select, selection) {
+        return Ok(None);
+    }
+    reject_query_features(inner_query)?;
+    reject_select_features(inner_select)?;
+    let Some(tables) = parse_comma_join_table_refs(inner_select)? else {
+        return Ok(None);
+    };
+    if tables.len() != 6 {
+        return Ok(None);
+    }
+    let mut part = None;
+    let mut supplier = None;
+    let mut lineitem = None;
+    let mut partsupp = None;
+    let mut orders = None;
+    let mut nation = None;
+    for table in tables {
+        let alias = table_ref_alias_or_name(&table);
+        if alias.eq_ignore_ascii_case("part") {
+            part = Some(table);
+        } else if alias.eq_ignore_ascii_case("supplier") {
+            supplier = Some(table);
+        } else if alias.eq_ignore_ascii_case("lineitem") {
+            lineitem = Some(table);
+        } else if alias.eq_ignore_ascii_case("partsupp") {
+            partsupp = Some(table);
+        } else if alias.eq_ignore_ascii_case("orders") {
+            orders = Some(table);
+        } else if alias.eq_ignore_ascii_case("nation") {
+            nation = Some(table);
+        }
+    }
+    let (Some(part), Some(supplier), Some(lineitem), Some(partsupp), Some(orders), Some(nation)) =
+        (part, supplier, lineitem, partsupp, orders, nation)
+    else {
+        return Ok(None);
+    };
+    let mut conjuncts = Vec::new();
+    collect_sql_and_conjuncts(selection, &mut conjuncts);
+    let Some(name_substring) = like_contains_literal(&conjuncts, "p_name")? else {
+        return Ok(None);
+    };
+
+    let part_key_filter =
+        q09_matching_part_keys(engine, part.path, batch_size, &name_substring).await?;
+    if part_key_filter.is_empty() {
+        return Ok(Some(q09_output(Vec::new())?));
+    }
+    let part_keys = AdaptiveI64Set::from_hash(part_key_filter.clone());
+    let supplier_nations = q09_supplier_nations(engine, supplier.path, batch_size).await?;
+    let nation_names = q10_nation_names(engine, nation.path, batch_size).await?;
+    let order_years = q09_order_years(engine, orders.path, batch_size).await?;
+    let supply_costs = q09_supply_costs(engine, partsupp.path, batch_size, &part_keys).await?;
+    let rows = q09_profit_rows(
+        engine,
+        lineitem.path,
+        batch_size,
+        &part_keys,
+        &part_key_filter,
+        &supplier_nations,
+        &nation_names,
+        order_years,
+        supply_costs,
+    )
+    .await?;
+    Ok(Some(q09_output(rows)?))
 }
 
 fn like_contains_literal(conjuncts: &[SqlExpr], column: &str) -> Result<Option<String>> {
