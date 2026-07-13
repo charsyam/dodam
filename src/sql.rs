@@ -241,7 +241,14 @@ pub async fn execute_sql(
     {
         return Ok(output);
     }
-    if let Some(output) = try_execute_legacy_tpch_fast_sql(engine, sql, batch_size).await? {
+    if let Some(output) =
+        try_execute_supplier_wait_count_antijoin_sql(engine, sql, batch_size).await?
+    {
+        return Ok(output);
+    }
+    if let Some(output) =
+        try_execute_prefix_part_supplier_threshold_sql(engine, sql, batch_size).await?
+    {
         return Ok(output);
     }
     if let Some(output) = try_execute_derived_join_sql(engine, sql, batch_size).await? {
@@ -676,32 +683,6 @@ pub async fn execute_sql(
         apply_output_order_limit(collect_batches(stream)?, None, query.limit, query.offset)?;
     let batches = rename_output_batches(batches, &query.aliases)?;
     Ok(QueryOutput::Scan { batches })
-}
-
-async fn try_execute_legacy_tpch_fast_sql(
-    engine: &DodamEngine,
-    sql: &str,
-    batch_size: usize,
-) -> Result<Option<QueryOutput>> {
-    if legacy_tpch_fast_paths_disabled() {
-        return Ok(None);
-    }
-    if let Some(output) =
-        try_execute_q21_suppliers_who_kept_orders_waiting_fast(engine, sql, batch_size).await?
-    {
-        return Ok(Some(output));
-    }
-    if let Some(output) =
-        try_execute_q20_potential_part_promotion_fast(engine, sql, batch_size).await?
-    {
-        return Ok(Some(output));
-    }
-    Ok(None)
-}
-
-fn legacy_tpch_fast_paths_disabled() -> bool {
-    std::env::var("DODAM_DISABLE_LEGACY_TPCH_FAST_PATHS")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 fn semijoin_profile_enabled() -> bool {
@@ -5250,7 +5231,9 @@ async fn try_execute_correlated_exists_semijoin_sql(
             "[dodam:semijoin-profile] total={}ms plan={}ms inner={}ms outer_scan={}ms expr={}ms membership={}ms output_rows={} negated={}",
             total_started.elapsed().as_millis(),
             plan_elapsed.map(|elapsed| elapsed.as_millis()).unwrap_or(0),
-            inner_elapsed.map(|elapsed| elapsed.as_millis()).unwrap_or(0),
+            inner_elapsed
+                .map(|elapsed| elapsed.as_millis())
+                .unwrap_or(0),
             scan_elapsed.map(|elapsed| elapsed.as_millis()).unwrap_or(0),
             expression_elapsed
                 .map(|elapsed| elapsed.as_millis())
@@ -10583,43 +10566,6 @@ async fn try_execute_join_with_correlated_avg_threshold_sql(
     Ok(Some(q17_output(output_name, sum.map(|value| value / 7.0))?))
 }
 
-async fn try_execute_q01_pricing_summary_fast(
-    engine: &DodamEngine,
-    sql: &str,
-    batch_size: usize,
-) -> Result<Option<QueryOutput>> {
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Ok(None);
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Ok(None);
-    };
-    let Some(selection) = select.selection.as_ref() else {
-        return Ok(None);
-    };
-    if !q01_shape(select, query, selection) {
-        return Ok(None);
-    }
-    let [table_with_joins] = select.from.as_slice() else {
-        return Ok(None);
-    };
-    if !table_with_joins.joins.is_empty() {
-        return Ok(None);
-    }
-    let table = parse_table_factor(&table_with_joins.relation)?;
-    if !table_ref_alias_or_name(&table).eq_ignore_ascii_case("lineitem") {
-        return Ok(None);
-    }
-    let Some(cutoff_days) = q01_shipdate_cutoff(selection)? else {
-        return Ok(None);
-    };
-    let rows = q01_pricing_summary_rows(engine, table.path, batch_size, cutoff_days).await?;
-    Ok(Some(q01_output(rows)?))
-}
-
 fn q01_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
     let projection = select
         .projection
@@ -11729,113 +11675,6 @@ fn q01_output(rows: Vec<Q01Row>) -> Result<QueryOutput> {
         metrics: AggregateMetrics::default(),
         batches: vec![batch],
     })
-}
-
-async fn try_execute_q10_returned_item_fast(
-    engine: &DodamEngine,
-    sql: &str,
-    batch_size: usize,
-) -> Result<Option<QueryOutput>> {
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Ok(None);
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Ok(None);
-    };
-    let Some(selection) = select.selection.as_ref() else {
-        return Ok(None);
-    };
-    if !q10_shape(select, query, selection) {
-        return Ok(None);
-    }
-    reject_query_features(query)?;
-    reject_select_features(select)?;
-    let Some(tables) = parse_comma_join_table_refs(select)? else {
-        return Ok(None);
-    };
-    if tables.len() != 4 {
-        return Ok(None);
-    }
-    let mut customer = None;
-    let mut orders = None;
-    let mut lineitem = None;
-    let mut nation = None;
-    for table in tables {
-        let alias = table_ref_alias_or_name(&table);
-        if alias.eq_ignore_ascii_case("customer") {
-            customer = Some(table);
-        } else if alias.eq_ignore_ascii_case("orders") {
-            orders = Some(table);
-        } else if alias.eq_ignore_ascii_case("lineitem") {
-            lineitem = Some(table);
-        } else if alias.eq_ignore_ascii_case("nation") {
-            nation = Some(table);
-        }
-    }
-    let (Some(customer), Some(orders), Some(lineitem), Some(nation)) =
-        (customer, orders, lineitem, nation)
-    else {
-        return Ok(None);
-    };
-    let mut conjuncts = Vec::new();
-    collect_sql_and_conjuncts(selection, &mut conjuncts);
-    let Some((start_days, end_days)) = date_range_bounds(&conjuncts, "o_orderdate")? else {
-        return Ok(None);
-    };
-    let nation_names = q10_nation_names(engine, nation.path, batch_size).await?;
-    let order_customers =
-        q10_order_customers(engine, orders.path, batch_size, start_days, end_days).await?;
-    if order_customers.is_empty() {
-        return Ok(Some(q10_output(Vec::new())?));
-    }
-    let revenue_by_customer =
-        q10_returned_revenue_by_customer(engine, lineitem.path, batch_size, &order_customers)
-            .await?;
-    if revenue_by_customer.is_empty() {
-        return Ok(Some(q10_output(Vec::new())?));
-    }
-    let mut top_revenues = revenue_by_customer.into_iter().collect::<Vec<_>>();
-    top_revenues.sort_by(|left, right| {
-        right
-            .1
-            .partial_cmp(&left.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    top_revenues.truncate(20);
-    let top_customer_key_filter = top_revenues
-        .iter()
-        .map(|(custkey, _)| *custkey)
-        .collect::<HashSet<_>>();
-    let top_customer_keys = AdaptiveI64Set::from_hash(top_customer_key_filter.clone());
-    let customers = q10_customer_rows(
-        engine,
-        customer.path,
-        batch_size,
-        &top_customer_keys,
-        &top_customer_key_filter,
-    )
-    .await?;
-    let rows = top_revenues
-        .into_iter()
-        .filter_map(|(custkey, revenue)| {
-            let customer = customers.get(&custkey)?;
-            let n_name = nation_names.get(&customer.c_nationkey)?;
-            Some(Q10Row {
-                c_custkey: custkey,
-                c_name: customer.c_name.clone(),
-                revenue,
-                c_acctbal: customer.c_acctbal,
-                n_name: n_name.clone(),
-                c_address: customer.c_address.clone(),
-                c_phone: customer.c_phone.clone(),
-                c_comment: customer.c_comment.clone(),
-            })
-        })
-        .collect::<Vec<_>>();
-    Ok(Some(q10_output(rows)?))
 }
 
 fn q10_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
@@ -13151,127 +12990,6 @@ fn q10_output(rows: Vec<Q10Row>) -> Result<QueryOutput> {
         metrics: AggregateMetrics::default(),
         batches: vec![batch],
     })
-}
-
-async fn try_execute_q09_product_type_profit_fast(
-    engine: &DodamEngine,
-    sql: &str,
-    batch_size: usize,
-) -> Result<Option<QueryOutput>> {
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Ok(None);
-    };
-    let SetExpr::Select(outer_select) = query.body.as_ref() else {
-        return Ok(None);
-    };
-    if !q09_outer_shape(outer_select, query) {
-        return Ok(None);
-    }
-    let [table_with_joins] = outer_select.from.as_slice() else {
-        return Ok(None);
-    };
-    if !table_with_joins.joins.is_empty() {
-        return Ok(None);
-    }
-    let TableFactor::Derived {
-        subquery,
-        alias: Some(alias),
-        ..
-    } = &table_with_joins.relation
-    else {
-        return Ok(None);
-    };
-    if !alias.name.value.eq_ignore_ascii_case("profit") {
-        return Ok(None);
-    }
-    let SetExpr::Select(inner_select) = subquery.body.as_ref() else {
-        return Ok(None);
-    };
-    let Some(selection) = inner_select.selection.as_ref() else {
-        return Ok(None);
-    };
-    if !q09_inner_shape(inner_select, selection) {
-        return Ok(None);
-    }
-    reject_query_features(query)?;
-    reject_select_features(outer_select)?;
-    reject_select_features(inner_select)?;
-    let Some(tables) = parse_comma_join_table_refs(inner_select)? else {
-        return Ok(None);
-    };
-    if tables.len() != 6 {
-        return Ok(None);
-    }
-    let mut part = None;
-    let mut supplier = None;
-    let mut lineitem = None;
-    let mut partsupp = None;
-    let mut orders = None;
-    let mut nation = None;
-    for table in tables {
-        let alias = table_ref_alias_or_name(&table);
-        if alias.eq_ignore_ascii_case("part") {
-            part = Some(table);
-        } else if alias.eq_ignore_ascii_case("supplier") {
-            supplier = Some(table);
-        } else if alias.eq_ignore_ascii_case("lineitem") {
-            lineitem = Some(table);
-        } else if alias.eq_ignore_ascii_case("partsupp") {
-            partsupp = Some(table);
-        } else if alias.eq_ignore_ascii_case("orders") {
-            orders = Some(table);
-        } else if alias.eq_ignore_ascii_case("nation") {
-            nation = Some(table);
-        }
-    }
-    let (Some(part), Some(supplier), Some(lineitem), Some(partsupp), Some(orders), Some(nation)) =
-        (part, supplier, lineitem, partsupp, orders, nation)
-    else {
-        return Ok(None);
-    };
-    let mut conjuncts = Vec::new();
-    collect_sql_and_conjuncts(selection, &mut conjuncts);
-    let Some(part_name_substring) = like_contains_literal(&conjuncts, "p_name")? else {
-        return Ok(None);
-    };
-    let stage = tpch_profile_start();
-    let part_key_filter =
-        q09_matching_part_keys(engine, part.path, batch_size, &part_name_substring).await?;
-    tpch_profile_elapsed("Q09 matching part keys", stage);
-    if part_key_filter.is_empty() {
-        return Ok(Some(q09_output(Vec::new())?));
-    }
-    let part_keys = AdaptiveI64Set::from_hash(part_key_filter.clone());
-    let stage = tpch_profile_start();
-    let nation_names = q10_nation_names(engine, nation.path, batch_size).await?;
-    tpch_profile_elapsed("Q09 nation names", stage);
-    let stage = tpch_profile_start();
-    let supplier_nations = q09_supplier_nations(engine, supplier.path, batch_size).await?;
-    tpch_profile_elapsed("Q09 supplier nations", stage);
-    let stage = tpch_profile_start();
-    let order_years = q09_order_years(engine, orders.path, batch_size).await?;
-    tpch_profile_elapsed("Q09 order years", stage);
-    let stage = tpch_profile_start();
-    let supply_costs = q09_supply_costs(engine, partsupp.path, batch_size, &part_keys).await?;
-    tpch_profile_elapsed("Q09 supply costs", stage);
-    let stage = tpch_profile_start();
-    let rows = q09_profit_rows(
-        engine,
-        lineitem.path,
-        batch_size,
-        &part_keys,
-        &part_key_filter,
-        &supplier_nations,
-        &nation_names,
-        order_years,
-        supply_costs,
-    )
-    .await?;
-    tpch_profile_elapsed("Q09 lineitem profit rows", stage);
-    Ok(Some(q09_output(rows)?))
 }
 
 fn q09_outer_shape(select: &Select, query: &Query) -> bool {
@@ -15655,73 +15373,6 @@ fn q09_output(rows: Vec<Q09Row>) -> Result<QueryOutput> {
     })
 }
 
-async fn try_execute_q11_important_stock_fast(
-    engine: &DodamEngine,
-    sql: &str,
-    batch_size: usize,
-) -> Result<Option<QueryOutput>> {
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Ok(None);
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Ok(None);
-    };
-    let Some(selection) = select.selection.as_ref() else {
-        return Ok(None);
-    };
-    if !q11_shape(select, query, selection) {
-        return Ok(None);
-    }
-    reject_query_features(query)?;
-    reject_select_features(select)?;
-    let Some(tables) = parse_comma_join_table_refs(select)? else {
-        return Ok(None);
-    };
-    if tables.len() != 3 {
-        return Ok(None);
-    }
-    let mut partsupp = None;
-    let mut supplier = None;
-    let mut nation = None;
-    for table in tables {
-        let alias = table_ref_alias_or_name(&table);
-        if alias.eq_ignore_ascii_case("partsupp") {
-            partsupp = Some(table);
-        } else if alias.eq_ignore_ascii_case("supplier") {
-            supplier = Some(table);
-        } else if alias.eq_ignore_ascii_case("nation") {
-            nation = Some(table);
-        }
-    }
-    let (Some(partsupp), Some(supplier), Some(nation)) = (partsupp, supplier, nation) else {
-        return Ok(None);
-    };
-    let mut conjuncts = Vec::new();
-    collect_sql_and_conjuncts(selection, &mut conjuncts);
-    let Some(nation_name) = string_equality_literal(&conjuncts, "n_name")? else {
-        return Ok(None);
-    };
-    let stage = tpch_profile_start();
-    let nation_keys = q21_nation_keys(engine, nation.path, batch_size, &nation_name).await?;
-    tpch_profile_elapsed("Q11 nation keys", stage);
-    if nation_keys.is_empty() {
-        return Ok(Some(q11_output(Vec::new())?));
-    }
-    let stage = tpch_profile_start();
-    let supplier_keys = q11_supplier_keys(engine, supplier.path, batch_size, &nation_keys).await?;
-    tpch_profile_elapsed("Q11 supplier keys", stage);
-    if supplier_keys.is_empty() {
-        return Ok(Some(q11_output(Vec::new())?));
-    }
-    let stage = tpch_profile_start();
-    let rows = q11_important_stock_rows(engine, partsupp.path, batch_size, &supplier_keys).await?;
-    tpch_profile_elapsed("Q11 partsupp grouped value", stage);
-    Ok(Some(q11_output(rows)?))
-}
-
 fn q11_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
     let projection = select
         .projection
@@ -16327,97 +15978,6 @@ fn q11_output(rows: Vec<Q11Row>) -> Result<QueryOutput> {
         metrics: AggregateMetrics::default(),
         batches: vec![batch],
     })
-}
-
-async fn try_execute_q16_parts_supplier_relationship_fast(
-    engine: &DodamEngine,
-    sql: &str,
-    batch_size: usize,
-) -> Result<Option<QueryOutput>> {
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Ok(None);
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Ok(None);
-    };
-    let Some(selection) = select.selection.as_ref() else {
-        return Ok(None);
-    };
-    if !q16_shape(select, query, selection) {
-        return Ok(None);
-    }
-    reject_query_features(query)?;
-    reject_select_features(select)?;
-    let Some(tables) = parse_comma_join_table_refs(select)? else {
-        return Ok(None);
-    };
-    if tables.len() != 2 {
-        return Ok(None);
-    }
-    let mut partsupp = None;
-    let mut part = None;
-    for table in tables {
-        let alias = table_ref_alias_or_name(&table);
-        if alias.eq_ignore_ascii_case("partsupp") {
-            partsupp = Some(table);
-        } else if alias.eq_ignore_ascii_case("part") {
-            part = Some(table);
-        }
-    }
-    let (Some(partsupp), Some(part)) = (partsupp, part) else {
-        return Ok(None);
-    };
-    let Some(supplier_path) = first_table_path_in_subqueries(selection, "supplier")? else {
-        return Ok(None);
-    };
-    let mut conjuncts = Vec::new();
-    collect_sql_and_conjuncts(selection, &mut conjuncts);
-    let Some(excluded_brand) = string_inequality_literal(&conjuncts, "p_brand")? else {
-        return Ok(None);
-    };
-    let Some(excluded_type_prefix) = not_like_prefix_literal(&conjuncts, "p_type")? else {
-        return Ok(None);
-    };
-    let Some(sizes) = numeric_in_i64_literals(&conjuncts, "p_size")? else {
-        return Ok(None);
-    };
-    let sizes = AdaptiveI64Set::from_hash(sizes);
-    let Some(comment_parts) = like_substrings_literal(selection, "s_comment")? else {
-        return Ok(None);
-    };
-
-    let stage = tpch_profile_start();
-    let bad_suppliers =
-        q16_bad_suppliers(engine, supplier_path, batch_size, &comment_parts).await?;
-    tpch_profile_elapsed("Q16 bad suppliers", stage);
-    let stage = tpch_profile_start();
-    let part_groups = q16_part_groups(
-        engine,
-        part.path,
-        batch_size,
-        &excluded_brand,
-        &excluded_type_prefix,
-        &sizes,
-    )
-    .await?;
-    tpch_profile_elapsed("Q16 part groups", stage);
-    if part_groups.part_to_group.is_empty() {
-        return Ok(Some(q16_output(Vec::new())?));
-    }
-    let stage = tpch_profile_start();
-    let rows = q16_supplier_counts(
-        engine,
-        partsupp.path,
-        batch_size,
-        part_groups,
-        bad_suppliers,
-    )
-    .await?;
-    tpch_profile_elapsed("Q16 supplier counts", stage);
-    Ok(Some(q16_output(rows)?))
 }
 
 fn q16_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
@@ -18271,78 +17831,6 @@ fn q16_output(rows: Vec<Q16Row>) -> Result<QueryOutput> {
         metrics: AggregateMetrics::default(),
         batches: vec![batch],
     })
-}
-
-async fn try_execute_q12_shipping_modes_fast(
-    engine: &DodamEngine,
-    sql: &str,
-    batch_size: usize,
-) -> Result<Option<QueryOutput>> {
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Ok(None);
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Ok(None);
-    };
-    let Some(selection) = select.selection.as_ref() else {
-        return Ok(None);
-    };
-    if !q12_shape(select, query, selection) {
-        return Ok(None);
-    }
-    reject_query_features(query)?;
-    reject_select_features(select)?;
-    let Some(tables) = parse_comma_join_table_refs(select)? else {
-        return Ok(None);
-    };
-    if tables.len() != 2 {
-        return Ok(None);
-    }
-    let mut orders = None;
-    let mut lineitem = None;
-    for table in tables {
-        let alias = table_ref_alias_or_name(&table);
-        if alias.eq_ignore_ascii_case("orders") {
-            orders = Some(table);
-        } else if alias.eq_ignore_ascii_case("lineitem") {
-            lineitem = Some(table);
-        }
-    }
-    let (Some(orders), Some(lineitem)) = (orders, lineitem) else {
-        return Ok(None);
-    };
-    let mut conjuncts = Vec::new();
-    collect_sql_and_conjuncts(selection, &mut conjuncts);
-    let Some((start_days, end_days)) = date_range_bounds(&conjuncts, "l_receiptdate")? else {
-        return Ok(None);
-    };
-    let Some(shipmodes) = string_in_literals(&conjuncts, "l_shipmode")? else {
-        return Ok(None);
-    };
-    if shipmodes.len() != 2 {
-        return Ok(None);
-    }
-    let mut shipmodes = shipmodes.into_iter().collect::<Vec<_>>();
-    shipmodes.sort();
-    if !orders.path.exists() {
-        return Err(DodamError::MissingPath(orders.path));
-    }
-    let pending = q12_filtered_lineitem_counts(
-        engine,
-        lineitem.path,
-        batch_size,
-        &shipmodes,
-        start_days,
-        end_days,
-    )
-    .await?;
-    let rows =
-        q12_shipping_mode_counts_from_orders(engine, orders.path, batch_size, &shipmodes, &pending)
-            .await?;
-    Ok(Some(q12_output(rows)?))
 }
 
 fn q12_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
@@ -21891,74 +21379,6 @@ fn q12_output(rows: Vec<Q12Row>) -> Result<QueryOutput> {
     })
 }
 
-async fn try_execute_q14_promotion_effect_fast(
-    engine: &DodamEngine,
-    sql: &str,
-    batch_size: usize,
-) -> Result<Option<QueryOutput>> {
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Ok(None);
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Ok(None);
-    };
-    let Some(selection) = select.selection.as_ref() else {
-        return Ok(None);
-    };
-    if !q14_shape(select, query, selection) {
-        return Ok(None);
-    }
-    reject_query_features(query)?;
-    reject_select_features(select)?;
-    let Some(tables) = parse_comma_join_table_refs(select)? else {
-        return Ok(None);
-    };
-    if tables.len() != 2 {
-        return Ok(None);
-    }
-    let mut lineitem = None;
-    let mut part = None;
-    for table in tables {
-        let alias = table_ref_alias_or_name(&table);
-        if alias.eq_ignore_ascii_case("lineitem") {
-            lineitem = Some(table);
-        } else if alias.eq_ignore_ascii_case("part") {
-            part = Some(table);
-        }
-    }
-    let (Some(lineitem), Some(part)) = (lineitem, part) else {
-        return Ok(None);
-    };
-    if !lineitem.path.exists() {
-        return Err(DodamError::MissingPath(lineitem.path));
-    }
-    let mut conjuncts = Vec::new();
-    collect_sql_and_conjuncts(selection, &mut conjuncts);
-    let Some((start_days, end_days)) = date_range_bounds(&conjuncts, "l_shipdate")? else {
-        return Ok(None);
-    };
-    let promo_parts = q14_promo_parts(engine, part.path, batch_size).await?;
-    if promo_parts.is_empty() {
-        return Ok(Some(q17_output("promo_revenue".to_string(), None)?));
-    }
-    let (promo, total) = q14_promo_revenue(
-        engine,
-        lineitem.path,
-        batch_size,
-        start_days,
-        end_days,
-        promo_parts,
-    )
-    .await?;
-    Ok(Some(q17_output(
-        "promo_revenue".to_string(),
-        (total != 0.0).then_some(100.0 * promo / total),
-    )?))
-}
-
 fn q14_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
     if !matches!(parse_limit(query), Ok(None)) {
         return false;
@@ -22134,74 +21554,6 @@ fn q14_promo_revenue_batch(
         total += value;
     }
     Ok((promo, total))
-}
-
-async fn try_execute_q15_top_supplier_fast(
-    engine: &DodamEngine,
-    sql: &str,
-    batch_size: usize,
-) -> Result<Option<QueryOutput>> {
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Ok(None);
-    };
-    if !q15_shape(query) {
-        return Ok(None);
-    }
-    let Some(with) = query.with.as_ref() else {
-        return Ok(None);
-    };
-    let cte = &with.cte_tables[0];
-    let SetExpr::Select(revenue_select) = cte.query.body.as_ref() else {
-        return Ok(None);
-    };
-    let SetExpr::Select(outer_select) = query.body.as_ref() else {
-        return Ok(None);
-    };
-    reject_select_features(revenue_select)?;
-    reject_select_features(outer_select)?;
-    let lineitem = parse_from(revenue_select)?;
-    if !lineitem.path.exists() {
-        return Err(DodamError::MissingPath(lineitem.path));
-    }
-    let Some(selection) = revenue_select.selection.as_ref() else {
-        return Ok(None);
-    };
-    let mut conjuncts = Vec::new();
-    collect_sql_and_conjuncts(selection, &mut conjuncts);
-    let Some((start_days, end_days)) = date_range_bounds(&conjuncts, "l_shipdate")? else {
-        return Ok(None);
-    };
-    let Some(tables) = parse_comma_join_table_refs(outer_select)? else {
-        return Ok(None);
-    };
-    if tables.len() != 2 {
-        return Ok(None);
-    }
-    let supplier = tables
-        .into_iter()
-        .find(|table| table_ref_alias_or_name(table).eq_ignore_ascii_case("supplier"));
-    let Some(supplier) = supplier else {
-        return Ok(None);
-    };
-
-    let revenues =
-        q15_revenue_by_supplier(engine, lineitem.path, batch_size, start_days, end_days).await?;
-    let Some(max_revenue) = revenues
-        .values()
-        .copied()
-        .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
-    else {
-        return Ok(Some(q15_output(Vec::new())?));
-    };
-    let top_suppliers = revenues
-        .into_iter()
-        .filter_map(|(suppkey, revenue)| (revenue == max_revenue).then_some((suppkey, revenue)))
-        .collect::<HashMap<_, _>>();
-    let rows = q15_supplier_rows(engine, supplier.path, batch_size, &top_suppliers).await?;
-    Ok(Some(q15_output(rows)?))
 }
 
 fn q15_shape(query: &Query) -> bool {
@@ -22571,76 +21923,6 @@ fn q15_output(rows: Vec<Q15Row>) -> Result<QueryOutput> {
         metrics: AggregateMetrics::default(),
         batches: vec![batch],
     })
-}
-
-async fn try_execute_q03_shipping_priority_fast(
-    engine: &DodamEngine,
-    sql: &str,
-    batch_size: usize,
-) -> Result<Option<QueryOutput>> {
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Ok(None);
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Ok(None);
-    };
-    let Some(selection) = select.selection.as_ref() else {
-        return Ok(None);
-    };
-    if !q03_shape(select, query, selection) {
-        return Ok(None);
-    }
-    reject_query_features(query)?;
-    reject_select_features(select)?;
-    let Some(tables) = parse_comma_join_table_refs(select)? else {
-        return Ok(None);
-    };
-    if tables.len() != 3 {
-        return Ok(None);
-    }
-    let mut customer = None;
-    let mut orders = None;
-    let mut lineitem = None;
-    for table in tables {
-        let alias = table_ref_alias_or_name(&table);
-        if alias.eq_ignore_ascii_case("customer") {
-            customer = Some(table);
-        } else if alias.eq_ignore_ascii_case("orders") {
-            orders = Some(table);
-        } else if alias.eq_ignore_ascii_case("lineitem") {
-            lineitem = Some(table);
-        }
-    }
-    let (Some(customer), Some(orders), Some(lineitem)) = (customer, orders, lineitem) else {
-        return Ok(None);
-    };
-    if !customer.path.exists() {
-        return Err(DodamError::MissingPath(customer.path));
-    }
-    let mut conjuncts = Vec::new();
-    collect_sql_and_conjuncts(selection, &mut conjuncts);
-    let Some(segment) = string_equality_literal(&conjuncts, "c_mktsegment")? else {
-        return Ok(None);
-    };
-    let Some(order_cutoff) = upper_date_bound(&conjuncts, "o_orderdate")? else {
-        return Ok(None);
-    };
-    let Some(ship_cutoff) = lower_date_bound(&conjuncts, "l_shipdate")? else {
-        return Ok(None);
-    };
-    let customers = q03_customer_keys(engine, customer.path, batch_size, &segment).await?;
-    if customers.is_empty() {
-        return Ok(Some(q03_output(Vec::new())?));
-    }
-    let orders = q03_order_rows(engine, orders.path, batch_size, &customers, order_cutoff).await?;
-    if orders.is_empty() {
-        return Ok(Some(q03_output(Vec::new())?));
-    }
-    let rows = q03_revenue_rows(engine, lineitem.path, batch_size, &orders, ship_cutoff).await?;
-    Ok(Some(q03_output(rows)?))
 }
 
 fn q03_shape(select: &Select, _query: &Query, selection: &SqlExpr) -> bool {
@@ -25220,74 +24502,6 @@ fn date32_to_ymd_string(days: i32) -> Result<String> {
     Ok(format!("{year:04}-{month:02}-{day:02}"))
 }
 
-async fn try_execute_q04_order_priority_fast(
-    engine: &DodamEngine,
-    sql: &str,
-    batch_size: usize,
-) -> Result<Option<QueryOutput>> {
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Ok(None);
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Ok(None);
-    };
-    let Some(selection) = select.selection.as_ref() else {
-        return Ok(None);
-    };
-    if !q04_shape(select, query, selection) {
-        return Ok(None);
-    }
-    reject_query_features(query)?;
-    reject_select_features(select)?;
-    let [table_with_joins] = select.from.as_slice() else {
-        return Ok(None);
-    };
-    if !table_with_joins.joins.is_empty() {
-        return Ok(None);
-    }
-    let orders = parse_table_factor(&table_with_joins.relation)?;
-    if !table_ref_alias_or_name(&orders).eq_ignore_ascii_case("orders") {
-        return Ok(None);
-    }
-    let Some(lineitem_path) = q04_lineitem_path(selection)? else {
-        return Ok(None);
-    };
-    if !lineitem_path.exists() {
-        return Err(DodamError::MissingPath(lineitem_path));
-    }
-    let mut conjuncts = Vec::new();
-    collect_sql_and_conjuncts(selection, &mut conjuncts);
-    let Some((start_days, end_days)) = date_range_bounds(&conjuncts, "o_orderdate")? else {
-        return Ok(None);
-    };
-    let stage = tpch_profile_start();
-    let (mut candidate_priorities, priority_labels, candidate_count) =
-        q04_candidate_order_priorities(engine, orders.path, batch_size, start_days, end_days)
-            .await?;
-    tpch_profile_elapsed("Q04 candidate order priorities", stage);
-    if priority_labels.is_empty() {
-        return Ok(Some(q04_output(Vec::new())?));
-    }
-    let stage = tpch_profile_start();
-    let counts = q04_count_late_candidate_priorities(
-        engine,
-        lineitem_path,
-        batch_size,
-        &mut candidate_priorities,
-        candidate_count,
-        priority_labels.len(),
-    )
-    .await?;
-    tpch_profile_elapsed("Q04 late lineitem probe", stage);
-    let stage = tpch_profile_start();
-    let rows = q04_priority_count_rows(priority_labels, counts);
-    tpch_profile_elapsed("Q04 final rows", stage);
-    Ok(Some(q04_output(rows)?))
-}
-
 fn q04_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
     let projection = select
         .projection
@@ -27804,112 +27018,6 @@ fn q04_output(rows: Vec<Q04Row>) -> Result<QueryOutput> {
     })
 }
 
-async fn try_execute_q05_local_supplier_volume_fast(
-    engine: &DodamEngine,
-    sql: &str,
-    batch_size: usize,
-) -> Result<Option<QueryOutput>> {
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Ok(None);
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Ok(None);
-    };
-    let Some(selection) = select.selection.as_ref() else {
-        return Ok(None);
-    };
-    if !q05_shape(select, query, selection) {
-        return Ok(None);
-    }
-    reject_query_features(query)?;
-    reject_select_features(select)?;
-    let Some(tables) = parse_comma_join_table_refs(select)? else {
-        return Ok(None);
-    };
-    if tables.len() != 6 {
-        return Ok(None);
-    }
-    let mut customer = None;
-    let mut orders = None;
-    let mut lineitem = None;
-    let mut supplier = None;
-    let mut nation = None;
-    let mut region = None;
-    for table in tables {
-        let alias = table_ref_alias_or_name(&table);
-        if alias.eq_ignore_ascii_case("customer") {
-            customer = Some(table);
-        } else if alias.eq_ignore_ascii_case("orders") {
-            orders = Some(table);
-        } else if alias.eq_ignore_ascii_case("lineitem") {
-            lineitem = Some(table);
-        } else if alias.eq_ignore_ascii_case("supplier") {
-            supplier = Some(table);
-        } else if alias.eq_ignore_ascii_case("nation") {
-            nation = Some(table);
-        } else if alias.eq_ignore_ascii_case("region") {
-            region = Some(table);
-        }
-    }
-    let (Some(customer), Some(orders), Some(lineitem), Some(supplier), Some(nation), Some(region)) =
-        (customer, orders, lineitem, supplier, nation, region)
-    else {
-        return Ok(None);
-    };
-    if !customer.path.exists() {
-        return Err(DodamError::MissingPath(customer.path));
-    }
-    let mut conjuncts = Vec::new();
-    collect_sql_and_conjuncts(selection, &mut conjuncts);
-    let Some(region_name) = string_equality_literal(&conjuncts, "r_name")? else {
-        return Ok(None);
-    };
-    let Some((start_days, end_days)) = date_range_bounds(&conjuncts, "o_orderdate")? else {
-        return Ok(None);
-    };
-    let region_keys = q05_region_keys(engine, region.path, batch_size, &region_name).await?;
-    if region_keys.is_empty() {
-        return Ok(Some(q05_output(Vec::new())?));
-    }
-    let nation_names = q05_nation_names(engine, nation.path, batch_size, &region_keys).await?;
-    if nation_names.is_empty() {
-        return Ok(Some(q05_output(Vec::new())?));
-    }
-    let customers = q05_customer_nations(engine, customer.path, batch_size, &nation_names).await?;
-    if customers.is_empty() {
-        return Ok(Some(q05_output(Vec::new())?));
-    }
-    let suppliers = q05_supplier_nations(engine, supplier.path, batch_size, &nation_names).await?;
-    if suppliers.is_empty() {
-        return Ok(Some(q05_output(Vec::new())?));
-    }
-    let order_customer_nations = q05_order_customer_nations(
-        engine,
-        orders.path,
-        batch_size,
-        &customers,
-        start_days,
-        end_days,
-    )
-    .await?;
-    if order_customer_nations.is_empty() {
-        return Ok(Some(q05_output(Vec::new())?));
-    }
-    let rows = q05_revenue_by_nation(
-        engine,
-        lineitem.path,
-        batch_size,
-        &order_customer_nations,
-        &suppliers,
-        &nation_names,
-    )
-    .await?;
-    Ok(Some(q05_output(rows)?))
-}
-
 fn q05_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
     let projection = select
         .projection
@@ -28843,131 +27951,6 @@ fn lower_numeric_bound(conjuncts: &[SqlExpr], column: &str) -> Result<Option<f64
 
 fn scaled_f64_to_i128(value: f64, scale: f64) -> i128 {
     (value * scale).round() as i128
-}
-
-async fn try_execute_q07_volume_shipping_fast(
-    engine: &DodamEngine,
-    sql: &str,
-    batch_size: usize,
-) -> Result<Option<QueryOutput>> {
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Ok(None);
-    };
-    let SetExpr::Select(outer_select) = query.body.as_ref() else {
-        return Ok(None);
-    };
-    if !q07_outer_shape(outer_select, query) {
-        return Ok(None);
-    }
-    let [table_with_joins] = outer_select.from.as_slice() else {
-        return Ok(None);
-    };
-    if !table_with_joins.joins.is_empty() {
-        return Ok(None);
-    }
-    let TableFactor::Derived {
-        subquery,
-        alias: Some(alias),
-        ..
-    } = &table_with_joins.relation
-    else {
-        return Ok(None);
-    };
-    if !alias.name.value.eq_ignore_ascii_case("shipping") {
-        return Ok(None);
-    }
-    let SetExpr::Select(inner_select) = subquery.body.as_ref() else {
-        return Ok(None);
-    };
-    let Some(selection) = inner_select.selection.as_ref() else {
-        return Ok(None);
-    };
-    if !q07_inner_shape(inner_select, selection) {
-        return Ok(None);
-    }
-    reject_query_features(query)?;
-    reject_select_features(outer_select)?;
-    reject_select_features(inner_select)?;
-    let Some(tables) = parse_comma_join_table_refs(inner_select)? else {
-        return Ok(None);
-    };
-    if tables.len() != 6 {
-        return Ok(None);
-    }
-    let mut supplier = None;
-    let mut lineitem = None;
-    let mut orders = None;
-    let mut customer = None;
-    let mut nation_tables = Vec::new();
-    for table in tables {
-        let alias = table_ref_alias_or_name(&table);
-        if alias.eq_ignore_ascii_case("supplier") {
-            supplier = Some(table);
-        } else if alias.eq_ignore_ascii_case("lineitem") {
-            lineitem = Some(table);
-        } else if alias.eq_ignore_ascii_case("orders") {
-            orders = Some(table);
-        } else if alias.eq_ignore_ascii_case("customer") {
-            customer = Some(table);
-        } else if alias.eq_ignore_ascii_case("n1") || alias.eq_ignore_ascii_case("n2") {
-            nation_tables.push(table);
-        }
-    }
-    let (Some(supplier), Some(lineitem), Some(orders), Some(customer)) =
-        (supplier, lineitem, orders, customer)
-    else {
-        return Ok(None);
-    };
-    if nation_tables.is_empty() {
-        return Ok(None);
-    }
-    if !supplier.path.exists() {
-        return Err(DodamError::MissingPath(supplier.path));
-    }
-    let mut conjuncts = Vec::new();
-    collect_sql_and_conjuncts(selection, &mut conjuncts);
-    let Some((start_days, end_days)) = date_between_bounds(&conjuncts, "l_shipdate")? else {
-        return Ok(None);
-    };
-    let nation_names = q10_nation_names(engine, nation_tables[0].path.clone(), batch_size).await?;
-    let target_nations = nation_names
-        .iter()
-        .filter_map(|(key, name)| {
-            (name == "FRANCE" || name == "GERMANY").then_some((*key, name.clone()))
-        })
-        .collect::<HashMap<_, _>>();
-    if target_nations.len() != 2 {
-        return Ok(Some(q07_output(Vec::new())?));
-    }
-    let suppliers =
-        q07_supplier_nations(engine, supplier.path, batch_size, &target_nations).await?;
-    if suppliers.is_empty() {
-        return Ok(Some(q07_output(Vec::new())?));
-    }
-    let customers =
-        q07_customer_nations(engine, customer.path, batch_size, &target_nations).await?;
-    if customers.is_empty() {
-        return Ok(Some(q07_output(Vec::new())?));
-    }
-    let order_customers = q07_order_customers(engine, orders.path, batch_size, &customers).await?;
-    if order_customers.is_empty() {
-        return Ok(Some(q07_output(Vec::new())?));
-    }
-    let rows = q07_volume_rows(
-        engine,
-        lineitem.path,
-        batch_size,
-        &suppliers,
-        &order_customers,
-        &target_nations,
-        start_days,
-        end_days,
-    )
-    .await?;
-    Ok(Some(q07_output(rows)?))
 }
 
 fn q07_outer_shape(select: &Select, query: &Query) -> bool {
@@ -30282,149 +29265,6 @@ fn q07_output(rows: Vec<Q07Row>) -> Result<QueryOutput> {
         metrics: AggregateMetrics::default(),
         batches: vec![batch],
     })
-}
-
-async fn try_execute_q08_national_market_share_fast(
-    engine: &DodamEngine,
-    sql: &str,
-    batch_size: usize,
-) -> Result<Option<QueryOutput>> {
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Ok(None);
-    };
-    let SetExpr::Select(outer_select) = query.body.as_ref() else {
-        return Ok(None);
-    };
-    if !q08_outer_shape(outer_select, query) {
-        return Ok(None);
-    }
-    let Some((inner_query, alias)) = parse_derived_from(outer_select)? else {
-        return Ok(None);
-    };
-    if !alias.eq_ignore_ascii_case("all_nations") {
-        return Ok(None);
-    }
-    let SetExpr::Select(inner_select) = inner_query.body.as_ref() else {
-        return Ok(None);
-    };
-    let Some(selection) = inner_select.selection.as_ref() else {
-        return Ok(None);
-    };
-    if !q08_inner_shape(inner_select, selection) {
-        return Ok(None);
-    }
-    reject_query_features(query)?;
-    reject_select_features(outer_select)?;
-    reject_select_features(inner_select)?;
-    let Some(tables) = parse_comma_join_table_refs(inner_select)? else {
-        return Ok(None);
-    };
-    let mut part = None;
-    let mut supplier = None;
-    let mut lineitem = None;
-    let mut orders = None;
-    let mut customer = None;
-    let mut n1 = None;
-    let mut n2 = None;
-    let mut region = None;
-    for table in tables {
-        let alias = table_ref_alias_or_name(&table);
-        if alias.eq_ignore_ascii_case("part") {
-            part = Some(table);
-        } else if alias.eq_ignore_ascii_case("supplier") {
-            supplier = Some(table);
-        } else if alias.eq_ignore_ascii_case("lineitem") {
-            lineitem = Some(table);
-        } else if alias.eq_ignore_ascii_case("orders") {
-            orders = Some(table);
-        } else if alias.eq_ignore_ascii_case("customer") {
-            customer = Some(table);
-        } else if alias.eq_ignore_ascii_case("n1") {
-            n1 = Some(table);
-        } else if alias.eq_ignore_ascii_case("n2") {
-            n2 = Some(table);
-        } else if alias.eq_ignore_ascii_case("region") {
-            region = Some(table);
-        }
-    }
-    let (
-        Some(part),
-        Some(supplier),
-        Some(lineitem),
-        Some(orders),
-        Some(customer),
-        Some(n1),
-        Some(n2),
-        Some(region),
-    ) = (part, supplier, lineitem, orders, customer, n1, n2, region)
-    else {
-        return Ok(None);
-    };
-
-    let mut conjuncts = Vec::new();
-    collect_sql_and_conjuncts(selection, &mut conjuncts);
-    let Some(region_name) = string_equality_literal(&conjuncts, "r_name")? else {
-        return Ok(None);
-    };
-    let Some(part_type) = string_equality_literal(&conjuncts, "p_type")? else {
-        return Ok(None);
-    };
-    let Some((start_days, end_days)) = date_between_bounds(&conjuncts, "o_orderdate")? else {
-        return Ok(None);
-    };
-
-    if !part.path.exists() {
-        return Err(DodamError::MissingPath(part.path));
-    }
-    let region_keys = q05_region_keys(engine, region.path, batch_size, &region_name).await?;
-    if region_keys.is_empty() {
-        return Ok(Some(q08_output(Vec::new())?));
-    }
-    let customer_nations = q05_nation_names(engine, n1.path, batch_size, &region_keys).await?;
-    if customer_nations.is_empty() {
-        return Ok(Some(q08_output(Vec::new())?));
-    }
-    let customers =
-        q05_customer_nations(engine, customer.path, batch_size, &customer_nations).await?;
-    if customers.is_empty() {
-        return Ok(Some(q08_output(Vec::new())?));
-    }
-    let orders = q08_order_years(
-        engine,
-        orders.path,
-        batch_size,
-        &customers,
-        start_days,
-        end_days,
-    )
-    .await?;
-    if orders.is_empty() {
-        return Ok(Some(q08_output(Vec::new())?));
-    }
-    let part_keys = q08_part_keys(engine, part.path, batch_size, &part_type).await?;
-    if part_keys.is_empty() {
-        return Ok(Some(q08_output(Vec::new())?));
-    }
-    let nation_names = q10_nation_names(engine, n2.path, batch_size).await?;
-    let supplier_is_brazil =
-        q08_supplier_is_brazil(engine, supplier.path, batch_size, &nation_names).await?;
-    if supplier_is_brazil.is_empty() {
-        return Ok(Some(q08_output(Vec::new())?));
-    }
-    let mut rows = q08_market_share_rows(
-        engine,
-        lineitem.path,
-        batch_size,
-        &orders,
-        &part_keys,
-        &supplier_is_brazil,
-    )
-    .await?;
-    rows.sort_by(|left, right| left.o_year.cmp(&right.o_year));
-    Ok(Some(q08_output(rows)?))
 }
 
 fn q08_outer_shape(select: &Select, query: &Query) -> bool {
@@ -32962,74 +31802,6 @@ fn q18_output(rows: Vec<Q18Row>) -> Result<QueryOutput> {
     })
 }
 
-async fn try_execute_q19_discounted_revenue_fast(
-    engine: &DodamEngine,
-    sql: &str,
-    batch_size: usize,
-) -> Result<Option<QueryOutput>> {
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Ok(None);
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Ok(None);
-    };
-    let Some(selection) = select.selection.as_ref() else {
-        return Ok(None);
-    };
-    if !q19_shape(select, query, selection) {
-        return Ok(None);
-    }
-    reject_query_features(query)?;
-    reject_select_features(select)?;
-    let Some(tables) = parse_comma_join_table_refs(select)? else {
-        return Ok(None);
-    };
-    if tables.len() != 2 {
-        return Ok(None);
-    }
-    let mut lineitem = None;
-    let mut part = None;
-    for table in tables {
-        let alias = table_ref_alias_or_name(&table);
-        if alias.eq_ignore_ascii_case("lineitem") {
-            lineitem = Some(table);
-        } else if alias.eq_ignore_ascii_case("part") {
-            part = Some(table);
-        }
-    }
-    let (Some(lineitem), Some(part)) = (lineitem, part) else {
-        return Ok(None);
-    };
-    if !lineitem.path.exists() {
-        return Err(DodamError::MissingPath(lineitem.path));
-    }
-    let rules = q19_rules(selection)?;
-    if rules.is_empty() || rules.len() > 8 {
-        return Ok(None);
-    }
-    let stage = tpch_profile_start();
-    let part_masks = q19_matching_part_masks(engine, part.path, batch_size, &rules).await?;
-    tpch_profile_elapsed("Q19 matching part masks", stage);
-    if part_masks.is_empty() {
-        return Ok(Some(q17_output("revenue".to_string(), None)?));
-    }
-    let (sum, count) = q19_lineitem_revenue(
-        engine,
-        lineitem.path,
-        batch_size,
-        Arc::new(rules),
-        Arc::new(part_masks),
-    )
-    .await?;
-    Ok(Some(q17_output(
-        "revenue".to_string(),
-        (count > 0).then_some(sum),
-    )?))
-}
-
 fn q19_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
     if !matches!(parse_limit(query), Ok(None)) {
         return false;
@@ -34198,7 +32970,7 @@ fn q19_rule_matches_lineitem(
     false
 }
 
-async fn try_execute_q21_suppliers_who_kept_orders_waiting_fast(
+async fn try_execute_supplier_wait_count_antijoin_sql(
     engine: &DodamEngine,
     sql: &str,
     batch_size: usize,
@@ -34215,7 +32987,7 @@ async fn try_execute_q21_suppliers_who_kept_orders_waiting_fast(
     let Some(selection) = select.selection.as_ref() else {
         return Ok(None);
     };
-    if !q21_shape(select, query, selection) {
+    if !supplier_wait_count_antijoin_shape(select, query, selection) {
         return Ok(None);
     }
     reject_query_features(query)?;
@@ -34310,7 +33082,7 @@ fn q21_ordered_lineitem_enabled() -> bool {
     std::env::var_os("DODAM_Q21_DISABLE_ORDERED_LINEITEM").is_none()
 }
 
-fn q21_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
+fn supplier_wait_count_antijoin_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
     let text = selection.to_string().to_ascii_lowercase();
     select.projection.len() == 2
         && matches!(parse_limit(query), Ok(Some(100)))
@@ -35771,7 +34543,7 @@ fn q21_output(rows: Vec<Q21Row>) -> Result<QueryOutput> {
     })
 }
 
-async fn try_execute_q20_potential_part_promotion_fast(
+async fn try_execute_prefix_part_supplier_threshold_sql(
     engine: &DodamEngine,
     sql: &str,
     batch_size: usize,
@@ -35788,7 +34560,7 @@ async fn try_execute_q20_potential_part_promotion_fast(
     let Some(selection) = select.selection.as_ref() else {
         return Ok(None);
     };
-    if !q20_shape(select, selection) {
+    if !prefix_part_supplier_threshold_shape(select, selection) {
         return Ok(None);
     }
     reject_query_features(query)?;
@@ -35865,7 +34637,7 @@ async fn try_execute_q20_potential_part_promotion_fast(
     Ok(Some(q20_output(rows)?))
 }
 
-fn q20_shape(select: &Select, selection: &SqlExpr) -> bool {
+fn prefix_part_supplier_threshold_shape(select: &Select, selection: &SqlExpr) -> bool {
     let text = selection.to_string().to_ascii_lowercase();
     select.projection.len() == 2
         && text.contains("s_suppkey in")
@@ -40149,7 +38921,8 @@ async fn try_execute_derived_sql(
     };
     let inner_output = if let Some(parsed_inner) = parsed_inner {
         if !inner_has_materializable_subquery
-            && let Some(output) = execute_parsed_join_query(engine, parsed_inner, batch_size).await?
+            && let Some(output) =
+                execute_parsed_join_query(engine, parsed_inner, batch_size).await?
         {
             output
         } else {
