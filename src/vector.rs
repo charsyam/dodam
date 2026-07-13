@@ -990,4 +990,17 @@ impl SelectionRunsBuilder {
         }
         runs.push((start, len));
     }
+
+    pub(crate) fn push_disjoint_run(
+        &mut self,
+        runs: &mut Vec<(usize, usize)>,
+        start: usize,
+        len: usize,
+    ) {
+        if len == 0 {
+            return;
+        }
+        self.selected_rows = self.selected_rows.saturating_add(len);
+        runs.push((start, len));
+    }
 }

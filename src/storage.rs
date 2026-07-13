@@ -2019,7 +2019,8 @@ where
 
         let read_started = Instant::now();
         let predicate_started = Instant::now();
-        let mut selected_runs = Vec::<(usize, usize)>::new();
+        let mut selected_runs =
+            Vec::<(usize, usize)>::with_capacity((row_count / 64).clamp(16, 16_384));
         let mut selected_builder = SelectionRunsBuilder::default();
         if build_i32x3_dictionary_selected_runs_for_row_group_pagewise(
             &*row_group,
@@ -2264,12 +2265,12 @@ fn append_i32x3_dictionary_selected_runs<P>(
                 run_len += 1;
             }
         } else if let Some(start) = run_start.take() {
-            builder.push_run(runs, start, run_len);
+            builder.push_disjoint_run(runs, start, run_len);
             run_len = 0;
         }
     }
     if let Some(start) = run_start {
-        builder.push_run(runs, start, run_len);
+        builder.push_disjoint_run(runs, start, run_len);
     }
 }
 
@@ -3191,7 +3192,7 @@ where
                     run_len += 1;
                 }
             } else if let Some(start) = run_start.take() {
-                builder.push_run(runs, start, run_len);
+                builder.push_disjoint_run(runs, start, run_len);
                 run_len = 0;
             }
         }
@@ -3201,7 +3202,7 @@ where
         row_offset += records;
     }
     if let Some(start) = run_start {
-        builder.push_run(runs, start, run_len);
+        builder.push_disjoint_run(runs, start, run_len);
     }
     Ok(Some(()))
 }
