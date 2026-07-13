@@ -51896,6 +51896,7 @@ fn fused_dictionary_selected_aggregate_auto_accepts(
     if std::env::var("DODAM_DISABLE_FUSED_DICTIONARY_SELECTED_AUTO")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
     {
+        log_fused_dictionary_selected_auto_decision("disabled", None, None, None, None, None, None);
         return Ok(false);
     }
     let Some((column_min, column_max)) = engine
@@ -51907,6 +51908,15 @@ fn fused_dictionary_selected_aggregate_auto_accepts(
                 .flatten()
         })
     else {
+        log_fused_dictionary_selected_auto_decision(
+            "missing-stats",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         return Ok(false);
     };
     let Some(estimated_selectivity) = (DecimalRangeSelectivityInput {
@@ -51916,6 +51926,15 @@ fn fused_dictionary_selected_aggregate_auto_accepts(
         filter_max: decimal_filter.decimal_max,
     })
     .estimated_selectivity() else {
+        log_fused_dictionary_selected_auto_decision(
+            "invalid-selectivity",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         return Ok(false);
     };
     if let Some((candidate_row_groups, total_row_groups, total_rows)) =
@@ -51932,15 +51951,75 @@ fn fused_dictionary_selected_aggregate_auto_accepts(
             max_selected_row_groups: fused_dictionary_selected_auto_max_selected_row_groups(),
         });
         if !decision.accepted() {
+            log_fused_dictionary_selected_auto_decision(
+                decision.reason(),
+                Some(estimated_selectivity),
+                Some(estimated_selected_rows.max(1)),
+                Some(candidate_row_groups),
+                Some(total_row_groups),
+                Some(total_rows),
+                Some(fused_dictionary_selected_auto_max_estimated_ratio()),
+            );
             return Ok(false);
         }
     }
-    Ok(choose_fused_selected_aggregate(
-        FusedSelectedAggregateCostInput {
-            estimated_selectivity,
-            max_selectivity: fused_dictionary_selected_auto_max_estimated_ratio(),
+    let max_selectivity = fused_dictionary_selected_auto_max_estimated_ratio();
+    let accepted = choose_fused_selected_aggregate(FusedSelectedAggregateCostInput {
+        estimated_selectivity,
+        max_selectivity,
+    });
+    log_fused_dictionary_selected_auto_decision(
+        if accepted {
+            "accepted"
+        } else {
+            "estimated-selectivity"
         },
-    ))
+        Some(estimated_selectivity),
+        None,
+        None,
+        None,
+        None,
+        Some(max_selectivity),
+    );
+    Ok(accepted)
+}
+
+fn log_fused_dictionary_selected_auto_decision(
+    reason: &str,
+    estimated_selectivity: Option<f64>,
+    estimated_selected_rows: Option<usize>,
+    candidate_row_groups: Option<usize>,
+    total_row_groups: Option<usize>,
+    total_rows: Option<usize>,
+    max_selectivity: Option<f64>,
+) {
+    if !std::env::var("DODAM_COALESCE_AGG_PROFILE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return;
+    }
+    eprintln!(
+        "[dodam:coalesce-agg-profile] fused_selected_auto decision={} estimated_selectivity={} estimated_selected_rows={} row_groups={}/{} total_rows={} max_selectivity={}",
+        reason,
+        estimated_selectivity
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_else(|| "n/a".to_string()),
+        estimated_selected_rows
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+        candidate_row_groups
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+        total_row_groups
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+        total_rows
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+        max_selectivity
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_else(|| "n/a".to_string()),
+    );
 }
 
 fn decimal_filter_candidate_row_group_spread(

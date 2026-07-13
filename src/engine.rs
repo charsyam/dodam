@@ -3663,12 +3663,21 @@ impl DodamEngine {
             else {
                 return Ok(None);
             };
-            if !late_materialization_policy_accepts_with_io(
+            let accepted = late_materialization_policy_accepts_with_io(
                 policy,
                 &sample_metrics,
                 predicate_compressed_bytes,
                 payload_compressed_bytes,
-            ) {
+            );
+            log_late_materialization_policy_decision(
+                "sample",
+                accepted,
+                &sample_metrics,
+                predicate_compressed_bytes,
+                payload_compressed_bytes,
+                policy,
+            );
+            if !accepted {
                 return Ok(None);
             }
         }
@@ -8353,6 +8362,59 @@ fn late_materialization_policy_accepts_with_io(
         min_io_saving_ratio: late_materialization_min_estimated_io_saving_ratio(),
         io_override: late_materialization_io_override_enabled(),
     })
+}
+
+fn log_late_materialization_policy_decision(
+    label: &str,
+    accepted: bool,
+    metrics: &LateMaterializedMetrics,
+    predicate_compressed_bytes: u64,
+    payload_compressed_bytes: u64,
+    policy: LateMaterializationPolicy,
+) {
+    if !std::env::var("DODAM_LATE_MATERIALIZATION_PROFILE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        && !std::env::var("DODAM_COALESCE_AGG_PROFILE")
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return;
+    }
+    let selected_ratio = if metrics.total_rows == 0 {
+        0.0
+    } else {
+        metrics.selected_rows as f64 / metrics.total_rows as f64
+    };
+    let selector_run_ratio = if metrics.total_rows == 0 {
+        0.0
+    } else {
+        metrics.selector_runs as f64 / metrics.total_rows as f64
+    };
+    let io_saving = crate::cost::late_materialization_estimated_io_saving(
+        selected_ratio,
+        predicate_compressed_bytes,
+        payload_compressed_bytes,
+    );
+    eprintln!(
+        "[dodam:late-materialization-profile] {label} accepted={} rows={} selected={} selected_ratio={:.6} selector_runs={} selector_run_ratio={:.6} predicate_bytes={} payload_bytes={} io_saving={:.6} max_selected_ratio={} max_selector_run_ratio={} io_cost_gate={}",
+        accepted,
+        metrics.total_rows,
+        metrics.selected_rows,
+        selected_ratio,
+        metrics.selector_runs,
+        selector_run_ratio,
+        predicate_compressed_bytes,
+        payload_compressed_bytes,
+        io_saving,
+        policy
+            .max_selected_ratio
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_else(|| "n/a".to_string()),
+        policy
+            .max_selector_run_ratio
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_else(|| "n/a".to_string()),
+        policy.io_cost_gate,
+    );
 }
 
 fn late_materialization_min_estimated_io_saving_ratio() -> f64 {
