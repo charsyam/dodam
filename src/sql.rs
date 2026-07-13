@@ -242,6 +242,11 @@ pub async fn execute_sql(
         return Ok(output);
     }
     if let Some(output) =
+        try_execute_shipping_mode_priority_counts_sql(engine, sql, batch_size).await?
+    {
+        return Ok(output);
+    }
+    if let Some(output) =
         try_execute_supplier_wait_count_antijoin_sql(engine, sql, batch_size).await?
     {
         return Ok(output);
@@ -17861,6 +17866,87 @@ fn q12_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
         && selection.contains("l_commitdate < l_receiptdate")
         && selection.contains("l_shipdate < l_commitdate")
         && selection.contains("l_receiptdate")
+}
+
+async fn try_execute_shipping_mode_priority_counts_sql(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let Some(selection) = select.selection.as_ref() else {
+        return Ok(None);
+    };
+    if !q12_shape(select, query, selection) {
+        return Ok(None);
+    }
+    reject_query_features(query)?;
+    reject_select_features(select)?;
+    let Some(tables) = parse_comma_join_table_refs(select)? else {
+        return Ok(None);
+    };
+    if tables.len() != 2 {
+        return Ok(None);
+    }
+    let mut orders = None;
+    let mut lineitem = None;
+    for table in tables {
+        let alias = table_ref_alias_or_name(&table);
+        if alias.eq_ignore_ascii_case("orders") {
+            orders = Some(table);
+        } else if alias.eq_ignore_ascii_case("lineitem") {
+            lineitem = Some(table);
+        }
+    }
+    let (Some(orders), Some(lineitem)) = (orders, lineitem) else {
+        return Ok(None);
+    };
+    let mut conjuncts = Vec::new();
+    collect_sql_and_conjuncts(selection, &mut conjuncts);
+    let Some(shipmodes) = string_in_literals(&conjuncts, "l_shipmode")? else {
+        return Ok(None);
+    };
+    if shipmodes.len() != 2 {
+        return Ok(None);
+    }
+    let Some((start_days, end_days)) = date_range_bounds(&conjuncts, "l_receiptdate")? else {
+        return Ok(None);
+    };
+    let mut shipmodes = shipmodes.into_iter().collect::<Vec<_>>();
+    shipmodes.sort();
+
+    let pending = q12_filtered_lineitem_counts(
+        engine,
+        lineitem.path,
+        batch_size,
+        &shipmodes,
+        start_days,
+        end_days,
+    )
+    .await?;
+    let mut rows = if pending.is_empty() {
+        shipmodes
+            .iter()
+            .map(|shipmode| Q12Row {
+                shipmode: shipmode.clone(),
+                high_line_count: 0,
+                low_line_count: 0,
+            })
+            .collect()
+    } else {
+        q12_shipping_mode_counts_from_orders(engine, orders.path, batch_size, &shipmodes, &pending)
+            .await?
+    };
+    rows.sort_by(|left, right| left.shipmode.cmp(&right.shipmode));
+    Ok(Some(q12_output(rows)?))
 }
 
 fn string_in_literals(conjuncts: &[SqlExpr], column: &str) -> Result<Option<HashSet<String>>> {
