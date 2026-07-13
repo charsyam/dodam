@@ -1345,7 +1345,7 @@ fn update_three_i32_date_dictionary_slices_group_id_cache(
     if slot_count == 0 || slot_count > coalesce_group_id_cache_max_slots() {
         return Ok(false);
     }
-    if coalesce_dictionary_selected_local_accumulate_enabled()
+    if coalesce_dictionary_selected_local_accumulate_accepts(first_values.len(), slot_count)
         && update_three_i32_date_dictionary_slices_local_accumulate(
             range,
             slot_count,
@@ -1442,7 +1442,7 @@ fn update_three_i32_date_dictionary_masked_group_id_cache(
     if slot_count == 0 || slot_count > coalesce_group_id_cache_max_slots() {
         return Ok(false);
     }
-    if coalesce_dictionary_selected_local_accumulate_enabled()
+    if coalesce_dictionary_selected_local_accumulate_accepts(selection.selected_rows(), slot_count)
         && update_three_i32_date_dictionary_masked_local_accumulate(
             range,
             slot_count,
@@ -2951,9 +2951,6 @@ fn update_three_dictionary_selected_local_accumulate<'a>(
     cache: &mut CoalesceStringIdViewCache<'a>,
     groups: &mut CoalesceKeyCountSumGroups,
 ) -> bool {
-    if !coalesce_dictionary_selected_local_accumulate_enabled() {
-        return false;
-    }
     let Some(leading_slots) = range.first_len.checked_mul(range.second_len) else {
         return false;
     };
@@ -2964,6 +2961,9 @@ fn update_three_dictionary_selected_local_accumulate<'a>(
         || slot_count == 0
         || slot_count > coalesce_dictionary_selected_local_accumulate_max_slots()
     {
+        return false;
+    }
+    if !coalesce_dictionary_selected_local_accumulate_accepts(selected_rows.len(), slot_count) {
         return false;
     }
 
@@ -3393,6 +3393,28 @@ fn coalesce_dictionary_selected_local_accumulate_enabled() -> bool {
     })
 }
 
+fn coalesce_dictionary_selected_local_accumulate_accepts(
+    selected_rows: usize,
+    slot_count: usize,
+) -> bool {
+    if coalesce_dictionary_selected_local_accumulate_enabled() {
+        return true;
+    }
+    if std::env::var("DODAM_DISABLE_COALESCE_DICTIONARY_SELECTED_LOCAL_ACCUMULATE_AUTO")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return false;
+    }
+    if selected_rows < coalesce_dictionary_selected_local_accumulate_auto_min_rows() {
+        return false;
+    }
+    if slot_count == 0 || slot_count > coalesce_dictionary_selected_local_accumulate_max_slots() {
+        return false;
+    }
+    let rows_per_slot = selected_rows as f64 / slot_count as f64;
+    rows_per_slot >= coalesce_dictionary_selected_local_accumulate_auto_min_rows_per_slot()
+}
+
 fn coalesce_dictionary_string_id_cache_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -3434,6 +3456,28 @@ fn coalesce_dictionary_selected_local_accumulate_max_slots() -> usize {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or_else(coalesce_group_id_cache_max_slots)
+    })
+}
+
+fn coalesce_dictionary_selected_local_accumulate_auto_min_rows() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("DODAM_COALESCE_DICTIONARY_SELECTED_LOCAL_ACCUMULATE_AUTO_MIN_ROWS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(8192)
+    })
+}
+
+fn coalesce_dictionary_selected_local_accumulate_auto_min_rows_per_slot() -> f64 {
+    static VALUE: OnceLock<f64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("DODAM_COALESCE_DICTIONARY_SELECTED_LOCAL_ACCUMULATE_AUTO_MIN_ROWS_PER_SLOT")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or(1.0)
     })
 }
 
