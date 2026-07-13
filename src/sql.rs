@@ -248,6 +248,11 @@ pub async fn execute_sql(
         return Ok(output);
     }
     if let Some(output) =
+        try_execute_discounted_revenue_or_predicate_sql(engine, sql, batch_size).await?
+    {
+        return Ok(output);
+    }
+    if let Some(output) =
         try_execute_derived_prefix_avg_anti_join_aggregate_sql(engine, sql, batch_size).await?
     {
         return Ok(output);
@@ -32524,6 +32529,72 @@ fn q19_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
         && selection.contains("p_size between")
         && selection.contains("l_shipmode in")
         && selection.contains("l_shipinstruct")
+}
+
+async fn try_execute_discounted_revenue_or_predicate_sql(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let Some(selection) = select.selection.as_ref() else {
+        return Ok(None);
+    };
+    if !q19_shape(select, query, selection) {
+        return Ok(None);
+    }
+    reject_query_features(query)?;
+    reject_select_features(select)?;
+    let Some(tables) = parse_comma_join_table_refs(select)? else {
+        return Ok(None);
+    };
+    if tables.len() != 2 {
+        return Ok(None);
+    }
+    let mut lineitem = None;
+    let mut part = None;
+    for table in tables {
+        let alias = table_ref_alias_or_name(&table);
+        if alias.eq_ignore_ascii_case("lineitem") {
+            lineitem = Some(table);
+        } else if alias.eq_ignore_ascii_case("part") {
+            part = Some(table);
+        }
+    }
+    let (Some(lineitem), Some(part)) = (lineitem, part) else {
+        return Ok(None);
+    };
+    let rules = q19_rules(selection)?;
+    if rules.is_empty() || rules.len() > u8::BITS as usize {
+        return Ok(None);
+    }
+    let rules = Arc::new(rules);
+    let stage = tpch_profile_start();
+    let part_masks = q19_matching_part_masks(engine, part.path, batch_size, rules.as_ref()).await?;
+    tpch_profile_elapsed("Q19 part masks", stage);
+    if part_masks.is_empty() {
+        return Ok(Some(q17_output("revenue".to_string(), None)?));
+    }
+    let stage = tpch_profile_start();
+    let (revenue, count) = q19_lineitem_revenue(
+        engine,
+        lineitem.path,
+        batch_size,
+        rules,
+        Arc::new(part_masks),
+    )
+    .await?;
+    tpch_profile_elapsed("Q19 lineitem revenue", stage);
+    let value = (count > 0).then_some(revenue);
+    Ok(Some(q17_output("revenue".to_string(), value)?))
 }
 
 #[derive(Clone)]
