@@ -338,6 +338,8 @@ pub(crate) struct CoalesceKeyCountSumCollector {
     groups: Option<CoalesceKeyCountSumGroups>,
     dictionary_string_id_cache: AggregateHashMap<Vec<Bytes>, Vec<u32>>,
     dictionary_group_id_cache: AggregateHashMap<Vec<Bytes>, Vec<usize>>,
+    local_accumulate_scratch: Vec<LocalCoalesceCountSum>,
+    local_accumulate_touched: Vec<usize>,
     use_composite_hash: bool,
     metrics: AggregateMetrics,
     bind_nanos: u64,
@@ -364,6 +366,8 @@ impl CoalesceKeyCountSumCollector {
             groups: None,
             dictionary_string_id_cache: AggregateHashMap::default(),
             dictionary_group_id_cache: AggregateHashMap::default(),
+            local_accumulate_scratch: Vec::new(),
+            local_accumulate_touched: Vec::new(),
             use_composite_hash,
             metrics: AggregateMetrics::default(),
             bind_nanos: 0,
@@ -619,6 +623,8 @@ impl CoalesceKeyCountSumCollector {
             dictionary,
             sums,
             &mut self.dictionary_group_id_cache,
+            &mut self.local_accumulate_scratch,
+            &mut self.local_accumulate_touched,
             groups,
         )? {
             self.update_nanos = self.update_nanos.saturating_add(elapsed_nanos_u64(started));
@@ -794,6 +800,8 @@ impl CoalesceKeyCountSumCollector {
             sums,
             selection,
             &mut self.dictionary_group_id_cache,
+            &mut self.local_accumulate_scratch,
+            &mut self.local_accumulate_touched,
             groups,
         )? {
             self.update_nanos = self.update_nanos.saturating_add(elapsed_nanos_u64(started));
@@ -1315,6 +1323,8 @@ fn update_three_i32_date_dictionary_slices_group_id_cache(
     dictionary: &[Bytes],
     sum_values: &[i64],
     group_id_cache: &mut AggregateHashMap<Vec<Bytes>, Vec<usize>>,
+    local: &mut Vec<LocalCoalesceCountSum>,
+    touched: &mut Vec<usize>,
     groups: &mut CoalesceKeyCountSumGroups,
 ) -> Result<bool> {
     if !coalesce_group_id_cache_enabled() {
@@ -1344,6 +1354,8 @@ fn update_three_i32_date_dictionary_slices_group_id_cache(
             dictionary_ids,
             dictionary,
             sum_values,
+            local,
+            touched,
             groups,
         )?
     {
@@ -1408,6 +1420,8 @@ fn update_three_i32_date_dictionary_masked_group_id_cache(
     sum_values: &[i64],
     selection: SelectionRuns<'_>,
     group_id_cache: &mut AggregateHashMap<Vec<Bytes>, Vec<usize>>,
+    local: &mut Vec<LocalCoalesceCountSum>,
+    touched: &mut Vec<usize>,
     groups: &mut CoalesceKeyCountSumGroups,
 ) -> Result<bool> {
     if !coalesce_group_id_cache_enabled() {
@@ -1438,6 +1452,8 @@ fn update_three_i32_date_dictionary_masked_group_id_cache(
             dictionary,
             sum_values,
             selection,
+            local,
+            touched,
             groups,
         )?
     {
@@ -1507,14 +1523,15 @@ fn update_three_i32_date_dictionary_slices_local_accumulate(
     dictionary_ids: &[i32],
     dictionary: &[Bytes],
     sum_values: &[i64],
+    local: &mut Vec<LocalCoalesceCountSum>,
+    touched: &mut Vec<usize>,
     groups: &mut CoalesceKeyCountSumGroups,
 ) -> Result<bool> {
     if slot_count > coalesce_dictionary_selected_local_accumulate_max_slots() {
         return Ok(false);
     }
     let dictionary_len = dictionary.len();
-    let mut local = vec![LocalCoalesceCountSum::default(); slot_count];
-    let mut touched = Vec::new();
+    prepare_local_coalesce_accumulate(local, touched, slot_count);
     for row in 0..first_values.len() {
         let Some(leading_slot) =
             dense_leading_slot(range, i64::from(first_values[row]), second_values[row])
@@ -1540,8 +1557,8 @@ fn update_three_i32_date_dictionary_slices_local_accumulate(
         range,
         dictionary_len,
         dictionary,
-        &local,
-        &touched,
+        local,
+        touched,
         groups,
     )
 }
@@ -1556,14 +1573,15 @@ fn update_three_i32_date_dictionary_masked_local_accumulate(
     dictionary: &[Bytes],
     sum_values: &[i64],
     selection: SelectionRuns<'_>,
+    local: &mut Vec<LocalCoalesceCountSum>,
+    touched: &mut Vec<usize>,
     groups: &mut CoalesceKeyCountSumGroups,
 ) -> Result<bool> {
     if slot_count > coalesce_dictionary_selected_local_accumulate_max_slots() {
         return Ok(false);
     }
     let dictionary_len = dictionary.len();
-    let mut local = vec![LocalCoalesceCountSum::default(); slot_count];
-    let mut touched = Vec::new();
+    prepare_local_coalesce_accumulate(local, touched, slot_count);
     for &(run_start, run_len) in selection.runs() {
         for row in run_start..run_start + run_len {
             let Some(leading_slot) =
@@ -1593,17 +1611,28 @@ fn update_three_i32_date_dictionary_masked_local_accumulate(
         range,
         dictionary_len,
         dictionary,
-        &local,
-        &touched,
+        local,
+        touched,
         groups,
     )
+}
+
+fn prepare_local_coalesce_accumulate(
+    local: &mut Vec<LocalCoalesceCountSum>,
+    touched: &mut Vec<usize>,
+    slot_count: usize,
+) {
+    touched.clear();
+    if local.len() < slot_count {
+        local.resize(slot_count, LocalCoalesceCountSum::default());
+    }
 }
 
 fn merge_three_i32_date_dictionary_local_accumulate(
     range: DenseLeadingRange,
     dictionary_len: usize,
     dictionary: &[Bytes],
-    local: &[LocalCoalesceCountSum],
+    local: &mut [LocalCoalesceCountSum],
     touched: &[usize],
     groups: &mut CoalesceKeyCountSumGroups,
 ) -> Result<bool> {
@@ -1635,6 +1664,7 @@ fn merge_three_i32_date_dictionary_local_accumulate(
         };
         let (first, second) = dense_leading_values(range, leading_slot);
         groups.merge_three_non_null_string_id_sum(first, second, string_id, value.count, value.sum);
+        local[slot] = LocalCoalesceCountSum::default();
     }
     Ok(true)
 }
