@@ -3224,8 +3224,14 @@ fn primitive_topk_fused_filter_threshold_enabled() -> bool {
 }
 
 fn primitive_topk_block_max_skip_enabled() -> bool {
-    std::env::var("DODAM_ENABLE_PRIMITIVE_TOPK_BLOCK_MAX_SKIP")
+    if std::env::var("DODAM_DISABLE_PRIMITIVE_TOPK_BLOCK_MAX_SKIP")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return false;
+    }
+    std::env::var("DODAM_ENABLE_PRIMITIVE_TOPK_BLOCK_MAX_SKIP")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
+        .unwrap_or(true)
 }
 
 fn null_free_primitive_columns_for_topk<'a>(
