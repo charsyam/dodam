@@ -178,6 +178,7 @@ fn rewrite_join_side_expr(expr: &Expr, prefix: &str) -> Expr {
             pattern,
             negated,
             escape,
+            case_insensitive,
         } => Expr::Like {
             column: strip_join_prefix(column, prefix)
                 .unwrap_or(column)
@@ -185,6 +186,7 @@ fn rewrite_join_side_expr(expr: &Expr, prefix: &str) -> Expr {
             pattern: pattern.clone(),
             negated: *negated,
             escape: *escape,
+            case_insensitive: *case_insensitive,
         },
         Expr::IsNull { column, negated } => Expr::IsNull {
             column: strip_join_prefix(column, prefix)

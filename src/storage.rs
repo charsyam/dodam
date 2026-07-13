@@ -10987,14 +10987,7 @@ fn projection_reorder_indices(
     }
     let mut indices = Vec::with_capacity(projection_order.len());
     for column in projection_order {
-        indices.push(
-            batch
-                .schema()
-                .fields()
-                .iter()
-                .position(|field| field.name() == column)
-                .ok_or_else(|| DodamError::UnknownColumn(column.clone()))?,
-        );
+        indices.push(schema_column_index(&batch.schema(), column)?);
     }
     if indices.iter().copied().eq(0..indices.len()) {
         Ok(None)
@@ -11124,14 +11117,27 @@ fn projection_indices(
 ) -> Result<Vec<usize>> {
     columns
         .iter()
-        .map(|column| {
-            schema
-                .fields()
-                .iter()
-                .position(|field| field.name() == column)
-                .ok_or_else(|| DodamError::UnknownColumn(column.clone()))
-        })
+        .map(|column| schema_column_index(schema, column))
         .collect()
+}
+
+fn schema_column_index(schema: &arrow::datatypes::SchemaRef, column: &str) -> Result<usize> {
+    if let Some(index) = schema
+        .fields()
+        .iter()
+        .position(|field| field.name() == column)
+    {
+        return Ok(index);
+    }
+    if let Some((_, unqualified)) = column.split_once('.')
+        && let Some(index) = schema
+            .fields()
+            .iter()
+            .position(|field| field.name() == unqualified)
+    {
+        return Ok(index);
+    }
+    Err(DodamError::UnknownColumn(column.to_string()))
 }
 
 fn projection_indices_for_schema(
@@ -11295,7 +11301,21 @@ fn row_group_may_match<T: ChunkReader + 'static>(
             pattern,
             negated,
             escape,
-        } => row_group_may_match_like(builder, row_group_index, column, pattern, *negated, *escape),
+            case_insensitive,
+        } => {
+            if *case_insensitive {
+                Ok(true)
+            } else {
+                row_group_may_match_like(
+                    builder,
+                    row_group_index,
+                    column,
+                    pattern,
+                    *negated,
+                    *escape,
+                )
+            }
+        }
         Expr::Boolean(_)
         | Expr::ColumnComparison { .. }
         | Expr::InList { .. }

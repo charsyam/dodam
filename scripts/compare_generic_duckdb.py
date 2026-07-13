@@ -238,6 +238,41 @@ def generic_queries(data_dir: Path) -> list[GenericQuery]:
             f"SELECT id, key, bucket, label FROM read_parquet('{facts}') WHERE (key BETWEEN 10 AND 40 OR label LIKE 'label-2%') AND id NOT BETWEEN 1000 AND 2000 ORDER BY id LIMIT 5000",
         ),
         GenericQuery(
+            "standard_string_functions",
+            f"SELECT id, trim(concat(' ', coalesce(label, 'missing'), ' ')) AS label_trimmed, replace(coalesce(label, 'missing'), 'label', 'tag') AS label_replaced, concat(coalesce(label, 'missing'), '-', CAST(bucket AS VARCHAR)) AS label_bucket FROM '{facts}' WHERE replace(coalesce(label, 'missing'), 'label', 'tag') LIKE 'tag-2%' ORDER BY id LIMIT 5000",
+            f"SELECT id, trim(concat(' ', coalesce(label, 'missing'), ' ')) AS label_trimmed, replace(coalesce(label, 'missing'), 'label', 'tag') AS label_replaced, concat(coalesce(label, 'missing'), '-', CAST(bucket AS VARCHAR)) AS label_bucket FROM read_parquet('{facts}') WHERE replace(coalesce(label, 'missing'), 'label', 'tag') LIKE 'tag-2%' ORDER BY id LIMIT 5000",
+        ),
+        GenericQuery(
+            "standard_ilike_filter",
+            f"SELECT id, key, bucket, label FROM '{facts}' WHERE label ILIKE 'LABEL-2%' OR coalesce(label, 'missing') ILIKE 'MISSING' ORDER BY id LIMIT 5000",
+            f"SELECT id, key, bucket, label FROM read_parquet('{facts}') WHERE label ILIKE 'LABEL-2%' OR coalesce(label, 'missing') ILIKE 'MISSING' ORDER BY id LIMIT 5000",
+        ),
+        GenericQuery(
+            "standard_numeric_functions",
+            f"SELECT id, abs(value - 500) AS value_distance, floor(amount / 10.0) AS amount_floor, ceil(amount / 10.0) AS amount_ceil, round(amount / 7.0) AS amount_round FROM '{facts}' WHERE abs(value - 500) <= 20 OR floor(amount / 10.0) = 3 ORDER BY id LIMIT 5000",
+            f"SELECT id, abs(value - 500) AS value_distance, floor(amount / 10.0) AS amount_floor, ceil(amount / 10.0) AS amount_ceil, round(amount / 7.0) AS amount_round FROM read_parquet('{facts}') WHERE abs(value - 500) <= 20 OR floor(amount / 10.0) = 3 ORDER BY id LIMIT 5000",
+        ),
+        GenericQuery(
+            "standard_aggregate_filter",
+            f"SELECT bucket, count(*) FILTER (WHERE amount >= '50.00') AS high_amount_rows, count(value) FILTER (WHERE key IS NOT NULL) AS keyed_values, sum(value) FILTER (WHERE label LIKE 'label-2%') AS label_two_sum, avg(value) FILTER (WHERE amount < '25.00') AS low_amount_avg FROM '{facts}' GROUP BY bucket ORDER BY bucket",
+            f"SELECT bucket, count(*) FILTER (WHERE amount >= '50.00') AS high_amount_rows, count(value) FILTER (WHERE key IS NOT NULL) AS keyed_values, sum(value) FILTER (WHERE label LIKE 'label-2%') AS label_two_sum, avg(value) FILTER (WHERE amount < '25.00') AS low_amount_avg FROM read_parquet('{facts}') GROUP BY bucket ORDER BY bucket",
+        ),
+        GenericQuery(
+            "window_rank_partition_order",
+            f"SELECT id, bucket, value, row_number() OVER (PARTITION BY bucket ORDER BY value) AS rn, rank() OVER (PARTITION BY bucket ORDER BY value) AS rnk, dense_rank() OVER (PARTITION BY bucket ORDER BY value) AS drnk FROM '{facts}' ORDER BY bucket, value, id LIMIT 100000",
+            f"SELECT id, bucket, value, row_number() OVER (PARTITION BY bucket ORDER BY value) AS rn, rank() OVER (PARTITION BY bucket ORDER BY value) AS rnk, dense_rank() OVER (PARTITION BY bucket ORDER BY value) AS drnk FROM read_parquet('{facts}') ORDER BY bucket, value, id LIMIT 100000",
+        ),
+        GenericQuery(
+            "window_aggregate_partition",
+            f"SELECT id, key, count(value) OVER (PARTITION BY key) AS value_count, sum(CAST(value AS DOUBLE)) OVER (PARTITION BY key) AS value_sum, avg(value) OVER (PARTITION BY key) AS value_avg FROM '{facts}' ORDER BY key NULLS FIRST, id LIMIT 100000",
+            f"SELECT id, key, count(value) OVER (PARTITION BY key) AS value_count, sum(CAST(value AS DOUBLE)) OVER (PARTITION BY key) AS value_sum, avg(value) OVER (PARTITION BY key) AS value_avg FROM read_parquet('{facts}') ORDER BY key NULLS FIRST, id LIMIT 100000",
+        ),
+        GenericQuery(
+            "window_running_aggregate",
+            f"SELECT id, key, count(*) OVER (PARTITION BY key ORDER BY id) AS running_count, sum(CAST(value AS DOUBLE)) OVER (PARTITION BY key ORDER BY id) AS running_sum FROM '{facts}' ORDER BY key NULLS FIRST, id LIMIT 100000",
+            f"SELECT id, key, count(*) OVER (PARTITION BY key ORDER BY id) AS running_count, sum(CAST(value AS DOUBLE)) OVER (PARTITION BY key ORDER BY id) AS running_sum FROM read_parquet('{facts}') ORDER BY key NULLS FIRST, id LIMIT 100000",
+        ),
+        GenericQuery(
             "union_all_append",
             f"SELECT id, bucket, value FROM '{facts}' WHERE bucket = 1 UNION ALL SELECT id, bucket, value FROM '{facts}' WHERE bucket = 7",
             f"SELECT id, bucket, value FROM read_parquet('{facts}') WHERE bucket = 1 UNION ALL SELECT id, bucket, value FROM read_parquet('{facts}') WHERE bucket = 7",

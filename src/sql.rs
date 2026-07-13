@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBufferBuilder, BooleanBuilder, Date32Array, Date64Array,
     Decimal128Array, DictionaryArray, Float64Array, Int32Array, Int64Array, ListArray, StringArray,
-    StructArray, TimestampMillisecondArray, UInt32Array, UInt64Array,
+    StructArray, TimestampMillisecondArray, UInt32Array, UInt64Array, make_array,
 };
+use arrow::buffer::NullBuffer;
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Int32Type, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -23,9 +24,9 @@ use memchr::memmem::Finder;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use rayon::prelude::*;
 use sqlparser::ast::{
-    AccessExpr, BinaryOperator, DateTimeField, Distinct, DuplicateTreatment, Expr as SqlExpr,
-    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator,
-    LimitClause, ObjectName, ObjectNamePart, OrderByKind, Query, Select, SelectItem,
+    AccessExpr, BinaryOperator, CeilFloorKind, DateTimeField, Distinct, DuplicateTreatment,
+    Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint,
+    JoinOperator, LimitClause, ObjectName, ObjectNamePart, OrderByKind, Query, Select, SelectItem,
     SelectItemQualifiedWildcardKind, SetExpr, SetOperator, SetQuantifier, Statement, Subscript,
     TableFactor, UnaryOperator, Value, WindowType,
 };
@@ -165,6 +166,7 @@ pub struct SqlQuery {
     offset: usize,
     distinct: bool,
     aggregates: Vec<AggregateExpr>,
+    filtered_aggregates: Vec<NativeFilteredAggregateSpec>,
     aggregate_expressions: Vec<ProjectionExpression>,
     expressions: Vec<ProjectionExpression>,
     group_by: Vec<String>,
@@ -218,68 +220,13 @@ pub async fn execute_sql(
     if let Some(output) = try_execute_set_operation_sql(engine, sql, batch_size).await? {
         return Ok(output);
     }
-    if let Some(output) = try_execute_projection_expression_sql(engine, sql, batch_size).await? {
-        return Ok(output);
-    }
-    if let Some(output) = try_execute_q15_top_supplier_fast(engine, sql, batch_size).await? {
+    if let Some(output) = try_execute_window_sql(engine, sql, batch_size).await? {
         return Ok(output);
     }
     if let Some(output) = try_execute_with_cte_sql(engine, sql, batch_size).await? {
         return Ok(output);
     }
-    if let Some(output) = try_execute_q01_pricing_summary_fast(engine, sql, batch_size).await? {
-        return Ok(output);
-    }
-    if let Some(output) = try_execute_q10_returned_item_fast(engine, sql, batch_size).await? {
-        return Ok(output);
-    }
-    if let Some(output) = try_execute_q09_product_type_profit_fast(engine, sql, batch_size).await? {
-        return Ok(output);
-    }
-    if let Some(output) = try_execute_q11_important_stock_fast(engine, sql, batch_size).await? {
-        return Ok(output);
-    }
-    if let Some(output) =
-        try_execute_q02_minimum_cost_supplier_fast(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) = try_execute_q12_shipping_modes_fast(engine, sql, batch_size).await? {
-        return Ok(output);
-    }
-    if let Some(output) = try_execute_q14_promotion_effect_fast(engine, sql, batch_size).await? {
-        return Ok(output);
-    }
-    if let Some(output) =
-        try_execute_q16_parts_supplier_relationship_fast(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) = try_execute_q03_shipping_priority_fast(engine, sql, batch_size).await? {
-        return Ok(output);
-    }
-    if let Some(output) = try_execute_q04_order_priority_fast(engine, sql, batch_size).await? {
-        return Ok(output);
-    }
-    if let Some(output) =
-        try_execute_q05_local_supplier_volume_fast(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) = try_execute_q06_forecast_revenue_fast(engine, sql, batch_size).await? {
-        return Ok(output);
-    }
-    if let Some(output) = try_execute_q07_volume_shipping_fast(engine, sql, batch_size).await? {
-        return Ok(output);
-    }
-    if let Some(output) =
-        try_execute_q08_national_market_share_fast(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) =
-        try_execute_q22_global_sales_opportunity_fast(engine, sql, batch_size).await?
-    {
+    if let Some(output) = try_execute_legacy_tpch_fast_sql(engine, sql, batch_size).await? {
         return Ok(output);
     }
     if let Some(output) = try_execute_derived_join_sql(engine, sql, batch_size).await? {
@@ -291,29 +238,6 @@ pub async fn execute_sql(
         return Ok(output);
     }
     if let Some(output) = try_execute_derived_sql(engine, sql, batch_size).await? {
-        return Ok(output);
-    }
-    if let Some(output) =
-        try_execute_q18_large_volume_customer_fast(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) = try_execute_q19_discounted_revenue_fast(engine, sql, batch_size).await? {
-        return Ok(output);
-    }
-    if let Some(output) =
-        try_execute_q17_small_quantity_order_revenue_fast(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) =
-        try_execute_q21_suppliers_who_kept_orders_waiting_fast(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) =
-        try_execute_q20_potential_part_promotion_fast(engine, sql, batch_size).await?
-    {
         return Ok(output);
     }
     if let Some(output) =
@@ -355,7 +279,7 @@ pub async fn execute_sql(
     if let Some(output) = try_execute_in_subquery_sql(engine, sql, batch_size).await? {
         return Ok(output);
     }
-    if let Some(output) = try_execute_window_sql(engine, sql, batch_size).await? {
+    if let Some(output) = try_execute_projection_expression_sql(engine, sql, batch_size).await? {
         return Ok(output);
     }
     let query = parse_sql(sql)?;
@@ -434,6 +358,7 @@ pub async fn execute_sql(
                 2,
                 &group_by,
                 &aggregates,
+                &query.filtered_aggregates,
                 &query.aggregate_expressions,
             )?;
             let mut batches = aggregate_metrics_to_batches(&metrics, &group_by, &aggregates)?;
@@ -523,111 +448,113 @@ pub async fn execute_sql(
     if query.is_aggregate() {
         let aggregates = query.aggregates.clone();
         let group_by = query.group_by.clone();
-        let metrics = if !query.aggregate_expressions.is_empty() {
-            if let Some(metrics) = try_collect_expression_aggregate_fused_dictionary_selected(
-                engine,
-                query.path.clone(),
-                batch_size,
-                query.filter.clone(),
-                &group_by,
-                &aggregates,
-                &query.aggregate_expressions,
-                query.order_by.is_some(),
-                expression_aggregate_output_limit(
-                    &group_by,
-                    query.order_by.as_ref(),
-                    query.limit,
-                    query.offset,
-                ),
-            )
-            .await?
-            {
-                metrics
-            } else if let Some(metrics) = try_collect_expression_aggregate_late_materialized(
-                engine,
-                query.path.clone(),
-                batch_size,
-                query.filter.clone(),
-                &group_by,
-                &aggregates,
-                &query.aggregate_expressions,
-                query.order_by.is_some(),
-                expression_aggregate_output_limit(
-                    &group_by,
-                    query.order_by.as_ref(),
-                    query.limit,
-                    query.offset,
-                ),
-            )
-            .await?
-            {
-                metrics
-            } else if let Some(metrics) = try_collect_expression_aggregate_scan_fold(
-                engine,
-                query.path.clone(),
-                batch_size,
-                query.projection.clone(),
-                query.filter.clone(),
-                &group_by,
-                &aggregates,
-                &query.aggregate_expressions,
-                query.order_by.is_some(),
-                expression_aggregate_output_limit(
-                    &group_by,
-                    query.order_by.as_ref(),
-                    query.limit,
-                    query.offset,
-                ),
-            )
-            .await?
-            {
-                metrics
-            } else if let Some(metrics) = try_collect_expression_aggregate_row_group_map(
-                engine,
-                query.path.clone(),
-                batch_size,
-                query.projection.clone(),
-                query.filter.clone(),
-                &group_by,
-                &aggregates,
-                &query.aggregate_expressions,
-            )
-            .await?
-            {
-                metrics
-            } else {
-                let stream = engine
-                    .scan_parquet_batches(
-                        query.path,
-                        batch_size,
-                        None,
-                        query.projection.clone(),
-                        query.filter,
-                    )
-                    .await?;
-                collect_aggregates_with_optional_expression_views(
-                    stream,
-                    1,
+        let metrics =
+            if !query.aggregate_expressions.is_empty() || !query.filtered_aggregates.is_empty() {
+                if let Some(metrics) = try_collect_expression_aggregate_fused_dictionary_selected(
+                    engine,
+                    query.path.clone(),
+                    batch_size,
+                    query.filter.clone(),
                     &group_by,
                     &aggregates,
                     &query.aggregate_expressions,
-                )?
-            }
-        } else if query.group_by.is_empty() {
-            engine
-                .aggregate_parquet(query.path, batch_size, aggregates.clone(), query.filter)
-                .await?
-        } else {
-            engine
-                .aggregate_parquet_grouped(
-                    query.path,
-                    batch_size,
-                    aggregates.clone(),
-                    group_by.clone(),
-                    query.filter,
+                    query.order_by.is_some(),
+                    expression_aggregate_output_limit(
+                        &group_by,
+                        query.order_by.as_ref(),
+                        query.limit,
+                        query.offset,
+                    ),
                 )
                 .await?
-        };
+                {
+                    metrics
+                } else if let Some(metrics) = try_collect_expression_aggregate_late_materialized(
+                    engine,
+                    query.path.clone(),
+                    batch_size,
+                    query.filter.clone(),
+                    &group_by,
+                    &aggregates,
+                    &query.aggregate_expressions,
+                    query.order_by.is_some(),
+                    expression_aggregate_output_limit(
+                        &group_by,
+                        query.order_by.as_ref(),
+                        query.limit,
+                        query.offset,
+                    ),
+                )
+                .await?
+                {
+                    metrics
+                } else if let Some(metrics) = try_collect_expression_aggregate_scan_fold(
+                    engine,
+                    query.path.clone(),
+                    batch_size,
+                    query.projection.clone(),
+                    query.filter.clone(),
+                    &group_by,
+                    &aggregates,
+                    &query.aggregate_expressions,
+                    query.order_by.is_some(),
+                    expression_aggregate_output_limit(
+                        &group_by,
+                        query.order_by.as_ref(),
+                        query.limit,
+                        query.offset,
+                    ),
+                )
+                .await?
+                {
+                    metrics
+                } else if let Some(metrics) = try_collect_expression_aggregate_row_group_map(
+                    engine,
+                    query.path.clone(),
+                    batch_size,
+                    query.projection.clone(),
+                    query.filter.clone(),
+                    &group_by,
+                    &aggregates,
+                    &query.aggregate_expressions,
+                )
+                .await?
+                {
+                    metrics
+                } else {
+                    let stream = engine
+                        .scan_parquet_batches(
+                            query.path,
+                            batch_size,
+                            None,
+                            query.projection.clone(),
+                            query.filter,
+                        )
+                        .await?;
+                    collect_aggregates_with_optional_expression_views(
+                        stream,
+                        1,
+                        &group_by,
+                        &aggregates,
+                        &query.filtered_aggregates,
+                        &query.aggregate_expressions,
+                    )?
+                }
+            } else if query.group_by.is_empty() {
+                engine
+                    .aggregate_parquet(query.path, batch_size, aggregates.clone(), query.filter)
+                    .await?
+            } else {
+                engine
+                    .aggregate_parquet_grouped(
+                        query.path,
+                        batch_size,
+                        aggregates.clone(),
+                        group_by.clone(),
+                        query.filter,
+                    )
+                    .await?
+            };
         let mut batches = aggregate_metrics_to_batches(&metrics, &group_by, &aggregates)?;
         batches = apply_output_filter(batches, query.having.as_ref())?;
         let has_output_expressions = projection_requires_expression_path(&query.expressions);
@@ -675,6 +602,7 @@ pub async fn execute_sql(
     if !query.distinct
         && monotonic_order_limit_scan_enabled()
         && query.limit.is_some()
+        && Path::new(&query.path).exists()
         && let Some(column) = monotonic_stream_limit_column(query.order_by.as_ref())
         && engine
             .parquet_row_groups_monotonic_by_column(query.path.clone(), &column)
@@ -735,12 +663,109 @@ pub async fn execute_sql(
     Ok(QueryOutput::Scan { batches })
 }
 
+async fn try_execute_legacy_tpch_fast_sql(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    if legacy_tpch_fast_paths_disabled() {
+        return Ok(None);
+    }
+    if let Some(output) = try_execute_q15_top_supplier_fast(engine, sql, batch_size).await? {
+        return Ok(Some(output));
+    }
+    if let Some(output) = try_execute_q01_pricing_summary_fast(engine, sql, batch_size).await? {
+        return Ok(Some(output));
+    }
+    if let Some(output) = try_execute_q10_returned_item_fast(engine, sql, batch_size).await? {
+        return Ok(Some(output));
+    }
+    if let Some(output) = try_execute_q09_product_type_profit_fast(engine, sql, batch_size).await? {
+        return Ok(Some(output));
+    }
+    if let Some(output) = try_execute_q11_important_stock_fast(engine, sql, batch_size).await? {
+        return Ok(Some(output));
+    }
+    if let Some(output) =
+        try_execute_q02_minimum_cost_supplier_fast(engine, sql, batch_size).await?
+    {
+        return Ok(Some(output));
+    }
+    if let Some(output) = try_execute_q12_shipping_modes_fast(engine, sql, batch_size).await? {
+        return Ok(Some(output));
+    }
+    if let Some(output) = try_execute_q14_promotion_effect_fast(engine, sql, batch_size).await? {
+        return Ok(Some(output));
+    }
+    if let Some(output) =
+        try_execute_q16_parts_supplier_relationship_fast(engine, sql, batch_size).await?
+    {
+        return Ok(Some(output));
+    }
+    if let Some(output) = try_execute_q03_shipping_priority_fast(engine, sql, batch_size).await? {
+        return Ok(Some(output));
+    }
+    if let Some(output) = try_execute_q04_order_priority_fast(engine, sql, batch_size).await? {
+        return Ok(Some(output));
+    }
+    if let Some(output) =
+        try_execute_q05_local_supplier_volume_fast(engine, sql, batch_size).await?
+    {
+        return Ok(Some(output));
+    }
+    if let Some(output) = try_execute_q07_volume_shipping_fast(engine, sql, batch_size).await? {
+        return Ok(Some(output));
+    }
+    if let Some(output) =
+        try_execute_q08_national_market_share_fast(engine, sql, batch_size).await?
+    {
+        return Ok(Some(output));
+    }
+    if let Some(output) =
+        try_execute_q22_global_sales_opportunity_fast(engine, sql, batch_size).await?
+    {
+        return Ok(Some(output));
+    }
+    if let Some(output) =
+        try_execute_q18_large_volume_customer_fast(engine, sql, batch_size).await?
+    {
+        return Ok(Some(output));
+    }
+    if let Some(output) = try_execute_q19_discounted_revenue_fast(engine, sql, batch_size).await? {
+        return Ok(Some(output));
+    }
+    if let Some(output) =
+        try_execute_q17_small_quantity_order_revenue_fast(engine, sql, batch_size).await?
+    {
+        return Ok(Some(output));
+    }
+    if let Some(output) =
+        try_execute_q21_suppliers_who_kept_orders_waiting_fast(engine, sql, batch_size).await?
+    {
+        return Ok(Some(output));
+    }
+    if let Some(output) =
+        try_execute_q20_potential_part_promotion_fast(engine, sql, batch_size).await?
+    {
+        return Ok(Some(output));
+    }
+    Ok(None)
+}
+
+fn legacy_tpch_fast_paths_disabled() -> bool {
+    std::env::var("DODAM_DISABLE_LEGACY_TPCH_FAST_PATHS")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
 async fn try_execute_monotonic_row_group_order_limit_scan(
     engine: &DodamEngine,
     query: &SqlQuery,
     batch_size: usize,
 ) -> Result<Option<Vec<RecordBatch>>> {
     if query.distinct || query.expression_filter.is_some() || query.limit.is_none() {
+        return Ok(None);
+    }
+    if !Path::new(&query.path).exists() {
         return Ok(None);
     }
     let Some(order_by) = query.order_by.as_ref() else {
@@ -5051,9 +5076,16 @@ async fn try_execute_exists_subquery_sql(
 fn top_level_exists_subquery(expr: Option<&SqlExpr>) -> Option<(&Query, bool)> {
     match expr? {
         SqlExpr::Exists { subquery, negated } => Some((subquery.as_ref(), *negated)),
+        SqlExpr::UnaryOp { op, expr } if *op == UnaryOperator::Not => {
+            top_level_exists_subquery(Some(expr)).map(|(query, negated)| (query, !negated))
+        }
         SqlExpr::Nested(expr) => top_level_exists_subquery(Some(expr)),
         _ => None,
     }
+}
+
+fn exists_conjunct_subquery(expr: &SqlExpr) -> Option<(&Query, bool)> {
+    top_level_exists_subquery(Some(expr))
 }
 
 async fn try_execute_correlated_exists_semijoin_sql(
@@ -5091,13 +5123,8 @@ async fn try_execute_correlated_exists_semijoin_sql(
     let Some((exists_index, exists_subquery, exists_negated)) = outer_conjuncts
         .iter()
         .enumerate()
-        .find_map(|(index, expr)| match expr {
-            SqlExpr::Exists { subquery, negated } => Some((index, subquery.as_ref(), *negated)),
-            SqlExpr::Nested(expr) => match expr.as_ref() {
-                SqlExpr::Exists { subquery, negated } => Some((index, subquery.as_ref(), *negated)),
-                _ => None,
-            },
-            _ => None,
+        .find_map(|(index, expr)| {
+            exists_conjunct_subquery(expr).map(|(query, negated)| (index, query, negated))
         })
     else {
         return Ok(None);
@@ -5138,6 +5165,12 @@ async fn try_execute_correlated_exists_semijoin_sql(
         .enumerate()
         .filter_map(|(index, conjunct)| (index != join_index).then_some(conjunct))
         .collect::<Vec<_>>();
+    if inner_residual
+        .iter()
+        .any(predicate_requires_expression_path)
+    {
+        return Ok(None);
+    }
     let inner_filter = combine_sql_and_conjuncts(inner_residual)
         .as_ref()
         .map(|expr| parse_filter(expr, &[], inner_path.alias.as_deref(), false))
@@ -5156,10 +5189,33 @@ async fn try_execute_correlated_exists_semijoin_sql(
         .enumerate()
         .filter_map(|(index, conjunct)| (index != exists_index).then_some(conjunct))
         .collect::<Vec<_>>();
-    let outer_filter = combine_sql_and_conjuncts(outer_residual)
-        .as_ref()
-        .map(|expr| parse_filter(expr, &[], outer_path.alias.as_deref(), false))
-        .transpose()?;
+    let outer_residual = combine_sql_and_conjuncts(outer_residual);
+    let (outer_filter, outer_expression_filters) =
+        if let Some(outer_residual) = outer_residual.as_ref() {
+            if predicate_requires_expression_path(outer_residual)
+                || expr_contains_materializable_subquery(outer_residual)
+            {
+                split_subquery_and_expression_filters(
+                    engine,
+                    outer_residual,
+                    outer_path.alias.as_deref(),
+                    batch_size,
+                )
+                .await?
+            } else {
+                (
+                    Some(parse_filter(
+                        outer_residual,
+                        &[],
+                        outer_path.alias.as_deref(),
+                        false,
+                    )?),
+                    Vec::new(),
+                )
+            }
+        } else {
+            (None, Vec::new())
+        };
 
     let group_by = parse_group_by(select, outer_path.alias.as_deref())?;
     let parsed_projection = parse_projection(select, &group_by, outer_path.alias.as_deref())?;
@@ -5184,13 +5240,19 @@ async fn try_execute_correlated_exists_semijoin_sql(
         order_by.as_ref(),
     )?;
 
-    let outer_projection = semijoin_outer_projection(
+    let mut outer_projection = semijoin_outer_projection(
         &parsed_projection,
         &group_by,
         order_by.as_ref(),
         &outer_key,
         outer_filter.as_ref(),
     );
+    for expression_filter in &outer_expression_filters {
+        add_projection_columns(
+            &mut outer_projection,
+            predicate_expression_columns(expression_filter, outer_path.alias.as_deref())?,
+        );
+    }
     let stream = engine
         .scan_parquet_batches(
             outer_path.path,
@@ -5200,7 +5262,14 @@ async fn try_execute_correlated_exists_semijoin_sql(
             outer_filter,
         )
         .await?;
-    let outer_batches = collect_batches(stream)?;
+    let mut outer_batches = collect_batches(stream)?;
+    for expression_filter in outer_expression_filters {
+        outer_batches = apply_output_expression_filter(
+            outer_batches,
+            &expression_filter,
+            outer_path.alias.as_deref(),
+        )?;
+    }
     let mut filtered = Vec::new();
     for batch in outer_batches {
         let mut mask = semijoin_membership_mask(&batch, &outer_key, &inner_keys)?;
@@ -5367,6 +5436,12 @@ async fn try_execute_correlated_in_pair_semijoin_sql(
         .enumerate()
         .filter_map(|(index, conjunct)| (index != join_index).then_some(conjunct))
         .collect::<Vec<_>>();
+    if inner_residual
+        .iter()
+        .any(predicate_requires_expression_path)
+    {
+        return Ok(None);
+    }
     let inner_filter = combine_sql_and_conjuncts(inner_residual)
         .as_ref()
         .map(|expr| parse_filter(expr, &[], inner_path.alias.as_deref(), false))
@@ -5393,6 +5468,12 @@ async fn try_execute_correlated_in_pair_semijoin_sql(
         .enumerate()
         .filter_map(|(index, conjunct)| (index != in_index).then_some(conjunct))
         .collect::<Vec<_>>();
+    if outer_residual
+        .iter()
+        .any(predicate_requires_expression_path)
+    {
+        return Ok(None);
+    }
     let outer_filter = combine_sql_and_conjuncts(outer_residual)
         .as_ref()
         .map(|expr| parse_filter(expr, &[], outer_path.alias.as_deref(), false))
@@ -5616,16 +5697,10 @@ async fn collect_semijoin_key_set(
     let Some(first_batch) = batches.first() else {
         return Ok(SemijoinKeySet::Empty);
     };
-    let column_index = first_batch
-        .schema()
-        .index_of(key_column)
-        .map_err(|_| DodamError::UnknownColumn(key_column.to_string()))?;
+    let column_index = batch_column_index(first_batch, key_column)?;
     let mut keys = SemijoinKeySet::for_data_type(first_batch.column(column_index).data_type());
     for batch in &batches {
-        let column_index = batch
-            .schema()
-            .index_of(key_column)
-            .map_err(|_| DodamError::UnknownColumn(key_column.to_string()))?;
+        let column_index = batch_column_index(batch, key_column)?;
         let column = batch.column(column_index);
         for row in 0..batch.num_rows() {
             keys.insert_from_column(column, row)?;
@@ -5639,10 +5714,7 @@ fn semijoin_membership_mask(
     key_column: &str,
     keys: &SemijoinKeySet,
 ) -> Result<BooleanArray> {
-    let column_index = batch
-        .schema()
-        .index_of(key_column)
-        .map_err(|_| DodamError::UnknownColumn(key_column.to_string()))?;
+    let column_index = batch_column_index(batch, key_column)?;
     let column = batch.column(column_index);
     let values = (0..batch.num_rows())
         .map(|row| keys.contains_column_value(column, row))
@@ -5676,14 +5748,8 @@ async fn collect_semijoin_i64_pair_set(
     let batches = collect_batches(stream)?;
     let mut values = HashSet::new();
     for batch in &batches {
-        let left_index = batch
-            .schema()
-            .index_of(left_column)
-            .map_err(|_| DodamError::UnknownColumn(left_column.to_string()))?;
-        let right_index = batch
-            .schema()
-            .index_of(right_column)
-            .map_err(|_| DodamError::UnknownColumn(right_column.to_string()))?;
+        let left_index = batch_column_index(batch, left_column)?;
+        let right_index = batch_column_index(batch, right_column)?;
         let left = batch.column(left_index);
         let right = batch.column(right_index);
         for row in 0..batch.num_rows() {
@@ -5705,14 +5771,8 @@ fn semijoin_i64_pair_membership_mask(
     right_column: &str,
     keys: &HashSet<(i64, i64)>,
 ) -> Result<BooleanArray> {
-    let left_index = batch
-        .schema()
-        .index_of(left_column)
-        .map_err(|_| DodamError::UnknownColumn(left_column.to_string()))?;
-    let right_index = batch
-        .schema()
-        .index_of(right_column)
-        .map_err(|_| DodamError::UnknownColumn(right_column.to_string()))?;
+    let left_index = batch_column_index(batch, left_column)?;
+    let right_index = batch_column_index(batch, right_column)?;
     let left = batch.column(left_index);
     let right = batch.column(right_index);
     let values = (0..batch.num_rows())
@@ -6399,6 +6459,7 @@ async fn try_execute_correlated_exists_subquery_sql(
 
 fn subquery_references_outer_alias(subquery_sql: &str, outer_alias: &str) -> bool {
     subquery_sql.contains(&format!("{outer_alias}."))
+        || subquery_sql.contains(&format!("{outer_alias} ."))
 }
 
 async fn evaluate_correlated_exists_mask(
@@ -6437,6 +6498,7 @@ fn bind_outer_row_references(
         let literal = sql_literal(&literal);
         if let Some(outer_alias) = outer_alias {
             sql = sql.replace(&format!("{outer_alias}.{}", field.name()), &literal);
+            sql = sql.replace(&format!("{outer_alias} . {}", field.name()), &literal);
             if unqualified_column_matches_table_alias(field.name(), Some(outer_alias)) {
                 sql = replace_identifier_tokens_preserving_local_subqueries(
                     &sql,
@@ -6737,6 +6799,7 @@ async fn try_execute_in_subquery_sql(
             1,
             &group_by,
             &parsed_projection.aggregates,
+            &parsed_projection.filtered_aggregates,
             &parsed_projection.aggregate_expressions,
         )?;
         let mut batches =
@@ -6842,41 +6905,262 @@ async fn try_execute_window_sql(
         .as_ref()
         .map(|expr| parse_filter(expr, &[], path.alias.as_deref(), false))
         .transpose()?;
+    let order_by = parse_window_query_order_by(query, &window, path.alias.as_deref())?;
+    let limit = parse_limit(query)?;
+    let offset = parse_offset(query)?;
+    let execution_sort = window_execution_sort(&window, order_by.as_ref());
+    let pre_window_prefix_limit =
+        if execution_sort_satisfies_order(execution_sort.as_ref(), order_by.as_ref())
+            && window_prefix_limit_safe(&window)
+        {
+            limit.and_then(|limit| limit.checked_add(offset))
+        } else {
+            None
+        };
     let mut scan_projection = Projection::Columns(window.input_columns.clone());
-    add_projection_columns(
-        &mut scan_projection,
-        window
-            .window_sort
-            .expressions
-            .iter()
-            .map(|sort| sort.column.clone())
-            .collect(),
-    );
+    if let Some(window_sort) = &execution_sort {
+        add_projection_columns(
+            &mut scan_projection,
+            window_sort
+                .expressions
+                .iter()
+                .map(|sort| sort.column.clone())
+                .collect(),
+        );
+    }
     if let Some(order_by) = query.order_by.as_ref() {
         add_projection_columns(
             &mut scan_projection,
             row_number_query_order_columns(order_by, &window, path.alias.as_deref())?,
         );
     }
-    let stream = engine
-        .scan_parquet_batches(path.path, batch_size, None, scan_projection, filter)
-        .await?;
+    let profile = window_profile_enabled();
+    let total_started = profile.then(Instant::now);
+    let scan_started = profile.then(Instant::now);
+    let use_ordered_window_scan = window_ordered_scan_enabled() && execution_sort.is_some();
+    let stream = if use_ordered_window_scan {
+        let window_sort = execution_sort
+            .as_ref()
+            .expect("ordered window scan requires execution sort");
+        engine
+            .scan_parquet_ordered_batches_by(
+                path.path,
+                batch_size,
+                pre_window_prefix_limit,
+                scan_projection,
+                filter,
+                window_sort.clone(),
+            )
+            .await?
+    } else {
+        engine
+            .scan_parquet_batches(path.path, batch_size, None, scan_projection, filter)
+            .await?
+    };
+    let scan_elapsed = scan_started.map(|started| started.elapsed());
+    let collect_started = profile.then(Instant::now);
     let mut batches = collect_batches(stream)?;
-    batches = apply_output_order_limit(batches, Some(&window.window_sort), None, 0)?;
-    batches = append_window_function_columns(batches, &window)?;
-    let order_by = parse_window_query_order_by(query, &window, path.alias.as_deref())?;
-    let limit = parse_limit(query)?;
-    let offset = parse_offset(query)?;
-    batches = apply_output_order_limit(batches, order_by.as_ref(), limit, offset)?;
+    let collected_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+    let collected_batches = batches.len();
+    let collect_elapsed = collect_started.map(|started| started.elapsed());
+    let sort_started = profile.then(Instant::now);
+    batches = if let Some(window_sort) = &execution_sort {
+        if use_ordered_window_scan && pre_window_prefix_limit.is_some() {
+            limit_batches(batches, pre_window_prefix_limit, 0)
+        } else if use_ordered_window_scan
+            && batches.len() <= 1
+            && output_batches_satisfy_order(&batches, window_sort)?
+        {
+            batches
+        } else {
+            apply_output_order_limit(batches, Some(window_sort), pre_window_prefix_limit, 0)?
+        }
+    } else {
+        coalesce_batches(batches)?
+    };
+    let sorted_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+    let sorted_batches = batches.len();
+    let sort_elapsed = sort_started.map(|started| started.elapsed());
+    let append_started = profile.then(Instant::now);
+    let window_columns_appended = if window_partition_hash_aggregate_safe(&window) {
+        if let Some(late_batches) = try_apply_int32_partition_hash_window_order_limit(
+            batches.clone(),
+            &window,
+            order_by.as_ref(),
+            limit,
+            offset,
+        )? {
+            batches = late_batches;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if !window_columns_appended {
+        batches = append_window_function_columns(batches, &window)?;
+        let order_started = profile.then(Instant::now);
+        batches = if execution_sort_satisfies_order(execution_sort.as_ref(), order_by.as_ref()) {
+            limit_batches(batches, limit, offset)
+        } else {
+            apply_output_order_limit(batches, order_by.as_ref(), limit, offset)?
+        };
+        if let (true, Some(started)) = (profile, order_started) {
+            eprintln!(
+                "[dodam:window-profile] final_order={}us",
+                window_profile_micros(started.elapsed())
+            );
+        }
+    }
+    let append_elapsed = append_started.map(|started| started.elapsed());
+    let projection_started = profile.then(Instant::now);
     batches = apply_output_projection(batches, &Projection::Columns(window.output_columns))?;
+    let output_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+    if let (true, Some(total_started)) = (profile, total_started) {
+        eprintln!(
+            "[dodam:window-profile] total={}us scan_plan={}us collect={}us sort={}us append_window={}us projection={}us collected_batches={} collected_rows={} sorted_batches={} sorted_rows={} output_rows={} ordered_scan={} prefix_limit={:?}",
+            window_profile_micros(total_started.elapsed()),
+            scan_elapsed.map(window_profile_micros).unwrap_or(0),
+            collect_elapsed.map(window_profile_micros).unwrap_or(0),
+            sort_elapsed.map(window_profile_micros).unwrap_or(0),
+            append_elapsed.map(window_profile_micros).unwrap_or(0),
+            projection_started
+                .map(|started| window_profile_micros(started.elapsed()))
+                .unwrap_or(0),
+            collected_batches,
+            collected_rows,
+            sorted_batches,
+            sorted_rows,
+            output_rows,
+            use_ordered_window_scan,
+            pre_window_prefix_limit,
+        );
+    }
     Ok(Some(QueryOutput::Scan { batches }))
+}
+
+fn window_profile_enabled() -> bool {
+    std::env::var("DODAM_WINDOW_PROFILE").is_ok_and(|value| {
+        value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+    })
+}
+
+fn window_profile_micros(duration: Duration) -> u128 {
+    duration.as_micros()
+}
+
+fn window_ordered_scan_enabled() -> bool {
+    std::env::var("DODAM_DISABLE_WINDOW_ORDERED_SCAN")
+        .map(|value| value != "1" && !value.eq_ignore_ascii_case("true"))
+        .unwrap_or(true)
+}
+
+fn window_execution_sort(
+    window: &WindowProjection,
+    final_order: Option<&SortKey>,
+) -> Option<SortKey> {
+    if window_partition_hash_aggregate_safe(window) {
+        return None;
+    }
+    let Some(final_order) = final_order else {
+        return window.window_sort.clone();
+    };
+    if final_order
+        .expressions
+        .iter()
+        .any(|sort| window.has_output_name(&sort.column))
+    {
+        return window.window_sort.clone();
+    }
+    match window.window_sort.as_ref() {
+        Some(window_sort)
+            if final_order_can_drive_window_sort(window, final_order, window_sort)
+                && final_order != window_sort =>
+        {
+            Some(final_order.clone())
+        }
+        Some(window_sort) => Some(window_sort.clone()),
+        None => Some(final_order.clone()),
+    }
+}
+
+fn execution_sort_satisfies_order(
+    execution_sort: Option<&SortKey>,
+    final_order: Option<&SortKey>,
+) -> bool {
+    let Some(final_order) = final_order else {
+        return true;
+    };
+    let Some(execution_sort) = execution_sort else {
+        return false;
+    };
+    sort_key_prefix_matches(execution_sort, final_order)
+}
+
+fn sort_key_prefix_matches(sort: &SortKey, prefix: &SortKey) -> bool {
+    sort.expressions.len() >= prefix.expressions.len()
+        && sort
+            .expressions
+            .iter()
+            .zip(&prefix.expressions)
+            .all(|(left, right)| left == right)
+}
+
+fn final_order_can_drive_window_sort(
+    window: &WindowProjection,
+    final_order: &SortKey,
+    window_sort: &SortKey,
+) -> bool {
+    if final_order.expressions.len() < window_sort.expressions.len() {
+        return false;
+    }
+    let partition_columns = window
+        .functions
+        .first()
+        .map(|function| function.partition_by.len())
+        .unwrap_or(0);
+    final_order
+        .expressions
+        .iter()
+        .zip(&window_sort.expressions)
+        .enumerate()
+        .all(|(index, (final_sort, window_sort))| {
+            if index < partition_columns {
+                final_sort.column == window_sort.column
+            } else {
+                final_sort == window_sort
+            }
+        })
+}
+
+fn window_prefix_limit_safe(window: &WindowProjection) -> bool {
+    window.functions.iter().all(|function| {
+        matches!(
+            function.function,
+            WindowFunctionKind::RowNumber
+                | WindowFunctionKind::Rank
+                | WindowFunctionKind::DenseRank
+        ) || !function.order_by.is_empty()
+    })
+}
+
+fn window_partition_hash_aggregate_safe(window: &WindowProjection) -> bool {
+    !window.functions.is_empty()
+        && window.functions.iter().all(|function| {
+            matches!(
+                function.function,
+                WindowFunctionKind::Sum | WindowFunctionKind::Count | WindowFunctionKind::Avg
+            ) && function.order_by.is_empty()
+                && !function.partition_by.is_empty()
+        })
 }
 
 #[derive(Debug)]
 struct WindowProjection {
     input_columns: Vec<String>,
     output_columns: Vec<String>,
-    window_sort: SortKey,
+    window_sort: Option<SortKey>,
     aliases: Vec<(String, String)>,
     ordinal_targets: Vec<String>,
     functions: Vec<WindowProjectionFunction>,
@@ -6886,6 +7170,7 @@ struct WindowProjection {
 struct WindowProjectionFunction {
     output_name: String,
     function: WindowFunctionKind,
+    argument: Option<ScalarSqlExpression>,
     partition_by: Vec<String>,
     order_by: Vec<String>,
 }
@@ -6895,6 +7180,9 @@ enum WindowFunctionKind {
     RowNumber,
     Rank,
     DenseRank,
+    Sum,
+    Count,
+    Avg,
 }
 
 fn parse_window_projection(select: &Select) -> Result<Option<WindowProjection>> {
@@ -6909,7 +7197,7 @@ fn parse_window_projection(select: &Select) -> Result<Option<WindowProjection>> 
     let mut output_columns = Vec::new();
     let mut aliases = Vec::new();
     let mut functions = Vec::new();
-    let mut window_sort = None;
+    let mut window_sort: Option<Option<SortKey>> = None;
 
     for item in &select.projection {
         match item {
@@ -6935,12 +7223,18 @@ fn parse_window_projection(select: &Select) -> Result<Option<WindowProjection>> 
             | SelectItem::ExprWithAlias {
                 expr: SqlExpr::Function(function),
                 alias: _,
-            } if supported_window_function(function).is_some() => {
+            } if function.over.is_some() && supported_window_function(function).is_some() => {
                 let output_name = match item {
                     SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
                     _ => function.to_string(),
                 };
-                let (function, partition_by, order_by, sort) = parse_window_function(function)?;
+                let (function, argument, partition_by, order_by, sort) =
+                    parse_window_function(function)?;
+                if let Some(argument) = &argument {
+                    for column in scalar_expression_columns(argument) {
+                        add_column_once(&mut input_columns, column);
+                    }
+                }
                 if let Some(window_sort) = &window_sort {
                     if window_sort != &sort {
                         return Err(DodamError::UnsupportedSql(
@@ -6954,6 +7248,7 @@ fn parse_window_projection(select: &Select) -> Result<Option<WindowProjection>> 
                 functions.push(WindowProjectionFunction {
                     output_name: output_name.clone(),
                     function,
+                    argument,
                     partition_by,
                     order_by,
                 });
@@ -6975,7 +7270,7 @@ fn parse_window_projection(select: &Select) -> Result<Option<WindowProjection>> 
     Ok(Some(WindowProjection {
         input_columns,
         output_columns,
-        window_sort: window_sort.expect("window functions imply sort"),
+        window_sort: window_sort.expect("window functions imply a parsed OVER specification"),
         aliases,
         ordinal_targets,
         functions,
@@ -6988,7 +7283,7 @@ fn select_item_is_row_number_window(item: &SelectItem) -> bool {
         | SelectItem::ExprWithAlias {
             expr: SqlExpr::Function(function),
             ..
-        } => supported_window_function(function).is_some(),
+        } => function.over.is_some() && supported_window_function(function).is_some(),
         _ => false,
     }
 }
@@ -6999,13 +7294,22 @@ fn supported_window_function(function: &sqlparser::ast::Function) -> Option<Wind
         "row_number" => Some(WindowFunctionKind::RowNumber),
         "rank" => Some(WindowFunctionKind::Rank),
         "dense_rank" => Some(WindowFunctionKind::DenseRank),
+        "sum" => Some(WindowFunctionKind::Sum),
+        "count" => Some(WindowFunctionKind::Count),
+        "avg" => Some(WindowFunctionKind::Avg),
         _ => None,
     }
 }
 
 fn parse_window_function(
     function: &sqlparser::ast::Function,
-) -> Result<(WindowFunctionKind, Vec<String>, Vec<String>, SortKey)> {
+) -> Result<(
+    WindowFunctionKind,
+    Option<ScalarSqlExpression>,
+    Vec<String>,
+    Vec<String>,
+    Option<SortKey>,
+)> {
     let function_kind = supported_window_function(function).ok_or_else(|| {
         DodamError::UnsupportedSql(format!("unsupported window function: {function}"))
     })?;
@@ -7019,16 +7323,7 @@ fn parse_window_function(
                 .to_string(),
         ));
     }
-    match &function.args {
-        FunctionArguments::None => {}
-        FunctionArguments::List(args) if args.args.is_empty() && args.clauses.is_empty() => {}
-        _ => {
-            return Err(DodamError::UnsupportedSql(format!(
-                "window function expects no arguments, got {}",
-                function.args
-            )));
-        }
-    }
+    let argument = parse_window_function_argument(function, function_kind)?;
     let Some(WindowType::WindowSpec(spec)) = &function.over else {
         return Err(DodamError::UnsupportedSql(
             "window function requires an OVER window specification".to_string(),
@@ -7039,9 +7334,16 @@ fn parse_window_function(
             "window names and frames are not supported".to_string(),
         ));
     }
-    if spec.order_by.is_empty() {
+    if spec.order_by.is_empty()
+        && matches!(
+            function_kind,
+            WindowFunctionKind::RowNumber
+                | WindowFunctionKind::Rank
+                | WindowFunctionKind::DenseRank
+        )
+    {
         return Err(DodamError::UnsupportedSql(
-            "window function requires ORDER BY in the window specification".to_string(),
+            "ranking window function requires ORDER BY in the window specification".to_string(),
         ));
     }
     let partition_by = spec
@@ -7075,12 +7377,82 @@ fn parse_window_function(
         .collect::<Vec<_>>();
     sort_expressions.extend(order_by.clone());
     let order_columns = order_by.iter().map(|sort| sort.column.clone()).collect();
-    Ok((
-        function_kind,
-        partition_by,
-        order_columns,
-        SortKey::new(sort_expressions)?,
-    ))
+    let sort = if sort_expressions.is_empty() {
+        None
+    } else {
+        Some(SortKey::new(sort_expressions)?)
+    };
+    Ok((function_kind, argument, partition_by, order_columns, sort))
+}
+
+fn parse_window_function_argument(
+    function: &sqlparser::ast::Function,
+    function_kind: WindowFunctionKind,
+) -> Result<Option<ScalarSqlExpression>> {
+    match function_kind {
+        WindowFunctionKind::RowNumber
+        | WindowFunctionKind::Rank
+        | WindowFunctionKind::DenseRank => match &function.args {
+            FunctionArguments::None => Ok(None),
+            FunctionArguments::List(args) if args.args.is_empty() && args.clauses.is_empty() => {
+                Ok(None)
+            }
+            _ => Err(DodamError::UnsupportedSql(format!(
+                "ranking window function expects no arguments, got {}",
+                function.args
+            ))),
+        },
+        WindowFunctionKind::Sum | WindowFunctionKind::Avg => {
+            let FunctionArguments::List(args) = &function.args else {
+                return Err(DodamError::UnsupportedSql(format!(
+                    "window aggregate expects one argument, got {}",
+                    function.args
+                )));
+            };
+            if !args.clauses.is_empty() || args.duplicate_treatment.is_some() {
+                return Err(DodamError::UnsupportedSql(format!(
+                    "unsupported window aggregate arguments: {}",
+                    function.args
+                )));
+            }
+            let [FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))] = args.args.as_slice() else {
+                return Err(DodamError::UnsupportedSql(format!(
+                    "window aggregate expects one expression argument, got {}",
+                    function.args
+                )));
+            };
+            Ok(Some(parse_scalar_sql_expression(expr, None)?))
+        }
+        WindowFunctionKind::Count => {
+            let FunctionArguments::List(args) = &function.args else {
+                return Err(DodamError::UnsupportedSql(format!(
+                    "window count expects an argument, got {}",
+                    function.args
+                )));
+            };
+            if !args.clauses.is_empty()
+                || !matches!(
+                    args.duplicate_treatment,
+                    None | Some(DuplicateTreatment::All)
+                )
+            {
+                return Err(DodamError::UnsupportedSql(format!(
+                    "unsupported window count arguments: {}",
+                    function.args
+                )));
+            }
+            match args.args.as_slice() {
+                [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)] => Ok(None),
+                [FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))] => {
+                    Ok(Some(parse_scalar_sql_expression(expr, None)?))
+                }
+                _ => Err(DodamError::UnsupportedSql(format!(
+                    "window count expects one argument, got {}",
+                    function.args
+                ))),
+            }
+        }
+    }
 }
 
 fn row_number_query_order_columns(
@@ -7159,25 +7531,31 @@ fn append_window_function_columns(
     batches: Vec<RecordBatch>,
     window: &WindowProjection,
 ) -> Result<Vec<RecordBatch>> {
-    let mut offset = 0_u64;
     batches
         .into_iter()
         .map(|batch| {
-            let row_count = batch.num_rows();
+            if let Some(batch) = append_int32_partition_hash_window_columns(&batch, window)? {
+                return Ok(batch);
+            }
+            if let Some(batch) = append_ranking_window_columns(&batch, window)? {
+                return Ok(batch);
+            }
+            if let Some(batch) = append_running_aggregate_window_columns(&batch, window)? {
+                return Ok(batch);
+            }
             let mut function_values = Vec::with_capacity(window.functions.len());
             for function in &window.functions {
-                function_values.push(window_function_values(&batch, function, offset)?);
+                function_values.push(window_function_values(&batch, function)?);
             }
-            offset += row_count as u64;
             let mut fields = batch.schema().fields().to_vec();
             let mut columns = batch.columns().to_vec();
             for (function, values) in window.functions.iter().zip(function_values) {
                 fields.push(Arc::new(Field::new(
                     function.output_name.clone(),
-                    DataType::UInt64,
-                    false,
+                    values.data_type(),
+                    values.is_nullable(),
                 )));
-                columns.push(Arc::new(UInt64Array::from(values)) as ArrayRef);
+                columns.push(values.into_array());
             }
             Ok(RecordBatch::try_new(
                 Arc::new(Schema::new(fields)),
@@ -7187,16 +7565,1324 @@ fn append_window_function_columns(
         .collect()
 }
 
+fn append_ranking_window_columns(
+    batch: &RecordBatch,
+    window: &WindowProjection,
+) -> Result<Option<RecordBatch>> {
+    let Some(first_function) = window.functions.first() else {
+        return Ok(None);
+    };
+    if !window.functions.iter().all(|function| {
+        matches!(
+            function.function,
+            WindowFunctionKind::RowNumber
+                | WindowFunctionKind::Rank
+                | WindowFunctionKind::DenseRank
+        ) && function.partition_by == first_function.partition_by
+            && function.order_by == first_function.order_by
+    }) {
+        return Ok(None);
+    }
+    if let Some(batch) = append_primitive_ranking_window_columns(batch, window, first_function)? {
+        return Ok(Some(batch));
+    }
+    if let Some(boundaries) = primitive_window_boundaries(batch, first_function)? {
+        return append_ranking_window_columns_with_boundaries(batch, window, &boundaries).map(Some);
+    }
+    let mut row_numbers = Vec::with_capacity(batch.num_rows());
+    let mut ranks = Vec::with_capacity(batch.num_rows());
+    let mut dense_ranks = Vec::with_capacity(batch.num_rows());
+    let mut partition_start = 0_usize;
+    let mut rank = 1_u64;
+    let mut dense_rank = 1_u64;
+    for row in 0..batch.num_rows() {
+        if row == 0 || !window_partition_equal(batch, first_function, row - 1, row)? {
+            partition_start = row;
+            rank = 1;
+            dense_rank = 1;
+        } else if !window_order_equal(batch, first_function, row - 1, row)? {
+            rank = u64::try_from(row - partition_start + 1)
+                .map_err(|_| DodamError::UnsupportedSql("window rank overflow".to_string()))?;
+            dense_rank += 1;
+        }
+        row_numbers.push(
+            u64::try_from(row - partition_start + 1)
+                .map_err(|_| DodamError::UnsupportedSql("row_number overflow".to_string()))?,
+        );
+        ranks.push(rank);
+        dense_ranks.push(dense_rank);
+    }
+
+    append_ranking_outputs(batch, window, row_numbers, ranks, dense_ranks).map(Some)
+}
+
+fn append_primitive_ranking_window_columns(
+    batch: &RecordBatch,
+    window: &WindowProjection,
+    first_function: &WindowProjectionFunction,
+) -> Result<Option<RecordBatch>> {
+    let Some(partition_values) = single_int32_window_partition_array(batch, first_function)? else {
+        return Ok(None);
+    };
+    let [order_column] = first_function.order_by.as_slice() else {
+        return Ok(None);
+    };
+    let order_index = output_batch_column_index(batch, order_column)?;
+    let order = batch.column(order_index);
+    match order.data_type() {
+        DataType::Int32 => {
+            let Some(order_values) = order.as_any().downcast_ref::<Int32Array>() else {
+                return Ok(None);
+            };
+            append_primitive_ranking_outputs(
+                batch,
+                window,
+                |left, right| int32_values_equal(partition_values, left, right),
+                |left, right| int32_values_equal(order_values, left, right),
+            )
+            .map(Some)
+        }
+        DataType::Int64 => {
+            let Some(order_values) = order.as_any().downcast_ref::<Int64Array>() else {
+                return Ok(None);
+            };
+            append_primitive_ranking_outputs(
+                batch,
+                window,
+                |left, right| int32_values_equal(partition_values, left, right),
+                |left, right| int64_values_equal(order_values, left, right),
+            )
+            .map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn append_primitive_ranking_outputs(
+    batch: &RecordBatch,
+    window: &WindowProjection,
+    partition_equal: impl Fn(usize, usize) -> bool,
+    order_equal: impl Fn(usize, usize) -> bool,
+) -> Result<RecordBatch> {
+    let mut row_numbers = Vec::with_capacity(batch.num_rows());
+    let mut ranks = Vec::with_capacity(batch.num_rows());
+    let mut dense_ranks = Vec::with_capacity(batch.num_rows());
+    let mut partition_start = 0_usize;
+    let mut rank = 1_u64;
+    let mut dense_rank = 1_u64;
+    for row in 0..batch.num_rows() {
+        if row == 0 || !partition_equal(row - 1, row) {
+            partition_start = row;
+            rank = 1;
+            dense_rank = 1;
+        } else if !order_equal(row - 1, row) {
+            rank = u64::try_from(row - partition_start + 1)
+                .map_err(|_| DodamError::UnsupportedSql("window rank overflow".to_string()))?;
+            dense_rank += 1;
+        }
+        row_numbers.push(
+            u64::try_from(row - partition_start + 1)
+                .map_err(|_| DodamError::UnsupportedSql("row_number overflow".to_string()))?,
+        );
+        ranks.push(rank);
+        dense_ranks.push(dense_rank);
+    }
+    append_ranking_outputs(batch, window, row_numbers, ranks, dense_ranks)
+}
+
+struct WindowBoundaries {
+    partition_start: Vec<bool>,
+    peer_changed: Vec<bool>,
+}
+
+fn primitive_window_boundaries(
+    batch: &RecordBatch,
+    window: &WindowProjectionFunction,
+) -> Result<Option<WindowBoundaries>> {
+    let Some(partition_keys) = single_int32_window_partition_keys(batch, window)? else {
+        return Ok(None);
+    };
+    let [order_column] = window.order_by.as_slice() else {
+        return Ok(None);
+    };
+    let order_index = output_batch_column_index(batch, order_column)?;
+    let order = batch.column(order_index);
+    let mut partition_start = Vec::with_capacity(batch.num_rows());
+    let mut peer_changed = Vec::with_capacity(batch.num_rows());
+    match order.data_type() {
+        DataType::Int32 => {
+            let Some(order_values) = order.as_any().downcast_ref::<Int32Array>() else {
+                return Ok(None);
+            };
+            for row in 0..batch.num_rows() {
+                let partition_changed = row == 0 || partition_keys[row - 1] != partition_keys[row];
+                let order_changed = row == 0 || !int32_values_equal(order_values, row - 1, row);
+                partition_start.push(partition_changed);
+                peer_changed.push(partition_changed || order_changed);
+            }
+        }
+        DataType::Int64 => {
+            let Some(order_values) = order.as_any().downcast_ref::<Int64Array>() else {
+                return Ok(None);
+            };
+            for row in 0..batch.num_rows() {
+                let partition_changed = row == 0 || partition_keys[row - 1] != partition_keys[row];
+                let order_changed = row == 0 || !int64_values_equal(order_values, row - 1, row);
+                partition_start.push(partition_changed);
+                peer_changed.push(partition_changed || order_changed);
+            }
+        }
+        _ => return Ok(None),
+    }
+    Ok(Some(WindowBoundaries {
+        partition_start,
+        peer_changed,
+    }))
+}
+
+fn int32_values_equal(values: &Int32Array, left: usize, right: usize) -> bool {
+    if values.is_null(left) != values.is_null(right) {
+        return false;
+    }
+    values.is_null(left) || values.value(left) == values.value(right)
+}
+
+fn int64_values_equal(values: &Int64Array, left: usize, right: usize) -> bool {
+    if values.is_null(left) != values.is_null(right) {
+        return false;
+    }
+    values.is_null(left) || values.value(left) == values.value(right)
+}
+
+fn append_ranking_window_columns_with_boundaries(
+    batch: &RecordBatch,
+    window: &WindowProjection,
+    boundaries: &WindowBoundaries,
+) -> Result<RecordBatch> {
+    let mut row_numbers = Vec::with_capacity(batch.num_rows());
+    let mut ranks = Vec::with_capacity(batch.num_rows());
+    let mut dense_ranks = Vec::with_capacity(batch.num_rows());
+    let mut partition_start = 0_usize;
+    let mut rank = 1_u64;
+    let mut dense_rank = 1_u64;
+    for row in 0..batch.num_rows() {
+        if boundaries.partition_start[row] {
+            partition_start = row;
+            rank = 1;
+            dense_rank = 1;
+        } else if boundaries.peer_changed[row] {
+            rank = u64::try_from(row - partition_start + 1)
+                .map_err(|_| DodamError::UnsupportedSql("window rank overflow".to_string()))?;
+            dense_rank += 1;
+        }
+        row_numbers.push(
+            u64::try_from(row - partition_start + 1)
+                .map_err(|_| DodamError::UnsupportedSql("row_number overflow".to_string()))?,
+        );
+        ranks.push(rank);
+        dense_ranks.push(dense_rank);
+    }
+    append_ranking_outputs(batch, window, row_numbers, ranks, dense_ranks)
+}
+
+fn append_ranking_outputs(
+    batch: &RecordBatch,
+    window: &WindowProjection,
+    row_numbers: Vec<u64>,
+    ranks: Vec<u64>,
+    dense_ranks: Vec<u64>,
+) -> Result<RecordBatch> {
+    let mut fields = batch.schema().fields().to_vec();
+    let mut columns = batch.columns().to_vec();
+    let mut row_numbers = Some(row_numbers);
+    let mut ranks = Some(ranks);
+    let mut dense_ranks = Some(dense_ranks);
+    let mut row_number_remaining = window
+        .functions
+        .iter()
+        .filter(|function| function.function == WindowFunctionKind::RowNumber)
+        .count();
+    let mut rank_remaining = window
+        .functions
+        .iter()
+        .filter(|function| function.function == WindowFunctionKind::Rank)
+        .count();
+    let mut dense_rank_remaining = window
+        .functions
+        .iter()
+        .filter(|function| function.function == WindowFunctionKind::DenseRank)
+        .count();
+    for function in &window.functions {
+        let values = match function.function {
+            WindowFunctionKind::RowNumber => {
+                row_number_remaining -= 1;
+                if row_number_remaining == 0 {
+                    row_numbers.take()
+                } else {
+                    row_numbers.clone()
+                }
+            }
+            WindowFunctionKind::Rank => {
+                rank_remaining -= 1;
+                if rank_remaining == 0 {
+                    ranks.take()
+                } else {
+                    ranks.clone()
+                }
+            }
+            WindowFunctionKind::DenseRank => {
+                dense_rank_remaining -= 1;
+                if dense_rank_remaining == 0 {
+                    dense_ranks.take()
+                } else {
+                    dense_ranks.clone()
+                }
+            }
+            WindowFunctionKind::Sum | WindowFunctionKind::Count | WindowFunctionKind::Avg => {
+                return Err(DodamError::UnsupportedSql(
+                    "aggregate window in ranking output".to_string(),
+                ));
+            }
+        }
+        .ok_or_else(|| {
+            DodamError::UnsupportedSql("duplicate ranking window output requested".to_string())
+        })?;
+        fields.push(Arc::new(Field::new(
+            function.output_name.clone(),
+            DataType::UInt64,
+            false,
+        )));
+        columns.push(Arc::new(UInt64Array::from_iter_values(values)) as ArrayRef);
+    }
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns,
+    )?)
+}
+
+fn append_running_aggregate_window_columns(
+    batch: &RecordBatch,
+    window: &WindowProjection,
+) -> Result<Option<RecordBatch>> {
+    let Some(first_function) = window.functions.first() else {
+        return Ok(None);
+    };
+    if first_function.order_by.is_empty()
+        || !window.functions.iter().all(|function| {
+            matches!(
+                function.function,
+                WindowFunctionKind::Count | WindowFunctionKind::Sum | WindowFunctionKind::Avg
+            ) && function.partition_by == first_function.partition_by
+                && function.order_by == first_function.order_by
+        })
+    {
+        return Ok(None);
+    }
+    if let Some(batch) =
+        append_primitive_running_aggregate_window_columns(batch, window, first_function)?
+    {
+        return Ok(Some(batch));
+    }
+
+    enum RunningInput {
+        Count {
+            present: Vec<bool>,
+            output: Vec<Option<u64>>,
+            count: u64,
+        },
+        SumAvg {
+            values: Vec<Option<f64>>,
+            output: Vec<Option<f64>>,
+            sum: f64,
+            count: u64,
+            avg: bool,
+        },
+    }
+
+    let mut inputs = window
+        .functions
+        .iter()
+        .map(|function| match function.function {
+            WindowFunctionKind::Count => {
+                let argument_values = function
+                    .argument
+                    .as_ref()
+                    .map(|argument| evaluate_scalar_expression(batch, argument))
+                    .transpose()?;
+                let present = argument_values
+                    .map(evaluated_scalar_present_mask)
+                    .transpose()?
+                    .unwrap_or_else(|| vec![true; batch.num_rows()]);
+                Ok(RunningInput::Count {
+                    present,
+                    output: Vec::with_capacity(batch.num_rows()),
+                    count: 0,
+                })
+            }
+            WindowFunctionKind::Sum | WindowFunctionKind::Avg => {
+                let argument = function.argument.as_ref().ok_or_else(|| {
+                    DodamError::UnsupportedSql("window aggregate requires an argument".to_string())
+                })?;
+                Ok(RunningInput::SumAvg {
+                    values: scalar_as_f64(evaluate_scalar_expression(batch, argument)?)?,
+                    output: Vec::with_capacity(batch.num_rows()),
+                    sum: 0.0,
+                    count: 0,
+                    avg: function.function == WindowFunctionKind::Avg,
+                })
+            }
+            WindowFunctionKind::RowNumber
+            | WindowFunctionKind::Rank
+            | WindowFunctionKind::DenseRank => unreachable!("checked above"),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let primitive_partition_values = single_int32_window_partition_array(batch, first_function)?;
+    let boundaries = if primitive_partition_values.is_some() {
+        None
+    } else {
+        primitive_window_boundaries(batch, first_function)?
+    };
+
+    for row in 0..batch.num_rows() {
+        let partition_start = if let Some(partition_values) = primitive_partition_values {
+            row == 0 || !int32_values_equal(partition_values, row - 1, row)
+        } else if let Some(boundaries) = boundaries.as_ref() {
+            boundaries.partition_start[row]
+        } else if row == 0 {
+            true
+        } else {
+            !window_partition_equal(batch, first_function, row - 1, row)?
+        };
+        if partition_start {
+            for input in &mut inputs {
+                match input {
+                    RunningInput::Count { count, .. } => *count = 0,
+                    RunningInput::SumAvg { sum, count, .. } => {
+                        *sum = 0.0;
+                        *count = 0;
+                    }
+                }
+            }
+        }
+        for input in &mut inputs {
+            match input {
+                RunningInput::Count {
+                    present,
+                    output,
+                    count,
+                } => {
+                    if present[row] {
+                        *count += 1;
+                    }
+                    output.push(Some(*count));
+                }
+                RunningInput::SumAvg {
+                    values,
+                    output,
+                    sum,
+                    count,
+                    avg,
+                } => {
+                    if let Some(value) = values[row] {
+                        *sum += value;
+                        *count += 1;
+                    }
+                    output.push(if *count > 0 {
+                        Some(if *avg { *sum / *count as f64 } else { *sum })
+                    } else {
+                        None
+                    });
+                }
+            }
+        }
+    }
+
+    let mut fields = batch.schema().fields().to_vec();
+    let mut columns = batch.columns().to_vec();
+    for (function, input) in window.functions.iter().zip(inputs) {
+        match input {
+            RunningInput::Count { output, .. } => {
+                fields.push(Arc::new(Field::new(
+                    function.output_name.clone(),
+                    DataType::UInt64,
+                    false,
+                )));
+                columns.push(Arc::new(UInt64Array::from(output)) as ArrayRef);
+            }
+            RunningInput::SumAvg { output, .. } => {
+                fields.push(Arc::new(Field::new(
+                    function.output_name.clone(),
+                    DataType::Float64,
+                    true,
+                )));
+                columns.push(Arc::new(Float64Array::from(output)) as ArrayRef);
+            }
+        }
+    }
+    Ok(Some(RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns,
+    )?))
+}
+
+fn append_primitive_running_aggregate_window_columns(
+    batch: &RecordBatch,
+    window: &WindowProjection,
+    first_function: &WindowProjectionFunction,
+) -> Result<Option<RecordBatch>> {
+    let Some(partition_values) = single_int32_window_partition_array(batch, first_function)? else {
+        return Ok(None);
+    };
+
+    enum PrimitiveRunningInput<'a> {
+        CountAll {
+            output: Vec<u64>,
+            count: u64,
+        },
+        SumAvgInt64 {
+            values: &'a Int64Array,
+            output: Vec<Option<f64>>,
+            sum: f64,
+            count: u64,
+            avg: bool,
+        },
+        SumAvgInt64NonNull {
+            values: &'a Int64Array,
+            output: Vec<f64>,
+            sum: f64,
+            count: u64,
+            avg: bool,
+        },
+    }
+
+    let mut inputs = Vec::with_capacity(window.functions.len());
+    for function in &window.functions {
+        match function.function {
+            WindowFunctionKind::Count if function.argument.is_none() => {
+                inputs.push(PrimitiveRunningInput::CountAll {
+                    output: Vec::with_capacity(batch.num_rows()),
+                    count: 0,
+                });
+            }
+            WindowFunctionKind::Sum | WindowFunctionKind::Avg => {
+                let Some(values) = int64_window_argument_array(batch, function)? else {
+                    return Ok(None);
+                };
+                if values.null_count() == 0 {
+                    inputs.push(PrimitiveRunningInput::SumAvgInt64NonNull {
+                        values,
+                        output: Vec::with_capacity(batch.num_rows()),
+                        sum: 0.0,
+                        count: 0,
+                        avg: function.function == WindowFunctionKind::Avg,
+                    });
+                } else {
+                    inputs.push(PrimitiveRunningInput::SumAvgInt64 {
+                        values,
+                        output: Vec::with_capacity(batch.num_rows()),
+                        sum: 0.0,
+                        count: 0,
+                        avg: function.function == WindowFunctionKind::Avg,
+                    });
+                }
+            }
+            _ => return Ok(None),
+        }
+    }
+
+    for row in 0..batch.num_rows() {
+        if row == 0 || !int32_values_equal(partition_values, row - 1, row) {
+            for input in &mut inputs {
+                match input {
+                    PrimitiveRunningInput::CountAll { count, .. } => *count = 0,
+                    PrimitiveRunningInput::SumAvgInt64 { sum, count, .. } => {
+                        *sum = 0.0;
+                        *count = 0;
+                    }
+                    PrimitiveRunningInput::SumAvgInt64NonNull { sum, count, .. } => {
+                        *sum = 0.0;
+                        *count = 0;
+                    }
+                }
+            }
+        }
+        for input in &mut inputs {
+            match input {
+                PrimitiveRunningInput::CountAll { output, count } => {
+                    *count += 1;
+                    output.push(*count);
+                }
+                PrimitiveRunningInput::SumAvgInt64 {
+                    values,
+                    output,
+                    sum,
+                    count,
+                    avg,
+                } => {
+                    if !values.is_null(row) {
+                        *sum += values.value(row) as f64;
+                        *count += 1;
+                    }
+                    output.push(if *count > 0 {
+                        Some(if *avg { *sum / *count as f64 } else { *sum })
+                    } else {
+                        None
+                    });
+                }
+                PrimitiveRunningInput::SumAvgInt64NonNull {
+                    values,
+                    output,
+                    sum,
+                    count,
+                    avg,
+                } => {
+                    *sum += values.value(row) as f64;
+                    *count += 1;
+                    output.push(if *avg { *sum / *count as f64 } else { *sum });
+                }
+            }
+        }
+    }
+
+    let mut fields = batch.schema().fields().to_vec();
+    let mut columns = batch.columns().to_vec();
+    for (function, input) in window.functions.iter().zip(inputs) {
+        match input {
+            PrimitiveRunningInput::CountAll { output, .. } => {
+                fields.push(Arc::new(Field::new(
+                    function.output_name.clone(),
+                    DataType::UInt64,
+                    false,
+                )));
+                columns.push(Arc::new(UInt64Array::from_iter_values(output)) as ArrayRef);
+            }
+            PrimitiveRunningInput::SumAvgInt64 { output, .. } => {
+                fields.push(Arc::new(Field::new(
+                    function.output_name.clone(),
+                    DataType::Float64,
+                    true,
+                )));
+                columns.push(Arc::new(Float64Array::from(output)) as ArrayRef);
+            }
+            PrimitiveRunningInput::SumAvgInt64NonNull { output, .. } => {
+                fields.push(Arc::new(Field::new(
+                    function.output_name.clone(),
+                    DataType::Float64,
+                    false,
+                )));
+                columns.push(Arc::new(Float64Array::from_iter_values(output)) as ArrayRef);
+            }
+        }
+    }
+    Ok(Some(RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns,
+    )?))
+}
+
+fn int64_window_argument_array<'a>(
+    batch: &'a RecordBatch,
+    function: &WindowProjectionFunction,
+) -> Result<Option<&'a Int64Array>> {
+    let Some(argument) = function.argument.as_ref() else {
+        return Ok(None);
+    };
+    let column = match argument {
+        ScalarSqlExpression::Column(column) => Some(column),
+        ScalarSqlExpression::Cast { expr, target }
+            if matches!(
+                target.to_ascii_lowercase().as_str(),
+                "double" | "float8" | "float" | "real"
+            ) =>
+        {
+            match expr.as_ref() {
+                ScalarSqlExpression::Column(column) => Some(column),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let Some(column) = column else {
+        return Ok(None);
+    };
+    let index = output_batch_column_index(batch, column)?;
+    Ok(batch.column(index).as_any().downcast_ref::<Int64Array>())
+}
+
+fn try_apply_int32_partition_hash_window_order_limit(
+    batches: Vec<RecordBatch>,
+    window: &WindowProjection,
+    order_by: Option<&SortKey>,
+    limit: Option<usize>,
+    offset: usize,
+) -> Result<Option<Vec<RecordBatch>>> {
+    if !window_partition_hash_aggregate_safe(window)
+        || order_by.is_none()
+        || window_order_uses_output(order_by, window)
+    {
+        return Ok(None);
+    }
+    let profile = window_profile_enabled();
+    let total_started = profile.then(Instant::now);
+    let coalesce_started = profile.then(Instant::now);
+    let Some(full_batch) = coalesce_batches(batches)?.into_iter().next() else {
+        return Ok(Some(Vec::new()));
+    };
+    let coalesce_elapsed = coalesce_started.map(|started| started.elapsed());
+    let Some(first_function) = window.functions.first() else {
+        return Ok(None);
+    };
+    if !window
+        .functions
+        .iter()
+        .all(|function| function.partition_by == first_function.partition_by)
+    {
+        return Ok(None);
+    }
+    let key_started = profile.then(Instant::now);
+    let Some(full_keys) = single_int32_window_partition_keys(&full_batch, first_function)? else {
+        return Ok(None);
+    };
+    let key_elapsed = key_started.map(|started| started.elapsed());
+    let state_started = profile.then(Instant::now);
+    let states = if let Some(states) =
+        try_shared_int64_partition_window_states(&full_batch, window, &full_keys)?
+    {
+        states
+    } else {
+        window
+            .functions
+            .iter()
+            .map(|function| int32_partition_window_state(&full_batch, function, &full_keys))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let state_elapsed = state_started.map(|started| started.elapsed());
+    let prune_started = profile.then(Instant::now);
+    let sortable_batch = prune_window_late_append_sort_batch(full_batch, window, order_by)?;
+    let prune_elapsed = prune_started.map(|started| started.elapsed());
+    let sort_started = profile.then(Instant::now);
+    let limited_batches = apply_output_order_limit(vec![sortable_batch], order_by, limit, offset)?;
+    let sort_elapsed = sort_started.map(|started| started.elapsed());
+    let append_started = profile.then(Instant::now);
+    let result = limited_batches
+        .into_iter()
+        .map(|batch| append_int32_partition_hash_window_columns_from_states(batch, window, &states))
+        .collect::<Result<Vec<_>>>()
+        .map(Some);
+    let append_elapsed = append_started.map(|started| started.elapsed());
+    if let (true, Some(total_started)) = (profile, total_started) {
+        eprintln!(
+            "[dodam:window-late-profile] total={}us coalesce={}us keys={}us state={}us prune={}us sort_limit={}us append={}us",
+            window_profile_micros(total_started.elapsed()),
+            coalesce_elapsed.map(window_profile_micros).unwrap_or(0),
+            key_elapsed.map(window_profile_micros).unwrap_or(0),
+            state_elapsed.map(window_profile_micros).unwrap_or(0),
+            prune_elapsed.map(window_profile_micros).unwrap_or(0),
+            sort_elapsed.map(window_profile_micros).unwrap_or(0),
+            append_elapsed.map(window_profile_micros).unwrap_or(0),
+        );
+    }
+    result
+}
+
+fn prune_window_late_append_sort_batch(
+    batch: RecordBatch,
+    window: &WindowProjection,
+    order_by: Option<&SortKey>,
+) -> Result<RecordBatch> {
+    let mut needed = HashSet::new();
+    let window_outputs = window
+        .functions
+        .iter()
+        .map(|function| function.output_name.as_str())
+        .collect::<HashSet<_>>();
+    for column in &window.output_columns {
+        if !window_outputs.contains(column.as_str()) {
+            needed.insert(column.as_str());
+        }
+    }
+    if let Some(order_by) = order_by {
+        for sort in &order_by.expressions {
+            if !window_outputs.contains(sort.column.as_str()) {
+                needed.insert(sort.column.as_str());
+            }
+        }
+    }
+    for function in &window.functions {
+        for column in &function.partition_by {
+            needed.insert(column.as_str());
+        }
+    }
+    if needed.len() >= batch.num_columns() {
+        return Ok(batch);
+    }
+    let indices = batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, field)| needed.contains(field.name().as_str()).then_some(index))
+        .collect::<Vec<_>>();
+    Ok(batch.project(&indices)?)
+}
+
+fn window_order_uses_output(order_by: Option<&SortKey>, window: &WindowProjection) -> bool {
+    order_by.is_some_and(|order_by| {
+        order_by
+            .expressions
+            .iter()
+            .any(|sort| window.has_output_name(&sort.column))
+    })
+}
+
+enum Int32PartitionWindowState {
+    Count(HashMap<Option<i32>, u64>),
+    CountDense {
+        min: i32,
+        counts: Vec<u64>,
+        null_count: u64,
+    },
+    SumAvg(HashMap<Option<i32>, (f64, u64)>),
+    SumAvgDense {
+        min: i32,
+        sums: Vec<f64>,
+        counts: Vec<u64>,
+        null_sum: f64,
+        null_count: u64,
+    },
+    SharedInt64Dense {
+        min: i32,
+        sums: Arc<Vec<f64>>,
+        counts: Arc<Vec<u64>>,
+        null_sum: f64,
+        null_count: u64,
+        output: SharedInt64WindowOutput,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum SharedInt64WindowOutput {
+    Count,
+    Sum,
+    Avg,
+}
+
+fn try_shared_int64_partition_window_states(
+    batch: &RecordBatch,
+    window: &WindowProjection,
+    keys: &[Option<i32>],
+) -> Result<Option<Vec<Int32PartitionWindowState>>> {
+    if window.functions.len() < 2 {
+        return Ok(None);
+    }
+    let Some((min, slot_count)) = dense_i32_window_partition_range(keys) else {
+        return Ok(None);
+    };
+    let Some(first_column) = shared_int64_window_argument_column(&window.functions[0]) else {
+        return Ok(None);
+    };
+    let mut outputs = Vec::with_capacity(window.functions.len());
+    for function in &window.functions {
+        let Some(column) = shared_int64_window_argument_column(function) else {
+            return Ok(None);
+        };
+        if column != first_column {
+            return Ok(None);
+        }
+        outputs.push(match function.function {
+            WindowFunctionKind::Count => SharedInt64WindowOutput::Count,
+            WindowFunctionKind::Sum => SharedInt64WindowOutput::Sum,
+            WindowFunctionKind::Avg => SharedInt64WindowOutput::Avg,
+            WindowFunctionKind::RowNumber
+            | WindowFunctionKind::Rank
+            | WindowFunctionKind::DenseRank => {
+                return Ok(None);
+            }
+        });
+    }
+    let index = output_batch_column_index(batch, first_column)?;
+    let Some(values) = batch.column(index).as_any().downcast_ref::<Int64Array>() else {
+        return Ok(None);
+    };
+    let mut sums = vec![0.0; slot_count];
+    let mut counts = vec![0_u64; slot_count];
+    let mut null_sum = 0.0;
+    let mut null_count = 0_u64;
+    for (row, key) in keys.iter().enumerate() {
+        if values.is_null(row) {
+            continue;
+        }
+        let value = values.value(row) as f64;
+        match key {
+            Some(key) => {
+                let slot = (*key - min) as usize;
+                sums[slot] += value;
+                counts[slot] += 1;
+            }
+            None => {
+                null_sum += value;
+                null_count += 1;
+            }
+        }
+    }
+    let sums = Arc::new(sums);
+    let counts = Arc::new(counts);
+    Ok(Some(
+        outputs
+            .into_iter()
+            .map(|output| Int32PartitionWindowState::SharedInt64Dense {
+                min,
+                sums: Arc::clone(&sums),
+                counts: Arc::clone(&counts),
+                null_sum,
+                null_count,
+                output,
+            })
+            .collect(),
+    ))
+}
+
+fn shared_int64_window_argument_column(function: &WindowProjectionFunction) -> Option<&str> {
+    let argument = function.argument.as_ref()?;
+    match (function.function, argument) {
+        (
+            WindowFunctionKind::Count | WindowFunctionKind::Avg,
+            ScalarSqlExpression::Column(column),
+        ) => Some(column),
+        (WindowFunctionKind::Sum, ScalarSqlExpression::Column(column)) => Some(column),
+        (
+            WindowFunctionKind::Sum | WindowFunctionKind::Avg,
+            ScalarSqlExpression::Cast { expr, target },
+        ) if matches!(
+            target.to_ascii_lowercase().as_str(),
+            "double" | "float8" | "float" | "real"
+        ) =>
+        {
+            match expr.as_ref() {
+                ScalarSqlExpression::Column(column) => Some(column),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn int32_partition_window_state(
+    batch: &RecordBatch,
+    function: &WindowProjectionFunction,
+    keys: &[Option<i32>],
+) -> Result<Int32PartitionWindowState> {
+    match function.function {
+        WindowFunctionKind::Count => {
+            let argument_values = function
+                .argument
+                .as_ref()
+                .map(|argument| evaluate_scalar_expression(batch, argument))
+                .transpose()?;
+            let present = argument_values
+                .map(evaluated_scalar_present_mask)
+                .transpose()?
+                .unwrap_or_else(|| vec![true; batch.num_rows()]);
+            if let Some((min, slot_count)) = dense_i32_window_partition_range(keys) {
+                let mut counts = vec![0_u64; slot_count];
+                let mut null_count = 0_u64;
+                for (key, present) in keys.iter().zip(present) {
+                    if !present {
+                        continue;
+                    }
+                    match key {
+                        Some(key) => counts[(*key - min) as usize] += 1,
+                        None => null_count += 1,
+                    }
+                }
+                return Ok(Int32PartitionWindowState::CountDense {
+                    min,
+                    counts,
+                    null_count,
+                });
+            }
+            let mut counts = HashMap::<Option<i32>, u64>::new();
+            for (key, present) in keys.iter().zip(present) {
+                if present {
+                    *counts.entry(*key).or_insert(0) += 1;
+                } else {
+                    counts.entry(*key).or_insert(0);
+                }
+            }
+            Ok(Int32PartitionWindowState::Count(counts))
+        }
+        WindowFunctionKind::Sum | WindowFunctionKind::Avg => {
+            let argument = function.argument.as_ref().ok_or_else(|| {
+                DodamError::UnsupportedSql("window aggregate requires an argument".to_string())
+            })?;
+            let values = scalar_as_f64(evaluate_scalar_expression(batch, argument)?)?;
+            if let Some((min, slot_count)) = dense_i32_window_partition_range(keys) {
+                let mut sums = vec![0.0; slot_count];
+                let mut counts = vec![0_u64; slot_count];
+                let mut null_sum = 0.0;
+                let mut null_count = 0_u64;
+                for (key, value) in keys.iter().zip(values) {
+                    let Some(value) = value else {
+                        continue;
+                    };
+                    match key {
+                        Some(key) => {
+                            let slot = (*key - min) as usize;
+                            sums[slot] += value;
+                            counts[slot] += 1;
+                        }
+                        None => {
+                            null_sum += value;
+                            null_count += 1;
+                        }
+                    }
+                }
+                return Ok(Int32PartitionWindowState::SumAvgDense {
+                    min,
+                    sums,
+                    counts,
+                    null_sum,
+                    null_count,
+                });
+            }
+            let mut aggregates = HashMap::<Option<i32>, (f64, u64)>::new();
+            for (key, value) in keys.iter().zip(values) {
+                let entry = aggregates.entry(*key).or_insert((0.0, 0));
+                if let Some(value) = value {
+                    entry.0 += value;
+                    entry.1 += 1;
+                }
+            }
+            Ok(Int32PartitionWindowState::SumAvg(aggregates))
+        }
+        WindowFunctionKind::RowNumber
+        | WindowFunctionKind::Rank
+        | WindowFunctionKind::DenseRank => Err(DodamError::UnsupportedSql(
+            "ranking functions are not partition hash aggregates".to_string(),
+        )),
+    }
+}
+
+fn dense_i32_window_partition_range(keys: &[Option<i32>]) -> Option<(i32, usize)> {
+    let mut min = i32::MAX;
+    let mut max = i32::MIN;
+    let mut has_value = false;
+    for key in keys.iter().flatten() {
+        min = min.min(*key);
+        max = max.max(*key);
+        has_value = true;
+    }
+    if !has_value {
+        return Some((0, 0));
+    }
+    let slot_count = usize::try_from(i64::from(max) - i64::from(min) + 1).ok()?;
+    (slot_count <= keys.len().saturating_mul(4) && slot_count <= 1_000_000)
+        .then_some((min, slot_count))
+}
+
+fn append_int32_partition_hash_window_columns_from_states(
+    batch: RecordBatch,
+    window: &WindowProjection,
+    states: &[Int32PartitionWindowState],
+) -> Result<RecordBatch> {
+    let Some(first_function) = window.functions.first() else {
+        return Ok(batch);
+    };
+    let Some(keys) = single_int32_window_partition_keys(&batch, first_function)? else {
+        return Err(DodamError::UnsupportedSql(
+            "expected Int32 partition key for window aggregate late append".to_string(),
+        ));
+    };
+    let mut fields = batch.schema().fields().to_vec();
+    let mut columns = batch.columns().to_vec();
+    for (function, state) in window.functions.iter().zip(states) {
+        let values = match (function.function, state) {
+            (WindowFunctionKind::Count, Int32PartitionWindowState::Count(counts)) => {
+                WindowFunctionValues::UInt64(
+                    keys.iter()
+                        .map(|key| Some(counts.get(key).copied().unwrap_or(0)))
+                        .collect(),
+                )
+            }
+            (
+                WindowFunctionKind::Count,
+                Int32PartitionWindowState::CountDense {
+                    min,
+                    counts,
+                    null_count,
+                },
+            ) => WindowFunctionValues::UInt64(
+                keys.iter()
+                    .map(|key| {
+                        Some(match key {
+                            Some(key) => counts.get((*key - *min) as usize).copied().unwrap_or(0),
+                            None => *null_count,
+                        })
+                    })
+                    .collect(),
+            ),
+            (
+                WindowFunctionKind::Sum | WindowFunctionKind::Avg,
+                Int32PartitionWindowState::SumAvg(aggregates),
+            ) => {
+                let sums_counts = keys
+                    .iter()
+                    .map(|key| aggregates.get(key).copied().unwrap_or((0.0, 0)))
+                    .collect::<Vec<_>>();
+                if function.function == WindowFunctionKind::Sum {
+                    WindowFunctionValues::Float64(
+                        sums_counts
+                            .into_iter()
+                            .map(|(sum, count)| (count > 0).then_some(sum))
+                            .collect(),
+                    )
+                } else {
+                    WindowFunctionValues::Float64(
+                        sums_counts
+                            .into_iter()
+                            .map(|(sum, count)| (count > 0).then_some(sum / count as f64))
+                            .collect(),
+                    )
+                }
+            }
+            (
+                WindowFunctionKind::Sum | WindowFunctionKind::Avg,
+                Int32PartitionWindowState::SumAvgDense {
+                    min,
+                    sums,
+                    counts,
+                    null_sum,
+                    null_count,
+                },
+            ) => {
+                let sums_counts = keys
+                    .iter()
+                    .map(|key| match key {
+                        Some(key) => {
+                            let slot = (*key - *min) as usize;
+                            (
+                                sums.get(slot).copied().unwrap_or(0.0),
+                                counts.get(slot).copied().unwrap_or(0),
+                            )
+                        }
+                        None => (*null_sum, *null_count),
+                    })
+                    .collect::<Vec<_>>();
+                if function.function == WindowFunctionKind::Sum {
+                    WindowFunctionValues::Float64(
+                        sums_counts
+                            .into_iter()
+                            .map(|(sum, count)| (count > 0).then_some(sum))
+                            .collect(),
+                    )
+                } else {
+                    WindowFunctionValues::Float64(
+                        sums_counts
+                            .into_iter()
+                            .map(|(sum, count)| (count > 0).then_some(sum / count as f64))
+                            .collect(),
+                    )
+                }
+            }
+            (
+                WindowFunctionKind::Count | WindowFunctionKind::Sum | WindowFunctionKind::Avg,
+                Int32PartitionWindowState::SharedInt64Dense {
+                    min,
+                    sums,
+                    counts,
+                    null_sum,
+                    null_count,
+                    output,
+                },
+            ) => match output {
+                SharedInt64WindowOutput::Count => WindowFunctionValues::UInt64(
+                    keys.iter()
+                        .map(|key| {
+                            Some(match key {
+                                Some(key) => {
+                                    counts.get((*key - *min) as usize).copied().unwrap_or(0)
+                                }
+                                None => *null_count,
+                            })
+                        })
+                        .collect(),
+                ),
+                SharedInt64WindowOutput::Sum => WindowFunctionValues::Float64(
+                    keys.iter()
+                        .map(|key| {
+                            let (sum, count) = match key {
+                                Some(key) => {
+                                    let slot = (*key - *min) as usize;
+                                    (
+                                        sums.get(slot).copied().unwrap_or(0.0),
+                                        counts.get(slot).copied().unwrap_or(0),
+                                    )
+                                }
+                                None => (*null_sum, *null_count),
+                            };
+                            (count > 0).then_some(sum)
+                        })
+                        .collect(),
+                ),
+                SharedInt64WindowOutput::Avg => WindowFunctionValues::Float64(
+                    keys.iter()
+                        .map(|key| {
+                            let (sum, count) = match key {
+                                Some(key) => {
+                                    let slot = (*key - *min) as usize;
+                                    (
+                                        sums.get(slot).copied().unwrap_or(0.0),
+                                        counts.get(slot).copied().unwrap_or(0),
+                                    )
+                                }
+                                None => (*null_sum, *null_count),
+                            };
+                            (count > 0).then_some(sum / count as f64)
+                        })
+                        .collect(),
+                ),
+            },
+            _ => {
+                return Err(DodamError::UnsupportedSql(
+                    "window aggregate state/function mismatch".to_string(),
+                ));
+            }
+        };
+        fields.push(Arc::new(Field::new(
+            function.output_name.clone(),
+            values.data_type(),
+            values.is_nullable(),
+        )));
+        columns.push(values.into_array());
+    }
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns,
+    )?)
+}
+
+fn append_int32_partition_hash_window_columns(
+    batch: &RecordBatch,
+    window: &WindowProjection,
+) -> Result<Option<RecordBatch>> {
+    if !window_partition_hash_aggregate_safe(window) {
+        return Ok(None);
+    }
+    let Some(first_function) = window.functions.first() else {
+        return Ok(None);
+    };
+    if !window
+        .functions
+        .iter()
+        .all(|function| function.partition_by == first_function.partition_by)
+    {
+        return Ok(None);
+    }
+    let Some(keys) = single_int32_window_partition_keys(batch, first_function)? else {
+        return Ok(None);
+    };
+
+    let mut fields = batch.schema().fields().to_vec();
+    let mut columns = batch.columns().to_vec();
+    for function in &window.functions {
+        let values = match function.function {
+            WindowFunctionKind::Count => {
+                let argument_values = function
+                    .argument
+                    .as_ref()
+                    .map(|argument| evaluate_scalar_expression(batch, argument))
+                    .transpose()?;
+                let present = argument_values
+                    .map(evaluated_scalar_present_mask)
+                    .transpose()?
+                    .unwrap_or_else(|| vec![true; batch.num_rows()]);
+                WindowFunctionValues::UInt64(window_hash_count_values_i32(&keys, &present))
+            }
+            WindowFunctionKind::Sum | WindowFunctionKind::Avg => {
+                let argument = function.argument.as_ref().ok_or_else(|| {
+                    DodamError::UnsupportedSql("window aggregate requires an argument".to_string())
+                })?;
+                let values = scalar_as_f64(evaluate_scalar_expression(batch, argument)?)?;
+                let (sums, counts) = window_hash_sum_count_values_i32(&keys, &values);
+                if function.function == WindowFunctionKind::Sum {
+                    WindowFunctionValues::Float64(sums)
+                } else {
+                    WindowFunctionValues::Float64(
+                        sums.into_iter()
+                            .zip(counts)
+                            .map(|(sum, count)| match (sum, count) {
+                                (Some(sum), count) if count > 0 => Some(sum / count as f64),
+                                _ => None,
+                            })
+                            .collect(),
+                    )
+                }
+            }
+            WindowFunctionKind::RowNumber
+            | WindowFunctionKind::Rank
+            | WindowFunctionKind::DenseRank => return Ok(None),
+        };
+        fields.push(Arc::new(Field::new(
+            function.output_name.clone(),
+            values.data_type(),
+            values.is_nullable(),
+        )));
+        columns.push(values.into_array());
+    }
+    Ok(Some(RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns,
+    )?))
+}
+
+fn coalesce_batches(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
+    if batches.len() <= 1 {
+        return Ok(batches);
+    }
+    let schema = batches[0].schema();
+    Ok(vec![concat_batches(&schema, batches.iter())?])
+}
+
+enum WindowFunctionValues {
+    UInt64(Vec<Option<u64>>),
+    Float64(Vec<Option<f64>>),
+}
+
+impl WindowFunctionValues {
+    fn data_type(&self) -> DataType {
+        match self {
+            Self::UInt64(_) => DataType::UInt64,
+            Self::Float64(_) => DataType::Float64,
+        }
+    }
+
+    fn is_nullable(&self) -> bool {
+        match self {
+            Self::UInt64(values) => values.iter().any(Option::is_none),
+            Self::Float64(values) => values.iter().any(Option::is_none),
+        }
+    }
+
+    fn into_array(self) -> ArrayRef {
+        match self {
+            Self::UInt64(values) => Arc::new(UInt64Array::from(values)) as ArrayRef,
+            Self::Float64(values) => Arc::new(Float64Array::from(values)) as ArrayRef,
+        }
+    }
+}
+
 fn window_function_values(
     batch: &RecordBatch,
     window: &WindowProjectionFunction,
-    offset: u64,
-) -> Result<Vec<u64>> {
+) -> Result<WindowFunctionValues> {
     match window.function {
         WindowFunctionKind::RowNumber if window.partition_by.is_empty() => {
-            return Ok((1..=batch.num_rows())
-                .map(|row| offset + row as u64)
-                .collect());
+            return Ok(WindowFunctionValues::UInt64(
+                (1..=batch.num_rows()).map(|row| Some(row as u64)).collect(),
+            ));
+        }
+        WindowFunctionKind::Sum | WindowFunctionKind::Count | WindowFunctionKind::Avg => {
+            return window_aggregate_values(batch, window);
         }
         _ => {}
     }
@@ -7214,14 +8900,445 @@ fn window_function_values(
                 .map_err(|_| DodamError::UnsupportedSql("window rank overflow".to_string()))?;
             dense_rank += 1;
         }
-        values.push(match window.function {
+        values.push(Some(match window.function {
             WindowFunctionKind::RowNumber => u64::try_from(row - partition_start + 1)
                 .map_err(|_| DodamError::UnsupportedSql("row_number overflow".to_string()))?,
             WindowFunctionKind::Rank => rank,
             WindowFunctionKind::DenseRank => dense_rank,
-        });
+            WindowFunctionKind::Sum | WindowFunctionKind::Count | WindowFunctionKind::Avg => {
+                unreachable!("window aggregates are handled before ranking loop")
+            }
+        }));
     }
-    Ok(values)
+    Ok(WindowFunctionValues::UInt64(values))
+}
+
+fn window_aggregate_values(
+    batch: &RecordBatch,
+    window: &WindowProjectionFunction,
+) -> Result<WindowFunctionValues> {
+    match window.function {
+        WindowFunctionKind::Count => {
+            let argument_values = window
+                .argument
+                .as_ref()
+                .map(|argument| evaluate_scalar_expression(batch, argument))
+                .transpose()?;
+            let present = argument_values
+                .map(evaluated_scalar_present_mask)
+                .transpose()?
+                .unwrap_or_else(|| vec![true; batch.num_rows()]);
+            Ok(WindowFunctionValues::UInt64(window_count_values(
+                batch, window, &present,
+            )?))
+        }
+        WindowFunctionKind::Sum | WindowFunctionKind::Avg => {
+            let argument = window.argument.as_ref().ok_or_else(|| {
+                DodamError::UnsupportedSql("window aggregate requires an argument".to_string())
+            })?;
+            let values = scalar_as_f64(evaluate_scalar_expression(batch, argument)?)?;
+            let (sums, counts) = window_sum_count_values(batch, window, &values)?;
+            if window.function == WindowFunctionKind::Sum {
+                Ok(WindowFunctionValues::Float64(sums))
+            } else {
+                Ok(WindowFunctionValues::Float64(
+                    sums.into_iter()
+                        .zip(counts)
+                        .map(|(sum, count)| match (sum, count) {
+                            (Some(sum), count) if count > 0 => Some(sum / count as f64),
+                            _ => None,
+                        })
+                        .collect(),
+                ))
+            }
+        }
+        WindowFunctionKind::RowNumber
+        | WindowFunctionKind::Rank
+        | WindowFunctionKind::DenseRank => {
+            unreachable!("ranking functions are not aggregate windows")
+        }
+    }
+}
+
+fn evaluated_scalar_present_mask(value: EvaluatedScalar) -> Result<Vec<bool>> {
+    Ok(match value {
+        EvaluatedScalar::Array(array) => (0..array.len()).map(|row| !array.is_null(row)).collect(),
+        EvaluatedScalar::Int64(values) => values.into_iter().map(|value| value.is_some()).collect(),
+        EvaluatedScalar::Float64(values) => {
+            values.into_iter().map(|value| value.is_some()).collect()
+        }
+        EvaluatedScalar::Decimal128 { values, .. } => {
+            values.into_iter().map(|value| value.is_some()).collect()
+        }
+        EvaluatedScalar::Utf8(values) => values.into_iter().map(|value| value.is_some()).collect(),
+        EvaluatedScalar::Boolean(values) => {
+            values.into_iter().map(|value| value.is_some()).collect()
+        }
+        EvaluatedScalar::Date32(values) => {
+            values.into_iter().map(|value| value.is_some()).collect()
+        }
+        EvaluatedScalar::TimestampMillisecond(values) => {
+            values.into_iter().map(|value| value.is_some()).collect()
+        }
+    })
+}
+
+fn window_count_values(
+    batch: &RecordBatch,
+    window: &WindowProjectionFunction,
+    present: &[bool],
+) -> Result<Vec<Option<u64>>> {
+    if !window.partition_by.is_empty() && window.order_by.is_empty() {
+        return window_hash_count_values(batch, window, present);
+    }
+    let mut output = vec![None; batch.num_rows()];
+    for (start, end) in window_partition_ranges(batch, window)? {
+        if window.order_by.is_empty() {
+            let count = present[start..end]
+                .iter()
+                .filter(|present| **present)
+                .count() as u64;
+            output[start..end].fill(Some(count));
+            continue;
+        }
+        let mut count = 0_u64;
+        for row in start..end {
+            if present[row] {
+                count += 1;
+            }
+            output[row] = Some(count);
+        }
+    }
+    Ok(output)
+}
+
+fn window_sum_count_values(
+    batch: &RecordBatch,
+    window: &WindowProjectionFunction,
+    values: &[Option<f64>],
+) -> Result<(Vec<Option<f64>>, Vec<u64>)> {
+    if !window.partition_by.is_empty() && window.order_by.is_empty() {
+        return window_hash_sum_count_values(batch, window, values);
+    }
+    let mut sums = vec![None; batch.num_rows()];
+    let mut counts = vec![0_u64; batch.num_rows()];
+    for (start, end) in window_partition_ranges(batch, window)? {
+        if window.order_by.is_empty() {
+            let mut sum = 0.0;
+            let mut count = 0_u64;
+            for value in &values[start..end] {
+                if let Some(value) = value {
+                    sum += value;
+                    count += 1;
+                }
+            }
+            let partition_sum = (count > 0).then_some(sum);
+            sums[start..end].fill(partition_sum);
+            counts[start..end].fill(count);
+            continue;
+        }
+        let mut sum = 0.0;
+        let mut count = 0_u64;
+        for row in start..end {
+            if let Some(value) = values[row] {
+                sum += value;
+                count += 1;
+            }
+            sums[row] = (count > 0).then_some(sum);
+            counts[row] = count;
+        }
+    }
+    Ok((sums, counts))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum WindowPartitionValue {
+    Null,
+    Boolean(bool),
+    Int32(i32),
+    Int64(i64),
+    UInt32(u32),
+    UInt64(u64),
+    Float64(u64),
+    Date32(i32),
+    Date64(i64),
+    TimestampMillisecond(i64),
+    Utf8(String),
+    Decimal128(i128),
+    Display(String),
+}
+
+type WindowPartitionKey = Vec<WindowPartitionValue>;
+
+fn window_hash_count_values(
+    batch: &RecordBatch,
+    window: &WindowProjectionFunction,
+    present: &[bool],
+) -> Result<Vec<Option<u64>>> {
+    if let Some(keys) = single_int32_window_partition_keys(batch, window)? {
+        return Ok(window_hash_count_values_i32(&keys, present));
+    }
+    let mut counts = HashMap::<WindowPartitionKey, u64>::new();
+    let mut keys = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        let key = window_partition_key(batch, &window.partition_by, row)?;
+        if present[row] {
+            *counts.entry(key.clone()).or_insert(0) += 1;
+        } else {
+            counts.entry(key.clone()).or_insert(0);
+        }
+        keys.push(key);
+    }
+    keys.into_iter()
+        .map(|key| {
+            counts.get(&key).copied().map(Some).ok_or_else(|| {
+                DodamError::UnsupportedSql("window partition count key missing".to_string())
+            })
+        })
+        .collect()
+}
+
+fn window_hash_sum_count_values(
+    batch: &RecordBatch,
+    window: &WindowProjectionFunction,
+    values: &[Option<f64>],
+) -> Result<(Vec<Option<f64>>, Vec<u64>)> {
+    if let Some(keys) = single_int32_window_partition_keys(batch, window)? {
+        return Ok(window_hash_sum_count_values_i32(&keys, values));
+    }
+    let mut aggregates = HashMap::<WindowPartitionKey, (f64, u64)>::new();
+    let mut keys = Vec::with_capacity(batch.num_rows());
+    for (row, value) in values.iter().enumerate().take(batch.num_rows()) {
+        let key = window_partition_key(batch, &window.partition_by, row)?;
+        let entry = aggregates.entry(key.clone()).or_insert((0.0, 0));
+        if let Some(value) = value {
+            entry.0 += value;
+            entry.1 += 1;
+        }
+        keys.push(key);
+    }
+    let mut sums = Vec::with_capacity(batch.num_rows());
+    let mut counts = Vec::with_capacity(batch.num_rows());
+    for key in keys {
+        let (sum, count) = aggregates.get(&key).copied().ok_or_else(|| {
+            DodamError::UnsupportedSql("window partition sum key missing".to_string())
+        })?;
+        sums.push((count > 0).then_some(sum));
+        counts.push(count);
+    }
+    Ok((sums, counts))
+}
+
+fn single_int32_window_partition_keys(
+    batch: &RecordBatch,
+    window: &WindowProjectionFunction,
+) -> Result<Option<Vec<Option<i32>>>> {
+    let Some(values) = single_int32_window_partition_array(batch, window)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        (0..values.len())
+            .map(|row| (!values.is_null(row)).then(|| values.value(row)))
+            .collect(),
+    ))
+}
+
+fn single_int32_window_partition_array<'a>(
+    batch: &'a RecordBatch,
+    window: &WindowProjectionFunction,
+) -> Result<Option<&'a Int32Array>> {
+    let [column] = window.partition_by.as_slice() else {
+        return Ok(None);
+    };
+    let index = output_batch_column_index(batch, column)?;
+    let array = batch.column(index);
+    let Some(values) = array.as_any().downcast_ref::<Int32Array>() else {
+        return Ok(None);
+    };
+    Ok(Some(values))
+}
+
+fn window_hash_count_values_i32(keys: &[Option<i32>], present: &[bool]) -> Vec<Option<u64>> {
+    let mut counts = HashMap::<Option<i32>, u64>::new();
+    for (key, present) in keys.iter().zip(present) {
+        if *present {
+            *counts.entry(*key).or_insert(0) += 1;
+        } else {
+            counts.entry(*key).or_insert(0);
+        }
+    }
+    keys.iter()
+        .map(|key| Some(counts.get(key).copied().unwrap_or(0)))
+        .collect()
+}
+
+fn window_hash_sum_count_values_i32(
+    keys: &[Option<i32>],
+    values: &[Option<f64>],
+) -> (Vec<Option<f64>>, Vec<u64>) {
+    let mut aggregates = HashMap::<Option<i32>, (f64, u64)>::new();
+    for (key, value) in keys.iter().zip(values) {
+        let entry = aggregates.entry(*key).or_insert((0.0, 0));
+        if let Some(value) = value {
+            entry.0 += value;
+            entry.1 += 1;
+        }
+    }
+    let mut sums = Vec::with_capacity(keys.len());
+    let mut counts = Vec::with_capacity(keys.len());
+    for key in keys {
+        let (sum, count) = aggregates.get(key).copied().unwrap_or((0.0, 0));
+        sums.push((count > 0).then_some(sum));
+        counts.push(count);
+    }
+    (sums, counts)
+}
+
+fn window_partition_key(
+    batch: &RecordBatch,
+    columns: &[String],
+    row: usize,
+) -> Result<WindowPartitionKey> {
+    columns
+        .iter()
+        .map(|column| {
+            let index = output_batch_column_index(batch, column)?;
+            window_partition_value(batch.column(index).as_ref(), row)
+        })
+        .collect()
+}
+
+fn window_partition_value(array: &dyn Array, row: usize) -> Result<WindowPartitionValue> {
+    if array.is_null(row) {
+        return Ok(WindowPartitionValue::Null);
+    }
+    match array.data_type() {
+        DataType::Boolean => {
+            let values = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    DodamError::TypeMismatch("expected BooleanArray for Boolean data".to_string())
+                })?;
+            Ok(WindowPartitionValue::Boolean(values.value(row)))
+        }
+        DataType::Int32 => {
+            let values = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                DodamError::TypeMismatch("expected Int32Array for Int32 data".to_string())
+            })?;
+            Ok(WindowPartitionValue::Int32(values.value(row)))
+        }
+        DataType::Int64 => {
+            let values = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                DodamError::TypeMismatch("expected Int64Array for Int64 data".to_string())
+            })?;
+            Ok(WindowPartitionValue::Int64(values.value(row)))
+        }
+        DataType::UInt32 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| {
+                    DodamError::TypeMismatch("expected UInt32Array for UInt32 data".to_string())
+                })?;
+            Ok(WindowPartitionValue::UInt32(values.value(row)))
+        }
+        DataType::UInt64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| {
+                    DodamError::TypeMismatch("expected UInt64Array for UInt64 data".to_string())
+                })?;
+            Ok(WindowPartitionValue::UInt64(values.value(row)))
+        }
+        DataType::Float64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| {
+                    DodamError::TypeMismatch("expected Float64Array for Float64 data".to_string())
+                })?;
+            Ok(WindowPartitionValue::Float64(values.value(row).to_bits()))
+        }
+        DataType::Date32 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| {
+                    DodamError::TypeMismatch("expected Date32Array for Date32 data".to_string())
+                })?;
+            Ok(WindowPartitionValue::Date32(values.value(row)))
+        }
+        DataType::Date64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Date64Array>()
+                .ok_or_else(|| {
+                    DodamError::TypeMismatch("expected Date64Array for Date64 data".to_string())
+                })?;
+            Ok(WindowPartitionValue::Date64(values.value(row)))
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, None) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .ok_or_else(|| {
+                    DodamError::TypeMismatch(
+                        "expected TimestampMillisecondArray for Timestamp(Millisecond) data"
+                            .to_string(),
+                    )
+                })?;
+            Ok(WindowPartitionValue::TimestampMillisecond(
+                values.value(row),
+            ))
+        }
+        DataType::Utf8 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    DodamError::TypeMismatch("expected StringArray for Utf8 data".to_string())
+                })?;
+            Ok(WindowPartitionValue::Utf8(values.value(row).to_string()))
+        }
+        DataType::Decimal128(_, _) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| {
+                    DodamError::TypeMismatch(
+                        "expected Decimal128Array for Decimal128 data".to_string(),
+                    )
+                })?;
+            Ok(WindowPartitionValue::Decimal128(values.value(row)))
+        }
+        _ => Ok(WindowPartitionValue::Display(array_value_to_string(
+            array, row,
+        )?)),
+    }
+}
+
+fn window_partition_ranges(
+    batch: &RecordBatch,
+    window: &WindowProjectionFunction,
+) -> Result<Vec<(usize, usize)>> {
+    if batch.num_rows() == 0 {
+        return Ok(Vec::new());
+    }
+    if window.partition_by.is_empty() {
+        return Ok(vec![(0, batch.num_rows())]);
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0_usize;
+    for row in 1..batch.num_rows() {
+        if !window_partition_equal(batch, window, row - 1, row)? {
+            ranges.push((start, row));
+            start = row;
+        }
+    }
+    ranges.push((start, batch.num_rows()));
+    Ok(ranges)
 }
 
 fn window_partition_equal(
@@ -7257,13 +9374,115 @@ fn rows_equal_on_columns(
         if array.is_null(left) {
             continue;
         }
-        if array_value_to_string(array.as_ref(), left)?
-            != array_value_to_string(array.as_ref(), right)?
-        {
+        if !array_values_equal(array.as_ref(), left, right)? {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+fn array_values_equal(array: &dyn Array, left: usize, right: usize) -> Result<bool> {
+    match array.data_type() {
+        DataType::Boolean => {
+            let values = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    DodamError::TypeMismatch("expected BooleanArray for Boolean data".to_string())
+                })?;
+            Ok(values.value(left) == values.value(right))
+        }
+        DataType::Int32 => {
+            let values = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                DodamError::TypeMismatch("expected Int32Array for Int32 data".to_string())
+            })?;
+            Ok(values.value(left) == values.value(right))
+        }
+        DataType::Int64 => {
+            let values = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                DodamError::TypeMismatch("expected Int64Array for Int64 data".to_string())
+            })?;
+            Ok(values.value(left) == values.value(right))
+        }
+        DataType::UInt32 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| {
+                    DodamError::TypeMismatch("expected UInt32Array for UInt32 data".to_string())
+                })?;
+            Ok(values.value(left) == values.value(right))
+        }
+        DataType::UInt64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| {
+                    DodamError::TypeMismatch("expected UInt64Array for UInt64 data".to_string())
+                })?;
+            Ok(values.value(left) == values.value(right))
+        }
+        DataType::Float64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| {
+                    DodamError::TypeMismatch("expected Float64Array for Float64 data".to_string())
+                })?;
+            Ok(values.value(left) == values.value(right))
+        }
+        DataType::Date32 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| {
+                    DodamError::TypeMismatch("expected Date32Array for Date32 data".to_string())
+                })?;
+            Ok(values.value(left) == values.value(right))
+        }
+        DataType::Date64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Date64Array>()
+                .ok_or_else(|| {
+                    DodamError::TypeMismatch("expected Date64Array for Date64 data".to_string())
+                })?;
+            Ok(values.value(left) == values.value(right))
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, None) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .ok_or_else(|| {
+                    DodamError::TypeMismatch(
+                        "expected TimestampMillisecondArray for Timestamp(Millisecond) data"
+                            .to_string(),
+                    )
+                })?;
+            Ok(values.value(left) == values.value(right))
+        }
+        DataType::Utf8 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    DodamError::TypeMismatch("expected StringArray for Utf8 data".to_string())
+                })?;
+            Ok(values.value(left) == values.value(right))
+        }
+        DataType::Decimal128(_, _) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| {
+                    DodamError::TypeMismatch(
+                        "expected Decimal128Array for Decimal128 data".to_string(),
+                    )
+                })?;
+            Ok(values.value(left) == values.value(right))
+        }
+        _ => Ok(array_value_to_string(array, left)? == array_value_to_string(array, right)?),
+    }
 }
 
 async fn split_subquery_and_expression_filters(
@@ -7384,6 +9603,23 @@ fn safe_expression_pushdown_filter(
             escape_char,
             table_alias,
             parser_kind,
+            false,
+        )?,
+        SqlExpr::ILike {
+            expr,
+            pattern,
+            negated,
+            any,
+            escape_char,
+        } => safe_expression_like_pushdown(
+            expr,
+            pattern,
+            *negated,
+            *any,
+            escape_char,
+            table_alias,
+            parser_kind,
+            true,
         )?,
         _ => None,
     };
@@ -7494,6 +9730,7 @@ fn safe_expression_like_pushdown(
     escape_char: &Option<sqlparser::ast::ValueWithSpan>,
     table_alias: Option<&str>,
     parser_kind: PredicateParserKind,
+    case_insensitive: bool,
 ) -> Result<Option<FilterExpr>> {
     if any {
         return Ok(None);
@@ -7506,6 +9743,7 @@ fn safe_expression_like_pushdown(
         pattern: sql_like_pattern(pattern)?,
         negated,
         escape: sql_like_escape(escape_char)?,
+        case_insensitive,
     })))
 }
 
@@ -8045,7 +10283,7 @@ fn predicate_requires_expression_path(expr: &SqlExpr) -> bool {
                 || scalar_predicate_side_requires_expression(low)
                 || scalar_predicate_side_requires_expression(high)
         }
-        SqlExpr::Like { expr, pattern, .. } => {
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
             scalar_predicate_side_requires_expression(expr)
                 || scalar_predicate_side_requires_expression(pattern)
         }
@@ -8056,7 +10294,7 @@ fn predicate_requires_expression_path(expr: &SqlExpr) -> bool {
 fn scalar_predicate_side_requires_expression(expr: &SqlExpr) -> bool {
     match expr {
         SqlExpr::Identifier(_) => false,
-        SqlExpr::CompoundIdentifier(parts) => parts.len() > 1,
+        SqlExpr::CompoundIdentifier(parts) => parts.len() > 2,
         SqlExpr::Function(_)
         | SqlExpr::Substring { .. }
         | SqlExpr::Cast { .. }
@@ -8131,6 +10369,10 @@ fn collect_predicate_expression_columns(
             for item in list {
                 collect_predicate_expression_columns(item, table_alias, columns)?;
             }
+        }
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            collect_predicate_expression_columns(expr, table_alias, columns)?;
+            collect_predicate_expression_columns(pattern, table_alias, columns)?;
         }
         SqlExpr::Exists { subquery, .. }
         | SqlExpr::InSubquery { subquery, .. }
@@ -8275,7 +10517,7 @@ fn expr_contains_scalar_subquery(expr: &SqlExpr) -> bool {
                 || expr_contains_scalar_subquery(low)
                 || expr_contains_scalar_subquery(high)
         }
-        SqlExpr::Like { expr, pattern, .. } => {
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
             expr_contains_scalar_subquery(expr) || expr_contains_scalar_subquery(pattern)
         }
         _ => false,
@@ -27705,84 +29947,6 @@ fn q05_output(rows: Vec<Q05Row>) -> Result<QueryOutput> {
     })
 }
 
-async fn try_execute_q06_forecast_revenue_fast(
-    engine: &DodamEngine,
-    sql: &str,
-    batch_size: usize,
-) -> Result<Option<QueryOutput>> {
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Ok(None);
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Ok(None);
-    };
-    let Some(selection) = select.selection.as_ref() else {
-        return Ok(None);
-    };
-    if !q06_shape(select, query, selection) {
-        return Ok(None);
-    }
-    reject_query_features(query)?;
-    reject_select_features(select)?;
-    let table = parse_from(select)?;
-    if !table_ref_alias_or_name(&table).eq_ignore_ascii_case("lineitem") {
-        return Ok(None);
-    }
-    let mut conjuncts = Vec::new();
-    collect_sql_and_conjuncts(selection, &mut conjuncts);
-    let Some((start_days, end_days)) = date_range_bounds(&conjuncts, "l_shipdate")? else {
-        return Ok(None);
-    };
-    let Some((discount_low, discount_high)) = numeric_between_bounds(&conjuncts, "l_discount")?
-    else {
-        return Ok(None);
-    };
-    let Some(quantity_limit) = upper_numeric_bound(&conjuncts, "l_quantity")? else {
-        return Ok(None);
-    };
-    let Some((sum, count)) = q06_revenue_sum(
-        engine,
-        table.path,
-        batch_size,
-        start_days,
-        end_days,
-        discount_low,
-        discount_high,
-        quantity_limit,
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(q17_output(
-        "revenue".to_string(),
-        (count > 0).then_some(sum),
-    )?))
-}
-
-fn q06_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
-    if !matches!(parse_limit(query), Ok(None)) {
-        return false;
-    }
-    let projection = select
-        .projection
-        .iter()
-        .map(|item| item.to_string().to_ascii_lowercase())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let selection = selection.to_string().to_ascii_lowercase();
-    select.projection.len() == 1
-        && projection.contains("sum(")
-        && projection.contains("l_extendedprice")
-        && projection.contains("l_discount")
-        && selection.contains("l_shipdate")
-        && selection.contains("l_discount")
-        && selection.contains("l_quantity")
-}
-
 fn numeric_between_bounds(conjuncts: &[SqlExpr], column: &str) -> Result<Option<(f64, f64)>> {
     for conjunct in conjuncts {
         let SqlExpr::Between {
@@ -27841,740 +30005,6 @@ fn lower_numeric_bound(conjuncts: &[SqlExpr], column: &str) -> Result<Option<f64
         }
     }
     Ok(bound)
-}
-
-async fn q06_revenue_sum(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-    start_days: i32,
-    end_days: i32,
-    discount_low: f64,
-    discount_high: f64,
-    quantity_limit: f64,
-) -> Result<Option<(f64, u64)>> {
-    if std::env::var_os("DODAM_Q06_ENABLE_LATE_MATERIALIZE").is_some() {
-        if let Some(result) = engine
-            .q06_late_materialized_revenue_sum(
-                path.clone(),
-                batch_size,
-                start_days,
-                end_days,
-                discount_low,
-                discount_high,
-                quantity_limit,
-            )
-            .await?
-        {
-            return Ok(Some(result));
-        }
-    }
-    if q06_direct_primitive_enabled()
-        && let Some(result) = q06_revenue_sum_direct_primitive(
-            engine,
-            path.clone(),
-            batch_size,
-            start_days,
-            end_days,
-            discount_low,
-            discount_high,
-            quantity_limit,
-        )?
-    {
-        return Ok(Some(result));
-    }
-    let row_filter_enabled = q06_row_filter_enabled();
-    let projection = if row_filter_enabled {
-        Projection::Columns(vec![
-            "l_discount".to_string(),
-            "l_extendedprice".to_string(),
-        ])
-    } else {
-        Projection::Columns(vec![
-            "l_shipdate".to_string(),
-            "l_discount".to_string(),
-            "l_quantity".to_string(),
-            "l_extendedprice".to_string(),
-        ])
-    };
-    if !row_filter_enabled {
-        return engine
-            .parquet_scan_accumulate_chunks_view(
-                path,
-                batch_size,
-                projection,
-                scan_aggregate_row_group_chunk(),
-                q06_revenue_chunk_size(),
-                scan_aggregate_fusion_enabled(),
-                || Some((0.0, 0_u64)),
-                || Some((0.0, 0_u64)),
-                move |view, total| {
-                    let batch = q06_revenue_sum_view(
-                        view,
-                        start_days,
-                        end_days,
-                        discount_low,
-                        discount_high,
-                        quantity_limit,
-                    )?;
-                    if let (Some(total), Some(batch)) = (total.as_mut(), batch) {
-                        total.0 += batch.0;
-                        total.1 += batch.1;
-                    } else {
-                        *total = None;
-                    }
-                    Ok(Some(()))
-                },
-                |total, batch| {
-                    if let (Some(total), Some(batch)) = (total.as_mut(), batch) {
-                        total.0 += batch.0;
-                        total.1 += batch.1;
-                    } else {
-                        *total = None;
-                    }
-                },
-                "Q06 revenue sum",
-            )
-            .await;
-    }
-
-    let mut stream = {
-        engine
-            .scan_parquet_batches_row_filtered(
-                path,
-                batch_size,
-                projection,
-                q06_row_filter_predicates(
-                    start_days,
-                    end_days,
-                    discount_low,
-                    discount_high,
-                    quantity_limit,
-                ),
-            )
-            .await?
-    };
-    parallel_batch_fold_view_chunks(
-        &mut stream,
-        q06_revenue_chunk_size(),
-        || Some((0.0, 0_u64)),
-        move |view, total: &mut Option<(f64, u64)>| {
-            let batch_result = if row_filter_enabled {
-                q06_filtered_revenue_sum_view(view)?
-            } else {
-                q06_revenue_sum_view(
-                    view,
-                    start_days,
-                    end_days,
-                    discount_low,
-                    discount_high,
-                    quantity_limit,
-                )?
-            };
-            if let (Some(total), Some(batch)) = (total.as_mut(), batch_result) {
-                total.0 += batch.0;
-                total.1 += batch.1;
-            } else {
-                *total = None;
-            }
-            Ok(Some(()))
-        },
-        Ok,
-        Some((0.0, 0_u64)),
-        |total, batch| {
-            if let (Some(total), Some(batch)) = (total.as_mut(), batch) {
-                total.0 += batch.0;
-                total.1 += batch.1;
-            } else {
-                *total = None;
-            }
-        },
-        "Q06 revenue sum",
-    )
-}
-
-fn q06_direct_primitive_enabled() -> bool {
-    std::env::var("DODAM_Q06_ENABLE_DIRECT_PRIMITIVE")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn q06_revenue_sum_direct_primitive(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-    start_days: i32,
-    end_days: i32,
-    discount_low: f64,
-    discount_high: f64,
-    quantity_limit: f64,
-) -> Result<Option<(f64, u64)>> {
-    let started = tpch_profile_start();
-    let row_groups = (0..engine.parquet_row_group_count(&path)?).collect::<Vec<_>>();
-    let columns = vec![
-        ("l_shipdate".to_string(), DirectPrimitiveColumnType::Date32),
-        (
-            "l_discount".to_string(),
-            DirectPrimitiveColumnType::Decimal128Int64Raw {
-                precision: 15,
-                scale: 2,
-            },
-        ),
-        (
-            "l_quantity".to_string(),
-            DirectPrimitiveColumnType::Decimal128Int64Raw {
-                precision: 15,
-                scale: 2,
-            },
-        ),
-        (
-            "l_extendedprice".to_string(),
-            DirectPrimitiveColumnType::Decimal128Int64Raw {
-                precision: 15,
-                scale: 2,
-            },
-        ),
-    ];
-    let Some((total, metrics)) = engine.scan_parquet_primitive_columns_parallel_view_fold(
-        path.clone(),
-        batch_size,
-        row_groups,
-        columns,
-        || Some((0.0, 0_u64)),
-        |total, view| {
-            let batch = q06_revenue_sum_view(
-                view,
-                start_days,
-                end_days,
-                discount_low,
-                discount_high,
-                quantity_limit,
-            )?;
-            if let (Some(total), Some(batch)) = (total.as_mut(), batch) {
-                total.0 += batch.0;
-                total.1 += batch.1;
-            } else {
-                *total = None;
-            }
-            Ok(())
-        },
-        |total, partial| {
-            if let (Some(total), Some(partial)) = (total.as_mut(), partial) {
-                total.0 += partial.0;
-                total.1 += partial.1;
-            } else {
-                *total = None;
-            }
-            Ok(())
-        },
-    )?
-    else {
-        return Ok(None);
-    };
-    let Some(total) = total else {
-        return Ok(None);
-    };
-    if let Some(started) = started {
-        eprintln!(
-            "[dodam:tpch-profile] Q06 direct_primitive: total={:.3} ms row_groups={} batches={} rows={} read={:.3} ms consume={:.3} ms",
-            started.elapsed().as_secs_f64() * 1000.0,
-            metrics.row_groups,
-            metrics.batches,
-            metrics.rows,
-            sql_nanos_to_millis(metrics.read_nanos),
-            sql_nanos_to_millis(metrics.consume_nanos),
-        );
-    }
-    Ok(Some(total))
-}
-
-fn q06_row_filter_enabled() -> bool {
-    std::env::var_os("DODAM_Q06_ROW_FILTER").is_some()
-}
-
-fn q06_row_filter_predicates(
-    start_days: i32,
-    end_days: i32,
-    discount_low: f64,
-    discount_high: f64,
-    quantity_limit: f64,
-) -> Vec<Expr> {
-    let predicates = vec![
-        q06_comparison(
-            "l_shipdate",
-            ComparisonOp::GtEq,
-            LiteralValue::Int64(i64::from(start_days)),
-        ),
-        q06_comparison(
-            "l_shipdate",
-            ComparisonOp::Lt,
-            LiteralValue::Int64(i64::from(end_days)),
-        ),
-        q06_comparison(
-            "l_discount",
-            ComparisonOp::GtEq,
-            LiteralValue::Float64(discount_low),
-        ),
-        q06_comparison(
-            "l_discount",
-            ComparisonOp::LtEq,
-            LiteralValue::Float64(discount_high),
-        ),
-        q06_comparison(
-            "l_quantity",
-            ComparisonOp::Lt,
-            LiteralValue::Float64(quantity_limit),
-        ),
-    ];
-    vec![
-        predicates
-            .into_iter()
-            .reduce(|left, right| Expr::And(Box::new(left), Box::new(right)))
-            .expect("q06 row filter predicates"),
-    ]
-}
-
-fn q06_comparison(column: &str, op: ComparisonOp, value: LiteralValue) -> Expr {
-    Expr::Comparison(ComparisonExpr {
-        column: column.to_string(),
-        op,
-        value,
-    })
-}
-
-fn q06_revenue_chunk_size() -> usize {
-    std::env::var("DODAM_Q06_CHUNK_SIZE")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(4)
-}
-
-fn q06_filtered_revenue_sum_batch(batch: RecordBatch) -> Result<Option<(f64, u64)>> {
-    let discounts = batch_column(&batch, "l_discount")?;
-    let extendedprices = batch_column(&batch, "l_extendedprice")?;
-    let (Some(discounts), Some(extendedprices)) =
-        (decimal_input(discounts)?, decimal_input(extendedprices)?)
-    else {
-        return Ok(None);
-    };
-    let mut sum = 0.0;
-    let mut count = 0_u64;
-    if discounts.null_count() == 0 && extendedprices.null_count() == 0 {
-        let revenue_scale = 1.0 / (extendedprices.scale * discounts.scale);
-        if discounts.precision <= 18 && extendedprices.precision <= 18 {
-            for (&discount, &extendedprice) in discounts
-                .raw_values()
-                .iter()
-                .zip(extendedprices.raw_values())
-            {
-                sum += (extendedprice as i64 * discount as i64) as f64 * revenue_scale;
-                count += 1;
-            }
-            return Ok(Some((sum, count)));
-        }
-        for (&discount, &extendedprice) in discounts
-            .raw_values()
-            .iter()
-            .zip(extendedprices.raw_values())
-        {
-            sum += (extendedprice * discount) as f64 * revenue_scale;
-            count += 1;
-        }
-        return Ok(Some((sum, count)));
-    }
-    for row in 0..batch.num_rows() {
-        if discounts.is_null(row) || extendedprices.is_null(row) {
-            continue;
-        }
-        sum += extendedprices.value(row) * discounts.value(row);
-        count += 1;
-    }
-    Ok(Some((sum, count)))
-}
-
-fn q06_filtered_revenue_sum_view(view: BatchView<'_>) -> Result<Option<(f64, u64)>> {
-    if view.num_columns() == 2
-        && let (Some(discounts), Some(extendedprices)) =
-            (view.decimal128_vector(0), view.decimal128_vector(1))
-    {
-        return q06_filtered_revenue_sum_vectors(discounts, extendedprices, view.num_rows());
-    }
-    let Some(batch) = view.try_record_batch() else {
-        return Ok(None);
-    };
-    q06_filtered_revenue_sum_batch(batch.clone())
-}
-
-fn q06_filtered_revenue_sum_vectors(
-    discounts: Decimal128VectorView<'_>,
-    extendedprices: Decimal128VectorView<'_>,
-    row_count: usize,
-) -> Result<Option<(f64, u64)>> {
-    let mut sum = 0.0;
-    let mut count = 0_u64;
-    if discounts.null_count() == 0 && extendedprices.null_count() == 0 {
-        let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
-        if discounts.precision() <= 18 && extendedprices.precision() <= 18 {
-            if let (Some(discounts), Some(extendedprices)) =
-                (discounts.raw_i64_values(), extendedprices.raw_i64_values())
-            {
-                for (&discount, &extendedprice) in discounts.iter().zip(extendedprices) {
-                    sum += (extendedprice * discount) as f64 * revenue_scale;
-                    count += 1;
-                }
-                return Ok(Some((sum, count)));
-            }
-            for (&discount, &extendedprice) in discounts
-                .raw_values()
-                .iter()
-                .zip(extendedprices.raw_values())
-            {
-                sum += (extendedprice as i64 * discount as i64) as f64 * revenue_scale;
-                count += 1;
-            }
-            return Ok(Some((sum, count)));
-        }
-        for (&discount, &extendedprice) in discounts
-            .raw_values()
-            .iter()
-            .zip(extendedprices.raw_values())
-        {
-            sum += (extendedprice * discount) as f64 * revenue_scale;
-            count += 1;
-        }
-        return Ok(Some((sum, count)));
-    }
-    for row in 0..row_count {
-        if discounts.is_null(row) || extendedprices.is_null(row) {
-            continue;
-        }
-        sum += extendedprices.value(row) * discounts.value(row);
-        count += 1;
-    }
-    Ok(Some((sum, count)))
-}
-
-fn q06_revenue_sum_batch(
-    batch: RecordBatch,
-    start_days: i32,
-    end_days: i32,
-    discount_low: f64,
-    discount_high: f64,
-    quantity_limit: f64,
-) -> Result<Option<(f64, u64)>> {
-    let shipdates = batch_column(&batch, "l_shipdate")?;
-    let discounts = batch_column(&batch, "l_discount")?;
-    let quantities = batch_column(&batch, "l_quantity")?;
-    let extendedprices = batch_column(&batch, "l_extendedprice")?;
-    if let (Some(shipdates), Some(discounts), Some(quantities), Some(extendedprices)) = (
-        shipdates.as_any().downcast_ref::<Date32Array>(),
-        decimal_input(discounts)?,
-        decimal_input(quantities)?,
-        decimal_input(extendedprices)?,
-    ) {
-        let mut sum = 0.0;
-        let mut count = 0_u64;
-        if shipdates.null_count() == 0
-            && discounts.null_count() == 0
-            && quantities.null_count() == 0
-            && extendedprices.null_count() == 0
-        {
-            let discount_low_raw = scaled_f64_to_i128(discount_low, discounts.scale);
-            let discount_high_raw = scaled_f64_to_i128(discount_high, discounts.scale);
-            let quantity_limit_raw = scaled_f64_to_i128(quantity_limit, quantities.scale);
-            let revenue_scale = 1.0 / (extendedprices.scale * discounts.scale);
-            let shipdate_values = shipdates.values().as_ref();
-            let discount_values = discounts.raw_values();
-            let quantity_values = quantities.raw_values();
-            let extendedprice_values = extendedprices.raw_values();
-            if discounts.precision <= 18
-                && quantities.precision <= 18
-                && extendedprices.precision <= 18
-            {
-                let discount_low_raw = discount_low_raw as i64;
-                let discount_high_raw = discount_high_raw as i64;
-                let quantity_limit_raw = quantity_limit_raw as i64;
-                for row in 0..shipdate_values.len() {
-                    let shipdate = shipdate_values[row];
-                    let discount = discount_values[row] as i64;
-                    if shipdate < start_days
-                        || shipdate >= end_days
-                        || discount < discount_low_raw
-                        || discount > discount_high_raw
-                        || (quantity_values[row] as i64) >= quantity_limit_raw
-                    {
-                        continue;
-                    }
-                    sum += ((extendedprice_values[row] as i64) * discount) as f64 * revenue_scale;
-                    count += 1;
-                }
-                return Ok(Some((sum, count)));
-            }
-            for row in 0..shipdate_values.len() {
-                let shipdate = shipdate_values[row];
-                let discount = discount_values[row];
-                if shipdate < start_days
-                    || shipdate >= end_days
-                    || discount < discount_low_raw
-                    || discount > discount_high_raw
-                    || quantity_values[row] >= quantity_limit_raw
-                {
-                    continue;
-                }
-                sum += (extendedprice_values[row] * discount) as f64 * revenue_scale;
-                count += 1;
-            }
-            return Ok(Some((sum, count)));
-        }
-        for row in 0..batch.num_rows() {
-            if shipdates.is_null(row)
-                || discounts.is_null(row)
-                || quantities.is_null(row)
-                || extendedprices.is_null(row)
-            {
-                continue;
-            }
-            let shipdate = shipdates.value(row);
-            let discount = discounts.value(row);
-            if shipdate < start_days
-                || shipdate >= end_days
-                || discount < discount_low
-                || discount > discount_high
-                || quantities.value(row) >= quantity_limit
-            {
-                continue;
-            }
-            sum += extendedprices.value(row) * discount;
-            count += 1;
-        }
-        return Ok(Some((sum, count)));
-    }
-    Ok(None)
-}
-
-fn q06_revenue_sum_view(
-    view: BatchView<'_>,
-    start_days: i32,
-    end_days: i32,
-    discount_low: f64,
-    discount_high: f64,
-    quantity_limit: f64,
-) -> Result<Option<(f64, u64)>> {
-    if view.num_columns() == 4 {
-        let (Some(shipdates), Some(discounts), Some(quantities), Some(extendedprices)) = (
-            view.date32_vector(0),
-            view.decimal128_vector(1),
-            view.decimal128_vector(2),
-            view.decimal128_vector(3),
-        ) else {
-            let Some(batch) = view.try_record_batch() else {
-                return Ok(None);
-            };
-            return q06_revenue_sum_batch(
-                batch.clone(),
-                start_days,
-                end_days,
-                discount_low,
-                discount_high,
-                quantity_limit,
-            );
-        };
-        return q06_revenue_sum_vector_views(
-            shipdates,
-            discounts,
-            quantities,
-            extendedprices,
-            view.num_rows(),
-            start_days,
-            end_days,
-            discount_low,
-            discount_high,
-            quantity_limit,
-        );
-    }
-    let Some(batch) = view.try_record_batch() else {
-        return Ok(None);
-    };
-    q06_revenue_sum_batch(
-        batch.clone(),
-        start_days,
-        end_days,
-        discount_low,
-        discount_high,
-        quantity_limit,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn q06_revenue_sum_vector_views(
-    shipdates: Date32VectorView<'_>,
-    discounts: Decimal128VectorView<'_>,
-    quantities: Decimal128VectorView<'_>,
-    extendedprices: Decimal128VectorView<'_>,
-    row_count: usize,
-    start_days: i32,
-    end_days: i32,
-    discount_low: f64,
-    discount_high: f64,
-    quantity_limit: f64,
-) -> Result<Option<(f64, u64)>> {
-    if let Some(shipdate_values) = shipdates.values_if_null_free()
-        && discounts.null_count() == 0
-        && quantities.null_count() == 0
-        && extendedprices.null_count() == 0
-    {
-        let discount_low_raw = scaled_f64_to_i128(discount_low, discounts.scale());
-        let discount_high_raw = scaled_f64_to_i128(discount_high, discounts.scale());
-        let quantity_limit_raw = scaled_f64_to_i128(quantity_limit, quantities.scale());
-        let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
-        if discounts.precision() <= 18
-            && quantities.precision() <= 18
-            && extendedprices.precision() <= 18
-        {
-            if let (Some(discount_values), Some(quantity_values), Some(extendedprice_values)) = (
-                discounts.raw_i64_values(),
-                quantities.raw_i64_values(),
-                extendedprices.raw_i64_values(),
-            ) {
-                return Ok(Some(vector_q06_revenue_sum_i64_raw(
-                    shipdate_values,
-                    discount_values,
-                    quantity_values,
-                    extendedprice_values,
-                    start_days,
-                    end_days,
-                    discount_low_raw as i64,
-                    discount_high_raw as i64,
-                    quantity_limit_raw as i64,
-                    revenue_scale,
-                )));
-            }
-            let discount_values = discounts.raw_values();
-            let quantity_values = quantities.raw_values();
-            let extendedprice_values = extendedprices.raw_values();
-            return Ok(Some(vector_q06_revenue_sum_i64(
-                shipdate_values,
-                discount_values,
-                quantity_values,
-                extendedprice_values,
-                start_days,
-                end_days,
-                discount_low_raw as i64,
-                discount_high_raw as i64,
-                quantity_limit_raw as i64,
-                revenue_scale,
-            )));
-        }
-        let discount_values = discounts.raw_values();
-        let quantity_values = quantities.raw_values();
-        let extendedprice_values = extendedprices.raw_values();
-        let mut sum = 0.0;
-        let mut count = 0_u64;
-        for row in 0..shipdate_values.len() {
-            let shipdate = shipdate_values[row];
-            let discount = discount_values[row];
-            if shipdate < start_days
-                || shipdate >= end_days
-                || discount < discount_low_raw
-                || discount > discount_high_raw
-                || quantity_values[row] >= quantity_limit_raw
-            {
-                continue;
-            }
-            sum += (extendedprice_values[row] * discount) as f64 * revenue_scale;
-            count += 1;
-        }
-        return Ok(Some((sum, count)));
-    }
-    let mut sum = 0.0;
-    let mut count = 0_u64;
-    for row in 0..row_count {
-        if shipdates.is_null(row)
-            || discounts.is_null(row)
-            || quantities.is_null(row)
-            || extendedprices.is_null(row)
-        {
-            continue;
-        }
-        let shipdate = shipdates.value(row);
-        let discount = discounts.value(row);
-        if shipdate < start_days
-            || shipdate >= end_days
-            || discount < discount_low
-            || discount > discount_high
-            || quantities.value(row) >= quantity_limit
-        {
-            continue;
-        }
-        sum += extendedprices.value(row) * discount;
-        count += 1;
-    }
-    Ok(Some((sum, count)))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn vector_q06_revenue_sum_i64_raw(
-    shipdates: &[i32],
-    discounts: &[i64],
-    quantities: &[i64],
-    extendedprices: &[i64],
-    start_days: i32,
-    end_days: i32,
-    discount_low_raw: i64,
-    discount_high_raw: i64,
-    quantity_limit_raw: i64,
-    revenue_scale: f64,
-) -> (f64, u64) {
-    let mut sum = 0.0;
-    let mut count = 0_u64;
-    for row in 0..shipdates.len() {
-        let shipdate = shipdates[row];
-        let discount = discounts[row];
-        if shipdate < start_days
-            || shipdate >= end_days
-            || discount < discount_low_raw
-            || discount > discount_high_raw
-            || quantities[row] >= quantity_limit_raw
-        {
-            continue;
-        }
-        sum += (extendedprices[row] * discount) as f64 * revenue_scale;
-        count += 1;
-    }
-    (sum, count)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn vector_q06_revenue_sum_i64(
-    shipdates: &[i32],
-    discounts: &[i128],
-    quantities: &[i128],
-    extendedprices: &[i128],
-    start_days: i32,
-    end_days: i32,
-    discount_low_raw: i64,
-    discount_high_raw: i64,
-    quantity_limit_raw: i64,
-    revenue_scale: f64,
-) -> (f64, u64) {
-    let mut sum = 0.0;
-    let mut count = 0_u64;
-    for row in 0..shipdates.len() {
-        let shipdate = shipdates[row];
-        let discount = discounts[row] as i64;
-        if shipdate < start_days
-            || shipdate >= end_days
-            || discount < discount_low_raw
-            || discount > discount_high_raw
-            || (quantities[row] as i64) >= quantity_limit_raw
-        {
-            continue;
-        }
-        sum += ((extendedprices[row] as i64) * discount) as f64 * revenue_scale;
-        count += 1;
-    }
-    (sum, count)
 }
 
 fn scaled_f64_to_i128(value: f64, scale: f64) -> i128 {
@@ -36530,6 +37960,9 @@ async fn parse_filter_with_subqueries(
             list,
             negated,
         } => {
+            if predicate_requires_expression_path(expr) {
+                return Ok(None);
+            }
             if let Ok(value) = sql_literal_value(in_expr) {
                 return Ok(Some(Expr::Boolean(evaluate_literal_in_list(
                     &value, list, *negated,
@@ -36662,6 +38095,9 @@ async fn parse_filter_with_subqueries(
                     | BinaryOperator::LtEq
             ) =>
         {
+            if predicate_requires_expression_path(expr) {
+                return Ok(None);
+            }
             if let (Ok(left), Ok(right)) = (sql_literal_value(left), sql_literal_value(right)) {
                 return Ok(Some(Expr::Boolean(compare_literal_values(
                     &left, op, &right,
@@ -36685,6 +38121,7 @@ async fn parse_filter_with_subqueries(
             ))
             .await
         }
+        _ if predicate_requires_expression_path(expr) => Ok(None),
         _ => Ok(Some(sql_expr_to_filter_expr(
             expr,
             aliases,
@@ -36909,7 +38346,7 @@ fn rewrite_cte_scalar_subqueries_to_literals(
             rewrite_cte_scalar_subqueries_to_literals(low, cte_alias, cte_batches)?;
             rewrite_cte_scalar_subqueries_to_literals(high, cte_alias, cte_batches)?;
         }
-        SqlExpr::Like { expr, pattern, .. } => {
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
             rewrite_cte_scalar_subqueries_to_literals(expr, cte_alias, cte_batches)?;
             rewrite_cte_scalar_subqueries_to_literals(pattern, cte_alias, cte_batches)?;
         }
@@ -36955,10 +38392,7 @@ fn evaluate_cte_scalar_subquery(
 fn max_literal_from_batches(batches: &[RecordBatch], column: &str) -> Result<LiteralValue> {
     let mut max_value: Option<LiteralValue> = None;
     for batch in batches {
-        let index = batch
-            .schema()
-            .index_of(column)
-            .map_err(|_| DodamError::UnknownColumn(column.to_string()))?;
+        let index = batch_column_index(batch, column)?;
         let array = batch.column(index);
         for row in 0..batch.num_rows() {
             if array.is_null(row) {
@@ -37247,6 +38681,7 @@ async fn execute_parsed_join_query(
             2,
             &group_by,
             &aggregates,
+            &query.filtered_aggregates,
             &query.aggregate_expressions,
         )?;
         let mut batches = aggregate_metrics_to_batches(&metrics, &group_by, &aggregates)?;
@@ -38825,6 +40260,13 @@ fn compare_join_fused_group_keys(left: &[GroupValue], right: &[GroupValue]) -> s
 }
 
 fn same_join_column(left: &str, right: &str) -> bool {
+    if let (Some((left_function, left_argument)), Some((right_function, right_argument))) =
+        (aggregate_column_parts(left), aggregate_column_parts(right))
+        && left_function.eq_ignore_ascii_case(right_function)
+        && same_join_column(left_argument, right_argument)
+    {
+        return true;
+    }
     left == right
         || left.rsplit('.').next() == Some(right)
         || right.rsplit('.').next() == Some(left)
@@ -39321,10 +40763,7 @@ fn collect_dense_right_counts_fast_like_view(
     let Some(batch) = view.try_record_batch() else {
         return Ok(None);
     };
-    let key_index = batch
-        .schema()
-        .index_of(key_column)
-        .map_err(|_| DodamError::UnknownColumn(key_column.to_string()))?;
+    let key_index = batch_column_index(batch, key_column)?;
     let Some(keys) = batch
         .column(key_index)
         .as_any()
@@ -39332,10 +40771,7 @@ fn collect_dense_right_counts_fast_like_view(
     else {
         return Ok(None);
     };
-    let string_index = batch
-        .schema()
-        .index_of(&filter.column)
-        .map_err(|_| DodamError::UnknownColumn(filter.column.clone()))?;
+    let string_index = batch_column_index(batch, &filter.column)?;
     let Some(strings) = view.utf8(string_index) else {
         return collect_dense_right_counts_fast_like_batch(
             batch.clone(),
@@ -39464,8 +40900,10 @@ fn fast_like_substrings_filter(expr: &Expr) -> Option<FastLikeSubstrings> {
             pattern,
             negated,
             escape,
+            case_insensitive,
         } => {
-            if escape.is_some()
+            if *case_insensitive
+                || escape.is_some()
                 || !pattern.starts_with('%')
                 || !pattern.ends_with('%')
                 || pattern.contains('_')
@@ -39715,12 +41153,15 @@ fn resolve_inner_output_column_index(inner: &SqlQuery, column: &str) -> Option<u
 }
 
 fn batch_column_index(batch: &RecordBatch, column: &str) -> Result<usize> {
-    batch
+    if let Some(index) = batch
         .schema()
         .fields()
         .iter()
-        .position(|field| field.name() == column)
-        .ok_or_else(|| DodamError::UnknownColumn(column.to_string()))
+        .position(|field| same_join_column(field.name(), column))
+    {
+        return Ok(index);
+    }
+    Err(DodamError::UnknownColumn(column.to_string()))
 }
 
 fn projected_column_index(projection: &[String], column: &str) -> Option<usize> {
@@ -40701,6 +42142,9 @@ fn prune_comma_join_current_columns(
         if *used {
             continue;
         }
+        if expr_contains_materializable_subquery(conjunct) {
+            return Ok(batches);
+        }
         let mut columns = Vec::new();
         collect_join_column_candidates(conjunct, alias_refs, &mut columns)?;
         needed.extend(columns);
@@ -40873,7 +42317,7 @@ fn collect_join_column_candidates(
             collect_join_column_candidates(low, table_aliases, columns)?;
             collect_join_column_candidates(high, table_aliases, columns)?;
         }
-        SqlExpr::Like { expr, pattern, .. } => {
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
             collect_join_column_candidates(expr, table_aliases, columns)?;
             collect_join_column_candidates(pattern, table_aliases, columns)?;
         }
@@ -44274,7 +45718,7 @@ fn pushed_join_output_projection(query: &SqlQuery) -> Result<Projection> {
         return Ok(Projection::All);
     };
     if query.is_aggregate() {
-        return Ok(aggregate_join_output_projection(query));
+        return aggregate_join_output_projection(query);
     }
     if query.distinct {
         return Ok(Projection::All);
@@ -44293,7 +45737,7 @@ fn join_working_projection(query: &SqlQuery) -> Result<Projection> {
         return Ok(query.projection.clone());
     };
     let mut projection = if query.is_aggregate() {
-        aggregate_join_output_projection(query)
+        aggregate_join_output_projection(query)?
     } else {
         query.projection.clone()
     };
@@ -44327,12 +45771,12 @@ fn join_input_projection_with_expression_filter(query: &SqlQuery) -> Result<Proj
     join_working_projection(query)
 }
 
-fn aggregate_join_output_projection(query: &SqlQuery) -> Projection {
+fn aggregate_join_output_projection(query: &SqlQuery) -> Result<Projection> {
     let Projection::Columns(columns) = &query.projection else {
-        return Projection::All;
+        return Ok(Projection::All);
     };
     let Some(join) = &query.join else {
-        return Projection::All;
+        return Ok(Projection::All);
     };
     let mut columns = columns.clone();
     if let Some(filter) = &query.filter {
@@ -44341,6 +45785,11 @@ fn aggregate_join_output_projection(query: &SqlQuery) -> Projection {
         }
     }
     let aliases = [join.left_alias.as_str(), join.right_alias.as_str()];
+    if let Some(expression_filter) = query.expression_filter.as_ref() {
+        for column in join_sql_expression_columns(expression_filter, &aliases)? {
+            add_column_once(&mut columns, column);
+        }
+    }
     for expression in &query.aggregate_expressions {
         for column in join_scalar_expression_columns(&expression.expr, &aliases)
             .unwrap_or_else(|_| scalar_expression_columns(&expression.expr))
@@ -44348,7 +45797,7 @@ fn aggregate_join_output_projection(query: &SqlQuery) -> Projection {
             add_column_once(&mut columns, column);
         }
     }
-    Projection::Columns(columns)
+    Ok(Projection::Columns(columns))
 }
 
 fn parse_query(query: &Query) -> Result<SqlQuery> {
@@ -44385,11 +45834,20 @@ fn parse_select(query: &Query, select: &Select) -> Result<SqlQuery> {
     let group_by = parse_group_by(select, path.alias.as_deref())?;
     let parsed_projection = parse_projection(select, &group_by, path.alias.as_deref())?;
     let distinct = parse_distinct(select)?;
-    let filter = select
-        .selection
-        .as_ref()
-        .map(|expr| parse_filter(expr, &[], path.alias.as_deref(), false))
-        .transpose()?;
+    let (filter, expression_filter) = if let Some(selection) = select.selection.as_ref() {
+        if predicate_requires_expression_path(selection)
+            && !expr_contains_materializable_subquery(selection)
+        {
+            (None, Some(selection.clone()))
+        } else {
+            (
+                Some(parse_filter(selection, &[], path.alias.as_deref(), false)?),
+                None,
+            )
+        }
+    } else {
+        (None, None)
+    };
     let having = select
         .having
         .as_ref()
@@ -44415,13 +45873,14 @@ fn parse_select(query: &Query, select: &Select) -> Result<SqlQuery> {
         join: None,
         projection: parsed_projection.projection,
         filter,
-        expression_filter: None,
+        expression_filter,
         having,
         order_by,
         limit,
         offset,
         distinct,
         aggregates: parsed_projection.aggregates,
+        filtered_aggregates: parsed_projection.filtered_aggregates,
         aggregate_expressions: parsed_projection.aggregate_expressions,
         expressions: parsed_projection.expressions,
         group_by,
@@ -44499,6 +45958,7 @@ fn parse_comma_join_select(query: &Query, select: &Select) -> Result<SqlQuery> {
         offset,
         distinct,
         aggregates: projection.aggregates,
+        filtered_aggregates: projection.filtered_aggregates,
         aggregate_expressions: projection.aggregate_expressions,
         expressions: projection.expressions,
         group_by,
@@ -44579,6 +46039,7 @@ fn parse_join_select(query: &Query, select: &Select) -> Result<SqlQuery> {
         offset,
         distinct,
         aggregates: projection.aggregates,
+        filtered_aggregates: projection.filtered_aggregates,
         aggregate_expressions: projection.aggregate_expressions,
         expressions: projection.expressions,
         group_by,
@@ -45004,10 +46465,21 @@ fn correlated_inner_outer_key(
         let Some(right_column) = semijoin_column_name(right)? else {
             continue;
         };
-        let left_in_outer = resolve_batch_column(outer_batch, &left_column)?.is_some();
-        let right_in_outer = resolve_batch_column(outer_batch, &right_column)?.is_some();
         let left_inner = column_has_any_prefix(&left_column, inner_prefixes);
         let right_inner = column_has_any_prefix(&right_column, inner_prefixes);
+        if left_inner != right_inner {
+            let (inner, outer) = if left_inner {
+                (left_column, right_column)
+            } else {
+                (right_column, left_column)
+            };
+            if resolve_batch_column(outer_batch, &outer)?.is_some() {
+                return Ok(Some((index, inner, outer)));
+            }
+            continue;
+        }
+        let left_in_outer = resolve_batch_column(outer_batch, &left_column)?.is_some();
+        let right_in_outer = resolve_batch_column(outer_batch, &right_column)?.is_some();
         match (left_in_outer, right_in_outer) {
             (true, true) if left_inner && !right_inner => {
                 return Ok(Some((index, left_column, right_column)));
@@ -45591,11 +47063,13 @@ fn strip_filter_prefix(expr: Expr, prefix: &str) -> Expr {
             pattern,
             negated,
             escape,
+            case_insensitive,
         } => Expr::Like {
             column: strip_column_prefix(&column, prefix),
             pattern,
             negated,
             escape,
+            case_insensitive,
         },
         Expr::IsNull { column, negated } => Expr::IsNull {
             column: strip_column_prefix(&column, prefix),
@@ -45627,6 +47101,7 @@ fn parse_join_projection(
 ) -> Result<ParsedProjection> {
     let mut columns = Vec::new();
     let mut aggregates = Vec::new();
+    let mut filtered_aggregates = Vec::new();
     let mut aggregate_expressions = Vec::new();
     let mut aggregate_expression_columns = Vec::new();
     let mut aliases = Vec::new();
@@ -45684,6 +47159,14 @@ fn parse_join_projection(
                         table_aliases,
                         aggregate_expressions.len(),
                     )?;
+                    if let Some(spec) = filtered_join_aggregate_spec_from_function(
+                        function,
+                        table_aliases,
+                        &aggregate,
+                        &expression,
+                    )? {
+                        filtered_aggregates.push(spec);
+                    }
                     if let Some(expression) = expression {
                         for column in
                             join_scalar_expression_columns(&expression.expr, table_aliases)?
@@ -45718,6 +47201,7 @@ fn parse_join_projection(
                     expr,
                     table_aliases,
                     &mut aggregates,
+                    &mut filtered_aggregates,
                     &mut aggregate_expressions,
                     &mut aggregate_expression_columns,
                     &mut expression_columns,
@@ -45793,6 +47277,14 @@ fn parse_join_projection(
                             table_aliases,
                             aggregate_expressions.len(),
                         )?;
+                        if let Some(spec) = filtered_join_aggregate_spec_from_function(
+                            function,
+                            table_aliases,
+                            &aggregate,
+                            &expression,
+                        )? {
+                            filtered_aggregates.push(spec);
+                        }
                         if let Some(expression) = expression {
                             for column in
                                 join_scalar_expression_columns(&expression.expr, table_aliases)?
@@ -45825,6 +47317,7 @@ fn parse_join_projection(
                         expr,
                         table_aliases,
                         &mut aggregates,
+                        &mut filtered_aggregates,
                         &mut aggregate_expressions,
                         &mut aggregate_expression_columns,
                         &mut expression_columns,
@@ -45891,9 +47384,12 @@ fn parse_join_projection(
         let mut projected_columns = physical_projection_columns(&columns);
         for aggregate in &aggregates {
             if let Some(column) = aggregate.referenced_column() {
-                add_column_once(&mut projected_columns, column.to_string());
+                if !column.starts_with("__dodam_join_agg_expr_") {
+                    add_column_once(&mut projected_columns, column.to_string());
+                }
             }
         }
+        add_filtered_aggregate_projection_columns(&mut projected_columns, &filtered_aggregates)?;
         for column in aggregate_expression_columns {
             add_column_once(&mut projected_columns, column);
         }
@@ -45907,6 +47403,7 @@ fn parse_join_projection(
         return Ok(ParsedProjection {
             projection: Projection::Columns(projected_columns),
             aggregates,
+            filtered_aggregates,
             aggregate_expressions,
             aliases,
             expressions,
@@ -45923,6 +47420,7 @@ fn parse_join_projection(
             Projection::Columns(columns)
         },
         aggregates,
+        filtered_aggregates,
         aggregate_expressions,
         aliases,
         expressions,
@@ -46285,11 +47783,29 @@ fn join_expr_to_filter_expr(
                 pattern: sql_like_pattern(pattern)?,
                 negated: *negated,
                 escape: sql_like_escape(escape_char)?,
+                case_insensitive: false,
             })
         }
-        SqlExpr::ILike { .. } => Err(DodamError::UnsupportedSql(
-            "ILIKE is not supported".to_string(),
-        )),
+        SqlExpr::ILike {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => {
+            if *any {
+                return Err(DodamError::UnsupportedSql(
+                    "ILIKE ANY is not supported".to_string(),
+                ));
+            }
+            Ok(Expr::Like {
+                column: join_filter_column(expr, aliases, table_aliases, allow_aggregates)?,
+                pattern: sql_like_pattern(pattern)?,
+                negated: *negated,
+                escape: sql_like_escape(escape_char)?,
+                case_insensitive: true,
+            })
+        }
         _ => Err(DodamError::UnsupportedSql(format!(
             "unsupported JOIN WHERE expression: {expr}"
         ))),
@@ -46515,6 +48031,11 @@ impl<'a> ColumnResolver<'a> {
         if batch_column_index(batch, column).is_ok() {
             return Ok(Some(BoundColumn::physical(column)));
         }
+        if let Some((_, unqualified)) = column.split_once('.')
+            && batch_column_index(batch, unqualified).is_ok()
+        {
+            return Ok(Some(BoundColumn::physical(unqualified.to_string())));
+        }
         if let Some((function, argument)) = aggregate_column_parts(column) {
             let aggregate_suffix = format!(".{argument})");
             let matches = batch
@@ -46573,6 +48094,9 @@ impl<'a> ColumnResolver<'a> {
         }
         if let Some(alias) = infer_tpch_table_alias(prefix, self.table_aliases) {
             return Ok(BoundColumn::qualified(alias, column));
+        }
+        if is_tpch_column_prefix(prefix) {
+            return Err(DodamError::UnknownColumn(column.to_string()));
         }
         let Some(prefix_initial) = prefix.chars().next() else {
             return Err(DodamError::UnsupportedSql(format!(
@@ -46658,10 +48182,18 @@ fn tpch_alias_prefix(alias: &str) -> Option<&'static str> {
     }
 }
 
+fn is_tpch_column_prefix(prefix: &str) -> bool {
+    matches!(
+        prefix.to_ascii_lowercase().as_str(),
+        "c" | "o" | "l" | "p" | "ps" | "s" | "n" | "r"
+    )
+}
+
 #[derive(Debug)]
 struct ParsedProjection {
     projection: Projection,
     aggregates: Vec<AggregateExpr>,
+    filtered_aggregates: Vec<NativeFilteredAggregateSpec>,
     aggregate_expressions: Vec<ProjectionExpression>,
     aliases: Vec<(String, String)>,
     expressions: Vec<ProjectionExpression>,
@@ -46782,6 +48314,19 @@ fn projected_group_expression(
         })
 }
 
+fn add_filtered_aggregate_projection_columns(
+    projected_columns: &mut Vec<String>,
+    specs: &[NativeFilteredAggregateSpec],
+) -> Result<()> {
+    for spec in specs {
+        for column in scalar_expression_columns(&spec.input) {
+            add_column_once(projected_columns, column);
+        }
+        collect_predicate_expression_columns(&spec.condition, None, projected_columns)?;
+    }
+    Ok(())
+}
+
 fn group_expression_bindings(
     select: &Select,
     table_alias: Option<&str>,
@@ -46878,6 +48423,17 @@ enum ScalarSqlExpression {
     Lower(Box<ScalarSqlExpression>),
     Upper(Box<ScalarSqlExpression>),
     Length(Box<ScalarSqlExpression>),
+    Trim(Box<ScalarSqlExpression>),
+    Abs(Box<ScalarSqlExpression>),
+    Round(Box<ScalarSqlExpression>),
+    Floor(Box<ScalarSqlExpression>),
+    Ceil(Box<ScalarSqlExpression>),
+    Replace {
+        expr: Box<ScalarSqlExpression>,
+        from: Box<ScalarSqlExpression>,
+        to: Box<ScalarSqlExpression>,
+    },
+    Concat(Vec<ScalarSqlExpression>),
     ExtractYear(Box<ScalarSqlExpression>),
     Substring {
         expr: Box<ScalarSqlExpression>,
@@ -46898,6 +48454,7 @@ fn parse_projection(
 ) -> Result<ParsedProjection> {
     let mut columns = Vec::new();
     let mut aggregates = Vec::new();
+    let mut filtered_aggregates = Vec::new();
     let mut aggregate_expressions = Vec::new();
     let mut aggregate_expression_columns = Vec::new();
     let mut aliases = Vec::new();
@@ -46961,6 +48518,14 @@ fn parse_projection(
                         table_alias,
                         aggregate_expressions.len(),
                     )?;
+                    if let Some(spec) = filtered_aggregate_spec_from_function(
+                        function,
+                        table_alias,
+                        &aggregate,
+                        &expression,
+                    )? {
+                        filtered_aggregates.push(spec);
+                    }
                     if let Some(expression) = expression {
                         for column in scalar_expression_columns(&expression.expr) {
                             add_column_once(&mut aggregate_expression_columns, column);
@@ -46986,6 +48551,7 @@ fn parse_projection(
                     expr,
                     table_alias,
                     &mut aggregates,
+                    &mut filtered_aggregates,
                     &mut aggregate_expressions,
                     &mut aggregate_expression_columns,
                     &mut expression_columns,
@@ -47050,6 +48616,14 @@ fn parse_projection(
                             table_alias,
                             aggregate_expressions.len(),
                         )?;
+                        if let Some(spec) = filtered_aggregate_spec_from_function(
+                            function,
+                            table_alias,
+                            &aggregate,
+                            &expression,
+                        )? {
+                            filtered_aggregates.push(spec);
+                        }
                         if let Some(expression) = expression {
                             for column in scalar_expression_columns(&expression.expr) {
                                 add_column_once(&mut aggregate_expression_columns, column);
@@ -47076,6 +48650,7 @@ fn parse_projection(
                         expr,
                         table_alias,
                         &mut aggregates,
+                        &mut filtered_aggregates,
                         &mut aggregate_expressions,
                         &mut aggregate_expression_columns,
                         &mut expression_columns,
@@ -47123,6 +48698,7 @@ fn parse_projection(
                 Projection::Columns(columns)
             },
             aggregates,
+            filtered_aggregates,
             aggregate_expressions,
             aliases,
             expressions: if wildcard { Vec::new() } else { expressions },
@@ -47157,6 +48733,7 @@ fn parse_projection(
             }
         }
     }
+    add_filtered_aggregate_projection_columns(&mut projected_columns, &filtered_aggregates)?;
     for column in aggregate_expression_columns {
         add_column_once(&mut projected_columns, column);
     }
@@ -47170,6 +48747,7 @@ fn parse_projection(
     Ok(ParsedProjection {
         projection: Projection::Columns(projected_columns),
         aggregates,
+        filtered_aggregates,
         aggregate_expressions,
         aliases,
         expressions,
@@ -47199,7 +48777,19 @@ fn parse_scalar_function_projection(
     let lowercase_name = name.to_ascii_lowercase();
     if !matches!(
         lowercase_name.as_str(),
-        "coalesce" | "lower" | "upper" | "length" | "array_length" | "list_length"
+        "coalesce"
+            | "lower"
+            | "upper"
+            | "length"
+            | "trim"
+            | "abs"
+            | "round"
+            | "floor"
+            | "ceil"
+            | "replace"
+            | "concat"
+            | "array_length"
+            | "list_length"
     ) {
         return Ok(None);
     }
@@ -47238,44 +48828,7 @@ fn parse_scalar_function_projection(
             ))),
         })
         .collect::<Result<Vec<_>>>()?;
-    let expr = match lowercase_name.as_str() {
-        "coalesce" => {
-            if values.is_empty() {
-                return Err(DodamError::UnsupportedSql(
-                    "COALESCE requires at least one argument".to_string(),
-                ));
-            }
-            ScalarSqlExpression::Coalesce(values)
-        }
-        "lower" | "upper" | "length" | "array_length" | "list_length" => {
-            let [value] = values.as_slice() else {
-                return Err(DodamError::UnsupportedSql(format!(
-                    "{name} requires exactly one argument"
-                )));
-            };
-            match lowercase_name.as_str() {
-                "lower" => ScalarSqlExpression::Lower(Box::new(value.clone())),
-                "upper" => ScalarSqlExpression::Upper(Box::new(value.clone())),
-                "length" => ScalarSqlExpression::Length(Box::new(value.clone())),
-                "array_length" | "list_length" => {
-                    let (column, field) = match value {
-                        ScalarSqlExpression::Column(column) => (column.clone(), None),
-                        ScalarSqlExpression::StructField { column, field } => {
-                            (column.clone(), Some(field.clone()))
-                        }
-                        _ => {
-                            return Err(DodamError::UnsupportedSql(format!(
-                                "{name} currently requires a list column or struct list field"
-                            )));
-                        }
-                    };
-                    ScalarSqlExpression::ListLength { column, field }
-                }
-                _ => unreachable!("validated scalar function"),
-            }
-        }
-        _ => unreachable!("validated scalar function"),
-    };
+    let expr = scalar_function_expression(&name, &lowercase_name, values)?;
     Ok(Some(ProjectionExpression {
         output_name: alias.map_or_else(|| function.to_string(), ToString::to_string),
         expr,
@@ -47291,7 +48844,19 @@ fn parse_join_scalar_function_projection(
     let lowercase_name = name.to_ascii_lowercase();
     if !matches!(
         lowercase_name.as_str(),
-        "coalesce" | "lower" | "upper" | "length" | "array_length" | "list_length"
+        "coalesce"
+            | "lower"
+            | "upper"
+            | "length"
+            | "trim"
+            | "abs"
+            | "round"
+            | "floor"
+            | "ceil"
+            | "replace"
+            | "concat"
+            | "array_length"
+            | "list_length"
     ) {
         return Ok(None);
     }
@@ -47330,7 +48895,19 @@ fn parse_join_scalar_function_projection(
             ))),
         })
         .collect::<Result<Vec<_>>>()?;
-    let expr = match lowercase_name.as_str() {
+    let expr = scalar_function_expression(&name, &lowercase_name, values)?;
+    Ok(Some(ProjectionExpression {
+        output_name: alias.map_or_else(|| function.to_string(), ToString::to_string),
+        expr,
+    }))
+}
+
+fn scalar_function_expression(
+    name: &str,
+    lowercase_name: &str,
+    values: Vec<ScalarSqlExpression>,
+) -> Result<ScalarSqlExpression> {
+    Ok(match lowercase_name {
         "coalesce" => {
             if values.is_empty() {
                 return Err(DodamError::UnsupportedSql(
@@ -47339,16 +48916,42 @@ fn parse_join_scalar_function_projection(
             }
             ScalarSqlExpression::Coalesce(values)
         }
-        "lower" | "upper" | "length" | "array_length" | "list_length" => {
+        "concat" => {
+            if values.is_empty() {
+                return Err(DodamError::UnsupportedSql(
+                    "CONCAT requires at least one argument".to_string(),
+                ));
+            }
+            ScalarSqlExpression::Concat(values)
+        }
+        "replace" => {
+            let [expr, from, to] = values.as_slice() else {
+                return Err(DodamError::UnsupportedSql(
+                    "REPLACE requires exactly three arguments".to_string(),
+                ));
+            };
+            ScalarSqlExpression::Replace {
+                expr: Box::new(expr.clone()),
+                from: Box::new(from.clone()),
+                to: Box::new(to.clone()),
+            }
+        }
+        "lower" | "upper" | "length" | "trim" | "abs" | "round" | "floor" | "ceil"
+        | "array_length" | "list_length" => {
             let [value] = values.as_slice() else {
                 return Err(DodamError::UnsupportedSql(format!(
                     "{name} requires exactly one argument"
                 )));
             };
-            match lowercase_name.as_str() {
+            match lowercase_name {
                 "lower" => ScalarSqlExpression::Lower(Box::new(value.clone())),
                 "upper" => ScalarSqlExpression::Upper(Box::new(value.clone())),
                 "length" => ScalarSqlExpression::Length(Box::new(value.clone())),
+                "trim" => ScalarSqlExpression::Trim(Box::new(value.clone())),
+                "abs" => ScalarSqlExpression::Abs(Box::new(value.clone())),
+                "round" => ScalarSqlExpression::Round(Box::new(value.clone())),
+                "floor" => ScalarSqlExpression::Floor(Box::new(value.clone())),
+                "ceil" => ScalarSqlExpression::Ceil(Box::new(value.clone())),
                 "array_length" | "list_length" => {
                     let (column, field) = match value {
                         ScalarSqlExpression::Column(column) => (column.clone(), None),
@@ -47367,11 +48970,7 @@ fn parse_join_scalar_function_projection(
             }
         }
         _ => unreachable!("validated scalar function"),
-    };
-    Ok(Some(ProjectionExpression {
-        output_name: alias.map_or_else(|| function.to_string(), ToString::to_string),
-        expr,
-    }))
+    })
 }
 
 fn parse_scalar_sql_expression(
@@ -47424,6 +49023,9 @@ fn parse_scalar_sql_expression(
                     | BinaryOperator::Divide
             ) =>
         {
+            if let Ok(value) = sql_literal_value(expr) {
+                return Ok(ScalarSqlExpression::Literal(value));
+            }
             Ok(ScalarSqlExpression::Binary {
                 left: Box::new(parse_scalar_sql_expression(left, table_alias)?),
                 op: op.clone(),
@@ -47445,6 +49047,38 @@ fn parse_scalar_sql_expression(
             };
             Ok(projection.expr)
         }
+        SqlExpr::Trim {
+            trim_where,
+            trim_what,
+            expr,
+            trim_characters,
+        } => {
+            if trim_where.is_some() || trim_what.is_some() || trim_characters.is_some() {
+                return Err(DodamError::UnsupportedSql(
+                    "TRIM variants with trim characters or direction are not supported yet"
+                        .to_string(),
+                ));
+            }
+            Ok(ScalarSqlExpression::Trim(Box::new(
+                parse_scalar_sql_expression(expr, table_alias)?,
+            )))
+        }
+        SqlExpr::Floor { expr, field } => parse_ceil_floor_scalar_expression(
+            "FLOOR",
+            expr,
+            field,
+            table_alias,
+            parse_scalar_sql_expression,
+            ScalarSqlExpression::Floor,
+        ),
+        SqlExpr::Ceil { expr, field } => parse_ceil_floor_scalar_expression(
+            "CEIL",
+            expr,
+            field,
+            table_alias,
+            parse_scalar_sql_expression,
+            ScalarSqlExpression::Ceil,
+        ),
         SqlExpr::Substring {
             expr,
             substring_from,
@@ -47542,6 +49176,9 @@ fn parse_join_scalar_sql_expression(
                     | BinaryOperator::Divide
             ) =>
         {
+            if let Ok(value) = sql_literal_value(expr) {
+                return Ok(ScalarSqlExpression::Literal(value));
+            }
             Ok(ScalarSqlExpression::Binary {
                 left: Box::new(parse_join_scalar_sql_expression(left, table_aliases)?),
                 op: op.clone(),
@@ -47564,6 +49201,38 @@ fn parse_join_scalar_sql_expression(
             };
             Ok(projection.expr)
         }
+        SqlExpr::Trim {
+            trim_where,
+            trim_what,
+            expr,
+            trim_characters,
+        } => {
+            if trim_where.is_some() || trim_what.is_some() || trim_characters.is_some() {
+                return Err(DodamError::UnsupportedSql(
+                    "TRIM variants with trim characters or direction are not supported yet"
+                        .to_string(),
+                ));
+            }
+            Ok(ScalarSqlExpression::Trim(Box::new(
+                parse_join_scalar_sql_expression(expr, table_aliases)?,
+            )))
+        }
+        SqlExpr::Floor { expr, field } => parse_ceil_floor_scalar_expression(
+            "FLOOR",
+            expr,
+            field,
+            table_aliases,
+            parse_join_scalar_sql_expression,
+            ScalarSqlExpression::Floor,
+        ),
+        SqlExpr::Ceil { expr, field } => parse_ceil_floor_scalar_expression(
+            "CEIL",
+            expr,
+            field,
+            table_aliases,
+            parse_join_scalar_sql_expression,
+            ScalarSqlExpression::Ceil,
+        ),
         SqlExpr::Substring {
             expr,
             substring_from,
@@ -47619,6 +49288,28 @@ fn parse_join_scalar_sql_expression(
             "unsupported JOIN scalar expression: {expr}"
         ))),
     }
+}
+
+fn parse_ceil_floor_scalar_expression<C>(
+    name: &str,
+    expr: &SqlExpr,
+    field: &CeilFloorKind,
+    context: C,
+    parser: fn(&SqlExpr, C) -> Result<ScalarSqlExpression>,
+    builder: fn(Box<ScalarSqlExpression>) -> ScalarSqlExpression,
+) -> Result<ScalarSqlExpression>
+where
+    C: Copy,
+{
+    if !matches!(
+        field,
+        CeilFloorKind::DateTimeField(DateTimeField::NoDateTime)
+    ) {
+        return Err(DodamError::UnsupportedSql(format!(
+            "{name} scale/date-time variants are not supported yet"
+        )));
+    }
+    Ok(builder(Box::new(parser(expr, context)?)))
 }
 
 fn parse_join_struct_field_access(
@@ -47820,6 +49511,7 @@ fn parse_join_aggregate_output_expression(
     expr: &SqlExpr,
     table_aliases: &[&str],
     aggregates: &mut Vec<AggregateExpr>,
+    filtered_aggregates: &mut Vec<NativeFilteredAggregateSpec>,
     aggregate_expressions: &mut Vec<ProjectionExpression>,
     aggregate_expression_columns: &mut Vec<String>,
     expression_columns: &mut Vec<String>,
@@ -47836,6 +49528,7 @@ fn parse_join_aggregate_output_expression(
             expr,
             table_aliases,
             aggregates,
+            filtered_aggregates,
             aggregate_expressions,
             aggregate_expression_columns,
             expression_columns,
@@ -47855,6 +49548,7 @@ fn parse_join_aggregate_output_expression(
                     left,
                     table_aliases,
                     aggregates,
+                    filtered_aggregates,
                     aggregate_expressions,
                     aggregate_expression_columns,
                     expression_columns,
@@ -47865,6 +49559,7 @@ fn parse_join_aggregate_output_expression(
                     right,
                     table_aliases,
                     aggregates,
+                    filtered_aggregates,
                     aggregate_expressions,
                     aggregate_expression_columns,
                     expression_columns,
@@ -47879,6 +49574,7 @@ fn parse_join_aggregate_output_expression(
                 expr,
                 table_aliases,
                 aggregates,
+                filtered_aggregates,
                 aggregate_expressions,
                 aggregate_expression_columns,
                 expression_columns,
@@ -47891,6 +49587,7 @@ fn parse_join_aggregate_output_expression(
                 expr,
                 table_aliases,
                 aggregates,
+                filtered_aggregates,
                 aggregate_expressions,
                 aggregate_expression_columns,
                 expression_columns,
@@ -47903,6 +49600,14 @@ fn parse_join_aggregate_output_expression(
                 table_aliases,
                 aggregate_expressions.len(),
             )?;
+            if let Some(spec) = filtered_join_aggregate_spec_from_function(
+                function,
+                table_aliases,
+                &aggregate,
+                &expression,
+            )? {
+                filtered_aggregates.push(spec);
+            }
             if let Some(expression) = expression {
                 for column in join_scalar_expression_columns(&expression.expr, table_aliases)? {
                     add_column_once(aggregate_expression_columns, column);
@@ -47953,6 +49658,19 @@ fn rewrite_join_scalar_predicate(expr: &SqlExpr, table_aliases: &[&str]) -> Resu
             pattern,
             escape_char,
         } => Ok(SqlExpr::Like {
+            negated: *negated,
+            any: *any,
+            expr: Box::new(rewrite_join_scalar_predicate(expr, table_aliases)?),
+            pattern: Box::new(rewrite_join_scalar_predicate(pattern, table_aliases)?),
+            escape_char: escape_char.clone(),
+        }),
+        SqlExpr::ILike {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => Ok(SqlExpr::ILike {
             negated: *negated,
             any: *any,
             expr: Box::new(rewrite_join_scalar_predicate(expr, table_aliases)?),
@@ -48015,11 +49733,26 @@ fn collect_join_scalar_expression_columns(
                 collect_join_scalar_expression_columns(value, table_aliases, columns)?;
             }
         }
+        ScalarSqlExpression::Concat(values) => {
+            for value in values {
+                collect_join_scalar_expression_columns(value, table_aliases, columns)?;
+            }
+        }
         ScalarSqlExpression::Lower(expr)
         | ScalarSqlExpression::Upper(expr)
         | ScalarSqlExpression::Length(expr)
+        | ScalarSqlExpression::Trim(expr)
+        | ScalarSqlExpression::Abs(expr)
+        | ScalarSqlExpression::Round(expr)
+        | ScalarSqlExpression::Floor(expr)
+        | ScalarSqlExpression::Ceil(expr)
         | ScalarSqlExpression::ExtractYear(expr) => {
             collect_join_scalar_expression_columns(expr, table_aliases, columns)?;
+        }
+        ScalarSqlExpression::Replace { expr, from, to } => {
+            collect_join_scalar_expression_columns(expr, table_aliases, columns)?;
+            collect_join_scalar_expression_columns(from, table_aliases, columns)?;
+            collect_join_scalar_expression_columns(to, table_aliases, columns)?;
         }
         ScalarSqlExpression::Substring {
             expr,
@@ -48070,7 +49803,7 @@ fn collect_join_predicate_columns(
         | SqlExpr::IsNotNull(expr) => {
             collect_join_predicate_columns(expr, table_aliases, columns)?;
         }
-        SqlExpr::Like { expr, pattern, .. } => {
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
             collect_join_predicate_columns(expr, table_aliases, columns)?;
             collect_join_predicate_columns(pattern, table_aliases, columns)?;
         }
@@ -48100,11 +49833,26 @@ fn collect_scalar_expression_columns(expr: &ScalarSqlExpression, columns: &mut V
                 collect_scalar_expression_columns(value, columns);
             }
         }
+        ScalarSqlExpression::Concat(values) => {
+            for value in values {
+                collect_scalar_expression_columns(value, columns);
+            }
+        }
         ScalarSqlExpression::Lower(expr)
         | ScalarSqlExpression::Upper(expr)
         | ScalarSqlExpression::Length(expr)
+        | ScalarSqlExpression::Trim(expr)
+        | ScalarSqlExpression::Abs(expr)
+        | ScalarSqlExpression::Round(expr)
+        | ScalarSqlExpression::Floor(expr)
+        | ScalarSqlExpression::Ceil(expr)
         | ScalarSqlExpression::ExtractYear(expr) => {
             collect_scalar_expression_columns(expr, columns)
+        }
+        ScalarSqlExpression::Replace { expr, from, to } => {
+            collect_scalar_expression_columns(expr, columns);
+            collect_scalar_expression_columns(from, columns);
+            collect_scalar_expression_columns(to, columns);
         }
         ScalarSqlExpression::Substring {
             expr,
@@ -48155,12 +49903,25 @@ fn scalar_expression_references_aggregate(
         | ScalarSqlExpression::Lower(expr)
         | ScalarSqlExpression::Upper(expr)
         | ScalarSqlExpression::Length(expr)
+        | ScalarSqlExpression::Trim(expr)
+        | ScalarSqlExpression::Abs(expr)
+        | ScalarSqlExpression::Round(expr)
+        | ScalarSqlExpression::Floor(expr)
+        | ScalarSqlExpression::Ceil(expr)
         | ScalarSqlExpression::ExtractYear(expr) => {
             scalar_expression_references_aggregate(expr, aggregates)
         }
         ScalarSqlExpression::Coalesce(values) => values
             .iter()
             .any(|value| scalar_expression_references_aggregate(value, aggregates)),
+        ScalarSqlExpression::Concat(values) => values
+            .iter()
+            .any(|value| scalar_expression_references_aggregate(value, aggregates)),
+        ScalarSqlExpression::Replace { expr, from, to } => {
+            scalar_expression_references_aggregate(expr, aggregates)
+                || scalar_expression_references_aggregate(from, aggregates)
+                || scalar_expression_references_aggregate(to, aggregates)
+        }
         ScalarSqlExpression::Substring {
             expr,
             start,
@@ -48191,6 +49952,7 @@ fn parse_aggregate_output_expression(
     expr: &SqlExpr,
     table_alias: Option<&str>,
     aggregates: &mut Vec<AggregateExpr>,
+    filtered_aggregates: &mut Vec<NativeFilteredAggregateSpec>,
     aggregate_expressions: &mut Vec<ProjectionExpression>,
     aggregate_expression_columns: &mut Vec<String>,
     expression_columns: &mut Vec<String>,
@@ -48207,6 +49969,7 @@ fn parse_aggregate_output_expression(
             expr,
             table_alias,
             aggregates,
+            filtered_aggregates,
             aggregate_expressions,
             aggregate_expression_columns,
             expression_columns,
@@ -48226,6 +49989,7 @@ fn parse_aggregate_output_expression(
                     left,
                     table_alias,
                     aggregates,
+                    filtered_aggregates,
                     aggregate_expressions,
                     aggregate_expression_columns,
                     expression_columns,
@@ -48236,6 +50000,7 @@ fn parse_aggregate_output_expression(
                     right,
                     table_alias,
                     aggregates,
+                    filtered_aggregates,
                     aggregate_expressions,
                     aggregate_expression_columns,
                     expression_columns,
@@ -48250,6 +50015,7 @@ fn parse_aggregate_output_expression(
                 expr,
                 table_alias,
                 aggregates,
+                filtered_aggregates,
                 aggregate_expressions,
                 aggregate_expression_columns,
                 expression_columns,
@@ -48262,6 +50028,7 @@ fn parse_aggregate_output_expression(
                 expr,
                 table_alias,
                 aggregates,
+                filtered_aggregates,
                 aggregate_expressions,
                 aggregate_expression_columns,
                 expression_columns,
@@ -48274,6 +50041,14 @@ fn parse_aggregate_output_expression(
                 table_alias,
                 aggregate_expressions.len(),
             )?;
+            if let Some(spec) = filtered_aggregate_spec_from_function(
+                function,
+                table_alias,
+                &aggregate,
+                &expression,
+            )? {
+                filtered_aggregates.push(spec);
+            }
             if let Some(expression) = expression {
                 for column in scalar_expression_columns(&expression.expr) {
                     add_column_once(aggregate_expression_columns, column);
@@ -48360,6 +50135,13 @@ fn parse_aggregate_with_input_expression(
     table_alias: Option<&str>,
     expression_index: usize,
 ) -> Result<(AggregateExpr, Option<ProjectionExpression>)> {
+    if function.filter.is_some() {
+        return parse_filtered_aggregate_with_input_expression(
+            function,
+            table_alias,
+            expression_index,
+        );
+    }
     match parse_aggregate(function, table_alias) {
         Ok(aggregate) => return Ok((aggregate, None)),
         Err(DodamError::UnsupportedSql(message))
@@ -48428,6 +50210,87 @@ fn parse_aggregate_with_input_expression(
     Ok((aggregate, Some(expression)))
 }
 
+fn parse_filtered_aggregate_with_input_expression(
+    function: &sqlparser::ast::Function,
+    table_alias: Option<&str>,
+    expression_index: usize,
+) -> Result<(AggregateExpr, Option<ProjectionExpression>)> {
+    if function.over.is_some()
+        || !function.within_group.is_empty()
+        || function.null_treatment.is_some()
+        || !matches!(function.parameters, FunctionArguments::None)
+    {
+        return Err(DodamError::UnsupportedSql(
+            "aggregate windows, within group, null treatment, and parameters are not supported"
+                .to_string(),
+        ));
+    }
+    let filter = function.filter.as_deref().ok_or_else(|| {
+        DodamError::UnsupportedSql("aggregate FILTER missing predicate".to_string())
+    })?;
+    let name = object_name_to_string(&function.name)?;
+    let lowercase_name = name.to_ascii_lowercase();
+    if !matches!(
+        lowercase_name.as_str(),
+        "sum" | "avg" | "min" | "max" | "count"
+    ) {
+        return Err(DodamError::UnsupportedSql(format!(
+            "aggregate FILTER is not supported for {name}"
+        )));
+    }
+    let FunctionArguments::List(args) = &function.args else {
+        return Err(DodamError::UnsupportedSql(format!(
+            "unsupported function arguments: {}",
+            function.args
+        )));
+    };
+    if !args.clauses.is_empty()
+        || (args.duplicate_treatment.is_some()
+            && !(lowercase_name == "count"
+                && args.duplicate_treatment == Some(DuplicateTreatment::Distinct)))
+    {
+        return Err(DodamError::UnsupportedSql(format!(
+            "unsupported function arguments: {}",
+            function.args
+        )));
+    }
+    let input = match args.args.as_slice() {
+        [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)] if lowercase_name == "count" => {
+            ScalarSqlExpression::Literal(LiteralValue::Int64(1))
+        }
+        [FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))] => {
+            parse_scalar_sql_expression(expr, table_alias)?
+        }
+        _ => {
+            return Err(DodamError::UnsupportedSql(format!(
+                "unsupported aggregate FILTER arguments: {}",
+                function.args
+            )));
+        }
+    };
+    let column = format!("__dodam_agg_expr_{expression_index}");
+    if args.duplicate_treatment == Some(DuplicateTreatment::Distinct) {
+        let expression = ProjectionExpression {
+            output_name: column.clone(),
+            expr: ScalarSqlExpression::Case {
+                conditions: vec![rewrite_scalar_predicate_table_alias(filter, table_alias)?],
+                results: vec![input],
+                else_result: None,
+            },
+        };
+        return Ok((
+            AggregateExpr::parse(&format!("count_distinct({column})"))?,
+            Some(expression),
+        ));
+    }
+    let aggregate = match lowercase_name.as_str() {
+        "count" => AggregateExpr::parse(&format!("count({column})"))?,
+        _ => AggregateExpr::parse(&format!("{name}({column})"))?,
+    };
+    let _ = input;
+    Ok((aggregate, None))
+}
+
 fn parse_join_aggregate(
     function: &sqlparser::ast::Function,
     table_aliases: &[&str],
@@ -48492,11 +50355,93 @@ fn parse_join_aggregate(
     }
 }
 
+fn filtered_aggregate_spec_from_function(
+    function: &sqlparser::ast::Function,
+    table_alias: Option<&str>,
+    aggregate: &AggregateExpr,
+    expression: &Option<ProjectionExpression>,
+) -> Result<Option<NativeFilteredAggregateSpec>> {
+    if function.filter.is_none() || expression.is_some() {
+        return Ok(None);
+    }
+    let (input, condition) = filtered_aggregate_input_and_condition(
+        function,
+        |expr| parse_scalar_sql_expression(expr, table_alias),
+        |expr| rewrite_scalar_predicate_table_alias(expr, table_alias),
+    )?;
+    Ok(Some(NativeFilteredAggregateSpec {
+        expr: aggregate.clone(),
+        condition,
+        input_kind: native_filtered_input_kind(aggregate, &input),
+        input,
+    }))
+}
+
+fn filtered_join_aggregate_spec_from_function(
+    function: &sqlparser::ast::Function,
+    table_aliases: &[&str],
+    aggregate: &AggregateExpr,
+    expression: &Option<ProjectionExpression>,
+) -> Result<Option<NativeFilteredAggregateSpec>> {
+    if function.filter.is_none() || expression.is_some() {
+        return Ok(None);
+    }
+    let (input, condition) = filtered_aggregate_input_and_condition(
+        function,
+        |expr| parse_join_scalar_sql_expression(expr, table_aliases),
+        |expr| rewrite_join_scalar_predicate(expr, table_aliases),
+    )?;
+    Ok(Some(NativeFilteredAggregateSpec {
+        expr: aggregate.clone(),
+        condition,
+        input_kind: native_filtered_input_kind(aggregate, &input),
+        input,
+    }))
+}
+
+fn filtered_aggregate_input_and_condition(
+    function: &sqlparser::ast::Function,
+    parse_input: impl Fn(&SqlExpr) -> Result<ScalarSqlExpression>,
+    rewrite_condition: impl Fn(&SqlExpr) -> Result<SqlExpr>,
+) -> Result<(ScalarSqlExpression, SqlExpr)> {
+    let filter = function.filter.as_deref().ok_or_else(|| {
+        DodamError::UnsupportedSql("aggregate FILTER missing predicate".to_string())
+    })?;
+    let name = object_name_to_string(&function.name)?;
+    let lowercase_name = name.to_ascii_lowercase();
+    let FunctionArguments::List(args) = &function.args else {
+        return Err(DodamError::UnsupportedSql(format!(
+            "unsupported function arguments: {}",
+            function.args
+        )));
+    };
+    let input = match args.args.as_slice() {
+        [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)] if lowercase_name == "count" => {
+            ScalarSqlExpression::Literal(LiteralValue::Int64(1))
+        }
+        [FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))] => parse_input(expr)?,
+        _ => {
+            return Err(DodamError::UnsupportedSql(format!(
+                "unsupported aggregate FILTER arguments: {}",
+                function.args
+            )));
+        }
+    };
+    Ok((input, rewrite_condition(filter)?))
+}
+
 fn parse_join_aggregate_with_input_expression(
     function: &sqlparser::ast::Function,
     table_aliases: &[&str],
     expression_index: usize,
 ) -> Result<(AggregateExpr, Option<ProjectionExpression>)> {
+    if function.filter.is_some() {
+        return parse_filtered_join_aggregate_with_input_expression(
+            function,
+            table_aliases,
+            expression_index,
+        );
+    }
     match parse_join_aggregate(function, table_aliases) {
         Ok(aggregate) => return Ok((aggregate, None)),
         Err(DodamError::UnsupportedSql(message))
@@ -48563,6 +50508,167 @@ fn parse_join_aggregate_with_input_expression(
         AggregateExpr::parse(&format!("{name}({column})"))?
     };
     Ok((aggregate, Some(expression)))
+}
+
+fn parse_filtered_join_aggregate_with_input_expression(
+    function: &sqlparser::ast::Function,
+    table_aliases: &[&str],
+    expression_index: usize,
+) -> Result<(AggregateExpr, Option<ProjectionExpression>)> {
+    if function.over.is_some()
+        || !function.within_group.is_empty()
+        || function.null_treatment.is_some()
+        || !matches!(function.parameters, FunctionArguments::None)
+    {
+        return Err(DodamError::UnsupportedSql(
+            "aggregate windows, within group, null treatment, and parameters are not supported"
+                .to_string(),
+        ));
+    }
+    let filter = function.filter.as_deref().ok_or_else(|| {
+        DodamError::UnsupportedSql("aggregate FILTER missing predicate".to_string())
+    })?;
+    let name = object_name_to_string(&function.name)?;
+    let lowercase_name = name.to_ascii_lowercase();
+    if !matches!(
+        lowercase_name.as_str(),
+        "sum" | "avg" | "min" | "max" | "count"
+    ) {
+        return Err(DodamError::UnsupportedSql(format!(
+            "JOIN aggregate FILTER is not supported for {name}"
+        )));
+    }
+    let FunctionArguments::List(args) = &function.args else {
+        return Err(DodamError::UnsupportedSql(format!(
+            "unsupported function arguments: {}",
+            function.args
+        )));
+    };
+    if !args.clauses.is_empty()
+        || (args.duplicate_treatment.is_some()
+            && !(lowercase_name == "count"
+                && args.duplicate_treatment == Some(DuplicateTreatment::Distinct)))
+    {
+        return Err(DodamError::UnsupportedSql(format!(
+            "unsupported function arguments: {}",
+            function.args
+        )));
+    }
+    let input = match args.args.as_slice() {
+        [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)] if lowercase_name == "count" => {
+            ScalarSqlExpression::Literal(LiteralValue::Int64(1))
+        }
+        [FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))] => {
+            parse_join_scalar_sql_expression(expr, table_aliases)?
+        }
+        _ => {
+            return Err(DodamError::UnsupportedSql(format!(
+                "unsupported JOIN aggregate FILTER arguments: {}",
+                function.args
+            )));
+        }
+    };
+    let column = format!("__dodam_join_agg_expr_{expression_index}");
+    if args.duplicate_treatment == Some(DuplicateTreatment::Distinct) {
+        let expression = ProjectionExpression {
+            output_name: column.clone(),
+            expr: ScalarSqlExpression::Case {
+                conditions: vec![rewrite_join_scalar_predicate(filter, table_aliases)?],
+                results: vec![input],
+                else_result: None,
+            },
+        };
+        return Ok((
+            AggregateExpr::parse(&format!("count_distinct({column})"))?,
+            Some(expression),
+        ));
+    }
+    let aggregate = match lowercase_name.as_str() {
+        "count" => AggregateExpr::parse(&format!("count({column})"))?,
+        _ => AggregateExpr::parse(&format!("{name}({column})"))?,
+    };
+    let _ = input;
+    Ok((aggregate, None))
+}
+
+fn rewrite_scalar_predicate_table_alias(
+    expr: &SqlExpr,
+    table_alias: Option<&str>,
+) -> Result<SqlExpr> {
+    match expr {
+        SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
+            Ok(sql_column_expr(&sql_column_name(expr, table_alias)?))
+        }
+        SqlExpr::BinaryOp { left, op, right } => Ok(SqlExpr::BinaryOp {
+            left: Box::new(rewrite_scalar_predicate_table_alias(left, table_alias)?),
+            op: op.clone(),
+            right: Box::new(rewrite_scalar_predicate_table_alias(right, table_alias)?),
+        }),
+        SqlExpr::Nested(expr) => Ok(SqlExpr::Nested(Box::new(
+            rewrite_scalar_predicate_table_alias(expr, table_alias)?,
+        ))),
+        SqlExpr::UnaryOp { op, expr } => Ok(SqlExpr::UnaryOp {
+            op: op.clone(),
+            expr: Box::new(rewrite_scalar_predicate_table_alias(expr, table_alias)?),
+        }),
+        SqlExpr::IsNull(expr) => Ok(SqlExpr::IsNull(Box::new(
+            rewrite_scalar_predicate_table_alias(expr, table_alias)?,
+        ))),
+        SqlExpr::IsNotNull(expr) => Ok(SqlExpr::IsNotNull(Box::new(
+            rewrite_scalar_predicate_table_alias(expr, table_alias)?,
+        ))),
+        SqlExpr::InList {
+            expr,
+            list,
+            negated,
+        } => Ok(SqlExpr::InList {
+            expr: Box::new(rewrite_scalar_predicate_table_alias(expr, table_alias)?),
+            list: list
+                .iter()
+                .map(|expr| rewrite_scalar_predicate_table_alias(expr, table_alias))
+                .collect::<Result<Vec<_>>>()?,
+            negated: *negated,
+        }),
+        SqlExpr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => Ok(SqlExpr::Between {
+            expr: Box::new(rewrite_scalar_predicate_table_alias(expr, table_alias)?),
+            negated: *negated,
+            low: Box::new(rewrite_scalar_predicate_table_alias(low, table_alias)?),
+            high: Box::new(rewrite_scalar_predicate_table_alias(high, table_alias)?),
+        }),
+        SqlExpr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => Ok(SqlExpr::Like {
+            negated: *negated,
+            any: *any,
+            expr: Box::new(rewrite_scalar_predicate_table_alias(expr, table_alias)?),
+            pattern: Box::new(rewrite_scalar_predicate_table_alias(pattern, table_alias)?),
+            escape_char: escape_char.clone(),
+        }),
+        SqlExpr::ILike {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => Ok(SqlExpr::ILike {
+            negated: *negated,
+            any: *any,
+            expr: Box::new(rewrite_scalar_predicate_table_alias(expr, table_alias)?),
+            pattern: Box::new(rewrite_scalar_predicate_table_alias(pattern, table_alias)?),
+            escape_char: escape_char.clone(),
+        }),
+        SqlExpr::Value(_) | SqlExpr::TypedString(_) => Ok(expr.clone()),
+        _ => Ok(expr.clone()),
+    }
 }
 
 fn parse_group_by(select: &Select, table_alias: Option<&str>) -> Result<Vec<String>> {
@@ -48929,11 +51035,29 @@ fn sql_expr_to_filter_expr(
                 pattern: sql_like_pattern(pattern)?,
                 negated: *negated,
                 escape: sql_like_escape(escape_char)?,
+                case_insensitive: false,
             })
         }
-        SqlExpr::ILike { .. } => Err(DodamError::UnsupportedSql(
-            "ILIKE is not supported".to_string(),
-        )),
+        SqlExpr::ILike {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => {
+            if *any {
+                return Err(DodamError::UnsupportedSql(
+                    "ILIKE ANY is not supported".to_string(),
+                ));
+            }
+            Ok(Expr::Like {
+                column: sql_filter_column(expr, aliases, table_alias, allow_aggregates)?,
+                pattern: sql_like_pattern(pattern)?,
+                negated: *negated,
+                escape: sql_like_escape(escape_char)?,
+                case_insensitive: true,
+            })
+        }
         _ => Err(DodamError::UnsupportedSql(format!(
             "unsupported WHERE expression: {expr}"
         ))),
@@ -49660,10 +51784,17 @@ fn apply_output_order_limit(
     if batches.is_empty() {
         return Ok(batches);
     }
+    if let Some(limit) = limit
+        && offset == 0
+        && let Some(batches) = try_streaming_primitive_topk_batches(&batches, order_by, limit)?
+    {
+        return Ok(batches);
+    }
     if topk_batch_prune_enabled()
         && let Some(limit) = limit
         && offset == 0
         && batches.len() > 1
+        && batches.iter().any(|batch| batch.num_rows() > limit)
     {
         let candidates = batches
             .iter()
@@ -49694,6 +51825,256 @@ fn apply_output_order_limit(
     let sorted_limit = limit.and_then(|limit| limit.checked_add(offset));
     let sorted = sort_output_batch(&batch, order_by, sorted_limit)?;
     Ok(limit_batches(vec![sorted], limit, offset))
+}
+
+type StreamingTopKSelected = (StreamingTopKKey, u64, usize, u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum StreamingTopKKey {
+    I32I64I64(i32, i64, i64),
+    NullableI32I64(bool, i32, i64),
+}
+
+fn try_streaming_primitive_topk_batches(
+    batches: &[RecordBatch],
+    order_by: &SortKey,
+    limit: usize,
+) -> Result<Option<Vec<RecordBatch>>> {
+    if !streaming_primitive_topk_sort_enabled()
+        || limit == 0
+        || batches.len() < 2
+        || order_by.expressions.iter().any(|sort| sort.descending)
+    {
+        return Ok(None);
+    }
+    let Some(shape) = streaming_topk_sort_shape(batches, order_by)? else {
+        return Ok(None);
+    };
+    let mut heap = BinaryHeap::<StreamingTopKSelected>::with_capacity(limit.saturating_add(1));
+    let mut sequence = 0_u64;
+    for (batch_index, batch) in batches.iter().enumerate() {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        match shape {
+            StreamingTopKSortShape::I32I64I64(first, second, third) => {
+                let first = batch
+                    .column(first)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("streaming top-k i32 sort key");
+                let second = batch
+                    .column(second)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("streaming top-k i64 sort key");
+                let third = batch
+                    .column(third)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("streaming top-k i64 sort key");
+                if heap.len() >= limit
+                    && let Some(worst) = heap.peek()
+                    && let Some(min_key) =
+                        streaming_topk_batch_min_i32_i64_i64(first, second, third)
+                    && (min_key, 0_u64, batch_index, 0_u32) >= *worst
+                {
+                    sequence = sequence.wrapping_add(batch.num_rows() as u64);
+                    continue;
+                }
+                for row in 0..batch.num_rows() {
+                    let item = (
+                        StreamingTopKKey::I32I64I64(
+                            first.value(row),
+                            second.value(row),
+                            third.value(row),
+                        ),
+                        sequence,
+                        batch_index,
+                        row as u32,
+                    );
+                    streaming_topk_push(limit, &mut heap, item);
+                    sequence = sequence.wrapping_add(1);
+                }
+            }
+            StreamingTopKSortShape::NullableI32I64(first, second) => {
+                let first = batch
+                    .column(first)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("streaming top-k i32 sort key");
+                let second = batch
+                    .column(second)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("streaming top-k i64 sort key");
+                if heap.len() >= limit
+                    && let Some(worst) = heap.peek()
+                    && let Some(min_key) = streaming_topk_batch_min_nullable_i32_i64(first, second)
+                    && (min_key, 0_u64, batch_index, 0_u32) >= *worst
+                {
+                    sequence = sequence.wrapping_add(batch.num_rows() as u64);
+                    continue;
+                }
+                for row in 0..batch.num_rows() {
+                    let present = !first.is_null(row);
+                    let value = if present { first.value(row) } else { 0 };
+                    let item = (
+                        StreamingTopKKey::NullableI32I64(present, value, second.value(row)),
+                        sequence,
+                        batch_index,
+                        row as u32,
+                    );
+                    streaming_topk_push(limit, &mut heap, item);
+                    sequence = sequence.wrapping_add(1);
+                }
+            }
+        }
+    }
+    if heap.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let mut selected = heap.into_vec();
+    selected.sort_unstable();
+    let materialize_selected = selected
+        .into_iter()
+        .map(|(_, sequence, batch_index, row)| (0_i128, sequence, batch_index, row))
+        .collect::<Vec<_>>();
+    Ok(Some(vec![materialize_topk_selected_rows(
+        batches,
+        &materialize_selected,
+    )?]))
+}
+
+fn streaming_topk_batch_min_i32_i64_i64(
+    first: &Int32Array,
+    second: &Int64Array,
+    third: &Int64Array,
+) -> Option<StreamingTopKKey> {
+    let mut min_key = None;
+    for row in 0..first.len() {
+        let key =
+            StreamingTopKKey::I32I64I64(first.value(row), second.value(row), third.value(row));
+        min_key = Some(min_key.map_or(key, |min: StreamingTopKKey| min.min(key)));
+    }
+    min_key
+}
+
+fn streaming_topk_batch_min_nullable_i32_i64(
+    first: &Int32Array,
+    second: &Int64Array,
+) -> Option<StreamingTopKKey> {
+    let mut min_key = None;
+    for row in 0..first.len() {
+        let present = !first.is_null(row);
+        let value = if present { first.value(row) } else { 0 };
+        let key = StreamingTopKKey::NullableI32I64(present, value, second.value(row));
+        min_key = Some(min_key.map_or(key, |min: StreamingTopKKey| min.min(key)));
+    }
+    min_key
+}
+
+fn streaming_topk_push(
+    limit: usize,
+    heap: &mut BinaryHeap<StreamingTopKSelected>,
+    item: StreamingTopKSelected,
+) {
+    if heap.len() < limit {
+        heap.push(item);
+        return;
+    }
+    if let Some(mut worst) = heap.peek_mut()
+        && item < *worst
+    {
+        *worst = item;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StreamingTopKSortShape {
+    I32I64I64(usize, usize, usize),
+    NullableI32I64(usize, usize),
+}
+
+fn streaming_topk_sort_shape(
+    batches: &[RecordBatch],
+    order_by: &SortKey,
+) -> Result<Option<StreamingTopKSortShape>> {
+    let Some(first_batch) = batches.iter().find(|batch| batch.num_rows() > 0) else {
+        return Ok(None);
+    };
+    let expressions = order_by.expressions.as_slice();
+    if let [first, second, third] = expressions
+        && !first.nulls_first
+        && !second.nulls_first
+        && !third.nulls_first
+    {
+        let first_index = output_batch_column_index(first_batch, &first.column)?;
+        let second_index = output_batch_column_index(first_batch, &second.column)?;
+        let third_index = output_batch_column_index(first_batch, &third.column)?;
+        if streaming_topk_column_is_non_null_i32(batches, first_index)
+            && streaming_topk_column_is_non_null_i64(batches, second_index)
+            && streaming_topk_column_is_non_null_i64(batches, third_index)
+        {
+            return Ok(Some(StreamingTopKSortShape::I32I64I64(
+                first_index,
+                second_index,
+                third_index,
+            )));
+        }
+    }
+    if let [first, second] = expressions
+        && first.nulls_first
+        && !second.nulls_first
+    {
+        let first_index = output_batch_column_index(first_batch, &first.column)?;
+        let second_index = output_batch_column_index(first_batch, &second.column)?;
+        if streaming_topk_column_is_i32(batches, first_index)
+            && streaming_topk_column_is_non_null_i64(batches, second_index)
+        {
+            return Ok(Some(StreamingTopKSortShape::NullableI32I64(
+                first_index,
+                second_index,
+            )));
+        }
+    }
+    Ok(None)
+}
+
+fn streaming_topk_column_is_i32(batches: &[RecordBatch], index: usize) -> bool {
+    batches.iter().all(|batch| {
+        batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .is_some()
+    })
+}
+
+fn streaming_topk_column_is_non_null_i32(batches: &[RecordBatch], index: usize) -> bool {
+    batches.iter().all(|batch| {
+        batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .is_some_and(|array| array.null_count() == 0)
+    })
+}
+
+fn streaming_topk_column_is_non_null_i64(batches: &[RecordBatch], index: usize) -> bool {
+    batches.iter().all(|batch| {
+        batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .is_some_and(|array| array.null_count() == 0)
+    })
+}
+
+fn streaming_primitive_topk_sort_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_STREAMING_PRIMITIVE_TOPK_SORT")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 fn output_batch_satisfies_order(batch: &RecordBatch, order_by: &SortKey) -> Result<bool> {
@@ -49767,6 +52148,104 @@ fn output_batch_satisfies_order(batch: &RecordBatch, order_by: &SortKey) -> Resu
             Ok(true)
         }
         _ => Ok(false),
+    }
+}
+
+fn output_batches_satisfy_order(batches: &[RecordBatch], order_by: &SortKey) -> Result<bool> {
+    if batches.is_empty() {
+        return Ok(true);
+    }
+    for batch in batches {
+        if !output_batch_satisfies_order(batch, order_by)? {
+            return Ok(false);
+        }
+    }
+    let [sort] = order_by.expressions.as_slice() else {
+        return Ok(false);
+    };
+    if sort.descending || sort.nulls_first {
+        return Ok(false);
+    }
+    let mut previous = None::<ScalarOrderValue>;
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let index = output_batch_column_index(batch, &sort.column)?;
+        let column = batch.column(index);
+        let first = scalar_order_value(column, 0)?;
+        let last = scalar_order_value(column, batch.num_rows() - 1)?;
+        if let Some(previous) = previous
+            && previous > first
+        {
+            return Ok(false);
+        }
+        previous = Some(last);
+    }
+    Ok(true)
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum ScalarOrderValue {
+    Int32(i32),
+    Date32(i32),
+    Int64(i64),
+    Utf8(String),
+}
+
+fn scalar_order_value(column: &ArrayRef, row: usize) -> Result<ScalarOrderValue> {
+    match column.data_type() {
+        DataType::Int32 => {
+            let values = column
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("Int32 data type");
+            if values.is_null(row) {
+                return Err(DodamError::UnsupportedSql(
+                    "ordered batch boundary contains NULL".to_string(),
+                ));
+            }
+            Ok(ScalarOrderValue::Int32(values.value(row)))
+        }
+        DataType::Date32 => {
+            let values = column
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .expect("Date32 data type");
+            if values.is_null(row) {
+                return Err(DodamError::UnsupportedSql(
+                    "ordered batch boundary contains NULL".to_string(),
+                ));
+            }
+            Ok(ScalarOrderValue::Date32(values.value(row)))
+        }
+        DataType::Int64 => {
+            let values = column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 data type");
+            if values.is_null(row) {
+                return Err(DodamError::UnsupportedSql(
+                    "ordered batch boundary contains NULL".to_string(),
+                ));
+            }
+            Ok(ScalarOrderValue::Int64(values.value(row)))
+        }
+        DataType::Utf8 => {
+            let values = column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("Utf8 data type");
+            if values.is_null(row) {
+                return Err(DodamError::UnsupportedSql(
+                    "ordered batch boundary contains NULL".to_string(),
+                ));
+            }
+            Ok(ScalarOrderValue::Utf8(values.value(row).to_string()))
+        }
+        _ => Err(DodamError::UnsupportedSql(
+            "ordered batch boundary type is unsupported".to_string(),
+        )),
     }
 }
 
@@ -49869,6 +52348,15 @@ fn sort_output_batch(
     order_by: &SortKey,
     limit: Option<usize>,
 ) -> Result<RecordBatch> {
+    if let Some(batch) = sort_nullable_i32_then_ordered_i64_batch(batch, order_by, limit)? {
+        return Ok(batch);
+    }
+    if let Some(batch) = sort_fixed_primitive_output_batch(batch, order_by, limit)? {
+        return Ok(batch);
+    }
+    if let Some(batch) = sort_primitive_output_batch(batch, order_by, limit)? {
+        return Ok(batch);
+    }
     let sort_columns = order_by
         .expressions
         .iter()
@@ -49895,6 +52383,369 @@ fn sort_output_batch(
     Ok(take_record_batch(batch, &indices)?)
 }
 
+fn sort_nullable_i32_then_ordered_i64_batch(
+    batch: &RecordBatch,
+    order_by: &SortKey,
+    limit: Option<usize>,
+) -> Result<Option<RecordBatch>> {
+    let Some(limit) = limit else {
+        return Ok(None);
+    };
+    if limit == 0 || batch.num_rows() == 0 || limit >= batch.num_rows() {
+        return Ok(None);
+    }
+    let [first_sort, second_sort] = order_by.expressions.as_slice() else {
+        return Ok(None);
+    };
+    if first_sort.descending
+        || second_sort.descending
+        || !first_sort.nulls_first
+        || second_sort.nulls_first
+    {
+        return Ok(None);
+    }
+    let first_index = output_batch_column_index(batch, &first_sort.column)?;
+    let second_index = output_batch_column_index(batch, &second_sort.column)?;
+    let first = batch.column(first_index);
+    let second = batch.column(second_index);
+    let Some(first) = first.as_any().downcast_ref::<Int32Array>() else {
+        return Ok(None);
+    };
+    if !primitive_integer_array_is_ascending(second) {
+        return Ok(None);
+    }
+    let Some((min, slot_count)) = dense_i32_array_range(first) else {
+        return Ok(None);
+    };
+    let mut null_rows = Vec::new();
+    let mut buckets = (0..slot_count).map(|_| Vec::new()).collect::<Vec<_>>();
+    for row in 0..first.len() {
+        let row = u32::try_from(row).map_err(|_| {
+            DodamError::UnsupportedSql("nullable i32/i64 ordered sort row overflow".to_string())
+        })?;
+        if first.is_null(row as usize) {
+            null_rows.push(row);
+        } else {
+            let slot = (first.value(row as usize) - min) as usize;
+            buckets[slot].push(row);
+        }
+    }
+    let mut indices = Vec::with_capacity(limit);
+    for row in null_rows {
+        indices.push(row);
+        if indices.len() == limit {
+            return take_primitive_record_batch_by_raw_indices(batch, &indices).map(Some);
+        }
+    }
+    for bucket in buckets {
+        for row in bucket {
+            indices.push(row);
+            if indices.len() == limit {
+                return take_primitive_record_batch_by_raw_indices(batch, &indices).map(Some);
+            }
+        }
+    }
+    take_primitive_record_batch_by_raw_indices(batch, &indices).map(Some)
+}
+
+fn primitive_integer_array_is_ascending(values: &ArrayRef) -> bool {
+    match values.data_type() {
+        DataType::Int32 => {
+            let values = values
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("Int32 data type");
+            if values.null_count() != 0 {
+                return false;
+            }
+            for row in 1..values.len() {
+                if values.value(row - 1) > values.value(row) {
+                    return false;
+                }
+            }
+            true
+        }
+        DataType::Int64 => {
+            let values = values
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 data type");
+            if values.null_count() != 0 {
+                return false;
+            }
+            for row in 1..values.len() {
+                if values.value(row - 1) > values.value(row) {
+                    return false;
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn dense_i32_array_range(values: &Int32Array) -> Option<(i32, usize)> {
+    let mut min = i32::MAX;
+    let mut max = i32::MIN;
+    let mut has_value = false;
+    for row in 0..values.len() {
+        if values.is_null(row) {
+            continue;
+        }
+        let value = values.value(row);
+        min = min.min(value);
+        max = max.max(value);
+        has_value = true;
+    }
+    if !has_value {
+        return Some((0, 0));
+    }
+    let slot_count = usize::try_from(i64::from(max) - i64::from(min) + 1).ok()?;
+    (slot_count <= values.len().saturating_mul(4) && slot_count <= 1_000_000)
+        .then_some((min, slot_count))
+}
+
+fn sort_fixed_primitive_output_batch(
+    batch: &RecordBatch,
+    order_by: &SortKey,
+    limit: Option<usize>,
+) -> Result<Option<RecordBatch>> {
+    if !fixed_primitive_partial_sort_enabled() {
+        return Ok(None);
+    }
+    let Some(limit) = limit else {
+        return Ok(None);
+    };
+    if batch.num_rows() == 0 || limit == 0 || limit >= batch.num_rows() {
+        return Ok(None);
+    }
+    if order_by.expressions.iter().any(|sort| sort.descending) {
+        return Ok(None);
+    }
+    if let Some(batch) = sort_i32_i64_i64_output_batch(batch, order_by, limit)? {
+        return Ok(Some(batch));
+    }
+    sort_nullable_i32_i64_output_batch(batch, order_by, limit)
+}
+
+fn sort_i32_i64_i64_output_batch(
+    batch: &RecordBatch,
+    order_by: &SortKey,
+    limit: usize,
+) -> Result<Option<RecordBatch>> {
+    let [first, second, third] = order_by.expressions.as_slice() else {
+        return Ok(None);
+    };
+    if first.nulls_first || second.nulls_first || third.nulls_first {
+        return Ok(None);
+    }
+    let first = batch.column(output_batch_column_index(batch, &first.column)?);
+    let second = batch.column(output_batch_column_index(batch, &second.column)?);
+    let third = batch.column(output_batch_column_index(batch, &third.column)?);
+    if first.null_count() != 0 || second.null_count() != 0 || third.null_count() != 0 {
+        return Ok(None);
+    }
+    let (Some(first), Some(second), Some(third)) = (
+        first.as_any().downcast_ref::<Int32Array>(),
+        second.as_any().downcast_ref::<Int64Array>(),
+        third.as_any().downcast_ref::<Int64Array>(),
+    ) else {
+        return Ok(None);
+    };
+    let mut keys = (0..batch.num_rows())
+        .map(|row| {
+            (
+                first.value(row),
+                second.value(row),
+                third.value(row),
+                row as u32,
+            )
+        })
+        .collect::<Vec<_>>();
+    keys.select_nth_unstable_by(limit, |left, right| {
+        (left.0, left.1, left.2, left.3).cmp(&(right.0, right.1, right.2, right.3))
+    });
+    keys.truncate(limit);
+    keys.sort_unstable_by(|left, right| {
+        (left.0, left.1, left.2, left.3).cmp(&(right.0, right.1, right.2, right.3))
+    });
+    let indices = keys
+        .into_iter()
+        .map(|(_, _, _, row)| row)
+        .collect::<Vec<_>>();
+    Ok(Some(take_primitive_record_batch_by_raw_indices(
+        batch, &indices,
+    )?))
+}
+
+fn sort_nullable_i32_i64_output_batch(
+    batch: &RecordBatch,
+    order_by: &SortKey,
+    limit: usize,
+) -> Result<Option<RecordBatch>> {
+    let [first, second] = order_by.expressions.as_slice() else {
+        return Ok(None);
+    };
+    if !first.nulls_first || second.nulls_first {
+        return Ok(None);
+    }
+    let first = batch.column(output_batch_column_index(batch, &first.column)?);
+    let second = batch.column(output_batch_column_index(batch, &second.column)?);
+    if second.null_count() != 0 {
+        return Ok(None);
+    }
+    let (Some(first), Some(second)) = (
+        first.as_any().downcast_ref::<Int32Array>(),
+        second.as_any().downcast_ref::<Int64Array>(),
+    ) else {
+        return Ok(None);
+    };
+    let mut keys = (0..batch.num_rows())
+        .map(|row| {
+            let present = !first.is_null(row);
+            let value = if present { first.value(row) } else { 0 };
+            (present, value, second.value(row), row as u32)
+        })
+        .collect::<Vec<_>>();
+    keys.select_nth_unstable_by(limit, |left, right| {
+        (left.0, left.1, left.2, left.3).cmp(&(right.0, right.1, right.2, right.3))
+    });
+    keys.truncate(limit);
+    keys.sort_unstable_by(|left, right| {
+        (left.0, left.1, left.2, left.3).cmp(&(right.0, right.1, right.2, right.3))
+    });
+    let indices = keys
+        .into_iter()
+        .map(|(_, _, _, row)| row)
+        .collect::<Vec<_>>();
+    Ok(Some(take_primitive_record_batch_by_raw_indices(
+        batch, &indices,
+    )?))
+}
+
+fn fixed_primitive_partial_sort_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_FIXED_PRIMITIVE_PARTIAL_SORT")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+enum PrimitiveSortColumn<'a> {
+    Int32(&'a Int32Array),
+    Int64(&'a Int64Array),
+    UInt64(&'a UInt64Array),
+    Float64(&'a Float64Array),
+    Date32(&'a Date32Array),
+}
+
+impl PrimitiveSortColumn<'_> {
+    fn compare(&self, left: usize, right: usize) -> std::cmp::Ordering {
+        match self {
+            Self::Int32(values) => values.value(left).cmp(&values.value(right)),
+            Self::Int64(values) => values.value(left).cmp(&values.value(right)),
+            Self::UInt64(values) => values.value(left).cmp(&values.value(right)),
+            Self::Float64(values) => values.value(left).total_cmp(&values.value(right)),
+            Self::Date32(values) => values.value(left).cmp(&values.value(right)),
+        }
+    }
+}
+
+fn sort_primitive_output_batch(
+    batch: &RecordBatch,
+    order_by: &SortKey,
+    limit: Option<usize>,
+) -> Result<Option<RecordBatch>> {
+    if !primitive_partial_sort_enabled() {
+        return Ok(None);
+    }
+    let Some(limit) = limit else {
+        return Ok(None);
+    };
+    if batch.num_rows() == 0 || limit == 0 || limit >= batch.num_rows() {
+        return Ok(None);
+    }
+    if order_by.expressions.is_empty() || order_by.expressions.len() > 4 {
+        return Ok(None);
+    }
+    let mut sort_columns = Vec::with_capacity(order_by.expressions.len());
+    let mut descending = Vec::with_capacity(order_by.expressions.len());
+    for sort in &order_by.expressions {
+        let column_index = output_batch_column_index(batch, &sort.column)?;
+        let column = batch.column(column_index);
+        if column.null_count() != 0 || sort.nulls_first {
+            return Ok(None);
+        }
+        let Some(sort_column) = primitive_sort_column(column) else {
+            return Ok(None);
+        };
+        sort_columns.push(sort_column);
+        descending.push(sort.descending);
+    }
+    if !batch.columns().iter().all(|column| {
+        column.null_count() == 0
+            && matches!(
+                column.data_type(),
+                DataType::Int32
+                    | DataType::Int64
+                    | DataType::UInt64
+                    | DataType::Float64
+                    | DataType::Date32
+            )
+    }) {
+        return Ok(None);
+    }
+    let row_count = u32::try_from(batch.num_rows()).map_err(|_| {
+        DodamError::UnsupportedSql("primitive partial sort row count overflow".to_string())
+    })?;
+    let mut indices = (0..row_count).collect::<Vec<_>>();
+    {
+        let compare_rows = |left: &u32, right: &u32| {
+            let left = *left as usize;
+            let right = *right as usize;
+            for (column, descending) in sort_columns.iter().zip(&descending) {
+                let ordering = column.compare(left, right);
+                if ordering != std::cmp::Ordering::Equal {
+                    return if *descending {
+                        ordering.reverse()
+                    } else {
+                        ordering
+                    };
+                }
+            }
+            left.cmp(&right)
+        };
+        indices.select_nth_unstable_by(limit, compare_rows);
+        indices.truncate(limit);
+        indices.sort_unstable_by(compare_rows);
+    }
+    take_primitive_record_batch_by_raw_indices(batch, &indices).map(Some)
+}
+
+fn primitive_sort_column(column: &ArrayRef) -> Option<PrimitiveSortColumn<'_>> {
+    match column.data_type() {
+        DataType::Int32 => column
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .map(PrimitiveSortColumn::Int32),
+        DataType::Int64 => column
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .map(PrimitiveSortColumn::Int64),
+        DataType::UInt64 => column
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .map(PrimitiveSortColumn::UInt64),
+        DataType::Float64 => column
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .map(PrimitiveSortColumn::Float64),
+        DataType::Date32 => column
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .map(PrimitiveSortColumn::Date32),
+        _ => None,
+    }
+}
+
 fn take_primitive_record_batch_by_indices(
     batch: &RecordBatch,
     indices: &UInt32Array,
@@ -49906,14 +52757,30 @@ fn take_primitive_record_batch_by_indices(
     for row in 0..indices.len() {
         raw_indices.push(indices.value(row));
     }
+    take_primitive_record_batch_by_raw_indices(batch, &raw_indices).map(Some)
+}
+
+fn take_primitive_record_batch_by_raw_indices(
+    batch: &RecordBatch,
+    raw_indices: &[u32],
+) -> Result<RecordBatch> {
     let mut columns = Vec::with_capacity(batch.num_columns());
     for column in batch.columns() {
         let Some(array) = gather_primitive_array(column, &raw_indices) else {
-            return Ok(None);
+            return Ok(take_record_batch(
+                batch,
+                &UInt32Array::from(raw_indices.to_vec()),
+            )?);
         };
         columns.push(array);
     }
-    Ok(Some(RecordBatch::try_new(batch.schema(), columns)?))
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
+}
+
+fn primitive_partial_sort_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_PRIMITIVE_PARTIAL_SORT")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 fn limit_batches(
@@ -50092,6 +52959,16 @@ fn evaluate_scalar_predicate_with_parser(
         SqlExpr::IsNull(expr) | SqlExpr::IsNotNull(expr) => {
             let value = evaluate_scalar_expression(batch, &parser.parse(expr)?)?;
             let is_not_null = matches!(predicate, SqlExpr::IsNotNull(_));
+            if let EvaluatedScalar::Array(array) = &value {
+                return Ok(BooleanArray::from(
+                    (0..array.len())
+                        .map(|row| {
+                            let is_null = array.is_null(row);
+                            if is_not_null { !is_null } else { is_null }
+                        })
+                        .collect::<Vec<_>>(),
+                ));
+            }
             Ok(BooleanArray::from(
                 scalar_null_mask(value)
                     .into_iter()
@@ -50157,6 +53034,13 @@ fn evaluate_scalar_predicate_with_parser(
             expr,
             pattern,
             escape_char,
+        }
+        | SqlExpr::ILike {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
         } => {
             if *any {
                 return Err(DodamError::UnsupportedSql(
@@ -50164,7 +53048,11 @@ fn evaluate_scalar_predicate_with_parser(
                 ));
             }
             let value = scalar_as_utf8(evaluate_scalar_expression(batch, &parser.parse(expr)?)?)?;
-            let pattern = sql_like_pattern(pattern)?;
+            let case_insensitive = matches!(predicate, SqlExpr::ILike { .. });
+            let mut pattern = sql_like_pattern(pattern)?;
+            if case_insensitive {
+                pattern = pattern.to_lowercase();
+            }
             let escape = sql_like_escape(escape_char)?;
             let tokens = scalar_like_pattern_tokens(&pattern, escape)?;
             Ok(BooleanArray::from(
@@ -50172,7 +53060,14 @@ fn evaluate_scalar_predicate_with_parser(
                     .into_iter()
                     .map(|value| {
                         value.map(|value| {
-                            let matched = scalar_like_matches(&value, &tokens);
+                            let normalized_value;
+                            let value = if case_insensitive {
+                                normalized_value = value.to_lowercase();
+                                normalized_value.as_str()
+                            } else {
+                                value.as_str()
+                            };
+                            let matched = scalar_like_matches(value, &tokens);
                             if *negated { !matched } else { matched }
                         })
                     })
@@ -50237,6 +53132,34 @@ fn try_evaluate_vector_scalar_predicate(
                 .map(|expr| parser.parse(expr))
                 .collect::<Result<Vec<_>>>()?;
             vector_i64_expression_in_list(batch, &expr, &values, *negated)
+        }
+        SqlExpr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        }
+        | SqlExpr::ILike {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => {
+            if *any {
+                return Ok(None);
+            }
+            let expr = parser.parse(expr)?;
+            let case_insensitive = matches!(predicate, SqlExpr::ILike { .. });
+            vector_string_like_literal(
+                batch,
+                &expr,
+                pattern,
+                sql_like_escape(escape_char)?,
+                *negated,
+                case_insensitive,
+            )
         }
         _ => Ok(None),
     }
@@ -50303,6 +53226,16 @@ fn vector_column_literal_compare(
         DataType::Int32 => {
             let values = array.as_any().downcast_ref::<Int32Array>().expect("Int32");
             let literal = literal_as_i64_for_type(literal)?;
+            if values.null_count() == 0 {
+                return Ok(Some(BooleanArray::from(
+                    (0..values.len())
+                        .map(|row| {
+                            compare_optional_values(Some(i64::from(values.value(row))), op, literal)
+                                .unwrap_or(false)
+                        })
+                        .collect::<Vec<_>>(),
+                )));
+            }
             Ok(Some(BooleanArray::from(
                 (0..values.len())
                     .map(|row| {
@@ -50318,6 +53251,16 @@ fn vector_column_literal_compare(
         DataType::Int64 => {
             let values = array.as_any().downcast_ref::<Int64Array>().expect("Int64");
             let literal = literal_as_i64_for_type(literal)?;
+            if values.null_count() == 0 {
+                return Ok(Some(BooleanArray::from(
+                    (0..values.len())
+                        .map(|row| {
+                            compare_optional_values(Some(values.value(row)), op, literal)
+                                .unwrap_or(false)
+                        })
+                        .collect::<Vec<_>>(),
+                )));
+            }
             Ok(Some(BooleanArray::from(
                 (0..values.len())
                     .map(|row| {
@@ -50336,6 +53279,16 @@ fn vector_column_literal_compare(
                 .downcast_ref::<Float64Array>()
                 .expect("Float64");
             let literal = literal_as_f64_for_type(literal)?;
+            if values.null_count() == 0 {
+                return Ok(Some(BooleanArray::from(
+                    (0..values.len())
+                        .map(|row| {
+                            compare_optional_f64(Some(values.value(row)), op, literal)
+                                .unwrap_or(false)
+                        })
+                        .collect::<Vec<_>>(),
+                )));
+            }
             Ok(Some(BooleanArray::from(
                 (0..values.len())
                     .map(|row| {
@@ -50354,6 +53307,16 @@ fn vector_column_literal_compare(
                 .downcast_ref::<BooleanArray>()
                 .expect("Boolean");
             let literal = literal_as_bool_for_type(literal)?;
+            if values.null_count() == 0 {
+                return Ok(Some(BooleanArray::from(
+                    (0..values.len())
+                        .map(|row| {
+                            compare_optional_values(Some(values.value(row)), op, literal)
+                                .unwrap_or(false)
+                        })
+                        .collect::<Vec<_>>(),
+                )));
+            }
             Ok(Some(BooleanArray::from(
                 (0..values.len())
                     .map(|row| {
@@ -50372,6 +53335,16 @@ fn vector_column_literal_compare(
                 .downcast_ref::<Date32Array>()
                 .expect("Date32");
             let literal = literal_as_date32_for_type(literal)?;
+            if values.null_count() == 0 {
+                return Ok(Some(BooleanArray::from(
+                    (0..values.len())
+                        .map(|row| {
+                            compare_optional_values(Some(values.value(row)), op, literal)
+                                .unwrap_or(false)
+                        })
+                        .collect::<Vec<_>>(),
+                )));
+            }
             Ok(Some(BooleanArray::from(
                 (0..values.len())
                     .map(|row| {
@@ -50390,6 +53363,16 @@ fn vector_column_literal_compare(
                 .downcast_ref::<Decimal128Array>()
                 .expect("Decimal128");
             let literal = literal_as_decimal128_for_type(literal, *precision, *scale)?;
+            if values.null_count() == 0 {
+                return Ok(Some(BooleanArray::from(
+                    (0..values.len())
+                        .map(|row| {
+                            compare_optional_values(Some(values.value(row)), op, literal)
+                                .unwrap_or(false)
+                        })
+                        .collect::<Vec<_>>(),
+                )));
+            }
             Ok(Some(BooleanArray::from(
                 (0..values.len())
                     .map(|row| {
@@ -50475,6 +53458,90 @@ fn vector_i64_expression(
             vector_i64_array(struct_field_array(batch, column, field)?)
         }
         _ => Ok(None),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SimpleLikeLiteral<'a> {
+    Exact(&'a str),
+    Prefix(&'a str),
+    Suffix(&'a str),
+    Contains(&'a str),
+}
+
+fn vector_string_like_literal(
+    batch: &RecordBatch,
+    expr: &ScalarSqlExpression,
+    pattern: &SqlExpr,
+    escape: Option<char>,
+    negated: bool,
+    case_insensitive: bool,
+) -> Result<Option<BooleanArray>> {
+    let ScalarSqlExpression::Column(column) = expr else {
+        return Ok(None);
+    };
+    let pattern = sql_like_pattern(pattern)?;
+    let Some(pattern) = simple_like_literal(&pattern, escape) else {
+        return Ok(None);
+    };
+    let values = batch_column(batch, column)?;
+    let Some(values) = values.as_any().downcast_ref::<StringArray>() else {
+        return Ok(None);
+    };
+    Ok(Some(BooleanArray::from(
+        (0..values.len())
+            .map(|row| {
+                if values.is_null(row) {
+                    return None;
+                }
+                let matched = simple_like_matches(values.value(row), pattern, case_insensitive);
+                Some(if negated { !matched } else { matched })
+            })
+            .collect::<Vec<_>>(),
+    )))
+}
+
+fn simple_like_literal(pattern: &str, escape: Option<char>) -> Option<SimpleLikeLiteral<'_>> {
+    if escape.is_some() || pattern.as_bytes().contains(&b'_') {
+        return None;
+    }
+    let percent_count = pattern
+        .as_bytes()
+        .iter()
+        .filter(|byte| **byte == b'%')
+        .count();
+    match percent_count {
+        0 => Some(SimpleLikeLiteral::Exact(pattern)),
+        1 if pattern.ends_with('%') => {
+            Some(SimpleLikeLiteral::Prefix(&pattern[..pattern.len() - 1]))
+        }
+        1 if pattern.starts_with('%') => Some(SimpleLikeLiteral::Suffix(&pattern[1..])),
+        2 if pattern.starts_with('%') && pattern.ends_with('%') => {
+            Some(SimpleLikeLiteral::Contains(&pattern[1..pattern.len() - 1]))
+        }
+        _ => None,
+    }
+}
+
+fn simple_like_matches(
+    value: &str,
+    pattern: SimpleLikeLiteral<'_>,
+    case_insensitive: bool,
+) -> bool {
+    if case_insensitive {
+        let value = value.to_lowercase();
+        return match pattern {
+            SimpleLikeLiteral::Exact(pattern) => value == pattern.to_lowercase(),
+            SimpleLikeLiteral::Prefix(pattern) => value.starts_with(&pattern.to_lowercase()),
+            SimpleLikeLiteral::Suffix(pattern) => value.ends_with(&pattern.to_lowercase()),
+            SimpleLikeLiteral::Contains(pattern) => value.contains(&pattern.to_lowercase()),
+        };
+    }
+    match pattern {
+        SimpleLikeLiteral::Exact(pattern) => value == pattern,
+        SimpleLikeLiteral::Prefix(pattern) => value.starts_with(pattern),
+        SimpleLikeLiteral::Suffix(pattern) => value.ends_with(pattern),
+        SimpleLikeLiteral::Contains(pattern) => value.contains(pattern),
     }
 }
 
@@ -50572,6 +53639,9 @@ fn apply_output_projection(
     batches
         .into_iter()
         .map(|batch| {
+            if projection_matches_batch_schema(&batch, columns) {
+                return Ok(batch);
+            }
             let indices = columns
                 .iter()
                 .map(|column| output_batch_column_index(&batch, column))
@@ -50579,6 +53649,16 @@ fn apply_output_projection(
             Ok(batch.project(&indices)?)
         })
         .collect()
+}
+
+fn projection_matches_batch_schema(batch: &RecordBatch, columns: &[String]) -> bool {
+    batch.num_columns() == columns.len()
+        && batch
+            .schema()
+            .fields()
+            .iter()
+            .zip(columns)
+            .all(|(field, column)| field.name() == column)
 }
 
 fn apply_qualified_wildcard_projection(
@@ -50712,8 +53792,27 @@ fn collect_aggregates_with_optional_expression_views(
     fragments: usize,
     group_by: &[String],
     aggregates: &[AggregateExpr],
+    filtered_aggregates: &[NativeFilteredAggregateSpec],
     expressions: &[ProjectionExpression],
 ) -> Result<AggregateMetrics> {
+    let started = generic_profile_start();
+    if group_by.len() <= 1 && !filtered_aggregates.is_empty() {
+        let metrics = collect_native_filtered_aggregates(
+            stream,
+            fragments,
+            group_by,
+            filtered_aggregates.to_vec(),
+        )?;
+        generic_profile_elapsed("aggregate filtered", started);
+        return Ok(metrics);
+    }
+    if group_by.len() <= 1
+        && let Some(specs) = legacy_case_filtered_aggregate_specs(aggregates, expressions)
+    {
+        let metrics = collect_native_filtered_aggregates(stream, fragments, group_by, specs)?;
+        generic_profile_elapsed("aggregate legacy case filtered", started);
+        return Ok(metrics);
+    }
     let started = generic_profile_start();
     if group_by.is_empty() {
         let stream = append_aggregate_expression_stream(stream, expressions.to_vec());
@@ -50737,6 +53836,524 @@ fn collect_aggregates_with_optional_expression_views(
     let metrics = collect_grouped_aggregates(stream, fragments, group_by, aggregates)?;
     generic_profile_elapsed("aggregate grouped append/fold", started);
     Ok(metrics)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct NativeFilteredAggregateSpec {
+    expr: AggregateExpr,
+    condition: SqlExpr,
+    input: ScalarSqlExpression,
+    input_kind: NativeFilteredInputKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeFilteredInputKind {
+    AlwaysSome,
+    Nullable,
+}
+
+#[derive(Clone)]
+enum NativeFilteredAggregateState {
+    Count(u64),
+    SumI64 { sum: i64, count: u64 },
+    AvgI64 { sum: i64, count: u64 },
+    MinI64(Option<i64>),
+    MaxI64(Option<i64>),
+}
+
+fn collect_native_filtered_aggregates(
+    mut stream: SendableBatchStream,
+    fragments: usize,
+    group_by: &[String],
+    specs: Vec<NativeFilteredAggregateSpec>,
+) -> Result<AggregateMetrics> {
+    let started = Instant::now();
+    let mut metrics = AggregateMetrics {
+        fragments,
+        ..AggregateMetrics::default()
+    };
+    if group_by.is_empty() {
+        let mut states = native_filtered_initial_states(&specs);
+        for batch in stream.by_ref() {
+            let batch = batch?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            metrics.batches += 1;
+            metrics.rows += batch.num_rows();
+            native_filtered_update_states(&batch, &specs, &mut states)?;
+        }
+        metrics.values = native_filtered_finish_states(&specs, states);
+        metrics.aggregate_nanos = elapsed_micros_to_nanos(started.elapsed());
+        return Ok(metrics);
+    }
+    debug_assert_eq!(group_by.len(), 1);
+    let group_column = &group_by[0];
+    const MAX_DENSE_GROUP_KEY: usize = 1_000_000;
+    let mut dense: Vec<Option<Vec<NativeFilteredAggregateState>>> = Vec::new();
+    let mut null_i64_group: Option<Vec<NativeFilteredAggregateState>> = None;
+    let mut groups: HashMap<GroupValue, Vec<NativeFilteredAggregateState>> = HashMap::new();
+    for batch in stream.by_ref() {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        metrics.batches += 1;
+        metrics.rows += batch.num_rows();
+        let group_values = evaluated_column(&batch, group_column)?;
+        let group_keys = NativeFilteredGroupKeys::new(&group_values);
+        let masks = native_filtered_batch_masks(&batch, &specs)?;
+        let inputs = native_filtered_batch_inputs(&batch, &specs)?;
+        for row in 0..batch.num_rows() {
+            let states = if group_keys.is_i64_like() {
+                match group_keys.i64_key_at(row)? {
+                    None => {
+                        null_i64_group.get_or_insert_with(|| native_filtered_initial_states(&specs))
+                    }
+                    Some(key) if key >= 0 && (key as usize) <= MAX_DENSE_GROUP_KEY => {
+                        let index = key as usize;
+                        if dense.len() <= index {
+                            dense.resize_with(index + 1, || None);
+                        }
+                        dense[index].get_or_insert_with(|| native_filtered_initial_states(&specs))
+                    }
+                    Some(key) => groups
+                        .entry(GroupValue::Int64(Some(key)))
+                        .or_insert_with(|| native_filtered_initial_states(&specs)),
+                }
+            } else {
+                let key = native_group_value_at(&group_values, row)?;
+                groups
+                    .entry(key)
+                    .or_insert_with(|| native_filtered_initial_states(&specs))
+            };
+            for (index, ((spec, mask), input)) in specs.iter().zip(&masks).zip(&inputs).enumerate()
+            {
+                if mask.selected(row) {
+                    native_filtered_update_state(&mut states[index], spec, input, row)?;
+                }
+            }
+        }
+    }
+    metrics.groups = groups
+        .into_iter()
+        .map(|(key, states)| GroupAggregateResult {
+            keys: vec![key],
+            values: native_filtered_finish_states(&specs, states),
+        })
+        .collect();
+    if let Some(states) = null_i64_group {
+        metrics.groups.push(GroupAggregateResult {
+            keys: vec![GroupValue::Int64(None)],
+            values: native_filtered_finish_states(&specs, states),
+        });
+    }
+    metrics
+        .groups
+        .extend(dense.into_iter().enumerate().filter_map(|(key, states)| {
+            states.map(|states| GroupAggregateResult {
+                keys: vec![GroupValue::Int64(Some(key as i64))],
+                values: native_filtered_finish_states(&specs, states),
+            })
+        }));
+    metrics
+        .groups
+        .sort_by(|left, right| compare_native_group_keys(&left.keys, &right.keys));
+    metrics.aggregate_nanos = elapsed_micros_to_nanos(started.elapsed());
+    Ok(metrics)
+}
+
+enum NativeFilteredGroupKeys {
+    I32(Int32Array),
+    I64(Int64Array),
+    Other,
+}
+
+impl NativeFilteredGroupKeys {
+    fn new(value: &EvaluatedScalar) -> Self {
+        let EvaluatedScalar::Array(array) = value else {
+            return Self::Other;
+        };
+        if let Some(values) = array.as_any().downcast_ref::<Int32Array>() {
+            return Self::I32(values.clone());
+        }
+        if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
+            return Self::I64(values.clone());
+        }
+        Self::Other
+    }
+
+    fn is_i64_like(&self) -> bool {
+        !matches!(self, Self::Other)
+    }
+
+    fn i64_key_at(&self, row: usize) -> Result<Option<i64>> {
+        Ok(match self {
+            Self::I32(values) => {
+                if values.is_null(row) {
+                    None
+                } else {
+                    Some(i64::from(values.value(row)))
+                }
+            }
+            Self::I64(values) => {
+                if values.is_null(row) {
+                    None
+                } else {
+                    Some(values.value(row))
+                }
+            }
+            Self::Other => {
+                return Err(DodamError::UnsupportedSql(
+                    "native filtered aggregate expected integer group key".to_string(),
+                ));
+            }
+        })
+    }
+}
+
+fn compare_native_group_keys(left: &[GroupValue], right: &[GroupValue]) -> std::cmp::Ordering {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| compare_native_group_value(left, right))
+        .find(|ordering| *ordering != std::cmp::Ordering::Equal)
+        .unwrap_or_else(|| left.len().cmp(&right.len()))
+}
+
+fn compare_native_group_value(left: &GroupValue, right: &GroupValue) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (left, right) {
+        (GroupValue::Int64(None), GroupValue::Int64(None)) => Ordering::Equal,
+        (GroupValue::Int64(None), GroupValue::Int64(_)) => Ordering::Less,
+        (GroupValue::Int64(_), GroupValue::Int64(None)) => Ordering::Greater,
+        (GroupValue::Int64(Some(left)), GroupValue::Int64(Some(right))) => left.cmp(right),
+        (GroupValue::Utf8(None), GroupValue::Utf8(None)) => Ordering::Equal,
+        (GroupValue::Utf8(None), GroupValue::Utf8(_)) => Ordering::Less,
+        (GroupValue::Utf8(_), GroupValue::Utf8(None)) => Ordering::Greater,
+        (GroupValue::Utf8(Some(left)), GroupValue::Utf8(Some(right))) => left.cmp(right),
+        (GroupValue::Date32(None), GroupValue::Date32(None)) => Ordering::Equal,
+        (GroupValue::Date32(None), GroupValue::Date32(_)) => Ordering::Less,
+        (GroupValue::Date32(_), GroupValue::Date32(None)) => Ordering::Greater,
+        (GroupValue::Date32(Some(left)), GroupValue::Date32(Some(right))) => left.cmp(right),
+        _ => Ordering::Equal,
+    }
+}
+
+fn elapsed_micros_to_nanos(duration: Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+fn legacy_case_filtered_aggregate_specs(
+    aggregates: &[AggregateExpr],
+    expressions: &[ProjectionExpression],
+) -> Option<Vec<NativeFilteredAggregateSpec>> {
+    if aggregates.is_empty() || expressions.is_empty() {
+        return None;
+    }
+    let mut specs = Vec::with_capacity(aggregates.len());
+    for aggregate in aggregates {
+        let column = aggregate.referenced_column()?;
+        let expression = expressions
+            .iter()
+            .find(|expression| expression.output_name == column)?;
+        let ScalarSqlExpression::Case {
+            conditions,
+            results,
+            else_result,
+        } = &expression.expr
+        else {
+            return None;
+        };
+        let ([condition], [input], None) = (
+            conditions.as_slice(),
+            results.as_slice(),
+            else_result.as_deref(),
+        ) else {
+            return None;
+        };
+        if !matches!(
+            aggregate,
+            AggregateExpr::Count(_)
+                | AggregateExpr::Sum(_)
+                | AggregateExpr::Avg(_)
+                | AggregateExpr::Min(_)
+                | AggregateExpr::Max(_)
+        ) {
+            return None;
+        }
+        specs.push(NativeFilteredAggregateSpec {
+            expr: aggregate.clone(),
+            condition: condition.clone(),
+            input: input.clone(),
+            input_kind: native_filtered_input_kind(aggregate, input),
+        });
+    }
+    Some(specs)
+}
+
+fn native_filtered_input_kind(
+    aggregate: &AggregateExpr,
+    input: &ScalarSqlExpression,
+) -> NativeFilteredInputKind {
+    match aggregate {
+        AggregateExpr::Count(_)
+            if matches!(
+                input,
+                ScalarSqlExpression::Literal(LiteralValue::Boolean(_))
+                    | ScalarSqlExpression::Literal(LiteralValue::Int64(_))
+                    | ScalarSqlExpression::Literal(LiteralValue::Float64(_))
+                    | ScalarSqlExpression::Literal(LiteralValue::Utf8(_))
+            ) =>
+        {
+            NativeFilteredInputKind::AlwaysSome
+        }
+        _ => NativeFilteredInputKind::Nullable,
+    }
+}
+
+fn native_filtered_initial_states(
+    specs: &[NativeFilteredAggregateSpec],
+) -> Vec<NativeFilteredAggregateState> {
+    specs
+        .iter()
+        .map(|spec| match spec.expr {
+            AggregateExpr::Count(_) => NativeFilteredAggregateState::Count(0),
+            AggregateExpr::Sum(_) => NativeFilteredAggregateState::SumI64 { sum: 0, count: 0 },
+            AggregateExpr::Avg(_) => NativeFilteredAggregateState::AvgI64 { sum: 0, count: 0 },
+            AggregateExpr::Min(_) => NativeFilteredAggregateState::MinI64(None),
+            AggregateExpr::Max(_) => NativeFilteredAggregateState::MaxI64(None),
+            _ => unreachable!("validated native filtered aggregate"),
+        })
+        .collect()
+}
+
+fn native_filtered_update_states(
+    batch: &RecordBatch,
+    specs: &[NativeFilteredAggregateSpec],
+    states: &mut [NativeFilteredAggregateState],
+) -> Result<()> {
+    let masks = native_filtered_batch_masks(batch, specs)?;
+    let inputs = native_filtered_batch_inputs(batch, specs)?;
+    for row in 0..batch.num_rows() {
+        for (index, spec) in specs.iter().enumerate() {
+            if masks[index].selected(row) {
+                native_filtered_update_state(&mut states[index], spec, &inputs[index], row)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+struct NativeFilteredBatchMask {
+    mask: BooleanArray,
+    nullable: bool,
+}
+
+impl NativeFilteredBatchMask {
+    fn new(mask: BooleanArray) -> Self {
+        let nullable = mask.null_count() > 0;
+        Self { mask, nullable }
+    }
+
+    fn selected(&self, row: usize) -> bool {
+        if self.nullable {
+            self.mask.is_valid(row) && self.mask.value(row)
+        } else {
+            self.mask.value(row)
+        }
+    }
+}
+
+fn native_filtered_batch_masks(
+    batch: &RecordBatch,
+    specs: &[NativeFilteredAggregateSpec],
+) -> Result<Vec<NativeFilteredBatchMask>> {
+    specs
+        .iter()
+        .map(|spec| {
+            evaluate_scalar_predicate(batch, &spec.condition, None)
+                .map(NativeFilteredBatchMask::new)
+        })
+        .collect()
+}
+
+enum NativeFilteredBatchInput {
+    AlwaysSome,
+    NonNull,
+    I64Array(Int64Array),
+    I32Array(Int32Array),
+    Other(EvaluatedScalar),
+}
+
+fn native_filtered_batch_inputs(
+    batch: &RecordBatch,
+    specs: &[NativeFilteredAggregateSpec],
+) -> Result<Vec<NativeFilteredBatchInput>> {
+    specs
+        .iter()
+        .map(|spec| native_filtered_batch_input(batch, spec))
+        .collect()
+}
+
+fn native_filtered_batch_input(
+    batch: &RecordBatch,
+    spec: &NativeFilteredAggregateSpec,
+) -> Result<NativeFilteredBatchInput> {
+    if spec.input_kind == NativeFilteredInputKind::AlwaysSome {
+        return Ok(NativeFilteredBatchInput::AlwaysSome);
+    }
+    let value = evaluate_scalar_expression(batch, &spec.input)?;
+    match (&spec.expr, &value) {
+        (AggregateExpr::Count(_), EvaluatedScalar::Array(array)) if array.null_count() == 0 => {
+            Ok(NativeFilteredBatchInput::NonNull)
+        }
+        (
+            AggregateExpr::Sum(_)
+            | AggregateExpr::Avg(_)
+            | AggregateExpr::Min(_)
+            | AggregateExpr::Max(_),
+            EvaluatedScalar::Array(array),
+        ) if array.data_type() == &DataType::Int64 => Ok(NativeFilteredBatchInput::I64Array(
+            array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64")
+                .clone(),
+        )),
+        (
+            AggregateExpr::Sum(_)
+            | AggregateExpr::Avg(_)
+            | AggregateExpr::Min(_)
+            | AggregateExpr::Max(_),
+            EvaluatedScalar::Array(array),
+        ) if array.data_type() == &DataType::Int32 => Ok(NativeFilteredBatchInput::I32Array(
+            array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("Int32")
+                .clone(),
+        )),
+        _ => Ok(NativeFilteredBatchInput::Other(value)),
+    }
+}
+
+fn native_filtered_update_state(
+    state: &mut NativeFilteredAggregateState,
+    spec: &NativeFilteredAggregateSpec,
+    input: &NativeFilteredBatchInput,
+    row: usize,
+) -> Result<()> {
+    match state {
+        NativeFilteredAggregateState::Count(count) => {
+            if native_filtered_input_is_some(input, row)? {
+                *count += 1;
+            }
+        }
+        NativeFilteredAggregateState::SumI64 { sum, count }
+        | NativeFilteredAggregateState::AvgI64 { sum, count } => {
+            if let Some(value) = native_filtered_input_i64(input, row)? {
+                *sum += value;
+                *count += 1;
+            }
+        }
+        NativeFilteredAggregateState::MinI64(value) => {
+            if let Some(input) = native_filtered_input_i64(input, row)? {
+                *value = Some(value.map_or(input, |current| current.min(input)));
+            }
+        }
+        NativeFilteredAggregateState::MaxI64(value) => {
+            if let Some(input) = native_filtered_input_i64(input, row)? {
+                *value = Some(value.map_or(input, |current| current.max(input)));
+            }
+        }
+    }
+    let _ = spec;
+    Ok(())
+}
+
+fn native_filtered_input_is_some(input: &NativeFilteredBatchInput, row: usize) -> Result<bool> {
+    Ok(match input {
+        NativeFilteredBatchInput::AlwaysSome | NativeFilteredBatchInput::NonNull => true,
+        NativeFilteredBatchInput::I64Array(values) => !values.is_null(row),
+        NativeFilteredBatchInput::I32Array(values) => !values.is_null(row),
+        NativeFilteredBatchInput::Other(value) => scalar_value_at(value, row)?.is_some(),
+    })
+}
+
+fn native_filtered_input_i64(input: &NativeFilteredBatchInput, row: usize) -> Result<Option<i64>> {
+    match input {
+        NativeFilteredBatchInput::AlwaysSome | NativeFilteredBatchInput::NonNull => Ok(None),
+        NativeFilteredBatchInput::I64Array(values) => {
+            if values.is_null(row) {
+                Ok(None)
+            } else {
+                Ok(Some(values.value(row)))
+            }
+        }
+        NativeFilteredBatchInput::I32Array(values) => {
+            if values.is_null(row) {
+                Ok(None)
+            } else {
+                Ok(Some(i64::from(values.value(row))))
+            }
+        }
+        NativeFilteredBatchInput::Other(value) => scalar_value_as_i64(value, row),
+    }
+}
+
+fn native_filtered_finish_states(
+    specs: &[NativeFilteredAggregateSpec],
+    states: Vec<NativeFilteredAggregateState>,
+) -> Vec<AggregateResult> {
+    specs
+        .iter()
+        .zip(states)
+        .map(|(spec, state)| AggregateResult {
+            expr: spec.expr.clone(),
+            value: match state {
+                NativeFilteredAggregateState::Count(count) => AggregateValue::Count(count),
+                NativeFilteredAggregateState::SumI64 { sum, count } => {
+                    AggregateValue::Int64((count > 0).then_some(sum))
+                }
+                NativeFilteredAggregateState::AvgI64 { sum, count } => {
+                    AggregateValue::Float64((count > 0).then_some(sum as f64 / count as f64))
+                }
+                NativeFilteredAggregateState::MinI64(value)
+                | NativeFilteredAggregateState::MaxI64(value) => AggregateValue::Int64(value),
+            },
+        })
+        .collect()
+}
+
+fn native_group_value_at(value: &EvaluatedScalar, row: usize) -> Result<GroupValue> {
+    Ok(match scalar_value_at(value, row)? {
+        Some(ScalarValue::Int64(value)) => GroupValue::Int64(Some(value)),
+        Some(ScalarValue::Float64(value)) => GroupValue::Int64(Some(value as i64)),
+        Some(ScalarValue::Utf8(value)) => GroupValue::Utf8(Some(value)),
+        Some(ScalarValue::Date32(value)) => GroupValue::Date32(Some(value)),
+        Some(ScalarValue::Decimal128(value, precision, scale)) => {
+            GroupValue::Decimal128(Some(value), precision, scale)
+        }
+        None => GroupValue::Int64(None),
+        Some(other) => {
+            return Err(DodamError::UnsupportedSql(format!(
+                "native filtered aggregate group key does not support {}",
+                scalar_value_type_name(&other)
+            )));
+        }
+    })
+}
+
+fn scalar_value_type_name(value: &ScalarValue) -> &'static str {
+    match value {
+        ScalarValue::Int64(_) => "INTEGER",
+        ScalarValue::Float64(_) => "DOUBLE",
+        ScalarValue::Decimal128(_, _, _) => "DECIMAL",
+        ScalarValue::Utf8(_) => "VARCHAR",
+        ScalarValue::Boolean(_) => "BOOLEAN",
+        ScalarValue::Date32(_) => "DATE",
+        ScalarValue::TimestampMillisecond(_) => "TIMESTAMP",
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -52418,11 +56035,26 @@ fn add_scalar_expression_columns(columns: &mut Vec<String>, expression: &ScalarS
         | ScalarSqlExpression::Lower(expr)
         | ScalarSqlExpression::Upper(expr)
         | ScalarSqlExpression::Length(expr)
+        | ScalarSqlExpression::Trim(expr)
+        | ScalarSqlExpression::Abs(expr)
+        | ScalarSqlExpression::Round(expr)
+        | ScalarSqlExpression::Floor(expr)
+        | ScalarSqlExpression::Ceil(expr)
         | ScalarSqlExpression::ExtractYear(expr) => add_scalar_expression_columns(columns, expr),
         ScalarSqlExpression::Coalesce(values) => {
             for value in values {
                 add_scalar_expression_columns(columns, value);
             }
+        }
+        ScalarSqlExpression::Concat(values) => {
+            for value in values {
+                add_scalar_expression_columns(columns, value);
+            }
+        }
+        ScalarSqlExpression::Replace { expr, from, to } => {
+            add_scalar_expression_columns(columns, expr);
+            add_scalar_expression_columns(columns, from);
+            add_scalar_expression_columns(columns, to);
         }
         ScalarSqlExpression::Substring {
             expr,
@@ -52706,6 +56338,56 @@ fn evaluate_scalar_expression(
                     .collect(),
             ))
         }
+        ScalarSqlExpression::Trim(expr) => {
+            let value = scalar_as_utf8(evaluate_scalar_expression(batch, expr)?)?;
+            Ok(EvaluatedScalar::Utf8(
+                value
+                    .into_iter()
+                    .map(|value| value.map(|value| value.trim().to_string()))
+                    .collect(),
+            ))
+        }
+        ScalarSqlExpression::Abs(expr) => {
+            let value = materialize_array_scalar(evaluate_scalar_expression(batch, expr)?)?;
+            evaluate_abs_scalar(value)
+        }
+        ScalarSqlExpression::Round(expr) => evaluate_f64_unary_scalar(batch, expr, f64::round),
+        ScalarSqlExpression::Floor(expr) => evaluate_f64_unary_scalar(batch, expr, f64::floor),
+        ScalarSqlExpression::Ceil(expr) => evaluate_f64_unary_scalar(batch, expr, f64::ceil),
+        ScalarSqlExpression::Replace { expr, from, to } => {
+            let values = scalar_as_utf8(evaluate_scalar_expression(batch, expr)?)?;
+            let from_values = scalar_as_utf8(evaluate_scalar_expression(batch, from)?)?;
+            let to_values = scalar_as_utf8(evaluate_scalar_expression(batch, to)?)?;
+            Ok(EvaluatedScalar::Utf8(
+                (0..batch.num_rows())
+                    .map(
+                        |row| match (&values[row], &from_values[row], &to_values[row]) {
+                            (Some(value), Some(from), Some(to)) => Some(value.replace(from, to)),
+                            _ => None,
+                        },
+                    )
+                    .collect(),
+            ))
+        }
+        ScalarSqlExpression::Concat(values) => {
+            let values = values
+                .iter()
+                .map(|expr| scalar_as_utf8(evaluate_scalar_expression(batch, expr)?))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(EvaluatedScalar::Utf8(
+                (0..batch.num_rows())
+                    .map(|row| {
+                        let mut output = String::new();
+                        for values in &values {
+                            if let Some(value) = &values[row] {
+                                output.push_str(value);
+                            }
+                        }
+                        Some(output)
+                    })
+                    .collect(),
+            ))
+        }
         ScalarSqlExpression::ExtractYear(expr) => {
             let value = scalar_as_i64(evaluate_scalar_expression(batch, expr)?)?;
             Ok(EvaluatedScalar::Int64(
@@ -52748,6 +56430,56 @@ fn evaluate_scalar_expression(
             else_result,
         } => evaluate_case_expression(batch, conditions, results, else_result.as_deref()),
     }
+}
+
+fn evaluate_abs_scalar(value: EvaluatedScalar) -> Result<EvaluatedScalar> {
+    match value {
+        EvaluatedScalar::Array(_) => unreachable!("array scalar was materialized before abs"),
+        EvaluatedScalar::Int64(values) => Ok(EvaluatedScalar::Int64(
+            values
+                .into_iter()
+                .map(|value| {
+                    value
+                        .map(|value| {
+                            value.checked_abs().ok_or_else(|| {
+                                DodamError::UnsupportedSql("ABS integer overflow".to_string())
+                            })
+                        })
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?,
+        )),
+        EvaluatedScalar::Float64(values) => Ok(EvaluatedScalar::Float64(
+            values
+                .into_iter()
+                .map(|value| value.map(f64::abs))
+                .collect(),
+        )),
+        EvaluatedScalar::Decimal128 { values, scale, .. } => {
+            let scale = decimal_scale_f64(scale)?;
+            Ok(EvaluatedScalar::Float64(
+                values
+                    .into_iter()
+                    .map(|value| value.map(|value| (value as f64 / scale).abs()))
+                    .collect(),
+            ))
+        }
+        other => Err(DodamError::TypeMismatch(format!(
+            "cannot use {} in ABS",
+            other.data_type()
+        ))),
+    }
+}
+
+fn evaluate_f64_unary_scalar(
+    batch: &RecordBatch,
+    expr: &ScalarSqlExpression,
+    op: fn(f64) -> f64,
+) -> Result<EvaluatedScalar> {
+    let values = scalar_as_f64(evaluate_scalar_expression(batch, expr)?)?;
+    Ok(EvaluatedScalar::Float64(
+        values.into_iter().map(|value| value.map(op)).collect(),
+    ))
 }
 
 fn evaluate_column_literal_coalesce(
@@ -53309,6 +57041,11 @@ fn evaluate_case_expression(
             "CASE conditions and results length mismatch".to_string(),
         ));
     }
+    if conditions.len() == 1 && else_result.is_none() {
+        let mask = evaluate_scalar_predicate(batch, &conditions[0], None)?;
+        let value = evaluate_scalar_expression(batch, &results[0])?;
+        return mask_evaluated_scalar(value, &mask);
+    }
     let evaluated_results = results
         .iter()
         .map(|expr| evaluate_scalar_expression(batch, expr))
@@ -53339,6 +57076,56 @@ fn evaluate_case_expression(
         set_scalar_value_from(&mut output, row, selected)?;
     }
     Ok(output)
+}
+
+fn mask_evaluated_scalar(value: EvaluatedScalar, mask: &BooleanArray) -> Result<EvaluatedScalar> {
+    if let EvaluatedScalar::Array(array) = value {
+        return Ok(EvaluatedScalar::Array(mask_array_with_boolean(
+            array, mask,
+        )?));
+    }
+    let value = materialize_array_scalar(value)?;
+    Ok(match value {
+        EvaluatedScalar::Array(_) => unreachable!("array scalar was materialized before masking"),
+        EvaluatedScalar::Int64(values) => EvaluatedScalar::Int64(mask_options(values, mask)),
+        EvaluatedScalar::Float64(values) => EvaluatedScalar::Float64(mask_options(values, mask)),
+        EvaluatedScalar::Decimal128 {
+            values,
+            precision,
+            scale,
+        } => EvaluatedScalar::Decimal128 {
+            values: mask_options(values, mask),
+            precision,
+            scale,
+        },
+        EvaluatedScalar::Utf8(values) => EvaluatedScalar::Utf8(mask_options(values, mask)),
+        EvaluatedScalar::Boolean(values) => EvaluatedScalar::Boolean(mask_options(values, mask)),
+        EvaluatedScalar::Date32(values) => EvaluatedScalar::Date32(mask_options(values, mask)),
+        EvaluatedScalar::TimestampMillisecond(values) => {
+            EvaluatedScalar::TimestampMillisecond(mask_options(values, mask))
+        }
+    })
+}
+
+fn mask_array_with_boolean(array: ArrayRef, mask: &BooleanArray) -> Result<ArrayRef> {
+    let mask_nulls = NullBuffer::from(
+        (0..array.len())
+            .map(|row| boolean_value(mask, row) == Some(true))
+            .collect::<Vec<_>>(),
+    );
+    let data = array.to_data();
+    let nulls = NullBuffer::union_many([data.nulls(), Some(&mask_nulls)]);
+    let data = data.into_builder().nulls(nulls).build()?;
+    Ok(make_array(data))
+}
+
+fn mask_options<T>(mut values: Vec<Option<T>>, mask: &BooleanArray) -> Vec<Option<T>> {
+    for (row, value) in values.iter_mut().enumerate() {
+        if boolean_value(mask, row) != Some(true) {
+            *value = None;
+        }
+    }
+    values
 }
 
 fn evaluate_scalar_in_list(
@@ -53471,7 +57258,7 @@ enum ScalarValue {
 fn scalar_value_at(value: &EvaluatedScalar, row: usize) -> Result<Option<ScalarValue>> {
     Ok(match value {
         EvaluatedScalar::Array(array) => {
-            return scalar_value_at(&evaluated_array(array.as_ref())?, row);
+            return array_scalar_value_at(array.as_ref(), row);
         }
         EvaluatedScalar::Int64(values) => values[row].map(ScalarValue::Int64),
         EvaluatedScalar::Float64(values) => values[row].map(ScalarValue::Float64),
@@ -53487,6 +57274,43 @@ fn scalar_value_at(value: &EvaluatedScalar, row: usize) -> Result<Option<ScalarV
             values[row].map(ScalarValue::TimestampMillisecond)
         }
     })
+}
+
+fn array_scalar_value_at(array: &dyn Array, row: usize) -> Result<Option<ScalarValue>> {
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
+        return Ok(Some(ScalarValue::Int64(values.value(row))));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Int32Array>() {
+        return Ok(Some(ScalarValue::Int64(i64::from(values.value(row)))));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Float64Array>() {
+        return Ok(Some(ScalarValue::Float64(values.value(row))));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Decimal128Array>() {
+        if let DataType::Decimal128(precision, scale) = array.data_type() {
+            return Ok(Some(ScalarValue::Decimal128(
+                values.value(row),
+                *precision,
+                *scale,
+            )));
+        }
+    }
+    if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
+        return Ok(Some(ScalarValue::Utf8(values.value(row).to_string())));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<BooleanArray>() {
+        return Ok(Some(ScalarValue::Boolean(values.value(row))));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Date32Array>() {
+        return Ok(Some(ScalarValue::Date32(values.value(row))));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<TimestampMillisecondArray>() {
+        return Ok(Some(ScalarValue::TimestampMillisecond(values.value(row))));
+    }
+    scalar_value_at(&evaluated_array(array)?, row)
 }
 
 fn cast_scalar_for_kind(
@@ -53662,14 +57486,25 @@ fn set_scalar_value_from(
 
 fn scalar_value_as_i64(value: &EvaluatedScalar, row: usize) -> Result<Option<i64>> {
     match value {
-        EvaluatedScalar::Array(array) => {
-            scalar_value_as_i64(&evaluated_array(array.as_ref())?, row)
-        }
+        EvaluatedScalar::Array(array) => array_value_as_i64(array.as_ref(), row),
         EvaluatedScalar::Int64(values) => Ok(values[row]),
         _ => Err(DodamError::UnsupportedSql(
             "CASE result type mismatch".to_string(),
         )),
     }
+}
+
+fn array_value_as_i64(array: &dyn Array, row: usize) -> Result<Option<i64>> {
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
+        return Ok(Some(values.value(row)));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<Int32Array>() {
+        return Ok(Some(i64::from(values.value(row))));
+    }
+    scalar_value_as_i64(&evaluated_array(array)?, row)
 }
 
 fn scalar_value_as_f64(value: &EvaluatedScalar, row: usize) -> Result<Option<f64>> {

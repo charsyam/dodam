@@ -1643,6 +1643,9 @@ impl Iterator for SortStream {
         }
         self.emitted = true;
 
+        let profile = sort_profile_enabled();
+        let total_started = profile.then(Instant::now);
+        let collect_started = profile.then(Instant::now);
         let mut batches = Vec::new();
         for batch in &mut self.input {
             match batch {
@@ -1651,12 +1654,31 @@ impl Iterator for SortStream {
                 Err(error) => return Some(Err(error)),
             }
         }
+        let collect_elapsed = collect_started.map(|started| started.elapsed());
 
         if batches.is_empty() {
             return None;
         }
 
-        Some(sort_batches(&batches, &self.sort, self.limit))
+        let sort_started = profile.then(Instant::now);
+        let result = sort_batches(&batches, &self.sort, self.limit);
+        let sort_elapsed = sort_started.map(|started| started.elapsed());
+        if let (true, Some(total_started)) = (profile, total_started) {
+            let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+            eprintln!(
+                "[dodam:sort-profile] total={}us collect={}us sort={}us input_batches={} input_rows={} limit={:?} keys={}",
+                total_started.elapsed().as_micros(),
+                collect_elapsed
+                    .map(|elapsed| elapsed.as_micros())
+                    .unwrap_or(0),
+                sort_elapsed.map(|elapsed| elapsed.as_micros()).unwrap_or(0),
+                batches.len(),
+                rows,
+                self.limit,
+                self.sort.expressions.len(),
+            );
+        }
+        Some(result)
     }
 }
 
@@ -1668,6 +1690,7 @@ fn sort_batches(
     if topk_batch_prune_enabled()
         && let Some(limit) = limit
         && batches.len() > 1
+        && batches.iter().any(|batch| batch.num_rows() > limit)
     {
         let candidates = batches
             .iter()
@@ -1700,6 +1723,11 @@ fn topk_batch_prune_enabled() -> bool {
         .unwrap_or(true)
 }
 
+fn sort_profile_enabled() -> bool {
+    std::env::var("DODAM_SORT_PROFILE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
 fn sort_single_batch(
     batch: &RecordBatch,
     sort: &SortKey,
@@ -1720,7 +1748,80 @@ fn sort_single_batch(
         })
         .collect::<Result<Vec<_>>>()?;
     let indices = lexsort_to_indices(&sort_columns, limit)?;
+    if let Some(batch) = take_primitive_record_batch_by_indices(batch, &indices)? {
+        return Ok(batch);
+    }
     Ok(take_record_batch(batch, &indices)?)
+}
+
+fn take_primitive_record_batch_by_indices(
+    batch: &RecordBatch,
+    indices: &UInt32Array,
+) -> Result<Option<RecordBatch>> {
+    if indices.null_count() != 0 || batch.num_rows() == 0 {
+        return Ok(None);
+    }
+    let mut raw_indices = Vec::with_capacity(indices.len());
+    for row in 0..indices.len() {
+        raw_indices.push(indices.value(row));
+    }
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for column in batch.columns() {
+        let Some(array) = gather_primitive_array(column, &raw_indices) else {
+            return Ok(None);
+        };
+        columns.push(array);
+    }
+    Ok(Some(RecordBatch::try_new(batch.schema(), columns)?))
+}
+
+fn gather_primitive_array(column: &ArrayRef, indices: &[u32]) -> Option<ArrayRef> {
+    if column.null_count() != 0 {
+        return None;
+    }
+    match column.data_type() {
+        DataType::Int32 => {
+            let values = column.as_any().downcast_ref::<Int32Array>()?;
+            let mut output = Vec::with_capacity(indices.len());
+            for &index in indices {
+                output.push(values.value(index as usize));
+            }
+            Some(Arc::new(Int32Array::from(output)))
+        }
+        DataType::Int64 => {
+            let values = column.as_any().downcast_ref::<Int64Array>()?;
+            let mut output = Vec::with_capacity(indices.len());
+            for &index in indices {
+                output.push(values.value(index as usize));
+            }
+            Some(Arc::new(Int64Array::from(output)))
+        }
+        DataType::UInt64 => {
+            let values = column.as_any().downcast_ref::<UInt64Array>()?;
+            let mut output = Vec::with_capacity(indices.len());
+            for &index in indices {
+                output.push(values.value(index as usize));
+            }
+            Some(Arc::new(UInt64Array::from(output)))
+        }
+        DataType::Float64 => {
+            let values = column.as_any().downcast_ref::<Float64Array>()?;
+            let mut output = Vec::with_capacity(indices.len());
+            for &index in indices {
+                output.push(values.value(index as usize));
+            }
+            Some(Arc::new(Float64Array::from(output)))
+        }
+        DataType::Date32 => {
+            let values = column.as_any().downcast_ref::<Date32Array>()?;
+            let mut output = Vec::with_capacity(indices.len());
+            for &index in indices {
+                output.push(values.value(index as usize));
+            }
+            Some(Arc::new(Date32Array::from(output)))
+        }
+        _ => None,
+    }
 }
 
 pub struct DistinctExec {
@@ -10104,7 +10205,8 @@ fn evaluate_filter(batch: &RecordBatch, expr: &Expr) -> Result<BooleanArray> {
             pattern,
             negated,
             escape,
-        } => evaluate_like(batch, column, pattern, *negated, *escape),
+            case_insensitive,
+        } => evaluate_like(batch, column, pattern, *negated, *escape, *case_insensitive),
         Expr::IsNull { column, negated } => evaluate_is_null(batch, column, *negated),
         Expr::Not(expr) => {
             let mask = evaluate_filter(batch, expr)?;
@@ -10474,6 +10576,7 @@ fn evaluate_like(
     pattern: &str,
     negated: bool,
     escape: Option<char>,
+    case_insensitive: bool,
 ) -> Result<BooleanArray> {
     let column_index = column_index(batch, column)?;
     let column_array = batch.column(column_index);
@@ -10484,6 +10587,13 @@ fn evaluate_like(
             column: column.to_string(),
             data_type: column_array.data_type().clone(),
         })?;
+    let normalized_pattern;
+    let pattern = if case_insensitive {
+        normalized_pattern = pattern.to_lowercase();
+        normalized_pattern.as_str()
+    } else {
+        pattern
+    };
     let fast_pattern = fast_like_pattern(pattern, escape);
     let mut builder = BooleanBuilder::with_capacity(values.len());
     if let Some(fast_pattern) = fast_pattern {
@@ -10492,7 +10602,14 @@ fn evaluate_like(
                 builder.append_null();
                 continue;
             }
-            let matched = fast_pattern.matches(values.value(row));
+            let normalized_value;
+            let value = if case_insensitive {
+                normalized_value = values.value(row).to_lowercase();
+                normalized_value.as_str()
+            } else {
+                values.value(row)
+            };
+            let matched = fast_pattern.matches(value);
             builder.append_value(if negated { !matched } else { matched });
         }
     } else {
@@ -10502,7 +10619,14 @@ fn evaluate_like(
                 builder.append_null();
                 continue;
             }
-            let matched = like_matches(values.value(row), &tokens);
+            let normalized_value;
+            let value = if case_insensitive {
+                normalized_value = values.value(row).to_lowercase();
+                normalized_value.as_str()
+            } else {
+                values.value(row)
+            };
+            let matched = like_matches(value, &tokens);
             builder.append_value(if negated { !matched } else { matched });
         }
     }
@@ -10806,12 +10930,44 @@ fn apply_projection(batch: RecordBatch, projection: &Projection) -> Result<Recor
 }
 
 pub(crate) fn column_index(batch: &RecordBatch, column: &str) -> Result<usize> {
-    batch
+    if let Some(index) = batch
         .schema()
         .fields()
         .iter()
-        .position(|field| field.name() == column)
-        .ok_or_else(|| DodamError::UnknownColumn(column.to_string()))
+        .position(|field| physical_same_column(field.name(), column))
+    {
+        return Ok(index);
+    }
+    if let Some((_, unqualified)) = column.split_once('.')
+        && let Some(index) = batch
+            .schema()
+            .fields()
+            .iter()
+            .position(|field| field.name() == unqualified)
+    {
+        return Ok(index);
+    }
+    Err(DodamError::UnknownColumn(column.to_string()))
+}
+
+fn physical_same_column(left: &str, right: &str) -> bool {
+    if let (Some((left_function, left_argument)), Some((right_function, right_argument))) = (
+        physical_aggregate_column_parts(left),
+        physical_aggregate_column_parts(right),
+    ) && left_function.eq_ignore_ascii_case(right_function)
+        && physical_same_column(left_argument, right_argument)
+    {
+        return true;
+    }
+    left == right
+        || left.rsplit('.').next() == Some(right)
+        || right.rsplit('.').next() == Some(left)
+}
+
+fn physical_aggregate_column_parts(column: &str) -> Option<(&str, &str)> {
+    let (function, rest) = column.split_once('(')?;
+    let argument = rest.strip_suffix(')')?;
+    Some((function, argument))
 }
 
 fn output_column_count(projection: &Projection, scanned_columns: usize) -> usize {

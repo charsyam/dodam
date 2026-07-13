@@ -286,6 +286,7 @@ pub enum Expr {
         pattern: String,
         negated: bool,
         escape: Option<char>,
+        case_insensitive: bool,
     },
     IsNull {
         column: String,
@@ -955,8 +956,11 @@ fn supports_row_group_pruning(expr: &Expr) -> bool {
             pattern,
             negated,
             escape,
+            case_insensitive,
             ..
-        } => !*negated && like_prefix_pruning_range(pattern, *escape).is_some(),
+        } => {
+            !*negated && !*case_insensitive && like_prefix_pruning_range(pattern, *escape).is_some()
+        }
         _ => false,
     }
 }

@@ -340,6 +340,58 @@ async fn duckdb_differential_aggregate_matrix() {
         tempdir.path(),
     )
     .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, key, count(value) OVER (PARTITION BY key) AS value_count, sum(CAST(value AS DOUBLE)) OVER (PARTITION BY key) AS value_sum, avg(value) OVER (PARTITION BY key) AS value_avg FROM '{}' ORDER BY key NULLS FIRST, id",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id, key, count(value) OVER (PARTITION BY key) AS value_count, sum(CAST(value AS DOUBLE)) OVER (PARTITION BY key) AS value_sum, avg(value) OVER (PARTITION BY key) AS value_avg FROM read_parquet('{}') ORDER BY key NULLS FIRST, id",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, key, count(*) OVER (PARTITION BY key ORDER BY id) AS running_count, sum(CAST(value AS DOUBLE)) OVER (PARTITION BY key ORDER BY id) AS running_sum FROM '{}' ORDER BY key NULLS FIRST, id",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id, key, count(*) OVER (PARTITION BY key ORDER BY id) AS running_count, sum(CAST(value AS DOUBLE)) OVER (PARTITION BY key ORDER BY id) AS running_sum FROM read_parquet('{}') ORDER BY key NULLS FIRST, id",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT count(*) FILTER (WHERE value > 0) AS positive_rows, count(value) FILTER (WHERE key IS NOT NULL) AS keyed_values, sum(value) FILTER (WHERE key = 2) AS key_two_sum, avg(value) FILTER (WHERE value IS NOT NULL) AS avg_value FROM '{}'",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT count(*) FILTER (WHERE value > 0) AS positive_rows, count(value) FILTER (WHERE key IS NOT NULL) AS keyed_values, sum(value) FILTER (WHERE key = 2) AS key_two_sum, avg(value) FILTER (WHERE value IS NOT NULL) AS avg_value FROM read_parquet('{}')",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT key, count(*) FILTER (WHERE f.value > 0) AS positive_rows, min(value) FILTER (WHERE value IS NOT NULL) AS min_value, max(value) FILTER (WHERE value < 30) AS capped_max FROM '{}' f GROUP BY key ORDER BY key NULLS FIRST",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT key, count(*) FILTER (WHERE f.value > 0) AS positive_rows, min(value) FILTER (WHERE value IS NOT NULL) AS min_value, max(value) FILTER (WHERE value < 30) AS capped_max FROM read_parquet('{}') f GROUP BY key ORDER BY key NULLS FIRST",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -391,6 +443,21 @@ async fn duckdb_differential_join_matrix() {
         ),
         &format!(
             "SELECT f.id, f.key, d.name FROM read_parquet('{}') f RIGHT JOIN read_parquet('{}') d ON f.key = d.key ORDER BY f.id, d.name",
+            facts_path.display(),
+            dim_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT d.name, count(*) FILTER (WHERE f.value > 0) AS positive_rows, sum(f.value) FILTER (WHERE d.name LIKE 'two%') AS two_sum FROM '{}' f JOIN '{}' d ON f.key = d.key GROUP BY d.name ORDER BY d.name",
+            facts_path.display(),
+            dim_path.display()
+        ),
+        &format!(
+            "SELECT d.name, count(*) FILTER (WHERE f.value > 0) AS positive_rows, sum(f.value) FILTER (WHERE d.name LIKE 'two%') AS two_sum FROM read_parquet('{}') f JOIN read_parquet('{}') d ON f.key = d.key GROUP BY d.name ORDER BY d.name",
             facts_path.display(),
             dim_path.display()
         ),
@@ -944,6 +1011,10 @@ async fn duckdb_differential_like_filters() {
         "text NOT LIKE '%requests%'",
         "text LIKE 'a_ph_'",
         "text LIKE '100!%%' ESCAPE '!'",
+        "text ILIKE 'ALPHA'",
+        "text ILIKE 'ALPHA%'",
+        "text NOT ILIKE '%REQUESTS%'",
+        "upper(text) ILIKE 'ALPHA%'",
     ];
     for predicate in cases {
         assert_same_as_duckdb(
@@ -1128,6 +1199,55 @@ async fn duckdb_differential_string_functions_and_case() {
         &format!(
             "SELECT id, upper(note) AS note_upper FROM read_parquet('{}') ORDER BY 1",
             types_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, trim(concat(' ', COALESCE(note, 'fallback'), ' ')) AS trimmed_note, replace(COALESCE(note, 'fallback'), 'a', 'A') AS replaced_note, concat(COALESCE(note, 'fallback'), '-', CAST(id AS VARCHAR)) AS note_id FROM '{}' ORDER BY id",
+            types_path.display()
+        ),
+        &format!(
+            "SELECT id, trim(concat(' ', COALESCE(note, 'fallback'), ' ')) AS trimmed_note, replace(COALESCE(note, 'fallback'), 'a', 'A') AS replaced_note, concat(COALESCE(note, 'fallback'), '-', CAST(id AS VARCHAR)) AS note_id FROM read_parquet('{}') ORDER BY id",
+            types_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id FROM '{}' WHERE replace(trim(concat(' ', COALESCE(note, 'fallback'), ' ')), 'a', 'A') LIKE 'g%' OR concat(note, '-x') = '-x' ORDER BY id",
+            types_path.display()
+        ),
+        &format!(
+            "SELECT id FROM read_parquet('{}') WHERE replace(trim(concat(' ', COALESCE(note, 'fallback'), ' ')), 'a', 'A') LIKE 'g%' OR concat(note, '-x') = '-x' ORDER BY id",
+            types_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn duckdb_differential_numeric_functions() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let path = tempdir.path().join("facts.parquet");
+    write_facts_parquet(&path);
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, abs(value - 10) AS value_distance, floor(value / 10.0) AS value_floor, ceil(value / 10.0) AS value_ceil, round(value / 7.0) AS value_round FROM '{}' WHERE abs(value - 10) <= 5 OR floor(value / 10.0) = 3 ORDER BY id",
+            path.display()
+        ),
+        &format!(
+            "SELECT id, abs(value - 10) AS value_distance, floor(value / 10.0) AS value_floor, ceil(value / 10.0) AS value_ceil, round(value / 7.0) AS value_round FROM read_parquet('{}') WHERE abs(value - 10) <= 5 OR floor(value / 10.0) = 3 ORDER BY id",
+            path.display()
         ),
         tempdir.path(),
     )
@@ -1943,14 +2063,6 @@ async fn dodam_sql_error_contract_matrix() {
     )
     .await;
     assert_dodam_error_contains(
-        &format!(
-            "SELECT id, sum(value) OVER (PARTITION BY key ORDER BY id) AS running_sum FROM '{}'",
-            facts_path.display()
-        ),
-        "window",
-    )
-    .await;
-    assert_dodam_error_contains(
         &format!("SELECT id + payload FROM '{}'", facts_path.display()),
         "cannot use Utf8 in integer arithmetic",
     )
@@ -2685,6 +2797,21 @@ async fn duckdb_differential_nested_struct_field_projection() {
         ),
         &format!(
             "SELECT f.id, n.attrs.label AS label FROM read_parquet('{}') f JOIN read_parquet('{}') n ON f.id = n.id WHERE coalesce(n.attrs.label, 'missing') LIKE 'h%' OR n.attrs.label IS NULL ORDER BY f.id",
+            facts_path.display(),
+            input_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT f.id, n.attrs.label AS label FROM '{}' f JOIN '{}' n ON f.id = n.id WHERE coalesce(n.attrs.label, 'missing') ILIKE 'H%' OR n.attrs.label IS NULL ORDER BY f.id",
+            facts_path.display(),
+            input_path.display()
+        ),
+        &format!(
+            "SELECT f.id, n.attrs.label AS label FROM read_parquet('{}') f JOIN read_parquet('{}') n ON f.id = n.id WHERE coalesce(n.attrs.label, 'missing') ILIKE 'H%' OR n.attrs.label IS NULL ORDER BY f.id",
             facts_path.display(),
             input_path.display()
         ),
