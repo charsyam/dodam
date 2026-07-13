@@ -217,6 +217,27 @@ pub fn choose_selected_payload_by_spread(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FragmentedSelectedPayloadCostInput {
+    pub selected_rows: usize,
+    pub selected_runs: usize,
+    pub min_selected_runs: usize,
+    pub max_average_run_len: usize,
+}
+
+pub fn choose_fragmented_selected_payload_full_decode(
+    input: FragmentedSelectedPayloadCostInput,
+) -> bool {
+    if input.selected_rows == 0 || input.selected_runs == 0 {
+        return false;
+    }
+    input.selected_runs >= input.min_selected_runs.max(1)
+        && input.selected_rows
+            <= input
+                .selected_runs
+                .saturating_mul(input.max_average_run_len.max(1))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LateMaterializationCostInput {
     pub total_rows: usize,
     pub selected_rows: usize,
@@ -519,6 +540,34 @@ mod tests {
             }),
             SelectedPayloadDecision::EmptySelection
         );
+    }
+
+    #[test]
+    fn fragmented_selected_payload_full_decode_requires_many_short_runs() {
+        assert!(choose_fragmented_selected_payload_full_decode(
+            FragmentedSelectedPayloadCostInput {
+                selected_rows: 108_434,
+                selected_runs: 98_786,
+                min_selected_runs: 4096,
+                max_average_run_len: 2,
+            }
+        ));
+        assert!(!choose_fragmented_selected_payload_full_decode(
+            FragmentedSelectedPayloadCostInput {
+                selected_rows: 108_434,
+                selected_runs: 100,
+                min_selected_runs: 4096,
+                max_average_run_len: 2,
+            }
+        ));
+        assert!(!choose_fragmented_selected_payload_full_decode(
+            FragmentedSelectedPayloadCostInput {
+                selected_rows: 10_000,
+                selected_runs: 1000,
+                min_selected_runs: 4096,
+                max_average_run_len: 2,
+            }
+        ));
     }
 
     #[test]

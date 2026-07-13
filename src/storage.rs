@@ -29,7 +29,10 @@ use parquet::file::statistics::Statistics;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
-use crate::cost::{SelectedPayloadCostInput, choose_selected_payload};
+use crate::cost::{
+    FragmentedSelectedPayloadCostInput, SelectedPayloadCostInput,
+    choose_fragmented_selected_payload_full_decode, choose_selected_payload,
+};
 use crate::error::{DodamError, Result};
 use crate::execution::{
     ComparisonExpr, ComparisonOp, Expr, FilterExpr, Projection, evaluate_filter_mask,
@@ -2376,7 +2379,20 @@ fn fragmented_selected_payload_should_full_decode(
     selected_rows: usize,
     selected_runs: usize,
 ) -> bool {
-    selected_rows > 0 && selected_runs >= 4096 && selected_rows <= selected_runs.saturating_mul(2)
+    let min_selected_runs = std::env::var("DODAM_FRAGMENTED_FULL_PAYLOAD_MIN_RUNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(4096);
+    let max_average_run_len = std::env::var("DODAM_FRAGMENTED_FULL_PAYLOAD_MAX_AVG_RUN_LEN")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(2);
+    choose_fragmented_selected_payload_full_decode(FragmentedSelectedPayloadCostInput {
+        selected_rows,
+        selected_runs,
+        min_selected_runs,
+        max_average_run_len,
+    })
 }
 
 #[inline(always)]
