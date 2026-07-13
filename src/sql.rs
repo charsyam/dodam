@@ -22595,6 +22595,7 @@ async fn q03_revenue_rows_late_materialized(
                     orders: orders.clone(),
                     ship_cutoff,
                     selected_orderkeys: Vec::new(),
+                    selected_offsets: Vec::new(),
                     payload_offset: 0,
                     revenues: fast_hash_map::<i64, f64>(),
                 }
@@ -22696,6 +22697,7 @@ async fn q03_revenue_rows_late_materialized_carry_order(
                     orders: orders.clone(),
                     ship_cutoff,
                     selected_orders: Vec::new(),
+                    selected_offsets: Vec::new(),
                     payload_offset: 0,
                     rows: fast_hash_map::<i64, Q03Row>(),
                 }
@@ -22733,6 +22735,7 @@ struct Q03RevenueLateCarryState {
     orders: Arc<Q03OrderMap>,
     ship_cutoff: i32,
     selected_orders: Vec<(i64, Q03Order)>,
+    selected_offsets: Vec<u32>,
     payload_offset: usize,
     rows: FastHashMap<i64, Q03Row>,
 }
@@ -22760,6 +22763,7 @@ fn q03_revenue_late_carry_build_selection_batch(
             state.orders.as_ref(),
             state.ship_cutoff,
             &mut state.selected_orders,
+            &mut state.selected_offsets,
         );
         return Ok(Some(()));
     }
@@ -22811,6 +22815,7 @@ fn q03_revenue_late_carry_build_selection_view(
                 state.orders.as_ref(),
                 state.ship_cutoff,
                 &mut state.selected_orders,
+                &mut state.selected_offsets,
             );
             return Ok(Some(()));
         }
@@ -22851,8 +22856,10 @@ fn q03_push_late_carry_selection_slices(
     orders: &Q03OrderMap,
     ship_cutoff: i32,
     selected_orders: &mut Vec<(i64, Q03Order)>,
+    selected_offsets: &mut Vec<u32>,
 ) {
-    let mut selected_offsets = Vec::with_capacity(orderkeys.len().min(1024));
+    selected_offsets.clear();
+    selected_offsets.reserve(orderkeys.len().min(1024));
     for row in 0..orderkeys.len() {
         if shipdates[row] <= ship_cutoff {
             continue;
@@ -22864,7 +22871,7 @@ fn q03_push_late_carry_selection_slices(
         selected_orders.push((orderkey, order));
         selected_offsets.push(row as u32);
     }
-    selection.push_selected_u32_offsets(orderkeys.len(), &selected_offsets);
+    selection.push_selected_u32_offsets(orderkeys.len(), selected_offsets);
 }
 
 fn q03_revenue_late_carry_consume_payload_batch(
@@ -23025,6 +23032,7 @@ struct Q03RevenueLateState {
     orders: Arc<Q03OrderMap>,
     ship_cutoff: i32,
     selected_orderkeys: Vec<i64>,
+    selected_offsets: Vec<u32>,
     payload_offset: usize,
     revenues: Q03RevenueMap,
 }
@@ -23052,6 +23060,7 @@ fn q03_revenue_late_build_selection_batch(
             state.orders.as_ref(),
             state.ship_cutoff,
             &mut state.selected_orderkeys,
+            &mut state.selected_offsets,
         );
         return Ok(Some(()));
     }
@@ -23096,6 +23105,7 @@ fn q03_revenue_late_build_selection_view(
                 state.orders.as_ref(),
                 state.ship_cutoff,
                 &mut state.selected_orderkeys,
+                &mut state.selected_offsets,
             );
             return Ok(Some(()));
         }
@@ -23129,8 +23139,10 @@ fn q03_push_late_key_selection_slices(
     orders: &Q03OrderMap,
     ship_cutoff: i32,
     selected_orderkeys: &mut Vec<i64>,
+    selected_offsets: &mut Vec<u32>,
 ) {
-    let mut selected_offsets = Vec::with_capacity(orderkeys.len().min(1024));
+    selected_offsets.clear();
+    selected_offsets.reserve(orderkeys.len().min(1024));
     for row in 0..orderkeys.len() {
         if shipdates[row] <= ship_cutoff {
             continue;
@@ -23142,7 +23154,7 @@ fn q03_push_late_key_selection_slices(
         selected_orderkeys.push(orderkey);
         selected_offsets.push(row as u32);
     }
-    selection.push_selected_u32_offsets(orderkeys.len(), &selected_offsets);
+    selection.push_selected_u32_offsets(orderkeys.len(), selected_offsets);
 }
 
 fn q03_revenue_late_consume_payload_batch(
