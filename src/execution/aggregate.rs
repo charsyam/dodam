@@ -5469,6 +5469,17 @@ impl SingleKeyCountSumVectorState {
                 "direct primitive count/sum page key type mismatch".to_string(),
             ));
         };
+        if consume_i64_i64_page_bytes_dense_accumulate(
+            index,
+            &mut self.groups,
+            &mut self.dense_counts_scratch,
+            &mut self.dense_totals_scratch,
+            key_bytes,
+            sum_bytes,
+            rows,
+        ) {
+            return Ok(());
+        }
         for row in 0..rows {
             let key = read_i64_le_unaligned(key_bytes, row);
             let sum = read_i64_le_unaligned(sum_bytes, row);
@@ -5754,25 +5765,36 @@ impl SingleKeyCountSumVectorState {
         } else if let Some((keys, def_levels)) = key_values.raw_nullable() {
             let mut value_index = 0usize;
             if let Some(sum_values) = sums.non_null_values() {
-                for row in 0..def_levels.len() {
-                    let group_id = if def_levels[row] == 0 {
-                        count_sum_null_group_id(
-                            null_group,
-                            &mut self.groups,
-                            GroupValue::Int64(None),
-                            &CountSumValueInput::Int64Raw,
-                        )
-                    } else {
-                        let key = keys[value_index];
-                        value_index += 1;
-                        count_sum_group_id_for_i64(
-                            index,
-                            key,
-                            &mut self.groups,
-                            &CountSumValueInput::Int64Raw,
-                        )
-                    };
-                    self.groups[group_id].update_raw_i64_non_null(sum_values[row]);
+                if !consume_i64_nullable_keys_non_null_sums_dense_accumulate(
+                    index,
+                    null_group,
+                    &mut self.groups,
+                    &mut self.dense_counts_scratch,
+                    &mut self.dense_totals_scratch,
+                    keys,
+                    def_levels,
+                    sum_values,
+                ) {
+                    for row in 0..def_levels.len() {
+                        let group_id = if def_levels[row] == 0 {
+                            count_sum_null_group_id(
+                                null_group,
+                                &mut self.groups,
+                                GroupValue::Int64(None),
+                                &CountSumValueInput::Int64Raw,
+                            )
+                        } else {
+                            let key = keys[value_index];
+                            value_index += 1;
+                            count_sum_group_id_for_i64(
+                                index,
+                                key,
+                                &mut self.groups,
+                                &CountSumValueInput::Int64Raw,
+                            )
+                        };
+                        self.groups[group_id].update_raw_i64_non_null(sum_values[row]);
+                    }
                 }
             } else {
                 for row in 0..def_levels.len() {
@@ -6076,6 +6098,70 @@ fn consume_i64_i64_page_bytes_dense_accumulate(
         };
         *count = count.saturating_add(1);
         totals[offset] = totals[offset].saturating_add(read_i64_le_unaligned(sum_bytes, row));
+    }
+    apply_i64_dense_accumulated_groups(min, index, groups, counts, totals)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn consume_i64_nullable_keys_non_null_sums_dense_accumulate(
+    index: &mut AdaptiveCopyGroupIndex<i64>,
+    null_group: &mut Option<usize>,
+    groups: &mut Vec<CountSumGroup>,
+    counts_scratch: &mut Vec<u32>,
+    totals_scratch: &mut Vec<i64>,
+    keys: &[i64],
+    def_levels: &[i16],
+    sums: &[i64],
+) -> bool {
+    if def_levels.len() != sums.len() || def_levels.len() < 1024 {
+        return false;
+    }
+    let Some((min, max)) = min_max_i64_slice(keys) else {
+        return false;
+    };
+    let Some(slot_count) = dense_i64_slot_count(min, max, dense_i32_batch_accumulate_max_slots())
+    else {
+        return false;
+    };
+    if slot_count > def_levels.len().saturating_mul(4) {
+        return false;
+    }
+    reset_dense_i32_accumulate_scratch(counts_scratch, totals_scratch, slot_count);
+    let counts = counts_scratch.as_mut_slice();
+    let totals = totals_scratch.as_mut_slice();
+    let mut null_count = 0_u64;
+    let mut null_total = 0_i64;
+    let mut key_index = 0usize;
+    for row in 0..def_levels.len() {
+        if def_levels[row] == 0 {
+            null_count = null_count.saturating_add(1);
+            null_total = null_total.saturating_add(sums[row]);
+            continue;
+        }
+        let Some(key) = keys.get(key_index).copied() else {
+            return false;
+        };
+        key_index += 1;
+        let Some(offset) = dense_i64_offset(min, key) else {
+            return false;
+        };
+        let Some(count) = counts.get_mut(offset) else {
+            return false;
+        };
+        *count = count.saturating_add(1);
+        totals[offset] = totals[offset].saturating_add(sums[row]);
+    }
+    if key_index != keys.len() {
+        return false;
+    }
+    if null_count > 0 {
+        let group_id = count_sum_null_group_id(
+            null_group,
+            groups,
+            GroupValue::Int64(None),
+            &CountSumValueInput::Int64Raw,
+        );
+        groups[group_id].update_raw_i64_non_null_many(null_count, null_total);
     }
     apply_i64_dense_accumulated_groups(min, index, groups, counts, totals)
 }
