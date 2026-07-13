@@ -932,26 +932,57 @@ fn collect_conjuncts(expr: &Expr, conjuncts: &mut Vec<Expr>) {
             collect_conjuncts(left, conjuncts);
             collect_conjuncts(right, conjuncts);
         }
-        Expr::Boolean(_)
-        | Expr::Or(_, _)
-        | Expr::Not(_)
-        | Expr::InList { .. }
-        | Expr::Like { .. }
-        | Expr::IsNull { .. } => {}
+        Expr::Boolean(_) | Expr::Not(_) | Expr::InList { .. } | Expr::IsNull { .. } => {}
         expr => conjuncts.push(expr.clone()),
     }
 }
 
 fn supports_row_group_pruning(expr: &Expr) -> bool {
-    matches!(
-        expr,
+    match expr {
         Expr::Comparison(ComparisonExpr {
-            op: ComparisonOp::Eq
+            op:
+                ComparisonOp::Eq
                 | ComparisonOp::Lt
                 | ComparisonOp::LtEq
                 | ComparisonOp::Gt
                 | ComparisonOp::GtEq,
             ..
-        })
-    )
+        }) => true,
+        Expr::And(left, right) | Expr::Or(left, right) => {
+            supports_row_group_pruning(left) && supports_row_group_pruning(right)
+        }
+        Expr::Like {
+            pattern,
+            negated,
+            escape,
+            ..
+        } => !*negated && like_prefix_pruning_range(pattern, *escape).is_some(),
+        _ => false,
+    }
+}
+
+fn like_prefix_pruning_range(
+    pattern: &str,
+    escape: Option<char>,
+) -> Option<(&str, Option<Vec<u8>>)> {
+    if escape.is_some() || pattern.contains('_') || pattern.starts_with('%') {
+        return None;
+    }
+    let prefix = pattern.strip_suffix('%')?;
+    if prefix.is_empty() || prefix.contains('%') || !prefix.is_ascii() {
+        return None;
+    }
+    Some((prefix, ascii_prefix_upper_bound(prefix)))
+}
+
+fn ascii_prefix_upper_bound(prefix: &str) -> Option<Vec<u8>> {
+    let mut bytes = prefix.as_bytes().to_vec();
+    for index in (0..bytes.len()).rev() {
+        if bytes[index] != u8::MAX {
+            bytes[index] += 1;
+            bytes.truncate(index + 1);
+            return Some(bytes);
+        }
+    }
+    None
 }

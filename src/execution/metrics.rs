@@ -2,10 +2,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use arrow::array::{Int32Array, StringArray};
+use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::error::Result;
+use crate::error::{DodamError, Result};
 
 pub struct SendableBatchStream {
     inner: Box<dyn Iterator<Item = Result<RecordBatch>> + Send>,
@@ -14,6 +15,11 @@ pub struct SendableBatchStream {
 
 pub trait RecordBatchSink {
     fn write_batch(&mut self, batch: &RecordBatch) -> Result<()>;
+
+    fn write_primitive_batch(&mut self, batch: PrimitiveBatch) -> Result<bool> {
+        self.write_batch(&batch.into_record_batch()?)?;
+        Ok(true)
+    }
 
     fn supports_i32_utf8_rows(&self) -> bool {
         false
@@ -44,6 +50,176 @@ pub trait RecordBatchSink {
 
     fn finish(&mut self) -> Result<()> {
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct PrimitiveBatch {
+    pub columns: Vec<PrimitiveColumn>,
+}
+
+#[derive(Debug)]
+pub struct PrimitiveColumn {
+    pub name: String,
+    pub data_type: DataType,
+    pub nullable: bool,
+    pub values: PrimitiveColumnValues,
+}
+
+#[derive(Debug)]
+pub enum PrimitiveColumnValues {
+    I32(Vec<i32>),
+    I64(Vec<i64>),
+}
+
+impl PrimitiveBatch {
+    pub fn num_rows(&self) -> usize {
+        self.columns
+            .first()
+            .map(|column| column.values.len())
+            .unwrap_or_default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.num_rows() == 0
+    }
+
+    pub fn slice(self, offset: usize, len: usize) -> Result<Self> {
+        let row_count = self.num_rows();
+        if offset > row_count || offset + len > row_count {
+            return Err(DodamError::UnsupportedSql(
+                "primitive batch slice is out of bounds".to_string(),
+            ));
+        }
+        let columns = self
+            .columns
+            .into_iter()
+            .map(|column| PrimitiveColumn {
+                name: column.name,
+                data_type: column.data_type,
+                nullable: column.nullable,
+                values: column.values.slice(offset, len),
+            })
+            .collect();
+        Ok(Self { columns })
+    }
+
+    pub fn concat(batches: Vec<Self>) -> Result<Self> {
+        let mut iter = batches.into_iter().filter(|batch| !batch.is_empty());
+        let Some(mut output) = iter.next() else {
+            return Ok(Self {
+                columns: Vec::new(),
+            });
+        };
+        let remaining = iter.collect::<Vec<_>>();
+        for batch in &remaining {
+            if batch.columns.len() != output.columns.len() {
+                return Err(DodamError::UnsupportedSql(
+                    "primitive batch column count mismatch".to_string(),
+                ));
+            }
+            for (target, source) in output.columns.iter().zip(batch.columns.iter()) {
+                if target.name != source.name || target.data_type != source.data_type {
+                    return Err(DodamError::UnsupportedSql(
+                        "primitive batch schema mismatch".to_string(),
+                    ));
+                }
+            }
+        }
+        for column_index in 0..output.columns.len() {
+            let additional = remaining
+                .iter()
+                .map(|batch| batch.columns[column_index].values.len())
+                .sum();
+            output.columns[column_index].values.reserve(additional);
+        }
+        for batch in remaining {
+            for (target, source) in output.columns.iter_mut().zip(batch.columns.into_iter()) {
+                target.values.extend(source.values)?;
+            }
+        }
+        Ok(output)
+    }
+
+    pub fn into_record_batch(self) -> Result<RecordBatch> {
+        let schema = self.schema();
+        self.into_record_batch_with_schema(schema)
+    }
+
+    pub fn into_record_batch_with_schema(self, schema: Arc<Schema>) -> Result<RecordBatch> {
+        Ok(RecordBatch::try_new(schema, self.into_arrays())?)
+    }
+
+    pub fn schema(&self) -> Arc<Schema> {
+        let fields = self
+            .columns
+            .iter()
+            .map(|column| Field::new(&column.name, column.data_type.clone(), column.nullable))
+            .collect::<Vec<_>>();
+        Arc::new(Schema::new(fields))
+    }
+
+    fn into_arrays(self) -> Vec<ArrayRef> {
+        self.columns
+            .into_iter()
+            .map(|column| column.values.into_array())
+            .collect::<Vec<_>>()
+    }
+
+    pub fn matches_schema(&self, schema: &Schema) -> bool {
+        schema.fields().len() == self.columns.len()
+            && schema
+                .fields()
+                .iter()
+                .zip(self.columns.iter())
+                .all(|(field, column)| {
+                    field.name() == &column.name
+                        && field.data_type() == &column.data_type
+                        && field.is_nullable() == column.nullable
+                })
+    }
+}
+
+impl PrimitiveColumnValues {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::I32(values) => values.len(),
+            Self::I64(values) => values.len(),
+        }
+    }
+
+    pub fn slice(self, offset: usize, len: usize) -> Self {
+        match self {
+            Self::I32(values) => Self::I32(values[offset..offset + len].to_vec()),
+            Self::I64(values) => Self::I64(values[offset..offset + len].to_vec()),
+        }
+    }
+
+    pub fn extend(&mut self, other: Self) -> Result<()> {
+        match (self, other) {
+            (Self::I32(target), Self::I32(source)) => target.extend(source),
+            (Self::I64(target), Self::I64(source)) => target.extend(source),
+            _ => {
+                return Err(DodamError::UnsupportedSql(
+                    "primitive batch value type mismatch".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn reserve(&mut self, additional: usize) {
+        match self {
+            Self::I32(values) => values.reserve(additional),
+            Self::I64(values) => values.reserve(additional),
+        }
+    }
+
+    pub fn into_array(self) -> ArrayRef {
+        match self {
+            Self::I32(values) => std::sync::Arc::new(Int32Array::from(values)) as ArrayRef,
+            Self::I64(values) => std::sync::Arc::new(Int64Array::from(values)) as ArrayRef,
+        }
     }
 }
 

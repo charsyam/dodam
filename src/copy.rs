@@ -1,23 +1,29 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::array::{
     Array, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray, UInt32Array,
     UInt64Array,
 };
+use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, Encoding};
-use parquet::file::properties::WriterProperties;
-use parquet::schema::types::ColumnPath;
+use parquet::data_type::{Int32Type, Int64Type};
+use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterPropertiesBuilder};
+use parquet::file::writer::SerializedFileWriter;
+use parquet::schema::parser::parse_message_type;
+use parquet::schema::types::{ColumnPath, TypePtr};
 use sqlparser::ast::{CopyOption, CopySource, CopyTarget, Ident, Statement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser as SqlParser;
 
+use crate::cost::{PrimitiveParquetSinkCostInput, choose_primitive_parquet_sink};
 use crate::error::{DodamError, Result};
-use crate::execution::{RecordBatchSink, ScanPlanMetrics};
+use crate::execution::{PrimitiveBatch, PrimitiveColumnValues, RecordBatchSink, ScanPlanMetrics};
 use crate::sql::{QueryOutput, SqlResultSink};
 
 #[derive(Debug, Clone)]
@@ -50,8 +56,8 @@ impl Default for ParquetCopyOptions {
             compression: Compression::SNAPPY,
             dictionary_enabled: false,
             max_row_group_rows: Some(256 * 1024),
-            write_batch_size: 64 * 1024,
-            data_page_row_count_limit: 32 * 1024,
+            write_batch_size: 32 * 1024,
+            data_page_row_count_limit: 16 * 1024,
         }
     }
 }
@@ -397,6 +403,13 @@ impl RecordBatchSink for CopyFileQuerySink {
         }
     }
 
+    fn write_primitive_batch(&mut self, batch: PrimitiveBatch) -> Result<bool> {
+        match self {
+            Self::Csv(sink) => sink.write_primitive_batch(batch),
+            Self::Parquet(sink) => sink.write_primitive_batch(batch),
+        }
+    }
+
     fn supports_i32_utf8_rows(&self) -> bool {
         matches!(self, Self::Csv(sink) if sink.supports_i32_utf8_rows())
     }
@@ -591,6 +604,8 @@ impl CsvFileQuerySink {
 pub struct ParquetFileQuerySink {
     path: PathBuf,
     writer: Option<ArrowWriter<BufWriter<File>>>,
+    primitive_writer: Option<PrimitiveParquetFileWriter>,
+    primitive_schema: Option<Arc<Schema>>,
     options: ParquetCopyOptions,
     buffer_size_override: Option<usize>,
     profile_enabled: bool,
@@ -607,6 +622,8 @@ impl ParquetFileQuerySink {
         Self {
             path: path.to_path_buf(),
             writer: None,
+            primitive_writer: None,
+            primitive_schema: None,
             options,
             buffer_size_override,
             profile_enabled,
@@ -633,6 +650,11 @@ impl ParquetFileQuerySink {
     }
 
     fn write_parquet_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        if self.primitive_writer.is_some() {
+            return Err(DodamError::UnsupportedSql(
+                "cannot mix RecordBatch writes after primitive Parquet writer started".to_string(),
+            ));
+        }
         if self.profile_enabled {
             self.stats.batches += 1;
             self.stats.rows += batch.num_rows();
@@ -644,22 +666,16 @@ impl ParquetFileQuerySink {
             let writer_started = self.profile_enabled.then(Instant::now);
             let file = File::create(&self.path)?;
             let buffer_size = parquet_buffer_size_bytes(self.buffer_size_override, batch);
-            let properties = WriterProperties::builder()
-                .set_compression(self.options.compression)
-                .set_dictionary_enabled(self.options.dictionary_enabled)
-                .set_max_row_group_row_count(self.options.max_row_group_rows)
-                .set_write_batch_size(self.options.write_batch_size)
-                .set_data_page_row_count_limit(self.options.data_page_row_count_limit)
-                .set_column_encoding(ColumnPath::from("f.id"), Encoding::DELTA_BINARY_PACKED)
-                .set_column_encoding(ColumnPath::from("id"), Encoding::DELTA_BINARY_PACKED);
-            let properties = properties.build();
+            let properties = parquet_writer_properties_for_batch(self.options, batch);
             self.writer = Some(ArrowWriter::try_new(
                 BufWriter::with_capacity(buffer_size, file),
                 batch.schema(),
                 Some(properties),
             )?);
             if let Some(writer_started) = writer_started {
-                self.stats.column_prepare += writer_started.elapsed();
+                let elapsed = writer_started.elapsed();
+                self.stats.column_prepare += elapsed;
+                self.stats.writer_open += elapsed;
             }
         }
         if batch.num_rows() == 0 {
@@ -672,20 +688,38 @@ impl ParquetFileQuerySink {
             .expect("Parquet writer is initialized")
             .write(batch)?;
         if let Some(write_started) = write_started {
-            self.stats.write += write_started.elapsed();
+            let elapsed = write_started.elapsed();
+            self.stats.write += elapsed;
+            self.stats.arrow_write += elapsed;
         }
         Ok(())
     }
 
     fn finish_parquet(&mut self) -> Result<()> {
         let flush_started = self.profile_enabled.then(Instant::now);
+        if let Some(writer) = self.primitive_writer.take() {
+            writer.close()?;
+            if let Some(flush_started) = flush_started {
+                let elapsed = flush_started.elapsed();
+                self.stats.flush += elapsed;
+                self.stats.writer_close += elapsed;
+            }
+            if self.profile_enabled
+                && let Ok(metadata) = std::fs::metadata(&self.path)
+            {
+                self.stats.bytes = metadata.len() as usize;
+            }
+            return Ok(());
+        }
         let Some(writer) = self.writer.take() else {
             File::create(&self.path)?;
             return Ok(());
         };
         writer.close()?;
         if let Some(flush_started) = flush_started {
-            self.stats.flush += flush_started.elapsed();
+            let elapsed = flush_started.elapsed();
+            self.stats.flush += elapsed;
+            self.stats.writer_close += elapsed;
         }
         if self.profile_enabled
             && let Ok(metadata) = std::fs::metadata(&self.path)
@@ -709,9 +743,426 @@ fn parquet_buffer_size_bytes(override_value: Option<usize>, batch: &RecordBatch)
         })
 }
 
+fn primitive_parquet_sink_enabled(batch: &PrimitiveBatch) -> bool {
+    if std::env::var("DODAM_ENABLE_PRIMITIVE_PARQUET_SINK")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return true;
+    }
+    if std::env::var("DODAM_DISABLE_PRIMITIVE_PARQUET_SINK_AUTO")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return false;
+    }
+    choose_primitive_parquet_sink(PrimitiveParquetSinkCostInput {
+        supported: primitive_parquet_columns(batch).is_some(),
+        rows: batch.num_rows(),
+        min_rows: primitive_parquet_sink_auto_min_rows(),
+    })
+}
+
+fn primitive_parquet_sink_auto_min_rows() -> usize {
+    std::env::var("DODAM_PRIMITIVE_PARQUET_SINK_AUTO_MIN_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(64 * 1024)
+}
+
+fn primitive_parquet_buffer_size_bytes(
+    override_value: Option<usize>,
+    batch: &PrimitiveBatch,
+) -> usize {
+    override_value
+        .or_else(copy_buffer_size_env)
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            if batch.columns.len() > 2 {
+                PARQUET_WIDE_SINK_BUFFER_BYTES
+            } else {
+                PARQUET_SINK_BUFFER_BYTES
+            }
+        })
+}
+
+struct PrimitiveParquetFileWriter {
+    writer: SerializedFileWriter<BufWriter<File>>,
+    columns: Vec<PrimitiveParquetColumn>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrimitiveParquetColumn {
+    I32,
+    I64,
+}
+
+impl PrimitiveParquetFileWriter {
+    fn try_new(
+        path: &Path,
+        buffer_size: usize,
+        options: ParquetCopyOptions,
+        batch: &PrimitiveBatch,
+    ) -> Result<Option<Self>> {
+        let Some(columns) = primitive_parquet_columns(batch) else {
+            return Ok(None);
+        };
+        if !primitive_parquet_options_supported(options) {
+            return Ok(None);
+        }
+        let schema = primitive_parquet_schema(batch, &columns)?;
+        let file = File::create(path)?;
+        let properties = primitive_parquet_writer_properties(options, batch);
+        let writer = SerializedFileWriter::new(
+            BufWriter::with_capacity(buffer_size, file),
+            schema,
+            Arc::new(properties),
+        )?;
+        Ok(Some(Self { writer, columns }))
+    }
+
+    fn write_batch(&mut self, batch: PrimitiveBatch) -> Result<()> {
+        let Some(columns) = primitive_parquet_columns(&batch) else {
+            return Err(DodamError::UnsupportedSql(
+                "primitive Parquet writer received unsupported batch".to_string(),
+            ));
+        };
+        if columns != self.columns {
+            return Err(DodamError::UnsupportedSql(
+                "primitive Parquet writer schema changed".to_string(),
+            ));
+        }
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let mut row_group = self.writer.next_row_group()?;
+        for (column, column_type) in batch.columns.into_iter().zip(self.columns.iter()) {
+            let Some(mut writer) = row_group.next_column()? else {
+                return Err(DodamError::UnsupportedSql(
+                    "primitive Parquet row group ended early".to_string(),
+                ));
+            };
+            match (column.values, column_type) {
+                (PrimitiveColumnValues::I32(values), PrimitiveParquetColumn::I32) => {
+                    writer
+                        .typed::<Int32Type>()
+                        .write_batch(&values, None, None)?;
+                }
+                (PrimitiveColumnValues::I64(values), PrimitiveParquetColumn::I64) => {
+                    writer
+                        .typed::<Int64Type>()
+                        .write_batch(&values, None, None)?;
+                }
+                _ => {
+                    return Err(DodamError::UnsupportedSql(
+                        "primitive Parquet column type mismatch".to_string(),
+                    ));
+                }
+            }
+            writer.close()?;
+        }
+        if row_group.next_column()?.is_some() {
+            return Err(DodamError::UnsupportedSql(
+                "primitive Parquet row group has extra columns".to_string(),
+            ));
+        }
+        row_group.close()?;
+        Ok(())
+    }
+
+    fn close(self) -> Result<()> {
+        self.writer.close()?;
+        Ok(())
+    }
+}
+
+fn primitive_parquet_writer_properties(
+    options: ParquetCopyOptions,
+    batch: &PrimitiveBatch,
+) -> WriterProperties {
+    let mut builder = WriterProperties::builder()
+        .set_compression(options.compression)
+        .set_dictionary_enabled(false)
+        .set_statistics_enabled(EnabledStatistics::Chunk)
+        .set_max_row_group_row_count(options.max_row_group_rows)
+        .set_write_batch_size(options.write_batch_size)
+        .set_data_page_row_count_limit(options.data_page_row_count_limit);
+
+    if parquet_auto_delta_encoding_enabled() {
+        builder = add_primitive_batch_delta_encoding(builder, batch);
+    }
+
+    builder.build()
+}
+
+fn add_primitive_batch_delta_encoding(
+    mut builder: WriterPropertiesBuilder,
+    batch: &PrimitiveBatch,
+) -> WriterPropertiesBuilder {
+    for column in &batch.columns {
+        let should_delta = match &column.values {
+            PrimitiveColumnValues::I32(values) => {
+                primitive_i32_values_monotonic_or_adjacent_duplicate(values)
+            }
+            PrimitiveColumnValues::I64(values) => {
+                primitive_i64_values_monotonic_or_adjacent_duplicate(values)
+            }
+        };
+        if should_delta {
+            builder = builder.set_column_encoding(
+                ColumnPath::from(column.name.as_str()),
+                Encoding::DELTA_BINARY_PACKED,
+            );
+        }
+    }
+    builder
+}
+
+fn primitive_i32_values_monotonic_or_adjacent_duplicate(values: &[i32]) -> bool {
+    if values.len() < 2 {
+        return false;
+    }
+    let mut nondecreasing = true;
+    let mut nonincreasing = true;
+    let mut adjacent_duplicates = 0usize;
+    let mut previous = values[0];
+    for &value in &values[1..] {
+        nondecreasing &= previous <= value;
+        nonincreasing &= previous >= value;
+        adjacent_duplicates += usize::from(previous == value);
+        previous = value;
+    }
+    nondecreasing || nonincreasing || adjacent_duplicates * 2 >= values.len()
+}
+
+fn primitive_i64_values_monotonic_or_adjacent_duplicate(values: &[i64]) -> bool {
+    if values.len() < 2 {
+        return false;
+    }
+    let mut nondecreasing = true;
+    let mut nonincreasing = true;
+    let mut adjacent_duplicates = 0usize;
+    let mut previous = values[0];
+    for &value in &values[1..] {
+        nondecreasing &= previous <= value;
+        nonincreasing &= previous >= value;
+        adjacent_duplicates += usize::from(previous == value);
+        previous = value;
+    }
+    nondecreasing || nonincreasing || adjacent_duplicates * 2 >= values.len()
+}
+
+fn primitive_parquet_options_supported(options: ParquetCopyOptions) -> bool {
+    !options.dictionary_enabled
+}
+
+fn primitive_parquet_columns(batch: &PrimitiveBatch) -> Option<Vec<PrimitiveParquetColumn>> {
+    if batch.columns.is_empty() || batch.columns.iter().any(|column| column.nullable) {
+        return None;
+    }
+    batch
+        .columns
+        .iter()
+        .map(|column| match (&column.data_type, &column.values) {
+            (DataType::Int32, PrimitiveColumnValues::I32(_))
+            | (DataType::Date32, PrimitiveColumnValues::I32(_)) => {
+                Some(PrimitiveParquetColumn::I32)
+            }
+            (DataType::Int64, PrimitiveColumnValues::I64(_)) => Some(PrimitiveParquetColumn::I64),
+            _ => None,
+        })
+        .collect()
+}
+
+fn primitive_parquet_schema(
+    batch: &PrimitiveBatch,
+    columns: &[PrimitiveParquetColumn],
+) -> Result<TypePtr> {
+    let mut schema = String::from("message schema {\n");
+    for (column, parquet_type) in batch.columns.iter().zip(columns.iter()) {
+        let name = primitive_parquet_field_name(&column.name)?;
+        match (column.data_type.clone(), parquet_type) {
+            (DataType::Date32, PrimitiveParquetColumn::I32) => {
+                schema.push_str(&format!("  REQUIRED INT32 {name} (DATE);\n"));
+            }
+            (_, PrimitiveParquetColumn::I32) => {
+                schema.push_str(&format!("  REQUIRED INT32 {name};\n"));
+            }
+            (_, PrimitiveParquetColumn::I64) => {
+                schema.push_str(&format!("  REQUIRED INT64 {name};\n"));
+            }
+        }
+    }
+    schema.push_str("}\n");
+    Ok(Arc::new(parse_message_type(&schema)?))
+}
+
+fn primitive_parquet_field_name(name: &str) -> Result<&str> {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Err(DodamError::UnsupportedSql(
+            "empty primitive Parquet field name".to_string(),
+        ));
+    };
+    if !(first == '_' || first.is_ascii_alphabetic())
+        || !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    {
+        return Err(DodamError::UnsupportedSql(format!(
+            "primitive Parquet field name {name} is not supported by lower-level writer"
+        )));
+    }
+    Ok(name)
+}
+
+fn parquet_writer_properties_for_batch(
+    options: ParquetCopyOptions,
+    first_batch: &RecordBatch,
+) -> WriterProperties {
+    let mut builder = WriterProperties::builder()
+        .set_compression(options.compression)
+        .set_dictionary_enabled(options.dictionary_enabled)
+        .set_statistics_enabled(EnabledStatistics::Chunk)
+        .set_max_row_group_row_count(options.max_row_group_rows)
+        .set_write_batch_size(options.write_batch_size)
+        .set_data_page_row_count_limit(options.data_page_row_count_limit);
+
+    if parquet_auto_delta_encoding_enabled() {
+        builder = add_monotonic_primitive_delta_encoding(builder, first_batch);
+    }
+
+    builder.build()
+}
+
+fn parquet_auto_delta_encoding_enabled() -> bool {
+    !std::env::var("DODAM_DISABLE_PARQUET_AUTO_DELTA_ENCODING")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn add_monotonic_primitive_delta_encoding(
+    mut builder: WriterPropertiesBuilder,
+    batch: &RecordBatch,
+) -> WriterPropertiesBuilder {
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+        if !matches!(
+            field.data_type(),
+            DataType::Int32 | DataType::Int64 | DataType::Date32
+        ) {
+            continue;
+        }
+        if primitive_column_is_monotonic_or_adjacent_duplicate(column.as_ref()) {
+            builder = builder.set_column_encoding(
+                ColumnPath::from(field.name().as_str()),
+                Encoding::DELTA_BINARY_PACKED,
+            );
+        }
+    }
+    builder
+}
+
+fn primitive_column_is_monotonic_or_adjacent_duplicate(column: &dyn Array) -> bool {
+    if column.len() < 2 || column.null_count() > 0 {
+        return false;
+    }
+    if let Some(array) = column.as_any().downcast_ref::<Int32Array>() {
+        return i32_array_is_monotonic_or_adjacent_duplicate(array);
+    }
+    if let Some(array) = column.as_any().downcast_ref::<Int64Array>() {
+        return i64_array_is_monotonic_or_adjacent_duplicate(array);
+    }
+    false
+}
+
+fn i32_array_is_monotonic_or_adjacent_duplicate(array: &Int32Array) -> bool {
+    let mut nondecreasing = true;
+    let mut nonincreasing = true;
+    let mut adjacent_duplicates = 0usize;
+    let mut previous = array.value(0);
+    for index in 1..array.len() {
+        let value = array.value(index);
+        nondecreasing &= previous <= value;
+        nonincreasing &= previous >= value;
+        adjacent_duplicates += usize::from(previous == value);
+        previous = value;
+    }
+    nondecreasing || nonincreasing || adjacent_duplicates * 2 >= array.len()
+}
+
+fn i64_array_is_monotonic_or_adjacent_duplicate(array: &Int64Array) -> bool {
+    let mut nondecreasing = true;
+    let mut nonincreasing = true;
+    let mut adjacent_duplicates = 0usize;
+    let mut previous = array.value(0);
+    for index in 1..array.len() {
+        let value = array.value(index);
+        nondecreasing &= previous <= value;
+        nonincreasing &= previous >= value;
+        adjacent_duplicates += usize::from(previous == value);
+        previous = value;
+    }
+    nondecreasing || nonincreasing || adjacent_duplicates * 2 >= array.len()
+}
+
 impl RecordBatchSink for ParquetFileQuerySink {
     fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         self.write_parquet_batch(batch)
+    }
+
+    fn write_primitive_batch(&mut self, batch: PrimitiveBatch) -> Result<bool> {
+        if let Some(writer) = self.primitive_writer.as_mut() {
+            if self.profile_enabled {
+                self.stats.batches += 1;
+                self.stats.rows += batch.num_rows();
+            }
+            let write_started = self.profile_enabled.then(Instant::now);
+            writer.write_batch(batch)?;
+            if let Some(write_started) = write_started {
+                let elapsed = write_started.elapsed();
+                self.stats.write += elapsed;
+                self.stats.primitive_write += elapsed;
+            }
+            return Ok(true);
+        }
+        if self.writer.is_none() && primitive_parquet_sink_enabled(&batch) && !batch.is_empty() {
+            let writer_started = self.profile_enabled.then(Instant::now);
+            let buffer_size =
+                primitive_parquet_buffer_size_bytes(self.buffer_size_override, &batch);
+            if let Some(mut writer) =
+                PrimitiveParquetFileWriter::try_new(&self.path, buffer_size, self.options, &batch)?
+            {
+                if let Some(writer_started) = writer_started {
+                    let elapsed = writer_started.elapsed();
+                    self.stats.column_prepare += elapsed;
+                    self.stats.writer_open += elapsed;
+                }
+                if self.profile_enabled {
+                    self.stats.batches += 1;
+                    self.stats.rows += batch.num_rows();
+                }
+                let write_started = self.profile_enabled.then(Instant::now);
+                writer.write_batch(batch)?;
+                if let Some(write_started) = write_started {
+                    let elapsed = write_started.elapsed();
+                    self.stats.write += elapsed;
+                    self.stats.primitive_write += elapsed;
+                }
+                self.primitive_writer = Some(writer);
+                return Ok(true);
+            }
+        }
+        let schema = match &self.primitive_schema {
+            Some(schema) if batch.matches_schema(schema.as_ref()) => schema.clone(),
+            _ => {
+                let schema = batch.schema();
+                self.primitive_schema = Some(schema.clone());
+                schema
+            }
+        };
+        let convert_started = self.profile_enabled.then(Instant::now);
+        let batch = batch.into_record_batch_with_schema(schema)?;
+        if let Some(convert_started) = convert_started {
+            self.stats.primitive_to_record_batch += convert_started.elapsed();
+        }
+        self.write_parquet_batch(&batch)?;
+        Ok(true)
     }
 
     fn finish(&mut self) -> Result<()> {
@@ -729,6 +1180,11 @@ pub struct CsvSinkStats {
     pub serialize: Duration,
     pub write: Duration,
     pub flush: Duration,
+    pub writer_open: Duration,
+    pub writer_close: Duration,
+    pub primitive_to_record_batch: Duration,
+    pub arrow_write: Duration,
+    pub primitive_write: Duration,
 }
 
 pub struct CopyProfile {
@@ -776,7 +1232,7 @@ impl CopyProfile {
             optional_micros(self.finish),
         );
         eprintln!(
-            "copy_profile_sink batches={} rows={} bytes={} header={}us column_prepare={}us serialize={}us write={}us flush={}us",
+            "copy_profile_sink batches={} rows={} bytes={} header={}us column_prepare={}us serialize={}us write={}us flush={}us writer_open={}us writer_close={}us primitive_to_record_batch={}us arrow_write={}us primitive_write={}us",
             sink.batches,
             sink.rows,
             sink.bytes,
@@ -785,6 +1241,11 @@ impl CopyProfile {
             micros(sink.serialize),
             micros(sink.write),
             micros(sink.flush),
+            micros(sink.writer_open),
+            micros(sink.writer_close),
+            micros(sink.primitive_to_record_batch),
+            micros(sink.arrow_write),
+            micros(sink.primitive_write),
         );
         if let Some(metrics) = self.scan_plan_metrics {
             eprintln!(

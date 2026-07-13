@@ -32,14 +32,24 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
+use crate::cost::{
+    DecimalRangeSelectivityInput, ExpressionAggregateLateChunkCostInput,
+    FusedSelectedAggregateCostInput, OrderedPrimitiveChunkCostInput, OrderedPrimitiveSinkCostInput,
+    ProjectionSelectivityCostInput, SelectedPayloadDecision, SelectedPayloadSpreadCostInput,
+    WorkerCostInput, choose_expression_aggregate_late_row_group_chunk,
+    choose_fused_selected_aggregate, choose_late_materialization_projection_selected_ratio,
+    choose_ordered_primitive_row_group_chunk, choose_ordered_primitive_sink,
+    choose_parallel_workers, choose_selected_payload_by_spread,
+};
 use crate::dense::{
     AdaptiveI64Map, AdaptiveI64Set, DenseAtomicU8, DenseI64BoolLookup, DenseI64F64Sum,
     DenseI64I32Map, PackedU32PairDistinct, SortedI64Lookup, adaptive_dense_index,
 };
 use crate::engine::{
-    DodamEngine, JoinAlgorithm, JoinParquetRequest, LateMaterializationPolicy,
-    LateMaterializedMetrics, LateSelectionBuilder, OrderedRowGroupBoundary, OrderedRowGroupChunk,
-    RowGroupBatchScanProfile, merge_ordered_row_group_chunks,
+    DirectPrimitiveBatchLocation, DodamEngine, JoinAlgorithm, JoinParquetRequest,
+    LateMaterializationPolicy, LateMaterializedMetrics, LateSelectionBuilder,
+    OrderedRowGroupBoundary, OrderedRowGroupChunk, RowGroupBatchScanProfile,
+    merge_ordered_row_group_chunks,
 };
 use crate::error::{DodamError, Result};
 use crate::execution::JoinType;
@@ -47,12 +57,13 @@ use crate::execution::{
     AggregateExpr, AggregateMetrics, AggregateResult, AggregateValue, CoalesceKeyCountSumCollector,
     ComparisonExpr, ComparisonOp, DecimalDateRangeFilter, DecimalInput, DistinctExec, Expr,
     FilterExpr, GroupAggregateResult, GroupKeyExpr, GroupKeyLiteral, GroupValue, HashJoinExec,
-    JoinBuildSide, LiteralValue, MemoryExec, PhysicalPlan, PredicateSet, Projection,
-    RecordBatchSink, ScanPlanMetrics, SendableBatchStream, SortExpr, SortKey,
-    aggregate_metrics_to_batches, collect_aggregates, collect_grouped_aggregates,
-    collect_grouped_aggregates_with_key_exprs, decimal_discounted_revenue_raw,
-    decimal_discounted_revenue_raw_i64, decimal_discounted_revenue_scales, decimal_input,
-    evaluate_filter_mask, evaluate_projected_view_filter_mask, filter_batch,
+    JoinBuildSide, LiteralValue, MemoryExec, PhysicalPlan, PredicateSet, PrimitiveBatch,
+    PrimitiveColumn, PrimitiveColumnValues, Projection, RecordBatchSink, ScanPlanMetrics,
+    SendableBatchStream, SortExpr, SortKey, aggregate_metrics_to_batches, collect_aggregates,
+    collect_grouped_aggregates, collect_grouped_aggregates_with_key_exprs,
+    decimal_discounted_revenue_raw, decimal_discounted_revenue_raw_i64,
+    decimal_discounted_revenue_scales, decimal_input, evaluate_filter_mask,
+    evaluate_projected_view_filter_mask, filter_batch, scan_projection,
     try_for_each_i64_i64_date32,
 };
 use crate::hash::{FastHashMap, FastHashSet, fast_hash_map, fast_hash_map_with_capacity};
@@ -60,7 +71,8 @@ use crate::optimizer::{JoinInputPlan, plan_join_inputs};
 use crate::storage::{
     DirectColumnScanMetrics, DirectI64I32I32ScanMetrics, DirectOrderedPrimitiveBatch,
     DirectOrderedPrimitiveColumnValues, DirectPrimitiveColumnScanMetrics,
-    DirectPrimitiveColumnSpec, DirectPrimitiveColumnType,
+    DirectPrimitiveColumnSpec, DirectPrimitiveColumnType, DirectSelectedPrimitiveColumnPageView,
+    DirectSelectedPrimitivePageBatch, PrimitiveRowGroupMinMax,
 };
 use crate::vector::{
     BatchConsumer, BatchView, Date32VectorView, Decimal128VectorView, DictionaryI32View,
@@ -206,6 +218,9 @@ pub async fn execute_sql(
     if let Some(output) = try_execute_set_operation_sql(engine, sql, batch_size).await? {
         return Ok(output);
     }
+    if let Some(output) = try_execute_projection_expression_sql(engine, sql, batch_size).await? {
+        return Ok(output);
+    }
     if let Some(output) = try_execute_q15_top_supplier_fast(engine, sql, batch_size).await? {
         return Ok(output);
     }
@@ -343,10 +358,6 @@ pub async fn execute_sql(
     if let Some(output) = try_execute_window_sql(engine, sql, batch_size).await? {
         return Ok(output);
     }
-    if let Some(output) = try_execute_projection_expression_sql(engine, sql, batch_size).await? {
-        return Ok(output);
-    }
-
     let query = parse_sql(sql)?;
     if let Some(join) = query.join.clone() {
         let is_aggregate = query.is_aggregate();
@@ -637,6 +648,54 @@ pub async fn execute_sql(
         return Ok(QueryOutput::Aggregate { metrics, batches });
     }
 
+    if query.distinct
+        && let Some(mut batches) = try_execute_direct_distinct_scan(
+            engine,
+            DirectDistinctScan {
+                path: query.path.clone(),
+                projection: query.projection.clone(),
+                aliases: query.aliases.clone(),
+                filter: query.filter.clone(),
+            },
+            batch_size,
+        )?
+    {
+        batches =
+            apply_output_order_limit(batches, query.order_by.as_ref(), query.limit, query.offset)?;
+        return Ok(QueryOutput::Scan { batches });
+    }
+
+    if let Some(batches) =
+        try_execute_monotonic_row_group_order_limit_scan(engine, &query, batch_size).await?
+    {
+        let batches = rename_output_batches(batches, &query.aliases)?;
+        return Ok(QueryOutput::Scan { batches });
+    }
+
+    if !query.distinct
+        && monotonic_order_limit_scan_enabled()
+        && query.limit.is_some()
+        && let Some(column) = monotonic_stream_limit_column(query.order_by.as_ref())
+        && engine
+            .parquet_row_groups_monotonic_by_column(query.path.clone(), &column)
+            .await?
+        && engine
+            .parquet_column_monotonic_by_scan(query.path.clone(), &column, batch_size)
+            .await?
+    {
+        let stream = engine
+            .scan_parquet_filtered_batches_preserve_order(
+                query.path.clone(),
+                batch_size,
+                query.projection.clone(),
+                query.filter.clone(),
+            )
+            .await?;
+        let batches = collect_ordered_stream_limit_batches(stream, query.limit, query.offset)?;
+        let batches = rename_output_batches(batches, &query.aliases)?;
+        return Ok(QueryOutput::Scan { batches });
+    }
+
     let stream = if query.distinct {
         engine
             .scan_parquet_distinct_batches(
@@ -676,6 +735,198 @@ pub async fn execute_sql(
     Ok(QueryOutput::Scan { batches })
 }
 
+async fn try_execute_monotonic_row_group_order_limit_scan(
+    engine: &DodamEngine,
+    query: &SqlQuery,
+    batch_size: usize,
+) -> Result<Option<Vec<RecordBatch>>> {
+    if query.distinct || query.expression_filter.is_some() || query.limit.is_none() {
+        return Ok(None);
+    }
+    let Some(order_by) = query.order_by.as_ref() else {
+        return Ok(None);
+    };
+    let Some(order_column) = monotonic_stream_limit_column(Some(order_by)) else {
+        return Ok(None);
+    };
+    if !monotonic_order_limit_scan_enabled()
+        || !monotonic_row_group_order_limit_scan_enabled()
+        || !engine
+            .parquet_row_groups_monotonic_by_column(query.path.clone(), &order_column)
+            .await?
+    {
+        return Ok(None);
+    }
+
+    let mut scan_projection = scan_projection(&query.projection, query.filter.as_ref());
+    add_projection_column_once(&mut scan_projection, order_column.clone());
+    let row_groups = engine.parquet_row_group_count(&query.path)?;
+    let mut output = Vec::new();
+    let mut order_state = MonotonicOrderState::default();
+    let mut limiter = OrderedLimitCollector::new(query.limit, query.offset);
+
+    for row_group in 0..row_groups {
+        let batches = engine
+            .scan_parquet_row_group_batches(
+                query.path.clone(),
+                batch_size,
+                scan_projection.clone(),
+                vec![row_group],
+            )
+            .await?;
+        for batch in batches {
+            let batch = if let Some(filter) = query.filter.as_ref() {
+                filter_batch(batch, filter)?
+            } else {
+                batch
+            };
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            if !order_state.consume_batch(&batch, &order_column)? {
+                return Ok(None);
+            }
+            limiter.push_batch(batch, &mut output);
+        }
+        if limiter.is_complete() {
+            let output = apply_output_projection(output, &query.projection)?;
+            return Ok(Some(output));
+        }
+    }
+
+    let output = apply_output_projection(output, &query.projection)?;
+    Ok(Some(output))
+}
+
+fn monotonic_row_group_order_limit_scan_enabled() -> bool {
+    !std::env::var("DODAM_DISABLE_MONOTONIC_ROW_GROUP_ORDER_LIMIT_SCAN")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn add_projection_column_once(projection: &mut Projection, column: String) {
+    if let Projection::Columns(columns) = projection
+        && !columns.iter().any(|existing| existing == &column)
+    {
+        columns.push(column);
+    }
+}
+
+struct OrderedLimitCollector {
+    to_skip: usize,
+    remaining: usize,
+}
+
+impl OrderedLimitCollector {
+    fn new(limit: Option<usize>, offset: usize) -> Self {
+        Self {
+            to_skip: offset,
+            remaining: limit.unwrap_or(usize::MAX),
+        }
+    }
+
+    fn push_batch(&mut self, batch: RecordBatch, output: &mut Vec<RecordBatch>) {
+        if self.remaining == 0 {
+            return;
+        }
+        if self.to_skip >= batch.num_rows() {
+            self.to_skip -= batch.num_rows();
+            return;
+        }
+        let batch = if self.to_skip > 0 {
+            let sliced = batch.slice(self.to_skip, batch.num_rows() - self.to_skip);
+            self.to_skip = 0;
+            sliced
+        } else {
+            batch
+        };
+        let rows = self.remaining.min(batch.num_rows());
+        self.remaining -= rows;
+        if rows > 0 {
+            output.push(batch.slice(0, rows));
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.remaining == 0
+    }
+}
+
+#[derive(Default)]
+enum MonotonicOrderState {
+    #[default]
+    Empty,
+    Int32(i32),
+    Int64(i64),
+    Utf8(String),
+}
+
+impl MonotonicOrderState {
+    fn consume_batch(&mut self, batch: &RecordBatch, column: &str) -> Result<bool> {
+        let index = output_batch_column_index(batch, column)?;
+        let values = batch.column(index);
+        match values.data_type() {
+            DataType::Int32 | DataType::Date32 => {
+                let values = values
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("Int32/Date32 data type");
+                for row in 0..values.len() {
+                    if values.is_null(row) {
+                        return Ok(false);
+                    }
+                    let value = values.value(row);
+                    if let Self::Int32(previous) = self
+                        && value < *previous
+                    {
+                        return Ok(false);
+                    }
+                    *self = Self::Int32(value);
+                }
+                Ok(true)
+            }
+            DataType::Int64 => {
+                let values = values
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64 data type");
+                for row in 0..values.len() {
+                    if values.is_null(row) {
+                        return Ok(false);
+                    }
+                    let value = values.value(row);
+                    if let Self::Int64(previous) = self
+                        && value < *previous
+                    {
+                        return Ok(false);
+                    }
+                    *self = Self::Int64(value);
+                }
+                Ok(true)
+            }
+            DataType::Utf8 => {
+                let values = values
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("Utf8 data type");
+                for row in 0..values.len() {
+                    if values.is_null(row) {
+                        return Ok(false);
+                    }
+                    let value = values.value(row);
+                    if let Self::Utf8(previous) = self
+                        && value < previous.as_str()
+                    {
+                        return Ok(false);
+                    }
+                    *self = Self::Utf8(value.to_string());
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+}
+
 async fn try_execute_set_operation_sql(
     engine: &DodamEngine,
     sql: &str,
@@ -711,16 +962,39 @@ async fn try_execute_set_operation_sql(
         batches = apply_output_order_limit(batches, order_by.as_ref(), limit, offset)?;
         return Ok(Some(QueryOutput::Scan { batches }));
     }
+    if order_by.is_none()
+        && limit.is_none()
+        && offset == 0
+        && let Some(batches) =
+            try_execute_same_source_union_all_filter_scan(engine, query.body.as_ref(), batch_size)
+                .await?
+    {
+        return Ok(Some(QueryOutput::Scan { batches }));
+    }
+    if let Some(mut batches) = try_execute_same_source_union_distinct_scan(
+        engine,
+        query.body.as_ref(),
+        batch_size,
+        order_by.as_ref(),
+        limit,
+        offset,
+    )
+    .await?
+    {
+        batches = apply_output_order_limit(batches, order_by.as_ref(), limit, offset)?;
+        return Ok(Some(QueryOutput::Scan { batches }));
+    }
     let child_topk = if offset == 0 {
         order_by.as_ref().zip(limit)
     } else {
         None
     };
-    let mut batches = Box::pin(execute_union_all_set_expr(
+    let mut batches = Box::pin(execute_union_set_expr(
         engine,
         query.body.as_ref(),
         batch_size,
         child_topk,
+        false,
     ))
     .await?;
     batches = apply_output_order_limit(batches, order_by.as_ref(), limit, offset)?;
@@ -1491,18 +1765,33 @@ async fn try_same_source_union_all_streaming_desc_topk(
     let mut batches = Vec::new();
     let mut heap = BinaryHeap::<Reverse<(i128, u64, usize, u32)>>::with_capacity(limit + 1);
     let mut sequence = 0u64;
+    let profile = ordered_sink_profile_enabled();
+    let total_started = profile.then(Instant::now);
+    let mut next_elapsed = Duration::ZERO;
+    let mut heap_elapsed = Duration::ZERO;
+    let mut selected_sort_elapsed = Duration::ZERO;
+    let mut materialize_elapsed = Duration::ZERO;
+    let mut scanned_batches = 0usize;
+    let mut scanned_rows = 0usize;
 
     for batch in stream.by_ref() {
+        let next_started = profile.then(Instant::now);
         let batch = batch?;
+        if let Some(started) = next_started {
+            next_elapsed += started.elapsed();
+        }
         if batch.num_rows() == 0 {
             continue;
         }
+        scanned_batches += 1;
+        scanned_rows += batch.num_rows();
         let key_index = output_batch_column_index(&batch, sort_column)?;
         let key_column = batch.column(key_index);
         if !topk_sort_key_type_supported(key_column.data_type()) {
             return Ok(None);
         }
         let batch_index = batches.len();
+        let heap_started = profile.then(Instant::now);
         if !update_streaming_desc_topk_heap(
             key_column,
             batch_index,
@@ -1511,6 +1800,9 @@ async fn try_same_source_union_all_streaming_desc_topk(
             &mut heap,
         )? {
             return Ok(None);
+        }
+        if let Some(started) = heap_started {
+            heap_elapsed += started.elapsed();
         }
         batches.push(batch);
     }
@@ -1523,9 +1815,1719 @@ async fn try_same_source_union_all_streaming_desc_topk(
         .into_iter()
         .map(|Reverse(item)| item)
         .collect::<Vec<_>>();
+    let selected_sort_started = profile.then(Instant::now);
     selected.sort_unstable_by(|left, right| right.cmp(left));
+    if let Some(started) = selected_sort_started {
+        selected_sort_elapsed += started.elapsed();
+    }
+    let materialize_started = profile.then(Instant::now);
     let batch = materialize_topk_selected_rows(&batches, &selected)?;
+    if let Some(started) = materialize_started {
+        materialize_elapsed += started.elapsed();
+    }
+    print_streaming_topk_profile(
+        total_started,
+        next_elapsed,
+        heap_elapsed,
+        selected_sort_elapsed,
+        materialize_elapsed,
+        scanned_batches,
+        scanned_rows,
+        selected.len(),
+    );
     Ok(Some(vec![batch]))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_streaming_topk_profile(
+    total_started: Option<Instant>,
+    next_elapsed: Duration,
+    heap_elapsed: Duration,
+    selected_sort_elapsed: Duration,
+    materialize_elapsed: Duration,
+    scanned_batches: usize,
+    scanned_rows: usize,
+    selected_rows: usize,
+) {
+    let Some(total_started) = total_started else {
+        return;
+    };
+    eprintln!(
+        "[dodam:streaming-topk-profile] total={}us next={}us heap={}us selected_sort={}us materialize={}us batches={} rows={} selected={}",
+        total_started.elapsed().as_micros(),
+        next_elapsed.as_micros(),
+        heap_elapsed.as_micros(),
+        selected_sort_elapsed.as_micros(),
+        materialize_elapsed.as_micros(),
+        scanned_batches,
+        scanned_rows,
+        selected_rows,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_write_same_source_union_all_streaming_primitive_topk_to_sink(
+    engine: &DodamEngine,
+    shared: &SameSourceUnionAllScan,
+    batch_size: usize,
+    scan_projection: &Projection,
+    sort_column: &str,
+    limit: usize,
+    row_group_count: usize,
+    sink: &mut dyn RecordBatchSink,
+) -> Result<bool> {
+    try_write_same_source_union_all_streaming_primitive_topk_to_sink_inner(
+        engine,
+        shared,
+        batch_size,
+        scan_projection,
+        sort_column,
+        limit,
+        row_group_count,
+        sink,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_write_same_source_union_all_streaming_primitive_topk_to_sink_inner(
+    engine: &DodamEngine,
+    shared: &SameSourceUnionAllScan,
+    batch_size: usize,
+    scan_projection: &Projection,
+    sort_column: &str,
+    limit: usize,
+    row_group_count: usize,
+    sink: &mut dyn RecordBatchSink,
+    allow_selected_payload: bool,
+) -> Result<bool> {
+    if limit > reverse_row_group_topk_max_limit_rows() {
+        return Ok(false);
+    }
+    let Projection::Columns(columns) = scan_projection else {
+        return Ok(false);
+    };
+    let Expr::InList {
+        column: filter_column,
+        values,
+        negated,
+        ..
+    } = shared.filter.expr()
+    else {
+        return Ok(false);
+    };
+    if *negated {
+        return Ok(false);
+    }
+    let Some(column_types) = engine.parquet_direct_primitive_column_types(&shared.path, columns)?
+    else {
+        return Ok(false);
+    };
+    if !column_types.iter().all(|column_type| {
+        matches!(
+            column_type,
+            DirectPrimitiveColumnType::I32 | DirectPrimitiveColumnType::I64
+        )
+    }) {
+        return Ok(false);
+    }
+    let Some(filter_index) = columns.iter().position(|column| column == filter_column) else {
+        return Ok(false);
+    };
+    let Some(sort_index) = columns.iter().position(|column| column == sort_column) else {
+        return Ok(false);
+    };
+    let key_scan_columns = primitive_topk_key_columns(columns, filter_index, sort_index);
+    let explicit_selected_payload = primitive_topk_selected_payload_enabled();
+    let auto_selected_payload =
+        primitive_topk_selected_payload_auto_enabled() && !explicit_selected_payload;
+    let use_selected_payload = allow_selected_payload
+        && (explicit_selected_payload || auto_selected_payload)
+        && primitive_topk_selected_payload_precheck_accepts(
+            engine,
+            &shared.path,
+            sort_column,
+            limit,
+            row_group_count,
+            columns,
+            &key_scan_columns,
+            auto_selected_payload,
+        )?;
+    let scan_columns = if use_selected_payload {
+        key_scan_columns
+    } else {
+        columns.clone()
+    };
+    let scan_column_types = scan_columns
+        .iter()
+        .map(|column| {
+            let Some(index) = columns.iter().position(|candidate| candidate == column) else {
+                return Err(DodamError::UnsupportedSql(format!(
+                    "primitive top-k scan column {column} is not projected"
+                )));
+            };
+            Ok(column_types[index])
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let Some(scan_filter_index) = scan_columns
+        .iter()
+        .position(|column| column == filter_column)
+    else {
+        return Ok(false);
+    };
+    let Some(scan_sort_index) = scan_columns.iter().position(|column| column == sort_column) else {
+        return Ok(false);
+    };
+    let scan_filter_values = match scan_column_types[scan_filter_index] {
+        DirectPrimitiveColumnType::I32 => PrimitiveFilterValues::I32(
+            values
+                .iter()
+                .map(|value| value.as_i32(filter_column))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        DirectPrimitiveColumnType::I64 => PrimitiveFilterValues::I64(
+            values
+                .iter()
+                .map(|value| value.as_i64(filter_column))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        DirectPrimitiveColumnType::Date32
+        | DirectPrimitiveColumnType::Decimal128Int64 { .. }
+        | DirectPrimitiveColumnType::Decimal128Int64Raw { .. } => return Ok(false),
+    };
+    let row_groups = (0..row_group_count).collect::<Vec<_>>();
+    let profile = ordered_sink_profile_enabled();
+    let total_started = profile.then(Instant::now);
+    if primitive_topk_fused_selected_page_reader_enabled() && !use_selected_payload {
+        let filter_i32_values;
+        let filter_i64_values;
+        let (filter_i32, filter_i64) = match &scan_filter_values {
+            PrimitiveFilterValues::I32(values) => {
+                filter_i32_values = values.clone();
+                (&filter_i32_values[..], &[][..])
+            }
+            PrimitiveFilterValues::I64(values) => {
+                filter_i64_values = values.clone();
+                (&[][..], &filter_i64_values[..])
+            }
+        };
+        let specs = columns
+            .iter()
+            .zip(column_types.iter())
+            .map(|(name, column_type)| DirectPrimitiveColumnSpec {
+                name,
+                column_type: *column_type,
+            })
+            .collect::<Vec<_>>();
+        let mut state = PrimitiveSelectedBatchTopkState::new(limit, &column_types);
+        let mut metrics = DirectPrimitiveColumnScanMetrics::default();
+        let mut supported = true;
+        let chunk_size = same_source_union_primitive_chunk_size(row_group_count);
+        for chunk in row_groups.chunks(chunk_size) {
+            let scan_results = std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(chunk.len());
+                for (position, row_group) in chunk.iter().copied().enumerate() {
+                    let engine = engine.clone();
+                    let path = shared.path.clone();
+                    let specs = specs.clone();
+                    let column_types = column_types.clone();
+                    let columns = columns.to_vec();
+                    handles.push(scope.spawn(move || {
+                        let mut local_state =
+                            PrimitiveSelectedBatchTopkState::new(limit, &column_types);
+                        let metrics = engine
+                            .scan_parquet_required_plain_primitive_in_list_desc_selected_pages(
+                                &path,
+                                batch_size,
+                                &[row_group],
+                                &specs,
+                                filter_index,
+                                filter_i32,
+                                filter_i64,
+                                |batch| {
+                                    local_state.consume_selected_page(
+                                        batch,
+                                        &column_types,
+                                        sort_index,
+                                    )
+                                },
+                            )?;
+                        let batch = if local_state.unsupported {
+                            None
+                        } else {
+                            Some(local_state.into_primitive_batch(&columns, &column_types)?)
+                                .filter(|batch| !batch.is_empty())
+                        };
+                        Ok::<_, DodamError>((position, batch, metrics))
+                    }));
+                }
+                let mut results = Vec::with_capacity(handles.len());
+                for handle in handles {
+                    match handle.join() {
+                        Ok(result) => results.push(result?),
+                        Err(_) => {
+                            return Err(DodamError::UnsupportedSql(
+                                "primitive top-k fused selected page worker panicked".to_string(),
+                            ));
+                        }
+                    }
+                }
+                Ok::<_, DodamError>(results)
+            })?;
+            let mut scan_results = scan_results;
+            scan_results.sort_by_key(|(position, _, _)| *position);
+            for (_, batch, row_group_metrics) in scan_results {
+                let Some(row_group_metrics) = row_group_metrics else {
+                    supported = false;
+                    break;
+                };
+                metrics.merge_from(row_group_metrics);
+                if let Some(batch) = batch {
+                    state.consume_primitive_batch(&batch, &column_types, sort_index)?;
+                }
+            }
+            if !supported || state.unsupported {
+                break;
+            }
+        }
+        if supported && !state.unsupported {
+            let batch = state.into_primitive_batch(columns, &column_types)?;
+            print_streaming_primitive_topk_profile(total_started, &metrics, batch.num_rows());
+            write_same_source_primitive_batch_to_sink(batch, scan_projection, shared, sink)?;
+            return Ok(true);
+        }
+    }
+    let Some((state, metrics)) = engine
+        .scan_parquet_primitive_columns_parallel_view_fold_with_location(
+            shared.path.clone(),
+            batch_size,
+            row_groups,
+            scan_columns
+                .iter()
+                .zip(scan_column_types.iter())
+                .map(|(name, column_type)| (name.clone(), *column_type))
+                .collect(),
+            || PrimitiveTopkState::new(limit, &scan_column_types),
+            |state, location, view| {
+                state.consume_view(
+                    location,
+                    view,
+                    &scan_column_types,
+                    scan_filter_index,
+                    &scan_filter_values,
+                    scan_sort_index,
+                )
+            },
+            PrimitiveTopkState::merge,
+        )?
+    else {
+        return Ok(false);
+    };
+    if state.unsupported {
+        return Ok(false);
+    }
+    let batch = if use_selected_payload {
+        if let Some(row_refs) = state.selected_row_refs_sorted() {
+            let base_batch = state.into_primitive_batch(&scan_columns, &scan_column_types)?;
+            if primitive_topk_selected_payload_spread_accepts(
+                &row_refs,
+                row_group_count,
+                columns,
+                &scan_columns,
+            ) || !primitive_topk_selected_payload_spread_gate_enabled()
+            {
+                read_primitive_topk_selected_payload_with_base(
+                    engine,
+                    &shared.path,
+                    batch_size,
+                    row_refs,
+                    base_batch,
+                    &scan_columns,
+                    &scan_column_types,
+                    columns,
+                    &column_types,
+                )?
+            } else {
+                return try_write_same_source_union_all_streaming_primitive_topk_to_sink_inner(
+                    engine,
+                    shared,
+                    batch_size,
+                    scan_projection,
+                    sort_column,
+                    limit,
+                    row_group_count,
+                    sink,
+                    false,
+                );
+            }
+        } else {
+            state.into_primitive_batch(&scan_columns, &scan_column_types)?
+        }
+    } else {
+        state.into_primitive_batch(columns, &column_types)?
+    };
+    print_streaming_primitive_topk_profile(total_started, &metrics, batch.num_rows());
+    write_same_source_primitive_batch_to_sink(batch, scan_projection, shared, sink)?;
+    Ok(true)
+}
+
+fn primitive_topk_key_columns(
+    columns: &[String],
+    filter_index: usize,
+    sort_index: usize,
+) -> Vec<String> {
+    let mut scan_columns = Vec::with_capacity(2);
+    scan_columns.push(columns[filter_index].clone());
+    if sort_index != filter_index {
+        scan_columns.push(columns[sort_index].clone());
+    }
+    scan_columns
+}
+
+fn primitive_topk_selected_payload_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_PRIMITIVE_TOPK_SELECTED_PAYLOAD")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn primitive_topk_selected_payload_auto_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_PRIMITIVE_TOPK_SELECTED_PAYLOAD_AUTO")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn primitive_topk_fused_selected_page_reader_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_PRIMITIVE_TOPK_FUSED_SELECTED_PAGE_READER")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn primitive_topk_selected_payload_precheck_accepts(
+    engine: &DodamEngine,
+    path: &Path,
+    sort_column: &str,
+    limit: usize,
+    total_row_groups: usize,
+    output_columns: &[String],
+    base_columns: &[String],
+    require_stats: bool,
+) -> Result<bool> {
+    let missing_payload_columns =
+        primitive_topk_missing_payload_columns(output_columns, base_columns);
+    if missing_payload_columns == 0 {
+        log_primitive_topk_selected_payload_spread(
+            limit,
+            0,
+            total_row_groups,
+            missing_payload_columns,
+            SelectedPayloadDecision::EmptySelection,
+            "precheck",
+        );
+        return Ok(true);
+    }
+    let Some(ranges) = engine.parquet_primitive_column_min_max_by_row_group(path, sort_column)?
+    else {
+        return Ok(!require_stats);
+    };
+    let Some(candidate_row_groups) =
+        estimate_desc_topk_candidate_row_groups_from_stats(&ranges, limit)
+    else {
+        return Ok(!require_stats);
+    };
+    let decision = choose_selected_payload_by_spread(SelectedPayloadSpreadCostInput {
+        selected_rows: limit,
+        selected_row_groups: candidate_row_groups,
+        total_row_groups,
+        missing_payload_columns,
+        max_selected_row_group_ratio: primitive_topk_selected_payload_max_row_group_ratio(),
+        max_selected_row_groups: primitive_topk_selected_payload_max_row_groups(),
+    });
+    log_primitive_topk_selected_payload_spread(
+        limit,
+        candidate_row_groups,
+        total_row_groups,
+        missing_payload_columns,
+        decision,
+        "precheck",
+    );
+    Ok(decision.accepted())
+}
+
+fn estimate_desc_topk_candidate_row_groups_from_stats(
+    ranges: &[PrimitiveRowGroupMinMax],
+    limit: usize,
+) -> Option<usize> {
+    if limit == 0 || ranges.is_empty() {
+        return Some(0);
+    }
+    let mut sorted = ranges.to_vec();
+    sorted.sort_unstable_by(|left, right| {
+        right
+            .max
+            .cmp(&left.max)
+            .then_with(|| right.min.cmp(&left.min))
+            .then_with(|| left.row_group.cmp(&right.row_group))
+    });
+    let mut rows = 0usize;
+    let mut threshold_min = None;
+    for range in &sorted {
+        rows = rows.saturating_add(range.rows);
+        threshold_min =
+            Some(threshold_min.map_or(range.min, |current: i128| current.min(range.min)));
+        if rows >= limit {
+            break;
+        }
+    }
+    let threshold_min = threshold_min?;
+    Some(
+        ranges
+            .iter()
+            .filter(|range| range.max >= threshold_min)
+            .count(),
+    )
+}
+
+fn primitive_topk_selected_payload_spread_accepts(
+    row_refs: &[PrimitiveTopkRowRef],
+    total_row_groups: usize,
+    output_columns: &[String],
+    base_columns: &[String],
+) -> bool {
+    let missing_payload_columns =
+        primitive_topk_missing_payload_columns(output_columns, base_columns);
+    let mut row_groups = FastHashSet::default();
+    for row_ref in row_refs {
+        row_groups.insert(row_ref.row_group);
+    }
+    let decision = choose_selected_payload_by_spread(SelectedPayloadSpreadCostInput {
+        selected_rows: row_refs.len(),
+        selected_row_groups: row_groups.len(),
+        total_row_groups,
+        missing_payload_columns,
+        max_selected_row_group_ratio: primitive_topk_selected_payload_max_row_group_ratio(),
+        max_selected_row_groups: primitive_topk_selected_payload_max_row_groups(),
+    });
+    log_primitive_topk_selected_payload_spread(
+        row_refs.len(),
+        row_groups.len(),
+        total_row_groups,
+        missing_payload_columns,
+        decision,
+        "actual",
+    );
+    decision.accepted()
+}
+
+fn primitive_topk_missing_payload_columns(
+    output_columns: &[String],
+    base_columns: &[String],
+) -> usize {
+    output_columns
+        .iter()
+        .filter(|column| !base_columns.contains(*column))
+        .count()
+}
+
+fn primitive_topk_selected_payload_max_row_group_ratio() -> f64 {
+    std::env::var("DODAM_PRIMITIVE_TOPK_SELECTED_PAYLOAD_MAX_ROW_GROUP_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.25)
+}
+
+fn primitive_topk_selected_payload_max_row_groups() -> usize {
+    std::env::var("DODAM_PRIMITIVE_TOPK_SELECTED_PAYLOAD_MAX_ROW_GROUPS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(16)
+}
+
+fn primitive_topk_selected_payload_spread_gate_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_PRIMITIVE_TOPK_SELECTED_PAYLOAD_SPREAD_GATE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn log_primitive_topk_selected_payload_spread(
+    selected_rows: usize,
+    selected_row_groups: usize,
+    total_row_groups: usize,
+    missing_payload_columns: usize,
+    decision: SelectedPayloadDecision,
+    phase: &str,
+) {
+    if !std::env::var("DODAM_PRIMITIVE_TOPK_SELECTED_PAYLOAD_TRACE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return;
+    }
+    eprintln!(
+        "[dodam:primitive-topk-selected-payload] phase={} decision={} selected_rows={} row_groups={}/{} missing_payload_columns={}",
+        phase,
+        decision.reason(),
+        selected_rows,
+        selected_row_groups,
+        total_row_groups,
+        missing_payload_columns
+    );
+}
+
+fn read_primitive_topk_selected_payload(
+    engine: &DodamEngine,
+    path: &Path,
+    batch_size: usize,
+    row_refs: Vec<PrimitiveTopkRowRef>,
+    column_names: &[String],
+    column_types: &[DirectPrimitiveColumnType],
+) -> Result<PrimitiveBatch> {
+    if row_refs.is_empty() {
+        return primitive_empty_batch(column_names, column_types);
+    }
+    let mut refs_by_row_group = FastHashMap::<usize, Vec<(usize, usize)>>::default();
+    for (output_index, row_ref) in row_refs.iter().copied().enumerate() {
+        refs_by_row_group
+            .entry(row_ref.row_group)
+            .or_default()
+            .push((row_ref.row_offset, output_index));
+    }
+    let mut row_groups = refs_by_row_group.keys().copied().collect::<Vec<_>>();
+    row_groups.sort_unstable();
+    for refs in refs_by_row_group.values_mut() {
+        refs.sort_unstable_by_key(|(row_offset, _)| *row_offset);
+    }
+    let refs_by_row_group = Arc::new(refs_by_row_group);
+    let rows = row_refs.len();
+    let Some((state, _metrics)) = engine
+        .scan_parquet_primitive_columns_parallel_view_fold_with_location(
+            path.to_path_buf(),
+            batch_size,
+            row_groups,
+            column_names
+                .iter()
+                .zip(column_types.iter())
+                .map(|(name, column_type)| (name.clone(), *column_type))
+                .collect(),
+            || SelectedPrimitivePayloadState::new(rows, column_types),
+            {
+                let refs_by_row_group = Arc::clone(&refs_by_row_group);
+                move |state: &mut SelectedPrimitivePayloadState, location, view| {
+                    state.consume(location, view, column_types, refs_by_row_group.as_ref())
+                }
+            },
+            SelectedPrimitivePayloadState::merge,
+        )?
+    else {
+        return Err(DodamError::UnsupportedSql(
+            "primitive top-k selected payload reader is unsupported".to_string(),
+        ));
+    };
+    state.into_batch(column_names, column_types)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_primitive_topk_selected_payload_with_base(
+    engine: &DodamEngine,
+    path: &Path,
+    batch_size: usize,
+    row_refs: Vec<PrimitiveTopkRowRef>,
+    base_batch: PrimitiveBatch,
+    base_column_names: &[String],
+    base_column_types: &[DirectPrimitiveColumnType],
+    output_column_names: &[String],
+    output_column_types: &[DirectPrimitiveColumnType],
+) -> Result<PrimitiveBatch> {
+    if output_column_names.len() != output_column_types.len()
+        || base_column_names.len() != base_column_types.len()
+    {
+        return Err(DodamError::UnsupportedSql(
+            "primitive top-k selected payload schema mismatch".to_string(),
+        ));
+    }
+    let mut base_columns = base_batch
+        .columns
+        .into_iter()
+        .map(|column| (column.name.clone(), column))
+        .collect::<FastHashMap<_, _>>();
+    let mut missing_names = Vec::new();
+    let mut missing_types = Vec::new();
+    for (name, column_type) in output_column_names.iter().zip(output_column_types.iter()) {
+        if base_columns.contains_key(name) {
+            continue;
+        }
+        missing_names.push(name.clone());
+        missing_types.push(*column_type);
+    }
+    let mut missing_columns = if missing_names.is_empty() {
+        FastHashMap::default()
+    } else {
+        read_primitive_topk_selected_payload(
+            engine,
+            path,
+            batch_size,
+            row_refs,
+            &missing_names,
+            &missing_types,
+        )?
+        .columns
+        .into_iter()
+        .map(|column| (column.name.clone(), column))
+        .collect::<FastHashMap<_, _>>()
+    };
+    let mut columns = Vec::with_capacity(output_column_names.len());
+    for (name, column_type) in output_column_names.iter().zip(output_column_types.iter()) {
+        let column = if let Some(column) = base_columns.remove(name) {
+            column
+        } else if let Some(column) = missing_columns.remove(name) {
+            column
+        } else {
+            return Err(DodamError::UnsupportedSql(format!(
+                "primitive top-k selected payload column {name} was not materialized"
+            )));
+        };
+        if !primitive_column_matches_direct_type(&column, column_type) {
+            return Err(DodamError::UnsupportedSql(format!(
+                "primitive top-k selected payload column {name} type mismatch"
+            )));
+        }
+        columns.push(column);
+    }
+    Ok(PrimitiveBatch { columns })
+}
+
+struct SelectedPrimitivePayloadState {
+    columns: Vec<PrimitiveColumnOutput>,
+    filled: Vec<bool>,
+    unsupported: bool,
+}
+
+impl SelectedPrimitivePayloadState {
+    fn new(rows: usize, column_types: &[DirectPrimitiveColumnType]) -> Self {
+        let columns = column_types
+            .iter()
+            .map(|column_type| match column_type {
+                DirectPrimitiveColumnType::I32 => PrimitiveColumnOutput::I32(vec![0; rows]),
+                DirectPrimitiveColumnType::I64 => PrimitiveColumnOutput::I64(vec![0; rows]),
+                _ => unreachable!("primitive selected payload only uses i32/i64 columns"),
+            })
+            .collect();
+        Self {
+            columns,
+            filled: vec![false; rows],
+            unsupported: false,
+        }
+    }
+
+    fn consume(
+        &mut self,
+        location: DirectPrimitiveBatchLocation,
+        view: BatchView<'_>,
+        column_types: &[DirectPrimitiveColumnType],
+        refs_by_row_group: &FastHashMap<usize, Vec<(usize, usize)>>,
+    ) -> Result<()> {
+        let Some(refs) = refs_by_row_group.get(&location.row_group) else {
+            return Ok(());
+        };
+        let batch_start = location.row_offset;
+        let batch_end = batch_start.saturating_add(view.num_rows());
+        let first = refs.partition_point(|(row_offset, _)| *row_offset < batch_start);
+        let mut index = first;
+        if index >= refs.len() || refs[index].0 >= batch_end {
+            return Ok(());
+        }
+        let Some(columns) = null_free_primitive_columns_for_topk(view, column_types) else {
+            self.unsupported = true;
+            return Ok(());
+        };
+        while index < refs.len() {
+            let (row_offset, output_index) = refs[index];
+            if row_offset >= batch_end {
+                break;
+            }
+            let local_row = row_offset - batch_start;
+            for (source, target) in columns.iter().zip(self.columns.iter_mut()) {
+                overwrite_null_free_primitive_value(source, local_row, target, output_index)?;
+            }
+            self.filled[output_index] = true;
+            index += 1;
+        }
+        Ok(())
+    }
+
+    fn merge(&mut self, source: Self) -> Result<()> {
+        self.unsupported |= source.unsupported;
+        for (index, filled) in source.filled.iter().copied().enumerate() {
+            if !filled {
+                continue;
+            }
+            for (source_column, target) in source.columns.iter().zip(self.columns.iter_mut()) {
+                overwrite_primitive_output_slot(source_column, index, target, index)?;
+            }
+            self.filled[index] = true;
+        }
+        Ok(())
+    }
+
+    fn into_batch(
+        self,
+        column_names: &[String],
+        column_types: &[DirectPrimitiveColumnType],
+    ) -> Result<PrimitiveBatch> {
+        if self.unsupported || self.filled.iter().any(|filled| !*filled) {
+            return Err(DodamError::UnsupportedSql(
+                "primitive top-k selected payload reader did not fill all rows".to_string(),
+            ));
+        }
+        let columns = self
+            .columns
+            .into_iter()
+            .zip(column_names.iter())
+            .zip(column_types.iter())
+            .map(|((values, name), column_type)| {
+                let values = match values {
+                    PrimitiveColumnOutput::I32(values) => PrimitiveColumnValues::I32(values),
+                    PrimitiveColumnOutput::I64(values) => PrimitiveColumnValues::I64(values),
+                };
+                Ok(PrimitiveColumn {
+                    name: name.clone(),
+                    data_type: primitive_output_data_type(column_type)?,
+                    nullable: false,
+                    values,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(PrimitiveBatch { columns })
+    }
+}
+
+fn print_streaming_primitive_topk_profile(
+    total_started: Option<Instant>,
+    metrics: &DirectPrimitiveColumnScanMetrics,
+    rows: usize,
+) {
+    let Some(total_started) = total_started else {
+        return;
+    };
+    let column_read = metrics
+        .column_read_nanos
+        .iter()
+        .map(|nanos| format!("{:.3}", (*nanos as f64) / 1_000_000.0))
+        .collect::<Vec<_>>()
+        .join(",");
+    eprintln!(
+        "[dodam:streaming-primitive-topk-profile] total={}us read={:.3}ms consume={:.3}ms row_groups={} batches={} scanned_rows={} output_rows={} column_read_ms=[{}]",
+        total_started.elapsed().as_micros(),
+        (metrics.read_nanos as f64) / 1_000_000.0,
+        (metrics.consume_nanos as f64) / 1_000_000.0,
+        metrics.row_groups,
+        metrics.batches,
+        metrics.rows,
+        rows,
+        column_read,
+    );
+}
+
+struct PrimitiveTopkState {
+    limit: usize,
+    unsupported: bool,
+    sequence: u64,
+    heap: BinaryHeap<Reverse<(i128, u64, usize)>>,
+    columns: Vec<PrimitiveColumnOutput>,
+    row_refs: Option<Vec<PrimitiveTopkRowRef>>,
+    selected_positions: Vec<usize>,
+}
+
+struct PrimitiveSelectedBatchTopkState {
+    limit: usize,
+    unsupported: bool,
+    sequence: u64,
+    heap: BinaryHeap<Reverse<(i128, u64, usize)>>,
+    columns: Vec<PrimitiveColumnOutput>,
+}
+
+#[derive(Clone, Copy)]
+struct PrimitiveTopkRowRef {
+    row_group: usize,
+    row_offset: usize,
+}
+
+impl PrimitiveSelectedBatchTopkState {
+    fn new(limit: usize, column_types: &[DirectPrimitiveColumnType]) -> Self {
+        let columns = column_types
+            .iter()
+            .map(|column_type| match column_type {
+                DirectPrimitiveColumnType::I32 => {
+                    PrimitiveColumnOutput::I32(Vec::with_capacity(limit))
+                }
+                DirectPrimitiveColumnType::I64 => {
+                    PrimitiveColumnOutput::I64(Vec::with_capacity(limit))
+                }
+                _ => unreachable!("primitive selected top-k only uses i32/i64 columns"),
+            })
+            .collect();
+        Self {
+            limit,
+            unsupported: false,
+            sequence: 0,
+            heap: BinaryHeap::with_capacity(limit.saturating_add(1)),
+            columns,
+        }
+    }
+
+    fn consume_selected_page(
+        &mut self,
+        batch: DirectSelectedPrimitivePageBatch<'_>,
+        column_types: &[DirectPrimitiveColumnType],
+        sort_index: usize,
+    ) -> Result<()> {
+        if sort_index >= batch.columns.len()
+            || batch.columns.len() != column_types.len()
+            || batch.columns.is_empty()
+        {
+            self.unsupported = true;
+            return Ok(());
+        }
+        for &row in batch.selected_positions {
+            let Some(key) = batch.columns[sort_index].value_i128(row) else {
+                self.unsupported = true;
+                return Ok(());
+            };
+            self.insert_candidate_page(key, &batch.columns, column_types, row)?;
+            self.sequence = self.sequence.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    fn consume_primitive_batch(
+        &mut self,
+        batch: &PrimitiveBatch,
+        column_types: &[DirectPrimitiveColumnType],
+        sort_index: usize,
+    ) -> Result<()> {
+        if sort_index >= batch.columns.len()
+            || batch.columns.len() != column_types.len()
+            || batch.columns.is_empty()
+        {
+            self.unsupported = true;
+            return Ok(());
+        }
+        let rows = batch.num_rows();
+        for column in &batch.columns {
+            if column.values.len() != rows {
+                self.unsupported = true;
+                return Ok(());
+            }
+        }
+        for row in 0..rows {
+            let Some(key) = primitive_column_values_key(&batch.columns[sort_index].values, row)
+            else {
+                self.unsupported = true;
+                return Ok(());
+            };
+            self.insert_candidate_primitive_batch(key, &batch.columns, column_types, row)?;
+            self.sequence = self.sequence.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    fn insert_candidate_page(
+        &mut self,
+        key: i128,
+        columns: &[DirectSelectedPrimitiveColumnPageView<'_>],
+        column_types: &[DirectPrimitiveColumnType],
+        row: usize,
+    ) -> Result<()> {
+        let sequence = self.sequence;
+        if self.heap.len() < self.limit {
+            let slot = self.push_slot_from_page(columns, column_types, row)?;
+            self.heap.push(Reverse((key, sequence, slot)));
+            return Ok(());
+        }
+        if let Some(worst) = self.heap.peek()
+            && key < worst.0.0
+        {
+            return Ok(());
+        }
+        let mut replace_slot = None;
+        {
+            if let Some(mut worst) = self.heap.peek_mut()
+                && (key, sequence, 0usize) > (worst.0.0, worst.0.1, 0usize)
+            {
+                replace_slot = Some(worst.0.2);
+                *worst = Reverse((key, sequence, worst.0.2));
+            }
+        }
+        if let Some(slot) = replace_slot {
+            self.overwrite_slot_from_page(slot, columns, column_types, row)?;
+        }
+        Ok(())
+    }
+
+    fn insert_candidate_primitive_batch(
+        &mut self,
+        key: i128,
+        columns: &[PrimitiveColumn],
+        column_types: &[DirectPrimitiveColumnType],
+        row: usize,
+    ) -> Result<()> {
+        let sequence = self.sequence;
+        if self.heap.len() < self.limit {
+            let slot = self.push_slot_from_primitive_batch(columns, column_types, row)?;
+            self.heap.push(Reverse((key, sequence, slot)));
+            return Ok(());
+        }
+        if let Some(worst) = self.heap.peek()
+            && key < worst.0.0
+        {
+            return Ok(());
+        }
+        let mut replace_slot = None;
+        {
+            if let Some(mut worst) = self.heap.peek_mut()
+                && (key, sequence, 0usize) > (worst.0.0, worst.0.1, 0usize)
+            {
+                replace_slot = Some(worst.0.2);
+                *worst = Reverse((key, sequence, worst.0.2));
+            }
+        }
+        if let Some(slot) = replace_slot {
+            self.overwrite_slot_from_primitive_batch(slot, columns, column_types, row)?;
+        }
+        Ok(())
+    }
+
+    fn push_slot_from_page(
+        &mut self,
+        columns: &[DirectSelectedPrimitiveColumnPageView<'_>],
+        column_types: &[DirectPrimitiveColumnType],
+        row: usize,
+    ) -> Result<usize> {
+        let slot = primitive_output_len(&self.columns[0]);
+        for ((source, column_type), target) in columns
+            .iter()
+            .zip(column_types.iter())
+            .zip(self.columns.iter_mut())
+        {
+            push_direct_selected_page_value(source, column_type, row, target)?;
+        }
+        Ok(slot)
+    }
+
+    fn overwrite_slot_from_page(
+        &mut self,
+        slot: usize,
+        columns: &[DirectSelectedPrimitiveColumnPageView<'_>],
+        column_types: &[DirectPrimitiveColumnType],
+        row: usize,
+    ) -> Result<()> {
+        for ((source, column_type), target) in columns
+            .iter()
+            .zip(column_types.iter())
+            .zip(self.columns.iter_mut())
+        {
+            overwrite_direct_selected_page_value(source, column_type, row, target, slot)?;
+        }
+        Ok(())
+    }
+
+    fn push_slot_from_primitive_batch(
+        &mut self,
+        columns: &[PrimitiveColumn],
+        column_types: &[DirectPrimitiveColumnType],
+        row: usize,
+    ) -> Result<usize> {
+        let slot = primitive_output_len(&self.columns[0]);
+        for ((source, column_type), target) in columns
+            .iter()
+            .zip(column_types.iter())
+            .zip(self.columns.iter_mut())
+        {
+            push_primitive_batch_value(&source.values, column_type, row, target)?;
+        }
+        Ok(slot)
+    }
+
+    fn overwrite_slot_from_primitive_batch(
+        &mut self,
+        slot: usize,
+        columns: &[PrimitiveColumn],
+        column_types: &[DirectPrimitiveColumnType],
+        row: usize,
+    ) -> Result<()> {
+        for ((source, column_type), target) in columns
+            .iter()
+            .zip(column_types.iter())
+            .zip(self.columns.iter_mut())
+        {
+            overwrite_primitive_batch_value(&source.values, column_type, row, target, slot)?;
+        }
+        Ok(())
+    }
+
+    fn into_primitive_batch(
+        self,
+        column_names: &[String],
+        column_types: &[DirectPrimitiveColumnType],
+    ) -> Result<PrimitiveBatch> {
+        let mut selected = self
+            .heap
+            .into_iter()
+            .map(|Reverse(item)| item)
+            .collect::<Vec<_>>();
+        selected.sort_unstable_by(|left, right| right.cmp(left));
+        let mut output = column_types
+            .iter()
+            .map(|column_type| match column_type {
+                DirectPrimitiveColumnType::I32 => {
+                    PrimitiveColumnOutput::I32(Vec::with_capacity(selected.len()))
+                }
+                DirectPrimitiveColumnType::I64 => {
+                    PrimitiveColumnOutput::I64(Vec::with_capacity(selected.len()))
+                }
+                _ => unreachable!("primitive selected top-k only uses i32/i64 columns"),
+            })
+            .collect::<Vec<_>>();
+        for (_, _, slot) in selected {
+            for (source, target) in self.columns.iter().zip(output.iter_mut()) {
+                push_primitive_output_slot(source, slot, target)?;
+            }
+        }
+        primitive_output_batch_from_columns(output, column_names, column_types)
+    }
+}
+
+impl PrimitiveTopkState {
+    fn new(limit: usize, column_types: &[DirectPrimitiveColumnType]) -> Self {
+        let columns = column_types
+            .iter()
+            .map(|column_type| match column_type {
+                DirectPrimitiveColumnType::I32 => {
+                    PrimitiveColumnOutput::I32(Vec::with_capacity(limit))
+                }
+                DirectPrimitiveColumnType::I64 => {
+                    PrimitiveColumnOutput::I64(Vec::with_capacity(limit))
+                }
+                _ => unreachable!("primitive top-k only uses i32/i64 columns"),
+            })
+            .collect();
+        Self {
+            limit,
+            unsupported: false,
+            sequence: 0,
+            heap: BinaryHeap::with_capacity(limit.saturating_add(1)),
+            columns,
+            row_refs: (primitive_topk_row_refs_enabled()
+                || primitive_topk_selected_payload_enabled())
+            .then(|| Vec::with_capacity(limit)),
+            selected_positions: Vec::new(),
+        }
+    }
+
+    fn consume_view(
+        &mut self,
+        location: DirectPrimitiveBatchLocation,
+        view: BatchView<'_>,
+        column_types: &[DirectPrimitiveColumnType],
+        filter_index: usize,
+        filter_values: &PrimitiveFilterValues,
+        sort_index: usize,
+    ) -> Result<()> {
+        let Some(columns) = null_free_primitive_columns_for_topk(view, column_types) else {
+            self.unsupported = true;
+            return Ok(());
+        };
+        let threshold_key =
+            if primitive_topk_fused_filter_threshold_enabled() && self.heap.len() >= self.limit {
+                self.heap.peek().map(|worst| worst.0.0)
+            } else {
+                None
+            };
+        if let Some(threshold_key) = threshold_key {
+            primitive_topk_filter_positions_with_min_key_into(
+                columns[filter_index],
+                filter_values,
+                columns[sort_index],
+                threshold_key,
+                &mut self.selected_positions,
+            );
+        } else {
+            primitive_topk_filter_positions_into(
+                columns[filter_index],
+                filter_values,
+                &mut self.selected_positions,
+            );
+        }
+        let base_sequence = primitive_topk_sequence_base(location).unwrap_or(self.sequence);
+        self.sequence = self.sequence.wrapping_add(view.num_rows() as u64);
+        for index in 0..self.selected_positions.len() {
+            let row = self.selected_positions[index];
+            let Some(key) = primitive_topk_key(columns[sort_index], row) else {
+                return Err(DodamError::UnsupportedSql(
+                    "streaming primitive top-k sort column type mismatch".to_string(),
+                ));
+            };
+            self.insert_candidate_with_sequence(
+                key,
+                base_sequence.wrapping_add(row as u64),
+                &columns,
+                PrimitiveTopkRowRef {
+                    row_group: location.row_group,
+                    row_offset: location.row_offset.saturating_add(row),
+                },
+                row,
+            )?;
+        }
+        self.selected_positions.clear();
+        Ok(())
+    }
+
+    fn insert_candidate_with_sequence(
+        &mut self,
+        key: i128,
+        sequence: u64,
+        columns: &[NullFreePrimitiveColumn<'_>],
+        row_ref: PrimitiveTopkRowRef,
+        row: usize,
+    ) -> Result<()> {
+        if self.heap.len() < self.limit {
+            let slot = self.push_slot_from_columns(columns, row_ref, row)?;
+            self.heap.push(Reverse((key, sequence, slot)));
+            return Ok(());
+        }
+        if let Some(worst) = self.heap.peek()
+            && key < worst.0.0
+        {
+            return Ok(());
+        }
+        let mut replace_slot = None;
+        {
+            if let Some(mut worst) = self.heap.peek_mut()
+                && (key, sequence, 0usize) > (worst.0.0, worst.0.1, 0usize)
+            {
+                replace_slot = Some(worst.0.2);
+                *worst = Reverse((key, sequence, worst.0.2));
+            }
+        }
+        if let Some(slot) = replace_slot {
+            self.overwrite_slot_from_columns(slot, columns, row_ref, row)?;
+        }
+        Ok(())
+    }
+
+    fn merge(&mut self, other: Self) -> Result<()> {
+        self.unsupported |= other.unsupported;
+        if other.unsupported {
+            return Ok(());
+        }
+        let mut selected = other
+            .heap
+            .iter()
+            .map(|Reverse(item)| *item)
+            .collect::<Vec<_>>();
+        selected.sort_unstable_by(|left, right| right.cmp(left));
+        for (key, _, slot) in selected {
+            self.insert_candidate_from_state(key, &other, slot)?;
+        }
+        Ok(())
+    }
+
+    fn insert_candidate_from_state(
+        &mut self,
+        key: i128,
+        source: &PrimitiveTopkState,
+        source_slot: usize,
+    ) -> Result<()> {
+        let sequence = self.sequence;
+        self.sequence = self.sequence.wrapping_add(1);
+        if self.heap.len() < self.limit {
+            let slot = self.push_slot_from_state(source, source_slot)?;
+            self.heap.push(Reverse((key, sequence, slot)));
+            return Ok(());
+        }
+        if let Some(worst) = self.heap.peek()
+            && key < worst.0.0
+        {
+            return Ok(());
+        }
+        let mut replace_slot = None;
+        {
+            if let Some(mut worst) = self.heap.peek_mut()
+                && (key, sequence, 0usize) > (worst.0.0, worst.0.1, 0usize)
+            {
+                replace_slot = Some(worst.0.2);
+                *worst = Reverse((key, sequence, worst.0.2));
+            }
+        }
+        if let Some(slot) = replace_slot {
+            self.overwrite_slot_from_state(slot, source, source_slot)?;
+        }
+        Ok(())
+    }
+
+    fn into_primitive_batch(
+        self,
+        column_names: &[String],
+        column_types: &[DirectPrimitiveColumnType],
+    ) -> Result<PrimitiveBatch> {
+        let mut selected = self
+            .heap
+            .into_iter()
+            .map(|Reverse(item)| item)
+            .collect::<Vec<_>>();
+        selected.sort_unstable_by(|left, right| right.cmp(left));
+        let mut output = column_types
+            .iter()
+            .map(|column_type| match column_type {
+                DirectPrimitiveColumnType::I32 => {
+                    PrimitiveColumnOutput::I32(Vec::with_capacity(selected.len()))
+                }
+                DirectPrimitiveColumnType::I64 => {
+                    PrimitiveColumnOutput::I64(Vec::with_capacity(selected.len()))
+                }
+                _ => unreachable!("primitive top-k only uses i32/i64 columns"),
+            })
+            .collect::<Vec<_>>();
+        for (_, _, slot) in selected {
+            if let Some(row_refs) = &self.row_refs {
+                let row_ref = row_refs[slot];
+                let _physical_row = (row_ref.row_group, row_ref.row_offset);
+            }
+            for (source, target) in self.columns.iter().zip(output.iter_mut()) {
+                push_primitive_output_slot(source, slot, target)?;
+            }
+        }
+        primitive_output_batch_from_columns(output, column_names, column_types)
+    }
+
+    fn selected_row_refs_sorted(&self) -> Option<Vec<PrimitiveTopkRowRef>> {
+        let row_refs = self.row_refs.as_ref()?;
+        let mut selected = self
+            .heap
+            .iter()
+            .map(|Reverse(item)| *item)
+            .collect::<Vec<_>>();
+        selected.sort_unstable_by(|left, right| right.cmp(left));
+        Some(
+            selected
+                .into_iter()
+                .map(|(_, _, slot)| row_refs[slot])
+                .collect(),
+        )
+    }
+
+    fn push_slot_from_columns(
+        &mut self,
+        columns: &[NullFreePrimitiveColumn<'_>],
+        row_ref: PrimitiveTopkRowRef,
+        row: usize,
+    ) -> Result<usize> {
+        let slot = primitive_output_len(&self.columns[0]);
+        for (source, target) in columns.iter().zip(self.columns.iter_mut()) {
+            push_null_free_primitive_value(source, row, target)?;
+        }
+        if let Some(row_refs) = &mut self.row_refs {
+            row_refs.push(row_ref);
+        }
+        Ok(slot)
+    }
+
+    fn overwrite_slot_from_columns(
+        &mut self,
+        slot: usize,
+        columns: &[NullFreePrimitiveColumn<'_>],
+        row_ref: PrimitiveTopkRowRef,
+        row: usize,
+    ) -> Result<()> {
+        for (source, target) in columns.iter().zip(self.columns.iter_mut()) {
+            overwrite_null_free_primitive_value(source, row, target, slot)?;
+        }
+        if let Some(row_refs) = &mut self.row_refs {
+            row_refs[slot] = row_ref;
+        }
+        Ok(())
+    }
+
+    fn push_slot_from_state(
+        &mut self,
+        source: &PrimitiveTopkState,
+        source_slot: usize,
+    ) -> Result<usize> {
+        let slot = primitive_output_len(&self.columns[0]);
+        for (source_column, target) in source.columns.iter().zip(self.columns.iter_mut()) {
+            push_primitive_output_slot(source_column, source_slot, target)?;
+        }
+        if let (Some(target_refs), Some(source_refs)) = (&mut self.row_refs, &source.row_refs) {
+            target_refs.push(source_refs[source_slot]);
+        }
+        Ok(slot)
+    }
+
+    fn overwrite_slot_from_state(
+        &mut self,
+        slot: usize,
+        source: &PrimitiveTopkState,
+        source_slot: usize,
+    ) -> Result<()> {
+        for (source_column, target) in source.columns.iter().zip(self.columns.iter_mut()) {
+            overwrite_primitive_output_slot(source_column, source_slot, target, slot)?;
+        }
+        if let (Some(target_refs), Some(source_refs)) = (&mut self.row_refs, &source.row_refs) {
+            target_refs[slot] = source_refs[source_slot];
+        }
+        Ok(())
+    }
+}
+
+fn primitive_topk_row_refs_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_PRIMITIVE_TOPK_ROW_REFS")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn primitive_topk_fused_filter_threshold_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_PRIMITIVE_TOPK_FUSED_FILTER_THRESHOLD")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn null_free_primitive_columns_for_topk<'a>(
+    view: BatchView<'a>,
+    column_types: &[DirectPrimitiveColumnType],
+) -> Option<Vec<NullFreePrimitiveColumn<'a>>> {
+    let mut columns = Vec::with_capacity(column_types.len());
+    for (index, column_type) in column_types.iter().enumerate() {
+        match column_type {
+            DirectPrimitiveColumnType::I32 => {
+                let values = view.i32_vector(index)?.values_if_null_free()?;
+                columns.push(NullFreePrimitiveColumn::I32(values));
+            }
+            DirectPrimitiveColumnType::I64 => {
+                let values = view.i64_vector(index)?.values_if_null_free()?;
+                columns.push(NullFreePrimitiveColumn::I64(values));
+            }
+            _ => return None,
+        }
+    }
+    Some(columns)
+}
+
+fn primitive_topk_key(column: NullFreePrimitiveColumn<'_>, row: usize) -> Option<i128> {
+    match column {
+        NullFreePrimitiveColumn::I32(values) => Some(i128::from(values[row])),
+        NullFreePrimitiveColumn::I64(values) => Some(i128::from(values[row])),
+    }
+}
+
+fn primitive_column_values_key(column: &PrimitiveColumnValues, row: usize) -> Option<i128> {
+    match column {
+        PrimitiveColumnValues::I32(values) => values.get(row).map(|value| (*value).into()),
+        PrimitiveColumnValues::I64(values) => values.get(row).map(|value| (*value).into()),
+    }
+}
+
+fn primitive_output_len(output: &PrimitiveColumnOutput) -> usize {
+    match output {
+        PrimitiveColumnOutput::I32(values) => values.len(),
+        PrimitiveColumnOutput::I64(values) => values.len(),
+    }
+}
+
+fn push_primitive_batch_value(
+    source: &PrimitiveColumnValues,
+    column_type: &DirectPrimitiveColumnType,
+    row: usize,
+    target: &mut PrimitiveColumnOutput,
+) -> Result<()> {
+    match (source, column_type, target) {
+        (
+            PrimitiveColumnValues::I32(values),
+            DirectPrimitiveColumnType::I32,
+            PrimitiveColumnOutput::I32(target),
+        ) => {
+            let Some(value) = values.get(row).copied() else {
+                return Err(DodamError::UnsupportedSql(
+                    "primitive selected top-k row out of range".to_string(),
+                ));
+            };
+            target.push(value);
+            Ok(())
+        }
+        (
+            PrimitiveColumnValues::I64(values),
+            DirectPrimitiveColumnType::I64,
+            PrimitiveColumnOutput::I64(target),
+        ) => {
+            let Some(value) = values.get(row).copied() else {
+                return Err(DodamError::UnsupportedSql(
+                    "primitive selected top-k row out of range".to_string(),
+                ));
+            };
+            target.push(value);
+            Ok(())
+        }
+        _ => Err(DodamError::UnsupportedSql(
+            "primitive selected top-k column type mismatch".to_string(),
+        )),
+    }
+}
+
+fn push_direct_selected_page_value(
+    source: &DirectSelectedPrimitiveColumnPageView<'_>,
+    column_type: &DirectPrimitiveColumnType,
+    row: usize,
+    target: &mut PrimitiveColumnOutput,
+) -> Result<()> {
+    match (source, column_type, target) {
+        (
+            DirectSelectedPrimitiveColumnPageView::I32Plain { .. }
+            | DirectSelectedPrimitiveColumnPageView::I32Dictionary { .. },
+            DirectPrimitiveColumnType::I32,
+            PrimitiveColumnOutput::I32(target),
+        ) => {
+            let Some(value) = source.value_i32(row) else {
+                return Err(DodamError::UnsupportedSql(
+                    "primitive selected top-k row out of range".to_string(),
+                ));
+            };
+            target.push(value);
+            Ok(())
+        }
+        (
+            DirectSelectedPrimitiveColumnPageView::I64Plain { .. },
+            DirectPrimitiveColumnType::I64,
+            PrimitiveColumnOutput::I64(target),
+        ) => {
+            let Some(value) = source.value_i64(row) else {
+                return Err(DodamError::UnsupportedSql(
+                    "primitive selected top-k row out of range".to_string(),
+                ));
+            };
+            target.push(value);
+            Ok(())
+        }
+        _ => Err(DodamError::UnsupportedSql(
+            "primitive selected top-k column type mismatch".to_string(),
+        )),
+    }
+}
+
+fn overwrite_direct_selected_page_value(
+    source: &DirectSelectedPrimitiveColumnPageView<'_>,
+    column_type: &DirectPrimitiveColumnType,
+    row: usize,
+    target: &mut PrimitiveColumnOutput,
+    slot: usize,
+) -> Result<()> {
+    match (source, column_type, target) {
+        (
+            DirectSelectedPrimitiveColumnPageView::I32Plain { .. }
+            | DirectSelectedPrimitiveColumnPageView::I32Dictionary { .. },
+            DirectPrimitiveColumnType::I32,
+            PrimitiveColumnOutput::I32(target),
+        ) => {
+            let Some(value) = source.value_i32(row) else {
+                return Err(DodamError::UnsupportedSql(
+                    "primitive selected top-k row out of range".to_string(),
+                ));
+            };
+            let Some(target) = target.get_mut(slot) else {
+                return Err(DodamError::UnsupportedSql(
+                    "primitive selected top-k slot out of range".to_string(),
+                ));
+            };
+            *target = value;
+            Ok(())
+        }
+        (
+            DirectSelectedPrimitiveColumnPageView::I64Plain { .. },
+            DirectPrimitiveColumnType::I64,
+            PrimitiveColumnOutput::I64(target),
+        ) => {
+            let Some(value) = source.value_i64(row) else {
+                return Err(DodamError::UnsupportedSql(
+                    "primitive selected top-k row out of range".to_string(),
+                ));
+            };
+            let Some(target) = target.get_mut(slot) else {
+                return Err(DodamError::UnsupportedSql(
+                    "primitive selected top-k slot out of range".to_string(),
+                ));
+            };
+            *target = value;
+            Ok(())
+        }
+        _ => Err(DodamError::UnsupportedSql(
+            "primitive selected top-k column type mismatch".to_string(),
+        )),
+    }
+}
+
+fn overwrite_primitive_batch_value(
+    source: &PrimitiveColumnValues,
+    column_type: &DirectPrimitiveColumnType,
+    row: usize,
+    target: &mut PrimitiveColumnOutput,
+    slot: usize,
+) -> Result<()> {
+    match (source, column_type, target) {
+        (
+            PrimitiveColumnValues::I32(values),
+            DirectPrimitiveColumnType::I32,
+            PrimitiveColumnOutput::I32(target),
+        ) => {
+            let Some(value) = values.get(row).copied() else {
+                return Err(DodamError::UnsupportedSql(
+                    "primitive selected top-k row out of range".to_string(),
+                ));
+            };
+            let Some(target) = target.get_mut(slot) else {
+                return Err(DodamError::UnsupportedSql(
+                    "primitive selected top-k slot out of range".to_string(),
+                ));
+            };
+            *target = value;
+            Ok(())
+        }
+        (
+            PrimitiveColumnValues::I64(values),
+            DirectPrimitiveColumnType::I64,
+            PrimitiveColumnOutput::I64(target),
+        ) => {
+            let Some(value) = values.get(row).copied() else {
+                return Err(DodamError::UnsupportedSql(
+                    "primitive selected top-k row out of range".to_string(),
+                ));
+            };
+            let Some(target) = target.get_mut(slot) else {
+                return Err(DodamError::UnsupportedSql(
+                    "primitive selected top-k slot out of range".to_string(),
+                ));
+            };
+            *target = value;
+            Ok(())
+        }
+        _ => Err(DodamError::UnsupportedSql(
+            "primitive selected top-k column type mismatch".to_string(),
+        )),
+    }
+}
+
+fn push_null_free_primitive_value(
+    source: &NullFreePrimitiveColumn<'_>,
+    row: usize,
+    target: &mut PrimitiveColumnOutput,
+) -> Result<()> {
+    match (source, target) {
+        (NullFreePrimitiveColumn::I32(values), PrimitiveColumnOutput::I32(target)) => {
+            target.push(values[row]);
+            Ok(())
+        }
+        (NullFreePrimitiveColumn::I64(values), PrimitiveColumnOutput::I64(target)) => {
+            target.push(values[row]);
+            Ok(())
+        }
+        _ => Err(DodamError::UnsupportedSql(
+            "primitive top-k column type mismatch".to_string(),
+        )),
+    }
+}
+
+fn overwrite_null_free_primitive_value(
+    source: &NullFreePrimitiveColumn<'_>,
+    row: usize,
+    target: &mut PrimitiveColumnOutput,
+    slot: usize,
+) -> Result<()> {
+    match (source, target) {
+        (NullFreePrimitiveColumn::I32(values), PrimitiveColumnOutput::I32(target)) => {
+            target[slot] = values[row];
+            Ok(())
+        }
+        (NullFreePrimitiveColumn::I64(values), PrimitiveColumnOutput::I64(target)) => {
+            target[slot] = values[row];
+            Ok(())
+        }
+        _ => Err(DodamError::UnsupportedSql(
+            "primitive top-k column type mismatch".to_string(),
+        )),
+    }
+}
+
+fn push_primitive_output_slot(
+    source: &PrimitiveColumnOutput,
+    source_slot: usize,
+    target: &mut PrimitiveColumnOutput,
+) -> Result<()> {
+    match (source, target) {
+        (PrimitiveColumnOutput::I32(source), PrimitiveColumnOutput::I32(target)) => {
+            target.push(source[source_slot]);
+            Ok(())
+        }
+        (PrimitiveColumnOutput::I64(source), PrimitiveColumnOutput::I64(target)) => {
+            target.push(source[source_slot]);
+            Ok(())
+        }
+        _ => Err(DodamError::UnsupportedSql(
+            "primitive top-k column type mismatch".to_string(),
+        )),
+    }
+}
+
+fn overwrite_primitive_output_slot(
+    source: &PrimitiveColumnOutput,
+    source_slot: usize,
+    target: &mut PrimitiveColumnOutput,
+    target_slot: usize,
+) -> Result<()> {
+    match (source, target) {
+        (PrimitiveColumnOutput::I32(source), PrimitiveColumnOutput::I32(target)) => {
+            target[target_slot] = source[source_slot];
+            Ok(())
+        }
+        (PrimitiveColumnOutput::I64(source), PrimitiveColumnOutput::I64(target)) => {
+            target[target_slot] = source[source_slot];
+            Ok(())
+        }
+        _ => Err(DodamError::UnsupportedSql(
+            "primitive top-k column type mismatch".to_string(),
+        )),
+    }
+}
+
+fn primitive_output_batch_from_columns(
+    output: Vec<PrimitiveColumnOutput>,
+    column_names: &[String],
+    column_types: &[DirectPrimitiveColumnType],
+) -> Result<PrimitiveBatch> {
+    let columns = output
+        .into_iter()
+        .zip(column_names.iter())
+        .zip(column_types.iter())
+        .map(|((values, name), column_type)| {
+            let values = match values {
+                PrimitiveColumnOutput::I32(values) => PrimitiveColumnValues::I32(values),
+                PrimitiveColumnOutput::I64(values) => PrimitiveColumnValues::I64(values),
+            };
+            Ok(PrimitiveColumn {
+                name: name.clone(),
+                data_type: primitive_output_data_type(column_type)?,
+                nullable: false,
+                values,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(PrimitiveBatch { columns })
+}
+
+fn primitive_column_matches_direct_type(
+    column: &PrimitiveColumn,
+    column_type: &DirectPrimitiveColumnType,
+) -> bool {
+    matches!(
+        (&column.values, column_type),
+        (
+            PrimitiveColumnValues::I32(_),
+            DirectPrimitiveColumnType::I32
+        ) | (
+            PrimitiveColumnValues::I64(_),
+            DirectPrimitiveColumnType::I64
+        )
+    )
 }
 
 fn update_streaming_desc_topk_heap(
@@ -1658,6 +3660,9 @@ fn materialize_topk_selected_rows(
             .unwrap_or_else(|| Arc::new(Schema::empty()));
         return Ok(RecordBatch::new_empty(schema));
     }
+    if let Some(batch) = take_topk_selected_record_batch_runs(batches, selected)? {
+        return Ok(batch);
+    }
     if let Some(batch) = gather_topk_selected_record_batch(batches, selected)? {
         return Ok(batch);
     }
@@ -1667,6 +3672,52 @@ fn materialize_topk_selected_rows(
     }
     let schema = chunks[0].schema();
     Ok(concat_batches(&schema, chunks.iter())?)
+}
+
+fn take_topk_selected_record_batch_runs(
+    batches: &[RecordBatch],
+    selected: &[(i128, u64, usize, u32)],
+) -> Result<Option<RecordBatch>> {
+    if selected.len() < topk_take_materialization_min_rows() {
+        return Ok(None);
+    }
+    let Some(first_batch) = batches.first() else {
+        return Ok(None);
+    };
+    let schema = first_batch.schema();
+    let mut chunks = Vec::new();
+    let mut index = 0usize;
+    while index < selected.len() {
+        let batch_index = selected[index].2;
+        let Some(batch) = batches.get(batch_index) else {
+            return Ok(None);
+        };
+        if batch.schema() != schema {
+            return Ok(None);
+        }
+        let mut rows = Vec::new();
+        while index < selected.len() && selected[index].2 == batch_index {
+            rows.push(selected[index].3);
+            index += 1;
+        }
+        chunks.push(take_record_batch(batch, &UInt32Array::from(rows))?);
+    }
+    let Some(first) = chunks.first() else {
+        return Ok(None);
+    };
+    if chunks.len() == 1 {
+        return Ok(chunks.pop());
+    }
+    let schema = first.schema();
+    Ok(Some(concat_batches(&schema, chunks.iter())?))
+}
+
+fn topk_take_materialization_min_rows() -> usize {
+    std::env::var("DODAM_TOPK_TAKE_MATERIALIZATION_MIN_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(usize::MAX)
 }
 
 fn gather_topk_selected_record_batch(
@@ -1702,79 +3753,159 @@ fn gather_topk_selected_array(
 
     match data_type {
         DataType::Boolean => {
-            let mut output = Vec::with_capacity(selected.len());
-            for &(_, _, batch_index, row) in selected {
-                let values = batches[batch_index]
-                    .column(column_index)
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()?;
-                let row = row as usize;
-                output.push((!values.is_null(row)).then(|| values.value(row)));
+            if topk_selected_column_null_count(batches, column_index) == 0 {
+                let mut output = Vec::with_capacity(selected.len());
+                for &(_, _, batch_index, row) in selected {
+                    let values = batches[batch_index]
+                        .column(column_index)
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()?;
+                    output.push(values.value(row as usize));
+                }
+                Some(Arc::new(BooleanArray::from(output)))
+            } else {
+                let mut output = Vec::with_capacity(selected.len());
+                for &(_, _, batch_index, row) in selected {
+                    let values = batches[batch_index]
+                        .column(column_index)
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()?;
+                    let row = row as usize;
+                    output.push((!values.is_null(row)).then(|| values.value(row)));
+                }
+                Some(Arc::new(BooleanArray::from(output)))
             }
-            Some(Arc::new(BooleanArray::from(output)))
         }
         DataType::Int32 => {
-            let mut output = Vec::with_capacity(selected.len());
-            for &(_, _, batch_index, row) in selected {
-                let values = batches[batch_index]
-                    .column(column_index)
-                    .as_any()
-                    .downcast_ref::<Int32Array>()?;
-                let row = row as usize;
-                output.push((!values.is_null(row)).then(|| values.value(row)));
+            if topk_selected_column_null_count(batches, column_index) == 0 {
+                let mut output = Vec::with_capacity(selected.len());
+                for &(_, _, batch_index, row) in selected {
+                    let values = batches[batch_index]
+                        .column(column_index)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()?;
+                    output.push(values.value(row as usize));
+                }
+                Some(Arc::new(Int32Array::from(output)))
+            } else {
+                let mut output = Vec::with_capacity(selected.len());
+                for &(_, _, batch_index, row) in selected {
+                    let values = batches[batch_index]
+                        .column(column_index)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()?;
+                    let row = row as usize;
+                    output.push((!values.is_null(row)).then(|| values.value(row)));
+                }
+                Some(Arc::new(Int32Array::from(output)))
             }
-            Some(Arc::new(Int32Array::from(output)))
         }
         DataType::Int64 => {
-            let mut output = Vec::with_capacity(selected.len());
-            for &(_, _, batch_index, row) in selected {
-                let values = batches[batch_index]
-                    .column(column_index)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()?;
-                let row = row as usize;
-                output.push((!values.is_null(row)).then(|| values.value(row)));
+            if topk_selected_column_null_count(batches, column_index) == 0 {
+                let mut output = Vec::with_capacity(selected.len());
+                for &(_, _, batch_index, row) in selected {
+                    let values = batches[batch_index]
+                        .column(column_index)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()?;
+                    output.push(values.value(row as usize));
+                }
+                Some(Arc::new(Int64Array::from(output)))
+            } else {
+                let mut output = Vec::with_capacity(selected.len());
+                for &(_, _, batch_index, row) in selected {
+                    let values = batches[batch_index]
+                        .column(column_index)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()?;
+                    let row = row as usize;
+                    output.push((!values.is_null(row)).then(|| values.value(row)));
+                }
+                Some(Arc::new(Int64Array::from(output)))
             }
-            Some(Arc::new(Int64Array::from(output)))
         }
         DataType::UInt64 => {
-            let mut output = Vec::with_capacity(selected.len());
-            for &(_, _, batch_index, row) in selected {
-                let values = batches[batch_index]
-                    .column(column_index)
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()?;
-                let row = row as usize;
-                output.push((!values.is_null(row)).then(|| values.value(row)));
+            if topk_selected_column_null_count(batches, column_index) == 0 {
+                let mut output = Vec::with_capacity(selected.len());
+                for &(_, _, batch_index, row) in selected {
+                    let values = batches[batch_index]
+                        .column(column_index)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()?;
+                    output.push(values.value(row as usize));
+                }
+                Some(Arc::new(UInt64Array::from(output)))
+            } else {
+                let mut output = Vec::with_capacity(selected.len());
+                for &(_, _, batch_index, row) in selected {
+                    let values = batches[batch_index]
+                        .column(column_index)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()?;
+                    let row = row as usize;
+                    output.push((!values.is_null(row)).then(|| values.value(row)));
+                }
+                Some(Arc::new(UInt64Array::from(output)))
             }
-            Some(Arc::new(UInt64Array::from(output)))
         }
         DataType::Float64 => {
-            let mut output = Vec::with_capacity(selected.len());
-            for &(_, _, batch_index, row) in selected {
-                let values = batches[batch_index]
-                    .column(column_index)
-                    .as_any()
-                    .downcast_ref::<Float64Array>()?;
-                let row = row as usize;
-                output.push((!values.is_null(row)).then(|| values.value(row)));
+            if topk_selected_column_null_count(batches, column_index) == 0 {
+                let mut output = Vec::with_capacity(selected.len());
+                for &(_, _, batch_index, row) in selected {
+                    let values = batches[batch_index]
+                        .column(column_index)
+                        .as_any()
+                        .downcast_ref::<Float64Array>()?;
+                    output.push(values.value(row as usize));
+                }
+                Some(Arc::new(Float64Array::from(output)))
+            } else {
+                let mut output = Vec::with_capacity(selected.len());
+                for &(_, _, batch_index, row) in selected {
+                    let values = batches[batch_index]
+                        .column(column_index)
+                        .as_any()
+                        .downcast_ref::<Float64Array>()?;
+                    let row = row as usize;
+                    output.push((!values.is_null(row)).then(|| values.value(row)));
+                }
+                Some(Arc::new(Float64Array::from(output)))
             }
-            Some(Arc::new(Float64Array::from(output)))
         }
         DataType::Date32 => {
-            let mut output = Vec::with_capacity(selected.len());
-            for &(_, _, batch_index, row) in selected {
-                let values = batches[batch_index]
-                    .column(column_index)
-                    .as_any()
-                    .downcast_ref::<Date32Array>()?;
-                let row = row as usize;
-                output.push((!values.is_null(row)).then(|| values.value(row)));
+            if topk_selected_column_null_count(batches, column_index) == 0 {
+                let mut output = Vec::with_capacity(selected.len());
+                for &(_, _, batch_index, row) in selected {
+                    let values = batches[batch_index]
+                        .column(column_index)
+                        .as_any()
+                        .downcast_ref::<Date32Array>()?;
+                    output.push(values.value(row as usize));
+                }
+                Some(Arc::new(Date32Array::from(output)))
+            } else {
+                let mut output = Vec::with_capacity(selected.len());
+                for &(_, _, batch_index, row) in selected {
+                    let values = batches[batch_index]
+                        .column(column_index)
+                        .as_any()
+                        .downcast_ref::<Date32Array>()?;
+                    let row = row as usize;
+                    output.push((!values.is_null(row)).then(|| values.value(row)));
+                }
+                Some(Arc::new(Date32Array::from(output)))
             }
-            Some(Arc::new(Date32Array::from(output)))
         }
         _ => None,
     }
+}
+
+fn topk_selected_column_null_count(batches: &[RecordBatch], column_index: usize) -> usize {
+    let mut null_count = 0usize;
+    for batch in batches {
+        null_count = null_count.saturating_add(batch.column(column_index).null_count());
+    }
+    null_count
 }
 
 fn topk_sort_key_type_supported(data_type: &DataType) -> bool {
@@ -1870,6 +4001,411 @@ async fn try_execute_same_source_union_all_scan(
     Ok(Some(batches))
 }
 
+async fn try_execute_same_source_union_all_filter_scan(
+    engine: &DodamEngine,
+    expr: &SetExpr,
+    batch_size: usize,
+) -> Result<Option<Vec<RecordBatch>>> {
+    let Some(shared) = plan_same_source_union_all_filter_scan(expr)? else {
+        return Ok(None);
+    };
+    let mut stream = engine
+        .scan_parquet_batches(
+            shared.path.clone(),
+            batch_size,
+            None,
+            shared.scan_projection.clone(),
+            Some(shared.prefilter.clone()),
+        )
+        .await?;
+    let mut output = Vec::new();
+    for batch in stream.by_ref() {
+        let batch = batch?;
+        append_same_source_union_all_filter_batches(&mut output, &batch, &shared)?;
+    }
+    Ok(Some(output))
+}
+
+async fn try_execute_same_source_union_distinct_scan(
+    engine: &DodamEngine,
+    expr: &SetExpr,
+    batch_size: usize,
+    order_by: Option<&SortKey>,
+    limit: Option<usize>,
+    offset: usize,
+) -> Result<Option<Vec<RecordBatch>>> {
+    let Some(shared) = plan_same_source_union_distinct_scan(expr)? else {
+        return Ok(None);
+    };
+    if let Some(batches) = try_execute_direct_distinct_scan(
+        engine,
+        DirectDistinctScan {
+            path: shared.path.clone(),
+            projection: shared.projection.clone(),
+            aliases: shared.aliases.clone(),
+            filter: Some(shared.filter.clone()),
+        },
+        batch_size,
+    )? {
+        return Ok(Some(batches));
+    }
+    let stream = engine
+        .scan_parquet_distinct_batches(
+            shared.path,
+            batch_size,
+            scan_limit_with_offset(limit, offset)?,
+            shared.projection,
+            Some(shared.filter),
+            order_by.cloned(),
+        )
+        .await?;
+    let batches = rename_output_batches(collect_batches(stream)?, &shared.aliases)?;
+    Ok(Some(batches))
+}
+
+#[derive(Clone)]
+struct DirectDistinctScan {
+    path: PathBuf,
+    projection: Projection,
+    aliases: Vec<(String, String)>,
+    filter: Option<FilterExpr>,
+}
+
+fn try_execute_direct_distinct_scan(
+    engine: &DodamEngine,
+    scan: DirectDistinctScan,
+    batch_size: usize,
+) -> Result<Option<Vec<RecordBatch>>> {
+    if let Some(batches) = try_execute_direct_distinct_single_i32_values(engine, &scan, batch_size)?
+    {
+        return Ok(Some(batches));
+    }
+    if let Some(batches) = try_execute_direct_distinct_i32_i64_pairs(engine, &scan, batch_size)? {
+        return Ok(Some(batches));
+    }
+    Ok(None)
+}
+
+fn try_execute_direct_distinct_single_i32_values(
+    engine: &DodamEngine,
+    scan: &DirectDistinctScan,
+    batch_size: usize,
+) -> Result<Option<Vec<RecordBatch>>> {
+    let Projection::Columns(columns) = &scan.projection else {
+        return Ok(None);
+    };
+    let [projected_column] = columns.as_slice() else {
+        return Ok(None);
+    };
+    let Some(filter) = scan.filter.as_ref() else {
+        return Ok(None);
+    };
+    let Expr::InList {
+        column,
+        values,
+        negated: false,
+        has_null: false,
+    } = filter.expr()
+    else {
+        return Ok(None);
+    };
+    if column != projected_column {
+        return Ok(None);
+    }
+    let candidates = values
+        .iter()
+        .map(|value| value.as_i32(column))
+        .collect::<Result<Vec<_>>>()?;
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let Some(column_types) =
+        engine.parquet_direct_primitive_column_types(&scan.path, std::slice::from_ref(column))?
+    else {
+        return Ok(None);
+    };
+    if !matches!(column_types.as_slice(), [DirectPrimitiveColumnType::I32]) {
+        return Ok(None);
+    }
+    let row_group_count = engine.parquet_row_group_count(&scan.path)?;
+    let row_groups = (0..row_group_count).collect::<Vec<_>>();
+    let Some((state, _metrics)) = engine.scan_parquet_primitive_columns_parallel_view_fold(
+        scan.path.clone(),
+        batch_size,
+        row_groups,
+        vec![(column.clone(), DirectPrimitiveColumnType::I32)],
+        || I32CandidatePresence::new(candidates.clone()),
+        |state, view| state.consume(view),
+        |state, partial| {
+            state.merge(partial);
+            Ok(())
+        },
+    )?
+    else {
+        return Ok(None);
+    };
+    if state.unsupported {
+        return Ok(None);
+    }
+    let mut output = Vec::with_capacity(state.candidates.len());
+    for (index, candidate) in state.candidates.iter().copied().enumerate() {
+        if state.found[index] {
+            output.push(candidate);
+        }
+    }
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        projected_column,
+        DataType::Int32,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(output))])?;
+    rename_output_batches(vec![batch], &scan.aliases).map(Some)
+}
+
+fn try_execute_direct_distinct_i32_i64_pairs(
+    engine: &DodamEngine,
+    scan: &DirectDistinctScan,
+    batch_size: usize,
+) -> Result<Option<Vec<RecordBatch>>> {
+    let Projection::Columns(columns) = &scan.projection else {
+        return Ok(None);
+    };
+    let [first_column, second_column] = columns.as_slice() else {
+        return Ok(None);
+    };
+    let Some(filter) = scan.filter.as_ref() else {
+        return Ok(None);
+    };
+    let Expr::InList {
+        column,
+        values,
+        negated: false,
+        has_null: false,
+    } = filter.expr()
+    else {
+        return Ok(None);
+    };
+    let Some(filter_index) = columns.iter().position(|candidate| candidate == column) else {
+        return Ok(None);
+    };
+    if filter_index != 0 {
+        return Ok(None);
+    }
+    let other_index = if filter_index == 0 { 1 } else { 0 };
+    let candidates = values
+        .iter()
+        .map(|value| value.as_i32(column))
+        .collect::<Result<Vec<_>>>()?;
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let Some(column_types) = engine.parquet_direct_primitive_column_types(&scan.path, columns)?
+    else {
+        return Ok(None);
+    };
+    if !matches!(
+        (column_types[filter_index], column_types[other_index]),
+        (
+            DirectPrimitiveColumnType::I32,
+            DirectPrimitiveColumnType::I64
+        )
+    ) {
+        return Ok(None);
+    }
+    let row_group_count = engine.parquet_row_group_count(&scan.path)?;
+    let row_groups = (0..row_group_count).collect::<Vec<_>>();
+    let Some((state, _metrics)) = engine.scan_parquet_primitive_columns_parallel_view_fold(
+        scan.path.clone(),
+        batch_size,
+        row_groups,
+        columns
+            .iter()
+            .zip(column_types.iter())
+            .map(|(name, column_type)| (name.clone(), *column_type))
+            .collect(),
+        || I32I64DistinctPairs::new(candidates.clone(), filter_index, other_index),
+        |state, view| state.consume(view),
+        |state, partial| {
+            state.merge(partial);
+            Ok(())
+        },
+    )?
+    else {
+        return Ok(None);
+    };
+    if state.unsupported {
+        return Ok(None);
+    }
+    let mut pairs = state.pairs.into_iter().collect::<Vec<_>>();
+    pairs.sort_unstable();
+    let first_values = pairs.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+    let second_values = pairs.iter().map(|(_, value)| *value).collect::<Vec<_>>();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(first_column, DataType::Int32, true),
+        Field::new(second_column, DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(first_values)),
+            Arc::new(Int64Array::from(second_values)),
+        ],
+    )?;
+    rename_output_batches(vec![batch], &scan.aliases).map(Some)
+}
+
+struct I32CandidatePresence {
+    candidates: Vec<i32>,
+    found: Vec<bool>,
+    unsupported: bool,
+}
+
+impl I32CandidatePresence {
+    fn new(candidates: Vec<i32>) -> Self {
+        let found = vec![false; candidates.len()];
+        Self {
+            candidates,
+            found,
+            unsupported: false,
+        }
+    }
+
+    fn consume(&mut self, view: BatchView<'_>) -> Result<()> {
+        let Some(values) = view
+            .i32_vector(0)
+            .and_then(|column| column.values_if_null_free())
+        else {
+            self.unsupported = true;
+            return Ok(());
+        };
+        match self.candidates.as_slice() {
+            [a] => {
+                for &value in values {
+                    if value == *a {
+                        self.found[0] = true;
+                    }
+                }
+            }
+            [a, b] => {
+                for &value in values {
+                    if value == *a {
+                        self.found[0] = true;
+                    } else if value == *b {
+                        self.found[1] = true;
+                    }
+                }
+            }
+            [a, b, c] => {
+                for &value in values {
+                    if value == *a {
+                        self.found[0] = true;
+                    } else if value == *b {
+                        self.found[1] = true;
+                    } else if value == *c {
+                        self.found[2] = true;
+                    }
+                }
+            }
+            candidates => {
+                for &value in values {
+                    if let Some(index) = candidates.iter().position(|candidate| *candidate == value)
+                    {
+                        self.found[index] = true;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn merge(&mut self, partial: Self) {
+        self.unsupported |= partial.unsupported;
+        for (found, partial_found) in self.found.iter_mut().zip(partial.found) {
+            *found |= partial_found;
+        }
+    }
+}
+
+struct I32I64DistinctPairs {
+    candidates: Vec<i32>,
+    filter_index: usize,
+    other_index: usize,
+    pairs: FastHashSet<(i32, i64)>,
+    unsupported: bool,
+}
+
+impl I32I64DistinctPairs {
+    fn new(candidates: Vec<i32>, filter_index: usize, other_index: usize) -> Self {
+        Self {
+            candidates,
+            filter_index,
+            other_index,
+            pairs: FastHashSet::default(),
+            unsupported: false,
+        }
+    }
+
+    fn consume(&mut self, view: BatchView<'_>) -> Result<()> {
+        let Some(keys) = view
+            .i32_vector(self.filter_index)
+            .and_then(|column| column.values_if_null_free())
+        else {
+            self.unsupported = true;
+            return Ok(());
+        };
+        let Some(values) = view
+            .i64_vector(self.other_index)
+            .and_then(|column| column.values_if_null_free())
+        else {
+            self.unsupported = true;
+            return Ok(());
+        };
+        if keys.len() != values.len() {
+            self.unsupported = true;
+            return Ok(());
+        }
+        match self.candidates.as_slice() {
+            [a] => {
+                for row in 0..keys.len() {
+                    if keys[row] == *a {
+                        self.pairs.insert((keys[row], values[row]));
+                    }
+                }
+            }
+            [a, b] => {
+                for row in 0..keys.len() {
+                    let key = keys[row];
+                    if key == *a || key == *b {
+                        self.pairs.insert((key, values[row]));
+                    }
+                }
+            }
+            [a, b, c] => {
+                for row in 0..keys.len() {
+                    let key = keys[row];
+                    if key == *a || key == *b || key == *c {
+                        self.pairs.insert((key, values[row]));
+                    }
+                }
+            }
+            candidates => {
+                for row in 0..keys.len() {
+                    let key = keys[row];
+                    if candidates.contains(&key) {
+                        self.pairs.insert((key, values[row]));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn merge(&mut self, partial: Self) {
+        self.unsupported |= partial.unsupported;
+        self.pairs.extend(partial.pairs);
+    }
+}
+
 fn plan_same_source_union_all_scan(expr: &SetExpr) -> Result<Option<SameSourceUnionAllScan>> {
     let mut operands = Vec::new();
     if !collect_union_all_operand_queries(expr, &mut operands)? || operands.len() < 2 {
@@ -1881,11 +4417,79 @@ fn plan_same_source_union_all_scan(expr: &SetExpr) -> Result<Option<SameSourceUn
     Ok(Some(shared))
 }
 
+fn plan_same_source_union_all_filter_scan(
+    expr: &SetExpr,
+) -> Result<Option<SameSourceUnionAllFilterScan>> {
+    let mut operands = Vec::new();
+    if !collect_union_all_operand_queries(expr, &mut operands)? || operands.len() < 2 {
+        return Ok(None);
+    }
+    Ok(same_source_union_all_filter_scan_plan(&operands))
+}
+
+fn plan_same_source_union_distinct_scan(expr: &SetExpr) -> Result<Option<SameSourceUnionAllScan>> {
+    let mut operands = Vec::new();
+    if !collect_union_distinct_operand_queries(expr, &mut operands)? || operands.len() < 2 {
+        return Ok(None);
+    }
+    let Some(shared) = same_source_union_distinct_plan(&operands) else {
+        return Ok(None);
+    };
+    Ok(Some(shared))
+}
+
 struct SameSourceUnionAllScan {
     path: PathBuf,
     projection: Projection,
     aliases: Vec<(String, String)>,
     filter: FilterExpr,
+}
+
+struct SameSourceUnionAllFilterScan {
+    path: PathBuf,
+    projection: Projection,
+    scan_projection: Projection,
+    aliases: Vec<(String, String)>,
+    filters: Vec<FilterExpr>,
+    prefilter: FilterExpr,
+}
+
+fn collect_union_distinct_operand_queries(
+    expr: &SetExpr,
+    output: &mut Vec<SqlQuery>,
+) -> Result<bool> {
+    match expr {
+        SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } if *op == SetOperator::Union && union_quantifier_is_distinct(*set_quantifier) => Ok(
+            collect_union_distinct_operand_queries(left.as_ref(), output)?
+                && collect_union_distinct_operand_queries(right.as_ref(), output)?,
+        ),
+        SetExpr::SetOperation { .. } => Ok(false),
+        SetExpr::Query(query) => {
+            if query_contains_set_operation(query.body.as_ref()) {
+                return collect_union_distinct_operand_queries(query.body.as_ref(), output);
+            }
+            if query.order_by.is_some()
+                || query.limit_clause.is_some()
+                || parse_offset(query)? != 0
+                || query.fetch.is_some()
+                || !query.locks.is_empty()
+            {
+                return Ok(false);
+            }
+            output.push(parse_sql(&query.to_string())?);
+            Ok(true)
+        }
+        SetExpr::Select(_) => {
+            output.push(parse_sql(&expr.to_string())?);
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 fn collect_union_all_operand_queries(expr: &SetExpr, output: &mut Vec<SqlQuery>) -> Result<bool> {
@@ -1923,13 +4527,14 @@ fn collect_union_all_operand_queries(expr: &SetExpr, output: &mut Vec<SqlQuery>)
     }
 }
 
-fn same_source_disjoint_union_all_plan(operands: &[SqlQuery]) -> Option<SameSourceUnionAllScan> {
+fn same_source_union_distinct_plan(operands: &[SqlQuery]) -> Option<SameSourceUnionAllScan> {
     let first = operands.first()?;
     if !same_source_union_all_operand_supported(first) {
         return None;
     }
-    let (equality_column, first_value) = equality_literal_filter(first.filter.as_ref()?)?;
-    let mut values = vec![first_value];
+    let (filter_column, first_values) = positive_literal_filter_values(first.filter.as_ref()?)?;
+    let mut values = Vec::new();
+    append_unique_literal_values(&mut values, first_values);
     for operand in operands.iter().skip(1) {
         if !same_source_union_all_operand_supported(operand)
             || operand.path != first.path
@@ -1938,23 +4543,142 @@ fn same_source_disjoint_union_all_plan(operands: &[SqlQuery]) -> Option<SameSour
         {
             return None;
         }
-        let (column, value) = equality_literal_filter(operand.filter.as_ref()?)?;
-        if column != equality_column || values.iter().any(|existing| existing == &value) {
+        let (column, operand_values) = positive_literal_filter_values(operand.filter.as_ref()?)?;
+        if column != filter_column {
             return None;
         }
-        values.push(value);
+        append_unique_literal_values(&mut values, operand_values);
     }
     Some(SameSourceUnionAllScan {
         path: first.path.clone(),
         projection: first.projection.clone(),
         aliases: first.aliases.clone(),
         filter: FilterExpr::new(Expr::InList {
-            column: equality_column,
+            column: filter_column,
             values,
             negated: false,
             has_null: false,
         }),
     })
+}
+
+fn same_source_union_all_filter_scan_plan(
+    operands: &[SqlQuery],
+) -> Option<SameSourceUnionAllFilterScan> {
+    let first = operands.first()?;
+    if !same_source_union_all_operand_supported(first) {
+        return None;
+    }
+    let mut filters = Vec::with_capacity(operands.len());
+    for operand in operands {
+        if !same_source_union_all_operand_supported(operand)
+            || operand.path != first.path
+            || operand.projection != first.projection
+            || operand.aliases != first.aliases
+        {
+            return None;
+        }
+        filters.push(operand.filter.clone()?);
+    }
+    let prefilter = union_filter_or(filters.iter().map(|filter| filter.expr().clone()))?;
+    let mut scan_projection = first.projection.clone();
+    for filter in &filters {
+        add_projection_columns(&mut scan_projection, filter.referenced_columns());
+    }
+    Some(SameSourceUnionAllFilterScan {
+        path: first.path.clone(),
+        projection: first.projection.clone(),
+        scan_projection,
+        aliases: first.aliases.clone(),
+        filters,
+        prefilter,
+    })
+}
+
+fn same_source_disjoint_union_all_plan(operands: &[SqlQuery]) -> Option<SameSourceUnionAllScan> {
+    let first = operands.first()?;
+    if !same_source_union_all_operand_supported(first) {
+        return None;
+    }
+    let (filter_column, first_values) = positive_literal_filter_values(first.filter.as_ref()?)?;
+    let mut values = Vec::new();
+    append_disjoint_literal_values(&mut values, first_values)?;
+    for operand in operands.iter().skip(1) {
+        if !same_source_union_all_operand_supported(operand)
+            || operand.path != first.path
+            || operand.projection != first.projection
+            || operand.aliases != first.aliases
+        {
+            return None;
+        }
+        let (column, operand_values) = positive_literal_filter_values(operand.filter.as_ref()?)?;
+        if column != filter_column {
+            return None;
+        }
+        append_disjoint_literal_values(&mut values, operand_values)?;
+    }
+    Some(SameSourceUnionAllScan {
+        path: first.path.clone(),
+        projection: first.projection.clone(),
+        aliases: first.aliases.clone(),
+        filter: FilterExpr::new(Expr::InList {
+            column: filter_column,
+            values,
+            negated: false,
+            has_null: false,
+        }),
+    })
+}
+
+fn union_filter_or(filters: impl IntoIterator<Item = Expr>) -> Option<FilterExpr> {
+    filters
+        .into_iter()
+        .reduce(|left, right| Expr::Or(Box::new(left), Box::new(right)))
+        .map(FilterExpr::new)
+}
+
+fn positive_literal_filter_values(filter: &FilterExpr) -> Option<(String, Vec<LiteralValue>)> {
+    match filter.expr() {
+        Expr::Comparison(comparison)
+            if comparison.op == ComparisonOp::Eq
+                && !matches!(comparison.value, LiteralValue::Null) =>
+        {
+            Some((comparison.column.clone(), vec![comparison.value.clone()]))
+        }
+        Expr::InList {
+            column,
+            values,
+            negated: false,
+            has_null: false,
+        } if values
+            .iter()
+            .all(|value| !matches!(value, LiteralValue::Null)) =>
+        {
+            Some((column.clone(), values.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn append_unique_literal_values(output: &mut Vec<LiteralValue>, values: Vec<LiteralValue>) {
+    for value in values {
+        if !output.iter().any(|existing| existing == &value) {
+            output.push(value);
+        }
+    }
+}
+
+fn append_disjoint_literal_values(
+    output: &mut Vec<LiteralValue>,
+    values: Vec<LiteralValue>,
+) -> Option<()> {
+    for value in values {
+        if output.iter().any(|existing| existing == &value) {
+            return None;
+        }
+        output.push(value);
+    }
+    Some(())
 }
 
 fn same_source_union_all_operand_supported(query: &SqlQuery) -> bool {
@@ -1978,18 +4702,6 @@ fn projection_expressions_are_plain_columns(expressions: &[ProjectionExpression]
         .all(|expression| matches!(expression.expr, ScalarSqlExpression::Column(_)))
 }
 
-fn equality_literal_filter(filter: &FilterExpr) -> Option<(String, LiteralValue)> {
-    match filter.expr() {
-        Expr::Comparison(comparison)
-            if comparison.op == ComparisonOp::Eq
-                && !matches!(comparison.value, LiteralValue::Null) =>
-        {
-            Some((comparison.column.clone(), comparison.value.clone()))
-        }
-        _ => None,
-    }
-}
-
 fn query_contains_set_operation(expr: &SetExpr) -> bool {
     match expr {
         SetExpr::SetOperation { .. } => true,
@@ -1998,11 +4710,12 @@ fn query_contains_set_operation(expr: &SetExpr) -> bool {
     }
 }
 
-async fn execute_union_all_set_expr(
+async fn execute_union_set_expr(
     engine: &DodamEngine,
     expr: &SetExpr,
     batch_size: usize,
     child_topk: Option<(&SortKey, usize)>,
+    child_distinct: bool,
 ) -> Result<Vec<RecordBatch>> {
     match expr {
         SetExpr::SetOperation {
@@ -2010,22 +4723,28 @@ async fn execute_union_all_set_expr(
             set_quantifier,
             left,
             right,
-        } if *op == SetOperator::Union && *set_quantifier == SetQuantifier::All => {
-            let mut left_batches = Box::pin(execute_union_all_set_expr(
+        } if *op == SetOperator::Union => {
+            let distinct = union_quantifier_is_distinct(*set_quantifier);
+            let mut left_batches = Box::pin(execute_union_set_expr(
                 engine,
                 left.as_ref(),
                 batch_size,
-                child_topk,
+                union_child_topk_for_quantifier(*set_quantifier, child_topk),
+                child_distinct || distinct,
             ))
             .await?;
-            let right_batches = Box::pin(execute_union_all_set_expr(
+            let right_batches = Box::pin(execute_union_set_expr(
                 engine,
                 right.as_ref(),
                 batch_size,
-                child_topk,
+                union_child_topk_for_quantifier(*set_quantifier, child_topk),
+                child_distinct || distinct,
             ))
             .await?;
             append_union_all_batches(&mut left_batches, right_batches)?;
+            if distinct {
+                left_batches = apply_output_distinct(left_batches, true)?;
+            }
             Ok(left_batches)
         }
         SetExpr::SetOperation {
@@ -2035,11 +4754,12 @@ async fn execute_union_all_set_expr(
         ))),
         SetExpr::Query(query) => {
             if query_contains_set_operation(query.body.as_ref()) {
-                return Box::pin(execute_union_all_set_expr(
+                return Box::pin(execute_union_set_expr(
                     engine,
                     query.body.as_ref(),
                     batch_size,
                     child_topk,
+                    child_distinct,
                 ))
                 .await;
             }
@@ -2049,20 +4769,42 @@ async fn execute_union_all_set_expr(
                 || !query.locks.is_empty()
             {
                 return Err(DodamError::UnsupportedSql(
-                    "ORDER BY, LIMIT, FETCH, and locking clauses inside UNION ALL operands are not supported yet"
+                    "ORDER BY, LIMIT, FETCH, and locking clauses inside UNION operands are not supported yet"
                         .to_string(),
                 ));
             }
             let sql = union_all_operand_sql_with_child_topk(&query.to_string(), child_topk);
-            query_output_batches(Box::pin(execute_sql(engine, &sql, batch_size)).await?)
+            let batches =
+                query_output_batches(Box::pin(execute_sql(engine, &sql, batch_size)).await?)?;
+            apply_output_distinct(batches, child_distinct)
         }
         SetExpr::Select(_) => {
             let sql = union_all_operand_sql_with_child_topk(&expr.to_string(), child_topk);
-            query_output_batches(Box::pin(execute_sql(engine, &sql, batch_size)).await?)
+            let batches =
+                query_output_batches(Box::pin(execute_sql(engine, &sql, batch_size)).await?)?;
+            apply_output_distinct(batches, child_distinct)
         }
         other => Err(DodamError::UnsupportedSql(format!(
-            "unsupported UNION ALL operand: {other}"
+            "unsupported UNION operand: {other}"
         ))),
+    }
+}
+
+fn union_quantifier_is_distinct(set_quantifier: SetQuantifier) -> bool {
+    matches!(
+        set_quantifier,
+        SetQuantifier::None | SetQuantifier::Distinct
+    )
+}
+
+fn union_child_topk_for_quantifier<'a>(
+    set_quantifier: SetQuantifier,
+    child_topk: Option<(&'a SortKey, usize)>,
+) -> Option<(&'a SortKey, usize)> {
+    if set_quantifier == SetQuantifier::All {
+        child_topk
+    } else {
+        None
     }
 }
 
@@ -4489,6 +7231,13 @@ async fn split_subquery_and_expression_filters(
         if predicate_requires_expression_path(&conjunct)
             && !expr_contains_materializable_subquery(&conjunct)
         {
+            if let Some(filter) = safe_expression_pushdown_filter(
+                &conjunct,
+                table_alias,
+                PredicateParserKind::Single,
+            )? {
+                filters.push(filter.expr().clone());
+            }
             expression_filters.push(conjunct);
             continue;
         }
@@ -4506,6 +7255,290 @@ async fn split_subquery_and_expression_filters(
         }
     }
     Ok((combine_expr_filters(filters), expression_filters))
+}
+
+#[derive(Clone, Copy)]
+enum PredicateParserKind<'a> {
+    Single,
+    Join(&'a [&'a str]),
+}
+
+fn safe_expression_pushdown_filter(
+    expr: &SqlExpr,
+    table_alias: Option<&str>,
+    parser_kind: PredicateParserKind,
+) -> Result<Option<FilterExpr>> {
+    let filter = match expr {
+        SqlExpr::Nested(expr) => safe_expression_pushdown_filter(expr, table_alias, parser_kind)?,
+        SqlExpr::UnaryOp { op, .. } if *op == UnaryOperator::Not => None,
+        SqlExpr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
+            combine_filter_options(
+                safe_expression_pushdown_filter(left, table_alias, parser_kind)?,
+                safe_expression_pushdown_filter(right, table_alias, parser_kind)?,
+            )
+        }
+        SqlExpr::BinaryOp { left, op, right } if *op == BinaryOperator::Or => {
+            let Some(left) = safe_expression_pushdown_filter(left, table_alias, parser_kind)?
+            else {
+                return Ok(None);
+            };
+            let Some(right) = safe_expression_pushdown_filter(right, table_alias, parser_kind)?
+            else {
+                return Ok(None);
+            };
+            Some(FilterExpr::new(Expr::Or(
+                Box::new(left.expr().clone()),
+                Box::new(right.expr().clone()),
+            )))
+        }
+        SqlExpr::BinaryOp { left, op, right }
+            if matches!(
+                op,
+                BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+            ) =>
+        {
+            safe_expression_comparison_pushdown(left, op, right, table_alias, parser_kind)?
+        }
+        SqlExpr::InList {
+            expr,
+            list,
+            negated,
+        } => safe_expression_in_list_pushdown(expr, list, *negated, table_alias, parser_kind)?,
+        SqlExpr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => safe_expression_between_pushdown(expr, *negated, low, high, table_alias, parser_kind)?,
+        SqlExpr::IsNull(expr) => {
+            safe_expression_null_pushdown(expr, false, table_alias, parser_kind)?
+        }
+        SqlExpr::IsNotNull(expr) => {
+            safe_expression_null_pushdown(expr, true, table_alias, parser_kind)?
+        }
+        SqlExpr::Like {
+            expr,
+            pattern,
+            negated,
+            any,
+            escape_char,
+        } => safe_expression_like_pushdown(
+            expr,
+            pattern,
+            *negated,
+            *any,
+            escape_char,
+            table_alias,
+            parser_kind,
+        )?,
+        _ => None,
+    };
+    Ok(filter)
+}
+
+fn safe_expression_between_pushdown(
+    expr: &SqlExpr,
+    negated: bool,
+    low: &SqlExpr,
+    high: &SqlExpr,
+    table_alias: Option<&str>,
+    parser_kind: PredicateParserKind,
+) -> Result<Option<FilterExpr>> {
+    let Some(column) = simple_column_wrapped_expression(expr, table_alias, parser_kind)? else {
+        return Ok(None);
+    };
+    let low = sql_literal_value(low)?;
+    let high = sql_literal_value(high)?;
+    let lower = Expr::Comparison(ComparisonExpr {
+        column: column.clone(),
+        op: if negated {
+            ComparisonOp::Lt
+        } else {
+            ComparisonOp::GtEq
+        },
+        value: low,
+    });
+    let upper = Expr::Comparison(ComparisonExpr {
+        column,
+        op: if negated {
+            ComparisonOp::Gt
+        } else {
+            ComparisonOp::LtEq
+        },
+        value: high,
+    });
+    Ok(Some(FilterExpr::new(if negated {
+        Expr::Or(Box::new(lower), Box::new(upper))
+    } else {
+        Expr::And(Box::new(lower), Box::new(upper))
+    })))
+}
+
+fn safe_expression_comparison_pushdown(
+    left: &SqlExpr,
+    op: &BinaryOperator,
+    right: &SqlExpr,
+    table_alias: Option<&str>,
+    parser_kind: PredicateParserKind,
+) -> Result<Option<FilterExpr>> {
+    if let Some(filter) =
+        safe_column_wrapper_comparison_pushdown(left, op, right, table_alias, parser_kind)?
+    {
+        return Ok(Some(filter));
+    }
+    safe_column_wrapper_comparison_pushdown(
+        right,
+        &reverse_binary_operator(op),
+        left,
+        table_alias,
+        parser_kind,
+    )
+}
+
+fn safe_expression_in_list_pushdown(
+    expr: &SqlExpr,
+    list: &[SqlExpr],
+    negated: bool,
+    table_alias: Option<&str>,
+    parser_kind: PredicateParserKind,
+) -> Result<Option<FilterExpr>> {
+    if negated {
+        return Ok(None);
+    }
+    let Some(column) = simple_column_wrapped_expression(expr, table_alias, parser_kind)? else {
+        return Ok(None);
+    };
+    let values = non_null_literal_values(list)?;
+    if values.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(FilterExpr::new(Expr::InList {
+        column,
+        values,
+        negated: false,
+        has_null: literal_list_contains_null(list)?,
+    })))
+}
+
+fn safe_expression_null_pushdown(
+    expr: &SqlExpr,
+    negated: bool,
+    table_alias: Option<&str>,
+    parser_kind: PredicateParserKind,
+) -> Result<Option<FilterExpr>> {
+    let Some(column) = simple_column_wrapped_expression(expr, table_alias, parser_kind)? else {
+        return Ok(None);
+    };
+    Ok(Some(FilterExpr::new(Expr::IsNull { column, negated })))
+}
+
+fn safe_expression_like_pushdown(
+    expr: &SqlExpr,
+    pattern: &SqlExpr,
+    negated: bool,
+    any: bool,
+    escape_char: &Option<sqlparser::ast::ValueWithSpan>,
+    table_alias: Option<&str>,
+    parser_kind: PredicateParserKind,
+) -> Result<Option<FilterExpr>> {
+    if any {
+        return Ok(None);
+    }
+    let Some(column) = simple_column_wrapped_expression(expr, table_alias, parser_kind)? else {
+        return Ok(None);
+    };
+    Ok(Some(FilterExpr::new(Expr::Like {
+        column,
+        pattern: sql_like_pattern(pattern)?,
+        negated,
+        escape: sql_like_escape(escape_char)?,
+    })))
+}
+
+fn safe_column_wrapper_comparison_pushdown(
+    expr: &SqlExpr,
+    op: &BinaryOperator,
+    literal_expr: &SqlExpr,
+    table_alias: Option<&str>,
+    parser_kind: PredicateParserKind,
+) -> Result<Option<FilterExpr>> {
+    let Ok(literal) = sql_literal_value(literal_expr) else {
+        return Ok(None);
+    };
+    if let Some(column) = simple_column_wrapped_expression(expr, table_alias, parser_kind)? {
+        return Ok(Some(FilterExpr::new(Expr::Comparison(ComparisonExpr {
+            column,
+            op: sql_comparison_op(op),
+            value: literal,
+        }))));
+    }
+    coalesce_comparison_pushdown(expr, op, &literal, table_alias, parser_kind)
+}
+
+fn simple_column_wrapped_expression(
+    expr: &SqlExpr,
+    table_alias: Option<&str>,
+    parser_kind: PredicateParserKind,
+) -> Result<Option<String>> {
+    match parse_predicate_scalar_expr(expr, table_alias, parser_kind)? {
+        ScalarSqlExpression::Column(column) => Ok(Some(column)),
+        _ => Ok(None),
+    }
+}
+
+fn coalesce_comparison_pushdown(
+    expr: &SqlExpr,
+    op: &BinaryOperator,
+    literal: &LiteralValue,
+    table_alias: Option<&str>,
+    parser_kind: PredicateParserKind,
+) -> Result<Option<FilterExpr>> {
+    let ScalarSqlExpression::Coalesce(values) =
+        parse_predicate_scalar_expr(expr, table_alias, parser_kind)?
+    else {
+        return Ok(None);
+    };
+    let [
+        ScalarSqlExpression::Column(column),
+        ScalarSqlExpression::Literal(fallback),
+    ] = values.as_slice()
+    else {
+        return Ok(None);
+    };
+    let column_filter = Expr::Comparison(ComparisonExpr {
+        column: column.clone(),
+        op: sql_comparison_op(op),
+        value: literal.clone(),
+    });
+    if compare_literal_values(fallback, op, literal)? == Some(true) {
+        Ok(Some(FilterExpr::new(Expr::Or(
+            Box::new(column_filter),
+            Box::new(Expr::IsNull {
+                column: column.clone(),
+                negated: false,
+            }),
+        ))))
+    } else {
+        Ok(Some(FilterExpr::new(column_filter)))
+    }
+}
+
+fn parse_predicate_scalar_expr(
+    expr: &SqlExpr,
+    table_alias: Option<&str>,
+    parser_kind: PredicateParserKind,
+) -> Result<ScalarSqlExpression> {
+    match parser_kind {
+        PredicateParserKind::Single => parse_scalar_sql_expression(expr, table_alias),
+        PredicateParserKind::Join(table_aliases) => {
+            parse_join_scalar_sql_expression(expr, table_aliases)
+        }
+    }
 }
 
 async fn try_execute_projection_expression_sql(
@@ -4539,10 +7572,30 @@ async fn try_execute_projection_expression_sql(
     let parsed_projection = parse_projection(select, &group_by, path.alias.as_deref())?;
     let projection_requires_expression =
         projection_requires_expression_path(&parsed_projection.expressions);
-    let filter_requires_expression = select
-        .selection
-        .as_ref()
-        .is_some_and(predicate_requires_expression_path);
+    let (filter, expression_filters) = if let Some(selection) = select.selection.as_ref() {
+        if predicate_requires_expression_path(selection) {
+            split_subquery_and_expression_filters(
+                engine,
+                selection,
+                path.alias.as_deref(),
+                batch_size,
+            )
+            .await?
+        } else {
+            (
+                Some(parse_filter(
+                    selection,
+                    &parsed_projection.aliases,
+                    path.alias.as_deref(),
+                    false,
+                )?),
+                Vec::new(),
+            )
+        }
+    } else {
+        (None, Vec::new())
+    };
+    let filter_requires_expression = !expression_filters.is_empty();
     if !projection_requires_expression && !filter_requires_expression {
         return Ok(None);
     }
@@ -4591,22 +7644,6 @@ async fn try_execute_projection_expression_sql(
         return Ok(Some(QueryOutput::Aggregate { metrics, batches }));
     }
 
-    let filter = if filter_requires_expression {
-        None
-    } else {
-        select
-            .selection
-            .as_ref()
-            .map(|expr| {
-                parse_filter(
-                    expr,
-                    &parsed_projection.aliases,
-                    path.alias.as_deref(),
-                    false,
-                )
-            })
-            .transpose()?
-    };
     let order_by = parse_order_by(
         query,
         &parsed_projection.aliases,
@@ -4615,10 +7652,10 @@ async fn try_execute_projection_expression_sql(
     )?;
     let limit = parse_limit(query)?;
     let mut scan_projection = parsed_projection.projection.clone();
-    if filter_requires_expression && let Some(selection) = select.selection.as_ref() {
+    for expression_filter in &expression_filters {
         add_projection_columns(
             &mut scan_projection,
-            predicate_expression_columns(selection, path.alias.as_deref())?,
+            predicate_expression_columns(expression_filter, path.alias.as_deref())?,
         );
     }
     if let Some(order_by) = order_by.as_ref() {
@@ -4647,8 +7684,11 @@ async fn try_execute_projection_expression_sql(
         batches = apply_output_order_limit(batches, order_by.as_ref(), limit, 0)?;
         return Ok(Some(QueryOutput::Scan { batches }));
     }
-    let (stream, expression_filter_stream_limited) = if filter_requires_expression {
-        if let (Some(selection), Some(limit)) = (select.selection.as_ref(), limit) {
+    let expression_selection = combine_sql_and_conjuncts(expression_filters.clone());
+    let (stream, expression_filter_stream_limited) = if let Some(selection) =
+        expression_selection.as_ref()
+    {
+        if let Some(limit) = limit {
             let auto_exact_monotonic_order_column =
                 expression_filter_exact_monotonic_stream_limit_auto_enabled()
                     .then(|| monotonic_stream_limit_column(order_by.as_ref()))
@@ -4686,11 +7726,11 @@ async fn try_execute_projection_expression_sql(
                 };
                 let stream = if use_monotonic_stream {
                     engine
-                        .scan_parquet_batches(path.path, batch_size, None, scan_projection, None)
+                        .scan_parquet_batches(path.path, batch_size, None, scan_projection, filter)
                         .await?
                 } else if auto_exact_monotonic_order_column.is_some() {
                     engine
-                        .scan_parquet_batches(path.path, batch_size, None, scan_projection, None)
+                        .scan_parquet_batches(path.path, batch_size, None, scan_projection, filter)
                         .await?
                 } else if let Some(order_by) = order_by.clone() {
                     engine
@@ -4699,13 +7739,13 @@ async fn try_execute_projection_expression_sql(
                             batch_size,
                             None,
                             scan_projection,
-                            None,
+                            filter,
                             order_by,
                         )
                         .await?
                 } else {
                     engine
-                        .scan_parquet_batches(path.path, batch_size, None, scan_projection, None)
+                        .scan_parquet_batches(path.path, batch_size, None, scan_projection, filter)
                         .await?
                 };
                 if use_monotonic_stream || auto_exact_monotonic_order_column.is_none() {
@@ -4722,7 +7762,7 @@ async fn try_execute_projection_expression_sql(
             } else {
                 (
                     engine
-                        .scan_parquet_batches(path.path, batch_size, None, scan_projection, None)
+                        .scan_parquet_batches(path.path, batch_size, None, scan_projection, filter)
                         .await?,
                     false,
                 )
@@ -4730,7 +7770,7 @@ async fn try_execute_projection_expression_sql(
         } else {
             (
                 engine
-                    .scan_parquet_batches(path.path, batch_size, None, scan_projection, None)
+                    .scan_parquet_batches(path.path, batch_size, None, scan_projection, filter)
                     .await?,
                 false,
             )
@@ -4758,9 +7798,9 @@ async fn try_execute_projection_expression_sql(
         )
     };
     let mut batches = collect_batches(stream)?;
-    if filter_requires_expression
+    if !expression_filters.is_empty()
         && !expression_filter_stream_limited
-        && let Some(selection) = select.selection.as_ref()
+        && let Some(selection) = expression_selection.as_ref()
     {
         batches = apply_output_expression_filter(batches, selection, path.alias.as_deref())?;
         batches = apply_output_order_limit(batches, order_by.as_ref(), limit, 0)?;
@@ -4800,7 +7840,8 @@ async fn try_late_materialized_projection_expression(
             LateMaterializationPolicy::selective_with_selector_run_ratio(
                 late_projection_max_selected_ratio(),
                 late_projection_max_selector_run_ratio(),
-            ),
+            )
+            .with_io_cost_gate(late_projection_io_cost_gate_enabled()),
             Vec::<RecordBatch>::new,
             {
                 let filter = filter.clone();
@@ -4811,14 +7852,15 @@ async fn try_late_materialized_projection_expression(
                     {
                         mask
                     } else {
+                        if !expression_aggregate_row_at_time_fallback_enabled() {
+                            return Ok(None);
+                        }
                         let Some(batch) = view.try_record_batch() else {
                             return Ok(None);
                         };
                         evaluate_filter_mask(batch, &filter)?
                     };
-                    selection.push_selected_rows(mask.len(), |row| {
-                        mask.is_valid(row) && mask.value(row)
-                    });
+                    push_boolean_mask_selection(&mask, selection);
                     Ok(Some(()))
                 }
             },
@@ -4882,6 +7924,11 @@ fn late_projection_max_selector_run_ratio() -> f64 {
         .unwrap_or(0.25)
 }
 
+fn late_projection_io_cost_gate_enabled() -> bool {
+    !std::env::var("DODAM_DISABLE_LATE_PROJECTION_IO_COST_GATE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
 fn expression_filter_stream_limit_enabled() -> bool {
     std::env::var("DODAM_ENABLE_EXPRESSION_FILTER_STREAM_LIMIT")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
@@ -4909,6 +7956,11 @@ fn monotonic_stream_limit_column(order_by: Option<&SortKey>) -> Option<String> {
     (!sort.descending && !sort.nulls_first).then(|| sort.column.clone())
 }
 
+fn monotonic_order_limit_scan_enabled() -> bool {
+    !std::env::var("DODAM_DISABLE_MONOTONIC_ORDER_LIMIT_SCAN")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
 fn projection_requires_expression_path(expressions: &[ProjectionExpression]) -> bool {
     expressions
         .iter()
@@ -4926,17 +7978,7 @@ fn predicate_requires_expression_path(expr: &SqlExpr) -> bool {
             predicate_requires_expression_path(expr)
         }
         SqlExpr::Nested(expr) => predicate_requires_expression_path(expr),
-        SqlExpr::BinaryOp { left, op, right }
-            if matches!(
-                op,
-                BinaryOperator::Eq
-                    | BinaryOperator::NotEq
-                    | BinaryOperator::Gt
-                    | BinaryOperator::GtEq
-                    | BinaryOperator::Lt
-                    | BinaryOperator::LtEq
-            ) =>
-        {
+        SqlExpr::BinaryOp { left, right, .. } => {
             scalar_predicate_side_requires_expression(left)
                 || scalar_predicate_side_requires_expression(right)
         }
@@ -4947,6 +7989,17 @@ fn predicate_requires_expression_path(expr: &SqlExpr) -> bool {
             scalar_predicate_side_requires_expression(expr)
                 || list.iter().any(scalar_predicate_side_requires_expression)
         }
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            scalar_predicate_side_requires_expression(expr)
+                || scalar_predicate_side_requires_expression(low)
+                || scalar_predicate_side_requires_expression(high)
+        }
+        SqlExpr::Like { expr, pattern, .. } => {
+            scalar_predicate_side_requires_expression(expr)
+                || scalar_predicate_side_requires_expression(pattern)
+        }
         _ => false,
     }
 }
@@ -4955,6 +8008,11 @@ fn scalar_predicate_side_requires_expression(expr: &SqlExpr) -> bool {
     match expr {
         SqlExpr::Identifier(_) => false,
         SqlExpr::CompoundIdentifier(parts) => parts.len() > 1,
+        SqlExpr::Function(_)
+        | SqlExpr::Substring { .. }
+        | SqlExpr::Cast { .. }
+        | SqlExpr::Case { .. }
+        | SqlExpr::CompoundFieldAccess { .. } => true,
         _ => sql_literal_value(expr).is_err(),
     }
 }
@@ -14252,6 +17310,63 @@ fn q12_pending_increment(pending: &mut Q12PendingMap, orderkey: i64, mode_index:
     pending.entry(orderkey).or_default().counts[mode_index] += 1;
 }
 
+struct Q12PendingRunAccumulator<'a> {
+    pending: &'a mut Q12PendingMap,
+    current_key: Option<i64>,
+    counts: [u64; 2],
+    combine_runs: bool,
+}
+
+impl<'a> Q12PendingRunAccumulator<'a> {
+    fn new(pending: &'a mut Q12PendingMap) -> Self {
+        Self {
+            pending,
+            current_key: None,
+            counts: [0, 0],
+            combine_runs: q12_pending_run_accumulator_enabled(),
+        }
+    }
+
+    #[inline(always)]
+    fn increment(&mut self, orderkey: i64, mode_index: usize) {
+        if !self.combine_runs {
+            q12_pending_increment(self.pending, orderkey, mode_index);
+            return;
+        }
+        if self.current_key == Some(orderkey) {
+            self.counts[mode_index] += 1;
+            return;
+        }
+        self.flush();
+        self.current_key = Some(orderkey);
+        self.counts = [0, 0];
+        self.counts[mode_index] = 1;
+    }
+
+    #[inline(always)]
+    fn flush(&mut self) {
+        if !self.combine_runs {
+            return;
+        }
+        let Some(orderkey) = self.current_key.take() else {
+            return;
+        };
+        let counts = self.counts;
+        if counts[0] != 0 || counts[1] != 0 {
+            q12_pending_add_order(self.pending, orderkey, Q12PendingOrder { counts });
+        }
+    }
+
+    fn finish(mut self) {
+        self.flush();
+    }
+}
+
+fn q12_pending_run_accumulator_enabled() -> bool {
+    std::env::var("DODAM_Q12_ENABLE_PENDING_RUN_ACCUMULATOR")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
 #[inline(always)]
 fn q12_pending_add_order(pending: &mut Q12PendingMap, orderkey: i64, order: Q12PendingOrder) {
     if let Some(target) = pending.get_mut(&orderkey) {
@@ -14344,6 +17459,57 @@ async fn q12_filtered_lineitem_counts(
         )
         .await;
     }
+    if q12_direct_lineitem_selected_payload_enabled()
+        && let Some(pending) = q12_filtered_lineitem_counts_direct_selected_payload(
+            engine,
+            path.clone(),
+            shipmodes.clone(),
+            start_days,
+            end_days,
+        )
+        .await?
+    {
+        return Ok(pending);
+    }
+    if q12_direct_lineitem_raw_enabled()
+        && let Some(pending) = q12_filtered_lineitem_counts_direct_raw(
+            engine,
+            path.clone(),
+            batch_size,
+            shipmodes.clone(),
+            start_days,
+            end_days,
+        )
+        .await?
+    {
+        return Ok(pending);
+    }
+    if q12_direct_lineitem_dict_raw_enabled()
+        && let Some(pending) = q12_filtered_lineitem_counts_direct_dict_raw(
+            engine,
+            path.clone(),
+            batch_size,
+            shipmodes.clone(),
+            start_days,
+            end_days,
+        )
+        .await?
+    {
+        return Ok(pending);
+    }
+    if q12_direct_lineitem_page_raw_enabled()
+        && let Some(pending) = q12_filtered_lineitem_counts_direct_page_raw(
+            engine,
+            path.clone(),
+            batch_size,
+            shipmodes.clone(),
+            start_days,
+            end_days,
+        )
+        .await?
+    {
+        return Ok(pending);
+    }
     if q12_row_group_map_enabled()
         && let Some(partials) = q12_filtered_lineitem_counts_row_group_map(
             engine,
@@ -14366,6 +17532,222 @@ async fn q12_filtered_lineitem_counts(
         engine, path, batch_size, projection, shipmodes, start_days, end_days,
     )
     .await
+}
+
+async fn q12_filtered_lineitem_counts_direct_selected_payload(
+    engine: &DodamEngine,
+    path: PathBuf,
+    shipmodes: Arc<Vec<String>>,
+    start_days: i32,
+    end_days: i32,
+) -> Result<Option<Q12PendingMap>> {
+    engine
+        .scan_parquet_i64_byte_array_selected_by_i32x3_dictionary_fold(
+            path,
+            [
+                "l_orderkey",
+                "l_shipmode",
+                "l_commitdate",
+                "l_receiptdate",
+                "l_shipdate",
+            ],
+            q12_receiptdate_pruning_predicates(start_days, end_days),
+            q12_row_group_map_chunk(),
+            q12_pending_map_new,
+            move |commitdate, receiptdate, shipdate| {
+                q12_lineitem_dates_match(commitdate, receiptdate, shipdate, start_days, end_days)
+            },
+            {
+                let shipmodes = shipmodes.clone();
+                move |pending, orderkeys, mode_ids, dictionary| {
+                    q12_filtered_lineitem_counts_selected_payload_into(
+                        orderkeys, mode_ids, dictionary, &shipmodes, pending,
+                    );
+                    Ok(())
+                }
+            },
+            Ok,
+            |pending, partial| {
+                q12_merge_pending_orders(pending, partial);
+                Ok(())
+            },
+        )
+        .await
+}
+
+async fn q12_filtered_lineitem_counts_direct_dict_raw(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    shipmodes: Arc<Vec<String>>,
+    start_days: i32,
+    end_days: i32,
+) -> Result<Option<Q12PendingMap>> {
+    engine
+        .scan_parquet_i64_dictionary_i32x3_dict_fold(
+            path,
+            batch_size,
+            [
+                "l_orderkey",
+                "l_shipmode",
+                "l_commitdate",
+                "l_receiptdate",
+                "l_shipdate",
+            ],
+            q12_receiptdate_pruning_predicates(start_days, end_days),
+            q12_row_group_map_chunk(),
+            q12_pending_map_new,
+            {
+                let shipmodes = shipmodes.clone();
+                move |pending,
+                      key_ids,
+                      key_dictionary,
+                      mode_ids,
+                      mode_dictionary,
+                      commitdate_ids,
+                      commitdate_dictionary,
+                      receiptdate_ids,
+                      receiptdate_dictionary,
+                      shipdate_ids,
+                      shipdate_dictionary| {
+                    q12_filtered_lineitem_counts_direct_dict_raw_into(
+                        key_ids,
+                        key_dictionary,
+                        mode_ids,
+                        mode_dictionary,
+                        commitdate_ids,
+                        commitdate_dictionary,
+                        receiptdate_ids,
+                        receiptdate_dictionary,
+                        shipdate_ids,
+                        shipdate_dictionary,
+                        &shipmodes,
+                        start_days,
+                        end_days,
+                        pending,
+                    );
+                    Ok(())
+                }
+            },
+            Ok,
+            |pending, partial| {
+                q12_merge_pending_orders(pending, partial);
+                Ok(())
+            },
+        )
+        .await
+}
+
+async fn q12_filtered_lineitem_counts_direct_page_raw(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    shipmodes: Arc<Vec<String>>,
+    start_days: i32,
+    end_days: i32,
+) -> Result<Option<Q12PendingMap>> {
+    engine
+        .scan_parquet_i64_dictionary_i32x3_page_fold(
+            path,
+            batch_size,
+            [
+                "l_orderkey",
+                "l_shipmode",
+                "l_commitdate",
+                "l_receiptdate",
+                "l_shipdate",
+            ],
+            q12_receiptdate_pruning_predicates(start_days, end_days),
+            q12_row_group_map_chunk(),
+            q12_pending_map_new,
+            {
+                let shipmodes = shipmodes.clone();
+                move |pending,
+                      orderkey_bytes,
+                      mode_ids,
+                      dictionary,
+                      commitdate_bytes,
+                      receiptdate_bytes,
+                      shipdate_bytes,
+                      records| {
+                    q12_filtered_lineitem_counts_direct_page_raw_into(
+                        orderkey_bytes,
+                        mode_ids,
+                        dictionary,
+                        commitdate_bytes,
+                        receiptdate_bytes,
+                        shipdate_bytes,
+                        records,
+                        &shipmodes,
+                        start_days,
+                        end_days,
+                        pending,
+                    );
+                    Ok(())
+                }
+            },
+            Ok,
+            |pending, partial| {
+                q12_merge_pending_orders(pending, partial);
+                Ok(())
+            },
+        )
+        .await
+}
+
+async fn q12_filtered_lineitem_counts_direct_raw(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    shipmodes: Arc<Vec<String>>,
+    start_days: i32,
+    end_days: i32,
+) -> Result<Option<Q12PendingMap>> {
+    engine
+        .scan_parquet_i64_dictionary_i32x3_fold(
+            path,
+            batch_size,
+            [
+                "l_orderkey",
+                "l_shipmode",
+                "l_commitdate",
+                "l_receiptdate",
+                "l_shipdate",
+            ],
+            q12_receiptdate_pruning_predicates(start_days, end_days),
+            q12_row_group_map_chunk(),
+            q12_pending_map_new,
+            {
+                let shipmodes = shipmodes.clone();
+                move |pending,
+                      orderkeys,
+                      mode_ids,
+                      dictionary,
+                      commitdates,
+                      receiptdates,
+                      shipdates| {
+                    q12_filtered_lineitem_counts_direct_raw_into(
+                        orderkeys,
+                        mode_ids,
+                        dictionary,
+                        commitdates,
+                        receiptdates,
+                        shipdates,
+                        &shipmodes,
+                        start_days,
+                        end_days,
+                        pending,
+                    );
+                    Ok(())
+                }
+            },
+            Ok,
+            |pending, partial| {
+                q12_merge_pending_orders(pending, partial);
+                Ok(())
+            },
+        )
+        .await
 }
 
 async fn q12_filtered_lineitem_counts_row_filtered(
@@ -14605,6 +17987,26 @@ fn q12_lineitem_row_filter_enabled() -> bool {
     std::env::var_os("DODAM_Q12_ENABLE_LINEITEM_ROW_FILTER").is_some()
 }
 
+fn q12_direct_lineitem_raw_enabled() -> bool {
+    std::env::var("DODAM_Q12_ENABLE_DIRECT_LINEITEM_RAW")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn q12_direct_lineitem_selected_payload_enabled() -> bool {
+    std::env::var("DODAM_Q12_ENABLE_DIRECT_LINEITEM_SELECTED_PAYLOAD")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn q12_direct_lineitem_dict_raw_enabled() -> bool {
+    std::env::var("DODAM_Q12_ENABLE_DIRECT_LINEITEM_DICT_RAW")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn q12_direct_lineitem_page_raw_enabled() -> bool {
+    std::env::var("DODAM_Q12_ENABLE_DIRECT_LINEITEM_PAGE_RAW")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
 fn q12_row_group_map_chunk() -> usize {
     std::env::var("DODAM_Q12_ROW_GROUP_MAP_CHUNK")
         .ok()
@@ -14827,6 +18229,292 @@ fn q12_filtered_lineitem_counts_projected_view_into(
     Ok(false)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn q12_filtered_lineitem_counts_direct_raw_into(
+    orderkeys: &[i64],
+    mode_ids: &[i32],
+    dictionary: &[bytes::Bytes],
+    commitdates: &[i32],
+    receiptdates: &[i32],
+    shipdates: &[i32],
+    shipmodes: &[String],
+    start_days: i32,
+    end_days: i32,
+    pending: &mut Q12PendingMap,
+) {
+    let Some(mode_flags) = q12_dictionary_bytes_match_flags(dictionary, shipmodes) else {
+        return;
+    };
+    let mut accumulator = Q12PendingRunAccumulator::new(pending);
+    for row in 0..orderkeys.len() {
+        let commitdate = commitdates[row];
+        let receiptdate = receiptdates[row];
+        if !q12_lineitem_dates_match(
+            commitdate,
+            receiptdate,
+            shipdates[row],
+            start_days,
+            end_days,
+        ) {
+            continue;
+        }
+        let mode_id = mode_ids[row];
+        if mode_id < 0 {
+            continue;
+        }
+        let Some(mode_index) = mode_flags
+            .get(mode_id as usize)
+            .and_then(|mode_index| *mode_index)
+        else {
+            continue;
+        };
+        accumulator.increment(orderkeys[row], mode_index);
+    }
+    accumulator.finish();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q12_filtered_lineitem_counts_direct_page_raw_into(
+    orderkey_bytes: &[u8],
+    mode_ids: &[i32],
+    dictionary: &[bytes::Bytes],
+    commitdate_bytes: &[u8],
+    receiptdate_bytes: &[u8],
+    shipdate_bytes: &[u8],
+    records: usize,
+    shipmodes: &[String],
+    start_days: i32,
+    end_days: i32,
+    pending: &mut Q12PendingMap,
+) {
+    let Some(mode_flags) = q12_dictionary_bytes_match_flags(dictionary, shipmodes) else {
+        return;
+    };
+    if orderkey_bytes.len() < records.saturating_mul(std::mem::size_of::<i64>())
+        || commitdate_bytes.len() < records.saturating_mul(std::mem::size_of::<i32>())
+        || receiptdate_bytes.len() < records.saturating_mul(std::mem::size_of::<i32>())
+        || shipdate_bytes.len() < records.saturating_mul(std::mem::size_of::<i32>())
+        || mode_ids.len() < records
+    {
+        return;
+    }
+    let mut accumulator = Q12PendingRunAccumulator::new(pending);
+    let mut row = 0usize;
+    while row + 8 <= records {
+        for offset in 0..8 {
+            let row = row + offset;
+            let commitdate = read_i32_le_unaligned(commitdate_bytes, row);
+            let receiptdate = read_i32_le_unaligned(receiptdate_bytes, row);
+            if !q12_lineitem_dates_match(
+                commitdate,
+                receiptdate,
+                read_i32_le_unaligned(shipdate_bytes, row),
+                start_days,
+                end_days,
+            ) {
+                continue;
+            }
+            let mode_id = mode_ids[row];
+            if mode_id < 0 {
+                continue;
+            }
+            let Some(mode_index) = mode_flags
+                .get(mode_id as usize)
+                .and_then(|mode_index| *mode_index)
+            else {
+                continue;
+            };
+            accumulator.increment(read_i64_le_unaligned(orderkey_bytes, row), mode_index);
+        }
+        row += 8;
+    }
+    while row < records {
+        let commitdate = read_i32_le_unaligned(commitdate_bytes, row);
+        let receiptdate = read_i32_le_unaligned(receiptdate_bytes, row);
+        if q12_lineitem_dates_match(
+            commitdate,
+            receiptdate,
+            read_i32_le_unaligned(shipdate_bytes, row),
+            start_days,
+            end_days,
+        ) {
+            let mode_id = mode_ids[row];
+            if mode_id >= 0
+                && let Some(mode_index) = mode_flags
+                    .get(mode_id as usize)
+                    .and_then(|mode_index| *mode_index)
+            {
+                accumulator.increment(read_i64_le_unaligned(orderkey_bytes, row), mode_index);
+            }
+        }
+        row += 1;
+    }
+    accumulator.finish();
+}
+
+fn q12_filtered_lineitem_counts_selected_payload_into(
+    orderkeys: &[i64],
+    mode_ids: &[i32],
+    dictionary: &[bytes::Bytes],
+    shipmodes: &[String],
+    pending: &mut Q12PendingMap,
+) {
+    let Some(mode_flags) = q12_dictionary_bytes_match_flags(dictionary, shipmodes) else {
+        return;
+    };
+    let rows = orderkeys.len().min(mode_ids.len());
+    let mut accumulator = Q12PendingRunAccumulator::new(pending);
+    let mut row = 0usize;
+    while row + 8 <= rows {
+        for offset in 0..8 {
+            let row = row + offset;
+            let Some(mode_index) = q12_mode_dictionary_match_index(mode_ids[row], &mode_flags)
+            else {
+                continue;
+            };
+            accumulator.increment(orderkeys[row], mode_index);
+        }
+        row += 8;
+    }
+    while row < rows {
+        if let Some(mode_index) = q12_mode_dictionary_match_index(mode_ids[row], &mode_flags) {
+            accumulator.increment(orderkeys[row], mode_index);
+        }
+        row += 1;
+    }
+    accumulator.finish();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q12_filtered_lineitem_counts_direct_dict_raw_into(
+    key_ids: &[i32],
+    key_dictionary: &[i64],
+    mode_ids: &[i32],
+    mode_dictionary: &[bytes::Bytes],
+    commitdate_ids: &[i32],
+    commitdate_dictionary: &[i32],
+    receiptdate_ids: &[i32],
+    receiptdate_dictionary: &[i32],
+    shipdate_ids: &[i32],
+    shipdate_dictionary: &[i32],
+    shipmodes: &[String],
+    start_days: i32,
+    end_days: i32,
+    pending: &mut Q12PendingMap,
+) {
+    let Some(mode_flags) = q12_dictionary_bytes_match_flags(mode_dictionary, shipmodes) else {
+        return;
+    };
+    let records = key_ids
+        .len()
+        .min(mode_ids.len())
+        .min(commitdate_ids.len())
+        .min(receiptdate_ids.len())
+        .min(shipdate_ids.len());
+    let mut accumulator = Q12PendingRunAccumulator::new(pending);
+    let mut row = 0usize;
+    while row + 8 <= records {
+        for offset in 0..8 {
+            let row = row + offset;
+            let Some(commitdate) =
+                q12_i32_dictionary_value(commitdate_ids[row], commitdate_dictionary)
+            else {
+                continue;
+            };
+            let Some(receiptdate) =
+                q12_i32_dictionary_value(receiptdate_ids[row], receiptdate_dictionary)
+            else {
+                continue;
+            };
+            let Some(shipdate) = q12_i32_dictionary_value(shipdate_ids[row], shipdate_dictionary)
+            else {
+                continue;
+            };
+            if !q12_lineitem_dates_match(commitdate, receiptdate, shipdate, start_days, end_days) {
+                continue;
+            }
+            let Some(mode_index) = q12_mode_dictionary_match_index(mode_ids[row], &mode_flags)
+            else {
+                continue;
+            };
+            let Some(orderkey) = q12_i64_dictionary_value(key_ids[row], key_dictionary) else {
+                continue;
+            };
+            accumulator.increment(orderkey, mode_index);
+        }
+        row += 8;
+    }
+    while row < records {
+        let Some(commitdate) = q12_i32_dictionary_value(commitdate_ids[row], commitdate_dictionary)
+        else {
+            row += 1;
+            continue;
+        };
+        let Some(receiptdate) =
+            q12_i32_dictionary_value(receiptdate_ids[row], receiptdate_dictionary)
+        else {
+            row += 1;
+            continue;
+        };
+        let Some(shipdate) = q12_i32_dictionary_value(shipdate_ids[row], shipdate_dictionary)
+        else {
+            row += 1;
+            continue;
+        };
+        if q12_lineitem_dates_match(commitdate, receiptdate, shipdate, start_days, end_days)
+            && let Some(mode_index) = q12_mode_dictionary_match_index(mode_ids[row], &mode_flags)
+            && let Some(orderkey) = q12_i64_dictionary_value(key_ids[row], key_dictionary)
+        {
+            accumulator.increment(orderkey, mode_index);
+        }
+        row += 1;
+    }
+    accumulator.finish();
+}
+
+#[inline(always)]
+fn q12_i32_dictionary_value(id: i32, dictionary: &[i32]) -> Option<i32> {
+    let id = usize::try_from(id).ok()?;
+    dictionary.get(id).copied()
+}
+
+#[inline(always)]
+fn q12_i64_dictionary_value(id: i32, dictionary: &[i64]) -> Option<i64> {
+    let id = usize::try_from(id).ok()?;
+    dictionary.get(id).copied()
+}
+
+#[inline(always)]
+fn q12_mode_dictionary_match_index(id: i32, flags: &[Option<usize>]) -> Option<usize> {
+    let id = usize::try_from(id).ok()?;
+    flags.get(id).and_then(|mode_index| *mode_index)
+}
+
+fn q12_dictionary_bytes_match_flags(
+    dictionary: &[bytes::Bytes],
+    shipmodes: &[String],
+) -> Option<Vec<Option<usize>>> {
+    let [left_mode, right_mode] = shipmodes else {
+        return None;
+    };
+    let left_mode = left_mode.as_bytes();
+    let right_mode = right_mode.as_bytes();
+    Some(
+        dictionary
+            .iter()
+            .map(|value| {
+                if value.as_ref() == left_mode {
+                    Some(0)
+                } else if value.as_ref() == right_mode {
+                    Some(1)
+                } else {
+                    None
+                }
+            })
+            .collect(),
+    )
+}
+
 struct Q12LineitemStringView<'a> {
     orderkeys: I64VectorView<'a>,
     modes: Utf8VectorView<'a>,
@@ -14892,6 +18580,7 @@ fn q12_filtered_lineitem_counts_batch_dictionary_typed_into(
             view.shipdates.values_if_null_free(),
         )
     {
+        let mut accumulator = Q12PendingRunAccumulator::new(pending);
         if q12_lineitem_selection_vector_enabled() {
             let mut selected = SelectionVector::with_capacity(orderkey_values.len().min(4096));
             for row in 0..orderkey_values.len() {
@@ -14915,8 +18604,9 @@ fn q12_filtered_lineitem_counts_batch_dictionary_typed_into(
                     else {
                         continue;
                     };
-                    q12_pending_increment(pending, orderkey_values[row], mode_index);
+                    accumulator.increment(orderkey_values[row], mode_index);
                 }
+                accumulator.finish();
                 return true;
             }
         }
@@ -14936,10 +18626,12 @@ fn q12_filtered_lineitem_counts_batch_dictionary_typed_into(
             else {
                 continue;
             };
-            q12_pending_increment(pending, orderkey_values[row], mode_index);
+            accumulator.increment(orderkey_values[row], mode_index);
         }
+        accumulator.finish();
         return true;
     }
+    let mut accumulator = Q12PendingRunAccumulator::new(pending);
     for row in 0..view.orderkeys.len() {
         if view.orderkeys.is_null(row)
             || view.modes.is_null(row)
@@ -14963,8 +18655,9 @@ fn q12_filtered_lineitem_counts_batch_dictionary_typed_into(
         let Some(mode_index) = dictionary_i32_view_match_index(mode_keys, &mode_flags, row) else {
             continue;
         };
-        q12_pending_increment(pending, view.orderkeys.value(row), mode_index);
+        accumulator.increment(view.orderkeys.value(row), mode_index);
     }
+    accumulator.finish();
     true
 }
 
@@ -15027,6 +18720,7 @@ fn q12_filtered_lineitem_counts_string_view_into(
             view.shipdates.values_if_null_free(),
         )
     {
+        let mut accumulator = Q12PendingRunAccumulator::new(pending);
         if q12_lineitem_selection_vector_enabled() {
             let mut selected = SelectionVector::with_capacity(orderkey_values.len().min(4096));
             for row in 0..orderkey_values.len() {
@@ -15053,8 +18747,9 @@ fn q12_filtered_lineitem_counts_string_view_into(
                     } else {
                         continue;
                     };
-                    q12_pending_increment(pending, orderkey_values[row], mode_index);
+                    accumulator.increment(orderkey_values[row], mode_index);
                 }
+                accumulator.finish();
                 return true;
             }
         }
@@ -15078,10 +18773,12 @@ fn q12_filtered_lineitem_counts_string_view_into(
             } else {
                 continue;
             };
-            q12_pending_increment(pending, orderkey_values[row], mode_index);
+            accumulator.increment(orderkey_values[row], mode_index);
         }
+        accumulator.finish();
         return true;
     }
+    let mut accumulator = Q12PendingRunAccumulator::new(pending);
     for row in 0..view.orderkeys.len() {
         if view.orderkeys.is_null(row)
             || view.modes.is_null(row)
@@ -15110,8 +18807,9 @@ fn q12_filtered_lineitem_counts_string_view_into(
         } else {
             continue;
         };
-        q12_pending_increment(pending, view.orderkeys.value(row), mode_index);
+        accumulator.increment(view.orderkeys.value(row), mode_index);
     }
+    accumulator.finish();
     true
 }
 
@@ -16072,29 +19770,32 @@ fn q12_order_late_build_selection_batch(
     if orderkeys.null_count() == 0 {
         let orderkey_values = orderkeys.values();
         let pending_dense = state.pending.dense_slices();
-        selection.push_selected_rows(orderkey_values.len(), |row| {
-            let orderkey = orderkey_values[row];
-            if let Some(order) = state.pending.get_cached(pending_dense, orderkey) {
-                state.selected_orders.push(order);
-                true
-            } else {
-                false
-            }
-        });
+        selection.push_selected_offsets(
+            orderkey_values.len(),
+            (0..orderkey_values.len()).filter_map(|row| {
+                let orderkey = orderkey_values[row];
+                if let Some(order) = state.pending.get_cached(pending_dense, orderkey) {
+                    state.selected_orders.push(order);
+                    Some(row)
+                } else {
+                    None
+                }
+            }),
+        );
         return Ok(Some(()));
     }
-    for row in 0..orderkeys.len() {
-        if orderkeys.is_null(row) {
-            selection.push(false);
-            continue;
-        }
-        if let Some(order) = state.pending.get(orderkeys.value(row)) {
-            state.selected_orders.push(order);
-            selection.push(true);
-        } else {
-            selection.push(false);
-        }
-    }
+    selection.push_selected_offsets(
+        orderkeys.len(),
+        (0..orderkeys.len()).filter_map(|row| {
+            if orderkeys.is_null(row) {
+                return None;
+            }
+            state.pending.get(orderkeys.value(row)).map(|order| {
+                state.selected_orders.push(order);
+                row
+            })
+        }),
+    );
     Ok(Some(()))
 }
 
@@ -16112,29 +19813,32 @@ fn q12_order_late_build_selection_view(
         };
         if let Some(orderkey_values) = orderkeys.values_if_null_free() {
             let pending_dense = state.pending.dense_slices();
-            selection.push_selected_rows(orderkey_values.len(), |row| {
-                let orderkey = orderkey_values[row];
-                if let Some(order) = state.pending.get_cached(pending_dense, orderkey) {
-                    state.selected_orders.push(order);
-                    true
-                } else {
-                    false
-                }
-            });
+            selection.push_selected_offsets(
+                orderkey_values.len(),
+                (0..orderkey_values.len()).filter_map(|row| {
+                    let orderkey = orderkey_values[row];
+                    if let Some(order) = state.pending.get_cached(pending_dense, orderkey) {
+                        state.selected_orders.push(order);
+                        Some(row)
+                    } else {
+                        None
+                    }
+                }),
+            );
             return Ok(Some(()));
         }
-        for row in 0..orderkeys.len() {
-            if orderkeys.is_null(row) {
-                selection.push(false);
-                continue;
-            }
-            if let Some(order) = state.pending.get(orderkeys.value(row)) {
-                state.selected_orders.push(order);
-                selection.push(true);
-            } else {
-                selection.push(false);
-            }
-        }
+        selection.push_selected_offsets(
+            orderkeys.len(),
+            (0..orderkeys.len()).filter_map(|row| {
+                if orderkeys.is_null(row) {
+                    return None;
+                }
+                state.pending.get(orderkeys.value(row)).map(|order| {
+                    state.selected_orders.push(order);
+                    row
+                })
+            }),
+        );
         return Ok(Some(()));
     }
     let Some(batch) = view.try_record_batch() else {
@@ -18943,7 +22647,7 @@ fn q03_revenue_late_materialized_row_group_chunk() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(8)
+        .unwrap_or(4)
 }
 
 fn q03_revenue_late_materialized_max_selected_ratio() -> f64 {
@@ -19049,39 +22753,38 @@ fn q03_revenue_late_carry_build_selection_batch(
     if orderkeys.null_count() == 0 && shipdates.null_count() == 0 {
         let orderkey_values = orderkeys.values().as_ref();
         let shipdate_values = shipdates.values().as_ref();
-        selection.push_selected_rows(orderkey_values.len(), |row| {
-            let orderkey = orderkey_values[row];
-            let selected_order = if shipdate_values[row] > state.ship_cutoff {
+        q03_push_late_carry_selection_slices(
+            selection,
+            orderkey_values,
+            shipdate_values,
+            state.orders.as_ref(),
+            state.ship_cutoff,
+            &mut state.selected_orders,
+        );
+        return Ok(Some(()));
+    }
+    selection.push_selected_offsets(
+        orderkeys.len(),
+        (0..orderkeys.len()).filter_map(|row| {
+            let orderkey = orderkeys.is_valid(row).then(|| orderkeys.value(row));
+            let selected_order = if let Some(orderkey) = orderkey
+                && shipdates.is_valid(row)
+                && shipdates.value(row) > state.ship_cutoff
+            {
                 state.orders.get(&orderkey).copied()
             } else {
                 None
             };
             if let Some(order) = selected_order {
-                state.selected_orders.push((orderkey, order));
-                true
+                state
+                    .selected_orders
+                    .push((orderkey.expect("validated orderkey"), order));
+                Some(row)
             } else {
-                false
+                None
             }
-        });
-        return Ok(Some(()));
-    }
-    for row in 0..orderkeys.len() {
-        let orderkey = orderkeys.is_valid(row).then(|| orderkeys.value(row));
-        let selected_order = if let Some(orderkey) = orderkey
-            && shipdates.is_valid(row)
-            && shipdates.value(row) > state.ship_cutoff
-        {
-            state.orders.get(&orderkey).copied()
-        } else {
-            None
-        };
-        selection.push(selected_order.is_some());
-        if let Some(order) = selected_order {
-            state
-                .selected_orders
-                .push((orderkey.expect("validated orderkey"), order));
-        }
-    }
+        }),
+    );
     Ok(Some(()))
 }
 
@@ -19101,45 +22804,67 @@ fn q03_revenue_late_carry_build_selection_view(
             orderkeys.values_if_null_free(),
             shipdates.values_if_null_free(),
         ) {
-            selection.push_selected_rows(orderkey_values.len(), |row| {
-                let orderkey = orderkey_values[row];
-                let selected_order = if shipdate_values[row] > state.ship_cutoff {
+            q03_push_late_carry_selection_slices(
+                selection,
+                orderkey_values,
+                shipdate_values,
+                state.orders.as_ref(),
+                state.ship_cutoff,
+                &mut state.selected_orders,
+            );
+            return Ok(Some(()));
+        }
+        selection.push_selected_offsets(
+            orderkeys.len(),
+            (0..orderkeys.len()).filter_map(|row| {
+                let orderkey = (!orderkeys.is_null(row)).then(|| orderkeys.value(row));
+                let selected_order = if let Some(orderkey) = orderkey
+                    && !shipdates.is_null(row)
+                    && shipdates.value(row) > state.ship_cutoff
+                {
                     state.orders.get(&orderkey).copied()
                 } else {
                     None
                 };
                 if let Some(order) = selected_order {
-                    state.selected_orders.push((orderkey, order));
-                    true
+                    state
+                        .selected_orders
+                        .push((orderkey.expect("validated orderkey"), order));
+                    Some(row)
                 } else {
-                    false
+                    None
                 }
-            });
-            return Ok(Some(()));
-        }
-        for row in 0..orderkeys.len() {
-            let orderkey = (!orderkeys.is_null(row)).then(|| orderkeys.value(row));
-            let selected_order = if let Some(orderkey) = orderkey
-                && !shipdates.is_null(row)
-                && shipdates.value(row) > state.ship_cutoff
-            {
-                state.orders.get(&orderkey).copied()
-            } else {
-                None
-            };
-            selection.push(selected_order.is_some());
-            if let Some(order) = selected_order {
-                state
-                    .selected_orders
-                    .push((orderkey.expect("validated orderkey"), order));
-            }
-        }
+            }),
+        );
         return Ok(Some(()));
     }
     let Some(batch) = view.try_record_batch() else {
         return Ok(None);
     };
     q03_revenue_late_carry_build_selection_batch(batch.clone(), selection, state)
+}
+
+fn q03_push_late_carry_selection_slices(
+    selection: &mut LateSelectionBuilder,
+    orderkeys: &[i64],
+    shipdates: &[i32],
+    orders: &Q03OrderMap,
+    ship_cutoff: i32,
+    selected_orders: &mut Vec<(i64, Q03Order)>,
+) {
+    let mut selected_offsets = Vec::with_capacity(orderkeys.len().min(1024));
+    for row in 0..orderkeys.len() {
+        if shipdates[row] <= ship_cutoff {
+            continue;
+        }
+        let orderkey = orderkeys[row];
+        let Some(order) = orders.get(&orderkey).copied() else {
+            continue;
+        };
+        selected_orders.push((orderkey, order));
+        selected_offsets.push(row as u32);
+    }
+    selection.push_selected_u32_offsets(orderkeys.len(), &selected_offsets);
 }
 
 fn q03_revenue_late_carry_consume_payload_batch(
@@ -19320,27 +23045,31 @@ fn q03_revenue_late_build_selection_batch(
     if orderkeys.null_count() == 0 && shipdates.null_count() == 0 {
         let orderkey_values = orderkeys.values().as_ref();
         let shipdate_values = shipdates.values().as_ref();
-        selection.push_selected_rows(orderkey_values.len(), |row| {
-            let orderkey = orderkey_values[row];
-            let selected =
-                shipdate_values[row] > state.ship_cutoff && state.orders.contains_key(&orderkey);
-            if selected {
-                state.selected_orderkeys.push(orderkey);
-            }
-            selected
-        });
+        q03_push_late_key_selection_slices(
+            selection,
+            orderkey_values,
+            shipdate_values,
+            state.orders.as_ref(),
+            state.ship_cutoff,
+            &mut state.selected_orderkeys,
+        );
         return Ok(Some(()));
     }
-    for row in 0..orderkeys.len() {
-        let selected = orderkeys.is_valid(row)
-            && shipdates.is_valid(row)
-            && shipdates.value(row) > state.ship_cutoff
-            && state.orders.contains_key(&orderkeys.value(row));
-        selection.push(selected);
-        if selected {
-            state.selected_orderkeys.push(orderkeys.value(row));
-        }
-    }
+    selection.push_selected_offsets(
+        orderkeys.len(),
+        (0..orderkeys.len()).filter_map(|row| {
+            let selected = orderkeys.is_valid(row)
+                && shipdates.is_valid(row)
+                && shipdates.value(row) > state.ship_cutoff
+                && state.orders.contains_key(&orderkeys.value(row));
+            if selected {
+                state.selected_orderkeys.push(orderkeys.value(row));
+                Some(row)
+            } else {
+                None
+            }
+        }),
+    );
     Ok(Some(()))
 }
 
@@ -19360,33 +23089,60 @@ fn q03_revenue_late_build_selection_view(
             orderkeys.values_if_null_free(),
             shipdates.values_if_null_free(),
         ) {
-            selection.push_selected_rows(orderkey_values.len(), |row| {
-                let orderkey = orderkey_values[row];
-                let selected = shipdate_values[row] > state.ship_cutoff
-                    && state.orders.contains_key(&orderkey);
-                if selected {
-                    state.selected_orderkeys.push(orderkey);
-                }
-                selected
-            });
+            q03_push_late_key_selection_slices(
+                selection,
+                orderkey_values,
+                shipdate_values,
+                state.orders.as_ref(),
+                state.ship_cutoff,
+                &mut state.selected_orderkeys,
+            );
             return Ok(Some(()));
         }
-        for row in 0..orderkeys.len() {
-            let selected = !orderkeys.is_null(row)
-                && !shipdates.is_null(row)
-                && shipdates.value(row) > state.ship_cutoff
-                && state.orders.contains_key(&orderkeys.value(row));
-            selection.push(selected);
-            if selected {
-                state.selected_orderkeys.push(orderkeys.value(row));
-            }
-        }
+        selection.push_selected_offsets(
+            orderkeys.len(),
+            (0..orderkeys.len()).filter_map(|row| {
+                let selected = !orderkeys.is_null(row)
+                    && !shipdates.is_null(row)
+                    && shipdates.value(row) > state.ship_cutoff
+                    && state.orders.contains_key(&orderkeys.value(row));
+                if selected {
+                    state.selected_orderkeys.push(orderkeys.value(row));
+                    Some(row)
+                } else {
+                    None
+                }
+            }),
+        );
         return Ok(Some(()));
     }
     let Some(batch) = view.try_record_batch() else {
         return Ok(None);
     };
     q03_revenue_late_build_selection_batch(batch.clone(), selection, state)
+}
+
+fn q03_push_late_key_selection_slices(
+    selection: &mut LateSelectionBuilder,
+    orderkeys: &[i64],
+    shipdates: &[i32],
+    orders: &Q03OrderMap,
+    ship_cutoff: i32,
+    selected_orderkeys: &mut Vec<i64>,
+) {
+    let mut selected_offsets = Vec::with_capacity(orderkeys.len().min(1024));
+    for row in 0..orderkeys.len() {
+        if shipdates[row] <= ship_cutoff {
+            continue;
+        }
+        let orderkey = orderkeys[row];
+        if !orders.contains_key(&orderkey) {
+            continue;
+        }
+        selected_orderkeys.push(orderkey);
+        selected_offsets.push(row as u32);
+    }
+    selection.push_selected_u32_offsets(orderkeys.len(), &selected_offsets);
 }
 
 fn q03_revenue_late_consume_payload_batch(
@@ -20710,15 +24466,19 @@ fn late_materialization_projection_selected_ratio(
     payload_projection: &Projection,
     default_max_selected_ratio: f64,
 ) -> f64 {
-    let predicate_columns = projection_column_count(predicate_projection);
-    let payload_columns = projection_column_count(payload_projection);
-    if predicate_columns == usize::MAX || payload_columns == usize::MAX {
-        return default_max_selected_ratio.min(0.35);
+    choose_late_materialization_projection_selected_ratio(ProjectionSelectivityCostInput {
+        predicate_columns: projection_column_count_for_cost(predicate_projection),
+        payload_columns: projection_column_count_for_cost(payload_projection),
+        default_max_selected_ratio,
+        narrow_payload_cap: 0.35,
+    })
+}
+
+fn projection_column_count_for_cost(projection: &Projection) -> Option<usize> {
+    match projection_column_count(projection) {
+        usize::MAX => None,
+        count => Some(count),
     }
-    if payload_columns >= predicate_columns.saturating_mul(2).max(1) {
-        return default_max_selected_ratio;
-    }
-    default_max_selected_ratio.min(0.35)
 }
 
 struct Q04LateCandidateState {
@@ -20998,31 +24758,41 @@ fn q04_late_candidate_build_selection_batch(
     if orderkeys.null_count() == 0 && orderdates.null_count() == 0 {
         let orderkey_values = orderkeys.values().as_ref();
         let orderdate_values = orderdates.values().as_ref();
-        selection.push_selected_rows(orderkey_values.len(), |row| {
-            let orderkey = orderkey_values[row];
-            let orderdate = orderdate_values[row];
-            let selected =
-                orderkey >= 0 && orderdate >= state.start_days && orderdate < state.end_days;
-            if selected {
-                state.selected_orderkeys.push(orderkey);
-            }
-            selected
-        });
+        selection.push_selected_offsets(
+            orderkey_values.len(),
+            (0..orderkey_values.len()).filter_map(|row| {
+                let orderkey = orderkey_values[row];
+                let orderdate = orderdate_values[row];
+                let selected =
+                    orderkey >= 0 && orderdate >= state.start_days && orderdate < state.end_days;
+                if selected {
+                    state.selected_orderkeys.push(orderkey);
+                    Some(row)
+                } else {
+                    None
+                }
+            }),
+        );
         return Ok(Some(()));
     }
-    for row in 0..batch.num_rows() {
-        let selected = if orderkeys.is_null(row) || orderdates.is_null(row) {
-            false
-        } else {
-            let orderkey = orderkeys.value(row);
-            let orderdate = orderdates.value(row);
-            orderkey >= 0 && orderdate >= state.start_days && orderdate < state.end_days
-        };
-        selection.push(selected);
-        if selected {
-            state.selected_orderkeys.push(orderkeys.value(row));
-        }
-    }
+    selection.push_selected_offsets(
+        batch.num_rows(),
+        (0..batch.num_rows()).filter_map(|row| {
+            let selected = if orderkeys.is_null(row) || orderdates.is_null(row) {
+                false
+            } else {
+                let orderkey = orderkeys.value(row);
+                let orderdate = orderdates.value(row);
+                orderkey >= 0 && orderdate >= state.start_days && orderdate < state.end_days
+            };
+            if selected {
+                state.selected_orderkeys.push(orderkeys.value(row));
+                Some(row)
+            } else {
+                None
+            }
+        }),
+    );
     Ok(Some(()))
 }
 
@@ -21038,31 +24808,42 @@ fn q04_late_candidate_build_selection_view(
             orderkeys.values_if_null_free(),
             orderdates.values_if_null_free(),
         ) {
-            selection.push_selected_rows(orderkey_values.len(), |row| {
-                let orderkey = orderkey_values[row];
-                let orderdate = orderdate_values[row];
-                let selected =
-                    orderkey >= 0 && orderdate >= state.start_days && orderdate < state.end_days;
-                if selected {
-                    state.selected_orderkeys.push(orderkey);
-                }
-                selected
-            });
+            selection.push_selected_offsets(
+                orderkey_values.len(),
+                (0..orderkey_values.len()).filter_map(|row| {
+                    let orderkey = orderkey_values[row];
+                    let orderdate = orderdate_values[row];
+                    let selected = orderkey >= 0
+                        && orderdate >= state.start_days
+                        && orderdate < state.end_days;
+                    if selected {
+                        state.selected_orderkeys.push(orderkey);
+                        Some(row)
+                    } else {
+                        None
+                    }
+                }),
+            );
             return Ok(Some(()));
         }
-        for row in 0..view.num_rows() {
-            let selected = if orderkeys.is_null(row) || orderdates.is_null(row) {
-                false
-            } else {
-                let orderkey = orderkeys.value(row);
-                let orderdate = orderdates.value(row);
-                orderkey >= 0 && orderdate >= state.start_days && orderdate < state.end_days
-            };
-            selection.push(selected);
-            if selected {
-                state.selected_orderkeys.push(orderkeys.value(row));
-            }
-        }
+        selection.push_selected_offsets(
+            view.num_rows(),
+            (0..view.num_rows()).filter_map(|row| {
+                let selected = if orderkeys.is_null(row) || orderdates.is_null(row) {
+                    false
+                } else {
+                    let orderkey = orderkeys.value(row);
+                    let orderdate = orderdates.value(row);
+                    orderkey >= 0 && orderdate >= state.start_days && orderdate < state.end_days
+                };
+                if selected {
+                    state.selected_orderkeys.push(orderkeys.value(row));
+                    Some(row)
+                } else {
+                    None
+                }
+            }),
+        );
         return Ok(Some(()));
     }
     let Some(batch) = view.try_record_batch() else {
@@ -21721,32 +25502,33 @@ fn q04_lineitem_late_build_selection_batch(
     };
     if orderkeys.null_count() == 0 {
         let orderkey_values = orderkeys.values();
-        selection.push_selected_rows(orderkeys.len(), |row| {
-            let orderkey = orderkey_values[row];
-            if let Some(index) =
-                dense_atomic_marker_present_index(orderkey, &state.candidate_priorities)
-            {
-                state.selected_orderkeys.push(index);
-                true
-            } else {
-                false
-            }
-        });
+        selection.push_selected_offsets(
+            orderkeys.len(),
+            (0..orderkeys.len()).filter_map(|row| {
+                let orderkey = orderkey_values[row];
+                dense_atomic_marker_present_index(orderkey, &state.candidate_priorities).map(
+                    |index| {
+                        state.selected_orderkeys.push(index);
+                        row
+                    },
+                )
+            }),
+        );
         return Ok(Some(()));
     }
-    for row in 0..orderkeys.len() {
-        let selected = if orderkeys.is_null(row) {
-            None
-        } else {
+    selection.push_selected_offsets(
+        orderkeys.len(),
+        (0..orderkeys.len()).filter_map(|row| {
+            if orderkeys.is_null(row) {
+                return None;
+            }
             dense_atomic_marker_present_index(orderkeys.value(row), &state.candidate_priorities)
-        };
-        if let Some(index) = selected {
-            selection.push(true);
-            state.selected_orderkeys.push(index);
-        } else {
-            selection.push(false);
-        }
-    }
+                .map(|index| {
+                    state.selected_orderkeys.push(index);
+                    row
+                })
+        }),
+    );
     Ok(Some(()))
 }
 
@@ -21760,32 +25542,33 @@ fn q04_lineitem_late_build_selection_view(
             return Ok(None);
         };
         if let Some(orderkey_values) = orderkeys.values_if_null_free() {
-            selection.push_selected_rows(orderkey_values.len(), |row| {
-                let orderkey = orderkey_values[row];
-                if let Some(index) =
-                    dense_atomic_marker_present_index(orderkey, &state.candidate_priorities)
-                {
-                    state.selected_orderkeys.push(index);
-                    true
-                } else {
-                    false
-                }
-            });
+            selection.push_selected_offsets(
+                orderkey_values.len(),
+                (0..orderkey_values.len()).filter_map(|row| {
+                    let orderkey = orderkey_values[row];
+                    dense_atomic_marker_present_index(orderkey, &state.candidate_priorities).map(
+                        |index| {
+                            state.selected_orderkeys.push(index);
+                            row
+                        },
+                    )
+                }),
+            );
             return Ok(Some(()));
         }
-        for row in 0..orderkeys.len() {
-            let selected = if orderkeys.is_null(row) {
-                None
-            } else {
+        selection.push_selected_offsets(
+            orderkeys.len(),
+            (0..orderkeys.len()).filter_map(|row| {
+                if orderkeys.is_null(row) {
+                    return None;
+                }
                 dense_atomic_marker_present_index(orderkeys.value(row), &state.candidate_priorities)
-            };
-            if let Some(index) = selected {
-                selection.push(true);
-                state.selected_orderkeys.push(index);
-            } else {
-                selection.push(false);
-            }
-        }
+                    .map(|index| {
+                        state.selected_orderkeys.push(index);
+                        row
+                    })
+            }),
+        );
         return Ok(Some(()));
     }
     let Some(batch) = view.try_record_batch() else {
@@ -29373,26 +33156,31 @@ fn q19_late_build_selection_batch(
     let quantity_values = quantities.raw_values();
     let discount_values = discounts.raw_values();
     let part_masks_dense = state.part_masks.dense_slices();
-    selection.push_selected_rows(batch.num_rows(), |row| {
-        let selected = if let Some(mask) = state
-            .part_masks
-            .get_cached(part_masks_dense, partkey_values[row])
-        {
-            q19_rule_matches_lineitem_raw(
-                raw_rules,
-                mask,
-                quantity_values[row],
-                bytes_string_parts(shipmode_offsets, shipmode_data, row),
-                bytes_string_parts(shipinstruct_offsets, shipinstruct_data, row),
-            )
-        } else {
-            false
-        };
-        if selected {
-            state.selected_discounts.push(discount_values[row] as i64);
-        }
-        selected
-    });
+    selection.push_selected_offsets(
+        batch.num_rows(),
+        (0..batch.num_rows()).filter_map(|row| {
+            let selected = if let Some(mask) = state
+                .part_masks
+                .get_cached(part_masks_dense, partkey_values[row])
+            {
+                q19_rule_matches_lineitem_raw(
+                    raw_rules,
+                    mask,
+                    quantity_values[row],
+                    bytes_string_parts(shipmode_offsets, shipmode_data, row),
+                    bytes_string_parts(shipinstruct_offsets, shipinstruct_data, row),
+                )
+            } else {
+                false
+            };
+            if selected {
+                state.selected_discounts.push(discount_values[row] as i64);
+                Some(row)
+            } else {
+                None
+            }
+        }),
+    );
     Ok(Some(()))
 }
 
@@ -29460,14 +33248,53 @@ fn q19_late_build_selection_vector_typed(
     if let (Some(quantity_values), Some(discount_values)) =
         (quantities.raw_i64_values(), discounts.raw_i64_values())
     {
-        selection.push_selected_rows(partkeys.len(), |row| {
+        selection.push_selected_offsets(
+            partkeys.len(),
+            (0..partkeys.len()).filter_map(|row| {
+                if partkeys.is_null(row)
+                    || quantities.is_null(row)
+                    || discounts.is_null(row)
+                    || shipmodes.is_null(row)
+                    || shipinstructs.is_null(row)
+                {
+                    return None;
+                }
+                let selected = if let Some(mask) = state
+                    .part_masks
+                    .get_cached(part_masks_dense, partkeys.value(row))
+                {
+                    q19_rule_matches_lineitem_raw(
+                        raw_rules,
+                        mask,
+                        i128::from(quantity_values[row]),
+                        shipmodes.value_bytes(row),
+                        shipinstructs.value_bytes(row),
+                    )
+                } else {
+                    false
+                };
+                if selected {
+                    state.selected_discounts.push(discount_values[row]);
+                    Some(row)
+                } else {
+                    None
+                }
+            }),
+        );
+        return Ok(Some(()));
+    }
+    let quantity_values = quantities.raw_values();
+    let discount_values = discounts.raw_values();
+    selection.push_selected_offsets(
+        partkeys.len(),
+        (0..partkeys.len()).filter_map(|row| {
             if partkeys.is_null(row)
                 || quantities.is_null(row)
                 || discounts.is_null(row)
                 || shipmodes.is_null(row)
                 || shipinstructs.is_null(row)
             {
-                return false;
+                return None;
             }
             let selected = if let Some(mask) = state
                 .part_masks
@@ -29476,7 +33303,7 @@ fn q19_late_build_selection_vector_typed(
                 q19_rule_matches_lineitem_raw(
                     raw_rules,
                     mask,
-                    i128::from(quantity_values[row]),
+                    quantity_values[row],
                     shipmodes.value_bytes(row),
                     shipinstructs.value_bytes(row),
                 )
@@ -29484,42 +33311,13 @@ fn q19_late_build_selection_vector_typed(
                 false
             };
             if selected {
-                state.selected_discounts.push(discount_values[row]);
+                state.selected_discounts.push(discount_values[row] as i64);
+                Some(row)
+            } else {
+                None
             }
-            selected
-        });
-        return Ok(Some(()));
-    }
-    let quantity_values = quantities.raw_values();
-    let discount_values = discounts.raw_values();
-    selection.push_selected_rows(partkeys.len(), |row| {
-        if partkeys.is_null(row)
-            || quantities.is_null(row)
-            || discounts.is_null(row)
-            || shipmodes.is_null(row)
-            || shipinstructs.is_null(row)
-        {
-            return false;
-        }
-        let selected = if let Some(mask) = state
-            .part_masks
-            .get_cached(part_masks_dense, partkeys.value(row))
-        {
-            q19_rule_matches_lineitem_raw(
-                raw_rules,
-                mask,
-                quantity_values[row],
-                shipmodes.value_bytes(row),
-                shipinstructs.value_bytes(row),
-            )
-        } else {
-            false
-        };
-        if selected {
-            state.selected_discounts.push(discount_values[row] as i64);
-        }
-        selected
-    });
+        }),
+    );
     Ok(Some(()))
 }
 
@@ -33843,7 +37641,7 @@ async fn scan_join_side_batches(
 }
 
 struct DirectJoinCoalesceLeftAggregate {
-    groups: FastHashMap<(Option<i64>, usize), (u64, i64)>,
+    groups: Vec<((Option<i64>, usize), (u64, i64))>,
     rows: usize,
     batches: usize,
     aggregate_nanos: u64,
@@ -33853,6 +37651,7 @@ struct JoinCoalesceLateLeftState {
     filter: DirectI64Filter,
     right_lookup: AdaptiveI64Map<usize>,
     selected_buckets: Vec<i64>,
+    selected_positions: Vec<usize>,
     payload_offset: usize,
     groups: JoinCoalesceGroupAccumulator,
     selected_rows: usize,
@@ -33984,6 +37783,7 @@ async fn try_late_join_coalesce_left_aggregate(
                     filter: filter.clone(),
                     right_lookup: right_lookup.clone(),
                     selected_buckets: Vec::with_capacity(batch_size / 2),
+                    selected_positions: Vec::with_capacity(batch_size / 2),
                     payload_offset: 0,
                     groups: JoinCoalesceGroupAccumulator::new(),
                     selected_rows: 0,
@@ -33995,14 +37795,16 @@ async fn try_late_join_coalesce_left_aggregate(
                     return Ok(None);
                 };
                 state.batches = state.batches.saturating_add(1);
-                selection.push_selected_rows(group.len(), |row| {
-                    let selected = state.filter.matches(&group, row);
-                    if selected {
-                        state.selected_rows = state.selected_rows.saturating_add(1);
-                        state.selected_buckets.push(group.value(row));
-                    }
-                    selected
-                });
+                state.filter.push_selected_positions_and_values(
+                    &group,
+                    &mut state.selected_positions,
+                    &mut state.selected_buckets,
+                );
+                state.selected_rows = state
+                    .selected_rows
+                    .saturating_add(state.selected_positions.len());
+                selection
+                    .push_selected_offsets(group.len(), state.selected_positions.iter().copied());
                 Ok(Some(()))
             },
             |view, state| {
@@ -34055,6 +37857,10 @@ async fn try_late_join_coalesce_left_aggregate(
                             (!sum.is_null(row)).then(|| sum.value(row)),
                         );
                     }
+                }
+                if state.payload_offset == state.selected_buckets.len() {
+                    state.selected_buckets.clear();
+                    state.payload_offset = 0;
                 }
                 Ok(Some(()))
             },
@@ -34119,16 +37925,431 @@ fn join_coalesce_late_left_max_selected_ratio() -> f64 {
 enum DirectI64Filter {
     All,
     None,
+    TinyIn(Vec<i64>),
     In(FastHashSet<i64>),
 }
 
 impl DirectI64Filter {
-    fn matches(&self, value: &DirectI64ishVector<'_>, row: usize) -> bool {
+    fn push_selected_positions_and_values(
+        &self,
+        value: &DirectI64ishVector<'_>,
+        positions: &mut Vec<usize>,
+        selected_values: &mut Vec<i64>,
+    ) {
+        positions.clear();
         match self {
-            Self::All => true,
-            Self::None => false,
-            Self::In(values) => !value.is_null(row) && values.contains(&value.value(row)),
+            Self::All => {
+                reserve_selected_positions(positions, value.len());
+                selected_values.reserve(value.len());
+                for row in 0..value.len() {
+                    if !value.is_null(row) {
+                        positions.push(row);
+                        selected_values.push(value.value(row));
+                    }
+                }
+            }
+            Self::None => {}
+            Self::TinyIn(values) if !value.has_nulls() => {
+                if let Some(raw_values) = value.i64_values_if_null_free() {
+                    push_i64_tiny_in_positions_and_values(
+                        raw_values,
+                        values,
+                        positions,
+                        selected_values,
+                    );
+                } else if let Some(raw_values) = value.i32_values_if_null_free()
+                    && let Some(values) = i64_filter_values_as_i32(values)
+                {
+                    push_i32_tiny_in_positions_and_values(
+                        raw_values,
+                        &values,
+                        positions,
+                        selected_values,
+                    );
+                }
+            }
+            Self::TinyIn(values) => {
+                for row in 0..value.len() {
+                    if !value.is_null(row) {
+                        let current = value.value(row);
+                        if values.iter().any(|candidate| *candidate == current) {
+                            positions.push(row);
+                            selected_values.push(current);
+                        }
+                    }
+                }
+            }
+            Self::In(values) if !value.has_nulls() => {
+                if let Some(raw_values) = value.i64_values_if_null_free() {
+                    push_i64_hashset_positions_and_values(
+                        raw_values,
+                        values,
+                        positions,
+                        selected_values,
+                    );
+                } else if let Some(raw_values) = value.i32_values_if_null_free() {
+                    push_i32_as_i64_hashset_positions_and_values(
+                        raw_values,
+                        values,
+                        positions,
+                        selected_values,
+                    );
+                }
+            }
+            Self::In(values) => {
+                for row in 0..value.len() {
+                    if !value.is_null(row) {
+                        let current = value.value(row);
+                        if values.contains(&current) {
+                            positions.push(row);
+                            selected_values.push(current);
+                        }
+                    }
+                }
+            }
         }
+    }
+
+    fn push_selected_positions(&self, value: &DirectI64ishVector<'_>, positions: &mut Vec<usize>) {
+        positions.clear();
+        match self {
+            Self::All => positions.extend(0..value.len()),
+            Self::None => {}
+            Self::TinyIn(values) if !value.has_nulls() => {
+                if let Some(raw_values) = value.i64_values_if_null_free() {
+                    primitive_topk_filter_i64_positions(raw_values, values, positions);
+                } else if let Some(raw_values) = value.i32_values_if_null_free()
+                    && let Some(values) = i64_filter_values_as_i32(values)
+                {
+                    primitive_topk_filter_i32_positions(raw_values, &values, positions);
+                }
+            }
+            Self::TinyIn(values) => {
+                for row in 0..value.len() {
+                    if !value.is_null(row)
+                        && values
+                            .iter()
+                            .any(|candidate| *candidate == value.value(row))
+                    {
+                        positions.push(row);
+                    }
+                }
+            }
+            Self::In(values) if !value.has_nulls() => {
+                if let Some(raw_values) = value.i64_values_if_null_free() {
+                    push_i64_hashset_positions(raw_values, values, positions);
+                } else if let Some(raw_values) = value.i32_values_if_null_free() {
+                    push_i32_as_i64_hashset_positions(raw_values, values, positions);
+                }
+            }
+            Self::In(values) => {
+                for row in 0..value.len() {
+                    if !value.is_null(row) && values.contains(&value.value(row)) {
+                        positions.push(row);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn push_i64_hashset_positions(
+    values: &[i64],
+    filter_values: &FastHashSet<i64>,
+    selected: &mut Vec<usize>,
+) {
+    let mut row = 0usize;
+    let chunks = values.len() / 8 * 8;
+    while row < chunks {
+        let v0 = values[row];
+        let v1 = values[row + 1];
+        let v2 = values[row + 2];
+        let v3 = values[row + 3];
+        let v4 = values[row + 4];
+        let v5 = values[row + 5];
+        let v6 = values[row + 6];
+        let v7 = values[row + 7];
+        if filter_values.contains(&v0) {
+            selected.push(row);
+        }
+        if filter_values.contains(&v1) {
+            selected.push(row + 1);
+        }
+        if filter_values.contains(&v2) {
+            selected.push(row + 2);
+        }
+        if filter_values.contains(&v3) {
+            selected.push(row + 3);
+        }
+        if filter_values.contains(&v4) {
+            selected.push(row + 4);
+        }
+        if filter_values.contains(&v5) {
+            selected.push(row + 5);
+        }
+        if filter_values.contains(&v6) {
+            selected.push(row + 6);
+        }
+        if filter_values.contains(&v7) {
+            selected.push(row + 7);
+        }
+        row += 8;
+    }
+    while row < values.len() {
+        if filter_values.contains(&values[row]) {
+            selected.push(row);
+        }
+        row += 1;
+    }
+}
+
+fn push_i64_hashset_positions_and_values(
+    values: &[i64],
+    filter_values: &FastHashSet<i64>,
+    selected: &mut Vec<usize>,
+    selected_values: &mut Vec<i64>,
+) {
+    let mut row = 0usize;
+    let chunks = values.len() / 8 * 8;
+    while row < chunks {
+        let v0 = values[row];
+        let v1 = values[row + 1];
+        let v2 = values[row + 2];
+        let v3 = values[row + 3];
+        let v4 = values[row + 4];
+        let v5 = values[row + 5];
+        let v6 = values[row + 6];
+        let v7 = values[row + 7];
+        if filter_values.contains(&v0) {
+            selected.push(row);
+            selected_values.push(v0);
+        }
+        if filter_values.contains(&v1) {
+            selected.push(row + 1);
+            selected_values.push(v1);
+        }
+        if filter_values.contains(&v2) {
+            selected.push(row + 2);
+            selected_values.push(v2);
+        }
+        if filter_values.contains(&v3) {
+            selected.push(row + 3);
+            selected_values.push(v3);
+        }
+        if filter_values.contains(&v4) {
+            selected.push(row + 4);
+            selected_values.push(v4);
+        }
+        if filter_values.contains(&v5) {
+            selected.push(row + 5);
+            selected_values.push(v5);
+        }
+        if filter_values.contains(&v6) {
+            selected.push(row + 6);
+            selected_values.push(v6);
+        }
+        if filter_values.contains(&v7) {
+            selected.push(row + 7);
+            selected_values.push(v7);
+        }
+        row += 8;
+    }
+    while row < values.len() {
+        let value = values[row];
+        if filter_values.contains(&value) {
+            selected.push(row);
+            selected_values.push(value);
+        }
+        row += 1;
+    }
+}
+
+fn push_i32_as_i64_hashset_positions(
+    values: &[i32],
+    filter_values: &FastHashSet<i64>,
+    selected: &mut Vec<usize>,
+) {
+    let mut row = 0usize;
+    let chunks = values.len() / 8 * 8;
+    while row < chunks {
+        let v0 = i64::from(values[row]);
+        let v1 = i64::from(values[row + 1]);
+        let v2 = i64::from(values[row + 2]);
+        let v3 = i64::from(values[row + 3]);
+        let v4 = i64::from(values[row + 4]);
+        let v5 = i64::from(values[row + 5]);
+        let v6 = i64::from(values[row + 6]);
+        let v7 = i64::from(values[row + 7]);
+        if filter_values.contains(&v0) {
+            selected.push(row);
+        }
+        if filter_values.contains(&v1) {
+            selected.push(row + 1);
+        }
+        if filter_values.contains(&v2) {
+            selected.push(row + 2);
+        }
+        if filter_values.contains(&v3) {
+            selected.push(row + 3);
+        }
+        if filter_values.contains(&v4) {
+            selected.push(row + 4);
+        }
+        if filter_values.contains(&v5) {
+            selected.push(row + 5);
+        }
+        if filter_values.contains(&v6) {
+            selected.push(row + 6);
+        }
+        if filter_values.contains(&v7) {
+            selected.push(row + 7);
+        }
+        row += 8;
+    }
+    while row < values.len() {
+        if filter_values.contains(&i64::from(values[row])) {
+            selected.push(row);
+        }
+        row += 1;
+    }
+}
+
+fn push_i32_as_i64_hashset_positions_and_values(
+    values: &[i32],
+    filter_values: &FastHashSet<i64>,
+    selected: &mut Vec<usize>,
+    selected_values: &mut Vec<i64>,
+) {
+    let mut row = 0usize;
+    let chunks = values.len() / 8 * 8;
+    while row < chunks {
+        let v0 = i64::from(values[row]);
+        let v1 = i64::from(values[row + 1]);
+        let v2 = i64::from(values[row + 2]);
+        let v3 = i64::from(values[row + 3]);
+        let v4 = i64::from(values[row + 4]);
+        let v5 = i64::from(values[row + 5]);
+        let v6 = i64::from(values[row + 6]);
+        let v7 = i64::from(values[row + 7]);
+        if filter_values.contains(&v0) {
+            selected.push(row);
+            selected_values.push(v0);
+        }
+        if filter_values.contains(&v1) {
+            selected.push(row + 1);
+            selected_values.push(v1);
+        }
+        if filter_values.contains(&v2) {
+            selected.push(row + 2);
+            selected_values.push(v2);
+        }
+        if filter_values.contains(&v3) {
+            selected.push(row + 3);
+            selected_values.push(v3);
+        }
+        if filter_values.contains(&v4) {
+            selected.push(row + 4);
+            selected_values.push(v4);
+        }
+        if filter_values.contains(&v5) {
+            selected.push(row + 5);
+            selected_values.push(v5);
+        }
+        if filter_values.contains(&v6) {
+            selected.push(row + 6);
+            selected_values.push(v6);
+        }
+        if filter_values.contains(&v7) {
+            selected.push(row + 7);
+            selected_values.push(v7);
+        }
+        row += 8;
+    }
+    while row < values.len() {
+        let value = i64::from(values[row]);
+        if filter_values.contains(&value) {
+            selected.push(row);
+            selected_values.push(value);
+        }
+        row += 1;
+    }
+}
+
+fn push_i64_tiny_in_positions_and_values(
+    values: &[i64],
+    filter_values: &[i64],
+    selected: &mut Vec<usize>,
+    selected_values: &mut Vec<i64>,
+) {
+    let mut row = 0usize;
+    let chunks = values.len() / 8 * 8;
+    while row < chunks {
+        push_i64_tiny_in_position_value(values, filter_values, row, selected, selected_values);
+        push_i64_tiny_in_position_value(values, filter_values, row + 1, selected, selected_values);
+        push_i64_tiny_in_position_value(values, filter_values, row + 2, selected, selected_values);
+        push_i64_tiny_in_position_value(values, filter_values, row + 3, selected, selected_values);
+        push_i64_tiny_in_position_value(values, filter_values, row + 4, selected, selected_values);
+        push_i64_tiny_in_position_value(values, filter_values, row + 5, selected, selected_values);
+        push_i64_tiny_in_position_value(values, filter_values, row + 6, selected, selected_values);
+        push_i64_tiny_in_position_value(values, filter_values, row + 7, selected, selected_values);
+        row += 8;
+    }
+    while row < values.len() {
+        push_i64_tiny_in_position_value(values, filter_values, row, selected, selected_values);
+        row += 1;
+    }
+}
+
+fn push_i64_tiny_in_position_value(
+    values: &[i64],
+    filter_values: &[i64],
+    row: usize,
+    selected: &mut Vec<usize>,
+    selected_values: &mut Vec<i64>,
+) {
+    let value = values[row];
+    if filter_values.iter().any(|candidate| *candidate == value) {
+        selected.push(row);
+        selected_values.push(value);
+    }
+}
+
+fn push_i32_tiny_in_positions_and_values(
+    values: &[i32],
+    filter_values: &[i32],
+    selected: &mut Vec<usize>,
+    selected_values: &mut Vec<i64>,
+) {
+    let mut row = 0usize;
+    let chunks = values.len() / 8 * 8;
+    while row < chunks {
+        push_i32_tiny_in_position_value(values, filter_values, row, selected, selected_values);
+        push_i32_tiny_in_position_value(values, filter_values, row + 1, selected, selected_values);
+        push_i32_tiny_in_position_value(values, filter_values, row + 2, selected, selected_values);
+        push_i32_tiny_in_position_value(values, filter_values, row + 3, selected, selected_values);
+        push_i32_tiny_in_position_value(values, filter_values, row + 4, selected, selected_values);
+        push_i32_tiny_in_position_value(values, filter_values, row + 5, selected, selected_values);
+        push_i32_tiny_in_position_value(values, filter_values, row + 6, selected, selected_values);
+        push_i32_tiny_in_position_value(values, filter_values, row + 7, selected, selected_values);
+        row += 8;
+    }
+    while row < values.len() {
+        push_i32_tiny_in_position_value(values, filter_values, row, selected, selected_values);
+        row += 1;
+    }
+}
+
+fn push_i32_tiny_in_position_value(
+    values: &[i32],
+    filter_values: &[i32],
+    row: usize,
+    selected: &mut Vec<usize>,
+    selected_values: &mut Vec<i64>,
+) {
+    let value = values[row];
+    if filter_values.iter().any(|candidate| *candidate == value) {
+        selected.push(row);
+        selected_values.push(i64::from(value));
     }
 }
 
@@ -34172,6 +38393,29 @@ impl<'a> DirectI64ishVector<'a> {
             Self::I32(values) => i64::from(values.value(row)),
         }
     }
+
+    fn i64_values_if_null_free(&self) -> Option<&'a [i64]> {
+        match self {
+            Self::I64(values) => values.values_if_null_free(),
+            Self::I32(_) => None,
+        }
+    }
+
+    fn i32_values_if_null_free(&self) -> Option<&'a [i32]> {
+        match self {
+            Self::I64(_) => None,
+            Self::I32(values) => values.values_if_null_free(),
+        }
+    }
+}
+
+fn i64_filter_values_as_i32(values: &[i64]) -> Option<Vec<i32>> {
+    values
+        .iter()
+        .copied()
+        .map(i32::try_from)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .ok()
 }
 
 fn try_direct_join_coalesce_left_aggregate(
@@ -34248,7 +38492,8 @@ fn try_direct_join_coalesce_left_aggregate(
                 column_type: sum_type,
             },
         ];
-        let mut groups = FastHashMap::<(Option<i64>, usize), (u64, i64)>::default();
+        let mut groups = JoinCoalesceGroupAccumulator::new();
+        let mut selected_positions = Vec::<usize>::with_capacity(batch_size);
         let mut rows = 0usize;
         let scanned = engine.scan_parquet_primitive_columns_view(
             path,
@@ -34271,23 +38516,33 @@ fn try_direct_join_coalesce_left_aggregate(
                         "direct join fusion sum column is not i64-like".to_string(),
                     ));
                 };
-                for row in 0..key.len() {
-                    if !filter.matches(&group, row) {
-                        continue;
+                let dense_lookup = right_lookup.dense_slices();
+                match filter {
+                    DirectI64Filter::All => {
+                        rows = rows.saturating_add(key.len());
+                        accumulate_direct_join_coalesce_rows(
+                            &mut groups,
+                            &key,
+                            &group,
+                            &sum,
+                            right_lookup,
+                            dense_lookup,
+                            0..key.len(),
+                        );
                     }
-                    rows = rows.saturating_add(1);
-                    if key.is_null(row) {
-                        continue;
-                    }
-                    let Some(class_id) = right_lookup.get(key.value(row)) else {
-                        continue;
-                    };
-                    let entry = groups
-                        .entry(((!group.is_null(row)).then(|| group.value(row)), class_id))
-                        .or_insert((0, 0));
-                    entry.0 = entry.0.saturating_add(1);
-                    if !sum.is_null(row) {
-                        entry.1 = entry.1.saturating_add(sum.value(row));
+                    DirectI64Filter::None => {}
+                    _ => {
+                        filter.push_selected_positions(&group, &mut selected_positions);
+                        rows = rows.saturating_add(selected_positions.len());
+                        accumulate_direct_join_coalesce_rows(
+                            &mut groups,
+                            &key,
+                            &group,
+                            &sum,
+                            right_lookup,
+                            dense_lookup,
+                            selected_positions.iter().copied(),
+                        );
                     }
                 }
                 Ok(())
@@ -34302,7 +38557,7 @@ fn try_direct_join_coalesce_left_aggregate(
                 ),
             );
             return Ok(Some(DirectJoinCoalesceLeftAggregate {
-                groups,
+                groups: groups.into_entries(),
                 rows,
                 batches: metrics.batches,
                 aggregate_nanos: metrics.consume_nanos,
@@ -34310,6 +38565,38 @@ fn try_direct_join_coalesce_left_aggregate(
         }
     }
     Ok(None)
+}
+
+fn accumulate_direct_join_coalesce_rows(
+    groups: &mut JoinCoalesceGroupAccumulator,
+    key: &DirectI64ishVector<'_>,
+    group: &DirectI64ishVector<'_>,
+    sum: &DirectI64ishVector<'_>,
+    right_lookup: &AdaptiveI64Map<usize>,
+    dense_lookup: Option<(&[usize], &[bool])>,
+    rows: impl IntoIterator<Item = usize>,
+) {
+    if !key.has_nulls() && !group.has_nulls() && !sum.has_nulls() {
+        for row in rows {
+            if let Some(class_id) = right_lookup.get_cached(dense_lookup, key.value(row)) {
+                groups.update_non_null(group.value(row), class_id, sum.value(row));
+            }
+        }
+        return;
+    }
+    for row in rows {
+        if key.is_null(row) {
+            continue;
+        }
+        let Some(class_id) = right_lookup.get_cached(dense_lookup, key.value(row)) else {
+            continue;
+        };
+        groups.update(
+            (!group.is_null(row)).then(|| group.value(row)),
+            class_id,
+            (!sum.is_null(row)).then(|| sum.value(row)),
+        );
+    }
 }
 
 fn direct_join_coalesce_left_aggregate_enabled() -> bool {
@@ -34333,11 +38620,18 @@ fn direct_join_left_i64_filter(
             negated: false,
             has_null: false,
         } if column == group_column => {
-            let mut set = FastHashSet::default();
+            let mut parsed_values = Vec::with_capacity(values.len());
             for value in values {
-                set.insert(value.as_i64(column)?);
+                parsed_values.push(value.as_i64(column)?);
             }
-            Ok(Some(DirectI64Filter::In(set)))
+            parsed_values.sort_unstable();
+            parsed_values.dedup();
+            if parsed_values.len() <= 8 {
+                return Ok(Some(DirectI64Filter::TinyIn(parsed_values)));
+            }
+            Ok(Some(DirectI64Filter::In(
+                parsed_values.into_iter().collect(),
+            )))
         }
         _ => Ok(None),
     }
@@ -36875,22 +41169,6 @@ fn sql_uses_multi_comma_join(sql: &str) -> Result<bool> {
     Ok(parse_comma_join_table_refs(select)?.is_some_and(|tables| tables.len() > 2))
 }
 
-fn sql_uses_expression_predicate(sql: &str) -> Result<bool> {
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Ok(false);
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Ok(false);
-    };
-    Ok(select
-        .selection
-        .as_ref()
-        .is_some_and(predicate_requires_expression_path))
-}
-
 pub async fn try_execute_sql_streaming(
     engine: &DodamEngine,
     sql: &str,
@@ -37008,6 +41286,10 @@ async fn try_execute_set_operation_sql_to_sink(
     }
 
     if let Some(shared) = plan_same_source_union_all_scan(query.body.as_ref())? {
+        if try_write_same_source_union_all_primitive_to_sink(engine, &shared, batch_size, sink)? {
+            sink.finish()?;
+            return Ok(Some(ScanPlanMetrics::default()));
+        }
         let mut stream = engine
             .scan_parquet_batches(
                 shared.path,
@@ -37017,16 +41299,21 @@ async fn try_execute_set_operation_sql_to_sink(
                 Some(shared.filter),
             )
             .await?;
-        for batch in stream.by_ref() {
-            let batch = batch?;
-            if shared.aliases.is_empty() {
-                sink.write_batch(&batch)?;
-            } else {
-                for renamed in rename_output_batches(vec![batch], &shared.aliases)? {
-                    sink.write_batch(&renamed)?;
-                }
-            }
-        }
+        write_same_source_union_all_scan_stream_to_sink(&mut stream, &shared.aliases, sink)?;
+        sink.finish()?;
+        return Ok(Some(stream.into_scan_plan_metrics()));
+    }
+    if let Some(shared) = plan_same_source_union_all_filter_scan(query.body.as_ref())? {
+        let mut stream = engine
+            .scan_parquet_batches(
+                shared.path.clone(),
+                batch_size,
+                None,
+                shared.scan_projection.clone(),
+                Some(shared.prefilter.clone()),
+            )
+            .await?;
+        write_same_source_union_all_filter_scan_stream_to_sink(&mut stream, &shared, sink)?;
         sink.finish()?;
         return Ok(Some(stream.into_scan_plan_metrics()));
     }
@@ -37042,6 +41329,340 @@ async fn try_execute_set_operation_sql_to_sink(
     .await?;
     sink.finish()?;
     Ok(Some(ScanPlanMetrics::default()))
+}
+
+fn write_same_source_union_all_scan_stream_to_sink(
+    stream: &mut SendableBatchStream,
+    aliases: &[(String, String)],
+    sink: &mut dyn RecordBatchSink,
+) -> Result<()> {
+    let target_rows = same_source_union_scan_write_coalesce_rows();
+    if target_rows == 0 {
+        for batch in stream.by_ref() {
+            let batch = batch?;
+            if aliases.is_empty() {
+                sink.write_batch(&batch)?;
+            } else {
+                for renamed in rename_output_batches(vec![batch], aliases)? {
+                    sink.write_batch(&renamed)?;
+                }
+            }
+        }
+        return Ok(());
+    }
+    let mut buffered = Vec::<RecordBatch>::new();
+    let mut buffered_rows = 0usize;
+    for batch in stream.by_ref() {
+        let batch = batch?;
+        let batches = if aliases.is_empty() {
+            vec![batch]
+        } else {
+            rename_output_batches(vec![batch], aliases)?
+        };
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            buffered_rows += batch.num_rows();
+            buffered.push(batch);
+            if buffered_rows >= target_rows {
+                flush_record_batch_buffer(&mut buffered, &mut buffered_rows, sink)?;
+            }
+        }
+    }
+    flush_record_batch_buffer(&mut buffered, &mut buffered_rows, sink)?;
+    Ok(())
+}
+
+fn write_same_source_union_all_filter_scan_stream_to_sink(
+    stream: &mut SendableBatchStream,
+    shared: &SameSourceUnionAllFilterScan,
+    sink: &mut dyn RecordBatchSink,
+) -> Result<()> {
+    for batch in stream.by_ref() {
+        let batch = batch?;
+        let mut output = Vec::new();
+        append_same_source_union_all_filter_batches(&mut output, &batch, shared)?;
+        for batch in output {
+            sink.write_batch(&batch)?;
+        }
+    }
+    Ok(())
+}
+
+fn append_same_source_union_all_filter_batches(
+    output: &mut Vec<RecordBatch>,
+    batch: &RecordBatch,
+    shared: &SameSourceUnionAllFilterScan,
+) -> Result<()> {
+    for filter in &shared.filters {
+        let filtered = filter_batch(batch.clone(), filter)?;
+        if filtered.num_rows() == 0 {
+            continue;
+        }
+        let filtered = apply_output_projection(vec![filtered], &shared.projection)?;
+        let filtered = rename_output_batches(filtered, &shared.aliases)?;
+        output.extend(filtered);
+    }
+    Ok(())
+}
+
+fn same_source_union_scan_write_coalesce_rows() -> usize {
+    std::env::var("DODAM_UNION_SCAN_WRITE_COALESCE_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+fn flush_record_batch_buffer(
+    buffered: &mut Vec<RecordBatch>,
+    buffered_rows: &mut usize,
+    sink: &mut dyn RecordBatchSink,
+) -> Result<()> {
+    if buffered.is_empty() {
+        return Ok(());
+    }
+    let batch = if buffered.len() == 1 {
+        buffered.pop().expect("checked non-empty buffer")
+    } else {
+        let schema = buffered[0].schema();
+        concat_batches(&schema, buffered.iter())?
+    };
+    buffered.clear();
+    *buffered_rows = 0;
+    sink.write_batch(&batch)?;
+    Ok(())
+}
+
+fn try_write_same_source_union_all_primitive_to_sink(
+    engine: &DodamEngine,
+    shared: &SameSourceUnionAllScan,
+    batch_size: usize,
+    sink: &mut dyn RecordBatchSink,
+) -> Result<bool> {
+    if !same_source_union_primitive_sink_enabled() {
+        return Ok(false);
+    }
+    let Projection::Columns(output_columns) = &shared.projection else {
+        return Ok(false);
+    };
+    let Expr::InList {
+        column: filter_column,
+        values,
+        negated,
+        ..
+    } = shared.filter.expr()
+    else {
+        return Ok(false);
+    };
+    if *negated {
+        return Ok(false);
+    }
+    let mut scan_projection = shared.projection.clone();
+    add_projection_columns(&mut scan_projection, vec![filter_column.clone()]);
+    let Projection::Columns(scan_columns) = &scan_projection else {
+        return Ok(false);
+    };
+    let Some(column_types) =
+        engine.parquet_direct_primitive_column_types(&shared.path, scan_columns)?
+    else {
+        return Ok(false);
+    };
+    if !column_types.iter().all(|column_type| {
+        matches!(
+            column_type,
+            DirectPrimitiveColumnType::I32 | DirectPrimitiveColumnType::I64
+        )
+    }) {
+        return Ok(false);
+    }
+    let Some(filter_index) = scan_columns
+        .iter()
+        .position(|column| column == filter_column)
+    else {
+        return Ok(false);
+    };
+    let filter_values = match column_types[filter_index] {
+        DirectPrimitiveColumnType::I32 => PrimitiveFilterValues::I32(
+            values
+                .iter()
+                .map(|value| value.as_i32(filter_column))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        DirectPrimitiveColumnType::I64 => PrimitiveFilterValues::I64(
+            values
+                .iter()
+                .map(|value| value.as_i64(filter_column))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        DirectPrimitiveColumnType::Date32
+        | DirectPrimitiveColumnType::Decimal128Int64 { .. }
+        | DirectPrimitiveColumnType::Decimal128Int64Raw { .. } => return Ok(false),
+    };
+    let row_group_count = engine.parquet_row_group_count(&shared.path)?;
+    if row_group_count == 0 {
+        return Ok(true);
+    }
+    let specs = scan_columns
+        .iter()
+        .zip(column_types.iter())
+        .map(|(name, column_type)| DirectPrimitiveColumnSpec {
+            name,
+            column_type: *column_type,
+        })
+        .collect::<Vec<_>>();
+    let chunk_size = same_source_union_primitive_chunk_size(row_group_count);
+    let row_groups = (0..row_group_count).collect::<Vec<_>>();
+    let profile = ordered_sink_profile_enabled();
+    let total_started = profile.then(Instant::now);
+    let mut metrics = DirectPrimitiveColumnScanMetrics::default();
+    let mut concat_elapsed = Duration::ZERO;
+    let mut write_elapsed = Duration::ZERO;
+    let mut batches_written = 0usize;
+    let mut rows_written = 0usize;
+    for chunk in row_groups.chunks(chunk_size) {
+        let scan_results = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(chunk.len());
+            let scan_columns_ref = scan_columns;
+            let column_types_ref = &column_types;
+            let filter_values_ref = &filter_values;
+            for (position, row_group) in chunk.iter().copied().enumerate() {
+                let engine = engine.clone();
+                let path = shared.path.clone();
+                let specs = specs.clone();
+                handles.push(scope.spawn(move || {
+                    let mut row_group_batches = Vec::new();
+                    let metrics = engine.scan_parquet_primitive_columns_view(
+                        &path,
+                        batch_size,
+                        &[row_group],
+                        &specs,
+                        |view| {
+                            if let Some(batch) = primitive_ordered_selected_batch(
+                                view,
+                                scan_columns_ref,
+                                column_types_ref,
+                                filter_index,
+                                filter_values_ref,
+                            )? && batch.num_rows() > 0
+                            {
+                                row_group_batches.push(batch);
+                            }
+                            Ok(())
+                        },
+                    )?;
+                    Ok::<_, DodamError>((position, row_group_batches, metrics))
+                }));
+            }
+            let mut results = Vec::with_capacity(handles.len());
+            for handle in handles {
+                match handle.join() {
+                    Ok(result) => results.push(result?),
+                    Err(_) => {
+                        return Err(DodamError::UnsupportedSql(
+                            "same-source union primitive scan worker panicked".to_string(),
+                        ));
+                    }
+                }
+            }
+            Ok::<_, DodamError>(results)
+        })?;
+        let mut scan_results = scan_results;
+        scan_results.sort_by_key(|(position, _, _)| *position);
+        let mut chunk_batches = Vec::new();
+        for (_, row_group_batches, row_group_metrics) in scan_results {
+            if let Some(row_group_metrics) = row_group_metrics {
+                metrics.merge_from(row_group_metrics);
+            }
+            chunk_batches.extend(row_group_batches);
+        }
+        if chunk_batches.is_empty() {
+            continue;
+        }
+        let concat_started = profile.then(Instant::now);
+        let batch = PrimitiveBatch::concat(chunk_batches)?;
+        if let Some(started) = concat_started {
+            concat_elapsed += started.elapsed();
+        }
+        if batch.is_empty() {
+            continue;
+        }
+        rows_written += batch.num_rows();
+        let write_started = profile.then(Instant::now);
+        write_same_source_primitive_batch_to_sink(batch, &scan_projection, shared, sink)?;
+        if let Some(started) = write_started {
+            write_elapsed += started.elapsed();
+            batches_written += 1;
+        }
+    }
+    print_same_source_union_primitive_sink_profile(
+        total_started,
+        &metrics,
+        concat_elapsed,
+        write_elapsed,
+        batches_written,
+        rows_written,
+        output_columns.len(),
+    );
+    Ok(true)
+}
+
+fn same_source_union_primitive_sink_enabled() -> bool {
+    if std::env::var("DODAM_DISABLE_UNION_PRIMITIVE_SINK")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return false;
+    }
+    std::env::var("DODAM_ENABLE_UNION_PRIMITIVE_SINK")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn same_source_union_primitive_chunk_size(row_group_count: usize) -> usize {
+    if let Some(value) = std::env::var("DODAM_UNION_PRIMITIVE_ROW_GROUP_CHUNK_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+    {
+        return value;
+    }
+    let workers = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .min(row_group_count.max(1));
+    workers.min(24).max(1)
+}
+
+fn print_same_source_union_primitive_sink_profile(
+    total_started: Option<Instant>,
+    metrics: &DirectPrimitiveColumnScanMetrics,
+    concat_elapsed: Duration,
+    write_elapsed: Duration,
+    batches: usize,
+    rows: usize,
+    output_columns: usize,
+) {
+    let Some(total_started) = total_started else {
+        return;
+    };
+    let column_read = metrics
+        .column_read_nanos
+        .iter()
+        .map(|nanos| format!("{:.3}", (*nanos as f64) / 1_000_000.0))
+        .collect::<Vec<_>>()
+        .join(",");
+    eprintln!(
+        "[dodam:same-source-union-primitive-sink-profile] total={}us read={:.3}ms consume={:.3}ms concat={}us write={}us row_groups={} batches={} rows={} output_columns={} column_read_ms=[{}]",
+        total_started.elapsed().as_micros(),
+        (metrics.read_nanos as f64) / 1_000_000.0,
+        (metrics.consume_nanos as f64) / 1_000_000.0,
+        concat_elapsed.as_micros(),
+        write_elapsed.as_micros(),
+        metrics.row_groups,
+        batches,
+        rows,
+        output_columns,
+        column_read,
+    );
 }
 
 async fn try_write_same_source_union_all_ordered_desc_to_sink(
@@ -37068,12 +41689,9 @@ async fn try_write_same_source_union_all_ordered_desc_to_sink(
     let Some(shared) = plan_same_source_union_all_scan(expr)? else {
         return Ok(false);
     };
-    if !engine
+    let row_groups_monotonic = engine
         .parquet_row_groups_monotonic_by_column(shared.path.clone(), &sort.column)
-        .await?
-    {
-        return Ok(false);
-    }
+        .await?;
     let row_group_count = engine.parquet_row_group_count(&shared.path)?;
     if row_group_count == 0 {
         return Ok(true);
@@ -37083,6 +41701,19 @@ async fn try_write_same_source_union_all_ordered_desc_to_sink(
     add_projection_columns(&mut scan_projection, shared.filter.referenced_columns());
     for sort in &order_by.expressions {
         add_projection_columns(&mut scan_projection, vec![sort.column.clone()]);
+    }
+
+    if !row_groups_monotonic {
+        return try_write_same_source_union_all_streaming_primitive_topk_to_sink(
+            engine,
+            &shared,
+            batch_size,
+            &scan_projection,
+            &sort.column,
+            limit,
+            row_group_count,
+            sink,
+        );
     }
 
     if try_write_same_source_union_all_ordered_desc_primitive_to_sink(
@@ -37412,6 +42043,33 @@ fn ordered_sink_row_group_chunk_size(limit: usize, row_group_count: usize) -> us
         })
 }
 
+fn ordered_primitive_parallel_chunk_enabled(chunk_len: usize, limit: usize) -> bool {
+    if chunk_len <= 1 || limit <= ordered_primitive_sink_auto_max_limit_rows() {
+        return false;
+    }
+    !std::env::var("DODAM_DISABLE_ORDERED_PRIMITIVE_PARALLEL_CHUNK")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn ordered_primitive_sink_row_group_chunk_size(limit: usize, row_group_count: usize) -> usize {
+    if let Some(value) = std::env::var("DODAM_ORDERED_SINK_ROW_GROUP_CHUNK_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+    {
+        return value;
+    }
+    choose_ordered_primitive_row_group_chunk(OrderedPrimitiveChunkCostInput {
+        limit,
+        row_groups: row_group_count,
+        available_parallelism: std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4),
+        small_limit_rows: ordered_primitive_sink_auto_max_limit_rows(),
+        max_workers: 24,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn print_ordered_chunked_sink_profile(
     total_started: Option<Instant>,
@@ -37472,7 +42130,9 @@ fn try_write_same_source_union_all_ordered_desc_primitive_to_sink(
     row_group_count: usize,
     sink: &mut dyn RecordBatchSink,
 ) -> Result<bool> {
-    if !ordered_primitive_sink_enabled(limit) {
+    let primitive_sink_enabled = ordered_primitive_sink_enabled(limit);
+    let fused_page_decoder_enabled = ordered_primitive_fused_page_decoder_enabled();
+    if !primitive_sink_enabled && !fused_page_decoder_enabled {
         return Ok(false);
     }
     let Projection::Columns(columns) = scan_projection else {
@@ -37530,33 +42190,17 @@ fn try_write_same_source_union_all_ordered_desc_primitive_to_sink(
             column_type: *column_type,
         })
         .collect::<Vec<_>>();
-    let schema = Arc::new(Schema::new(
-        columns
-            .iter()
-            .zip(column_types.iter())
-            .map(|(name, column_type)| {
-                let data_type = match column_type {
-                    DirectPrimitiveColumnType::I32 => DataType::Int32,
-                    DirectPrimitiveColumnType::I64 => DataType::Int64,
-                    DirectPrimitiveColumnType::Date32 => DataType::Date32,
-                    DirectPrimitiveColumnType::Decimal128Int64 { precision, scale }
-                    | DirectPrimitiveColumnType::Decimal128Int64Raw { precision, scale } => {
-                        DataType::Decimal128(*precision, *scale)
-                    }
-                };
-                Field::new(name, data_type, false)
-            })
-            .collect::<Vec<_>>(),
-    ));
     let mut written = 0usize;
     let mut primitive_metrics = DirectPrimitiveColumnScanMetrics::default();
     let profile = ordered_sink_profile_enabled();
     let total_started = profile.then(Instant::now);
     let mut write_elapsed = Duration::ZERO;
+    let mut concat_elapsed = Duration::ZERO;
+    let mut slice_elapsed = Duration::ZERO;
     let mut batches_written = 0usize;
     let row_groups = (0..row_group_count).rev().collect::<Vec<_>>();
-    let chunk_size = ordered_sink_row_group_chunk_size(limit, row_group_count).max(1);
-    if ordered_primitive_fused_page_decoder_enabled() {
+    let chunk_size = ordered_primitive_sink_row_group_chunk_size(limit, row_group_count).max(1);
+    if fused_page_decoder_enabled {
         let filter_i32_values;
         let filter_i64_values;
         let (filter_i32, filter_i64) = match &filter_values {
@@ -37583,9 +42227,12 @@ fn try_write_same_source_union_all_ordered_desc_primitive_to_sink(
                 filter_i32,
                 filter_i64,
                 |batch| {
-                    let batch =
-                        direct_ordered_primitive_batch_to_record_batch(batch, schema.clone())?;
-                    if batch.num_rows() > 0 {
+                    let batch = direct_ordered_primitive_batch_to_primitive_batch(
+                        batch,
+                        columns,
+                        &column_types,
+                    )?;
+                    if !batch.is_empty() {
                         chunk_batches.push(batch);
                     }
                     Ok(())
@@ -37601,26 +42248,25 @@ fn try_write_same_source_union_all_ordered_desc_primitive_to_sink(
             if chunk_batches.is_empty() {
                 continue;
             }
-            let schema = chunk_batches[0].schema();
-            let batch = if chunk_batches.len() == 1 {
-                chunk_batches[0].clone()
-            } else {
-                concat_batches(&schema, chunk_batches.iter())?
-            };
-            fused_batches.push(batch);
+            fused_batches.push(PrimitiveBatch::concat(chunk_batches)?);
         }
         if fused_supported {
             primitive_metrics.merge_from(fused_metrics);
             for batch in fused_batches {
                 let remaining = limit - written;
                 let batch = if batch.num_rows() > remaining {
-                    batch.slice(0, remaining)
+                    let slice_started = profile.then(Instant::now);
+                    let batch = batch.slice(0, remaining)?;
+                    if let Some(started) = slice_started {
+                        slice_elapsed += started.elapsed();
+                    }
+                    batch
                 } else {
                     batch
                 };
                 written += batch.num_rows();
                 let write_started = profile.then(Instant::now);
-                write_same_source_batch_to_sink(batch, scan_projection, shared, sink)?;
+                write_same_source_primitive_batch_to_sink(batch, scan_projection, shared, sink)?;
                 if let Some(started) = write_started {
                     write_elapsed += started.elapsed();
                     batches_written += 1;
@@ -37633,98 +42279,187 @@ fn try_write_same_source_union_all_ordered_desc_primitive_to_sink(
                 total_started,
                 &primitive_metrics,
                 write_elapsed,
+                concat_elapsed,
+                slice_elapsed,
                 batches_written,
                 written,
             );
             return Ok(true);
         }
+        if !primitive_sink_enabled {
+            return Ok(false);
+        }
     }
     for chunk in row_groups.chunks(chunk_size) {
         let mut chunk_batches = Vec::new();
-        for &row_group in chunk {
-            let mut row_group_batches = Vec::new();
-            let metrics = if ordered_primitive_sink_page_reader_enabled() {
-                engine.scan_parquet_primitive_columns_page_view(
-                    &shared.path,
-                    batch_size,
-                    &[row_group],
-                    &specs,
-                    |view| {
-                        if written >= limit {
-                            return Ok(());
+        if ordered_primitive_parallel_chunk_enabled(chunk.len(), limit) {
+            let page_reader_enabled = ordered_primitive_sink_page_reader_enabled();
+            let scan_results = std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(chunk.len());
+                let columns_ref = columns;
+                let column_types_ref = &column_types;
+                let filter_values_ref = &filter_values;
+                for (position, row_group) in chunk.iter().copied().enumerate() {
+                    let engine = engine.clone();
+                    let path = shared.path.clone();
+                    let specs = specs.clone();
+                    handles.push(scope.spawn(move || {
+                        let mut row_group_batches = Vec::new();
+                        let metrics = if page_reader_enabled {
+                            engine.scan_parquet_primitive_columns_page_view(
+                                &path,
+                                batch_size,
+                                &[row_group],
+                                &specs,
+                                |view| {
+                                    if let Some(batch) = primitive_ordered_selected_batch(
+                                        view,
+                                        columns_ref,
+                                        column_types_ref,
+                                        filter_index,
+                                        filter_values_ref,
+                                    )? && batch.num_rows() > 0
+                                    {
+                                        row_group_batches.push(batch);
+                                    }
+                                    Ok(())
+                                },
+                            )?
+                        } else {
+                            engine.scan_parquet_primitive_columns_view(
+                                &path,
+                                batch_size,
+                                &[row_group],
+                                &specs,
+                                |view| {
+                                    if let Some(batch) = primitive_ordered_selected_batch(
+                                        view,
+                                        columns_ref,
+                                        column_types_ref,
+                                        filter_index,
+                                        filter_values_ref,
+                                    )? && batch.num_rows() > 0
+                                    {
+                                        row_group_batches.push(batch);
+                                    }
+                                    Ok(())
+                                },
+                            )?
+                        };
+                        Ok::<_, DodamError>((position, row_group_batches, metrics))
+                    }));
+                }
+                let mut results = Vec::with_capacity(handles.len());
+                for handle in handles {
+                    match handle.join() {
+                        Ok(result) => results.push(result?),
+                        Err(_) => {
+                            return Err(DodamError::UnsupportedSql(
+                                "ordered primitive scan worker panicked".to_string(),
+                            ));
                         }
-                        if let Some(batch) = primitive_ordered_selected_batch(
-                            view,
-                            &column_types,
-                            filter_index,
-                            &filter_values,
-                            schema.clone(),
-                        )? && batch.num_rows() > 0
-                        {
-                            row_group_batches.push(batch);
-                        }
-                        Ok(())
-                    },
-                )?
-            } else {
-                engine.scan_parquet_primitive_columns_view(
-                    &shared.path,
-                    batch_size,
-                    &[row_group],
-                    &specs,
-                    |view| {
-                        if written >= limit {
-                            return Ok(());
-                        }
-                        if let Some(batch) = primitive_ordered_selected_batch(
-                            view,
-                            &column_types,
-                            filter_index,
-                            &filter_values,
-                            schema.clone(),
-                        )? && batch.num_rows() > 0
-                        {
-                            row_group_batches.push(batch);
-                        }
-                        Ok(())
-                    },
-                )?
-            };
-            if let Some(metrics) = metrics {
-                primitive_metrics.merge_from(metrics);
+                    }
+                }
+                Ok::<_, DodamError>(results)
+            })?;
+            let mut scan_results = scan_results;
+            scan_results.sort_by_key(|(position, _, _)| *position);
+            for (_, row_group_batches, metrics) in scan_results {
+                if let Some(metrics) = metrics {
+                    primitive_metrics.merge_from(metrics);
+                }
+                chunk_batches.extend(row_group_batches.into_iter().rev());
             }
-            chunk_batches.extend(row_group_batches.into_iter().rev());
-            if written
-                + chunk_batches
-                    .iter()
-                    .map(RecordBatch::num_rows)
-                    .sum::<usize>()
-                >= limit
-            {
-                break;
+        } else {
+            for &row_group in chunk {
+                let mut row_group_batches = Vec::new();
+                let metrics = if ordered_primitive_sink_page_reader_enabled() {
+                    engine.scan_parquet_primitive_columns_page_view(
+                        &shared.path,
+                        batch_size,
+                        &[row_group],
+                        &specs,
+                        |view| {
+                            if written >= limit {
+                                return Ok(());
+                            }
+                            if let Some(batch) = primitive_ordered_selected_batch(
+                                view,
+                                columns,
+                                &column_types,
+                                filter_index,
+                                &filter_values,
+                            )? && batch.num_rows() > 0
+                            {
+                                row_group_batches.push(batch);
+                            }
+                            Ok(())
+                        },
+                    )?
+                } else {
+                    engine.scan_parquet_primitive_columns_view(
+                        &shared.path,
+                        batch_size,
+                        &[row_group],
+                        &specs,
+                        |view| {
+                            if written >= limit {
+                                return Ok(());
+                            }
+                            if let Some(batch) = primitive_ordered_selected_batch(
+                                view,
+                                columns,
+                                &column_types,
+                                filter_index,
+                                &filter_values,
+                            )? && batch.num_rows() > 0
+                            {
+                                row_group_batches.push(batch);
+                            }
+                            Ok(())
+                        },
+                    )?
+                };
+                if let Some(metrics) = metrics {
+                    primitive_metrics.merge_from(metrics);
+                }
+                chunk_batches.extend(row_group_batches.into_iter().rev());
+                if written
+                    + chunk_batches
+                        .iter()
+                        .map(PrimitiveBatch::num_rows)
+                        .sum::<usize>()
+                    >= limit
+                {
+                    break;
+                }
             }
         }
         if chunk_batches.is_empty() {
             continue;
         }
-        let schema = chunk_batches[0].schema();
-        let batch = if chunk_batches.len() == 1 {
-            chunk_batches[0].clone()
-        } else {
-            concat_batches(&schema, chunk_batches.iter())?
-        };
-        if batch.num_rows() == 0 {
+        let concat_started = profile.then(Instant::now);
+        let batch = PrimitiveBatch::concat(chunk_batches)?;
+        if let Some(started) = concat_started {
+            concat_elapsed += started.elapsed();
+        }
+        if batch.is_empty() {
             continue;
         }
         let remaining = limit - written;
         let batch = if batch.num_rows() > remaining {
-            batch.slice(0, remaining)
+            let slice_started = profile.then(Instant::now);
+            let batch = batch.slice(0, remaining)?;
+            if let Some(started) = slice_started {
+                slice_elapsed += started.elapsed();
+            }
+            batch
         } else {
             batch
         };
         written += batch.num_rows();
         let write_started = profile.then(Instant::now);
-        write_same_source_batch_to_sink(batch, scan_projection, shared, sink)?;
+        write_same_source_primitive_batch_to_sink(batch, scan_projection, shared, sink)?;
         if let Some(started) = write_started {
             write_elapsed += started.elapsed();
             batches_written += 1;
@@ -37734,6 +42469,8 @@ fn try_write_same_source_union_all_ordered_desc_primitive_to_sink(
                 total_started,
                 &primitive_metrics,
                 write_elapsed,
+                concat_elapsed,
+                slice_elapsed,
                 batches_written,
                 written,
             );
@@ -37744,6 +42481,8 @@ fn try_write_same_source_union_all_ordered_desc_primitive_to_sink(
         total_started,
         &primitive_metrics,
         write_elapsed,
+        concat_elapsed,
+        slice_elapsed,
         batches_written,
         written,
     );
@@ -37755,23 +42494,58 @@ enum PrimitiveFilterValues {
     I64(Vec<i64>),
 }
 
-fn direct_ordered_primitive_batch_to_record_batch(
+fn direct_ordered_primitive_batch_to_primitive_batch(
     batch: DirectOrderedPrimitiveBatch,
-    schema: Arc<Schema>,
-) -> Result<RecordBatch> {
+    names: &[String],
+    column_types: &[DirectPrimitiveColumnType],
+) -> Result<PrimitiveBatch> {
+    if batch.columns.len() != names.len() || names.len() != column_types.len() {
+        return Err(DodamError::UnsupportedSql(
+            "primitive batch schema mismatch".to_string(),
+        ));
+    }
     let columns = batch
         .columns
         .into_iter()
-        .map(|column| match column {
-            DirectOrderedPrimitiveColumnValues::I32(values) => {
-                Arc::new(Int32Array::from(values)) as ArrayRef
-            }
-            DirectOrderedPrimitiveColumnValues::I64(values) => {
-                Arc::new(Int64Array::from(values)) as ArrayRef
-            }
+        .zip(names.iter())
+        .zip(column_types.iter())
+        .map(|((column, name), column_type)| {
+            let values = match (column, column_type) {
+                (
+                    DirectOrderedPrimitiveColumnValues::I32(values),
+                    DirectPrimitiveColumnType::I32,
+                ) => PrimitiveColumnValues::I32(values),
+                (
+                    DirectOrderedPrimitiveColumnValues::I64(values),
+                    DirectPrimitiveColumnType::I64,
+                ) => PrimitiveColumnValues::I64(values),
+                _ => {
+                    return Err(DodamError::UnsupportedSql(
+                        "primitive batch value type mismatch".to_string(),
+                    ));
+                }
+            };
+            Ok(PrimitiveColumn {
+                name: name.clone(),
+                data_type: primitive_output_data_type(column_type)?,
+                nullable: false,
+                values,
+            })
         })
-        .collect::<Vec<_>>();
-    Ok(RecordBatch::try_new(schema, columns)?)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(PrimitiveBatch { columns })
+}
+
+fn primitive_output_data_type(column_type: &DirectPrimitiveColumnType) -> Result<DataType> {
+    match column_type {
+        DirectPrimitiveColumnType::I32 => Ok(DataType::Int32),
+        DirectPrimitiveColumnType::I64 => Ok(DataType::Int64),
+        DirectPrimitiveColumnType::Date32 => Ok(DataType::Date32),
+        DirectPrimitiveColumnType::Decimal128Int64 { precision, scale }
+        | DirectPrimitiveColumnType::Decimal128Int64Raw { precision, scale } => {
+            Ok(DataType::Decimal128(*precision, *scale))
+        }
+    }
 }
 
 fn ordered_primitive_sink_enabled(limit: usize) -> bool {
@@ -37785,7 +42559,11 @@ fn ordered_primitive_sink_enabled(limit: usize) -> bool {
     {
         return false;
     }
-    limit <= ordered_primitive_sink_auto_max_limit_rows()
+    choose_ordered_primitive_sink(OrderedPrimitiveSinkCostInput {
+        limit,
+        small_limit_rows: ordered_primitive_sink_auto_max_limit_rows(),
+        large_auto_enabled: ordered_primitive_large_sink_auto_enabled(limit),
+    })
 }
 
 fn ordered_primitive_sink_auto_max_limit_rows() -> usize {
@@ -37794,6 +42572,15 @@ fn ordered_primitive_sink_auto_max_limit_rows() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(16 * 1024)
+}
+
+fn ordered_primitive_large_sink_auto_enabled(limit: usize) -> bool {
+    if std::env::var("DODAM_DISABLE_ORDERED_PRIMITIVE_LARGE_SINK_AUTO")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return false;
+    }
+    limit > ordered_primitive_sink_auto_max_limit_rows()
 }
 
 fn ordered_primitive_fused_page_decoder_enabled() -> bool {
@@ -37810,6 +42597,8 @@ fn print_ordered_primitive_sink_profile(
     total_started: Option<Instant>,
     metrics: &DirectPrimitiveColumnScanMetrics,
     write_elapsed: Duration,
+    concat_elapsed: Duration,
+    slice_elapsed: Duration,
     batches: usize,
     rows: usize,
 ) {
@@ -37823,10 +42612,12 @@ fn print_ordered_primitive_sink_profile(
         .collect::<Vec<_>>()
         .join(",");
     eprintln!(
-        "[dodam:ordered-primitive-sink-profile] total={}us read={:.3}ms consume={:.3}ms write={}us row_groups={} batches={} rows={} column_read_ms=[{}]",
+        "[dodam:ordered-primitive-sink-profile] total={}us read={:.3}ms consume={:.3}ms concat={}us slice={}us write={}us row_groups={} batches={} rows={} column_read_ms=[{}]",
         total_started.elapsed().as_micros(),
         (metrics.read_nanos as f64) / 1_000_000.0,
         (metrics.consume_nanos as f64) / 1_000_000.0,
+        concat_elapsed.as_micros(),
+        slice_elapsed.as_micros(),
         write_elapsed.as_micros(),
         metrics.row_groups,
         batches,
@@ -37837,19 +42628,22 @@ fn print_ordered_primitive_sink_profile(
 
 fn primitive_ordered_selected_batch(
     view: BatchView<'_>,
+    column_names: &[String],
     column_types: &[DirectPrimitiveColumnType],
     filter_index: usize,
     filter_values: &PrimitiveFilterValues,
-    schema: Arc<Schema>,
-) -> Result<Option<RecordBatch>> {
+) -> Result<Option<PrimitiveBatch>> {
     if let Some(batch) = primitive_ordered_selected_batch_null_free_fast(
         view,
+        column_names,
         column_types,
         filter_index,
         filter_values,
-        schema.clone(),
     )? {
         return Ok(Some(batch));
+    }
+    if !row_at_time_fallback_enabled() {
+        return Ok(None);
     }
     let mut selected = Vec::new();
     match filter_values {
@@ -37881,9 +42675,9 @@ fn primitive_ordered_selected_batch(
         }
     }
     if selected.is_empty() {
-        return Ok(Some(RecordBatch::new_empty(schema)));
+        return primitive_empty_batch(column_names, column_types).map(Some);
     }
-    let mut arrays = Vec::with_capacity(column_types.len());
+    let mut columns = Vec::with_capacity(column_types.len());
     for (index, column_type) in column_types.iter().enumerate() {
         match column_type {
             DirectPrimitiveColumnType::I32 => {
@@ -37898,7 +42692,12 @@ fn primitive_ordered_selected_batch(
                     }
                     output.push(column.value(row));
                 }
-                arrays.push(Arc::new(Int32Array::from(output)) as ArrayRef);
+                columns.push(PrimitiveColumn {
+                    name: column_names[index].clone(),
+                    data_type: primitive_output_data_type(column_type)?,
+                    nullable: false,
+                    values: PrimitiveColumnValues::I32(output),
+                });
             }
             DirectPrimitiveColumnType::I64 => {
                 let Some(column) = view.i64_vector(index) else {
@@ -37912,14 +42711,19 @@ fn primitive_ordered_selected_batch(
                     }
                     output.push(column.value(row));
                 }
-                arrays.push(Arc::new(Int64Array::from(output)) as ArrayRef);
+                columns.push(PrimitiveColumn {
+                    name: column_names[index].clone(),
+                    data_type: primitive_output_data_type(column_type)?,
+                    nullable: false,
+                    values: PrimitiveColumnValues::I64(output),
+                });
             }
             DirectPrimitiveColumnType::Date32
             | DirectPrimitiveColumnType::Decimal128Int64 { .. }
             | DirectPrimitiveColumnType::Decimal128Int64Raw { .. } => return Ok(None),
         }
     }
-    Ok(Some(RecordBatch::try_new(schema, arrays)?))
+    Ok(Some(PrimitiveBatch { columns }))
 }
 
 #[derive(Clone, Copy)]
@@ -37933,13 +42737,718 @@ enum PrimitiveColumnOutput {
     I64(Vec<i64>),
 }
 
+fn primitive_topk_filter_positions_into(
+    column: NullFreePrimitiveColumn<'_>,
+    filter_values: &PrimitiveFilterValues,
+    selected: &mut Vec<usize>,
+) {
+    selected.clear();
+    match (column, filter_values) {
+        (NullFreePrimitiveColumn::I32(values), PrimitiveFilterValues::I32(filter_values)) => {
+            reserve_selected_positions(selected, values.len());
+            primitive_topk_filter_i32_positions(values, filter_values, selected);
+        }
+        (NullFreePrimitiveColumn::I64(values), PrimitiveFilterValues::I64(filter_values)) => {
+            reserve_selected_positions(selected, values.len());
+            primitive_topk_filter_i64_positions(values, filter_values, selected);
+        }
+        _ => {}
+    }
+}
+
+fn primitive_topk_filter_positions_with_min_key_into(
+    filter_column: NullFreePrimitiveColumn<'_>,
+    filter_values: &PrimitiveFilterValues,
+    sort_column: NullFreePrimitiveColumn<'_>,
+    min_key: i128,
+    selected: &mut Vec<usize>,
+) {
+    selected.clear();
+    match (filter_column, filter_values, sort_column) {
+        (
+            NullFreePrimitiveColumn::I32(filter_values_slice),
+            PrimitiveFilterValues::I32(filter_values),
+            NullFreePrimitiveColumn::I32(sort_values),
+        ) => {
+            let min_key = match i32::try_from(min_key) {
+                Ok(min_key) => min_key,
+                Err(_) if min_key < i128::from(i32::MIN) => {
+                    primitive_topk_filter_i32_positions(
+                        filter_values_slice,
+                        filter_values,
+                        selected,
+                    );
+                    return;
+                }
+                Err(_) => {
+                    selected.clear();
+                    return;
+                }
+            };
+            reserve_selected_positions(selected, filter_values_slice.len());
+            primitive_topk_filter_i32_positions_with_i32_min_key(
+                filter_values_slice,
+                filter_values,
+                sort_values,
+                min_key,
+                selected,
+            );
+        }
+        (
+            NullFreePrimitiveColumn::I32(filter_values_slice),
+            PrimitiveFilterValues::I32(filter_values),
+            NullFreePrimitiveColumn::I64(sort_values),
+        ) => {
+            let min_key = match i64::try_from(min_key) {
+                Ok(min_key) => min_key,
+                Err(_) if min_key < i128::from(i64::MIN) => {
+                    primitive_topk_filter_i32_positions(
+                        filter_values_slice,
+                        filter_values,
+                        selected,
+                    );
+                    return;
+                }
+                Err(_) => {
+                    selected.clear();
+                    return;
+                }
+            };
+            reserve_selected_positions(selected, filter_values_slice.len());
+            primitive_topk_filter_i32_positions_with_i64_min_key(
+                filter_values_slice,
+                filter_values,
+                sort_values,
+                min_key,
+                selected,
+            );
+        }
+        (
+            NullFreePrimitiveColumn::I64(filter_values_slice),
+            PrimitiveFilterValues::I64(filter_values),
+            NullFreePrimitiveColumn::I64(sort_values),
+        ) => {
+            let min_key = match i64::try_from(min_key) {
+                Ok(min_key) => min_key,
+                Err(_) if min_key < i128::from(i64::MIN) => {
+                    primitive_topk_filter_i64_positions(
+                        filter_values_slice,
+                        filter_values,
+                        selected,
+                    );
+                    return;
+                }
+                Err(_) => {
+                    selected.clear();
+                    return;
+                }
+            };
+            reserve_selected_positions(selected, filter_values_slice.len());
+            primitive_topk_filter_i64_positions_with_i64_min_key(
+                filter_values_slice,
+                filter_values,
+                sort_values,
+                min_key,
+                selected,
+            );
+        }
+        (
+            NullFreePrimitiveColumn::I64(filter_values_slice),
+            PrimitiveFilterValues::I64(filter_values),
+            NullFreePrimitiveColumn::I32(sort_values),
+        ) => {
+            let min_key = match i32::try_from(min_key) {
+                Ok(min_key) => min_key,
+                Err(_) if min_key < i128::from(i32::MIN) => {
+                    primitive_topk_filter_i64_positions(
+                        filter_values_slice,
+                        filter_values,
+                        selected,
+                    );
+                    return;
+                }
+                Err(_) => {
+                    selected.clear();
+                    return;
+                }
+            };
+            reserve_selected_positions(selected, filter_values_slice.len());
+            primitive_topk_filter_i64_positions_with_i32_min_key(
+                filter_values_slice,
+                filter_values,
+                sort_values,
+                min_key,
+                selected,
+            );
+        }
+        _ => primitive_topk_filter_positions_into(filter_column, filter_values, selected),
+    }
+}
+
+fn primitive_topk_filter_i32_positions(
+    values: &[i32],
+    filter_values: &[i32],
+    selected: &mut Vec<usize>,
+) {
+    match filter_values {
+        [] => {}
+        [a] => push_i32_eq_positions(values, *a, selected),
+        [a, b] => push_i32_eq2_positions(values, *a, *b, selected),
+        [a, b, c] => push_i32_eq3_positions(values, *a, *b, *c, selected),
+        [a, b, c, d] => push_i32_eq4_positions(values, *a, *b, *c, *d, selected),
+        _ => {
+            for (row, value) in values.iter().copied().enumerate() {
+                if filter_values.contains(&value) {
+                    selected.push(row);
+                }
+            }
+        }
+    }
+}
+
+fn primitive_topk_filter_i64_positions(
+    values: &[i64],
+    filter_values: &[i64],
+    selected: &mut Vec<usize>,
+) {
+    match filter_values {
+        [] => {}
+        [a] => push_i64_eq_positions(values, *a, selected),
+        [a, b] => push_i64_eq2_positions(values, *a, *b, selected),
+        [a, b, c] => push_i64_eq3_positions(values, *a, *b, *c, selected),
+        [a, b, c, d] => push_i64_eq4_positions(values, *a, *b, *c, *d, selected),
+        _ => {
+            for (row, value) in values.iter().copied().enumerate() {
+                if filter_values.contains(&value) {
+                    selected.push(row);
+                }
+            }
+        }
+    }
+}
+
+fn primitive_topk_filter_i32_positions_with_i32_min_key(
+    values: &[i32],
+    filter_values: &[i32],
+    sort_values: &[i32],
+    min_key: i32,
+    selected: &mut Vec<usize>,
+) {
+    push_primitive_position_pairs_unrolled(values, sort_values, selected, |value, key| {
+        key >= min_key && small_i32_filter_values_contains(filter_values, value)
+    });
+}
+
+fn primitive_topk_filter_i32_positions_with_i64_min_key(
+    values: &[i32],
+    filter_values: &[i32],
+    sort_values: &[i64],
+    min_key: i64,
+    selected: &mut Vec<usize>,
+) {
+    push_primitive_position_pairs_unrolled(values, sort_values, selected, |value, key| {
+        key >= min_key && small_i32_filter_values_contains(filter_values, value)
+    });
+}
+
+fn primitive_topk_filter_i64_positions_with_i64_min_key(
+    values: &[i64],
+    filter_values: &[i64],
+    sort_values: &[i64],
+    min_key: i64,
+    selected: &mut Vec<usize>,
+) {
+    push_primitive_position_pairs_unrolled(values, sort_values, selected, |value, key| {
+        key >= min_key && small_i64_filter_values_contains(filter_values, value)
+    });
+}
+
+fn primitive_topk_filter_i64_positions_with_i32_min_key(
+    values: &[i64],
+    filter_values: &[i64],
+    sort_values: &[i32],
+    min_key: i32,
+    selected: &mut Vec<usize>,
+) {
+    push_primitive_position_pairs_unrolled(values, sort_values, selected, |value, key| {
+        key >= min_key && small_i64_filter_values_contains(filter_values, value)
+    });
+}
+
+fn small_i32_filter_values_contains(values: &[i32], value: i32) -> bool {
+    match values {
+        [] => false,
+        [a] => value == *a,
+        [a, b] => value == *a || value == *b,
+        [a, b, c] => value == *a || value == *b || value == *c,
+        [a, b, c, d] => value == *a || value == *b || value == *c || value == *d,
+        _ => values.contains(&value),
+    }
+}
+
+fn small_i64_filter_values_contains(values: &[i64], value: i64) -> bool {
+    match values {
+        [] => false,
+        [a] => value == *a,
+        [a, b] => value == *a || value == *b,
+        [a, b, c] => value == *a || value == *b || value == *c,
+        [a, b, c, d] => value == *a || value == *b || value == *c || value == *d,
+        _ => values.contains(&value),
+    }
+}
+
+fn push_i32_eq_positions(values: &[i32], a: i32, selected: &mut Vec<usize>) {
+    push_primitive_positions_unrolled(values, selected, |value| value == a);
+}
+
+fn push_i32_eq2_positions(values: &[i32], a: i32, b: i32, selected: &mut Vec<usize>) {
+    push_primitive_positions_unrolled(values, selected, |value| value == a || value == b);
+}
+
+fn push_i32_eq3_positions(values: &[i32], a: i32, b: i32, c: i32, selected: &mut Vec<usize>) {
+    push_primitive_positions_unrolled(values, selected, |value| {
+        value == a || value == b || value == c
+    });
+}
+
+fn push_i32_eq4_positions(
+    values: &[i32],
+    a: i32,
+    b: i32,
+    c: i32,
+    d: i32,
+    selected: &mut Vec<usize>,
+) {
+    push_primitive_positions_unrolled(values, selected, |value| {
+        value == a || value == b || value == c || value == d
+    });
+}
+
+fn push_i64_eq_positions(values: &[i64], a: i64, selected: &mut Vec<usize>) {
+    push_primitive_positions_unrolled(values, selected, |value| value == a);
+}
+
+fn push_i64_eq2_positions(values: &[i64], a: i64, b: i64, selected: &mut Vec<usize>) {
+    push_primitive_positions_unrolled(values, selected, |value| value == a || value == b);
+}
+
+fn push_i64_eq3_positions(values: &[i64], a: i64, b: i64, c: i64, selected: &mut Vec<usize>) {
+    push_primitive_positions_unrolled(values, selected, |value| {
+        value == a || value == b || value == c
+    });
+}
+
+fn push_i64_eq4_positions(
+    values: &[i64],
+    a: i64,
+    b: i64,
+    c: i64,
+    d: i64,
+    selected: &mut Vec<usize>,
+) {
+    push_primitive_positions_unrolled(values, selected, |value| {
+        value == a || value == b || value == c || value == d
+    });
+}
+
+fn push_primitive_positions_unrolled<T, F>(values: &[T], selected: &mut Vec<usize>, mut matches: F)
+where
+    T: Copy,
+    F: FnMut(T) -> bool,
+{
+    let mut row = 0usize;
+    let chunks = values.len() / 8 * 8;
+    while row < chunks {
+        let v0 = values[row];
+        let v1 = values[row + 1];
+        let v2 = values[row + 2];
+        let v3 = values[row + 3];
+        let v4 = values[row + 4];
+        let v5 = values[row + 5];
+        let v6 = values[row + 6];
+        let v7 = values[row + 7];
+        if matches(v0) {
+            selected.push(row);
+        }
+        if matches(v1) {
+            selected.push(row + 1);
+        }
+        if matches(v2) {
+            selected.push(row + 2);
+        }
+        if matches(v3) {
+            selected.push(row + 3);
+        }
+        if matches(v4) {
+            selected.push(row + 4);
+        }
+        if matches(v5) {
+            selected.push(row + 5);
+        }
+        if matches(v6) {
+            selected.push(row + 6);
+        }
+        if matches(v7) {
+            selected.push(row + 7);
+        }
+        row += 8;
+    }
+    while row < values.len() {
+        if matches(values[row]) {
+            selected.push(row);
+        }
+        row += 1;
+    }
+}
+
+fn push_primitive_position_pairs_unrolled<T, U, F>(
+    values: &[T],
+    keys: &[U],
+    selected: &mut Vec<usize>,
+    mut matches: F,
+) where
+    T: Copy,
+    U: Copy,
+    F: FnMut(T, U) -> bool,
+{
+    let len = values.len().min(keys.len());
+    let mut row = 0usize;
+    let chunks = len / 8 * 8;
+    while row < chunks {
+        let v0 = values[row];
+        let v1 = values[row + 1];
+        let v2 = values[row + 2];
+        let v3 = values[row + 3];
+        let v4 = values[row + 4];
+        let v5 = values[row + 5];
+        let v6 = values[row + 6];
+        let v7 = values[row + 7];
+        let k0 = keys[row];
+        let k1 = keys[row + 1];
+        let k2 = keys[row + 2];
+        let k3 = keys[row + 3];
+        let k4 = keys[row + 4];
+        let k5 = keys[row + 5];
+        let k6 = keys[row + 6];
+        let k7 = keys[row + 7];
+        if matches(v0, k0) {
+            selected.push(row);
+        }
+        if matches(v1, k1) {
+            selected.push(row + 1);
+        }
+        if matches(v2, k2) {
+            selected.push(row + 2);
+        }
+        if matches(v3, k3) {
+            selected.push(row + 3);
+        }
+        if matches(v4, k4) {
+            selected.push(row + 4);
+        }
+        if matches(v5, k5) {
+            selected.push(row + 5);
+        }
+        if matches(v6, k6) {
+            selected.push(row + 6);
+        }
+        if matches(v7, k7) {
+            selected.push(row + 7);
+        }
+        row += 8;
+    }
+    while row < len {
+        if matches(values[row], keys[row]) {
+            selected.push(row);
+        }
+        row += 1;
+    }
+}
+
+fn primitive_filter_i32_positions_desc(
+    values: &[i32],
+    filter_values: &[i32],
+    selected: &mut Vec<usize>,
+) {
+    match filter_values {
+        [] => {}
+        [a] => push_i32_eq_positions_desc(values, *a, selected),
+        [a, b] => push_i32_eq2_positions_desc(values, *a, *b, selected),
+        [a, b, c] => push_primitive_positions_desc_unrolled(values, selected, |value| {
+            value == *a || value == *b || value == *c
+        }),
+        [a, b, c, d] => push_primitive_positions_desc_unrolled(values, selected, |value| {
+            value == *a || value == *b || value == *c || value == *d
+        }),
+        _ => {
+            let mut row = values.len();
+            while row > 0 {
+                row -= 1;
+                if filter_values.contains(&values[row]) {
+                    selected.push(row);
+                }
+            }
+        }
+    }
+}
+
+fn primitive_filter_i64_positions_desc(
+    values: &[i64],
+    filter_values: &[i64],
+    selected: &mut Vec<usize>,
+) {
+    match filter_values {
+        [] => {}
+        [a] => push_i64_eq_positions_desc(values, *a, selected),
+        [a, b] => push_i64_eq2_positions_desc(values, *a, *b, selected),
+        [a, b, c] => push_primitive_positions_desc_unrolled(values, selected, |value| {
+            value == *a || value == *b || value == *c
+        }),
+        [a, b, c, d] => push_primitive_positions_desc_unrolled(values, selected, |value| {
+            value == *a || value == *b || value == *c || value == *d
+        }),
+        _ => {
+            let mut row = values.len();
+            while row > 0 {
+                row -= 1;
+                if filter_values.contains(&values[row]) {
+                    selected.push(row);
+                }
+            }
+        }
+    }
+}
+
+fn push_i32_eq_positions_desc(values: &[i32], a: i32, selected: &mut Vec<usize>) {
+    let mut row = values.len();
+    while row >= 8 {
+        row -= 8;
+        if values[row + 7] == a {
+            selected.push(row + 7);
+        }
+        if values[row + 6] == a {
+            selected.push(row + 6);
+        }
+        if values[row + 5] == a {
+            selected.push(row + 5);
+        }
+        if values[row + 4] == a {
+            selected.push(row + 4);
+        }
+        if values[row + 3] == a {
+            selected.push(row + 3);
+        }
+        if values[row + 2] == a {
+            selected.push(row + 2);
+        }
+        if values[row + 1] == a {
+            selected.push(row + 1);
+        }
+        if values[row] == a {
+            selected.push(row);
+        }
+    }
+    while row > 0 {
+        row -= 1;
+        if values[row] == a {
+            selected.push(row);
+        }
+    }
+}
+
+fn push_i32_eq2_positions_desc(values: &[i32], a: i32, b: i32, selected: &mut Vec<usize>) {
+    let mut row = values.len();
+    while row >= 8 {
+        row -= 8;
+        let v7 = values[row + 7];
+        let v6 = values[row + 6];
+        let v5 = values[row + 5];
+        let v4 = values[row + 4];
+        let v3 = values[row + 3];
+        let v2 = values[row + 2];
+        let v1 = values[row + 1];
+        let v0 = values[row];
+        if v7 == a || v7 == b {
+            selected.push(row + 7);
+        }
+        if v6 == a || v6 == b {
+            selected.push(row + 6);
+        }
+        if v5 == a || v5 == b {
+            selected.push(row + 5);
+        }
+        if v4 == a || v4 == b {
+            selected.push(row + 4);
+        }
+        if v3 == a || v3 == b {
+            selected.push(row + 3);
+        }
+        if v2 == a || v2 == b {
+            selected.push(row + 2);
+        }
+        if v1 == a || v1 == b {
+            selected.push(row + 1);
+        }
+        if v0 == a || v0 == b {
+            selected.push(row);
+        }
+    }
+    while row > 0 {
+        row -= 1;
+        let value = values[row];
+        if value == a || value == b {
+            selected.push(row);
+        }
+    }
+}
+
+fn push_i64_eq_positions_desc(values: &[i64], a: i64, selected: &mut Vec<usize>) {
+    let mut row = values.len();
+    while row >= 8 {
+        row -= 8;
+        if values[row + 7] == a {
+            selected.push(row + 7);
+        }
+        if values[row + 6] == a {
+            selected.push(row + 6);
+        }
+        if values[row + 5] == a {
+            selected.push(row + 5);
+        }
+        if values[row + 4] == a {
+            selected.push(row + 4);
+        }
+        if values[row + 3] == a {
+            selected.push(row + 3);
+        }
+        if values[row + 2] == a {
+            selected.push(row + 2);
+        }
+        if values[row + 1] == a {
+            selected.push(row + 1);
+        }
+        if values[row] == a {
+            selected.push(row);
+        }
+    }
+    while row > 0 {
+        row -= 1;
+        if values[row] == a {
+            selected.push(row);
+        }
+    }
+}
+
+fn push_i64_eq2_positions_desc(values: &[i64], a: i64, b: i64, selected: &mut Vec<usize>) {
+    let mut row = values.len();
+    while row >= 8 {
+        row -= 8;
+        let v7 = values[row + 7];
+        let v6 = values[row + 6];
+        let v5 = values[row + 5];
+        let v4 = values[row + 4];
+        let v3 = values[row + 3];
+        let v2 = values[row + 2];
+        let v1 = values[row + 1];
+        let v0 = values[row];
+        if v7 == a || v7 == b {
+            selected.push(row + 7);
+        }
+        if v6 == a || v6 == b {
+            selected.push(row + 6);
+        }
+        if v5 == a || v5 == b {
+            selected.push(row + 5);
+        }
+        if v4 == a || v4 == b {
+            selected.push(row + 4);
+        }
+        if v3 == a || v3 == b {
+            selected.push(row + 3);
+        }
+        if v2 == a || v2 == b {
+            selected.push(row + 2);
+        }
+        if v1 == a || v1 == b {
+            selected.push(row + 1);
+        }
+        if v0 == a || v0 == b {
+            selected.push(row);
+        }
+    }
+    while row > 0 {
+        row -= 1;
+        let value = values[row];
+        if value == a || value == b {
+            selected.push(row);
+        }
+    }
+}
+
+fn push_primitive_positions_desc_unrolled<T, F>(
+    values: &[T],
+    selected: &mut Vec<usize>,
+    mut matches: F,
+) where
+    T: Copy,
+    F: FnMut(T) -> bool,
+{
+    let mut row = values.len();
+    while row >= 8 {
+        row -= 8;
+        if matches(values[row + 7]) {
+            selected.push(row + 7);
+        }
+        if matches(values[row + 6]) {
+            selected.push(row + 6);
+        }
+        if matches(values[row + 5]) {
+            selected.push(row + 5);
+        }
+        if matches(values[row + 4]) {
+            selected.push(row + 4);
+        }
+        if matches(values[row + 3]) {
+            selected.push(row + 3);
+        }
+        if matches(values[row + 2]) {
+            selected.push(row + 2);
+        }
+        if matches(values[row + 1]) {
+            selected.push(row + 1);
+        }
+        if matches(values[row]) {
+            selected.push(row);
+        }
+    }
+    while row > 0 {
+        row -= 1;
+        if matches(values[row]) {
+            selected.push(row);
+        }
+    }
+}
+
+fn reserve_selected_positions(selected: &mut Vec<usize>, row_count: usize) {
+    let target = row_count / 4 + 1;
+    if selected.capacity() < target {
+        selected.reserve(target - selected.capacity());
+    }
+}
+
+fn primitive_topk_sequence_base(location: DirectPrimitiveBatchLocation) -> Option<u64> {
+    let row_group = u64::try_from(location.row_group).ok()?;
+    let row_offset = u64::try_from(location.row_offset).ok()?;
+    Some((row_group << 32) | row_offset)
+}
+
 fn primitive_ordered_selected_batch_null_free_fast(
     view: BatchView<'_>,
+    column_names: &[String],
     column_types: &[DirectPrimitiveColumnType],
     filter_index: usize,
     filter_values: &PrimitiveFilterValues,
-    schema: Arc<Schema>,
-) -> Result<Option<RecordBatch>> {
+) -> Result<Option<PrimitiveBatch>> {
     if filter_index >= column_types.len() {
         return Ok(None);
     }
@@ -37988,26 +43497,27 @@ fn primitive_ordered_selected_batch_null_free_fast(
             _ => unreachable!("checked primitive ordered column type"),
         })
         .collect::<Vec<_>>();
+    let mut selected_positions = Vec::with_capacity(row_count / 4 + 1);
     match (filter_values, columns[filter_index]) {
         (PrimitiveFilterValues::I32(values), NullFreePrimitiveColumn::I32(filter_column)) => {
-            for row in (0..row_count).rev() {
-                let value = filter_column[row];
-                if !small_i32_in_list(value, values) {
-                    continue;
-                }
-                push_null_free_primitive_row(&columns, &mut output, row)?;
-            }
+            primitive_filter_i32_positions_desc(filter_column, values, &mut selected_positions);
         }
         (PrimitiveFilterValues::I64(values), NullFreePrimitiveColumn::I64(filter_column)) => {
-            for row in (0..row_count).rev() {
-                let value = filter_column[row];
-                if !small_i64_in_list(value, values) {
-                    continue;
-                }
-                push_null_free_primitive_row(&columns, &mut output, row)?;
-            }
+            primitive_filter_i64_positions_desc(filter_column, values, &mut selected_positions);
         }
         _ => return Ok(None),
+    }
+    if selected_positions.is_empty() {
+        return primitive_empty_batch(column_names, column_types).map(Some);
+    }
+    if selected_positions.len().saturating_mul(2) >= row_count {
+        for (column, output) in columns.iter().zip(output.iter_mut()) {
+            gather_null_free_primitive_column(column, &selected_positions, output)?;
+        }
+    } else {
+        for &row in &selected_positions {
+            push_null_free_primitive_row(&columns, &mut output, row)?;
+        }
     }
     let selected_rows = output
         .first()
@@ -38017,16 +43527,62 @@ fn primitive_ordered_selected_batch_null_free_fast(
         })
         .unwrap_or(0);
     if selected_rows == 0 {
-        return Ok(Some(RecordBatch::new_empty(schema)));
+        return primitive_empty_batch(column_names, column_types).map(Some);
     }
-    let arrays = output
+    let columns = output
         .into_iter()
+        .zip(column_names.iter())
+        .zip(column_types.iter())
         .map(|column| match column {
-            PrimitiveColumnOutput::I32(values) => Arc::new(Int32Array::from(values)) as ArrayRef,
-            PrimitiveColumnOutput::I64(values) => Arc::new(Int64Array::from(values)) as ArrayRef,
+            ((PrimitiveColumnOutput::I32(values), name), column_type) => Ok(PrimitiveColumn {
+                name: name.clone(),
+                data_type: primitive_output_data_type(column_type)?,
+                nullable: false,
+                values: PrimitiveColumnValues::I32(values),
+            }),
+            ((PrimitiveColumnOutput::I64(values), name), column_type) => Ok(PrimitiveColumn {
+                name: name.clone(),
+                data_type: primitive_output_data_type(column_type)?,
+                nullable: false,
+                values: PrimitiveColumnValues::I64(values),
+            }),
         })
-        .collect::<Vec<_>>();
-    Ok(Some(RecordBatch::try_new(schema, arrays)?))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(PrimitiveBatch { columns }))
+}
+
+fn row_at_time_fallback_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_ROW_AT_TIME_FALLBACK")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn primitive_empty_batch(
+    column_names: &[String],
+    column_types: &[DirectPrimitiveColumnType],
+) -> Result<PrimitiveBatch> {
+    let columns = column_names
+        .iter()
+        .zip(column_types.iter())
+        .map(|(name, column_type)| {
+            let values = match column_type {
+                DirectPrimitiveColumnType::I32 | DirectPrimitiveColumnType::Date32 => {
+                    PrimitiveColumnValues::I32(Vec::new())
+                }
+                DirectPrimitiveColumnType::I64
+                | DirectPrimitiveColumnType::Decimal128Int64 { .. }
+                | DirectPrimitiveColumnType::Decimal128Int64Raw { .. } => {
+                    PrimitiveColumnValues::I64(Vec::new())
+                }
+            };
+            Ok(PrimitiveColumn {
+                name: name.clone(),
+                data_type: primitive_output_data_type(column_type)?,
+                nullable: false,
+                values,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(PrimitiveBatch { columns })
 }
 
 fn push_null_free_primitive_row(
@@ -38052,25 +43608,58 @@ fn push_null_free_primitive_row(
     Ok(())
 }
 
-fn small_i32_in_list(value: i32, values: &[i32]) -> bool {
-    match values {
-        [] => false,
-        [a] => value == *a,
-        [a, b] => value == *a || value == *b,
-        [a, b, c] => value == *a || value == *b || value == *c,
-        [a, b, c, d] => value == *a || value == *b || value == *c || value == *d,
-        _ => values.contains(&value),
+fn gather_null_free_primitive_column(
+    column: &NullFreePrimitiveColumn<'_>,
+    positions: &[usize],
+    output: &mut PrimitiveColumnOutput,
+) -> Result<()> {
+    match (column, output) {
+        (NullFreePrimitiveColumn::I32(values), PrimitiveColumnOutput::I32(output)) => {
+            output.reserve(positions.len());
+            extend_i32_desc_positions(values, positions, output);
+        }
+        (NullFreePrimitiveColumn::I64(values), PrimitiveColumnOutput::I64(output)) => {
+            output.reserve(positions.len());
+            extend_i64_desc_positions(values, positions, output);
+        }
+        _ => {
+            return Err(DodamError::UnsupportedSql(
+                "primitive ordered fast path column type mismatch".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn extend_i32_desc_positions(values: &[i32], positions: &[usize], output: &mut Vec<i32>) {
+    let mut index = 0usize;
+    while index < positions.len() {
+        let end = positions[index];
+        let mut len = 1usize;
+        while index + len < positions.len()
+            && positions[index + len - 1] == positions[index + len] + 1
+        {
+            len += 1;
+        }
+        let start = end + 1 - len;
+        output.extend(values[start..=end].iter().rev().copied());
+        index += len;
     }
 }
 
-fn small_i64_in_list(value: i64, values: &[i64]) -> bool {
-    match values {
-        [] => false,
-        [a] => value == *a,
-        [a, b] => value == *a || value == *b,
-        [a, b, c] => value == *a || value == *b || value == *c,
-        [a, b, c, d] => value == *a || value == *b || value == *c || value == *d,
-        _ => values.contains(&value),
+fn extend_i64_desc_positions(values: &[i64], positions: &[usize], output: &mut Vec<i64>) {
+    let mut index = 0usize;
+    while index < positions.len() {
+        let end = positions[index];
+        let mut len = 1usize;
+        while index + len < positions.len()
+            && positions[index + len - 1] == positions[index + len] + 1
+        {
+            len += 1;
+        }
+        let start = end + 1 - len;
+        output.extend(values[start..=end].iter().rev().copied());
+        index += len;
     }
 }
 
@@ -38117,6 +43706,66 @@ fn write_same_source_batch_to_sink(
         sink.write_batch(&batch)?;
     }
     Ok(())
+}
+
+fn write_same_source_primitive_batch_to_sink(
+    batch: PrimitiveBatch,
+    scan_projection: &Projection,
+    shared: &SameSourceUnionAllScan,
+    sink: &mut dyn RecordBatchSink,
+) -> Result<()> {
+    let batch = project_rename_primitive_batch(
+        batch,
+        scan_projection,
+        &shared.projection,
+        &shared.aliases,
+    )?;
+    if !sink.write_primitive_batch(batch)? {
+        return Err(DodamError::UnsupportedSql(
+            "primitive sink rejected primitive batch".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn project_rename_primitive_batch(
+    batch: PrimitiveBatch,
+    scan_projection: &Projection,
+    output_projection: &Projection,
+    aliases: &[(String, String)],
+) -> Result<PrimitiveBatch> {
+    let mut columns = batch.columns;
+    if scan_projection != output_projection {
+        let Projection::Columns(output_columns) = output_projection else {
+            return Err(DodamError::UnsupportedSql(
+                "primitive sink cannot widen projected output".to_string(),
+            ));
+        };
+        let mut projected = Vec::with_capacity(output_columns.len());
+        for output_column in output_columns {
+            let Some(index) = columns
+                .iter()
+                .position(|column| column.name == *output_column)
+            else {
+                return Err(DodamError::UnsupportedSql(format!(
+                    "primitive output column {output_column} was not scanned"
+                )));
+            };
+            projected.push(columns.remove(index));
+        }
+        columns = projected;
+    }
+    if !aliases.is_empty() {
+        for column in &mut columns {
+            if let Some((alias, _)) = aliases
+                .iter()
+                .find(|(alias, target)| !alias.contains('(') && target == &column.name)
+            {
+                column.name = alias.clone();
+            }
+        }
+    }
+    Ok(PrimitiveBatch { columns })
 }
 
 #[derive(Default)]
@@ -38225,14 +43874,27 @@ fn plan_direct_join_sink_request(
     if sql_uses_set_operation(sql)? {
         return Ok(None);
     }
-    if sql_uses_materialized_subquery(sql)?
-        || sql_uses_multi_comma_join(sql)?
-        || sql_uses_expression_predicate(sql)?
-    {
+    if sql_uses_materialized_subquery(sql)? || sql_uses_multi_comma_join(sql)? {
+        return Ok(None);
+    }
+    if !sql_select_has_explicit_join(sql)? {
         return Ok(None);
     }
     let query = parse_sql(sql)?;
     direct_join_sink_request(query, batch_size)
+}
+
+fn sql_select_has_explicit_join(sql: &str) -> Result<bool> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(false);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(false);
+    };
+    Ok(select.from.iter().any(|table| !table.joins.is_empty()))
 }
 
 fn sql_uses_set_operation(sql: &str) -> Result<bool> {
@@ -38258,7 +43920,7 @@ fn direct_join_sink_request(
 
     let join_plan = plan_join_inputs(
         &query.projection,
-        None,
+        query.filter.as_ref(),
         None,
         &join.left_alias,
         &join.left_keys,
@@ -38295,10 +43957,55 @@ fn query_allows_direct_join_sink(query: &SqlQuery) -> bool {
         && !query.is_aggregate()
         && query.having.is_none()
         && !query.distinct
-        && query.filter.is_none()
+        && query.filter.as_ref().is_none_or(|filter| {
+            query.join.as_ref().is_some_and(|join| {
+                filter_fully_pushable_to_join_inputs(
+                    filter.expr(),
+                    &join.left_alias,
+                    &join.right_alias,
+                )
+            })
+        })
         && query.expression_filter.is_none()
         && query.order_by.is_none()
         && join_aliases_are_implicit_output_names(&query.aliases)
+}
+
+fn filter_fully_pushable_to_join_inputs(expr: &Expr, left_alias: &str, right_alias: &str) -> bool {
+    match expr {
+        Expr::Boolean(value) => matches!(value, Some(true)),
+        Expr::Comparison(_)
+        | Expr::ColumnComparison { .. }
+        | Expr::InList { .. }
+        | Expr::Like { .. }
+        | Expr::IsNull { .. } => {
+            expr_references_only_join_side(expr, left_alias)
+                || expr_references_only_join_side(expr, right_alias)
+        }
+        Expr::Not(expr) => {
+            expr_references_only_join_side(expr, left_alias)
+                || expr_references_only_join_side(expr, right_alias)
+        }
+        Expr::And(left, right) => {
+            filter_fully_pushable_to_join_inputs(left, left_alias, right_alias)
+                && filter_fully_pushable_to_join_inputs(right, left_alias, right_alias)
+        }
+        Expr::Or(_, _) => {
+            expr_references_only_join_side(expr, left_alias)
+                || expr_references_only_join_side(expr, right_alias)
+        }
+    }
+}
+
+fn expr_references_only_join_side(expr: &Expr, alias: &str) -> bool {
+    let mut columns = Vec::new();
+    collect_filter_columns(expr, &mut columns);
+    !columns.is_empty()
+        && columns.iter().all(|column| {
+            column
+                .strip_prefix(alias)
+                .is_some_and(|rest| rest.starts_with('.'))
+        })
 }
 
 fn join_aliases_are_implicit_output_names(aliases: &[(String, String)]) -> bool {
@@ -40199,7 +45906,10 @@ fn parse_join_filter_plan(
         return Ok((None, None));
     };
     if join_predicate_requires_expression_path(expr, table_aliases)? {
-        return Ok((None, Some(expr.clone())));
+        return Ok((
+            safe_expression_pushdown_filter(expr, None, PredicateParserKind::Join(table_aliases))?,
+            Some(expr.clone()),
+        ));
     }
     Ok((
         Some(parse_join_filter(
@@ -43696,6 +49406,45 @@ fn collect_batches(mut stream: SendableBatchStream) -> Result<Vec<RecordBatch>> 
     Ok(batches)
 }
 
+fn collect_ordered_stream_limit_batches(
+    mut stream: SendableBatchStream,
+    limit: Option<usize>,
+    offset: usize,
+) -> Result<Vec<RecordBatch>> {
+    let mut to_skip = offset;
+    let mut remaining = limit.unwrap_or(usize::MAX);
+    let mut batches = Vec::new();
+    if remaining == 0 {
+        return Ok(batches);
+    }
+    for batch in stream.by_ref() {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        if to_skip >= batch.num_rows() {
+            to_skip -= batch.num_rows();
+            continue;
+        }
+        let batch = if to_skip > 0 {
+            let sliced = batch.slice(to_skip, batch.num_rows() - to_skip);
+            to_skip = 0;
+            sliced
+        } else {
+            batch
+        };
+        let rows = remaining.min(batch.num_rows());
+        remaining -= rows;
+        if rows > 0 {
+            batches.push(batch.slice(0, rows));
+        }
+        if remaining == 0 {
+            break;
+        }
+    }
+    Ok(batches)
+}
+
 fn collect_expression_filtered_limit_batches(
     mut stream: SendableBatchStream,
     predicate: &SqlExpr,
@@ -44225,6 +49974,44 @@ fn evaluate_scalar_predicate_with_parser(
             Ok(BooleanArray::from(evaluate_scalar_in_list(
                 value, &values, *negated,
             )?))
+        }
+        SqlExpr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let lower = evaluate_scalar_predicate_with_parser(
+                batch,
+                &SqlExpr::BinaryOp {
+                    left: expr.clone(),
+                    op: if *negated {
+                        BinaryOperator::Lt
+                    } else {
+                        BinaryOperator::GtEq
+                    },
+                    right: low.clone(),
+                },
+                parser,
+            )?;
+            let upper = evaluate_scalar_predicate_with_parser(
+                batch,
+                &SqlExpr::BinaryOp {
+                    left: expr.clone(),
+                    op: if *negated {
+                        BinaryOperator::Gt
+                    } else {
+                        BinaryOperator::LtEq
+                    },
+                    right: high.clone(),
+                },
+                parser,
+            )?;
+            if *negated {
+                Ok(boolean_or(&lower, &upper))
+            } else {
+                Ok(boolean_and(&lower, &upper))
+            }
         }
         SqlExpr::Like {
             negated,
@@ -44857,7 +50644,7 @@ async fn try_collect_expression_aggregate_late_materialized(
             payload_projection,
             expression_aggregate_dictionary_columns(&group_keys),
             Vec::new(),
-            expression_aggregate_late_row_group_chunk(),
+            expression_aggregate_late_row_group_chunk(ordered_output, output_limit),
             LateMaterializationPolicy::selective_with_selector_run_ratio(
                 expression_aggregate_late_max_selected_ratio(),
                 expression_aggregate_late_max_selector_run_ratio(),
@@ -44888,29 +50675,27 @@ async fn try_collect_expression_aggregate_late_materialized(
                     {
                         mask
                     } else {
+                        if !expression_aggregate_row_at_time_fallback_enabled() {
+                            return Ok(None);
+                        }
                         let Some(batch) = view.try_record_batch() else {
                             return Ok(None);
                         };
                         evaluate_filter_mask(batch, &filter)?
                     };
-                    selection.push_selected_rows(mask.len(), |row| {
-                        mask.is_valid(row) && mask.value(row)
-                    });
+                    push_boolean_mask_selection(&mask, selection);
                     Ok(Some(()))
                 }
             },
             {
                 let payload_projected_columns = payload_projected_columns.clone();
                 move |view, collector: &mut CoalesceKeyCountSumCollector| {
-                    if expression_aggregate_late_view_payload_enabled()
-                        || view.num_rows() <= expression_aggregate_late_view_payload_max_rows()
-                    {
+                    if expression_aggregate_row_at_time_fallback_enabled() {
                         collector.consume_projected_view(view, &payload_projected_columns)?;
-                    } else {
-                        let Some(batch) = view.try_record_batch() else {
-                            return Ok(None);
-                        };
-                        collector.consume_batch(batch)?;
+                    } else if !collector
+                        .try_consume_projected_view_vectorized(view, &payload_projected_columns)?
+                    {
+                        return Ok(None);
                     }
                     Ok(Some(()))
                 }
@@ -45018,13 +50803,14 @@ async fn try_collect_expression_aggregate_fused_dictionary_selected(
                 .expect("fused dictionary selected aggregate precondition")
             },
             |collector, batch| {
-                if let Some((chunks, selected_rows)) = batch.sum_chunks() {
-                    collector.consume_i32_date_dictionary_i64_sum_chunks(
+                if let Some((chunks, sums, selected_rows)) = batch.sum_chunk_ranges() {
+                    collector.consume_i32_date_dictionary_i64_sum_chunk_ranges(
                         batch.first(),
                         batch.second(),
                         batch.dictionary_ids(),
                         batch.dictionary(),
                         chunks,
+                        sums,
                         selected_rows,
                     )
                 } else if let Some(selection) = batch.selection() {
@@ -45051,7 +50837,7 @@ async fn try_collect_expression_aggregate_fused_dictionary_selected(
     else {
         return Ok(None);
     };
-    let _ = scan_metrics;
+    log_fused_dictionary_selected_profile(&scan_metrics);
     Ok(Some(
         CoalesceKeyCountSumCollector::merge_partials_with_order_and_output(
             vec![collector],
@@ -45062,6 +50848,31 @@ async fn try_collect_expression_aggregate_fused_dictionary_selected(
             output_limit,
         )?,
     ))
+}
+
+fn log_fused_dictionary_selected_profile(metrics: &DirectPrimitiveColumnScanMetrics) {
+    if !std::env::var("DODAM_COALESCE_AGG_PROFILE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return;
+    }
+    eprintln!(
+        "[dodam:coalesce-agg-profile] fused_selected row_groups={} batches={} rows={} selected={} runs={} read={:.3}ms consume={:.3}ms predicate={:.3}ms payload={:.3}ms dictionary={:.3}ms full_payload_batches={} selected_payload_batches={} selected_read_rows={} selected_skipped_rows={}",
+        metrics.row_groups,
+        metrics.batches,
+        metrics.rows,
+        metrics.selected_rows,
+        metrics.selected_runs,
+        sql_nanos_to_millis(metrics.read_nanos),
+        sql_nanos_to_millis(metrics.consume_nanos),
+        sql_nanos_to_millis(metrics.selected_predicate_nanos),
+        sql_nanos_to_millis(metrics.selected_payload_nanos),
+        sql_nanos_to_millis(metrics.selected_dictionary_nanos),
+        metrics.full_payload_batches,
+        metrics.selected_payload_batches,
+        metrics.selected_read_rows,
+        metrics.selected_skipped_rows,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -45133,6 +50944,9 @@ async fn try_collect_expression_aggregate_scan_fold(
                         )? {
                             mask
                         } else {
+                            if !expression_aggregate_row_at_time_fallback_enabled() {
+                                return Ok(None);
+                            }
                             let Some(batch) = view.try_record_batch() else {
                                 return Ok(None);
                             };
@@ -45141,7 +50955,19 @@ async fn try_collect_expression_aggregate_scan_fold(
                         if mask.true_count() == 0 {
                             return Ok(Some(()));
                         }
-                        collector.consume_projected_view_masked(view, &projected_columns, &mask)?;
+                        if expression_aggregate_row_at_time_fallback_enabled() {
+                            collector.consume_projected_view_masked_with_record_batch_fallback(
+                                view,
+                                &projected_columns,
+                                &mask,
+                            )?;
+                        } else if !collector.try_consume_projected_view_masked_vectorized(
+                            view,
+                            &projected_columns,
+                            &mask,
+                        )? {
+                            return Ok(None);
+                        }
                         Ok(Some(()))
                     }
                 },
@@ -45227,12 +51053,27 @@ fn push_projected_view_filter_selection(
     filter: &FilterExpr,
     selection: &mut LateSelectionBuilder,
 ) -> Result<bool> {
-    if !std::env::var("DODAM_ENABLE_DIRECT_LATE_SELECTION")
+    if std::env::var("DODAM_DISABLE_DIRECT_LATE_SELECTION")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
     {
         return Ok(false);
     }
     push_projected_view_expr_selection(view, columns, filter.expr(), selection)
+}
+
+fn push_boolean_mask_selection(mask: &BooleanArray, selection: &mut LateSelectionBuilder) {
+    if mask.true_count() == 0 {
+        selection.push_repeated(mask.len(), false);
+        return;
+    }
+    if mask.true_count() == mask.len() && mask.null_count() == 0 {
+        selection.push_repeated(mask.len(), true);
+        return;
+    }
+    selection.push_selected_offsets(
+        mask.len(),
+        (0..mask.len()).filter(|row| mask.is_valid(*row) && mask.value(*row)),
+    );
 }
 
 fn push_projected_view_expr_selection(
@@ -45244,7 +51085,7 @@ fn push_projected_view_expr_selection(
     match expr {
         Expr::Boolean(value) => {
             let value = value.unwrap_or(false);
-            selection.push_selected_rows(view.num_rows(), |_| value);
+            selection.push_repeated(view.num_rows(), value);
             Ok(true)
         }
         Expr::Comparison(comparison) => {
@@ -45274,7 +51115,7 @@ fn push_comparison_selection_for_projected_view(
     selection: &mut LateSelectionBuilder,
 ) -> Result<bool> {
     if matches!(comparison.value, LiteralValue::Null) {
-        selection.push_selected_rows(view.num_rows(), |_| false);
+        selection.push_repeated(view.num_rows(), false);
         return Ok(true);
     }
     let Some(index) = projected_view_column_index(columns, &comparison.column) else {
@@ -45282,25 +51123,82 @@ fn push_comparison_selection_for_projected_view(
     };
     if let Some(values) = view.i64_vector(index) {
         let literal = comparison.value.as_i64(&comparison.column)?;
-        selection.push_selected_rows(values.len(), |row| {
-            !values.is_null(row) && compare_i64(values.value(row), comparison.op, literal)
-        });
+        if let Some(raw) = values.values_if_null_free() {
+            selection.push_selected_offsets(
+                raw.len(),
+                raw.iter().enumerate().filter_map(|(row, value)| {
+                    compare_i64(*value, comparison.op, literal).then_some(row)
+                }),
+            );
+        } else if let Some((data, len)) = values.raw_bytes() {
+            selection.push_selected_offsets(
+                len,
+                (0..len).filter(|row| {
+                    compare_i64(read_i64_le_unaligned(data, *row), comparison.op, literal)
+                }),
+            );
+        } else {
+            selection.push_selected_offsets(
+                values.len(),
+                (0..values.len()).filter(|row| {
+                    !values.is_null(*row) && compare_i64(values.value(*row), comparison.op, literal)
+                }),
+            );
+        }
         return Ok(true);
     }
     if let Some(values) = view.i32_vector(index) {
         let literal = comparison.value.as_i32(&comparison.column)?;
-        selection.push_selected_rows(values.len(), |row| {
-            !values.is_null(row) && compare_i32(values.value(row), comparison.op, literal)
-        });
+        if let Some(raw) = values.values_if_null_free() {
+            selection.push_selected_offsets(
+                raw.len(),
+                raw.iter().enumerate().filter_map(|(row, value)| {
+                    compare_i32(*value, comparison.op, literal).then_some(row)
+                }),
+            );
+        } else if let Some((data, len)) = values.raw_bytes() {
+            selection.push_selected_offsets(
+                len,
+                (0..len).filter(|row| {
+                    compare_i32(read_i32_le_unaligned(data, *row), comparison.op, literal)
+                }),
+            );
+        } else {
+            selection.push_selected_offsets(
+                values.len(),
+                (0..values.len()).filter(|row| {
+                    !values.is_null(*row) && compare_i32(values.value(*row), comparison.op, literal)
+                }),
+            );
+        }
         return Ok(true);
     }
     if let Some(values) = view.date32_vector(index) {
         let Some(literal) = literal_as_date32_for_type(&comparison.value)? else {
             return Ok(false);
         };
-        selection.push_selected_rows(values.len(), |row| {
-            !values.is_null(row) && compare_i32(values.value(row), comparison.op, literal)
-        });
+        if let Some(raw) = values.values_if_null_free() {
+            selection.push_selected_offsets(
+                raw.len(),
+                raw.iter().enumerate().filter_map(|(row, value)| {
+                    compare_i32(*value, comparison.op, literal).then_some(row)
+                }),
+            );
+        } else if let Some((data, len)) = values.raw_bytes() {
+            selection.push_selected_offsets(
+                len,
+                (0..len).filter(|row| {
+                    compare_i32(read_i32_le_unaligned(data, *row), comparison.op, literal)
+                }),
+            );
+        } else {
+            selection.push_selected_offsets(
+                values.len(),
+                (0..values.len()).filter(|row| {
+                    !values.is_null(*row) && compare_i32(values.value(*row), comparison.op, literal)
+                }),
+            );
+        }
         return Ok(true);
     }
     if let Some(values) = view.decimal128_vector(index) {
@@ -45309,14 +51207,34 @@ fn push_comparison_selection_for_projected_view(
             return Ok(false);
         };
         if let Some(raw) = values.raw_i64_values() {
-            selection.push_selected_rows(raw.len(), |row| {
-                !values.is_null(row) && compare_i128(i128::from(raw[row]), comparison.op, literal)
-            });
+            selection.push_selected_offsets(
+                raw.len(),
+                raw.iter().enumerate().filter_map(|(row, value)| {
+                    (!values.is_null(row)
+                        && compare_i128(i128::from(*value), comparison.op, literal))
+                    .then_some(row)
+                }),
+            );
+        } else if let Some((data, len)) = values.raw_i64_bytes() {
+            selection.push_selected_offsets(
+                len,
+                (0..len).filter(|row| {
+                    compare_i128(
+                        i128::from(read_i64_le_unaligned(data, *row)),
+                        comparison.op,
+                        literal,
+                    )
+                }),
+            );
         } else {
             let raw = values.raw_values();
-            selection.push_selected_rows(raw.len(), |row| {
-                !values.is_null(row) && compare_i128(raw[row], comparison.op, literal)
-            });
+            selection.push_selected_offsets(
+                raw.len(),
+                raw.iter().enumerate().filter_map(|(row, value)| {
+                    (!values.is_null(row) && compare_i128(*value, comparison.op, literal))
+                        .then_some(row)
+                }),
+            );
         }
         return Ok(true);
     }
@@ -45341,17 +51259,31 @@ fn push_in_list_selection_for_projected_view(
             .filter(|value| !matches!(value, LiteralValue::Null))
             .map(|value| value.as_i64(column))
             .collect::<Result<Vec<_>>>()?;
-        selection.push_selected_rows(probe.len(), |row| {
-            if probe.is_null(row) {
-                false
-            } else {
-                selected_in_list_result(
-                    small_in_list_match_i64(probe.value(row), &values),
-                    negated,
-                    has_null,
-                )
-            }
-        });
+        if let Some(raw) = probe.values_if_null_free() {
+            selection.push_selected_offsets(
+                raw.len(),
+                raw.iter().enumerate().filter_map(|(row, value)| {
+                    selected_in_list_result(
+                        small_in_list_match_i64(*value, &values),
+                        negated,
+                        has_null,
+                    )
+                    .then_some(row)
+                }),
+            );
+        } else {
+            selection.push_selected_offsets(
+                probe.len(),
+                (0..probe.len()).filter(|row| {
+                    !probe.is_null(*row)
+                        && selected_in_list_result(
+                            small_in_list_match_i64(probe.value(*row), &values),
+                            negated,
+                            has_null,
+                        )
+                }),
+            );
+        }
         return Ok(true);
     }
     if let Some(probe) = view.i32_vector(index) {
@@ -45360,17 +51292,31 @@ fn push_in_list_selection_for_projected_view(
             .filter(|value| !matches!(value, LiteralValue::Null))
             .map(|value| value.as_i32(column))
             .collect::<Result<Vec<_>>>()?;
-        selection.push_selected_rows(probe.len(), |row| {
-            if probe.is_null(row) {
-                false
-            } else {
-                selected_in_list_result(
-                    small_in_list_match_i32(probe.value(row), &values),
-                    negated,
-                    has_null,
-                )
-            }
-        });
+        if let Some(raw) = probe.values_if_null_free() {
+            selection.push_selected_offsets(
+                raw.len(),
+                raw.iter().enumerate().filter_map(|(row, value)| {
+                    selected_in_list_result(
+                        small_in_list_match_i32(*value, &values),
+                        negated,
+                        has_null,
+                    )
+                    .then_some(row)
+                }),
+            );
+        } else {
+            selection.push_selected_offsets(
+                probe.len(),
+                (0..probe.len()).filter(|row| {
+                    !probe.is_null(*row)
+                        && selected_in_list_result(
+                            small_in_list_match_i32(probe.value(*row), &values),
+                            negated,
+                            has_null,
+                        )
+                }),
+            );
+        }
         return Ok(true);
     }
     Ok(false)
@@ -45574,6 +51520,14 @@ fn compare_decimal128_view(
                 output.append_value(compare_i128(i128::from(raw[row]), op, literal));
             }
         }
+    } else if let Some((data, len)) = values.raw_i64_bytes() {
+        for row in 0..len {
+            output.append_value(compare_i128(
+                i128::from(read_i64_le_unaligned(data, row)),
+                op,
+                literal,
+            ));
+        }
     } else {
         let raw = values.raw_values();
         for row in 0..raw.len() {
@@ -45588,11 +51542,7 @@ fn compare_decimal128_view(
 }
 
 fn values_len_decimal128(values: Decimal128VectorView<'_>) -> usize {
-    if let Some(values) = values.raw_i64_values() {
-        values.len()
-    } else {
-        values.raw_values().len()
-    }
+    values.len()
 }
 
 fn in_list_i64_view(
@@ -45936,39 +51886,93 @@ fn fused_dictionary_selected_aggregate_auto_accepts(
     {
         return Ok(false);
     }
-    let Some((column_min, column_max)) =
-        engine.parquet_i128_column_min_max(path, decimal_column)?
+    let Some((column_min, column_max)) = engine
+        .parquet_i128_column_min_max(path, decimal_column)?
+        .or_else(|| {
+            engine
+                .parquet_i128_column_min_max_relaxed(path, decimal_column)
+                .ok()
+                .flatten()
+        })
     else {
         return Ok(false);
     };
-    let Some(domain_len) = column_max
-        .checked_sub(column_min)
-        .and_then(|value| value.checked_add(1))
-    else {
+    let Some(estimated_selectivity) = (DecimalRangeSelectivityInput {
+        column_min,
+        column_max,
+        filter_min: decimal_filter.decimal_min,
+        filter_max: decimal_filter.decimal_max,
+    })
+    .estimated_selectivity() else {
         return Ok(false);
     };
-    if domain_len <= 0 {
-        return Ok(false);
+    if let Some((candidate_row_groups, total_row_groups, total_rows)) =
+        decimal_filter_candidate_row_group_spread(engine, path, decimal_column, decimal_filter)?
+    {
+        let estimated_selected_rows = ((total_rows as f64) * estimated_selectivity).ceil() as usize;
+        let decision = choose_selected_payload_by_spread(SelectedPayloadSpreadCostInput {
+            selected_rows: estimated_selected_rows.max(1),
+            selected_row_groups: candidate_row_groups,
+            total_row_groups,
+            missing_payload_columns: 4,
+            max_selected_row_group_ratio:
+                fused_dictionary_selected_auto_max_selected_row_group_ratio(),
+            max_selected_row_groups: fused_dictionary_selected_auto_max_selected_row_groups(),
+        });
+        if !decision.accepted() {
+            return Ok(false);
+        }
     }
-    let filter_min = decimal_filter
+    Ok(choose_fused_selected_aggregate(
+        FusedSelectedAggregateCostInput {
+            estimated_selectivity,
+            max_selectivity: fused_dictionary_selected_auto_max_estimated_ratio(),
+        },
+    ))
+}
+
+fn decimal_filter_candidate_row_group_spread(
+    engine: &DodamEngine,
+    path: &Path,
+    decimal_column: &str,
+    decimal_filter: &DecimalDateRangeFilter,
+) -> Result<Option<(usize, usize, usize)>> {
+    let Some(ranges) =
+        engine.parquet_primitive_column_min_max_by_row_group(path, decimal_column)?
+    else {
+        return Ok(None);
+    };
+    if ranges.is_empty() {
+        return Ok(Some((0, 0, 0)));
+    }
+    let mut candidate_row_groups = 0usize;
+    let mut total_rows = 0usize;
+    for range in &ranges {
+        total_rows = total_rows.saturating_add(range.rows);
+        if decimal_filter_row_group_may_match(range, decimal_filter) {
+            candidate_row_groups += 1;
+        }
+    }
+    Ok(Some((candidate_row_groups, ranges.len(), total_rows)))
+}
+
+fn decimal_filter_row_group_may_match(
+    range: &PrimitiveRowGroupMinMax,
+    decimal_filter: &DecimalDateRangeFilter,
+) -> bool {
+    if decimal_filter
         .decimal_min
-        .unwrap_or(column_min)
-        .max(column_min);
-    let filter_max = decimal_filter
-        .decimal_max
-        .unwrap_or(column_max)
-        .min(column_max);
-    if filter_min > filter_max {
-        return Ok(true);
+        .is_some_and(|filter_min| range.max < filter_min)
+    {
+        return false;
     }
-    let Some(selected_len) = filter_max
-        .checked_sub(filter_min)
-        .and_then(|value| value.checked_add(1))
-    else {
-        return Ok(false);
-    };
-    let estimated_ratio = selected_len as f64 / domain_len as f64;
-    Ok(estimated_ratio <= fused_dictionary_selected_auto_max_estimated_ratio())
+    if decimal_filter
+        .decimal_max
+        .is_some_and(|filter_max| range.min > filter_max)
+    {
+        return false;
+    }
+    true
 }
 
 fn fused_dictionary_selected_auto_max_estimated_ratio() -> f64 {
@@ -45980,12 +51984,37 @@ fn fused_dictionary_selected_auto_max_estimated_ratio() -> f64 {
         .clamp(0.0, 1.0)
 }
 
+fn fused_dictionary_selected_auto_max_selected_row_group_ratio() -> f64 {
+    std::env::var("DODAM_FUSED_DICT_SELECTED_AUTO_MAX_ROW_GROUP_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.50)
+        .clamp(0.0, 1.0)
+}
+
+fn fused_dictionary_selected_auto_max_selected_row_groups() -> usize {
+    std::env::var("DODAM_FUSED_DICT_SELECTED_AUTO_MAX_ROW_GROUPS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(16)
+}
+
 fn fused_dictionary_selected_auto_workers() -> usize {
     std::env::var("DODAM_FUSED_DICT_SELECTED_AUTO_WORKERS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(8)
+        .unwrap_or_else(|| {
+            choose_parallel_workers(WorkerCostInput {
+                row_groups: usize::MAX,
+                available_parallelism: std::thread::available_parallelism()
+                    .map(usize::from)
+                    .unwrap_or(1),
+                max_workers: 12,
+            })
+        })
 }
 
 fn expression_aggregate_dictionary_scan_fold_row_group_chunk() -> usize {
@@ -46001,29 +52030,23 @@ fn expression_aggregate_late_materialized_enabled() -> bool {
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
-fn expression_aggregate_late_view_payload_enabled() -> bool {
-    std::env::var("DODAM_ENABLE_EXPRESSION_AGG_LATE_VIEW_PAYLOAD")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-}
-
-fn expression_aggregate_late_view_payload_max_rows() -> usize {
-    if std::env::var("DODAM_DISABLE_EXPRESSION_AGG_SMALL_LATE_VIEW_PAYLOAD")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-    {
-        return 0;
-    }
-    std::env::var("DODAM_EXPRESSION_AGG_LATE_VIEW_PAYLOAD_MAX_ROWS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(131_072)
-}
-
-fn expression_aggregate_late_row_group_chunk() -> usize {
-    std::env::var("DODAM_EXPRESSION_AGG_LATE_ROW_GROUP_CHUNK")
+fn expression_aggregate_late_row_group_chunk(
+    ordered_output: bool,
+    output_limit: Option<usize>,
+) -> usize {
+    if let Some(value) = std::env::var("DODAM_EXPRESSION_AGG_LATE_ROW_GROUP_CHUNK")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(2)
+    {
+        return value;
+    }
+    choose_expression_aggregate_late_row_group_chunk(ExpressionAggregateLateChunkCostInput {
+        ordered_output,
+        output_limit,
+        default_chunk: 2,
+        ordered_limit_chunk: 4,
+    })
 }
 
 fn expression_aggregate_late_max_selected_ratio() -> f64 {
@@ -46043,8 +52066,12 @@ fn expression_aggregate_late_max_selector_run_ratio() -> f64 {
 }
 
 fn expression_aggregate_late_io_cost_gate_enabled() -> bool {
-    std::env::var("DODAM_ENABLE_EXPRESSION_AGG_LATE_IO_COST_GATE")
+    !std::env::var("DODAM_DISABLE_EXPRESSION_AGG_LATE_IO_COST_GATE")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn expression_aggregate_row_at_time_fallback_enabled() -> bool {
+    row_at_time_fallback_enabled()
 }
 
 fn log_expression_aggregate_late_profile(metrics: &LateMaterializedMetrics) {
@@ -48752,6 +54779,29 @@ mod tests {
     }
 
     #[test]
+    fn direct_join_sink_request_accepts_fully_pushed_side_filter() {
+        let sql = "SELECT l.l_orderkey, o.o_orderdate \
+                   FROM '/tmp/lineitem.parquet' l \
+                   JOIN '/tmp/orders.parquet' o \
+                   ON l.l_orderkey = o.o_orderkey \
+                   WHERE o.o_orderstatus = 'O'";
+
+        let request = plan_direct_join_sink_request(sql, 1024)
+            .expect("query should parse")
+            .expect("side-filtered projected join should use direct sink");
+
+        assert_eq!(request.left_filter, None);
+        assert_eq!(
+            request.right_filter,
+            Some(FilterExpr::new(Expr::Comparison(ComparisonExpr {
+                column: "o_orderstatus".to_string(),
+                op: ComparisonOp::Eq,
+                value: LiteralValue::Utf8("O".to_string()),
+            })))
+        );
+    }
+
+    #[test]
     fn direct_join_sink_request_rejects_materialized_join_shapes() {
         for sql in [
             "SELECT l.l_orderkey, count(*) \
@@ -48810,5 +54860,131 @@ mod tests {
             ])
         );
         assert!(matches!(plan.filter.expr(), Expr::InList { .. }));
+    }
+
+    #[test]
+    fn same_source_union_all_plan_accepts_disjoint_in_filters() {
+        let dialect = GenericDialect {};
+        let statements = Parser::parse_sql(
+            &dialect,
+            "SELECT id, bucket, value FROM '/tmp/facts.parquet' WHERE bucket IN (1, 3) \
+             UNION ALL \
+             SELECT id, bucket, value FROM '/tmp/facts.parquet' WHERE bucket IN (7, 9)",
+        )
+        .expect("query should parse");
+        let [Statement::Query(query)] = statements.as_slice() else {
+            panic!("expected query");
+        };
+
+        let mut operands = Vec::new();
+        assert!(
+            collect_union_all_operand_queries(query.body.as_ref(), &mut operands)
+                .expect("operands should parse")
+        );
+        let plan =
+            same_source_disjoint_union_all_plan(&operands).expect("shared scan should be planned");
+
+        let Expr::InList { values, .. } = plan.filter.expr() else {
+            panic!("expected in-list filter");
+        };
+        assert_eq!(values.len(), 4);
+    }
+
+    #[test]
+    fn same_source_union_all_plan_rejects_overlapping_in_filters() {
+        let dialect = GenericDialect {};
+        let statements = Parser::parse_sql(
+            &dialect,
+            "SELECT id, bucket, value FROM '/tmp/facts.parquet' WHERE bucket IN (1, 3) \
+             UNION ALL \
+             SELECT id, bucket, value FROM '/tmp/facts.parquet' WHERE bucket IN (3, 7)",
+        )
+        .expect("query should parse");
+        let [Statement::Query(query)] = statements.as_slice() else {
+            panic!("expected query");
+        };
+
+        let mut operands = Vec::new();
+        assert!(
+            collect_union_all_operand_queries(query.body.as_ref(), &mut operands)
+                .expect("operands should parse")
+        );
+        assert!(same_source_disjoint_union_all_plan(&operands).is_none());
+        assert!(same_source_union_all_filter_scan_plan(&operands).is_some());
+    }
+
+    #[test]
+    fn expression_pushdown_derives_coalesce_prefilter() {
+        let dialect = GenericDialect {};
+        let statements = Parser::parse_sql(
+            &dialect,
+            "SELECT id FROM '/tmp/facts.parquet' WHERE COALESCE(bucket, 7) = 7",
+        )
+        .expect("query should parse");
+        let [Statement::Query(query)] = statements.as_slice() else {
+            panic!("expected query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select");
+        };
+        let selection = select.selection.as_ref().expect("selection");
+        let filter = safe_expression_pushdown_filter(selection, None, PredicateParserKind::Single)
+            .expect("pushdown should parse")
+            .expect("coalesce should produce a prefilter");
+
+        assert_eq!(
+            filter,
+            FilterExpr::new(Expr::Or(
+                Box::new(Expr::Comparison(ComparisonExpr {
+                    column: "bucket".to_string(),
+                    op: ComparisonOp::Eq,
+                    value: LiteralValue::Int64(7),
+                })),
+                Box::new(Expr::IsNull {
+                    column: "bucket".to_string(),
+                    negated: false,
+                }),
+            ))
+        );
+    }
+
+    #[test]
+    fn join_expression_filter_returns_side_prefilter_and_residual() {
+        let dialect = GenericDialect {};
+        let statements = Parser::parse_sql(
+            &dialect,
+            "SELECT l.l_orderkey FROM '/tmp/lineitem.parquet' l \
+             JOIN '/tmp/orders.parquet' o ON l.l_orderkey = o.o_orderkey \
+             WHERE COALESCE(o.o_orderstatus, 'O') = 'O'",
+        )
+        .expect("query should parse");
+        let [Statement::Query(query)] = statements.as_slice() else {
+            panic!("expected query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select");
+        };
+        let selection = select.selection.as_ref().expect("selection");
+        let aliases = [("l_orderkey".to_string(), "l_orderkey".to_string())];
+        let table_aliases = ["l", "o"];
+        let (filter, residual) =
+            parse_join_filter_plan(Some(selection), &aliases, &table_aliases, false)
+                .expect("join filter should parse");
+
+        assert!(residual.is_some());
+        assert_eq!(
+            filter,
+            Some(FilterExpr::new(Expr::Or(
+                Box::new(Expr::Comparison(ComparisonExpr {
+                    column: "o.o_orderstatus".to_string(),
+                    op: ComparisonOp::Eq,
+                    value: LiteralValue::Utf8("O".to_string()),
+                })),
+                Box::new(Expr::IsNull {
+                    column: "o.o_orderstatus".to_string(),
+                    negated: false,
+                }),
+            )))
+        );
     }
 }

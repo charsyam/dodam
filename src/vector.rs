@@ -116,6 +116,9 @@ impl<'a> I64VectorView<'a> {
             Self::Raw(values) => values[row],
             Self::RawBytes { data, .. } => read_i64_le_unaligned(data, row),
             Self::RawNullable { values, def_levels } => {
+                if values.len() == def_levels.len() {
+                    return values[row];
+                }
                 let value_index = nullable_value_index(def_levels, row);
                 values[value_index]
             }
@@ -126,7 +129,10 @@ impl<'a> I64VectorView<'a> {
         match self {
             Self::Arrow(values) => (values.null_count() == 0).then(|| values.values().as_ref()),
             Self::Raw(values) => Some(values),
-            Self::RawBytes { .. } | Self::RawNullable { .. } => None,
+            Self::RawBytes { .. } => None,
+            Self::RawNullable { values, def_levels } => (values.len() == def_levels.len()
+                && def_levels.iter().all(|level| *level != 0))
+            .then_some(*values),
         }
     }
 
@@ -183,6 +189,9 @@ impl<'a> I32VectorView<'a> {
             Self::Raw(values) => values[row],
             Self::RawBytes { data, .. } => read_i32_le_unaligned(data, row),
             Self::RawNullable { values, def_levels } => {
+                if values.len() == def_levels.len() {
+                    return values[row];
+                }
                 let value_index = nullable_value_index(def_levels, row);
                 values[value_index]
             }
@@ -193,7 +202,10 @@ impl<'a> I32VectorView<'a> {
         match self {
             Self::Arrow(values) => (values.null_count() == 0).then(|| values.values().as_ref()),
             Self::Raw(values) => Some(values),
-            Self::RawBytes { .. } | Self::RawNullable { .. } => None,
+            Self::RawBytes { .. } => None,
+            Self::RawNullable { values, def_levels } => (values.len() == def_levels.len()
+                && def_levels.iter().all(|level| *level != 0))
+            .then_some(*values),
         }
     }
 
@@ -311,6 +323,7 @@ pub(crate) enum Decimal128VectorView<'a> {
     },
     RawI64Bytes {
         data: &'a [u8],
+        len: usize,
         precision: u8,
         scale: f64,
     },
@@ -390,6 +403,22 @@ impl<'a> Decimal128VectorView<'a> {
         match self {
             Self::RawI64 { values, .. } => Some(values),
             _ => None,
+        }
+    }
+
+    pub(crate) fn raw_i64_bytes(&self) -> Option<(&'a [u8], usize)> {
+        match self {
+            Self::RawI64Bytes { data, len, .. } => Some((data, *len)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Arrow { values, .. } => values.len(),
+            Self::Raw { values, .. } => values.len(),
+            Self::RawI64 { values, .. } => values.len(),
+            Self::RawI64Bytes { len, .. } => *len,
         }
     }
 }
@@ -583,11 +612,12 @@ impl<'a> BatchView<'a> {
                 }),
                 RawColumnView::Decimal128I64Bytes {
                     data,
+                    len,
                     precision,
                     scale,
-                    ..
                 } => Some(Decimal128VectorView::RawI64Bytes {
                     data,
+                    len,
                     precision,
                     scale: decimal_scale_factor(scale),
                 }),
@@ -934,14 +964,6 @@ impl<'a> SelectionRuns<'a> {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.selected_rows == 0
-    }
-
-    pub(crate) fn for_each_index(self, mut f: impl FnMut(usize)) {
-        for &(start, len) in self.runs {
-            for index in start..start.saturating_add(len) {
-                f(index);
-            }
-        }
     }
 }
 

@@ -233,9 +233,34 @@ def generic_queries(data_dir: Path) -> list[GenericQuery]:
             f"SELECT bucket, event_date, coalesce(label, 'missing') AS label_or_missing, count(*), sum(value) FROM read_parquet('{facts}') WHERE amount < '1.00' GROUP BY bucket, event_date, coalesce(label, 'missing')",
         ),
         GenericQuery(
+            "standard_between_like_case",
+            f"SELECT id, key, bucket, label FROM '{facts}' WHERE (key BETWEEN 10 AND 40 OR label LIKE 'label-2%') AND id NOT BETWEEN 1000 AND 2000 ORDER BY id LIMIT 5000",
+            f"SELECT id, key, bucket, label FROM read_parquet('{facts}') WHERE (key BETWEEN 10 AND 40 OR label LIKE 'label-2%') AND id NOT BETWEEN 1000 AND 2000 ORDER BY id LIMIT 5000",
+        ),
+        GenericQuery(
             "union_all_append",
             f"SELECT id, bucket, value FROM '{facts}' WHERE bucket = 1 UNION ALL SELECT id, bucket, value FROM '{facts}' WHERE bucket = 7",
             f"SELECT id, bucket, value FROM read_parquet('{facts}') WHERE bucket = 1 UNION ALL SELECT id, bucket, value FROM read_parquet('{facts}') WHERE bucket = 7",
+        ),
+        GenericQuery(
+            "union_distinct_low_cardinality",
+            f"SELECT bucket FROM '{facts}' WHERE bucket IN (1, 7) UNION SELECT bucket FROM '{facts}' WHERE bucket IN (7, 9) ORDER BY bucket",
+            f"SELECT bucket FROM read_parquet('{facts}') WHERE bucket IN (1, 7) UNION SELECT bucket FROM read_parquet('{facts}') WHERE bucket IN (7, 9) ORDER BY bucket",
+        ),
+        GenericQuery(
+            "union_distinct_rows",
+            f"SELECT bucket, value FROM '{facts}' WHERE bucket IN (1, 7) UNION DISTINCT SELECT bucket, value FROM '{facts}' WHERE bucket IN (7, 9) ORDER BY bucket, value LIMIT 5000",
+            f"SELECT bucket, value FROM read_parquet('{facts}') WHERE bucket IN (1, 7) UNION DISTINCT SELECT bucket, value FROM read_parquet('{facts}') WHERE bucket IN (7, 9) ORDER BY bucket, value LIMIT 5000",
+        ),
+        GenericQuery(
+            "select_distinct_low_cardinality",
+            f"SELECT DISTINCT bucket FROM '{facts}' WHERE bucket IN (1, 7, 9) ORDER BY bucket",
+            f"SELECT DISTINCT bucket FROM read_parquet('{facts}') WHERE bucket IN (1, 7, 9) ORDER BY bucket",
+        ),
+        GenericQuery(
+            "select_distinct_rows",
+            f"SELECT DISTINCT bucket, value FROM '{facts}' WHERE bucket IN (1, 7, 9) ORDER BY bucket, value LIMIT 5000",
+            f"SELECT DISTINCT bucket, value FROM read_parquet('{facts}') WHERE bucket IN (1, 7, 9) ORDER BY bucket, value LIMIT 5000",
         ),
         GenericQuery(
             "union_all_order_limit",

@@ -411,6 +411,7 @@ fn scan_direct_primitive_count_sum_page_fold(
         crate::storage::DirectPrimitiveColumnScanMetrics,
     )>,
 > {
+    let batch_size = direct_primitive_count_sum_page_batch_size(batch_size, &columns);
     let init = || match key_type {
         "i32" | "I32" | "int32" | "Int32" => Ok(if let Some((min, max)) = i32_dense_range {
             SingleKeyCountSumVectorState::new_i32_with_dense_range(
@@ -438,6 +439,12 @@ fn scan_direct_primitive_count_sum_page_fold(
             DirectPrimitiveCountSumPageBatch::I32I64 { keys, sums, rows } => {
                 state.consume_i32_i64_page_bytes(keys, sums, rows)
             }
+            DirectPrimitiveCountSumPageBatch::I32NullableI64 {
+                keys,
+                key_def_levels,
+                sums,
+                rows,
+            } => state.consume_i32_nullable_i64_page_bytes(keys, key_def_levels, sums, rows),
             DirectPrimitiveCountSumPageBatch::I64I64 { keys, sums, rows } => {
                 state.consume_i64_i64_page_bytes(keys, sums, rows)
             }
@@ -465,10 +472,7 @@ fn scan_direct_primitive_count_sum_page_fold(
         log_direct_primitive_exec_profile(&path, &columns, &metrics);
         return Ok(Some((state, metrics)));
     }
-    let workers = std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(4)
-        .min(row_groups.len());
+    let workers = direct_primitive_count_sum_page_workers(row_groups.len());
     let (sender, receiver) = mpsc::channel();
     let row_group_partitions = partition_row_groups_balanced(&row_groups, workers);
     std::thread::scope(|scope| {
@@ -533,6 +537,44 @@ fn scan_direct_primitive_count_sum_page_fold(
     }
     log_direct_primitive_exec_profile(&path, &columns, &scan_metrics);
     Ok(Some((state, scan_metrics)))
+}
+
+fn direct_primitive_count_sum_page_batch_size(
+    requested_batch_size: usize,
+    columns: &[(String, DirectPrimitiveColumnType)],
+) -> usize {
+    let Some(target_bytes) = std::env::var("DODAM_DIRECT_PRIMITIVE_L2_CHUNK_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+    else {
+        return requested_batch_size;
+    };
+    let row_width = columns
+        .iter()
+        .map(|(_, column_type)| match column_type {
+            DirectPrimitiveColumnType::I32 | DirectPrimitiveColumnType::Date32 => 4,
+            DirectPrimitiveColumnType::I64
+            | DirectPrimitiveColumnType::Decimal128Int64 { .. }
+            | DirectPrimitiveColumnType::Decimal128Int64Raw { .. } => 8,
+        })
+        .sum::<usize>()
+        .max(1);
+    let rows = (target_bytes / row_width).max(1024);
+    requested_batch_size.min(rows).max(1)
+}
+
+fn direct_primitive_count_sum_page_workers(row_group_count: usize) -> usize {
+    let available = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4);
+    let default_workers = available.min(row_group_count.max(1));
+    std::env::var("DODAM_DIRECT_PRIMITIVE_COUNT_SUM_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default_workers)
+        .min(row_group_count.max(1))
 }
 
 fn scan_direct_primitive_parallel_fold<S, Init, Consume, Merge>(
@@ -702,7 +744,7 @@ fn log_direct_primitive_exec_profile(
 }
 
 fn direct_primitive_count_sum_page_operator_enabled() -> bool {
-    std::env::var("DODAM_ENABLE_PRIMITIVE_PAGE_AGG_OPERATOR")
+    !std::env::var("DODAM_DISABLE_PRIMITIVE_PAGE_AGG_OPERATOR")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 

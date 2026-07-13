@@ -64,3 +64,585 @@ pub fn partition_count(estimated_build_bytes: u64, memory_limit_bytes: u64) -> u
         estimated_build_bytes.saturating_add(memory_limit_bytes - 1) / memory_limit_bytes;
     partitions.clamp(2, 1024) as usize
 }
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecimalRangeSelectivityInput {
+    pub column_min: i128,
+    pub column_max: i128,
+    pub filter_min: Option<i128>,
+    pub filter_max: Option<i128>,
+}
+
+impl DecimalRangeSelectivityInput {
+    pub fn estimated_selectivity(self) -> Option<f64> {
+        let domain_len = self
+            .column_max
+            .checked_sub(self.column_min)
+            .and_then(|value| value.checked_add(1))?;
+        if domain_len <= 0 {
+            return None;
+        }
+        let filter_min = self
+            .filter_min
+            .unwrap_or(self.column_min)
+            .max(self.column_min);
+        let filter_max = self
+            .filter_max
+            .unwrap_or(self.column_max)
+            .min(self.column_max);
+        if filter_min > filter_max {
+            return Some(0.0);
+        }
+        let selected_len = filter_max
+            .checked_sub(filter_min)
+            .and_then(|value| value.checked_add(1))?;
+        Some((selected_len as f64 / domain_len as f64).clamp(0.0, 1.0))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FusedSelectedAggregateCostInput {
+    pub estimated_selectivity: f64,
+    pub max_selectivity: f64,
+}
+
+pub fn choose_fused_selected_aggregate(input: FusedSelectedAggregateCostInput) -> bool {
+    input.estimated_selectivity.is_finite()
+        && input.max_selectivity.is_finite()
+        && input.estimated_selectivity <= input.max_selectivity.clamp(0.0, 1.0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerCostInput {
+    pub row_groups: usize,
+    pub available_parallelism: usize,
+    pub max_workers: usize,
+}
+
+pub fn choose_parallel_workers(input: WorkerCostInput) -> usize {
+    input
+        .available_parallelism
+        .max(1)
+        .min(input.max_workers.max(1))
+        .min(input.row_groups.max(1))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SelectedPayloadCostInput {
+    pub records: usize,
+    pub selected_rows: usize,
+    pub selected_runs: usize,
+    pub max_selected_ratio: f64,
+    pub min_average_run_len: usize,
+    pub cached_reread: bool,
+    pub cached_min_average_run_len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedPayloadDecision {
+    Accept,
+    EmptySelection,
+    SelectedRatio,
+    FragmentedRuns,
+    RowGroupSpread,
+}
+
+impl SelectedPayloadDecision {
+    pub fn accepted(self) -> bool {
+        matches!(self, Self::Accept)
+    }
+
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Accept => "accepted",
+            Self::EmptySelection => "empty-selection",
+            Self::SelectedRatio => "selected-ratio",
+            Self::FragmentedRuns => "fragmented-runs",
+            Self::RowGroupSpread => "row-group-spread",
+        }
+    }
+}
+
+pub fn choose_selected_payload(input: SelectedPayloadCostInput) -> SelectedPayloadDecision {
+    if input.records == 0 || input.selected_rows == 0 {
+        return SelectedPayloadDecision::EmptySelection;
+    }
+    let selected_ratio = input.selected_rows as f64 / input.records as f64;
+    if selected_ratio > input.max_selected_ratio.clamp(0.0, 1.0) {
+        return SelectedPayloadDecision::SelectedRatio;
+    }
+    let min_average_run_len = if input.cached_reread {
+        input
+            .cached_min_average_run_len
+            .min(input.min_average_run_len)
+            .max(1)
+    } else {
+        input.min_average_run_len.max(1)
+    };
+    let average_run_len = input.selected_rows / input.selected_runs.max(1);
+    if average_run_len < min_average_run_len {
+        return SelectedPayloadDecision::FragmentedRuns;
+    }
+    SelectedPayloadDecision::Accept
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SelectedPayloadSpreadCostInput {
+    pub selected_rows: usize,
+    pub selected_row_groups: usize,
+    pub total_row_groups: usize,
+    pub missing_payload_columns: usize,
+    pub max_selected_row_group_ratio: f64,
+    pub max_selected_row_groups: usize,
+}
+
+pub fn choose_selected_payload_by_spread(
+    input: SelectedPayloadSpreadCostInput,
+) -> SelectedPayloadDecision {
+    if input.selected_rows == 0 || input.missing_payload_columns == 0 {
+        return SelectedPayloadDecision::EmptySelection;
+    }
+    if input.total_row_groups == 0 {
+        return SelectedPayloadDecision::RowGroupSpread;
+    }
+    let selected_row_groups = input.selected_row_groups.min(input.total_row_groups);
+    if selected_row_groups > input.max_selected_row_groups.max(1) {
+        return SelectedPayloadDecision::RowGroupSpread;
+    }
+    let ratio = selected_row_groups as f64 / input.total_row_groups as f64;
+    if ratio > input.max_selected_row_group_ratio.clamp(0.0, 1.0) {
+        return SelectedPayloadDecision::RowGroupSpread;
+    }
+    SelectedPayloadDecision::Accept
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LateMaterializationCostInput {
+    pub total_rows: usize,
+    pub selected_rows: usize,
+    pub selector_runs: usize,
+    pub max_selected_ratio: Option<f64>,
+    pub max_selector_run_ratio: Option<f64>,
+    pub max_selector_runs_per_selected: Option<f64>,
+    pub io_cost_gate: bool,
+    pub predicate_compressed_bytes: u64,
+    pub payload_compressed_bytes: u64,
+    pub min_io_saving_ratio: f64,
+    pub io_override: bool,
+}
+
+pub fn late_materialization_selected_ratio(total_rows: usize, selected_rows: usize) -> f64 {
+    if total_rows == 0 {
+        0.0
+    } else {
+        selected_rows as f64 / total_rows as f64
+    }
+}
+
+pub fn late_materialization_estimated_io_saving(
+    selected_ratio: f64,
+    predicate_compressed_bytes: u64,
+    payload_compressed_bytes: u64,
+) -> f64 {
+    let full = predicate_compressed_bytes.saturating_add(payload_compressed_bytes) as f64;
+    if full <= 0.0 {
+        return 0.0;
+    }
+    let late = predicate_compressed_bytes as f64 + payload_compressed_bytes as f64 * selected_ratio;
+    ((full - late) / full).clamp(0.0, 1.0)
+}
+
+pub fn choose_late_materialization(input: LateMaterializationCostInput) -> bool {
+    if input.total_rows == 0 {
+        return true;
+    }
+    if input.max_selected_ratio.is_none()
+        && input.max_selector_run_ratio.is_none()
+        && input.max_selector_runs_per_selected.is_none()
+    {
+        return true;
+    }
+    if let Some(max_selector_run_ratio) = input.max_selector_run_ratio {
+        let selector_run_ratio = input.selector_runs as f64 / input.total_rows as f64;
+        if selector_run_ratio > max_selector_run_ratio {
+            return false;
+        }
+    }
+    if let Some(max_selector_runs_per_selected) = input.max_selector_runs_per_selected {
+        if input.selected_rows > 0 {
+            let selector_runs_per_selected =
+                input.selector_runs as f64 / input.selected_rows as f64;
+            if selector_runs_per_selected > max_selector_runs_per_selected {
+                return false;
+            }
+        }
+    }
+
+    let selected_ratio = late_materialization_selected_ratio(input.total_rows, input.selected_rows);
+    let accepts_selected_ratio = input
+        .max_selected_ratio
+        .is_none_or(|max_selected_ratio| selected_ratio <= max_selected_ratio);
+    if !input.io_cost_gate {
+        return accepts_selected_ratio;
+    }
+
+    let io_saving = late_materialization_estimated_io_saving(
+        selected_ratio,
+        input.predicate_compressed_bytes,
+        input.payload_compressed_bytes,
+    );
+    let saves_enough_io = io_saving >= input.min_io_saving_ratio.clamp(0.0, 1.0);
+    if accepts_selected_ratio {
+        saves_enough_io
+    } else {
+        input.io_override && saves_enough_io
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProjectionSelectivityCostInput {
+    pub predicate_columns: Option<usize>,
+    pub payload_columns: Option<usize>,
+    pub default_max_selected_ratio: f64,
+    pub narrow_payload_cap: f64,
+}
+
+pub fn choose_late_materialization_projection_selected_ratio(
+    input: ProjectionSelectivityCostInput,
+) -> f64 {
+    let default_ratio = input.default_max_selected_ratio.clamp(0.0, 1.0);
+    let narrow_cap = input.narrow_payload_cap.clamp(0.0, 1.0);
+    let Some(predicate_columns) = input.predicate_columns else {
+        return default_ratio.min(narrow_cap);
+    };
+    let Some(payload_columns) = input.payload_columns else {
+        return default_ratio.min(narrow_cap);
+    };
+    if payload_columns >= predicate_columns.saturating_mul(2).max(1) {
+        default_ratio
+    } else {
+        default_ratio.min(narrow_cap)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpressionAggregateLateChunkCostInput {
+    pub ordered_output: bool,
+    pub output_limit: Option<usize>,
+    pub default_chunk: usize,
+    pub ordered_limit_chunk: usize,
+}
+
+pub fn choose_expression_aggregate_late_row_group_chunk(
+    input: ExpressionAggregateLateChunkCostInput,
+) -> usize {
+    let default_chunk = input.default_chunk.max(1);
+    if input.ordered_output && input.output_limit.is_some() {
+        input.ordered_limit_chunk.max(default_chunk)
+    } else {
+        default_chunk
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrimitiveParquetSinkCostInput {
+    pub supported: bool,
+    pub rows: usize,
+    pub min_rows: usize,
+}
+
+pub fn choose_primitive_parquet_sink(input: PrimitiveParquetSinkCostInput) -> bool {
+    input.supported && input.rows >= input.min_rows.max(1)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrderedPrimitiveSinkCostInput {
+    pub limit: usize,
+    pub small_limit_rows: usize,
+    pub large_auto_enabled: bool,
+}
+
+pub fn choose_ordered_primitive_sink(input: OrderedPrimitiveSinkCostInput) -> bool {
+    input.limit <= input.small_limit_rows.max(1)
+        || (input.large_auto_enabled && input.limit > input.small_limit_rows.max(1))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrderedPrimitiveChunkCostInput {
+    pub limit: usize,
+    pub row_groups: usize,
+    pub available_parallelism: usize,
+    pub small_limit_rows: usize,
+    pub max_workers: usize,
+}
+
+pub fn choose_ordered_primitive_row_group_chunk(input: OrderedPrimitiveChunkCostInput) -> usize {
+    if input.limit <= input.small_limit_rows.max(1) {
+        return 1;
+    }
+    choose_parallel_workers(WorkerCostInput {
+        row_groups: input.row_groups,
+        available_parallelism: input.available_parallelism,
+        max_workers: input.max_workers,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DenseI32AggregateCostInput {
+    pub rows: usize,
+    pub min_rows: usize,
+    pub sample_rows: usize,
+    pub sample_unique: usize,
+    pub max_sample_unique: usize,
+}
+
+pub fn choose_dense_i32_block_accumulate(input: DenseI32AggregateCostInput) -> bool {
+    input.sample_rows >= 64
+        && input.rows >= input.min_rows.max(1)
+        && input.sample_unique <= input.max_sample_unique.max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decimal_range_selectivity_estimates_filter_overlap() {
+        let selectivity = DecimalRangeSelectivityInput {
+            column_min: 0,
+            column_max: 9999,
+            filter_min: None,
+            filter_max: Some(99),
+        }
+        .estimated_selectivity()
+        .expect("selectivity");
+        assert!((selectivity - 0.01).abs() < 0.000001);
+    }
+
+    #[test]
+    fn decimal_range_selectivity_handles_empty_overlap() {
+        let selectivity = DecimalRangeSelectivityInput {
+            column_min: 0,
+            column_max: 9999,
+            filter_min: Some(10_000),
+            filter_max: Some(20_000),
+        }
+        .estimated_selectivity()
+        .expect("selectivity");
+        assert_eq!(selectivity, 0.0);
+    }
+
+    #[test]
+    fn selected_payload_decision_reports_reason() {
+        assert_eq!(
+            choose_selected_payload(SelectedPayloadCostInput {
+                records: 10_000,
+                selected_rows: 100,
+                selected_runs: 2,
+                max_selected_ratio: 0.2,
+                min_average_run_len: 32,
+                cached_reread: false,
+                cached_min_average_run_len: 8,
+            }),
+            SelectedPayloadDecision::Accept
+        );
+        assert_eq!(
+            choose_selected_payload(SelectedPayloadCostInput {
+                records: 10_000,
+                selected_rows: 5_000,
+                selected_runs: 2,
+                max_selected_ratio: 0.2,
+                min_average_run_len: 32,
+                cached_reread: false,
+                cached_min_average_run_len: 8,
+            }),
+            SelectedPayloadDecision::SelectedRatio
+        );
+        assert_eq!(
+            choose_selected_payload(SelectedPayloadCostInput {
+                records: 10_000,
+                selected_rows: 100,
+                selected_runs: 100,
+                max_selected_ratio: 0.2,
+                min_average_run_len: 32,
+                cached_reread: false,
+                cached_min_average_run_len: 8,
+            }),
+            SelectedPayloadDecision::FragmentedRuns
+        );
+        assert_eq!(
+            choose_selected_payload(SelectedPayloadCostInput {
+                records: 10_000,
+                selected_rows: 800,
+                selected_runs: 100,
+                max_selected_ratio: 0.2,
+                min_average_run_len: 32,
+                cached_reread: true,
+                cached_min_average_run_len: 8,
+            }),
+            SelectedPayloadDecision::Accept
+        );
+    }
+
+    #[test]
+    fn selected_payload_spread_rejects_wide_second_pass() {
+        assert_eq!(
+            choose_selected_payload_by_spread(SelectedPayloadSpreadCostInput {
+                selected_rows: 5_000,
+                selected_row_groups: 49,
+                total_row_groups: 49,
+                missing_payload_columns: 1,
+                max_selected_row_group_ratio: 0.25,
+                max_selected_row_groups: 16,
+            }),
+            SelectedPayloadDecision::RowGroupSpread
+        );
+        assert_eq!(
+            choose_selected_payload_by_spread(SelectedPayloadSpreadCostInput {
+                selected_rows: 5_000,
+                selected_row_groups: 4,
+                total_row_groups: 49,
+                missing_payload_columns: 1,
+                max_selected_row_group_ratio: 0.25,
+                max_selected_row_groups: 16,
+            }),
+            SelectedPayloadDecision::Accept
+        );
+        assert_eq!(
+            choose_selected_payload_by_spread(SelectedPayloadSpreadCostInput {
+                selected_rows: 5_000,
+                selected_row_groups: 4,
+                total_row_groups: 49,
+                missing_payload_columns: 0,
+                max_selected_row_group_ratio: 0.25,
+                max_selected_row_groups: 16,
+            }),
+            SelectedPayloadDecision::EmptySelection
+        );
+    }
+
+    #[test]
+    fn parallel_workers_are_bounded() {
+        assert_eq!(
+            choose_parallel_workers(WorkerCostInput {
+                row_groups: 49,
+                available_parallelism: 32,
+                max_workers: 12,
+            }),
+            12
+        );
+        assert_eq!(
+            choose_parallel_workers(WorkerCostInput {
+                row_groups: 4,
+                available_parallelism: 32,
+                max_workers: 12,
+            }),
+            4
+        );
+    }
+
+    #[test]
+    fn late_materialization_accepts_io_saving_override() {
+        assert!(choose_late_materialization(LateMaterializationCostInput {
+            total_rows: 1_000,
+            selected_rows: 600,
+            selector_runs: 10,
+            max_selected_ratio: Some(0.1),
+            max_selector_run_ratio: Some(0.1),
+            max_selector_runs_per_selected: None,
+            io_cost_gate: true,
+            predicate_compressed_bytes: 1,
+            payload_compressed_bytes: 100,
+            min_io_saving_ratio: 0.2,
+            io_override: true,
+        }));
+        assert!(!choose_late_materialization(LateMaterializationCostInput {
+            total_rows: 1_000,
+            selected_rows: 600,
+            selector_runs: 200,
+            max_selected_ratio: Some(0.1),
+            max_selector_run_ratio: Some(0.1),
+            max_selector_runs_per_selected: None,
+            io_cost_gate: true,
+            predicate_compressed_bytes: 1,
+            payload_compressed_bytes: 100,
+            min_io_saving_ratio: 0.2,
+            io_override: true,
+        }));
+    }
+
+    #[test]
+    fn projection_selected_ratio_caps_narrow_payload() {
+        assert_eq!(
+            choose_late_materialization_projection_selected_ratio(ProjectionSelectivityCostInput {
+                predicate_columns: Some(2),
+                payload_columns: Some(1),
+                default_max_selected_ratio: 0.75,
+                narrow_payload_cap: 0.35,
+            }),
+            0.35
+        );
+        assert_eq!(
+            choose_late_materialization_projection_selected_ratio(ProjectionSelectivityCostInput {
+                predicate_columns: Some(1),
+                payload_columns: Some(2),
+                default_max_selected_ratio: 0.75,
+                narrow_payload_cap: 0.35,
+            }),
+            0.75
+        );
+    }
+
+    #[test]
+    fn primitive_sink_and_dense_gates_are_data_driven() {
+        assert!(choose_primitive_parquet_sink(
+            PrimitiveParquetSinkCostInput {
+                supported: true,
+                rows: 65_536,
+                min_rows: 64 * 1024,
+            }
+        ));
+        assert!(choose_ordered_primitive_sink(
+            OrderedPrimitiveSinkCostInput {
+                limit: 1_000_000,
+                small_limit_rows: 16 * 1024,
+                large_auto_enabled: true,
+            }
+        ));
+        assert!(choose_dense_i32_block_accumulate(
+            DenseI32AggregateCostInput {
+                rows: 256,
+                min_rows: 1,
+                sample_rows: 256,
+                sample_unique: 8,
+                max_sample_unique: 32,
+            }
+        ));
+    }
+
+    #[test]
+    fn expression_aggregate_late_chunk_grows_for_ordered_limit() {
+        assert_eq!(
+            choose_expression_aggregate_late_row_group_chunk(
+                ExpressionAggregateLateChunkCostInput {
+                    ordered_output: true,
+                    output_limit: Some(2_000),
+                    default_chunk: 2,
+                    ordered_limit_chunk: 4,
+                }
+            ),
+            4
+        );
+        assert_eq!(
+            choose_expression_aggregate_late_row_group_chunk(
+                ExpressionAggregateLateChunkCostInput {
+                    ordered_output: false,
+                    output_limit: Some(2_000),
+                    default_chunk: 2,
+                    ordered_limit_chunk: 4,
+                }
+            ),
+            2
+        );
+    }
+}

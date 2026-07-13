@@ -24,7 +24,8 @@ pub use logical::{
     Projection, SortExpr, SortKey,
 };
 pub use metrics::{
-    RecordBatchSink, ScanMetrics, ScanPlanMetrics, SendableBatchStream, write_stream_to_sink,
+    PrimitiveBatch, PrimitiveColumn, PrimitiveColumnValues, RecordBatchSink, ScanMetrics,
+    ScanPlanMetrics, SendableBatchStream, write_stream_to_sink,
 };
 pub(crate) use physical::evaluate_projected_view_filter_mask;
 pub use physical::{

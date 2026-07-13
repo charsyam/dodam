@@ -94,6 +94,45 @@ async fn duckdb_differential_scan_filter_and_nulls() {
         tempdir.path(),
     )
     .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, key, payload FROM '{}' WHERE id + 1 BETWEEN 3 AND 6 ORDER BY id",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id, key, payload FROM read_parquet('{}') WHERE id + 1 BETWEEN 3 AND 6 ORDER BY id",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, key, payload FROM '{}' WHERE id NOT BETWEEN 2 AND 5 ORDER BY id",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id, key, payload FROM read_parquet('{}') WHERE id NOT BETWEEN 2 AND 5 ORDER BY id",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, key, payload FROM '{}' WHERE upper(payload) LIKE 'A%' OR lower(payload) LIKE 'f%' ORDER BY id",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id, key, payload FROM read_parquet('{}') WHERE upper(payload) LIKE 'A%' OR lower(payload) LIKE 'f%' ORDER BY id",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -608,6 +647,36 @@ async fn duckdb_differential_union_all() {
         ),
         &format!(
             "SELECT id, key, value FROM read_parquet('{}') WHERE key = 1 UNION ALL SELECT id, key, value FROM read_parquet('{}') WHERE key = 3 ORDER BY id DESC LIMIT 4",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT key AS value FROM '{}' WHERE id <= 4 UNION SELECT key AS value FROM '{}' WHERE id >= 2 ORDER BY value",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT key AS value FROM read_parquet('{}') WHERE id <= 4 UNION SELECT key AS value FROM read_parquet('{}') WHERE id >= 2 ORDER BY value",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT key AS value, payload FROM '{}' WHERE id <= 5 UNION DISTINCT SELECT key AS value, payload FROM '{}' WHERE id >= 2 ORDER BY value, payload",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT key AS value, payload FROM read_parquet('{}') WHERE id <= 5 UNION DISTINCT SELECT key AS value, payload FROM read_parquet('{}') WHERE id >= 2 ORDER BY value, payload",
             facts_path.display(),
             facts_path.display()
         ),
