@@ -2107,7 +2107,7 @@ fn try_write_same_source_union_all_streaming_primitive_topk_to_sink_inner(
                 .zip(scan_column_types.iter())
                 .map(|(name, column_type)| (name.clone(), *column_type))
                 .collect(),
-            || PrimitiveTopkState::new(limit, &scan_column_types),
+            || PrimitiveTopkState::new(limit, &scan_column_types, use_selected_payload),
             |state, location, view| {
                 state.consume_view(
                     location,
@@ -2925,7 +2925,7 @@ impl PrimitiveSelectedBatchTopkState {
 }
 
 impl PrimitiveTopkState {
-    fn new(limit: usize, column_types: &[DirectPrimitiveColumnType]) -> Self {
+    fn new(limit: usize, column_types: &[DirectPrimitiveColumnType], track_row_refs: bool) -> Self {
         let columns = column_types
             .iter()
             .map(|column_type| match column_type {
@@ -2944,7 +2944,8 @@ impl PrimitiveTopkState {
             sequence: 0,
             heap: BinaryHeap::with_capacity(limit.saturating_add(1)),
             columns,
-            row_refs: (primitive_topk_row_refs_enabled()
+            row_refs: (track_row_refs
+                || primitive_topk_row_refs_enabled()
                 || primitive_topk_selected_payload_enabled())
             .then(|| Vec::with_capacity(limit)),
             selected_positions: Vec::new(),
@@ -3220,6 +3221,11 @@ fn primitive_topk_fused_filter_threshold_enabled() -> bool {
     std::env::var("DODAM_ENABLE_PRIMITIVE_TOPK_FUSED_FILTER_THRESHOLD")
         .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
         .unwrap_or(true)
+}
+
+fn primitive_topk_block_max_skip_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_PRIMITIVE_TOPK_BLOCK_MAX_SKIP")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 fn null_free_primitive_columns_for_topk<'a>(
@@ -42983,9 +42989,13 @@ fn primitive_topk_filter_i32_positions_with_i32_min_key(
     min_key: i32,
     selected: &mut Vec<usize>,
 ) {
-    push_primitive_position_pairs_unrolled(values, sort_values, selected, |value, key| {
-        key >= min_key && small_i32_filter_values_contains(filter_values, value)
-    });
+    push_primitive_position_pairs_unrolled_with_offset(
+        values,
+        sort_values,
+        0,
+        selected,
+        |value, key| key >= min_key && small_i32_filter_values_contains(filter_values, value),
+    );
 }
 
 fn primitive_topk_filter_i32_positions_with_i64_min_key(
@@ -42995,9 +43005,34 @@ fn primitive_topk_filter_i32_positions_with_i64_min_key(
     min_key: i64,
     selected: &mut Vec<usize>,
 ) {
-    push_primitive_position_pairs_unrolled(values, sort_values, selected, |value, key| {
-        key >= min_key && small_i32_filter_values_contains(filter_values, value)
-    });
+    if let [a, b] = filter_values {
+        if primitive_topk_block_max_skip_enabled() {
+            push_i32_eq2_positions_with_i64_min_key_blocked(
+                values,
+                *a,
+                *b,
+                sort_values,
+                min_key,
+                selected,
+            );
+        } else {
+            push_primitive_position_pairs_unrolled_with_offset(
+                values,
+                sort_values,
+                0,
+                selected,
+                |value, key| key >= min_key && (value == *a || value == *b),
+            );
+        }
+    } else {
+        push_primitive_position_pairs_unrolled_with_offset(
+            values,
+            sort_values,
+            0,
+            selected,
+            |value, key| key >= min_key && small_i32_filter_values_contains(filter_values, value),
+        );
+    }
 }
 
 fn primitive_topk_filter_i64_positions_with_i64_min_key(
@@ -43007,9 +43042,13 @@ fn primitive_topk_filter_i64_positions_with_i64_min_key(
     min_key: i64,
     selected: &mut Vec<usize>,
 ) {
-    push_primitive_position_pairs_unrolled(values, sort_values, selected, |value, key| {
-        key >= min_key && small_i64_filter_values_contains(filter_values, value)
-    });
+    push_primitive_position_pairs_unrolled_with_offset(
+        values,
+        sort_values,
+        0,
+        selected,
+        |value, key| key >= min_key && small_i64_filter_values_contains(filter_values, value),
+    );
 }
 
 fn primitive_topk_filter_i64_positions_with_i32_min_key(
@@ -43019,9 +43058,52 @@ fn primitive_topk_filter_i64_positions_with_i32_min_key(
     min_key: i32,
     selected: &mut Vec<usize>,
 ) {
-    push_primitive_position_pairs_unrolled(values, sort_values, selected, |value, key| {
-        key >= min_key && small_i64_filter_values_contains(filter_values, value)
-    });
+    push_primitive_position_pairs_unrolled_with_offset(
+        values,
+        sort_values,
+        0,
+        selected,
+        |value, key| key >= min_key && small_i64_filter_values_contains(filter_values, value),
+    );
+}
+
+fn push_i32_eq2_positions_with_i64_min_key_blocked(
+    values: &[i32],
+    a: i32,
+    b: i32,
+    keys: &[i64],
+    min_key: i64,
+    selected: &mut Vec<usize>,
+) {
+    let len = values.len().min(keys.len());
+    let mut row = 0usize;
+    const BLOCK: usize = 64;
+    while row + BLOCK <= len {
+        let block_keys = &keys[row..row + BLOCK];
+        let mut max_key = block_keys[0];
+        for key in block_keys.iter().copied().skip(1) {
+            if key > max_key {
+                max_key = key;
+            }
+        }
+        if max_key >= min_key {
+            push_primitive_position_pairs_unrolled_with_offset(
+                &values[row..row + BLOCK],
+                block_keys,
+                row,
+                selected,
+                |value, key| key >= min_key && (value == a || value == b),
+            );
+        }
+        row += BLOCK;
+    }
+    while row < len {
+        let value = values[row];
+        if keys[row] >= min_key && (value == a || value == b) {
+            selected.push(row);
+        }
+        row += 1;
+    }
 }
 
 fn small_i32_filter_values_contains(values: &[i32], value: i32) -> bool {
@@ -43150,9 +43232,10 @@ where
     }
 }
 
-fn push_primitive_position_pairs_unrolled<T, U, F>(
+fn push_primitive_position_pairs_unrolled_with_offset<T, U, F>(
     values: &[T],
     keys: &[U],
+    offset: usize,
     selected: &mut Vec<usize>,
     mut matches: F,
 ) where
@@ -43181,34 +43264,34 @@ fn push_primitive_position_pairs_unrolled<T, U, F>(
         let k6 = keys[row + 6];
         let k7 = keys[row + 7];
         if matches(v0, k0) {
-            selected.push(row);
+            selected.push(offset + row);
         }
         if matches(v1, k1) {
-            selected.push(row + 1);
+            selected.push(offset + row + 1);
         }
         if matches(v2, k2) {
-            selected.push(row + 2);
+            selected.push(offset + row + 2);
         }
         if matches(v3, k3) {
-            selected.push(row + 3);
+            selected.push(offset + row + 3);
         }
         if matches(v4, k4) {
-            selected.push(row + 4);
+            selected.push(offset + row + 4);
         }
         if matches(v5, k5) {
-            selected.push(row + 5);
+            selected.push(offset + row + 5);
         }
         if matches(v6, k6) {
-            selected.push(row + 6);
+            selected.push(offset + row + 6);
         }
         if matches(v7, k7) {
-            selected.push(row + 7);
+            selected.push(offset + row + 7);
         }
         row += 8;
     }
     while row < len {
         if matches(values[row], keys[row]) {
-            selected.push(row);
+            selected.push(offset + row);
         }
         row += 1;
     }
