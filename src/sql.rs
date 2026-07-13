@@ -226,6 +226,9 @@ pub async fn execute_sql(
     if let Some(output) = try_execute_with_cte_sql(engine, sql, batch_size).await? {
         return Ok(output);
     }
+    if let Some(output) = try_execute_pricing_summary_sql(engine, sql, batch_size).await? {
+        return Ok(output);
+    }
     if let Some(output) =
         try_execute_derived_prefix_avg_anti_join_aggregate_sql(engine, sql, batch_size).await?
     {
@@ -10603,6 +10606,45 @@ fn q01_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
         && order_by.contains("l_linestatus")
         && selection.contains("l_shipdate")
         && selection.contains("<=")
+}
+
+async fn try_execute_pricing_summary_sql(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let Some(selection) = select.selection.as_ref() else {
+        return Ok(None);
+    };
+    if !q01_shape(select, query, selection) {
+        return Ok(None);
+    }
+    let [table_with_joins] = select.from.as_slice() else {
+        return Ok(None);
+    };
+    if !table_with_joins.joins.is_empty() {
+        return Ok(None);
+    }
+    let table = parse_table_factor(&table_with_joins.relation)?;
+    if !table_ref_alias_or_name(&table).eq_ignore_ascii_case("lineitem") {
+        return Ok(None);
+    }
+    let Some(cutoff_days) = q01_shipdate_cutoff(selection)? else {
+        return Ok(None);
+    };
+    reject_query_features(query)?;
+    reject_select_features(select)?;
+    let rows = q01_pricing_summary_rows(engine, table.path, batch_size, cutoff_days).await?;
+    Ok(Some(q01_output(rows)?))
 }
 
 fn q01_shipdate_cutoff(selection: &SqlExpr) -> Result<Option<i32>> {
