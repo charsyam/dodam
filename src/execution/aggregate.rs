@@ -5688,27 +5688,46 @@ impl SingleKeyCountSumVectorState {
             && len == row_count
             && sum_len == row_count
         {
-            for row in 0..row_count {
-                let key = read_i64_le_unaligned(key_bytes, row);
-                let sum = read_i64_le_unaligned(sum_bytes, row);
-                let group_id = count_sum_group_id_for_i64(
-                    index,
-                    key,
-                    &mut self.groups,
-                    &CountSumValueInput::Int64Raw,
-                );
-                self.groups[group_id].update_raw_i64_non_null(sum);
-            }
-        } else if let Some(keys) = key_values.values_if_null_free() {
-            if let Some(sum_values) = sums.non_null_values() {
-                for row in 0..keys.len() {
+            if !consume_i64_i64_page_bytes_dense_accumulate(
+                index,
+                &mut self.groups,
+                &mut self.dense_counts_scratch,
+                &mut self.dense_totals_scratch,
+                key_bytes,
+                sum_bytes,
+                row_count,
+            ) {
+                for row in 0..row_count {
+                    let key = read_i64_le_unaligned(key_bytes, row);
+                    let sum = read_i64_le_unaligned(sum_bytes, row);
                     let group_id = count_sum_group_id_for_i64(
                         index,
-                        keys[row],
+                        key,
                         &mut self.groups,
                         &CountSumValueInput::Int64Raw,
                     );
-                    self.groups[group_id].update_raw_i64_non_null(sum_values[row]);
+                    self.groups[group_id].update_raw_i64_non_null(sum);
+                }
+            }
+        } else if let Some(keys) = key_values.values_if_null_free() {
+            if let Some(sum_values) = sums.non_null_values() {
+                if !consume_i64_non_null_keys_sums_dense_accumulate(
+                    index,
+                    &mut self.groups,
+                    &mut self.dense_counts_scratch,
+                    &mut self.dense_totals_scratch,
+                    keys,
+                    sum_values,
+                ) {
+                    for row in 0..keys.len() {
+                        let group_id = count_sum_group_id_for_i64(
+                            index,
+                            keys[row],
+                            &mut self.groups,
+                            &CountSumValueInput::Int64Raw,
+                        );
+                        self.groups[group_id].update_raw_i64_non_null(sum_values[row]);
+                    }
                 }
             } else {
                 for row in 0..keys.len() {
@@ -5983,6 +6002,103 @@ fn consume_i32_non_null_keys_sums_dense_accumulate(
         totals[offset] = totals[offset].saturating_add(sums[row]);
     }
     apply_i32_dense_accumulated_groups(*dense_min, slots, groups, &counts, &totals)
+}
+
+fn consume_i64_non_null_keys_sums_dense_accumulate(
+    index: &mut AdaptiveCopyGroupIndex<i64>,
+    groups: &mut Vec<CountSumGroup>,
+    counts_scratch: &mut Vec<u32>,
+    totals_scratch: &mut Vec<i64>,
+    keys: &[i64],
+    sums: &[i64],
+) -> bool {
+    if keys.len() != sums.len() || keys.len() < 1024 {
+        return false;
+    }
+    let Some((min, max)) = min_max_i64_slice(keys) else {
+        return false;
+    };
+    let Some(slot_count) = dense_i64_slot_count(min, max, dense_i32_batch_accumulate_max_slots())
+    else {
+        return false;
+    };
+    if slot_count > keys.len().saturating_mul(4) {
+        return false;
+    }
+    reset_dense_i32_accumulate_scratch(counts_scratch, totals_scratch, slot_count);
+    let counts = counts_scratch.as_mut_slice();
+    let totals = totals_scratch.as_mut_slice();
+    for row in 0..keys.len() {
+        let Some(offset) = dense_i64_offset(min, keys[row]) else {
+            return false;
+        };
+        let Some(count) = counts.get_mut(offset) else {
+            return false;
+        };
+        *count = count.saturating_add(1);
+        totals[offset] = totals[offset].saturating_add(sums[row]);
+    }
+    apply_i64_dense_accumulated_groups(min, index, groups, counts, totals)
+}
+
+fn consume_i64_i64_page_bytes_dense_accumulate(
+    index: &mut AdaptiveCopyGroupIndex<i64>,
+    groups: &mut Vec<CountSumGroup>,
+    counts_scratch: &mut Vec<u32>,
+    totals_scratch: &mut Vec<i64>,
+    key_bytes: &[u8],
+    sum_bytes: &[u8],
+    rows: usize,
+) -> bool {
+    if rows < 1024 {
+        return false;
+    }
+    let Some((min, max)) = min_max_i64_page_bytes(key_bytes, rows) else {
+        return false;
+    };
+    let Some(slot_count) = dense_i64_slot_count(min, max, dense_i32_batch_accumulate_max_slots())
+    else {
+        return false;
+    };
+    if slot_count > rows.saturating_mul(4) {
+        return false;
+    }
+    reset_dense_i32_accumulate_scratch(counts_scratch, totals_scratch, slot_count);
+    let counts = counts_scratch.as_mut_slice();
+    let totals = totals_scratch.as_mut_slice();
+    for row in 0..rows {
+        let key = read_i64_le_unaligned(key_bytes, row);
+        let Some(offset) = dense_i64_offset(min, key) else {
+            return false;
+        };
+        let Some(count) = counts.get_mut(offset) else {
+            return false;
+        };
+        *count = count.saturating_add(1);
+        totals[offset] = totals[offset].saturating_add(read_i64_le_unaligned(sum_bytes, row));
+    }
+    apply_i64_dense_accumulated_groups(min, index, groups, counts, totals)
+}
+
+fn apply_i64_dense_accumulated_groups(
+    min: i64,
+    index: &mut AdaptiveCopyGroupIndex<i64>,
+    groups: &mut Vec<CountSumGroup>,
+    counts: &[u32],
+    totals: &[i64],
+) -> bool {
+    for (offset, count) in counts.iter().copied().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let Some(key) = min.checked_add(offset as i64) else {
+            return false;
+        };
+        let group_id =
+            count_sum_group_id_for_i64(index, key, groups, &CountSumValueInput::Int64Raw);
+        groups[group_id].update_raw_i64_non_null_many(u64::from(count), totals[offset]);
+    }
+    true
 }
 
 const DENSE_I32_STACK_ACCUMULATE_SLOTS: usize = 256;
@@ -6370,6 +6486,43 @@ fn min_max_i32_slice(values: &[i32]) -> Option<(i32, i32)> {
         max = max.max(value);
     }
     Some((min, max))
+}
+
+fn min_max_i64_slice(values: &[i64]) -> Option<(i64, i64)> {
+    let mut iter = values.iter().copied();
+    let first = iter.next()?;
+    let mut min = first;
+    let mut max = first;
+    for value in iter {
+        min = min.min(value);
+        max = max.max(value);
+    }
+    Some((min, max))
+}
+
+fn min_max_i64_page_bytes(data: &[u8], rows: usize) -> Option<(i64, i64)> {
+    if rows == 0 || data.len() < rows.saturating_mul(std::mem::size_of::<i64>()) {
+        return None;
+    }
+    let first = read_i64_le_unaligned(data, 0);
+    let mut min = first;
+    let mut max = first;
+    for row in 1..rows {
+        let value = read_i64_le_unaligned(data, row);
+        min = min.min(value);
+        max = max.max(value);
+    }
+    Some((min, max))
+}
+
+fn dense_i64_slot_count(min: i64, max: i64, max_slots: usize) -> Option<usize> {
+    let span = max.checked_sub(min)?.checked_add(1)?;
+    let slots = usize::try_from(span).ok()?;
+    (slots <= max_slots).then_some(slots)
+}
+
+fn dense_i64_offset(min: i64, value: i64) -> Option<usize> {
+    usize::try_from(value.checked_sub(min)?).ok()
 }
 
 fn dense_i32_batch_accumulate_max_slots() -> usize {
