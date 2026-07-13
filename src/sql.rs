@@ -671,56 +671,6 @@ async fn try_execute_legacy_tpch_fast_sql(
     if legacy_tpch_fast_paths_disabled() {
         return Ok(None);
     }
-    if let Some(output) = try_execute_q15_top_supplier_fast(engine, sql, batch_size).await? {
-        return Ok(Some(output));
-    }
-    if let Some(output) = try_execute_q01_pricing_summary_fast(engine, sql, batch_size).await? {
-        return Ok(Some(output));
-    }
-    if let Some(output) = try_execute_q10_returned_item_fast(engine, sql, batch_size).await? {
-        return Ok(Some(output));
-    }
-    if let Some(output) = try_execute_q09_product_type_profit_fast(engine, sql, batch_size).await? {
-        return Ok(Some(output));
-    }
-    if let Some(output) = try_execute_q11_important_stock_fast(engine, sql, batch_size).await? {
-        return Ok(Some(output));
-    }
-    if let Some(output) =
-        try_execute_q02_minimum_cost_supplier_fast(engine, sql, batch_size).await?
-    {
-        return Ok(Some(output));
-    }
-    if let Some(output) = try_execute_q12_shipping_modes_fast(engine, sql, batch_size).await? {
-        return Ok(Some(output));
-    }
-    if let Some(output) = try_execute_q14_promotion_effect_fast(engine, sql, batch_size).await? {
-        return Ok(Some(output));
-    }
-    if let Some(output) =
-        try_execute_q16_parts_supplier_relationship_fast(engine, sql, batch_size).await?
-    {
-        return Ok(Some(output));
-    }
-    if let Some(output) = try_execute_q03_shipping_priority_fast(engine, sql, batch_size).await? {
-        return Ok(Some(output));
-    }
-    if let Some(output) = try_execute_q04_order_priority_fast(engine, sql, batch_size).await? {
-        return Ok(Some(output));
-    }
-    if let Some(output) =
-        try_execute_q05_local_supplier_volume_fast(engine, sql, batch_size).await?
-    {
-        return Ok(Some(output));
-    }
-    if let Some(output) = try_execute_q07_volume_shipping_fast(engine, sql, batch_size).await? {
-        return Ok(Some(output));
-    }
-    if let Some(output) =
-        try_execute_q08_national_market_share_fast(engine, sql, batch_size).await?
-    {
-        return Ok(Some(output));
-    }
     if let Some(output) =
         try_execute_q22_global_sales_opportunity_fast(engine, sql, batch_size).await?
     {
@@ -729,9 +679,6 @@ async fn try_execute_legacy_tpch_fast_sql(
     if let Some(output) =
         try_execute_q18_large_volume_customer_fast(engine, sql, batch_size).await?
     {
-        return Ok(Some(output));
-    }
-    if let Some(output) = try_execute_q19_discounted_revenue_fast(engine, sql, batch_size).await? {
         return Ok(Some(output));
     }
     if let Some(output) =
@@ -754,6 +701,11 @@ async fn try_execute_legacy_tpch_fast_sql(
 
 fn legacy_tpch_fast_paths_disabled() -> bool {
     std::env::var("DODAM_DISABLE_LEGACY_TPCH_FAST_PATHS")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn semijoin_profile_enabled() -> bool {
+    std::env::var("DODAM_SEMIJOIN_PROFILE")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
@@ -5175,6 +5127,9 @@ async fn try_execute_correlated_exists_semijoin_sql(
         .as_ref()
         .map(|expr| parse_filter(expr, &[], inner_path.alias.as_deref(), false))
         .transpose()?;
+    let profile = semijoin_profile_enabled();
+    let total_started = profile.then(Instant::now);
+    let inner_started = profile.then(Instant::now);
     let inner_keys = collect_semijoin_key_set(
         engine,
         inner_path.path,
@@ -5183,6 +5138,7 @@ async fn try_execute_correlated_exists_semijoin_sql(
         batch_size,
     )
     .await?;
+    let inner_elapsed = inner_started.map(|started| started.elapsed());
 
     let outer_residual = outer_conjuncts
         .into_iter()
@@ -5216,6 +5172,7 @@ async fn try_execute_correlated_exists_semijoin_sql(
         } else {
             (None, Vec::new())
         };
+    let plan_elapsed = total_started.map(|started| started.elapsed());
 
     let group_by = parse_group_by(select, outer_path.alias.as_deref())?;
     let parsed_projection = parse_projection(select, &group_by, outer_path.alias.as_deref())?;
@@ -5253,6 +5210,7 @@ async fn try_execute_correlated_exists_semijoin_sql(
             predicate_expression_columns(expression_filter, outer_path.alias.as_deref())?,
         );
     }
+    let scan_started = profile.then(Instant::now);
     let stream = engine
         .scan_parquet_batches(
             outer_path.path,
@@ -5263,6 +5221,8 @@ async fn try_execute_correlated_exists_semijoin_sql(
         )
         .await?;
     let mut outer_batches = collect_batches(stream)?;
+    let scan_elapsed = scan_started.map(|started| started.elapsed());
+    let expression_started = profile.then(Instant::now);
     for expression_filter in outer_expression_filters {
         outer_batches = apply_output_expression_filter(
             outer_batches,
@@ -5270,6 +5230,8 @@ async fn try_execute_correlated_exists_semijoin_sql(
             outer_path.alias.as_deref(),
         )?;
     }
+    let expression_elapsed = expression_started.map(|started| started.elapsed());
+    let membership_started = profile.then(Instant::now);
     let mut filtered = Vec::new();
     for batch in outer_batches {
         let mut mask = semijoin_membership_mask(&batch, &outer_key, &inner_keys)?;
@@ -5280,6 +5242,25 @@ async fn try_execute_correlated_exists_semijoin_sql(
         if batch.num_rows() > 0 {
             filtered.push(batch);
         }
+    }
+    let membership_elapsed = membership_started.map(|started| started.elapsed());
+    if let (true, Some(total_started)) = (profile, total_started) {
+        let rows = filtered.iter().map(RecordBatch::num_rows).sum::<usize>();
+        eprintln!(
+            "[dodam:semijoin-profile] total={}ms plan={}ms inner={}ms outer_scan={}ms expr={}ms membership={}ms output_rows={} negated={}",
+            total_started.elapsed().as_millis(),
+            plan_elapsed.map(|elapsed| elapsed.as_millis()).unwrap_or(0),
+            inner_elapsed.map(|elapsed| elapsed.as_millis()).unwrap_or(0),
+            scan_elapsed.map(|elapsed| elapsed.as_millis()).unwrap_or(0),
+            expression_elapsed
+                .map(|elapsed| elapsed.as_millis())
+                .unwrap_or(0),
+            membership_elapsed
+                .map(|elapsed| elapsed.as_millis())
+                .unwrap_or(0),
+            rows,
+            exists_negated,
+        );
     }
 
     if !parsed_projection.aggregates.is_empty() {
@@ -13160,1156 +13141,6 @@ fn q10_output(rows: Vec<Q10Row>) -> Result<QueryOutput> {
             )),
             Arc::new(StringArray::from_iter_values(
                 rows.iter().map(|row| row.c_comment.as_str()),
-            )),
-        ],
-    )?;
-    Ok(QueryOutput::Aggregate {
-        metrics: AggregateMetrics::default(),
-        batches: vec![batch],
-    })
-}
-
-async fn try_execute_q02_minimum_cost_supplier_fast(
-    engine: &DodamEngine,
-    sql: &str,
-    batch_size: usize,
-) -> Result<Option<QueryOutput>> {
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Ok(None);
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Ok(None);
-    };
-    let Some(selection) = select.selection.as_ref() else {
-        return Ok(None);
-    };
-    if !q02_shape(select, query, selection) {
-        return Ok(None);
-    }
-    reject_query_features(query)?;
-    reject_select_features(select)?;
-    let Some(tables) = parse_comma_join_table_refs(select)? else {
-        return Ok(None);
-    };
-    if tables.len() != 5 {
-        return Ok(None);
-    }
-    let mut part = None;
-    let mut supplier = None;
-    let mut partsupp = None;
-    let mut nation = None;
-    let mut region = None;
-    for table in tables {
-        let alias = table_ref_alias_or_name(&table);
-        if alias.eq_ignore_ascii_case("part") {
-            part = Some(table);
-        } else if alias.eq_ignore_ascii_case("supplier") {
-            supplier = Some(table);
-        } else if alias.eq_ignore_ascii_case("partsupp") {
-            partsupp = Some(table);
-        } else if alias.eq_ignore_ascii_case("nation") {
-            nation = Some(table);
-        } else if alias.eq_ignore_ascii_case("region") {
-            region = Some(table);
-        }
-    }
-    let (Some(part), Some(supplier), Some(partsupp), Some(nation), Some(region)) =
-        (part, supplier, partsupp, nation, region)
-    else {
-        return Ok(None);
-    };
-    if !partsupp.path.exists() {
-        return Err(DodamError::MissingPath(partsupp.path));
-    }
-    if !part.path.exists() {
-        return Err(DodamError::MissingPath(part.path));
-    }
-    let mut conjuncts = Vec::new();
-    collect_sql_and_conjuncts(selection, &mut conjuncts);
-    let Some(part_size) = numeric_equality_literal(&conjuncts, "p_size")? else {
-        return Ok(None);
-    };
-    let Some(part_type_suffix) = like_suffix_literal(&conjuncts, "p_type")? else {
-        return Ok(None);
-    };
-    let Some(region_name) = string_equality_literal(&conjuncts, "r_name")? else {
-        return Ok(None);
-    };
-
-    let stage = tpch_profile_start();
-    let region_keys = q02_region_keys(engine, region.path, batch_size, &region_name).await?;
-    tpch_profile_elapsed("Q02 region keys", stage);
-    if region_keys.is_empty() {
-        return Ok(Some(q02_output(Vec::new())?));
-    }
-    let stage = tpch_profile_start();
-    let nation_names = q02_nation_names(engine, nation.path, batch_size, &region_keys).await?;
-    tpch_profile_elapsed("Q02 nation names", stage);
-    if nation_names.is_empty() {
-        return Ok(Some(q02_output(Vec::new())?));
-    }
-    let stage = tpch_profile_start();
-    let suppliers = q02_suppliers(engine, supplier.path, batch_size, &nation_names).await?;
-    tpch_profile_elapsed("Q02 suppliers", stage);
-    if suppliers.is_empty() {
-        return Ok(Some(q02_output(Vec::new())?));
-    }
-    let stage = tpch_profile_start();
-    let parts =
-        q02_matching_parts(engine, part.path, batch_size, part_size, &part_type_suffix).await?;
-    tpch_profile_elapsed("Q02 parts", stage);
-    if parts.is_empty() {
-        return Ok(Some(q02_output(Vec::new())?));
-    }
-    let stage = tpch_profile_start();
-    let rows = q02_min_cost_rows(engine, partsupp.path, batch_size, &parts, &suppliers).await?;
-    tpch_profile_elapsed("Q02 partsupp min-cost rows", stage);
-    Ok(Some(q02_output(rows)?))
-}
-
-fn q02_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
-    let projection = select
-        .projection
-        .iter()
-        .map(|item| item.to_string().to_ascii_lowercase())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let order_by = query
-        .order_by
-        .as_ref()
-        .map(|order_by| order_by.to_string().to_ascii_lowercase())
-        .unwrap_or_default();
-    let selection = selection.to_string().to_ascii_lowercase();
-    select.from.len() == 5
-        && select.projection.len() == 8
-        && matches!(parse_limit(query), Ok(Some(100)))
-        && projection.contains("s_acctbal")
-        && projection.contains("s_name")
-        && projection.contains("n_name")
-        && projection.contains("p_partkey")
-        && projection.contains("p_mfgr")
-        && projection.contains("s_address")
-        && projection.contains("s_phone")
-        && projection.contains("s_comment")
-        && order_by.contains("s_acctbal desc")
-        && order_by.contains("n_name")
-        && order_by.contains("s_name")
-        && order_by.contains("p_partkey")
-        && selection.contains("p_partkey = ps_partkey")
-        && selection.contains("s_suppkey = ps_suppkey")
-        && selection.contains("s_nationkey = n_nationkey")
-        && selection.contains("n_regionkey = r_regionkey")
-        && selection.contains("p_size")
-        && selection.contains("p_type like")
-        && selection.contains("ps_supplycost")
-        && selection.contains("min(ps_supplycost)")
-}
-
-fn numeric_equality_literal(conjuncts: &[SqlExpr], column: &str) -> Result<Option<f64>> {
-    for conjunct in conjuncts {
-        let SqlExpr::BinaryOp { left, op, right } = conjunct else {
-            continue;
-        };
-        if *op != BinaryOperator::Eq {
-            continue;
-        }
-        if sql_expr_column_matches(left, column) {
-            return Ok(Some(literal_as_f64(&sql_literal_value(right)?)?));
-        } else if sql_expr_column_matches(right, column) {
-            return Ok(Some(literal_as_f64(&sql_literal_value(left)?)?));
-        }
-    }
-    Ok(None)
-}
-
-fn like_suffix_literal(conjuncts: &[SqlExpr], column: &str) -> Result<Option<String>> {
-    for conjunct in conjuncts {
-        let SqlExpr::Like {
-            expr,
-            pattern,
-            negated,
-            ..
-        } = conjunct
-        else {
-            continue;
-        };
-        if *negated || !sql_expr_column_matches(expr, column) {
-            continue;
-        }
-        let LiteralValue::Utf8(pattern) = sql_literal_value(pattern)? else {
-            continue;
-        };
-        if let Some(value) = pattern.strip_prefix('%')
-            && !value.contains('%')
-            && !value.contains('_')
-        {
-            return Ok(Some(value.to_string()));
-        }
-    }
-    Ok(None)
-}
-
-async fn q02_region_keys(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-    region_name: &str,
-) -> Result<HashSet<i64>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec!["r_regionkey".to_string(), "r_name".to_string()]),
-            None,
-        )
-        .await?;
-    let mut keys = HashSet::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        q02_region_keys_view_into(BatchView::new(&batch), region_name, &mut keys)?;
-    }
-    Ok(keys)
-}
-
-fn q02_region_keys_view_into(
-    view: BatchView<'_>,
-    region_name: &str,
-    keys: &mut HashSet<i64>,
-) -> Result<()> {
-    if view.num_columns() == 2
-        && let (Some(regionkeys), Some(names)) = (view.i64_vector(0), view.utf8_vector(1))
-    {
-        for row in 0..view.num_rows() {
-            if !regionkeys.is_null(row)
-                && names.is_valid(row)
-                && names.value_bytes(row) == region_name.as_bytes()
-            {
-                keys.insert(regionkeys.value(row));
-            }
-        }
-        return Ok(());
-    }
-    let Some(batch) = view.try_record_batch() else {
-        return Err(DodamError::UnsupportedSql(
-            "Q02 region raw vector columns have unsupported types".to_string(),
-        ));
-    };
-    let regionkeys = batch_column(batch, "r_regionkey")?;
-    let names = batch_string_column(batch, "r_name")?;
-    for row in 0..batch.num_rows() {
-        if names.is_valid(row)
-            && names.value(row) == region_name
-            && let Some(regionkey) = numeric_i64_value(regionkeys, row)?
-        {
-            keys.insert(regionkey);
-        }
-    }
-    Ok(())
-}
-
-async fn q02_nation_names(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-    region_keys: &HashSet<i64>,
-) -> Result<FastHashMap<i64, String>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec![
-                "n_nationkey".to_string(),
-                "n_name".to_string(),
-                "n_regionkey".to_string(),
-            ]),
-            None,
-        )
-        .await?;
-    let mut nations = fast_hash_map::<i64, String>();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        q02_nation_names_view_into(BatchView::new(&batch), region_keys, &mut nations)?;
-    }
-    Ok(nations)
-}
-
-fn q02_nation_names_view_into(
-    view: BatchView<'_>,
-    region_keys: &HashSet<i64>,
-    nations: &mut FastHashMap<i64, String>,
-) -> Result<()> {
-    if view.num_columns() == 3
-        && let (Some(nationkeys), Some(names), Some(regionkeys)) =
-            (view.i64_vector(0), view.utf8_vector(1), view.i64_vector(2))
-    {
-        for row in 0..view.num_rows() {
-            if nationkeys.is_null(row) || names.is_null(row) || regionkeys.is_null(row) {
-                continue;
-            }
-            if region_keys.contains(&regionkeys.value(row)) {
-                let name = std::str::from_utf8(names.value_bytes(row))
-                    .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
-                nations.insert(nationkeys.value(row), name.to_string());
-            }
-        }
-        return Ok(());
-    }
-    let Some(batch) = view.try_record_batch() else {
-        return Err(DodamError::UnsupportedSql(
-            "Q02 nation raw vector columns have unsupported types".to_string(),
-        ));
-    };
-    let nationkeys = batch_column(batch, "n_nationkey")?;
-    let names = batch_string_column(batch, "n_name")?;
-    let regionkeys = batch_column(batch, "n_regionkey")?;
-    for row in 0..batch.num_rows() {
-        if names.is_null(row) {
-            continue;
-        }
-        let (Some(nationkey), Some(regionkey)) = (
-            numeric_i64_value(nationkeys, row)?,
-            numeric_i64_value(regionkeys, row)?,
-        ) else {
-            continue;
-        };
-        if region_keys.contains(&regionkey) {
-            nations.insert(nationkey, names.value(row).to_string());
-        }
-    }
-    Ok(())
-}
-
-struct Q02Supplier {
-    acctbal: f64,
-    name: String,
-    nation_name: String,
-    address: String,
-    phone: String,
-    comment: String,
-}
-
-async fn q02_suppliers(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-    nation_names: &FastHashMap<i64, String>,
-) -> Result<FastHashMap<i64, Q02Supplier>> {
-    if q02_supplier_late_materialized_enabled()
-        && let Some(suppliers) =
-            q02_suppliers_late_materialized(engine, path.clone(), batch_size, nation_names).await?
-    {
-        return Ok(suppliers);
-    }
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec![
-                "s_suppkey".to_string(),
-                "s_acctbal".to_string(),
-                "s_name".to_string(),
-                "s_address".to_string(),
-                "s_nationkey".to_string(),
-                "s_phone".to_string(),
-                "s_comment".to_string(),
-            ]),
-            None,
-        )
-        .await?;
-    let mut suppliers = fast_hash_map::<i64, Q02Supplier>();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        q02_suppliers_view_into(BatchView::new(&batch), nation_names, &mut suppliers)?;
-    }
-    Ok(suppliers)
-}
-
-async fn q02_suppliers_late_materialized(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-    nation_names: &FastHashMap<i64, String>,
-) -> Result<Option<FastHashMap<i64, Q02Supplier>>> {
-    let nation_names = Arc::new(nation_names.clone());
-    let Some(chunks) = engine
-        .late_materialized_parquet_map_pruned_with_policy_view(
-            path,
-            batch_size,
-            Projection::Columns(vec![
-                "s_suppkey".to_string(),
-                "s_acctbal".to_string(),
-                "s_nationkey".to_string(),
-            ]),
-            Projection::Columns(vec![
-                "s_name".to_string(),
-                "s_address".to_string(),
-                "s_phone".to_string(),
-                "s_comment".to_string(),
-            ]),
-            Vec::new(),
-            q02_supplier_late_materialized_row_group_chunk(),
-            LateMaterializationPolicy::selective_with_selector_run_ratio(
-                q02_supplier_late_materialized_max_selected_ratio(),
-                q02_supplier_late_materialized_max_selector_run_ratio(),
-            ),
-            {
-                let nation_names = nation_names.clone();
-                move || Q02SupplierLateState {
-                    nation_names: nation_names.clone(),
-                    selected: Vec::new(),
-                    payload_offset: 0,
-                    suppliers: fast_hash_map(),
-                }
-            },
-            q02_supplier_late_build_selection_view,
-            q02_supplier_late_consume_payload_view,
-            |state, metrics| {
-                if state.payload_offset != state.selected.len() {
-                    return Err(DodamError::UnsupportedSql(
-                        "Q02 supplier payload row mismatch".to_string(),
-                    ));
-                }
-                Ok(Some((state.suppliers, metrics)))
-            },
-        )
-        .await?
-    else {
-        return Ok(None);
-    };
-    let mut suppliers = fast_hash_map::<i64, Q02Supplier>();
-    let mut metrics = LateMaterializedMetrics::default();
-    for chunk in chunks {
-        let (chunk_suppliers, chunk_metrics) = chunk.output;
-        metrics.add(chunk_metrics);
-        suppliers.extend(chunk_suppliers);
-    }
-    q02_log_supplier_late_materialized_profile(
-        metrics,
-        q02_supplier_late_materialized_row_group_chunk(),
-    );
-    Ok(Some(suppliers))
-}
-
-fn q02_supplier_late_materialized_enabled() -> bool {
-    std::env::var("DODAM_Q02_DISABLE_SUPPLIER_LATE_MATERIALIZE")
-        .map(|value| !matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(true)
-}
-
-fn q02_supplier_late_materialized_row_group_chunk() -> usize {
-    std::env::var("DODAM_Q02_SUPPLIER_LATE_ROW_GROUP_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(1)
-}
-
-fn q02_supplier_late_materialized_max_selected_ratio() -> f64 {
-    std::env::var("DODAM_Q02_SUPPLIER_LATE_MAX_SELECTED_RATIO")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.35)
-}
-
-fn q02_supplier_late_materialized_max_selector_run_ratio() -> f64 {
-    std::env::var("DODAM_Q02_SUPPLIER_LATE_MAX_SELECTOR_RUN_RATIO")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.75)
-}
-
-fn q02_log_supplier_late_materialized_profile(
-    metrics: LateMaterializedMetrics,
-    row_group_chunk: usize,
-) {
-    if !tpch_profile_enabled() {
-        return;
-    }
-    let ratio = if metrics.total_rows == 0 {
-        0.0
-    } else {
-        metrics.selected_rows as f64 / metrics.total_rows as f64
-    };
-    eprintln!(
-        "[dodam:tpch-profile] Q02 suppliers: late_materialized rows={} selected={} ratio={:.6} selector_runs={} row_group_chunk={}",
-        metrics.total_rows, metrics.selected_rows, ratio, metrics.selector_runs, row_group_chunk
-    );
-}
-
-struct Q02SupplierLateSelection {
-    suppkey: i64,
-    acctbal: f64,
-    nation_name: String,
-}
-
-struct Q02SupplierLateState {
-    nation_names: Arc<FastHashMap<i64, String>>,
-    selected: Vec<Q02SupplierLateSelection>,
-    payload_offset: usize,
-    suppliers: FastHashMap<i64, Q02Supplier>,
-}
-
-fn q02_supplier_late_build_selection_view(
-    view: BatchView<'_>,
-    selection: &mut LateSelectionBuilder,
-    state: &mut Q02SupplierLateState,
-) -> Result<Option<()>> {
-    if view.num_columns() == 3
-        && let (Some(suppkeys), Some(acctbals), Some(nationkeys)) = (
-            view.i64_vector(0),
-            view.decimal128_vector(1),
-            view.i64_vector(2),
-        )
-    {
-        if let (Some(suppkey_values), Some(nationkey_values)) = (
-            suppkeys.values_if_null_free(),
-            nationkeys.values_if_null_free(),
-        ) && acctbals.null_count() == 0
-        {
-            let mut selected_offsets = Vec::new();
-            for row in 0..suppkey_values.len() {
-                let Some(nation_name) = state.nation_names.get(&nationkey_values[row]) else {
-                    continue;
-                };
-                selected_offsets.push(row);
-                state.selected.push(Q02SupplierLateSelection {
-                    suppkey: suppkey_values[row],
-                    acctbal: acctbals.value(row),
-                    nation_name: nation_name.clone(),
-                });
-            }
-            selection.push_selected_offsets(suppkey_values.len(), selected_offsets);
-            return Ok(Some(()));
-        }
-        for row in 0..view.num_rows() {
-            if suppkeys.is_null(row) || acctbals.is_null(row) || nationkeys.is_null(row) {
-                selection.push(false);
-                continue;
-            }
-            let Some(nation_name) = state.nation_names.get(&nationkeys.value(row)) else {
-                selection.push(false);
-                continue;
-            };
-            selection.push(true);
-            state.selected.push(Q02SupplierLateSelection {
-                suppkey: suppkeys.value(row),
-                acctbal: acctbals.value(row),
-                nation_name: nation_name.clone(),
-            });
-        }
-        return Ok(Some(()));
-    }
-    let Some(batch) = view.try_record_batch() else {
-        return Ok(None);
-    };
-    let suppkeys = batch_column(batch, "s_suppkey")?;
-    let acctbals = batch_column(batch, "s_acctbal")?;
-    let nationkeys = batch_column(batch, "s_nationkey")?;
-    for row in 0..batch.num_rows() {
-        let (Some(suppkey), Some(acctbal), Some(nationkey)) = (
-            numeric_i64_value(suppkeys, row)?,
-            numeric_f64_value(acctbals, row)?,
-            numeric_i64_value(nationkeys, row)?,
-        ) else {
-            selection.push(false);
-            continue;
-        };
-        let Some(nation_name) = state.nation_names.get(&nationkey) else {
-            selection.push(false);
-            continue;
-        };
-        selection.push(true);
-        state.selected.push(Q02SupplierLateSelection {
-            suppkey,
-            acctbal,
-            nation_name: nation_name.clone(),
-        });
-    }
-    Ok(Some(()))
-}
-
-fn q02_supplier_late_consume_payload_view(
-    view: BatchView<'_>,
-    state: &mut Q02SupplierLateState,
-) -> Result<Option<()>> {
-    if view.num_columns() == 4
-        && let (Some(names), Some(addresses), Some(phones), Some(comments)) = (
-            view.utf8_vector(0),
-            view.utf8_vector(1),
-            view.utf8_vector(2),
-            view.utf8_vector(3),
-        )
-    {
-        for row in 0..view.num_rows() {
-            if names.is_null(row)
-                || addresses.is_null(row)
-                || phones.is_null(row)
-                || comments.is_null(row)
-            {
-                state.payload_offset += 1;
-                continue;
-            }
-            let Some(selected) = state.selected.get(state.payload_offset) else {
-                return Err(DodamError::UnsupportedSql(
-                    "Q02 supplier payload row overflow".to_string(),
-                ));
-            };
-            state.payload_offset += 1;
-            state.suppliers.insert(
-                selected.suppkey,
-                Q02Supplier {
-                    acctbal: selected.acctbal,
-                    name: utf8_vector_value_string(names, row)?,
-                    nation_name: selected.nation_name.clone(),
-                    address: utf8_vector_value_string(addresses, row)?,
-                    phone: utf8_vector_value_string(phones, row)?,
-                    comment: utf8_vector_value_string(comments, row)?,
-                },
-            );
-        }
-        return Ok(Some(()));
-    }
-    let Some(batch) = view.try_record_batch() else {
-        return Ok(None);
-    };
-    let names = batch_string_column(batch, "s_name")?;
-    let addresses = batch_string_column(batch, "s_address")?;
-    let phones = batch_string_column(batch, "s_phone")?;
-    let comments = batch_string_column(batch, "s_comment")?;
-    for row in 0..batch.num_rows() {
-        if names.is_null(row)
-            || addresses.is_null(row)
-            || phones.is_null(row)
-            || comments.is_null(row)
-        {
-            state.payload_offset += 1;
-            continue;
-        }
-        let Some(selected) = state.selected.get(state.payload_offset) else {
-            return Err(DodamError::UnsupportedSql(
-                "Q02 supplier payload row overflow".to_string(),
-            ));
-        };
-        state.payload_offset += 1;
-        state.suppliers.insert(
-            selected.suppkey,
-            Q02Supplier {
-                acctbal: selected.acctbal,
-                name: names.value(row).to_string(),
-                nation_name: selected.nation_name.clone(),
-                address: addresses.value(row).to_string(),
-                phone: phones.value(row).to_string(),
-                comment: comments.value(row).to_string(),
-            },
-        );
-    }
-    Ok(Some(()))
-}
-
-fn q02_suppliers_view_into(
-    view: BatchView<'_>,
-    nation_names: &FastHashMap<i64, String>,
-    suppliers: &mut FastHashMap<i64, Q02Supplier>,
-) -> Result<()> {
-    if view.num_columns() == 7
-        && let (
-            Some(suppkeys),
-            Some(acctbals),
-            Some(names),
-            Some(addresses),
-            Some(nationkeys),
-            Some(phones),
-            Some(comments),
-        ) = (
-            view.i64_vector(0),
-            view.decimal128_vector(1),
-            view.utf8_vector(2),
-            view.utf8_vector(3),
-            view.i64_vector(4),
-            view.utf8_vector(5),
-            view.utf8_vector(6),
-        )
-    {
-        for row in 0..view.num_rows() {
-            if suppkeys.is_null(row)
-                || acctbals.is_null(row)
-                || names.is_null(row)
-                || addresses.is_null(row)
-                || nationkeys.is_null(row)
-                || phones.is_null(row)
-                || comments.is_null(row)
-            {
-                continue;
-            }
-            let Some(nation_name) = nation_names.get(&nationkeys.value(row)) else {
-                continue;
-            };
-            suppliers.insert(
-                suppkeys.value(row),
-                Q02Supplier {
-                    acctbal: acctbals.value(row),
-                    name: utf8_vector_value_string(names, row)?,
-                    nation_name: nation_name.clone(),
-                    address: utf8_vector_value_string(addresses, row)?,
-                    phone: utf8_vector_value_string(phones, row)?,
-                    comment: utf8_vector_value_string(comments, row)?,
-                },
-            );
-        }
-        return Ok(());
-    }
-    let Some(batch) = view.try_record_batch() else {
-        return Err(DodamError::UnsupportedSql(
-            "Q02 supplier raw vector columns have unsupported types".to_string(),
-        ));
-    };
-    let suppkeys = batch_column(batch, "s_suppkey")?;
-    let acctbals = batch_column(batch, "s_acctbal")?;
-    let names = batch_string_column(batch, "s_name")?;
-    let addresses = batch_string_column(batch, "s_address")?;
-    let nationkeys = batch_column(batch, "s_nationkey")?;
-    let phones = batch_string_column(batch, "s_phone")?;
-    let comments = batch_string_column(batch, "s_comment")?;
-    for row in 0..batch.num_rows() {
-        if names.is_null(row)
-            || addresses.is_null(row)
-            || phones.is_null(row)
-            || comments.is_null(row)
-        {
-            continue;
-        }
-        let (Some(suppkey), Some(acctbal), Some(nationkey)) = (
-            numeric_i64_value(suppkeys, row)?,
-            numeric_f64_value(acctbals, row)?,
-            numeric_i64_value(nationkeys, row)?,
-        ) else {
-            continue;
-        };
-        let Some(nation_name) = nation_names.get(&nationkey) else {
-            continue;
-        };
-        suppliers.insert(
-            suppkey,
-            Q02Supplier {
-                acctbal,
-                name: names.value(row).to_string(),
-                nation_name: nation_name.clone(),
-                address: addresses.value(row).to_string(),
-                phone: phones.value(row).to_string(),
-                comment: comments.value(row).to_string(),
-            },
-        );
-    }
-    Ok(())
-}
-
-async fn q02_matching_parts(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-    part_size: f64,
-    type_suffix: &str,
-) -> Result<FastHashMap<i64, String>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec![
-                "p_partkey".to_string(),
-                "p_mfgr".to_string(),
-                "p_size".to_string(),
-                "p_type".to_string(),
-            ]),
-            None,
-        )
-        .await?;
-    let mut parts = fast_hash_map::<i64, String>();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        q02_matching_parts_view_into(BatchView::new(&batch), part_size, type_suffix, &mut parts)?;
-    }
-    Ok(parts)
-}
-
-fn q02_matching_parts_view_into(
-    view: BatchView<'_>,
-    part_size: f64,
-    type_suffix: &str,
-    parts: &mut FastHashMap<i64, String>,
-) -> Result<()> {
-    if view.num_columns() == 4
-        && let (Some(partkeys), Some(mfgrs), Some(sizes), Some(types)) = (
-            view.i64_vector(0),
-            view.utf8_vector(1),
-            view.i32_vector(2),
-            view.utf8_vector(3),
-        )
-    {
-        for row in 0..view.num_rows() {
-            if partkeys.is_null(row)
-                || mfgrs.is_null(row)
-                || sizes.is_null(row)
-                || types.is_null(row)
-            {
-                continue;
-            }
-            if f64::from(sizes.value(row)) == part_size
-                && types.value_bytes(row).ends_with(type_suffix.as_bytes())
-            {
-                parts.insert(partkeys.value(row), utf8_vector_value_string(mfgrs, row)?);
-            }
-        }
-        return Ok(());
-    }
-    let Some(batch) = view.try_record_batch() else {
-        return Err(DodamError::UnsupportedSql(
-            "Q02 part raw vector columns have unsupported types".to_string(),
-        ));
-    };
-    let partkeys = batch_column(batch, "p_partkey")?;
-    let mfgrs = batch_string_column(batch, "p_mfgr")?;
-    let sizes = batch_column(batch, "p_size")?;
-    let types = batch_string_column(batch, "p_type")?;
-    for row in 0..batch.num_rows() {
-        if mfgrs.is_null(row) || types.is_null(row) || !types.value(row).ends_with(type_suffix) {
-            continue;
-        }
-        let (Some(partkey), Some(size)) = (
-            numeric_i64_value(partkeys, row)?,
-            numeric_f64_value(sizes, row)?,
-        ) else {
-            continue;
-        };
-        if size == part_size {
-            parts.insert(partkey, mfgrs.value(row).to_string());
-        }
-    }
-    Ok(())
-}
-
-fn utf8_vector_value_string(values: Utf8VectorView<'_>, row: usize) -> Result<String> {
-    Ok(std::str::from_utf8(values.value_bytes(row))
-        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?
-        .to_string())
-}
-
-struct Q02Row {
-    acctbal: f64,
-    name: String,
-    nation_name: String,
-    partkey: i64,
-    mfgr: String,
-    address: String,
-    phone: String,
-    comment: String,
-}
-
-async fn q02_min_cost_rows(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-    parts: &FastHashMap<i64, String>,
-    suppliers: &FastHashMap<i64, Q02Supplier>,
-) -> Result<Vec<Q02Row>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec![
-                "ps_partkey".to_string(),
-                "ps_suppkey".to_string(),
-                "ps_supplycost".to_string(),
-            ]),
-            None,
-        )
-        .await?;
-    let part_keys = Arc::new(AdaptiveI64Set::from_hash(
-        parts.keys().copied().collect::<HashSet<_>>(),
-    ));
-    let supplier_keys = Arc::new(AdaptiveI64Set::from_hash(
-        suppliers.keys().copied().collect::<HashSet<_>>(),
-    ));
-    let candidates = parallel_batch_fold_view_chunks(
-        &mut stream,
-        4,
-        Q02PartsuppPartial::default,
-        move |view, partial| {
-            q02_merge_partsupp_min_cost(
-                partial,
-                q02_partsupp_min_cost_view(view, &part_keys, &supplier_keys)?,
-            );
-            Ok(Some(()))
-        },
-        Ok,
-        Q02PartsuppPartial::default(),
-        q02_merge_partsupp_min_cost,
-        "Q02 partsupp partials",
-    )?
-    .into_candidates();
-
-    let mut rows = Vec::new();
-    for (partkey, suppkey) in candidates {
-        let Some(supplier) = suppliers.get(&suppkey) else {
-            continue;
-        };
-        let Some(mfgr) = parts.get(&partkey) else {
-            continue;
-        };
-        rows.push(Q02Row {
-            acctbal: supplier.acctbal,
-            name: supplier.name.clone(),
-            nation_name: supplier.nation_name.clone(),
-            partkey,
-            mfgr: mfgr.clone(),
-            address: supplier.address.clone(),
-            phone: supplier.phone.clone(),
-            comment: supplier.comment.clone(),
-        });
-    }
-    rows.sort_by(|left, right| {
-        right
-            .acctbal
-            .partial_cmp(&left.acctbal)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.nation_name.cmp(&right.nation_name))
-            .then_with(|| left.name.cmp(&right.name))
-            .then_with(|| left.partkey.cmp(&right.partkey))
-    });
-    rows.truncate(100);
-    Ok(rows)
-}
-
-#[derive(Default)]
-struct Q02PartsuppPartial {
-    part_mins: FastHashMap<i64, Q02PartMin>,
-}
-
-impl Q02PartsuppPartial {
-    fn into_candidates(self) -> Vec<(i64, i64)> {
-        let mut candidates = Vec::new();
-        for (partkey, part_min) in self.part_mins {
-            candidates.extend(
-                part_min
-                    .suppkeys
-                    .into_iter()
-                    .map(|suppkey| (partkey, suppkey)),
-            );
-        }
-        candidates
-    }
-}
-
-struct Q02PartMin {
-    min_cost: f64,
-    suppkeys: Vec<i64>,
-}
-
-fn q02_partsupp_min_cost_batch(
-    batch: RecordBatch,
-    part_keys: &AdaptiveI64Set,
-    supplier_keys: &AdaptiveI64Set,
-) -> Result<Q02PartsuppPartial> {
-    let partkeys = batch_column(&batch, "ps_partkey")?;
-    let suppkeys = batch_column(&batch, "ps_suppkey")?;
-    let supplycosts = batch_column(&batch, "ps_supplycost")?;
-    if let Some(partial) = q02_partsupp_min_cost_batch_typed(
-        partkeys,
-        suppkeys,
-        supplycosts,
-        part_keys,
-        supplier_keys,
-    )? {
-        return Ok(partial);
-    }
-    let mut partial = Q02PartsuppPartial::default();
-    for row in 0..batch.num_rows() {
-        let (Some(partkey), Some(suppkey), Some(supplycost)) = (
-            numeric_i64_value(partkeys, row)?,
-            numeric_i64_value(suppkeys, row)?,
-            numeric_f64_value(supplycosts, row)?,
-        ) else {
-            continue;
-        };
-        if !part_keys.contains(partkey) || !supplier_keys.contains(suppkey) {
-            continue;
-        }
-        q02_push_partsupp_candidate(&mut partial, partkey, suppkey, supplycost);
-    }
-    Ok(partial)
-}
-
-fn q02_partsupp_min_cost_view(
-    view: BatchView<'_>,
-    part_keys: &AdaptiveI64Set,
-    supplier_keys: &AdaptiveI64Set,
-) -> Result<Q02PartsuppPartial> {
-    if view.num_columns() == 3
-        && let (Some(partkeys), Some(suppkeys), Some(supplycosts)) = (
-            view.i64_vector(0),
-            view.i64_vector(1),
-            view.decimal128_vector(2),
-        )
-    {
-        let mut partial = Q02PartsuppPartial::default();
-        if let (Some(partkey_values), Some(suppkey_values)) = (
-            partkeys.values_if_null_free(),
-            suppkeys.values_if_null_free(),
-        ) && supplycosts.null_count() == 0
-        {
-            let supplycost_values = supplycosts.raw_values();
-            let supplycost_scale = 1.0 / supplycosts.scale();
-            for row in 0..partkey_values.len() {
-                let partkey = partkey_values[row];
-                let suppkey = suppkey_values[row];
-                if !part_keys.contains(partkey) || !supplier_keys.contains(suppkey) {
-                    continue;
-                }
-                q02_push_partsupp_candidate(
-                    &mut partial,
-                    partkey,
-                    suppkey,
-                    supplycost_values[row] as f64 * supplycost_scale,
-                );
-            }
-            return Ok(partial);
-        }
-        for row in 0..view.num_rows() {
-            if partkeys.is_null(row) || suppkeys.is_null(row) || supplycosts.is_null(row) {
-                continue;
-            }
-            let partkey = partkeys.value(row);
-            let suppkey = suppkeys.value(row);
-            if !part_keys.contains(partkey) || !supplier_keys.contains(suppkey) {
-                continue;
-            }
-            q02_push_partsupp_candidate(&mut partial, partkey, suppkey, supplycosts.value(row));
-        }
-        return Ok(partial);
-    }
-    let Some(batch) = view.try_record_batch() else {
-        return Err(DodamError::UnsupportedSql(
-            "Q02 partsupp raw vector columns have unsupported types".to_string(),
-        ));
-    };
-    q02_partsupp_min_cost_batch(batch.clone(), part_keys, supplier_keys)
-}
-
-fn q02_partsupp_min_cost_batch_typed(
-    partkeys: &ArrayRef,
-    suppkeys: &ArrayRef,
-    supplycosts: &ArrayRef,
-    part_keys: &AdaptiveI64Set,
-    supplier_keys: &AdaptiveI64Set,
-) -> Result<Option<Q02PartsuppPartial>> {
-    let (Some(partkeys), Some(suppkeys), Some(supplycosts)) = (
-        partkeys.as_any().downcast_ref::<Int64Array>(),
-        suppkeys.as_any().downcast_ref::<Int64Array>(),
-        decimal_input(supplycosts)?,
-    ) else {
-        return Ok(None);
-    };
-    let mut partial = Q02PartsuppPartial::default();
-    for row in 0..partkeys.len() {
-        if partkeys.is_null(row) || suppkeys.is_null(row) || supplycosts.is_null(row) {
-            continue;
-        }
-        let partkey = partkeys.value(row);
-        let suppkey = suppkeys.value(row);
-        if !part_keys.contains(partkey) || !supplier_keys.contains(suppkey) {
-            continue;
-        }
-        q02_push_partsupp_candidate(&mut partial, partkey, suppkey, supplycosts.value(row));
-    }
-    Ok(Some(partial))
-}
-
-fn q02_push_partsupp_candidate(
-    partial: &mut Q02PartsuppPartial,
-    partkey: i64,
-    suppkey: i64,
-    supplycost: f64,
-) {
-    partial
-        .part_mins
-        .entry(partkey)
-        .and_modify(|part_min| {
-            if supplycost < part_min.min_cost {
-                part_min.min_cost = supplycost;
-                part_min.suppkeys.clear();
-                part_min.suppkeys.push(suppkey);
-            } else if supplycost == part_min.min_cost {
-                part_min.suppkeys.push(suppkey);
-            }
-        })
-        .or_insert_with(|| Q02PartMin {
-            min_cost: supplycost,
-            suppkeys: vec![suppkey],
-        });
-}
-
-fn q02_merge_partsupp_min_cost(output: &mut Q02PartsuppPartial, batch: Q02PartsuppPartial) {
-    for (partkey, mut batch_min) in batch.part_mins {
-        output
-            .part_mins
-            .entry(partkey)
-            .and_modify(|current| {
-                if batch_min.min_cost < current.min_cost {
-                    current.min_cost = batch_min.min_cost;
-                    current.suppkeys = std::mem::take(&mut batch_min.suppkeys);
-                } else if batch_min.min_cost == current.min_cost {
-                    current.suppkeys.append(&mut batch_min.suppkeys);
-                }
-            })
-            .or_insert(batch_min);
-    }
-}
-
-fn q02_output(rows: Vec<Q02Row>) -> Result<QueryOutput> {
-    let batch = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("s_acctbal", DataType::Float64, false),
-            Field::new("s_name", DataType::Utf8, false),
-            Field::new("n_name", DataType::Utf8, false),
-            Field::new("p_partkey", DataType::Int64, false),
-            Field::new("p_mfgr", DataType::Utf8, false),
-            Field::new("s_address", DataType::Utf8, false),
-            Field::new("s_phone", DataType::Utf8, false),
-            Field::new("s_comment", DataType::Utf8, false),
-        ])),
-        vec![
-            Arc::new(Float64Array::from_iter_values(
-                rows.iter().map(|row| row.acctbal),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|row| row.name.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|row| row.nation_name.as_str()),
-            )),
-            Arc::new(Int64Array::from_iter_values(
-                rows.iter().map(|row| row.partkey),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|row| row.mfgr.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|row| row.address.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|row| row.phone.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|row| row.comment.as_str()),
             )),
         ],
     )?;
@@ -41295,6 +40126,13 @@ async fn try_execute_derived_sql(
     reject_select_features(select)?;
 
     let distinct = parse_distinct(select)?;
+    let inner_has_materializable_subquery = match subquery.body.as_ref() {
+        SetExpr::Select(inner_select) => inner_select
+            .selection
+            .as_ref()
+            .is_some_and(expr_contains_materializable_subquery),
+        _ => false,
+    };
     let parsed_inner = match parse_query(subquery) {
         Ok(query) => Some(query),
         Err(DodamError::UnsupportedSql(_))
@@ -41303,7 +40141,9 @@ async fn try_execute_derived_sql(
         Err(error) => return Err(error),
     };
     let inner_output = if let Some(parsed_inner) = parsed_inner {
-        if let Some(output) = execute_parsed_join_query(engine, parsed_inner, batch_size).await? {
+        if !inner_has_materializable_subquery
+            && let Some(output) = execute_parsed_join_query(engine, parsed_inner, batch_size).await?
+        {
             output
         } else {
             Box::pin(execute_sql(engine, &subquery.to_string(), batch_size)).await?
