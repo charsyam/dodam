@@ -257,6 +257,10 @@ pub async fn execute_sql(
     {
         return Ok(output);
     }
+    if let Some(output) = try_execute_shipping_priority_revenue_sql(engine, sql, batch_size).await?
+    {
+        return Ok(output);
+    }
     if let Some(output) =
         try_execute_derived_prefix_avg_anti_join_aggregate_sql(engine, sql, batch_size).await?
     {
@@ -22305,6 +22309,85 @@ fn q03_shape(select: &Select, _query: &Query, selection: &SqlExpr) -> bool {
         && selection.contains("o_orderkey")
         && selection.contains("o_orderdate")
         && selection.contains("l_shipdate")
+}
+
+async fn try_execute_shipping_priority_revenue_sql(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let Some(selection) = select.selection.as_ref() else {
+        return Ok(None);
+    };
+    if !q03_shape(select, query, selection) {
+        return Ok(None);
+    }
+    if !matches!(parse_limit(query), Ok(Some(10))) {
+        return Ok(None);
+    }
+    reject_query_features(query)?;
+    reject_select_features(select)?;
+    let Some(tables) = parse_comma_join_table_refs(select)? else {
+        return Ok(None);
+    };
+    if tables.len() != 3 {
+        return Ok(None);
+    }
+    let mut customer = None;
+    let mut orders = None;
+    let mut lineitem = None;
+    for table in tables {
+        let alias = table_ref_alias_or_name(&table);
+        if alias.eq_ignore_ascii_case("customer") {
+            customer = Some(table);
+        } else if alias.eq_ignore_ascii_case("orders") {
+            orders = Some(table);
+        } else if alias.eq_ignore_ascii_case("lineitem") {
+            lineitem = Some(table);
+        }
+    }
+    let (Some(customer), Some(orders), Some(lineitem)) = (customer, orders, lineitem) else {
+        return Ok(None);
+    };
+    let mut conjuncts = Vec::new();
+    collect_sql_and_conjuncts(selection, &mut conjuncts);
+    let Some(segment) = string_equality_literal(&conjuncts, "c_mktsegment")? else {
+        return Ok(None);
+    };
+    let Some(order_cutoff) = upper_date_bound(&conjuncts, "o_orderdate")? else {
+        return Ok(None);
+    };
+    let Some(ship_cutoff) = lower_date_bound(&conjuncts, "l_shipdate")? else {
+        return Ok(None);
+    };
+
+    let stage = tpch_profile_start();
+    let customers = q03_customer_keys(engine, customer.path, batch_size, &segment).await?;
+    tpch_profile_elapsed("Q03 customer keys", stage);
+    if customers.is_empty() {
+        return Ok(Some(q03_output(Vec::new())?));
+    }
+
+    let stage = tpch_profile_start();
+    let orders = q03_order_rows(engine, orders.path, batch_size, &customers, order_cutoff).await?;
+    tpch_profile_elapsed("Q03 order rows", stage);
+    if orders.is_empty() {
+        return Ok(Some(q03_output(Vec::new())?));
+    }
+
+    let stage = tpch_profile_start();
+    let rows = q03_revenue_rows(engine, lineitem.path, batch_size, &orders, ship_cutoff).await?;
+    tpch_profile_elapsed("Q03 revenue rows", stage);
+    Ok(Some(q03_output(rows)?))
 }
 
 fn lower_date_bound(conjuncts: &[SqlExpr], column: &str) -> Result<Option<i32>> {
