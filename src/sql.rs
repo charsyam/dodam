@@ -244,6 +244,9 @@ pub async fn execute_sql(
     {
         return Ok(output);
     }
+    if let Some(output) = try_execute_nation_market_share_sql(engine, sql, batch_size).await? {
+        return Ok(output);
+    }
     if let Some(output) =
         try_execute_derived_prefix_avg_anti_join_aggregate_sql(engine, sql, batch_size).await?
     {
@@ -29869,6 +29872,143 @@ fn q08_inner_shape(select: &Select, selection: &SqlExpr) -> bool {
         && selection.contains("s_nationkey = n2.n_nationkey")
         && selection.contains("o_orderdate between")
         && selection.contains("p_type")
+}
+
+async fn try_execute_nation_market_share_sql(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    if !q08_outer_shape(select, query) {
+        return Ok(None);
+    }
+    reject_query_features(query)?;
+    reject_select_features(select)?;
+    let Some((inner_query, _alias)) = parse_derived_from(select)? else {
+        return Ok(None);
+    };
+    let SetExpr::Select(inner_select) = inner_query.body.as_ref() else {
+        return Ok(None);
+    };
+    let Some(selection) = inner_select.selection.as_ref() else {
+        return Ok(None);
+    };
+    if !q08_inner_shape(inner_select, selection) {
+        return Ok(None);
+    }
+    reject_query_features(inner_query)?;
+    reject_select_features(inner_select)?;
+    let Some(tables) = parse_comma_join_table_refs(inner_select)? else {
+        return Ok(None);
+    };
+    if tables.len() != 8 {
+        return Ok(None);
+    }
+    let mut part = None;
+    let mut supplier = None;
+    let mut lineitem = None;
+    let mut orders = None;
+    let mut customer = None;
+    let mut nation = None;
+    let mut region = None;
+    for table in tables {
+        let alias = table_ref_alias_or_name(&table);
+        if alias.eq_ignore_ascii_case("part") {
+            part = Some(table);
+        } else if alias.eq_ignore_ascii_case("supplier") {
+            supplier = Some(table);
+        } else if alias.eq_ignore_ascii_case("lineitem") {
+            lineitem = Some(table);
+        } else if alias.eq_ignore_ascii_case("orders") {
+            orders = Some(table);
+        } else if alias.eq_ignore_ascii_case("customer") {
+            customer = Some(table);
+        } else if alias.eq_ignore_ascii_case("n1") || alias.eq_ignore_ascii_case("n2") {
+            nation.get_or_insert(table);
+        } else if alias.eq_ignore_ascii_case("region") {
+            region = Some(table);
+        }
+    }
+    let (
+        Some(part),
+        Some(supplier),
+        Some(lineitem),
+        Some(orders),
+        Some(customer),
+        Some(nation),
+        Some(region),
+    ) = (part, supplier, lineitem, orders, customer, nation, region)
+    else {
+        return Ok(None);
+    };
+    let mut conjuncts = Vec::new();
+    collect_sql_and_conjuncts(selection, &mut conjuncts);
+    let Some(region_name) = string_equality_literal(&conjuncts, "r_name")? else {
+        return Ok(None);
+    };
+    let Some(part_type) = string_equality_literal(&conjuncts, "p_type")? else {
+        return Ok(None);
+    };
+    let Some((start_days, end_days)) = date_between_bounds(&conjuncts, "o_orderdate")? else {
+        return Ok(None);
+    };
+
+    let region_keys = q05_region_keys(engine, region.path, batch_size, &region_name).await?;
+    if region_keys.is_empty() {
+        return Ok(Some(q08_output(Vec::new())?));
+    }
+    let customer_nation_names =
+        q05_nation_names(engine, nation.path.clone(), batch_size, &region_keys).await?;
+    if customer_nation_names.is_empty() {
+        return Ok(Some(q08_output(Vec::new())?));
+    }
+    let customer_nations =
+        q07_customer_nations(engine, customer.path, batch_size, &customer_nation_names).await?;
+    if customer_nations.is_empty() {
+        return Ok(Some(q08_output(Vec::new())?));
+    }
+    let order_years = q08_order_years(
+        engine,
+        orders.path,
+        batch_size,
+        &customer_nations,
+        start_days,
+        end_days,
+    )
+    .await?;
+    if order_years.is_empty() {
+        return Ok(Some(q08_output(Vec::new())?));
+    }
+    let part_keys = q08_part_keys(engine, part.path, batch_size, &part_type).await?;
+    if part_keys.is_empty() {
+        return Ok(Some(q08_output(Vec::new())?));
+    }
+    let all_nation_names = q10_nation_names(engine, nation.path, batch_size).await?;
+    let supplier_is_brazil =
+        q08_supplier_is_brazil(engine, supplier.path, batch_size, &all_nation_names).await?;
+    if supplier_is_brazil.is_empty() {
+        return Ok(Some(q08_output(Vec::new())?));
+    }
+    let mut rows = q08_market_share_rows(
+        engine,
+        lineitem.path,
+        batch_size,
+        &order_years,
+        &part_keys,
+        &supplier_is_brazil,
+    )
+    .await?;
+    rows.sort_by(|left, right| left.o_year.cmp(&right.o_year));
+    Ok(Some(q08_output(rows)?))
 }
 
 async fn q08_part_keys(
