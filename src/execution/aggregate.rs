@@ -1335,6 +1335,20 @@ fn update_three_i32_date_dictionary_slices_group_id_cache(
     if slot_count == 0 || slot_count > coalesce_group_id_cache_max_slots() {
         return Ok(false);
     }
+    if coalesce_dictionary_selected_local_accumulate_enabled()
+        && update_three_i32_date_dictionary_slices_local_accumulate(
+            range,
+            slot_count,
+            first_values,
+            second_values,
+            dictionary_ids,
+            dictionary,
+            sum_values,
+            groups,
+        )?
+    {
+        return Ok(true);
+    }
 
     let mut string_ids = vec![None; dictionary.len()];
     let cache_key = dictionary.to_vec();
@@ -1414,6 +1428,21 @@ fn update_three_i32_date_dictionary_masked_group_id_cache(
     if slot_count == 0 || slot_count > coalesce_group_id_cache_max_slots() {
         return Ok(false);
     }
+    if coalesce_dictionary_selected_local_accumulate_enabled()
+        && update_three_i32_date_dictionary_masked_local_accumulate(
+            range,
+            slot_count,
+            first_values,
+            second_values,
+            dictionary_ids,
+            dictionary,
+            sum_values,
+            selection,
+            groups,
+        )?
+    {
+        return Ok(true);
+    }
 
     let mut string_ids = vec![None; dictionary.len()];
     let cache_key = dictionary.to_vec();
@@ -1466,6 +1495,147 @@ fn update_three_i32_date_dictionary_masked_group_id_cache(
         }
     }
     group_id_cache.insert(cache_key, group_ids);
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_three_i32_date_dictionary_slices_local_accumulate(
+    range: DenseLeadingRange,
+    slot_count: usize,
+    first_values: &[i32],
+    second_values: &[i32],
+    dictionary_ids: &[i32],
+    dictionary: &[Bytes],
+    sum_values: &[i64],
+    groups: &mut CoalesceKeyCountSumGroups,
+) -> Result<bool> {
+    if slot_count > coalesce_dictionary_selected_local_accumulate_max_slots() {
+        return Ok(false);
+    }
+    let dictionary_len = dictionary.len();
+    let mut local = vec![LocalCoalesceCountSum::default(); slot_count];
+    let mut touched = Vec::new();
+    for row in 0..first_values.len() {
+        let Some(leading_slot) =
+            dense_leading_slot(range, i64::from(first_values[row]), second_values[row])
+        else {
+            return Ok(false);
+        };
+        let dictionary_id = usize::try_from(dictionary_ids[row]).map_err(|_| {
+            DodamError::UnsupportedSql("coalesce aggregate dictionary id is negative".to_string())
+        })?;
+        if dictionary_id >= dictionary_len {
+            return Err(DodamError::UnsupportedSql(
+                "coalesce aggregate dictionary id out of range".to_string(),
+            ));
+        }
+        let slot = leading_slot * dictionary_len + dictionary_id;
+        if local[slot].count == 0 {
+            touched.push(slot);
+        }
+        local[slot].count += 1;
+        local[slot].sum = local[slot].sum.saturating_add(sum_values[row]);
+    }
+    merge_three_i32_date_dictionary_local_accumulate(
+        range,
+        dictionary_len,
+        dictionary,
+        &local,
+        &touched,
+        groups,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_three_i32_date_dictionary_masked_local_accumulate(
+    range: DenseLeadingRange,
+    slot_count: usize,
+    first_values: &[i32],
+    second_values: &[i32],
+    dictionary_ids: &[i32],
+    dictionary: &[Bytes],
+    sum_values: &[i64],
+    selection: SelectionRuns<'_>,
+    groups: &mut CoalesceKeyCountSumGroups,
+) -> Result<bool> {
+    if slot_count > coalesce_dictionary_selected_local_accumulate_max_slots() {
+        return Ok(false);
+    }
+    let dictionary_len = dictionary.len();
+    let mut local = vec![LocalCoalesceCountSum::default(); slot_count];
+    let mut touched = Vec::new();
+    for &(run_start, run_len) in selection.runs() {
+        for row in run_start..run_start + run_len {
+            let Some(leading_slot) =
+                dense_leading_slot(range, i64::from(first_values[row]), second_values[row])
+            else {
+                return Ok(false);
+            };
+            let dictionary_id = usize::try_from(dictionary_ids[row]).map_err(|_| {
+                DodamError::UnsupportedSql(
+                    "coalesce aggregate dictionary id is negative".to_string(),
+                )
+            })?;
+            if dictionary_id >= dictionary_len {
+                return Err(DodamError::UnsupportedSql(
+                    "coalesce aggregate dictionary id out of range".to_string(),
+                ));
+            }
+            let slot = leading_slot * dictionary_len + dictionary_id;
+            if local[slot].count == 0 {
+                touched.push(slot);
+            }
+            local[slot].count += 1;
+            local[slot].sum = local[slot].sum.saturating_add(sum_values[row]);
+        }
+    }
+    merge_three_i32_date_dictionary_local_accumulate(
+        range,
+        dictionary_len,
+        dictionary,
+        &local,
+        &touched,
+        groups,
+    )
+}
+
+fn merge_three_i32_date_dictionary_local_accumulate(
+    range: DenseLeadingRange,
+    dictionary_len: usize,
+    dictionary: &[Bytes],
+    local: &[LocalCoalesceCountSum],
+    touched: &[usize],
+    groups: &mut CoalesceKeyCountSumGroups,
+) -> Result<bool> {
+    let mut string_ids = vec![None; dictionary_len];
+    for slot in touched.iter().copied() {
+        let value = local[slot];
+        if value.count == 0 {
+            continue;
+        }
+        let leading_slot = slot / dictionary_len;
+        let dictionary_id = slot % dictionary_len;
+        let string_id = match string_ids[dictionary_id] {
+            Some(string_id) => string_id,
+            None => {
+                let value_bytes = dictionary.get(dictionary_id).ok_or_else(|| {
+                    DodamError::UnsupportedSql(
+                        "coalesce aggregate dictionary id out of range".to_string(),
+                    )
+                })?;
+                let value = std::str::from_utf8(value_bytes).map_err(|error| {
+                    DodamError::UnsupportedSql(format!(
+                        "coalesce aggregate dictionary value is not UTF8: {error}"
+                    ))
+                })?;
+                let string_id = groups.string_id(value);
+                string_ids[dictionary_id] = Some(string_id);
+                string_id
+            }
+        };
+        let (first, second) = dense_leading_values(range, leading_slot);
+        groups.merge_three_non_null_string_id_sum(first, second, string_id, value.count, value.sum);
+    }
     Ok(true)
 }
 
@@ -3188,8 +3358,14 @@ fn coalesce_group_id_cache_run_merge_enabled() -> bool {
 fn coalesce_dictionary_selected_local_accumulate_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("DODAM_ENABLE_COALESCE_DICTIONARY_SELECTED_LOCAL_ACCUMULATE")
+        if std::env::var("DODAM_DISABLE_COALESCE_DICTIONARY_SELECTED_LOCAL_ACCUMULATE")
             .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        {
+            return false;
+        }
+        std::env::var("DODAM_ENABLE_COALESCE_DICTIONARY_SELECTED_LOCAL_ACCUMULATE")
+            .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
     })
 }
 
