@@ -3388,14 +3388,8 @@ fn coalesce_group_id_cache_run_merge_enabled() -> bool {
 fn coalesce_dictionary_selected_local_accumulate_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        if std::env::var("DODAM_DISABLE_COALESCE_DICTIONARY_SELECTED_LOCAL_ACCUMULATE")
-            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        {
-            return false;
-        }
         std::env::var("DODAM_ENABLE_COALESCE_DICTIONARY_SELECTED_LOCAL_ACCUMULATE")
-            .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
-            .unwrap_or(true)
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
     })
 }
 
