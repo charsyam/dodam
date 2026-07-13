@@ -226,6 +226,21 @@ pub async fn execute_sql(
     if let Some(output) = try_execute_with_cte_sql(engine, sql, batch_size).await? {
         return Ok(output);
     }
+    if let Some(output) =
+        try_execute_derived_prefix_avg_anti_join_aggregate_sql(engine, sql, batch_size).await?
+    {
+        return Ok(output);
+    }
+    if let Some(output) =
+        try_execute_join_with_grouped_sum_semijoin_sql(engine, sql, batch_size).await?
+    {
+        return Ok(output);
+    }
+    if let Some(output) =
+        try_execute_join_with_correlated_avg_threshold_sql(engine, sql, batch_size).await?
+    {
+        return Ok(output);
+    }
     if let Some(output) = try_execute_legacy_tpch_fast_sql(engine, sql, batch_size).await? {
         return Ok(output);
     }
@@ -670,21 +685,6 @@ async fn try_execute_legacy_tpch_fast_sql(
 ) -> Result<Option<QueryOutput>> {
     if legacy_tpch_fast_paths_disabled() {
         return Ok(None);
-    }
-    if let Some(output) =
-        try_execute_q22_global_sales_opportunity_fast(engine, sql, batch_size).await?
-    {
-        return Ok(Some(output));
-    }
-    if let Some(output) =
-        try_execute_q18_large_volume_customer_fast(engine, sql, batch_size).await?
-    {
-        return Ok(Some(output));
-    }
-    if let Some(output) =
-        try_execute_q17_small_quantity_order_revenue_fast(engine, sql, batch_size).await?
-    {
-        return Ok(Some(output));
     }
     if let Some(output) =
         try_execute_q21_suppliers_who_kept_orders_waiting_fast(engine, sql, batch_size).await?
@@ -10505,7 +10505,7 @@ fn expr_contains_scalar_subquery(expr: &SqlExpr) -> bool {
     }
 }
 
-async fn try_execute_q17_small_quantity_order_revenue_fast(
+async fn try_execute_join_with_correlated_avg_threshold_sql(
     engine: &DodamEngine,
     sql: &str,
     batch_size: usize,
@@ -10522,7 +10522,10 @@ async fn try_execute_q17_small_quantity_order_revenue_fast(
     let Some(selection) = select.selection.as_ref() else {
         return Ok(None);
     };
-    if select.from.len() != 2 || !q17_projection_shape(select) || !q17_filter_shape(selection) {
+    if select.from.len() != 2
+        || !correlated_avg_threshold_projection_shape(select)
+        || !correlated_avg_threshold_filter_shape(selection)
+    {
         return Ok(None);
     }
     reject_query_features(query)?;
@@ -31547,7 +31550,7 @@ fn q08_output(rows: Vec<Q08Row>) -> Result<QueryOutput> {
     })
 }
 
-fn q17_projection_shape(select: &Select) -> bool {
+fn correlated_avg_threshold_projection_shape(select: &Select) -> bool {
     select.projection.len() == 1
         && select.projection.first().is_some_and(|item| {
             item.to_string()
@@ -31556,7 +31559,7 @@ fn q17_projection_shape(select: &Select) -> bool {
         })
 }
 
-fn q17_filter_shape(selection: &SqlExpr) -> bool {
+fn correlated_avg_threshold_filter_shape(selection: &SqlExpr) -> bool {
     let text = selection.to_string().to_ascii_lowercase();
     text.contains("p_partkey = l_partkey")
         && text.contains("p_brand")
@@ -31979,7 +31982,7 @@ fn decimal_scale_factor(scale: i8) -> f64 {
     10_f64.powi(i32::from(scale))
 }
 
-async fn try_execute_q22_global_sales_opportunity_fast(
+async fn try_execute_derived_prefix_avg_anti_join_aggregate_sql(
     engine: &DodamEngine,
     sql: &str,
     batch_size: usize,
@@ -31993,7 +31996,7 @@ async fn try_execute_q22_global_sales_opportunity_fast(
     let SetExpr::Select(select) = query.body.as_ref() else {
         return Ok(None);
     };
-    if !q22_shape(select, query) {
+    if !derived_prefix_avg_anti_join_aggregate_shape(select, query) {
         return Ok(None);
     }
     reject_query_features(query)?;
@@ -32020,7 +32023,7 @@ async fn try_execute_q22_global_sales_opportunity_fast(
     Ok(Some(q22_output(groups)?))
 }
 
-fn q22_shape(select: &Select, query: &Query) -> bool {
+fn derived_prefix_avg_anti_join_aggregate_shape(select: &Select, query: &Query) -> bool {
     if !matches!(parse_limit(query), Ok(None)) {
         return false;
     }
@@ -32308,7 +32311,7 @@ fn q22_output(groups: Vec<Q22Group>) -> Result<QueryOutput> {
     })
 }
 
-async fn try_execute_q18_large_volume_customer_fast(
+async fn try_execute_join_with_grouped_sum_semijoin_sql(
     engine: &DodamEngine,
     sql: &str,
     batch_size: usize,
@@ -32325,7 +32328,7 @@ async fn try_execute_q18_large_volume_customer_fast(
     let Some(selection) = select.selection.as_ref() else {
         return Ok(None);
     };
-    if !q18_shape(select, query, selection) {
+    if !join_with_grouped_sum_semijoin_shape(select, query, selection) {
         return Ok(None);
     }
     reject_query_features(query)?;
@@ -32406,7 +32409,11 @@ async fn try_execute_q18_large_volume_customer_fast(
     Ok(Some(q18_output(rows)?))
 }
 
-fn q18_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
+fn join_with_grouped_sum_semijoin_shape(
+    select: &Select,
+    query: &Query,
+    selection: &SqlExpr,
+) -> bool {
     let text = selection.to_string().to_ascii_lowercase();
     select.projection.len() == 6
         && matches!(parse_limit(query), Ok(Some(100)))
