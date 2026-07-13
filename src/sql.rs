@@ -51988,16 +51988,28 @@ fn fused_dictionary_selected_aggregate_auto_accepts(
             max_selected_row_groups: fused_dictionary_selected_auto_max_selected_row_groups(),
         });
         if !decision.accepted() {
-            log_fused_dictionary_selected_auto_decision(
-                decision.reason(),
-                Some(estimated_selectivity),
-                Some(estimated_selected_rows.max(1)),
-                Some(candidate_row_groups),
-                Some(total_row_groups),
-                Some(total_rows),
-                Some(fused_dictionary_selected_auto_max_estimated_ratio()),
-            );
-            return Ok(false);
+            if estimated_selectivity <= fused_dictionary_selected_auto_spread_override_ratio() {
+                log_fused_dictionary_selected_auto_decision(
+                    "spread-override",
+                    Some(estimated_selectivity),
+                    Some(estimated_selected_rows.max(1)),
+                    Some(candidate_row_groups),
+                    Some(total_row_groups),
+                    Some(total_rows),
+                    Some(fused_dictionary_selected_auto_max_estimated_ratio()),
+                );
+            } else {
+                log_fused_dictionary_selected_auto_decision(
+                    decision.reason(),
+                    Some(estimated_selectivity),
+                    Some(estimated_selected_rows.max(1)),
+                    Some(candidate_row_groups),
+                    Some(total_row_groups),
+                    Some(total_rows),
+                    Some(fused_dictionary_selected_auto_max_estimated_ratio()),
+                );
+                return Ok(false);
+            }
         }
     }
     let max_selectivity = fused_dictionary_selected_auto_max_estimated_ratio();
@@ -52019,6 +52031,14 @@ fn fused_dictionary_selected_aggregate_auto_accepts(
         Some(max_selectivity),
     );
     Ok(accepted)
+}
+
+fn fused_dictionary_selected_auto_spread_override_ratio() -> f64 {
+    std::env::var("DODAM_FUSED_DICTIONARY_SELECTED_AUTO_SPREAD_OVERRIDE_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.02)
 }
 
 fn log_fused_dictionary_selected_auto_decision(
