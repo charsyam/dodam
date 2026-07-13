@@ -236,6 +236,9 @@ pub async fn execute_sql(
     {
         return Ok(output);
     }
+    if let Some(output) = try_execute_important_stock_value_sql(engine, sql, batch_size).await? {
+        return Ok(output);
+    }
     if let Some(output) = try_execute_regional_supplier_revenue_sql(engine, sql, batch_size).await?
     {
         return Ok(output);
@@ -15684,6 +15687,79 @@ fn q11_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
         && selection.contains("ps_suppkey = s_suppkey")
         && selection.contains("s_nationkey = n_nationkey")
         && selection.contains("n_name")
+}
+
+async fn try_execute_important_stock_value_sql(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return Ok(None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let Some(selection) = select.selection.as_ref() else {
+        return Ok(None);
+    };
+    if !q11_shape(select, query, selection) {
+        return Ok(None);
+    }
+    if !matches!(parse_limit(query), Ok(None)) {
+        return Ok(None);
+    }
+    reject_query_features(query)?;
+    reject_select_features(select)?;
+    let Some(tables) = parse_comma_join_table_refs(select)? else {
+        return Ok(None);
+    };
+    if tables.len() != 3 {
+        return Ok(None);
+    }
+    let mut partsupp = None;
+    let mut supplier = None;
+    let mut nation = None;
+    for table in tables {
+        let alias = table_ref_alias_or_name(&table);
+        if alias.eq_ignore_ascii_case("partsupp") {
+            partsupp = Some(table);
+        } else if alias.eq_ignore_ascii_case("supplier") {
+            supplier = Some(table);
+        } else if alias.eq_ignore_ascii_case("nation") {
+            nation = Some(table);
+        }
+    }
+    let (Some(partsupp), Some(supplier), Some(nation)) = (partsupp, supplier, nation) else {
+        return Ok(None);
+    };
+    let mut conjuncts = Vec::new();
+    collect_sql_and_conjuncts(selection, &mut conjuncts);
+    let Some(nation_name) = string_equality_literal(&conjuncts, "n_name")? else {
+        return Ok(None);
+    };
+
+    let stage = tpch_profile_start();
+    let nation_keys = q21_nation_keys(engine, nation.path, batch_size, &nation_name).await?;
+    tpch_profile_elapsed("Q11 nation keys", stage);
+    if nation_keys.is_empty() {
+        return Ok(Some(q11_output(Vec::new())?));
+    }
+
+    let stage = tpch_profile_start();
+    let supplier_keys = q11_supplier_keys(engine, supplier.path, batch_size, &nation_keys).await?;
+    tpch_profile_elapsed("Q11 supplier keys", stage);
+    if supplier_keys.is_empty() {
+        return Ok(Some(q11_output(Vec::new())?));
+    }
+
+    let stage = tpch_profile_start();
+    let rows = q11_important_stock_rows(engine, partsupp.path, batch_size, &supplier_keys).await?;
+    tpch_profile_elapsed("Q11 stock values", stage);
+    Ok(Some(q11_output(rows)?))
 }
 
 async fn q11_supplier_keys(
