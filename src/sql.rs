@@ -573,6 +573,12 @@ pub async fn execute_sql(
         return Ok(QueryOutput::Scan { batches });
     }
 
+    let post_scan_order_by =
+        if prefer_post_scan_primitive_desc_topk(engine, &query, query.order_by.as_ref())? {
+            query.order_by.clone()
+        } else {
+            None
+        };
     let stream = if query.distinct {
         engine
             .scan_parquet_distinct_batches(
@@ -583,6 +589,10 @@ pub async fn execute_sql(
                 query.filter,
                 query.order_by,
             )
+            .await?
+    } else if post_scan_order_by.is_some() {
+        engine
+            .scan_parquet_batches(query.path, batch_size, None, query.projection, query.filter)
             .await?
     } else if let Some(order_by) = query.order_by {
         engine
@@ -606,8 +616,12 @@ pub async fn execute_sql(
             )
             .await?
     };
-    let batches =
-        apply_output_order_limit(collect_batches(stream)?, None, query.limit, query.offset)?;
+    let batches = apply_output_order_limit(
+        collect_batches(stream)?,
+        post_scan_order_by.as_ref(),
+        query.limit,
+        query.offset,
+    )?;
     let batches = rename_output_batches(batches, &query.aliases)?;
     Ok(QueryOutput::Scan { batches })
 }
@@ -1416,6 +1430,44 @@ async fn try_execute_monotonic_row_group_order_limit_scan(
 fn monotonic_row_group_order_limit_scan_enabled() -> bool {
     !std::env::var("DODAM_DISABLE_MONOTONIC_ROW_GROUP_ORDER_LIMIT_SCAN")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn prefer_post_scan_primitive_desc_topk(
+    engine: &DodamEngine,
+    query: &SqlQuery,
+    order_by: Option<&SortKey>,
+) -> Result<bool> {
+    if query.distinct
+        || query.limit.is_none()
+        || query.offset != 0
+        || !Path::new(&query.path).exists()
+    {
+        return Ok(false);
+    }
+    let Some(order_by) = order_by else {
+        return Ok(false);
+    };
+    let [sort] = order_by.expressions.as_slice() else {
+        return Ok(false);
+    };
+    if !sort.descending || sort.nulls_first {
+        return Ok(false);
+    }
+    let Projection::Columns(columns) = &query.projection else {
+        return Ok(false);
+    };
+    if !columns.iter().any(|column| column == &sort.column) {
+        return Ok(false);
+    }
+    let Some(column_types) = engine
+        .parquet_direct_primitive_column_types(&query.path, std::slice::from_ref(&sort.column))?
+    else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        column_types.as_slice(),
+        [DirectPrimitiveColumnType::I64]
+    ))
 }
 
 fn add_projection_column_once(projection: &mut Projection, column: String) {
@@ -51428,6 +51480,12 @@ fn apply_output_order_limit(
     }
     if let Some(limit) = limit
         && offset == 0
+        && let Some(batches) = try_streaming_primitive_desc_topk_batches(&batches, order_by, limit)?
+    {
+        return Ok(batches);
+    }
+    if let Some(limit) = limit
+        && offset == 0
         && let Some(batches) = try_streaming_primitive_topk_batches(&batches, order_by, limit)?
     {
         return Ok(batches);
@@ -51470,11 +51528,118 @@ fn apply_output_order_limit(
 }
 
 type StreamingTopKSelected = (StreamingTopKKey, u64, usize, u32);
+type DescTopKHeapItem = (Reverse<i64>, u64, usize, u32);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum StreamingTopKKey {
     I32I64I64(i32, i64, i64),
     NullableI32I64(bool, i32, i64),
+}
+
+fn try_streaming_primitive_desc_topk_batches(
+    batches: &[RecordBatch],
+    order_by: &SortKey,
+    limit: usize,
+) -> Result<Option<Vec<RecordBatch>>> {
+    if limit == 0 || batches.len() < 2 {
+        return Ok(None);
+    }
+    let [sort] = order_by.expressions.as_slice() else {
+        return Ok(None);
+    };
+    if !sort.descending || sort.nulls_first {
+        return Ok(None);
+    }
+    let Some(sort_index) = batches[0]
+        .schema()
+        .fields()
+        .iter()
+        .position(|field| field.name() == &sort.column)
+    else {
+        return Ok(None);
+    };
+    if batches.iter().any(|batch| {
+        batch
+            .schema()
+            .fields()
+            .get(sort_index)
+            .is_none_or(|field| field.data_type() != &DataType::Int64)
+    }) {
+        return Ok(None);
+    }
+
+    let mut heap = BinaryHeap::<DescTopKHeapItem>::with_capacity(limit.saturating_add(1));
+    let mut sequence = 0_u64;
+    for (batch_index, batch) in batches.iter().enumerate() {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let values = batch
+            .column(sort_index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("checked Int64 sort column");
+        if values.null_count() != 0 {
+            return Ok(None);
+        }
+        if heap.len() >= limit
+            && let Some(worst) = heap.peek()
+            && let Some(max_value) = int64_batch_max(values)
+            && max_value <= (worst.0).0
+        {
+            sequence = sequence.wrapping_add(batch.num_rows() as u64);
+            continue;
+        }
+        for row in 0..batch.num_rows() {
+            let item = (
+                Reverse(values.value(row)),
+                sequence,
+                batch_index,
+                row as u32,
+            );
+            if heap.len() < limit {
+                heap.push(item);
+            } else if heap.peek().is_some_and(|worst| item < *worst) {
+                heap.pop();
+                heap.push(item);
+            }
+            sequence = sequence.wrapping_add(1);
+        }
+    }
+    if heap.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let mut selected = heap
+        .into_iter()
+        .map(|(Reverse(value), sequence, batch_index, row)| (value, sequence, batch_index, row))
+        .collect::<Vec<_>>();
+    selected.sort_unstable_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.3.cmp(&right.3))
+    });
+    let selected = selected
+        .into_iter()
+        .map(|(_, sequence, batch_index, row)| (0_i128, sequence, batch_index, row))
+        .collect::<Vec<_>>();
+    Ok(Some(vec![materialize_topk_selected_rows(
+        batches, &selected,
+    )?]))
+}
+
+fn int64_batch_max(values: &Int64Array) -> Option<i64> {
+    if values.is_empty() {
+        return None;
+    }
+    let raw = values.values();
+    let mut max_value = raw[0];
+    for value in &raw[1..] {
+        max_value = max_value.max(*value);
+    }
+    Some(max_value)
 }
 
 fn try_streaming_primitive_topk_batches(
