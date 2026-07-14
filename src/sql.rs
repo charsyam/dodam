@@ -225,14 +225,7 @@ pub async fn execute_sql(
     if let Some(output) = try_execute_window_sql(engine, sql, batch_size).await? {
         return Ok(output);
     }
-    if let Some(output) =
-        tpch_rules::try_execute_promo_revenue_ratio_sql(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) =
-        tpch_rules::try_execute_top_supplier_revenue_sql(engine, sql, batch_size).await?
-    {
+    if let Some(output) = tpch_rules::try_execute_tpch_rule_sql(engine, sql, batch_size).await? {
         return Ok(output);
     }
     if let Some(output) = try_execute_with_cte_sql(engine, sql, batch_size).await? {
@@ -249,11 +242,6 @@ pub async fn execute_sql(
         return Ok(output);
     }
     if let Some(output) = try_execute_important_stock_value_sql(engine, sql, batch_size).await? {
-        return Ok(output);
-    }
-    if let Some(output) =
-        tpch_rules::try_execute_parts_supplier_relationship_sql(engine, sql, batch_size).await?
-    {
         return Ok(output);
     }
     if let Some(output) = try_execute_regional_supplier_revenue_sql(engine, sql, batch_size).await?

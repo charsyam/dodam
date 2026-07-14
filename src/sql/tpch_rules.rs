@@ -1,5 +1,24 @@
 use super::*;
 
+pub(super) async fn try_execute_tpch_rule_sql(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    if let Some(output) = try_execute_promo_revenue_ratio_sql(engine, sql, batch_size).await? {
+        return Ok(Some(output));
+    }
+    if let Some(output) = try_execute_top_supplier_revenue_sql(engine, sql, batch_size).await? {
+        return Ok(Some(output));
+    }
+    if let Some(output) =
+        try_execute_parts_supplier_relationship_sql(engine, sql, batch_size).await?
+    {
+        return Ok(Some(output));
+    }
+    Ok(None)
+}
+
 fn q16_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
     let projection = select
         .projection
@@ -32,7 +51,7 @@ fn q16_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
         && selection.contains("s_comment like")
 }
 
-pub(super) async fn try_execute_parts_supplier_relationship_sql(
+async fn try_execute_parts_supplier_relationship_sql(
     engine: &DodamEngine,
     sql: &str,
     batch_size: usize,
@@ -187,7 +206,7 @@ fn q14_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
         && selection.contains("l_shipdate")
 }
 
-pub(super) async fn try_execute_promo_revenue_ratio_sql(
+async fn try_execute_promo_revenue_ratio_sql(
     engine: &DodamEngine,
     sql: &str,
     batch_size: usize,
@@ -323,7 +342,7 @@ fn q15_shape(query: &Query) -> bool {
         && order_by.contains("s_suppkey")
 }
 
-pub(super) async fn try_execute_top_supplier_revenue_sql(
+async fn try_execute_top_supplier_revenue_sql(
     engine: &DodamEngine,
     sql: &str,
     batch_size: usize,
