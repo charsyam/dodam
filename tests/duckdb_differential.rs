@@ -753,6 +753,37 @@ async fn duckdb_differential_union_all() {
 
     assert_same_as_duckdb(
         &format!(
+            "SELECT id AS value FROM '{}' WHERE id IN (1, 2, 3, 4) UNION DISTINCT SELECT id AS value FROM '{}' WHERE id IN (3, 4, 5) ORDER BY value",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id AS value FROM read_parquet('{}') WHERE id IN (1, 2, 3, 4) UNION DISTINCT SELECT id AS value FROM read_parquet('{}') WHERE id IN (3, 4, 5) ORDER BY value",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb_unordered_case(
+        "i64/i32 union distinct direct scan",
+        &format!(
+            "SELECT id AS value, key FROM '{}' WHERE id IN (1, 2, 3, 4) UNION DISTINCT SELECT id AS value, key FROM '{}' WHERE id IN (3, 4, 5)",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id AS value, key FROM read_parquet('{}') WHERE id IN (1, 2, 3, 4) UNION DISTINCT SELECT id AS value, key FROM read_parquet('{}') WHERE id IN (3, 4, 5)",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
             "SELECT key AS value, payload FROM '{}' WHERE id <= 5 INTERSECT SELECT key AS value, payload FROM '{}' WHERE id >= 2 ORDER BY value, payload",
             facts_path.display(),
             facts_path.display()

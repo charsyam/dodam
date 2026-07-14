@@ -5157,17 +5157,18 @@ fn try_execute_direct_distinct_scan(
     scan: DirectDistinctScan,
     batch_size: usize,
 ) -> Result<Option<Vec<RecordBatch>>> {
-    if let Some(batches) = try_execute_direct_distinct_single_i32_values(engine, &scan, batch_size)?
+    if let Some(batches) =
+        try_execute_direct_distinct_single_primitive_values(engine, &scan, batch_size)?
     {
         return Ok(Some(batches));
     }
-    if let Some(batches) = try_execute_direct_distinct_i32_i64_pairs(engine, &scan, batch_size)? {
+    if let Some(batches) = try_execute_direct_distinct_primitive_pairs(engine, &scan, batch_size)? {
         return Ok(Some(batches));
     }
     Ok(None)
 }
 
-fn try_execute_direct_distinct_single_i32_values(
+fn try_execute_direct_distinct_single_primitive_values(
     engine: &DodamEngine,
     scan: &DirectDistinctScan,
     batch_size: usize,
@@ -5195,7 +5196,7 @@ fn try_execute_direct_distinct_single_i32_values(
     }
     let candidates = values
         .iter()
-        .map(|value| value.as_i32(column))
+        .map(|value| value.as_i64(column))
         .collect::<Result<Vec<_>>>()?;
     if candidates.is_empty() {
         return Ok(None);
@@ -5205,7 +5206,13 @@ fn try_execute_direct_distinct_single_i32_values(
     else {
         return Ok(None);
     };
-    if !matches!(column_types.as_slice(), [DirectPrimitiveColumnType::I32]) {
+    let [column_type] = column_types.as_slice() else {
+        return Ok(None);
+    };
+    if !matches!(
+        column_type,
+        DirectPrimitiveColumnType::I32 | DirectPrimitiveColumnType::I64
+    ) {
         return Ok(None);
     }
     let row_group_count = engine.parquet_row_group_count(&scan.path)?;
@@ -5214,9 +5221,9 @@ fn try_execute_direct_distinct_single_i32_values(
         scan.path.clone(),
         batch_size,
         row_groups,
-        vec![(column.clone(), DirectPrimitiveColumnType::I32)],
-        || I32CandidatePresence::new(candidates.clone()),
-        |state, view| state.consume(view),
+        vec![(column.clone(), *column_type)],
+        || PrimitiveCandidatePresence::new(candidates.clone()),
+        move |state, view| state.consume(view, *column_type),
         |state, partial| {
             state.merge(partial);
             Ok(())
@@ -5234,16 +5241,30 @@ fn try_execute_direct_distinct_single_i32_values(
             output.push(candidate);
         }
     }
+    let (data_type, column): (DataType, ArrayRef) = match column_type {
+        DirectPrimitiveColumnType::I32 => {
+            let values = output
+                .into_iter()
+                .map(|value| {
+                    i32::try_from(value)
+                        .map_err(|_| DodamError::InvalidFilter(format!("{column}={value}")))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            (DataType::Int32, Arc::new(Int32Array::from(values)))
+        }
+        DirectPrimitiveColumnType::I64 => (DataType::Int64, Arc::new(Int64Array::from(output))),
+        _ => return Ok(None),
+    };
     let schema = Arc::new(Schema::new(vec![Field::new(
         projected_column,
-        DataType::Int32,
+        data_type,
         true,
     )]));
-    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(output))])?;
+    let batch = RecordBatch::try_new(schema, vec![column])?;
     rename_output_batches(vec![batch], &scan.aliases).map(Some)
 }
 
-fn try_execute_direct_distinct_i32_i64_pairs(
+fn try_execute_direct_distinct_primitive_pairs(
     engine: &DodamEngine,
     scan: &DirectDistinctScan,
     batch_size: usize,
@@ -5275,7 +5296,7 @@ fn try_execute_direct_distinct_i32_i64_pairs(
     let other_index = if filter_index == 0 { 1 } else { 0 };
     let candidates = values
         .iter()
-        .map(|value| value.as_i32(column))
+        .map(|value| value.as_i64(column))
         .collect::<Result<Vec<_>>>()?;
     if candidates.is_empty() {
         return Ok(None);
@@ -5284,13 +5305,9 @@ fn try_execute_direct_distinct_i32_i64_pairs(
     else {
         return Ok(None);
     };
-    if !matches!(
-        (column_types[filter_index], column_types[other_index]),
-        (
-            DirectPrimitiveColumnType::I32,
-            DirectPrimitiveColumnType::I64
-        )
-    ) {
+    if !primitive_distinct_column_type_supported(column_types[filter_index])
+        || !primitive_distinct_column_type_supported(column_types[other_index])
+    {
         return Ok(None);
     }
     let row_group_count = engine.parquet_row_group_count(&scan.path)?;
@@ -5304,7 +5321,15 @@ fn try_execute_direct_distinct_i32_i64_pairs(
             .zip(column_types.iter())
             .map(|(name, column_type)| (name.clone(), *column_type))
             .collect(),
-        || I32I64DistinctPairs::new(candidates.clone(), filter_index, other_index),
+        || {
+            PrimitiveDistinctPairs::new(
+                candidates.clone(),
+                filter_index,
+                other_index,
+                column_types[filter_index],
+                column_types[other_index],
+            )
+        },
         |state, view| state.consume(view),
         |state, partial| {
             state.merge(partial);
@@ -5322,27 +5347,144 @@ fn try_execute_direct_distinct_i32_i64_pairs(
     let first_values = pairs.iter().map(|(key, _)| *key).collect::<Vec<_>>();
     let second_values = pairs.iter().map(|(_, value)| *value).collect::<Vec<_>>();
     let schema = Arc::new(Schema::new(vec![
-        Field::new(first_column, DataType::Int32, true),
-        Field::new(second_column, DataType::Int64, true),
+        Field::new(
+            first_column,
+            primitive_distinct_data_type(column_types[0])?,
+            true,
+        ),
+        Field::new(
+            second_column,
+            primitive_distinct_data_type(column_types[1])?,
+            true,
+        ),
     ]));
     let batch = RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(Int32Array::from(first_values)),
-            Arc::new(Int64Array::from(second_values)),
+            primitive_distinct_array(first_values, column_types[0])?,
+            primitive_distinct_array(second_values, column_types[1])?,
         ],
     )?;
     rename_output_batches(vec![batch], &scan.aliases).map(Some)
 }
 
-struct I32CandidatePresence {
-    candidates: Vec<i32>,
+fn primitive_distinct_column_type_supported(column_type: DirectPrimitiveColumnType) -> bool {
+    matches!(
+        column_type,
+        DirectPrimitiveColumnType::I32 | DirectPrimitiveColumnType::I64
+    )
+}
+
+fn primitive_distinct_data_type(column_type: DirectPrimitiveColumnType) -> Result<DataType> {
+    match column_type {
+        DirectPrimitiveColumnType::I32 => Ok(DataType::Int32),
+        DirectPrimitiveColumnType::I64 => Ok(DataType::Int64),
+        _ => Err(DodamError::UnsupportedSql(format!(
+            "unsupported primitive distinct type {column_type:?}"
+        ))),
+    }
+}
+
+fn primitive_distinct_array(
+    values: Vec<i64>,
+    column_type: DirectPrimitiveColumnType,
+) -> Result<ArrayRef> {
+    match column_type {
+        DirectPrimitiveColumnType::I32 => Ok(Arc::new(Int32Array::from(
+            values
+                .into_iter()
+                .map(|value| {
+                    i32::try_from(value).map_err(|_| {
+                        DodamError::InvalidFilter(format!("primitive distinct value {value}"))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ))),
+        DirectPrimitiveColumnType::I64 => Ok(Arc::new(Int64Array::from(values))),
+        _ => Err(DodamError::UnsupportedSql(format!(
+            "unsupported primitive distinct type {column_type:?}"
+        ))),
+    }
+}
+
+fn primitive_distinct_column_values(
+    view: &BatchView<'_>,
+    index: usize,
+    column_type: DirectPrimitiveColumnType,
+) -> Option<Vec<i64>> {
+    match column_type {
+        DirectPrimitiveColumnType::I32 => {
+            let column = view.i32_vector(index)?;
+            if let Some(values) = column.values_if_null_free() {
+                return Some(values.iter().map(|value| i64::from(*value)).collect());
+            }
+            let (values, def_levels) = column.raw_nullable()?;
+            Some(nullable_i32_values_to_i64(values, def_levels))
+        }
+        DirectPrimitiveColumnType::I64 => {
+            let column = view.i64_vector(index)?;
+            if let Some(values) = column.values_if_null_free() {
+                return Some(values.to_vec());
+            }
+            let (values, def_levels) = column.raw_nullable()?;
+            Some(nullable_i64_values(values, def_levels))
+        }
+        _ => None,
+    }
+}
+
+fn primitive_distinct_null_free_column_values(
+    view: &BatchView<'_>,
+    index: usize,
+    column_type: DirectPrimitiveColumnType,
+) -> Option<Vec<i64>> {
+    match column_type {
+        DirectPrimitiveColumnType::I32 => view
+            .i32_vector(index)
+            .and_then(|column| column.values_if_null_free())
+            .map(|values| values.iter().map(|value| i64::from(*value)).collect()),
+        DirectPrimitiveColumnType::I64 => view
+            .i64_vector(index)
+            .and_then(|column| column.values_if_null_free())
+            .map(|values| values.to_vec()),
+        _ => None,
+    }
+}
+
+fn nullable_i32_values_to_i64(values: &[i32], def_levels: &[i16]) -> Vec<i64> {
+    nullable_values(values.len(), def_levels, |index| i64::from(values[index]))
+}
+
+fn nullable_i64_values(values: &[i64], def_levels: &[i16]) -> Vec<i64> {
+    nullable_values(values.len(), def_levels, |index| values[index])
+}
+
+fn nullable_values<F>(value_len: usize, def_levels: &[i16], value_at: F) -> Vec<i64>
+where
+    F: Fn(usize) -> i64,
+{
+    let mut output = Vec::with_capacity(def_levels.len());
+    let mut value_index = 0usize;
+    let full_width_values = value_len == def_levels.len();
+    for (row, definition) in def_levels.iter().copied().enumerate() {
+        if definition == 0 {
+            continue;
+        }
+        let index = if full_width_values { row } else { value_index };
+        output.push(value_at(index));
+        value_index += 1;
+    }
+    output
+}
+
+struct PrimitiveCandidatePresence {
+    candidates: Vec<i64>,
     found: Vec<bool>,
     unsupported: bool,
 }
 
-impl I32CandidatePresence {
-    fn new(candidates: Vec<i32>) -> Self {
+impl PrimitiveCandidatePresence {
+    fn new(candidates: Vec<i64>) -> Self {
         let found = vec![false; candidates.len()];
         Self {
             candidates,
@@ -5351,24 +5493,33 @@ impl I32CandidatePresence {
         }
     }
 
-    fn consume(&mut self, view: BatchView<'_>) -> Result<()> {
-        let Some(values) = view
-            .i32_vector(0)
-            .and_then(|column| column.values_if_null_free())
-        else {
+    fn consume(
+        &mut self,
+        view: BatchView<'_>,
+        column_type: DirectPrimitiveColumnType,
+    ) -> Result<()> {
+        let Some(values) = primitive_distinct_column_values(&view, 0, column_type) else {
             self.unsupported = true;
             return Ok(());
         };
+        self.consume_values(values)
+    }
+
+    fn consume_values<I>(&mut self, values: I) -> Result<()>
+    where
+        I: IntoIterator<Item = i64>,
+    {
+        let values = values.into_iter();
         match self.candidates.as_slice() {
             [a] => {
-                for &value in values {
+                for value in values {
                     if value == *a {
                         self.found[0] = true;
                     }
                 }
             }
             [a, b] => {
-                for &value in values {
+                for value in values {
                     if value == *a {
                         self.found[0] = true;
                     } else if value == *b {
@@ -5377,7 +5528,7 @@ impl I32CandidatePresence {
                 }
             }
             [a, b, c] => {
-                for &value in values {
+                for value in values {
                     if value == *a {
                         self.found[0] = true;
                     } else if value == *b {
@@ -5388,7 +5539,7 @@ impl I32CandidatePresence {
                 }
             }
             candidates => {
-                for &value in values {
+                for value in values {
                     if let Some(index) = candidates.iter().position(|candidate| *candidate == value)
                     {
                         self.found[index] = true;
@@ -5547,36 +5698,44 @@ impl PrimitiveSetAllCounts {
     }
 }
 
-struct I32I64DistinctPairs {
-    candidates: Vec<i32>,
+struct PrimitiveDistinctPairs {
+    candidates: Vec<i64>,
     filter_index: usize,
     other_index: usize,
-    pairs: FastHashSet<(i32, i64)>,
+    filter_type: DirectPrimitiveColumnType,
+    other_type: DirectPrimitiveColumnType,
+    pairs: FastHashSet<(i64, i64)>,
     unsupported: bool,
 }
 
-impl I32I64DistinctPairs {
-    fn new(candidates: Vec<i32>, filter_index: usize, other_index: usize) -> Self {
+impl PrimitiveDistinctPairs {
+    fn new(
+        candidates: Vec<i64>,
+        filter_index: usize,
+        other_index: usize,
+        filter_type: DirectPrimitiveColumnType,
+        other_type: DirectPrimitiveColumnType,
+    ) -> Self {
         Self {
             candidates,
             filter_index,
             other_index,
+            filter_type,
+            other_type,
             pairs: FastHashSet::default(),
             unsupported: false,
         }
     }
 
     fn consume(&mut self, view: BatchView<'_>) -> Result<()> {
-        let Some(keys) = view
-            .i32_vector(self.filter_index)
-            .and_then(|column| column.values_if_null_free())
+        let Some(keys) =
+            primitive_distinct_null_free_column_values(&view, self.filter_index, self.filter_type)
         else {
             self.unsupported = true;
             return Ok(());
         };
-        let Some(values) = view
-            .i64_vector(self.other_index)
-            .and_then(|column| column.values_if_null_free())
+        let Some(values) =
+            primitive_distinct_null_free_column_values(&view, self.other_index, self.other_type)
         else {
             self.unsupported = true;
             return Ok(());

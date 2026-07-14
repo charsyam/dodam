@@ -348,6 +348,16 @@ def generic_queries(data_dir: Path) -> list[GenericQuery]:
             f"SELECT bucket, value FROM read_parquet('{facts}') WHERE bucket IN (1, 7) UNION DISTINCT SELECT bucket, value FROM read_parquet('{facts}') WHERE bucket IN (7, 9) ORDER BY bucket, value LIMIT 5000",
         ),
         GenericQuery(
+            "union_distinct_i64_rows",
+            f"SELECT id FROM '{facts}' WHERE id IN (1, 2, 3, 4, 5, 6, 7, 8) UNION DISTINCT SELECT id FROM '{facts}' WHERE id IN (5, 6, 7, 8, 9, 10, 11, 12) ORDER BY id",
+            f"SELECT id FROM read_parquet('{facts}') WHERE id IN (1, 2, 3, 4, 5, 6, 7, 8) UNION DISTINCT SELECT id FROM read_parquet('{facts}') WHERE id IN (5, 6, 7, 8, 9, 10, 11, 12) ORDER BY id",
+        ),
+        GenericQuery(
+            "union_distinct_i64_i32_rows",
+            f"SELECT id, bucket FROM '{facts}' WHERE id IN (1, 2, 3, 4, 5, 6, 7, 8) UNION DISTINCT SELECT id, bucket FROM '{facts}' WHERE id IN (5, 6, 7, 8, 9, 10, 11, 12) ORDER BY id, bucket",
+            f"SELECT id, bucket FROM read_parquet('{facts}') WHERE id IN (1, 2, 3, 4, 5, 6, 7, 8) UNION DISTINCT SELECT id, bucket FROM read_parquet('{facts}') WHERE id IN (5, 6, 7, 8, 9, 10, 11, 12) ORDER BY id, bucket",
+        ),
+        GenericQuery(
             "intersect_distinct_rows",
             f"SELECT bucket, value FROM '{facts}' WHERE bucket IN (1, 7) INTERSECT SELECT bucket, value FROM '{facts}' WHERE bucket IN (7, 9) ORDER BY bucket, value LIMIT 5000",
             f"SELECT bucket, value FROM read_parquet('{facts}') WHERE bucket IN (1, 7) INTERSECT SELECT bucket, value FROM read_parquet('{facts}') WHERE bucket IN (7, 9) ORDER BY bucket, value LIMIT 5000",

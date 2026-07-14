@@ -60,6 +60,24 @@ Priority order:
          - `select_distinct_rows`: Dodam `~29.4ms`, DuckDB `~35.4ms` (`0.83x`)
        - Full SF=10 generic with both UNION and SELECT distinct cases sampled Dodam `~527.7ms`, DuckDB `~652.9ms` (`0.81x`). Remaining slower cases were unrelated/noisy scan-heavy aggregate shapes.
        - Next generalization: widen direct distinct beyond i32/i64 pairs to nullable primitives, string dictionary ids, and multi-column mixed primitive keys using the same `column blocks -> local distinct set -> merged distinct batch` boundary.
+       - Widened direct distinct primitive coverage:
+         - single projected `i32/i64` with positive literal filter now shares one primitive presence rule
+         - two-column primitive pairs now cover null-free `i32/i64` combinations instead of only `(i32 filter, i64 payload)`
+         - single nullable `i32/i64` inputs can stay on the primitive path by skipping nulls when the positive literal filter excludes NULL
+       - Added generic benchmark cases:
+         - `union_distinct_i64_rows`
+         - `union_distinct_i64_i32_rows`
+       - SF=1 focused after widening:
+         - `union_distinct_low_cardinality`: Dodam `~4.7ms`, DuckDB `~20.0ms` (`0.23x`)
+         - `union_distinct_rows`: Dodam `~15.2ms`, DuckDB `~29.1ms` (`0.52x`)
+         - `union_distinct_i64_rows`: Dodam `~6.9ms`, DuckDB `~19.0ms` (`0.36x`)
+         - `union_distinct_i64_i32_rows`: Dodam `~8.0ms`, DuckDB `~19.6ms` (`0.41x`)
+         - `select_distinct_low_cardinality`: Dodam `~4.9ms`, DuckDB `~18.5ms` (`0.27x`)
+         - `select_distinct_rows`: Dodam `~14.9ms`, DuckDB `~21.8ms` (`0.68x`)
+       - Remaining work:
+         - nullable pair distinct still falls back because output null bitmap semantics must be preserved
+         - string dictionary-id distinct is not yet lowered into this direct rule
+         - generic set-op fallback still needs spill-aware row-key operators for very large operands
    - `INTERSECT` / `INTERSECT DISTINCT`
      - Implemented correctness-first materialized row-key fallback for `INTERSECT DISTINCT`/default `INTERSECT`, using the same Arrow row equality semantics as `DistinctExec` and DuckDB differential coverage over single-column and multi-column rows.
      - Added generic benchmark case `intersect_distinct_rows`.
