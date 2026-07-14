@@ -84,7 +84,7 @@ ORDER BY l_returnflag, l_linestatus
         },
         TpchQuery {
             name: "q02_minimum_cost_supplier",
-            expected_status: "needs-data:partsupp",
+            expected_status: "needs-data:region",
             sql: r#"
 SELECT
     s_acctbal,
@@ -138,7 +138,7 @@ LIMIT 10
         },
         TpchQuery {
             name: "q04_order_priority",
-            expected_status: "needs-data:lineitem",
+            expected_status: "needs-data:orders",
             sql: r#"
 SELECT
     o_orderpriority,
@@ -158,7 +158,7 @@ ORDER BY o_orderpriority
         },
         TpchQuery {
             name: "q05_local_supplier_volume",
-            expected_status: "needs-data:customer",
+            expected_status: "needs-data:region",
             sql: r#"
 SELECT
     n_name,
@@ -192,7 +192,7 @@ WHERE l_shipdate >= DATE '1994-01-01'
         },
         TpchQuery {
             name: "q07_volume_shipping",
-            expected_status: "needs-data:supplier",
+            expected_status: "needs-data:nation",
             sql: r#"
 SELECT
     supp_nation,
@@ -221,7 +221,7 @@ ORDER BY supp_nation, cust_nation, l_year
         },
         TpchQuery {
             name: "q08_national_market_share",
-            expected_status: "needs-data:part",
+            expected_status: "needs-data:region",
             sql: r#"
 SELECT
     o_year,
@@ -322,7 +322,7 @@ ORDER BY value DESC
         },
         TpchQuery {
             name: "q12_shipping_modes",
-            expected_status: "needs-data:orders",
+            expected_status: "needs-data:lineitem",
             sql: r#"
 SELECT
     l_shipmode,
@@ -361,7 +361,7 @@ ORDER BY custdist DESC, c_count DESC
         },
         TpchQuery {
             name: "q14_promotion_effect",
-            expected_status: "needs-data:lineitem",
+            expected_status: "needs-data:part",
             sql: r#"
 SELECT
     100.00 * sum(CASE WHEN p_type LIKE 'PROMO%' THEN l_extendedprice * (1 - l_discount) ELSE 0 END)
@@ -464,7 +464,7 @@ LIMIT 100
         },
         TpchQuery {
             name: "q19_discounted_revenue",
-            expected_status: "needs-data:lineitem",
+            expected_status: "needs-data:part",
             sql: r#"
 SELECT
     sum(l_extendedprice * (1 - l_discount)) AS revenue

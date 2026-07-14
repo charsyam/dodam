@@ -28,7 +28,7 @@ use sqlparser::ast::{
     Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint,
     JoinOperator, LimitClause, ObjectName, ObjectNamePart, OrderByKind, Query, Select, SelectItem,
     SelectItemQualifiedWildcardKind, SetExpr, SetOperator, SetQuantifier, Statement, Subscript,
-    TableFactor, UnaryOperator, Value, WindowType,
+    TableFactor, TableWithJoins, UnaryOperator, Value, WindowType,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -775,6 +775,42 @@ impl SqlRule {
             }
         }
     }
+
+    fn is_candidate(self, context: &SqlRuleContext) -> bool {
+        match self {
+            Self::Tpch => context.has_tpch_like_terms,
+            Self::WithCte => context.has_with,
+            Self::PricingSummary
+            | Self::ProfitByNationYear
+            | Self::ReturnedCustomerRevenue
+            | Self::ImportantStockValue
+            | Self::RegionalSupplierRevenue
+            | Self::BilateralShippingVolume
+            | Self::NationMarketShare
+            | Self::DiscountedRevenueOrPredicate
+            | Self::OrderPriorityExistsCount
+            | Self::ShippingPriorityRevenue
+            | Self::ShippingModePriorityCounts
+            | Self::SupplierWaitCountAntijoin
+            | Self::PrefixPartSupplierThreshold => context.has_tpch_like_terms,
+            Self::JoinWithGroupedSumSemijoin
+            | Self::JoinWithCorrelatedAvgThreshold
+            | Self::MultiCommaJoin => context.from_table_count > 1 || context.has_join,
+            Self::DerivedPrefixAvgAntiJoinAggregate
+            | Self::DerivedJoin
+            | Self::DerivedLeftJoinCountDistribution
+            | Self::Derived => context.has_derived_from,
+            Self::CorrelatedJoinSubqueryFilter
+            | Self::MaterializedJoinSubquery
+            | Self::CorrelatedExistsSemijoin
+            | Self::CorrelatedInPairSemijoin
+            | Self::CorrelatedSubqueryFilter
+            | Self::CorrelatedExistsSubquery
+            | Self::ExistsSubquery
+            | Self::InSubquery => context.has_subquery,
+            Self::ProjectionExpression => true,
+        }
+    }
 }
 
 fn sql_rule_registry() -> &'static [SqlRule] {
@@ -818,7 +854,12 @@ async fn try_execute_registered_sql_rules(
     sql: &str,
     batch_size: usize,
 ) -> Result<Option<QueryOutput>> {
-    for rule in sql_rule_registry() {
+    let context = SqlRuleContext::from_sql(sql)?;
+    let candidates = sql_rule_registry()
+        .iter()
+        .copied()
+        .filter(|rule| rule.is_candidate(&context));
+    for rule in candidates {
         if let Some(output) = rule.execute(engine, sql, batch_size).await? {
             if sql_rule_profile_enabled() {
                 eprintln!(
@@ -831,6 +872,107 @@ async fn try_execute_registered_sql_rules(
         }
     }
     Ok(None)
+}
+
+struct SqlRuleContext {
+    has_with: bool,
+    has_join: bool,
+    has_subquery: bool,
+    has_derived_from: bool,
+    has_tpch_like_terms: bool,
+    from_table_count: usize,
+}
+
+impl SqlRuleContext {
+    fn from_sql(sql: &str) -> Result<Self> {
+        let lower_sql = sql.to_ascii_lowercase();
+        let dialect = GenericDialect {};
+        let statements = Parser::parse_sql(&dialect, sql)
+            .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+        let Some(Statement::Query(query)) = statements.first() else {
+            return Ok(Self::from_lower_sql(lower_sql));
+        };
+        let mut context = Self::from_lower_sql(lower_sql);
+        context.has_with = query.with.is_some();
+        context.has_subquery = query_contains_subquery(query);
+        if let SetExpr::Select(select) = query.body.as_ref() {
+            context.from_table_count = select.from.len();
+            context.has_join = select.from.iter().any(|table| !table.joins.is_empty());
+            context.has_derived_from = select.from.iter().any(table_with_derived_relation);
+        }
+        Ok(context)
+    }
+
+    fn from_lower_sql(lower_sql: String) -> Self {
+        let has_tpch_like_terms = [
+            "lineitem", "orders", "customer", "supplier", "partsupp", "part", "nation", "region",
+            "l_", "o_", "c_", "s_", "ps_", "p_", "n_", "r_",
+        ]
+        .iter()
+        .any(|term| lower_sql.contains(term));
+        Self {
+            has_with: lower_sql.contains("with "),
+            has_join: lower_sql.contains(" join "),
+            has_subquery: lower_sql.contains("select")
+                && (lower_sql.contains(" exists")
+                    || lower_sql.contains(" in (select")
+                    || lower_sql.contains("(select")),
+            has_derived_from: lower_sql.contains("from ("),
+            has_tpch_like_terms,
+            from_table_count: 0,
+        }
+    }
+}
+
+fn query_contains_subquery(query: &Query) -> bool {
+    if query.with.as_ref().is_some_and(|with| {
+        with.cte_tables
+            .iter()
+            .any(|cte| query_contains_subquery(&cte.query))
+    }) {
+        return true;
+    }
+    set_expr_contains_subquery(query.body.as_ref())
+}
+
+fn set_expr_contains_subquery(expr: &SetExpr) -> bool {
+    match expr {
+        SetExpr::Select(select) => {
+            select
+                .selection
+                .as_ref()
+                .is_some_and(expr_contains_materializable_subquery)
+                || select.from.iter().any(|table| {
+                    table_with_derived_relation(table) || table_contains_subquery(table)
+                })
+        }
+        SetExpr::Query(query) => query_contains_subquery(query),
+        SetExpr::SetOperation { left, right, .. } => {
+            set_expr_contains_subquery(left) || set_expr_contains_subquery(right)
+        }
+        _ => false,
+    }
+}
+
+fn table_contains_subquery(table: &TableWithJoins) -> bool {
+    table_with_derived_relation(table)
+        || table
+            .joins
+            .iter()
+            .any(|join| table_factor_contains_derived(&join.relation))
+}
+
+fn table_with_derived_relation(table: &TableWithJoins) -> bool {
+    table_factor_contains_derived(&table.relation)
+}
+
+fn table_factor_contains_derived(factor: &TableFactor) -> bool {
+    matches!(
+        factor,
+        TableFactor::Derived { .. }
+            | TableFactor::TableFunction { .. }
+            | TableFactor::NestedJoin { .. }
+    )
 }
 
 fn sql_rule_profile_enabled() -> bool {
