@@ -208,6 +208,46 @@ def generic_queries(data_dir: Path) -> list[GenericQuery]:
             f"SELECT bucket, count(*), sum(value) FROM read_parquet('{facts}') GROUP BY bucket ORDER BY bucket",
         ),
         GenericQuery(
+            "review_q1_two_key_group",
+            f"SELECT bucket, event_date, count(*), sum(value), min(amount), max(amount) FROM '{facts}' WHERE event_date <= '2024-01-20' GROUP BY bucket, event_date ORDER BY bucket, event_date",
+            f"SELECT bucket, event_date, count(*), sum(value), min(amount), max(amount) FROM read_parquet('{facts}') WHERE event_date <= '2024-01-20' GROUP BY bucket, event_date ORDER BY bucket, event_date",
+        ),
+        GenericQuery(
+            "review_q1_one_key_group",
+            f"SELECT bucket, count(*), sum(value), min(amount), max(amount) FROM '{facts}' WHERE event_date <= '2024-01-20' GROUP BY bucket ORDER BY bucket",
+            f"SELECT bucket, count(*), sum(value), min(amount), max(amount) FROM read_parquet('{facts}') WHERE event_date <= '2024-01-20' GROUP BY bucket ORDER BY bucket",
+        ),
+        GenericQuery(
+            "review_q1_alt_string_group",
+            f"SELECT label, count(*), sum(value), min(amount), max(amount) FROM '{facts}' WHERE event_date <= '2024-01-20' GROUP BY label ORDER BY label NULLS FIRST",
+            f"SELECT label, count(*), sum(value), min(amount), max(amount) FROM read_parquet('{facts}') WHERE event_date <= '2024-01-20' GROUP BY label ORDER BY label NULLS FIRST",
+        ),
+        GenericQuery(
+            "review_q6_expression_sum",
+            f"SELECT sum(value * bucket) FROM '{facts}' WHERE amount >= '10.00' AND amount < '90.00' AND event_date < '2024-01-20'",
+            f"SELECT sum(value * bucket) FROM read_parquet('{facts}') WHERE amount >= '10.00' AND amount < '90.00' AND event_date < '2024-01-20'",
+        ),
+        GenericQuery(
+            "review_high_cardinality_group",
+            f"SELECT id, count(*), sum(value) FROM '{facts}' GROUP BY id ORDER BY id",
+            f"SELECT id, count(*), sum(value) FROM read_parquet('{facts}') GROUP BY id ORDER BY id",
+        ),
+        GenericQuery(
+            "review_count_distinct",
+            f"SELECT count(DISTINCT id) FROM '{facts}'",
+            f"SELECT count(DISTINCT id) FROM read_parquet('{facts}')",
+        ),
+        GenericQuery(
+            "review_like_group",
+            f"SELECT label, count(*), sum(value) FROM '{facts}' WHERE label LIKE 'label-2%' GROUP BY label ORDER BY label",
+            f"SELECT label, count(*), sum(value) FROM read_parquet('{facts}') WHERE label LIKE 'label-2%' GROUP BY label ORDER BY label",
+        ),
+        GenericQuery(
+            "review_filter_order_limit",
+            f"SELECT id, key, bucket, value FROM '{facts}' WHERE amount >= '10.00' AND event_date < '2024-01-20' ORDER BY value DESC LIMIT 5000",
+            f"SELECT id, key, bucket, value FROM read_parquet('{facts}') WHERE amount >= '10.00' AND event_date < '2024-01-20' ORDER BY value DESC LIMIT 5000",
+        ),
+        GenericQuery(
             "string_low_cardinality_group",
             f"SELECT label, count(*), sum(value) FROM '{facts}' WHERE id < 200000 GROUP BY label ORDER BY label NULLS FIRST",
             f"SELECT label, count(*), sum(value) FROM read_parquet('{facts}') WHERE id < 200000 GROUP BY label ORDER BY label NULLS FIRST",

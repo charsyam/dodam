@@ -394,113 +394,116 @@ pub async fn execute_sql(
     if query.is_aggregate() {
         let aggregates = query.aggregates.clone();
         let group_by = query.group_by.clone();
-        let metrics =
-            if !query.aggregate_expressions.is_empty() || !query.filtered_aggregates.is_empty() {
-                if let Some(metrics) = try_collect_expression_aggregate_fused_dictionary_selected(
-                    engine,
-                    query.path.clone(),
-                    batch_size,
-                    query.filter.clone(),
+        let metrics = if let Some(metrics) =
+            try_collect_direct_monotonic_count_distinct(engine, &query, batch_size)?
+        {
+            metrics
+        } else if !query.aggregate_expressions.is_empty() || !query.filtered_aggregates.is_empty() {
+            if let Some(metrics) = try_collect_expression_aggregate_fused_dictionary_selected(
+                engine,
+                query.path.clone(),
+                batch_size,
+                query.filter.clone(),
+                &group_by,
+                &aggregates,
+                &query.aggregate_expressions,
+                query.order_by.is_some(),
+                expression_aggregate_output_limit(
                     &group_by,
-                    &aggregates,
-                    &query.aggregate_expressions,
-                    query.order_by.is_some(),
-                    expression_aggregate_output_limit(
-                        &group_by,
-                        query.order_by.as_ref(),
-                        query.limit,
-                        query.offset,
-                    ),
-                )
-                .await?
-                {
-                    metrics
-                } else if let Some(metrics) = try_collect_expression_aggregate_late_materialized(
-                    engine,
-                    query.path.clone(),
-                    batch_size,
-                    query.filter.clone(),
+                    query.order_by.as_ref(),
+                    query.limit,
+                    query.offset,
+                ),
+            )
+            .await?
+            {
+                metrics
+            } else if let Some(metrics) = try_collect_expression_aggregate_late_materialized(
+                engine,
+                query.path.clone(),
+                batch_size,
+                query.filter.clone(),
+                &group_by,
+                &aggregates,
+                &query.aggregate_expressions,
+                query.order_by.is_some(),
+                expression_aggregate_output_limit(
                     &group_by,
-                    &aggregates,
-                    &query.aggregate_expressions,
-                    query.order_by.is_some(),
-                    expression_aggregate_output_limit(
-                        &group_by,
-                        query.order_by.as_ref(),
-                        query.limit,
-                        query.offset,
-                    ),
-                )
-                .await?
-                {
-                    metrics
-                } else if let Some(metrics) = try_collect_expression_aggregate_scan_fold(
-                    engine,
-                    query.path.clone(),
-                    batch_size,
-                    query.projection.clone(),
-                    query.filter.clone(),
+                    query.order_by.as_ref(),
+                    query.limit,
+                    query.offset,
+                ),
+            )
+            .await?
+            {
+                metrics
+            } else if let Some(metrics) = try_collect_expression_aggregate_scan_fold(
+                engine,
+                query.path.clone(),
+                batch_size,
+                query.projection.clone(),
+                query.filter.clone(),
+                &group_by,
+                &aggregates,
+                &query.aggregate_expressions,
+                query.order_by.is_some(),
+                expression_aggregate_output_limit(
                     &group_by,
-                    &aggregates,
-                    &query.aggregate_expressions,
-                    query.order_by.is_some(),
-                    expression_aggregate_output_limit(
-                        &group_by,
-                        query.order_by.as_ref(),
-                        query.limit,
-                        query.offset,
-                    ),
-                )
-                .await?
-                {
-                    metrics
-                } else if let Some(metrics) = try_collect_expression_aggregate_row_group_map(
-                    engine,
-                    query.path.clone(),
-                    batch_size,
-                    query.projection.clone(),
-                    query.filter.clone(),
-                    &group_by,
-                    &aggregates,
-                    &query.aggregate_expressions,
-                )
-                .await?
-                {
-                    metrics
-                } else {
-                    let stream = engine
-                        .scan_parquet_batches(
-                            query.path,
-                            batch_size,
-                            None,
-                            query.projection.clone(),
-                            query.filter,
-                        )
-                        .await?;
-                    collect_aggregates_with_optional_expression_views(
-                        stream,
-                        1,
-                        &group_by,
-                        &aggregates,
-                        &query.filtered_aggregates,
-                        &query.aggregate_expressions,
-                    )?
-                }
-            } else if query.group_by.is_empty() {
-                engine
-                    .aggregate_parquet(query.path, batch_size, aggregates.clone(), query.filter)
-                    .await?
+                    query.order_by.as_ref(),
+                    query.limit,
+                    query.offset,
+                ),
+            )
+            .await?
+            {
+                metrics
+            } else if let Some(metrics) = try_collect_expression_aggregate_row_group_map(
+                engine,
+                query.path.clone(),
+                batch_size,
+                query.projection.clone(),
+                query.filter.clone(),
+                &group_by,
+                &aggregates,
+                &query.aggregate_expressions,
+            )
+            .await?
+            {
+                metrics
             } else {
-                engine
-                    .aggregate_parquet_grouped(
+                let stream = engine
+                    .scan_parquet_batches(
                         query.path,
                         batch_size,
-                        aggregates.clone(),
-                        group_by.clone(),
+                        None,
+                        query.projection.clone(),
                         query.filter,
                     )
-                    .await?
-            };
+                    .await?;
+                collect_aggregates_with_optional_expression_views(
+                    stream,
+                    1,
+                    &group_by,
+                    &aggregates,
+                    &query.filtered_aggregates,
+                    &query.aggregate_expressions,
+                )?
+            }
+        } else if query.group_by.is_empty() {
+            engine
+                .aggregate_parquet(query.path, batch_size, aggregates.clone(), query.filter)
+                .await?
+        } else {
+            engine
+                .aggregate_parquet_grouped(
+                    query.path,
+                    batch_size,
+                    aggregates.clone(),
+                    group_by.clone(),
+                    query.filter,
+                )
+                .await?
+        };
         let mut batches = aggregate_metrics_to_batches(&metrics, &group_by, &aggregates)?;
         batches = apply_output_filter(batches, query.having.as_ref())?;
         let has_output_expressions = projection_requires_expression_path(&query.expressions);
@@ -4730,6 +4733,206 @@ struct DirectDistinctScan {
     projection: Projection,
     aliases: Vec<(String, String)>,
     filter: Option<FilterExpr>,
+}
+
+fn try_collect_direct_monotonic_count_distinct(
+    engine: &DodamEngine,
+    query: &SqlQuery,
+    batch_size: usize,
+) -> Result<Option<AggregateMetrics>> {
+    if !query.group_by.is_empty()
+        || query.filter.is_some()
+        || !query.aggregate_expressions.is_empty()
+        || !query.filtered_aggregates.is_empty()
+    {
+        return Ok(None);
+    }
+    let [AggregateExpr::CountDistinct(column)] = query.aggregates.as_slice() else {
+        return Ok(None);
+    };
+    let Some(column_types) =
+        engine.parquet_direct_primitive_column_types(&query.path, std::slice::from_ref(column))?
+    else {
+        return Ok(None);
+    };
+    let Some(column_type) = column_types.first().copied() else {
+        return Ok(None);
+    };
+    if !matches!(
+        column_type,
+        DirectPrimitiveColumnType::I32 | DirectPrimitiveColumnType::I64
+    ) {
+        return Ok(None);
+    }
+    let row_groups = (0..engine.parquet_row_group_count(&query.path)?).collect::<Vec<_>>();
+    let Some((state, scan_metrics)) = engine.scan_parquet_primitive_columns_parallel_view_fold(
+        query.path.clone(),
+        batch_size,
+        row_groups,
+        vec![(column.clone(), column_type)],
+        MonotonicPrimitiveDistinctCount::default,
+        move |state, view| state.consume(view, column_type),
+        |state, partial| state.merge(partial),
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(count) = state.finish() else {
+        return Ok(None);
+    };
+    Ok(Some(AggregateMetrics {
+        fragments: 1,
+        batches: scan_metrics.batches,
+        rows: scan_metrics.rows,
+        values: vec![AggregateResult {
+            expr: query.aggregates[0].clone(),
+            value: AggregateValue::Count(count),
+        }],
+        ..AggregateMetrics::default()
+    }))
+}
+
+#[derive(Default)]
+struct MonotonicPrimitiveDistinctCount {
+    ranges: Vec<(i64, i64, u64)>,
+    unsupported: bool,
+}
+
+impl MonotonicPrimitiveDistinctCount {
+    fn consume(
+        &mut self,
+        view: BatchView<'_>,
+        column_type: DirectPrimitiveColumnType,
+    ) -> Result<()> {
+        if self.unsupported || view.num_rows() == 0 {
+            return Ok(());
+        }
+        match column_type {
+            DirectPrimitiveColumnType::I32 => {
+                let Some(values) = view.i32_vector(0) else {
+                    self.unsupported = true;
+                    return Ok(());
+                };
+                self.consume_i32(values)
+            }
+            DirectPrimitiveColumnType::I64 => {
+                let Some(values) = view.i64_vector(0) else {
+                    self.unsupported = true;
+                    return Ok(());
+                };
+                self.consume_i64(values)
+            }
+            _ => {
+                self.unsupported = true;
+                Ok(())
+            }
+        }
+    }
+
+    fn consume_i32(&mut self, values: I32VectorView<'_>) -> Result<()> {
+        if let Some((bytes, len)) = values.raw_bytes() {
+            return self.consume_len_i64(len, |row| {
+                Some(i64::from(read_i32_le_unaligned(bytes, row)))
+            });
+        }
+        if let Some(values) = values.values_if_null_free() {
+            return self.consume_len_i64(values.len(), |row| Some(i64::from(values[row])));
+        }
+        if let Some((values, def_levels)) = values.raw_nullable() {
+            let full_width_values = values.len() == def_levels.len();
+            let mut value_index = 0usize;
+            return self.consume_len_i64(def_levels.len(), |row| {
+                if def_levels[row] == 0 {
+                    None
+                } else if full_width_values {
+                    Some(i64::from(values[row]))
+                } else {
+                    let value = values.get(value_index).copied().map(i64::from);
+                    value_index += 1;
+                    value
+                }
+            });
+        }
+        self.unsupported = true;
+        Ok(())
+    }
+
+    fn consume_i64(&mut self, values: I64VectorView<'_>) -> Result<()> {
+        if let Some((bytes, len)) = values.raw_bytes() {
+            return self.consume_len_i64(len, |row| Some(read_i64_le_unaligned(bytes, row)));
+        }
+        if let Some(values) = values.values_if_null_free() {
+            return self.consume_len_i64(values.len(), |row| Some(values[row]));
+        }
+        if let Some((values, def_levels)) = values.raw_nullable() {
+            let full_width_values = values.len() == def_levels.len();
+            let mut value_index = 0usize;
+            return self.consume_len_i64(def_levels.len(), |row| {
+                if def_levels[row] == 0 {
+                    None
+                } else if full_width_values {
+                    Some(values[row])
+                } else {
+                    let value = values.get(value_index).copied();
+                    value_index += 1;
+                    value
+                }
+            });
+        }
+        self.unsupported = true;
+        Ok(())
+    }
+
+    fn consume_len_i64<F>(&mut self, rows: usize, mut value_at: F) -> Result<()>
+    where
+        F: FnMut(usize) -> Option<i64>,
+    {
+        let mut first = None;
+        let mut last = None;
+        let mut count = 0u64;
+        for row in 0..rows {
+            let Some(value) = value_at(row) else {
+                continue;
+            };
+            if last.is_some_and(|previous| value <= previous) {
+                self.unsupported = true;
+                return Ok(());
+            }
+            first.get_or_insert(value);
+            last = Some(value);
+            count += 1;
+        }
+        if let (Some(first), Some(last)) = (first, last) {
+            self.ranges.push((first, last, count));
+        }
+        Ok(())
+    }
+
+    fn merge(&mut self, partial: Self) -> Result<()> {
+        if self.unsupported || partial.unsupported {
+            self.unsupported = true;
+            return Ok(());
+        }
+        self.ranges.extend(partial.ranges);
+        Ok(())
+    }
+
+    fn finish(mut self) -> Option<u64> {
+        if self.unsupported {
+            return None;
+        }
+        self.ranges.sort_unstable_by_key(|range| range.0);
+        let mut previous_end = None;
+        let mut count = 0u64;
+        for (start, end, range_count) in self.ranges {
+            if previous_end.is_some_and(|previous| start <= previous) {
+                return None;
+            }
+            previous_end = Some(end);
+            count = count.saturating_add(range_count);
+        }
+        Some(count)
+    }
 }
 
 fn try_execute_direct_distinct_scan(

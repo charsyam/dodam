@@ -5511,17 +5511,25 @@ fn decimal_min_result_type(value: Option<&AggregateResult>) -> Option<(u8, i8)> 
 }
 
 pub(crate) struct SingleKeyCountSumVectorState {
+    group_by: String,
     count_expr: AggregateExpr,
     sum_expr: AggregateExpr,
     group_index: CountSumGroupIndex,
     groups: Vec<CountSumGroup>,
     dense_counts_scratch: Vec<u32>,
     dense_totals_scratch: Vec<i64>,
+    direct_unique_i32: Option<DirectUniqueI32CountSum>,
+    direct_unique_i64: Option<DirectUniqueI64CountSum>,
 }
 
 impl SingleKeyCountSumVectorState {
-    pub(crate) fn new_i32(count_expr: AggregateExpr, sum_expr: AggregateExpr) -> Self {
+    pub(crate) fn new_i32(
+        group_by: impl Into<String>,
+        count_expr: AggregateExpr,
+        sum_expr: AggregateExpr,
+    ) -> Self {
         Self {
+            group_by: group_by.into(),
             count_expr,
             sum_expr,
             group_index: CountSumGroupIndex::Int32 {
@@ -5531,25 +5539,33 @@ impl SingleKeyCountSumVectorState {
             groups: Vec::new(),
             dense_counts_scratch: Vec::new(),
             dense_totals_scratch: Vec::new(),
+            direct_unique_i32: Some(DirectUniqueI32CountSum::default()),
+            direct_unique_i64: None,
         }
     }
 
     pub(crate) fn new_i32_with_dense_range(
+        group_by: impl Into<String>,
         count_expr: AggregateExpr,
         sum_expr: AggregateExpr,
         min: i32,
         max: i32,
         max_slots: usize,
     ) -> Self {
-        let mut state = Self::new_i32(count_expr, sum_expr);
+        let mut state = Self::new_i32(group_by, count_expr, sum_expr);
         if let CountSumGroupIndex::Int32 { groups, .. } = &mut state.group_index {
             let _ = groups.ensure_dense_range(min, max, max_slots);
         }
         state
     }
 
-    pub(crate) fn new_i64(count_expr: AggregateExpr, sum_expr: AggregateExpr) -> Self {
+    pub(crate) fn new_i64(
+        group_by: impl Into<String>,
+        count_expr: AggregateExpr,
+        sum_expr: AggregateExpr,
+    ) -> Self {
         Self {
+            group_by: group_by.into(),
             count_expr,
             sum_expr,
             group_index: CountSumGroupIndex::Int64 {
@@ -5559,6 +5575,8 @@ impl SingleKeyCountSumVectorState {
             groups: Vec::new(),
             dense_counts_scratch: Vec::new(),
             dense_totals_scratch: Vec::new(),
+            direct_unique_i32: None,
+            direct_unique_i64: Some(DirectUniqueI64CountSum::default()),
         }
     }
 
@@ -5574,6 +5592,22 @@ impl SingleKeyCountSumVectorState {
             return Err(DodamError::UnsupportedSql(
                 "direct primitive count/sum page byte length mismatch".to_string(),
             ));
+        }
+        if let Some(unique) = &mut self.direct_unique_i32 {
+            if unique.try_append_page_bytes(key_bytes, sum_bytes, rows) {
+                return Ok(());
+            }
+            if std::env::var("DODAM_GENERIC_PROFILE")
+                .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            {
+                eprintln!(
+                    "[dodam:aggregate-profile] direct_unique_i32 disabled rows={} previous_rows={} last_key={:?}",
+                    rows,
+                    unique.keys.len(),
+                    unique.last_key,
+                );
+            }
+            self.flush_direct_unique_i32_to_groups();
         }
         let CountSumGroupIndex::Int32 {
             groups: index,
@@ -5704,6 +5738,22 @@ impl SingleKeyCountSumVectorState {
                 "direct primitive count/sum page byte length mismatch".to_string(),
             ));
         }
+        if let Some(unique) = &mut self.direct_unique_i64 {
+            if unique.try_append_page_bytes(key_bytes, sum_bytes, rows) {
+                return Ok(());
+            }
+            if std::env::var("DODAM_GENERIC_PROFILE")
+                .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            {
+                eprintln!(
+                    "[dodam:aggregate-profile] direct_unique_i64 disabled rows={} previous_rows={} last_key={:?}",
+                    rows,
+                    unique.keys.len(),
+                    unique.last_key,
+                );
+            }
+            self.flush_direct_unique_i64_to_groups();
+        }
         let CountSumGroupIndex::Int64 {
             groups: index,
             null_group: _,
@@ -5771,38 +5821,26 @@ impl SingleKeyCountSumVectorState {
             && len == row_count
             && sum_len == row_count
         {
-            if !consume_i32_i64_page_bytes_dense_accumulate(
-                index,
-                &mut self.groups,
-                &mut self.dense_counts_scratch,
-                &mut self.dense_totals_scratch,
-                key_bytes,
-                sum_bytes,
-                row_count,
-            ) && (!primitive_page_dense_i32_aggregate_enabled()
-                || !consume_i32_i64_page_bytes_dense(
-                    index,
-                    &mut self.groups,
-                    key_bytes,
-                    sum_bytes,
-                    row_count,
-                ))
-            {
-                for row in 0..row_count {
-                    let key = read_i32_le_unaligned(key_bytes, row);
-                    let sum = read_i64_le_unaligned(sum_bytes, row);
-                    let group_id = count_sum_group_id_for_i32(
-                        index,
-                        key,
-                        &mut self.groups,
-                        &CountSumValueInput::Int64Raw,
-                    );
-                    self.groups[group_id].update_raw_i64_non_null(sum);
-                }
-            }
+            return self.consume_i32_i64_page_bytes(key_bytes, sum_bytes, row_count);
         } else if let Some(keys) = key_values.values_if_null_free() {
             let mut group_cache = i32_batch_group_cache(keys);
             if let Some(sum_values) = sums.non_null_values() {
+                if let Some(unique) = &mut self.direct_unique_i32 {
+                    if unique.try_append_values(keys, sum_values) {
+                        return Ok(());
+                    }
+                    if let Some(unique) = self.direct_unique_i32.take() {
+                        for (key, sum) in unique.keys.into_iter().zip(unique.sums) {
+                            let group_id = count_sum_group_id_for_i32(
+                                index,
+                                key,
+                                &mut self.groups,
+                                &CountSumValueInput::Int64Raw,
+                            );
+                            self.groups[group_id].update_raw_i64_non_null(sum);
+                        }
+                    }
+                }
                 if !consume_i32_non_null_keys_sums_dense_accumulate(
                     index,
                     &mut self.groups,
@@ -5943,29 +5981,25 @@ impl SingleKeyCountSumVectorState {
             && len == row_count
             && sum_len == row_count
         {
-            if !consume_i64_i64_page_bytes_dense_accumulate(
-                index,
-                &mut self.groups,
-                &mut self.dense_counts_scratch,
-                &mut self.dense_totals_scratch,
-                key_bytes,
-                sum_bytes,
-                row_count,
-            ) {
-                for row in 0..row_count {
-                    let key = read_i64_le_unaligned(key_bytes, row);
-                    let sum = read_i64_le_unaligned(sum_bytes, row);
-                    let group_id = count_sum_group_id_for_i64(
-                        index,
-                        key,
-                        &mut self.groups,
-                        &CountSumValueInput::Int64Raw,
-                    );
-                    self.groups[group_id].update_raw_i64_non_null(sum);
-                }
-            }
+            return self.consume_i64_i64_page_bytes(key_bytes, sum_bytes, row_count);
         } else if let Some(keys) = key_values.values_if_null_free() {
             if let Some(sum_values) = sums.non_null_values() {
+                if let Some(unique) = &mut self.direct_unique_i64 {
+                    if unique.try_append_values(keys, sum_values) {
+                        return Ok(());
+                    }
+                    if let Some(unique) = self.direct_unique_i64.take() {
+                        for (key, sum) in unique.keys.into_iter().zip(unique.sums) {
+                            let group_id = count_sum_group_id_for_i64(
+                                index,
+                                key,
+                                &mut self.groups,
+                                &CountSumValueInput::Int64Raw,
+                            );
+                            self.groups[group_id].update_raw_i64_non_null(sum);
+                        }
+                    }
+                }
                 if !consume_i64_non_null_keys_sums_dense_accumulate(
                     index,
                     &mut self.groups,
@@ -6136,15 +6170,226 @@ impl SingleKeyCountSumVectorState {
     }
 
     pub(crate) fn finish(self) -> AggregateMetrics {
-        AggregateMetrics {
-            groups: finish_count_sum_groups(
-                self.group_index,
-                self.groups,
-                self.count_expr,
-                self.sum_expr,
-            ),
-            ..AggregateMetrics::default()
+        if let Some(unique) = self.direct_unique_i32
+            && self.groups.is_empty()
+            && let Ok(batch) = unique.into_batch(&self.group_by, &self.count_expr, &self.sum_expr)
+        {
+            return AggregateMetrics {
+                output_batches: Some(vec![batch]),
+                ..AggregateMetrics::default()
+            };
         }
+        if let Some(unique) = self.direct_unique_i64
+            && self.groups.is_empty()
+            && let Ok(batch) = unique.into_batch(&self.group_by, &self.count_expr, &self.sum_expr)
+        {
+            return AggregateMetrics {
+                output_batches: Some(vec![batch]),
+                ..AggregateMetrics::default()
+            };
+        }
+        match finish_count_sum_groups_to_batch(
+            &self.group_by,
+            &self.count_expr,
+            &self.sum_expr,
+            &self.group_index,
+            &self.groups,
+        ) {
+            Ok(Some(batch)) => AggregateMetrics {
+                output_batches: Some(vec![batch]),
+                ..AggregateMetrics::default()
+            },
+            _ => AggregateMetrics {
+                groups: finish_count_sum_groups(
+                    self.group_index,
+                    self.groups,
+                    self.count_expr,
+                    self.sum_expr,
+                ),
+                ..AggregateMetrics::default()
+            },
+        }
+    }
+
+    fn flush_direct_unique_i32_to_groups(&mut self) {
+        let Some(unique) = self.direct_unique_i32.take() else {
+            return;
+        };
+        let CountSumGroupIndex::Int32 {
+            groups: index,
+            null_group: _,
+        } = &mut self.group_index
+        else {
+            return;
+        };
+        for (key, sum) in unique.keys.into_iter().zip(unique.sums) {
+            let group_id = count_sum_group_id_for_i32(
+                index,
+                key,
+                &mut self.groups,
+                &CountSumValueInput::Int64Raw,
+            );
+            self.groups[group_id].update_raw_i64_non_null(sum);
+        }
+    }
+
+    fn flush_direct_unique_i64_to_groups(&mut self) {
+        let Some(unique) = self.direct_unique_i64.take() else {
+            return;
+        };
+        let CountSumGroupIndex::Int64 {
+            groups: index,
+            null_group: _,
+        } = &mut self.group_index
+        else {
+            return;
+        };
+        for (key, sum) in unique.keys.into_iter().zip(unique.sums) {
+            let group_id = count_sum_group_id_for_i64(
+                index,
+                key,
+                &mut self.groups,
+                &CountSumValueInput::Int64Raw,
+            );
+            self.groups[group_id].update_raw_i64_non_null(sum);
+        }
+    }
+}
+
+#[derive(Default)]
+struct DirectUniqueI32CountSum {
+    keys: Vec<i32>,
+    sums: Vec<i64>,
+    last_key: Option<i32>,
+}
+
+impl DirectUniqueI32CountSum {
+    fn try_append_page_bytes(&mut self, key_bytes: &[u8], sum_bytes: &[u8], rows: usize) -> bool {
+        let mut previous = self.last_key;
+        for row in 0..rows {
+            let key = read_i32_le_unaligned(key_bytes, row);
+            if previous.is_some_and(|previous| key <= previous) {
+                return false;
+            }
+            previous = Some(key);
+        }
+        self.keys.reserve(rows);
+        self.sums.reserve(rows);
+        for row in 0..rows {
+            self.keys.push(read_i32_le_unaligned(key_bytes, row));
+            self.sums.push(read_i64_le_unaligned(sum_bytes, row));
+        }
+        self.last_key = previous;
+        true
+    }
+
+    fn try_append_values(&mut self, keys: &[i32], sums: &[i64]) -> bool {
+        if keys.len() != sums.len() {
+            return false;
+        }
+        let mut previous = self.last_key;
+        for key in keys {
+            if previous.is_some_and(|previous| *key <= previous) {
+                return false;
+            }
+            previous = Some(*key);
+        }
+        self.keys.extend_from_slice(keys);
+        self.sums.extend_from_slice(sums);
+        self.last_key = previous;
+        true
+    }
+
+    fn into_batch(
+        self,
+        group_by: &str,
+        count_expr: &AggregateExpr,
+        sum_expr: &AggregateExpr,
+    ) -> Result<RecordBatch> {
+        let rows = self.keys.len();
+        let counts = UInt64Array::from_iter_values(std::iter::repeat_n(1_u64, rows));
+        let fields = vec![
+            Field::new(group_by, DataType::Int64, true),
+            Field::new(count_expr.to_string(), DataType::UInt64, true),
+            Field::new(sum_expr.to_string(), DataType::Int64, true),
+        ];
+        let keys = self.keys.into_iter().map(i64::from).collect::<Vec<_>>();
+        Ok(RecordBatch::try_new(
+            Arc::new(Schema::new(fields)),
+            vec![
+                Arc::new(Int64Array::from_iter_values(keys)) as ArrayRef,
+                Arc::new(counts) as ArrayRef,
+                Arc::new(Int64Array::from_iter_values(self.sums)) as ArrayRef,
+            ],
+        )?)
+    }
+}
+
+#[derive(Default)]
+struct DirectUniqueI64CountSum {
+    keys: Vec<i64>,
+    sums: Vec<i64>,
+    last_key: Option<i64>,
+}
+
+impl DirectUniqueI64CountSum {
+    fn try_append_page_bytes(&mut self, key_bytes: &[u8], sum_bytes: &[u8], rows: usize) -> bool {
+        let mut previous = self.last_key;
+        for row in 0..rows {
+            let key = read_i64_le_unaligned(key_bytes, row);
+            if previous.is_some_and(|previous| key <= previous) {
+                return false;
+            }
+            previous = Some(key);
+        }
+        self.keys.reserve(rows);
+        self.sums.reserve(rows);
+        for row in 0..rows {
+            self.keys.push(read_i64_le_unaligned(key_bytes, row));
+            self.sums.push(read_i64_le_unaligned(sum_bytes, row));
+        }
+        self.last_key = previous;
+        true
+    }
+
+    fn try_append_values(&mut self, keys: &[i64], sums: &[i64]) -> bool {
+        if keys.len() != sums.len() {
+            return false;
+        }
+        let mut previous = self.last_key;
+        for key in keys {
+            if previous.is_some_and(|previous| *key <= previous) {
+                return false;
+            }
+            previous = Some(*key);
+        }
+        self.keys.extend_from_slice(keys);
+        self.sums.extend_from_slice(sums);
+        self.last_key = previous;
+        true
+    }
+
+    fn into_batch(
+        self,
+        group_by: &str,
+        count_expr: &AggregateExpr,
+        sum_expr: &AggregateExpr,
+    ) -> Result<RecordBatch> {
+        let rows = self.keys.len();
+        let counts = UInt64Array::from_iter_values(std::iter::repeat_n(1_u64, rows));
+        let fields = vec![
+            Field::new(group_by, DataType::Int64, true),
+            Field::new(count_expr.to_string(), DataType::UInt64, true),
+            Field::new(sum_expr.to_string(), DataType::Int64, true),
+        ];
+        Ok(RecordBatch::try_new(
+            Arc::new(Schema::new(fields)),
+            vec![
+                Arc::new(Int64Array::from_iter_values(self.keys)) as ArrayRef,
+                Arc::new(counts) as ArrayRef,
+                Arc::new(Int64Array::from_iter_values(self.sums)) as ArrayRef,
+            ],
+        )?)
     }
 }
 
@@ -8421,9 +8666,8 @@ fn merge_single_key_count_sum_partials(
             let Some(key) = group.keys.first() else {
                 return Ok(None);
             };
-            let sum_is_float = matches!(
+            let sum_output = CountSumOutputKind::from_aggregate_value(
                 group.values.get(1).map(|value| &value.value),
-                Some(AggregateValue::Float64(_))
             );
             let group_id = match key {
                 GroupValue::Utf8(Some(key)) => {
@@ -8441,7 +8685,7 @@ fn merge_single_key_count_sum_partials(
                         key_index.insert(key.clone(), group_id);
                         groups.push(CountSumGroup::new_for_merge(
                             GroupValue::Utf8(Some(key.clone())),
-                            sum_is_float,
+                            sum_output,
                         ));
                         group_id
                     }
@@ -8455,7 +8699,7 @@ fn merge_single_key_count_sum_partials(
                         null_group,
                         &mut groups,
                         GroupValue::Utf8(None),
-                        sum_is_float,
+                        sum_output,
                     )
                 }
                 GroupValue::Int64(Some(key)) => {
@@ -8466,7 +8710,7 @@ fn merge_single_key_count_sum_partials(
                     else {
                         return Ok(None);
                     };
-                    count_sum_group_id_for_i64_merge(key_index, *key, &mut groups, sum_is_float)
+                    count_sum_group_id_for_i64_merge(key_index, *key, &mut groups, sum_output)
                 }
                 GroupValue::Int64(None) => {
                     index.ensure_type(&DataType::Int64);
@@ -8477,7 +8721,7 @@ fn merge_single_key_count_sum_partials(
                         null_group,
                         &mut groups,
                         GroupValue::Int64(None),
-                        sum_is_float,
+                        sum_output,
                     )
                 }
                 GroupValue::UInt64(Some(key)) => {
@@ -8488,7 +8732,7 @@ fn merge_single_key_count_sum_partials(
                     else {
                         return Ok(None);
                     };
-                    count_sum_group_id_for_u64_merge(key_index, *key, &mut groups, sum_is_float)
+                    count_sum_group_id_for_u64_merge(key_index, *key, &mut groups, sum_output)
                 }
                 GroupValue::UInt64(None) => {
                     index.ensure_type(&DataType::UInt64);
@@ -8499,7 +8743,7 @@ fn merge_single_key_count_sum_partials(
                         null_group,
                         &mut groups,
                         GroupValue::UInt64(None),
-                        sum_is_float,
+                        sum_output,
                     )
                 }
                 _ => return Ok(None),
@@ -8584,9 +8828,9 @@ fn count_sum_metrics_to_batch(
     }
 
     let mut counts = Vec::with_capacity(metrics.groups.len());
-    let mut sums = Vec::with_capacity(metrics.groups.len());
+    let mut sums_i64 = Vec::with_capacity(metrics.groups.len());
     let mut sums_have_nulls = false;
-    let mut sum_is_float = false;
+    let mut sum_output = CountSumOutputKind::Int64;
     for group in &metrics.groups {
         let Some(count) = group.values.first() else {
             return Ok(None);
@@ -8601,12 +8845,17 @@ fn count_sum_metrics_to_batch(
         match &sum.value {
             AggregateValue::Int64(value) => {
                 sums_have_nulls |= value.is_none();
-                sums.push(*value);
+                sums_i64.push(*value);
             }
             AggregateValue::Float64(value) => {
-                sum_is_float = true;
+                sum_output = CountSumOutputKind::Float64;
                 sums_have_nulls |= value.is_none();
-                sums.push(value.map(|value| value as i64));
+                sums_i64.push(value.map(|value| value as i64));
+            }
+            AggregateValue::Decimal128(value, _, scale) => {
+                sum_output = CountSumOutputKind::Decimal128 { scale: *scale };
+                sums_have_nulls |= value.is_none();
+                sums_i64.push(None);
             }
             _ => return Ok(None),
         }
@@ -8617,33 +8866,57 @@ fn count_sum_metrics_to_batch(
         true,
     ));
     columns.push(Arc::new(UInt64Array::from(counts)));
-    if sum_is_float {
-        let values = metrics
-            .groups
-            .iter()
-            .map(
-                |group| match group.values.get(1).map(|result| &result.value) {
-                    Some(AggregateValue::Float64(value)) => *value,
-                    _ => None,
-                },
-            )
-            .collect::<Vec<_>>();
-        fields.push(Field::new(
-            aggregates[1].to_string(),
-            DataType::Float64,
-            true,
-        ));
-        columns.push(Arc::new(Float64Array::from(values)));
-    } else {
-        fields.push(Field::new(aggregates[1].to_string(), DataType::Int64, true));
-        if sums_have_nulls {
-            columns.push(Arc::new(Int64Array::from(sums)));
-        } else {
-            let values = sums
-                .into_iter()
-                .map(|value| value.expect("all count/sum int sums are non-null"))
+    match sum_output {
+        CountSumOutputKind::Float64 => {
+            let values = metrics
+                .groups
+                .iter()
+                .map(
+                    |group| match group.values.get(1).map(|result| &result.value) {
+                        Some(AggregateValue::Float64(value)) => *value,
+                        _ => None,
+                    },
+                )
                 .collect::<Vec<_>>();
-            columns.push(Arc::new(Int64Array::from(values)));
+            fields.push(Field::new(
+                aggregates[1].to_string(),
+                DataType::Float64,
+                true,
+            ));
+            columns.push(Arc::new(Float64Array::from(values)));
+        }
+        CountSumOutputKind::Decimal128 { scale } => {
+            let values = metrics
+                .groups
+                .iter()
+                .map(
+                    |group| match group.values.get(1).map(|result| &result.value) {
+                        Some(AggregateValue::Decimal128(value, _, _)) => *value,
+                        _ => None,
+                    },
+                )
+                .collect::<Vec<_>>();
+            let array = Decimal128Array::from(values)
+                .with_precision_and_scale(38, scale)
+                .expect("valid Decimal128 count/sum output");
+            fields.push(Field::new(
+                aggregates[1].to_string(),
+                DataType::Decimal128(38, scale),
+                true,
+            ));
+            columns.push(Arc::new(array));
+        }
+        CountSumOutputKind::Int64 => {
+            fields.push(Field::new(aggregates[1].to_string(), DataType::Int64, true));
+            if sums_have_nulls {
+                columns.push(Arc::new(Int64Array::from(sums_i64)));
+            } else {
+                let values = sums_i64
+                    .into_iter()
+                    .map(|value| value.expect("all count/sum int sums are non-null"))
+                    .collect::<Vec<_>>();
+                columns.push(Arc::new(Int64Array::from(values)));
+            }
         }
     }
 
@@ -10259,7 +10532,8 @@ struct TwoKeyCountSumGroup {
     count: u64,
     sum_i64: i64,
     sum_f64: f64,
-    sum_is_float: bool,
+    sum_decimal128: i128,
+    sum_output: CountSumOutputKind,
     sum_count: u64,
 }
 
@@ -10270,7 +10544,8 @@ impl TwoKeyCountSumGroup {
             count: 0,
             sum_i64: 0,
             sum_f64: 0.0,
-            sum_is_float: matches!(sum_input, CountSumValueInput::Float64(_)),
+            sum_decimal128: 0,
+            sum_output: CountSumOutputKind::from_input(sum_input),
             sum_count: 0,
         }
     }
@@ -10290,21 +10565,26 @@ impl TwoKeyCountSumGroup {
                 self.sum_f64 += values.value(row);
                 self.sum_count += 1;
             }
+            CountSumValueInput::Decimal128(values, _) if values.is_valid(row) => {
+                self.sum_decimal128 += values.value(row);
+                self.sum_count += 1;
+            }
             _ => {}
         }
     }
 
     fn finish(self, count_expr: AggregateExpr, sum_expr: AggregateExpr) -> GroupAggregateResult {
-        let sum_value = if self.sum_count == 0 {
-            if self.sum_is_float {
-                AggregateValue::Float64(None)
-            } else {
-                AggregateValue::Int64(None)
+        let sum_value = match (self.sum_output, self.sum_count) {
+            (CountSumOutputKind::Int64, 0) => AggregateValue::Int64(None),
+            (CountSumOutputKind::Int64, _) => AggregateValue::Int64(Some(self.sum_i64)),
+            (CountSumOutputKind::Float64, 0) => AggregateValue::Float64(None),
+            (CountSumOutputKind::Float64, _) => AggregateValue::Float64(Some(self.sum_f64)),
+            (CountSumOutputKind::Decimal128 { scale }, 0) => {
+                AggregateValue::Decimal128(None, 38, scale)
             }
-        } else if self.sum_is_float {
-            AggregateValue::Float64(Some(self.sum_f64))
-        } else {
-            AggregateValue::Int64(Some(self.sum_i64))
+            (CountSumOutputKind::Decimal128 { scale }, _) => {
+                AggregateValue::Decimal128(Some(self.sum_decimal128), 38, scale)
+            }
         };
         GroupAggregateResult {
             keys: self.keys,
@@ -10444,7 +10724,7 @@ enum TwoKeySumColumn<'a> {
     Int32(&'a Int32Array),
     Int64(&'a Int64Array),
     Float64(&'a Float64Array),
-    Decimal128(&'a Decimal128Array, f64),
+    Decimal128(&'a Decimal128Array, i8),
 }
 
 impl TwoKeySumColumn<'_> {
@@ -10467,7 +10747,7 @@ impl TwoKeySumColumn<'_> {
             }
             Self::Decimal128(values, scale) => {
                 if values.is_valid(row) {
-                    state.add_f64(values.value(row) as f64 / scale);
+                    state.add_decimal128(values.value(row), *scale);
                 }
             }
         }
@@ -10499,7 +10779,7 @@ fn two_key_sum_column(column: &ArrayRef) -> Option<TwoKeySumColumn<'_>> {
                 .as_any()
                 .downcast_ref::<Decimal128Array>()
                 .expect("Decimal128 data type"),
-            decimal_scale_factor(*scale),
+            *scale,
         )),
         _ => None,
     }
@@ -10553,7 +10833,18 @@ fn collect_single_key_count_sum_groups(
         }
     }
 
-    metrics.groups = finish_count_sum_groups(group_index, groups, aggregates[0].clone(), sum_expr);
+    metrics.output_batches = finish_count_sum_groups_to_batch(
+        &group_by[0],
+        &aggregates[0],
+        &sum_expr,
+        &group_index,
+        &groups,
+    )?
+    .map(|batch| vec![batch]);
+    if metrics.output_batches.is_none() {
+        metrics.groups =
+            finish_count_sum_groups(group_index, groups, aggregates[0].clone(), sum_expr);
+    }
     Ok(metrics)
 }
 
@@ -10699,6 +10990,7 @@ enum CountSumValueInput<'a> {
     Int32(&'a Int32Array),
     Int64(&'a Int64Array),
     Float64(&'a Float64Array),
+    Decimal128(&'a Decimal128Array, i8),
     Int64Raw,
 }
 
@@ -10722,6 +11014,13 @@ impl<'a> CountSumValueInput<'a> {
                     .as_any()
                     .downcast_ref::<Float64Array>()
                     .expect("Float64 sum input"),
+            )),
+            DataType::Decimal128(_, scale) => Ok(Self::Decimal128(
+                column
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("Decimal128 sum input"),
+                *scale,
             )),
             data_type => Err(DodamError::UnsupportedAggregateType {
                 function: "sum".to_string(),
@@ -11593,13 +11892,13 @@ fn count_sum_null_group_id_for_merge(
     null_group: &mut Option<usize>,
     groups: &mut Vec<CountSumGroup>,
     key: GroupValue,
-    sum_is_float: bool,
+    sum_output: CountSumOutputKind,
 ) -> usize {
     if let Some(group_id) = *null_group {
         return group_id;
     }
     let group_id = groups.len();
-    groups.push(CountSumGroup::new_for_merge(key, sum_is_float));
+    groups.push(CountSumGroup::new_for_merge(key, sum_output));
     *null_group = Some(group_id);
     group_id
 }
@@ -11608,7 +11907,7 @@ fn count_sum_group_id_for_i64_merge(
     index: &mut AdaptiveCopyGroupIndex<i64>,
     key: i64,
     groups: &mut Vec<CountSumGroup>,
-    sum_is_float: bool,
+    sum_output: CountSumOutputKind,
 ) -> usize {
     if let Some(group_id) = index.get(key) {
         return group_id;
@@ -11617,7 +11916,7 @@ fn count_sum_group_id_for_i64_merge(
     index.insert(key, group_id);
     groups.push(CountSumGroup::new_for_merge(
         GroupValue::Int64(Some(key)),
-        sum_is_float,
+        sum_output,
     ));
     group_id
 }
@@ -11626,7 +11925,7 @@ fn count_sum_group_id_for_u64_merge(
     index: &mut AdaptiveCopyGroupIndex<u64>,
     key: u64,
     groups: &mut Vec<CountSumGroup>,
-    sum_is_float: bool,
+    sum_output: CountSumOutputKind,
 ) -> usize {
     if let Some(group_id) = index.get(key) {
         return group_id;
@@ -11635,9 +11934,36 @@ fn count_sum_group_id_for_u64_merge(
     index.insert(key, group_id);
     groups.push(CountSumGroup::new_for_merge(
         GroupValue::UInt64(Some(key)),
-        sum_is_float,
+        sum_output,
     ));
     group_id
+}
+
+#[derive(Clone, Copy)]
+enum CountSumOutputKind {
+    Int64,
+    Float64,
+    Decimal128 { scale: i8 },
+}
+
+impl CountSumOutputKind {
+    fn from_input(input: &CountSumValueInput<'_>) -> Self {
+        match input {
+            CountSumValueInput::Float64(_) => Self::Float64,
+            CountSumValueInput::Decimal128(_, scale) => Self::Decimal128 { scale: *scale },
+            CountSumValueInput::Int32(_)
+            | CountSumValueInput::Int64(_)
+            | CountSumValueInput::Int64Raw => Self::Int64,
+        }
+    }
+
+    fn from_aggregate_value(value: Option<&AggregateValue>) -> Self {
+        match value {
+            Some(AggregateValue::Float64(_)) => Self::Float64,
+            Some(AggregateValue::Decimal128(_, _, scale)) => Self::Decimal128 { scale: *scale },
+            _ => Self::Int64,
+        }
+    }
 }
 
 struct CountSumGroup {
@@ -11645,7 +11971,8 @@ struct CountSumGroup {
     count: u64,
     sum_i64: i64,
     sum_f64: f64,
-    sum_is_float: bool,
+    sum_decimal128: i128,
+    sum_output: CountSumOutputKind,
     sum_count: u64,
 }
 
@@ -11656,18 +11983,20 @@ impl CountSumGroup {
             count: 0,
             sum_i64: 0,
             sum_f64: 0.0,
-            sum_is_float: matches!(sum_input, CountSumValueInput::Float64(_)),
+            sum_decimal128: 0,
+            sum_output: CountSumOutputKind::from_input(sum_input),
             sum_count: 0,
         }
     }
 
-    fn new_for_merge(key: GroupValue, sum_is_float: bool) -> Self {
+    fn new_for_merge(key: GroupValue, sum_output: CountSumOutputKind) -> Self {
         Self {
             key,
             count: 0,
             sum_i64: 0,
             sum_f64: 0.0,
-            sum_is_float,
+            sum_decimal128: 0,
+            sum_output,
             sum_count: 0,
         }
     }
@@ -11685,6 +12014,10 @@ impl CountSumGroup {
             }
             CountSumValueInput::Float64(values) if values.is_valid(row) => {
                 self.sum_f64 += values.value(row);
+                self.sum_count += 1;
+            }
+            CountSumValueInput::Decimal128(values, _) if values.is_valid(row) => {
+                self.sum_decimal128 += values.value(row);
                 self.sum_count += 1;
             }
             _ => {}
@@ -11721,6 +12054,7 @@ impl CountSumGroup {
         self.count = self.count.saturating_add(partial.count);
         self.sum_i64 = self.sum_i64.saturating_add(partial.sum_i64);
         self.sum_f64 += partial.sum_f64;
+        self.sum_decimal128 = self.sum_decimal128.saturating_add(partial.sum_decimal128);
         self.sum_count = self.sum_count.saturating_add(partial.sum_count);
     }
 
@@ -11742,7 +12076,17 @@ impl CountSumGroup {
                 self.sum_f64 += *value;
                 self.sum_count += 1;
             }
-            Some(AggregateValue::Int64(None) | AggregateValue::Float64(None)) | None => {}
+            Some(AggregateValue::Decimal128(Some(value), _, scale)) => {
+                self.sum_decimal128 += *value;
+                self.sum_output = CountSumOutputKind::Decimal128 { scale: *scale };
+                self.sum_count += 1;
+            }
+            Some(
+                AggregateValue::Int64(None)
+                | AggregateValue::Float64(None)
+                | AggregateValue::Decimal128(None, _, _),
+            )
+            | None => {}
             _ => {
                 return Err(DodamError::UnsupportedSql(
                     "partial count/sum aggregate type mismatch".to_string(),
@@ -11753,16 +12097,17 @@ impl CountSumGroup {
     }
 
     fn finish(self, count_expr: AggregateExpr, sum_expr: AggregateExpr) -> GroupAggregateResult {
-        let sum_value = if self.sum_count == 0 {
-            if self.sum_is_float {
-                AggregateValue::Float64(None)
-            } else {
-                AggregateValue::Int64(None)
+        let sum_value = match (self.sum_output, self.sum_count) {
+            (CountSumOutputKind::Int64, 0) => AggregateValue::Int64(None),
+            (CountSumOutputKind::Int64, _) => AggregateValue::Int64(Some(self.sum_i64)),
+            (CountSumOutputKind::Float64, 0) => AggregateValue::Float64(None),
+            (CountSumOutputKind::Float64, _) => AggregateValue::Float64(Some(self.sum_f64)),
+            (CountSumOutputKind::Decimal128 { scale }, 0) => {
+                AggregateValue::Decimal128(None, 38, scale)
             }
-        } else if self.sum_is_float {
-            AggregateValue::Float64(Some(self.sum_f64))
-        } else {
-            AggregateValue::Int64(Some(self.sum_i64))
+            (CountSumOutputKind::Decimal128 { scale }, _) => {
+                AggregateValue::Decimal128(Some(self.sum_decimal128), 38, scale)
+            }
         };
         GroupAggregateResult {
             keys: vec![self.key],
@@ -11842,6 +12187,235 @@ where
         }
     }
     results
+}
+
+fn finish_count_sum_groups_to_batch(
+    group_by: &str,
+    count_expr: &AggregateExpr,
+    sum_expr: &AggregateExpr,
+    group_index: &CountSumGroupIndex,
+    groups: &[CountSumGroup],
+) -> Result<Option<RecordBatch>> {
+    match group_index {
+        CountSumGroupIndex::Int32 {
+            groups: index,
+            null_group,
+        } => finish_ordered_count_sum_groups_to_batch(
+            group_by,
+            count_expr,
+            sum_expr,
+            index.iter(),
+            *null_group,
+            groups,
+            CountSumKeyOutput::Int64,
+            matches!(index, DenseI32GroupIndex::Dense { .. }),
+        )
+        .map(Some),
+        CountSumGroupIndex::Int64 {
+            groups: index,
+            null_group,
+        } => finish_ordered_count_sum_groups_to_batch(
+            group_by,
+            count_expr,
+            sum_expr,
+            index.iter(),
+            *null_group,
+            groups,
+            CountSumKeyOutput::Int64,
+            false,
+        )
+        .map(Some),
+        CountSumGroupIndex::UInt64 {
+            groups: index,
+            null_group,
+        } => finish_ordered_count_sum_groups_to_batch(
+            group_by,
+            count_expr,
+            sum_expr,
+            index.iter(),
+            *null_group,
+            groups,
+            CountSumKeyOutput::UInt64,
+            false,
+        )
+        .map(Some),
+        CountSumGroupIndex::Utf8 { .. } | CountSumGroupIndex::Unset => Ok(None),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CountSumKeyOutput {
+    Int64,
+    UInt64,
+}
+
+fn finish_ordered_count_sum_groups_to_batch<K, I>(
+    group_by: &str,
+    count_expr: &AggregateExpr,
+    sum_expr: &AggregateExpr,
+    index: I,
+    null_group: Option<usize>,
+    groups: &[CountSumGroup],
+    key_output: CountSumKeyOutput,
+    already_ordered: bool,
+) -> Result<RecordBatch>
+where
+    K: Copy + Ord,
+    I: Iterator<Item = (K, usize)>,
+{
+    let profile = std::env::var("DODAM_GENERIC_PROFILE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
+    let total_started = profile.then(Instant::now);
+    let collect_started = profile.then(Instant::now);
+    let mut entries = index.collect::<Vec<_>>();
+    if !already_ordered {
+        entries.sort_by_key(|(key, _)| *key);
+    }
+    let collect_elapsed = collect_started.map(|started| started.elapsed());
+    let fill_started = profile.then(Instant::now);
+    let rows = entries.len() + usize::from(null_group.is_some());
+    let mut key_i64 =
+        matches!(key_output, CountSumKeyOutput::Int64).then(|| Vec::with_capacity(rows));
+    let mut key_u64 =
+        matches!(key_output, CountSumKeyOutput::UInt64).then(|| Vec::with_capacity(rows));
+    let mut counts = Vec::with_capacity(rows);
+    let sum_output = groups
+        .iter()
+        .find(|group| group.sum_count > 0)
+        .map(|group| group.sum_output)
+        .or_else(|| groups.first().map(|group| group.sum_output))
+        .unwrap_or(CountSumOutputKind::Int64);
+    let mut sum_i64 =
+        matches!(sum_output, CountSumOutputKind::Int64).then(|| Vec::with_capacity(rows));
+    let mut sum_f64 =
+        matches!(sum_output, CountSumOutputKind::Float64).then(|| Vec::with_capacity(rows));
+    let mut sum_decimal = matches!(sum_output, CountSumOutputKind::Decimal128 { .. })
+        .then(|| Vec::with_capacity(rows));
+
+    if let Some(group_id) = null_group
+        && let Some(group) = groups.get(group_id)
+    {
+        push_count_sum_group_to_columns(
+            group,
+            &mut key_i64,
+            &mut key_u64,
+            &mut counts,
+            &mut sum_i64,
+            &mut sum_f64,
+            &mut sum_decimal,
+        );
+    }
+    for (_, group_id) in entries {
+        let Some(group) = groups.get(group_id) else {
+            continue;
+        };
+        push_count_sum_group_to_columns(
+            group,
+            &mut key_i64,
+            &mut key_u64,
+            &mut counts,
+            &mut sum_i64,
+            &mut sum_f64,
+            &mut sum_decimal,
+        );
+    }
+    let fill_elapsed = fill_started.map(|started| started.elapsed());
+
+    let arrays_started = profile.then(Instant::now);
+    let mut fields = Vec::with_capacity(3);
+    let mut columns = Vec::with_capacity(3);
+    match key_output {
+        CountSumKeyOutput::Int64 => {
+            fields.push(Field::new(group_by, DataType::Int64, true));
+            columns
+                .push(Arc::new(Int64Array::from(key_i64.expect("Int64 key column"))) as ArrayRef);
+        }
+        CountSumKeyOutput::UInt64 => {
+            fields.push(Field::new(group_by, DataType::UInt64, true));
+            columns
+                .push(Arc::new(UInt64Array::from(key_u64.expect("UInt64 key column"))) as ArrayRef);
+        }
+    }
+    fields.push(Field::new(count_expr.to_string(), DataType::UInt64, true));
+    columns.push(Arc::new(UInt64Array::from(counts)) as ArrayRef);
+    match sum_output {
+        CountSumOutputKind::Int64 => {
+            fields.push(Field::new(sum_expr.to_string(), DataType::Int64, true));
+            columns
+                .push(Arc::new(Int64Array::from(sum_i64.expect("Int64 sum column"))) as ArrayRef);
+        }
+        CountSumOutputKind::Float64 => {
+            fields.push(Field::new(sum_expr.to_string(), DataType::Float64, true));
+            columns.push(
+                Arc::new(Float64Array::from(sum_f64.expect("Float64 sum column"))) as ArrayRef,
+            );
+        }
+        CountSumOutputKind::Decimal128 { scale } => {
+            let array = Decimal128Array::from(sum_decimal.expect("Decimal128 sum column"))
+                .with_precision_and_scale(38, scale)
+                .expect("valid Decimal128 count/sum output");
+            fields.push(Field::new(
+                sum_expr.to_string(),
+                DataType::Decimal128(38, scale),
+                true,
+            ));
+            columns.push(Arc::new(array) as ArrayRef);
+        }
+    }
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
+    if let Some(total_started) = total_started {
+        let arrays_elapsed = arrays_started.map(|started| started.elapsed());
+        eprintln!(
+            "[dodam:aggregate-profile] count_sum_finish_batch rows={} groups={} collect_sort={:.3}ms fill={:.3}ms arrays={:.3}ms total={:.3}ms already_ordered={}",
+            rows,
+            groups.len(),
+            collect_elapsed
+                .map(|elapsed| elapsed.as_secs_f64() * 1000.0)
+                .unwrap_or(0.0),
+            fill_elapsed
+                .map(|elapsed| elapsed.as_secs_f64() * 1000.0)
+                .unwrap_or(0.0),
+            arrays_elapsed
+                .map(|elapsed| elapsed.as_secs_f64() * 1000.0)
+                .unwrap_or(0.0),
+            total_started.elapsed().as_secs_f64() * 1000.0,
+            already_ordered,
+        );
+    }
+    Ok(batch)
+}
+
+fn push_count_sum_group_to_columns(
+    group: &CountSumGroup,
+    key_i64: &mut Option<Vec<Option<i64>>>,
+    key_u64: &mut Option<Vec<Option<u64>>>,
+    counts: &mut Vec<u64>,
+    sum_i64: &mut Option<Vec<Option<i64>>>,
+    sum_f64: &mut Option<Vec<Option<f64>>>,
+    sum_decimal: &mut Option<Vec<Option<i128>>>,
+) {
+    if let Some(keys) = key_i64 {
+        keys.push(match &group.key {
+            GroupValue::Int64(value) => *value,
+            _ => None,
+        });
+    }
+    if let Some(keys) = key_u64 {
+        keys.push(match &group.key {
+            GroupValue::UInt64(value) => *value,
+            _ => None,
+        });
+    }
+    counts.push(group.count);
+    if let Some(values) = sum_i64 {
+        values.push((group.sum_count > 0).then_some(group.sum_i64));
+    }
+    if let Some(values) = sum_f64 {
+        values.push((group.sum_count > 0).then_some(group.sum_f64));
+    }
+    if let Some(values) = sum_decimal {
+        values.push((group.sum_count > 0).then_some(group.sum_decimal128));
+    }
 }
 
 fn collect_grouped_aggregates_generic(
@@ -14125,6 +14699,13 @@ impl NumericState {
     fn add_f64(&mut self, value: f64) {
         self.output.get_or_insert(NumericOutput::Float64);
         self.sum_f64 += value;
+        self.count += 1;
+    }
+
+    fn add_decimal128(&mut self, value: i128, scale: i8) {
+        self.output
+            .get_or_insert(NumericOutput::Decimal128 { scale });
+        self.sum_decimal128 += value;
         self.count += 1;
     }
 

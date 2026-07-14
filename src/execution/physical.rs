@@ -247,6 +247,7 @@ impl DirectPrimitiveFoldExec {
             .collect::<Result<Vec<_>>>()?;
         match self.mode {
             DirectPrimitiveFoldMode::SingleKeyCountSum {
+                group_by,
                 key_type,
                 count,
                 sum,
@@ -269,6 +270,7 @@ impl DirectPrimitiveFoldExec {
                         self.file_cache.clone(),
                         self.object_store.clone(),
                         key_type.as_str(),
+                        group_by.as_str(),
                         count.clone(),
                         sum.clone(),
                         i32_dense_range,
@@ -292,6 +294,7 @@ impl DirectPrimitiveFoldExec {
                         "i32" | "I32" | "int32" | "Int32" => {
                             Ok(if let Some((min, max)) = i32_dense_range {
                                 SingleKeyCountSumVectorState::new_i32_with_dense_range(
+                                    group_by.clone(),
                                     count.clone(),
                                     sum.clone(),
                                     min,
@@ -299,12 +302,20 @@ impl DirectPrimitiveFoldExec {
                                     direct_primitive_stats_dense_i32_max_slots(),
                                 )
                             } else {
-                                SingleKeyCountSumVectorState::new_i32(count.clone(), sum.clone())
+                                SingleKeyCountSumVectorState::new_i32(
+                                    group_by.clone(),
+                                    count.clone(),
+                                    sum.clone(),
+                                )
                             })
                         }
-                        "i64" | "I64" | "int64" | "Int64" => Ok(
-                            SingleKeyCountSumVectorState::new_i64(count.clone(), sum.clone()),
-                        ),
+                        "i64" | "I64" | "int64" | "Int64" => {
+                            Ok(SingleKeyCountSumVectorState::new_i64(
+                                group_by.clone(),
+                                count.clone(),
+                                sum.clone(),
+                            ))
+                        }
                         _ => Err(DodamError::UnsupportedSql(format!(
                             "unsupported DirectPrimitiveFoldExec count/sum key type: {key_type}"
                         ))),
@@ -402,6 +413,7 @@ fn scan_direct_primitive_count_sum_page_fold(
     file_cache: Arc<ParquetFileCache>,
     object_store: Arc<dyn ObjectStore>,
     key_type: &str,
+    group_by: &str,
     count: AggregateExpr,
     sum: AggregateExpr,
     i32_dense_range: Option<(i32, i32)>,
@@ -415,6 +427,7 @@ fn scan_direct_primitive_count_sum_page_fold(
     let init = || match key_type {
         "i32" | "I32" | "int32" | "Int32" => Ok(if let Some((min, max)) = i32_dense_range {
             SingleKeyCountSumVectorState::new_i32_with_dense_range(
+                group_by.to_string(),
                 count.clone(),
                 sum.clone(),
                 min,
@@ -422,9 +435,10 @@ fn scan_direct_primitive_count_sum_page_fold(
                 direct_primitive_stats_dense_i32_max_slots(),
             )
         } else {
-            SingleKeyCountSumVectorState::new_i32(count.clone(), sum.clone())
+            SingleKeyCountSumVectorState::new_i32(group_by.to_string(), count.clone(), sum.clone())
         }),
         "i64" | "I64" | "int64" | "Int64" => Ok(SingleKeyCountSumVectorState::new_i64(
+            group_by.to_string(),
             count.clone(),
             sum.clone(),
         )),
@@ -472,7 +486,14 @@ fn scan_direct_primitive_count_sum_page_fold(
         log_direct_primitive_exec_profile(&path, &columns, &metrics);
         return Ok(Some((state, metrics)));
     }
-    let workers = direct_primitive_count_sum_page_workers(row_groups.len());
+    let workers = if matches!(
+        key_type,
+        "i32" | "I32" | "int32" | "Int32" | "i64" | "I64" | "int64" | "Int64"
+    ) {
+        1
+    } else {
+        direct_primitive_count_sum_page_workers(row_groups.len())
+    };
     let (sender, receiver) = mpsc::channel();
     let row_group_partitions = partition_row_groups_balanced(&row_groups, workers);
     std::thread::scope(|scope| {
@@ -483,6 +504,7 @@ fn scan_direct_primitive_count_sum_page_fold(
             let row_groups = row_group_partition;
             let file_cache = file_cache.clone();
             let object_store = object_store.clone();
+            let group_by = group_by.to_string();
             let count = count.clone();
             let sum = sum.clone();
             scope.spawn(move || {
@@ -496,6 +518,7 @@ fn scan_direct_primitive_count_sum_page_fold(
                         "i32" | "I32" | "int32" | "Int32" => {
                             if let Some((min, max)) = i32_dense_range {
                                 SingleKeyCountSumVectorState::new_i32_with_dense_range(
+                                    group_by.clone(),
                                     count,
                                     sum,
                                     min,
@@ -503,11 +526,11 @@ fn scan_direct_primitive_count_sum_page_fold(
                                     direct_primitive_stats_dense_i32_max_slots(),
                                 )
                             } else {
-                                SingleKeyCountSumVectorState::new_i32(count, sum)
+                                SingleKeyCountSumVectorState::new_i32(group_by.clone(), count, sum)
                             }
                         }
                         "i64" | "I64" | "int64" | "Int64" => {
-                            SingleKeyCountSumVectorState::new_i64(count, sum)
+                            SingleKeyCountSumVectorState::new_i64(group_by.clone(), count, sum)
                         }
                         _ => return Ok(None),
                     };
@@ -10580,13 +10603,6 @@ fn evaluate_like(
 ) -> Result<BooleanArray> {
     let column_index = column_index(batch, column)?;
     let column_array = batch.column(column_index);
-    let values = column_array
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| DodamError::UnsupportedFilterType {
-            column: column.to_string(),
-            data_type: column_array.data_type().clone(),
-        })?;
     let normalized_pattern;
     let pattern = if case_insensitive {
         normalized_pattern = pattern.to_lowercase();
@@ -10595,36 +10611,89 @@ fn evaluate_like(
         pattern
     };
     let fast_pattern = fast_like_pattern(pattern, escape);
-    let mut builder = BooleanBuilder::with_capacity(values.len());
+    if let Some(values) = column_array.as_any().downcast_ref::<StringArray>() {
+        return evaluate_like_values(
+            values.len(),
+            |row| values.is_valid(row).then(|| values.value(row)),
+            pattern,
+            fast_pattern.as_ref(),
+            negated,
+            escape,
+            case_insensitive,
+        );
+    }
+    if let Some(values) = column_array
+        .as_any()
+        .downcast_ref::<DictionaryArray<Int32Type>>()
+    {
+        let Some(dictionary) = values.values().as_any().downcast_ref::<StringArray>() else {
+            return Err(DodamError::UnsupportedFilterType {
+                column: column.to_string(),
+                data_type: column_array.data_type().clone(),
+            });
+        };
+        let keys = values.keys().values();
+        return evaluate_like_values(
+            values.len(),
+            |row| {
+                if values.is_null(row) {
+                    return None;
+                }
+                let key = usize::try_from(keys[row]).ok()?;
+                (key < dictionary.len() && dictionary.is_valid(key)).then(|| dictionary.value(key))
+            },
+            pattern,
+            fast_pattern.as_ref(),
+            negated,
+            escape,
+            case_insensitive,
+        );
+    }
+    Err(DodamError::UnsupportedFilterType {
+        column: column.to_string(),
+        data_type: column_array.data_type().clone(),
+    })
+}
+
+fn evaluate_like_values<'a>(
+    len: usize,
+    mut value_at: impl FnMut(usize) -> Option<&'a str>,
+    pattern: &str,
+    fast_pattern: Option<&FastLikePattern<'_>>,
+    negated: bool,
+    escape: Option<char>,
+    case_insensitive: bool,
+) -> Result<BooleanArray> {
+    let mut builder = BooleanBuilder::with_capacity(len);
     if let Some(fast_pattern) = fast_pattern {
-        for row in 0..values.len() {
-            if values.is_null(row) {
+        for row in 0..len {
+            let Some(value) = value_at(row) else {
                 builder.append_null();
                 continue;
-            }
+            };
             let normalized_value;
             let value = if case_insensitive {
-                normalized_value = values.value(row).to_lowercase();
+                normalized_value = value.to_lowercase();
                 normalized_value.as_str()
             } else {
-                values.value(row)
+                value
             };
             let matched = fast_pattern.matches(value);
             builder.append_value(if negated { !matched } else { matched });
         }
     } else {
         let tokens = like_pattern_tokens(pattern, escape)?;
-        for row in 0..values.len() {
-            if values.is_null(row) {
+        for row in 0..len {
+            let Some(value) = value_at(row) else {
                 builder.append_null();
                 continue;
-            }
+            };
             let normalized_value;
             let value = if case_insensitive {
-                normalized_value = values.value(row).to_lowercase();
+                normalized_value = value.to_lowercase();
                 normalized_value.as_str()
             } else {
-                values.value(row)
+                value
             };
             let matched = like_matches(value, &tokens);
             builder.append_value(if negated { !matched } else { matched });
