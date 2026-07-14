@@ -1680,6 +1680,17 @@ async fn try_execute_set_operation_sql(
         batches = apply_output_order_limit(batches, order_by.as_ref(), limit, offset)?;
         return Ok(Some(QueryOutput::Scan { batches }));
     }
+    if let Some(mut batches) = try_execute_same_source_all_set_scan(
+        engine,
+        query.body.as_ref(),
+        batch_size,
+        order_by.as_ref(),
+        limit,
+        offset,
+    )? {
+        batches = apply_output_order_limit(batches, order_by.as_ref(), limit, offset)?;
+        return Ok(Some(QueryOutput::Scan { batches }));
+    }
     let child_topk = if offset == 0 {
         order_by.as_ref().zip(limit)
     } else {
@@ -4845,12 +4856,84 @@ async fn try_execute_same_source_distinct_set_scan(
     Ok(Some(batches))
 }
 
+fn try_execute_same_source_all_set_scan(
+    engine: &DodamEngine,
+    expr: &SetExpr,
+    batch_size: usize,
+    _order_by: Option<&SortKey>,
+    _limit: Option<usize>,
+    _offset: usize,
+) -> Result<Option<Vec<RecordBatch>>> {
+    let Some(scan) = plan_same_source_all_set_i32_scan(expr)? else {
+        return Ok(None);
+    };
+    let Some(column_types) = engine
+        .parquet_direct_primitive_column_types(&scan.path, std::slice::from_ref(&scan.column))?
+    else {
+        return Ok(None);
+    };
+    if !matches!(column_types.as_slice(), [DirectPrimitiveColumnType::I32]) {
+        return Ok(None);
+    }
+    let row_group_count = engine.parquet_row_group_count(&scan.path)?;
+    let row_groups = (0..row_group_count).collect::<Vec<_>>();
+    let candidates = scan.candidates();
+    let Some((state, _metrics)) = engine.scan_parquet_primitive_columns_parallel_view_fold(
+        scan.path.clone(),
+        batch_size,
+        row_groups,
+        vec![(scan.column.clone(), DirectPrimitiveColumnType::I32)],
+        || I32SetAllCounts::new(candidates.clone()),
+        |state, view| state.consume(view),
+        |state, partial| {
+            state.merge(partial);
+            Ok(())
+        },
+    )?
+    else {
+        return Ok(None);
+    };
+    if state.unsupported {
+        return Ok(None);
+    }
+    let output = state.finish(&scan.left_values, &scan.right_values, scan.op);
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        &scan.column,
+        DataType::Int32,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(output))])?;
+    rename_output_batches(vec![batch], &scan.aliases).map(Some)
+}
+
 #[derive(Clone)]
 struct DirectDistinctScan {
     path: PathBuf,
     projection: Projection,
     aliases: Vec<(String, String)>,
     filter: Option<FilterExpr>,
+}
+
+#[derive(Clone)]
+struct SameSourceAllSetI32Scan {
+    path: PathBuf,
+    column: String,
+    aliases: Vec<(String, String)>,
+    left_values: Vec<i32>,
+    right_values: Vec<i32>,
+    op: SetOperator,
+}
+
+impl SameSourceAllSetI32Scan {
+    fn candidates(&self) -> Vec<i32> {
+        let mut candidates = Vec::new();
+        for value in self.left_values.iter().chain(self.right_values.iter()) {
+            if !candidates.iter().any(|candidate| candidate == value) {
+                candidates.push(*value);
+            }
+        }
+        candidates
+    }
 }
 
 fn try_collect_direct_monotonic_count_distinct(
@@ -5308,6 +5391,116 @@ impl I32CandidatePresence {
     }
 }
 
+struct I32SetAllCounts {
+    candidates: Vec<i32>,
+    counts: Vec<usize>,
+    unsupported: bool,
+}
+
+impl I32SetAllCounts {
+    fn new(candidates: Vec<i32>) -> Self {
+        let counts = vec![0; candidates.len()];
+        Self {
+            candidates,
+            counts,
+            unsupported: false,
+        }
+    }
+
+    fn consume(&mut self, view: BatchView<'_>) -> Result<()> {
+        let Some(values) = view
+            .i32_vector(0)
+            .and_then(|column| column.values_if_null_free())
+        else {
+            self.unsupported = true;
+            return Ok(());
+        };
+        match self.candidates.as_slice() {
+            [] => {}
+            [a] => {
+                let mut count = 0usize;
+                for &value in values {
+                    count += usize::from(value == *a);
+                }
+                self.counts[0] += count;
+            }
+            [a, b] => {
+                let mut count_a = 0usize;
+                let mut count_b = 0usize;
+                for &value in values {
+                    if value == *a {
+                        count_a += 1;
+                    } else if value == *b {
+                        count_b += 1;
+                    }
+                }
+                self.counts[0] += count_a;
+                self.counts[1] += count_b;
+            }
+            [a, b, c] => {
+                let mut count_a = 0usize;
+                let mut count_b = 0usize;
+                let mut count_c = 0usize;
+                for &value in values {
+                    if value == *a {
+                        count_a += 1;
+                    } else if value == *b {
+                        count_b += 1;
+                    } else if value == *c {
+                        count_c += 1;
+                    }
+                }
+                self.counts[0] += count_a;
+                self.counts[1] += count_b;
+                self.counts[2] += count_c;
+            }
+            candidates => {
+                for &value in values {
+                    if let Some(index) = candidates.iter().position(|candidate| *candidate == value)
+                    {
+                        self.counts[index] += 1;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn merge(&mut self, partial: Self) {
+        self.unsupported |= partial.unsupported;
+        for (count, partial_count) in self.counts.iter_mut().zip(partial.counts) {
+            *count += partial_count;
+        }
+    }
+
+    fn finish(&self, left_values: &[i32], right_values: &[i32], op: SetOperator) -> Vec<i32> {
+        let mut output = Vec::new();
+        for &value in left_values {
+            let left_count = self.count_for(value);
+            let right_count = right_values
+                .iter()
+                .any(|right| *right == value)
+                .then(|| self.count_for(value))
+                .unwrap_or(0);
+            let repeats = match op {
+                SetOperator::Intersect => left_count.min(right_count),
+                SetOperator::Except => left_count.saturating_sub(right_count),
+                _ => 0,
+            };
+            output.extend(std::iter::repeat_n(value, repeats));
+        }
+        output
+    }
+
+    fn count_for(&self, value: i32) -> usize {
+        self.candidates
+            .iter()
+            .position(|candidate| *candidate == value)
+            .map(|index| self.counts[index])
+            .unwrap_or(0)
+    }
+}
+
 struct I32I64DistinctPairs {
     candidates: Vec<i32>,
     filter_index: usize,
@@ -5446,6 +5639,30 @@ fn plan_same_source_distinct_set_scan(expr: &SetExpr) -> Result<Option<SameSourc
         &right_query,
         *op,
     ))
+}
+
+fn plan_same_source_all_set_i32_scan(expr: &SetExpr) -> Result<Option<SameSourceAllSetI32Scan>> {
+    let SetExpr::SetOperation {
+        op,
+        set_quantifier,
+        left,
+        right,
+    } = expr
+    else {
+        return Ok(None);
+    };
+    if !matches!(*op, SetOperator::Intersect | SetOperator::Except)
+        || *set_quantifier != SetQuantifier::All
+    {
+        return Ok(None);
+    }
+    let Some(left_query) = single_set_operand_query(left.as_ref())? else {
+        return Ok(None);
+    };
+    let Some(right_query) = single_set_operand_query(right.as_ref())? else {
+        return Ok(None);
+    };
+    Ok(same_source_all_set_i32_plan(&left_query, &right_query, *op))
 }
 
 struct SameSourceUnionAllScan {
@@ -5627,6 +5844,40 @@ fn same_source_distinct_set_plan(
     })
 }
 
+fn same_source_all_set_i32_plan(
+    left: &SqlQuery,
+    right: &SqlQuery,
+    op: SetOperator,
+) -> Option<SameSourceAllSetI32Scan> {
+    if !same_source_union_all_operand_supported(left)
+        || !same_source_union_all_operand_supported(right)
+        || left.path != right.path
+        || left.projection != right.projection
+        || left.aliases != right.aliases
+    {
+        return None;
+    }
+    let Projection::Columns(projected) = &left.projection else {
+        return None;
+    };
+    let [projected_column] = projected.as_slice() else {
+        return None;
+    };
+    let (left_column, left_values) = positive_literal_filter_values(left.filter.as_ref()?)?;
+    let (right_column, right_values) = positive_literal_filter_values(right.filter.as_ref()?)?;
+    if left_column != right_column || left_column != *projected_column {
+        return None;
+    }
+    Some(SameSourceAllSetI32Scan {
+        path: left.path.clone(),
+        column: projected_column.clone(),
+        aliases: left.aliases.clone(),
+        left_values: literal_values_to_unique_i32(left_values, projected_column).ok()?,
+        right_values: literal_values_to_unique_i32(right_values, projected_column).ok()?,
+        op,
+    })
+}
+
 fn same_source_union_all_filter_scan_plan(
     operands: &[SqlQuery],
 ) -> Option<SameSourceUnionAllFilterScan> {
@@ -5731,6 +5982,17 @@ fn append_unique_literal_values(output: &mut Vec<LiteralValue>, values: Vec<Lite
             output.push(value);
         }
     }
+}
+
+fn literal_values_to_unique_i32(values: Vec<LiteralValue>, column: &str) -> Result<Vec<i32>> {
+    let mut output = Vec::new();
+    for value in values {
+        let value = value.as_i32(column)?;
+        if !output.iter().any(|existing| *existing == value) {
+            output.push(value);
+        }
+    }
+    Ok(output)
 }
 
 fn intersect_literal_values(
@@ -5848,11 +6110,6 @@ async fn execute_set_operation_expr(
             left,
             right,
         } if *op == SetOperator::Intersect || *op == SetOperator::Except => {
-            if !union_quantifier_is_distinct(*set_quantifier) {
-                return Err(DodamError::UnsupportedSql(format!(
-                    "{op} {set_quantifier} is not supported yet"
-                )));
-            }
             let left_batches = Box::pin(execute_set_operation_expr(
                 engine,
                 left.as_ref(),
@@ -5869,7 +6126,11 @@ async fn execute_set_operation_expr(
                 false,
             ))
             .await?;
-            let batches = apply_distinct_row_set_operation(left_batches, right_batches, *op)?;
+            let batches = if *set_quantifier == SetQuantifier::All {
+                apply_all_row_set_operation(left_batches, right_batches, *op)?
+            } else {
+                apply_distinct_row_set_operation(left_batches, right_batches, *op)?
+            };
             apply_output_distinct(batches, child_distinct)
         }
         SetExpr::SetOperation {
@@ -6009,6 +6270,88 @@ fn apply_distinct_row_set_operation(
             _ => false,
         };
         if keep && seen_left.insert(owned) {
+            let index = u32::try_from(index).map_err(|_| {
+                DodamError::UnsupportedSql(
+                    "set operation currently supports up to u32::MAX rows".to_string(),
+                )
+            })?;
+            indices.push(index);
+        }
+    }
+
+    if indices.is_empty() {
+        return Ok(vec![RecordBatch::new_empty(left_schema)]);
+    }
+    let indices = UInt32Array::from(indices);
+    Ok(vec![take_record_batch(&left_batch, &indices)?])
+}
+
+fn apply_all_row_set_operation(
+    left_batches: Vec<RecordBatch>,
+    right_batches: Vec<RecordBatch>,
+    op: SetOperator,
+) -> Result<Vec<RecordBatch>> {
+    let Some(left_schema) = set_operation_schema(&left_batches).cloned() else {
+        return Ok(Vec::new());
+    };
+    validate_union_all_batches(&left_schema, &left_batches)?;
+    validate_union_all_batches(&left_schema, &right_batches)?;
+
+    let left_batch = concat_or_empty_set_batches(&left_schema, &left_batches)?;
+    if left_batch.num_rows() == 0 {
+        return Ok(vec![left_batch]);
+    }
+
+    let right_batch = concat_or_empty_set_batches(&left_schema, &right_batches)?;
+    if right_batch.num_rows() == 0 {
+        return match op {
+            SetOperator::Except => Ok(vec![left_batch]),
+            SetOperator::Intersect => Ok(vec![RecordBatch::new_empty(left_schema)]),
+            _ => Err(DodamError::UnsupportedSql(format!(
+                "{op} is not supported by ALL row set operation"
+            ))),
+        };
+    }
+
+    let converter = row_set_converter(left_schema.as_ref())?;
+    let right_rows = converter.convert_columns(right_batch.columns())?;
+    let mut right_counts = HashMap::<OwnedRow, usize>::new();
+    for row in right_rows.iter() {
+        *right_counts.entry(row.owned()).or_insert(0) += 1;
+    }
+
+    let left_rows = converter.convert_columns(left_batch.columns())?;
+    let mut indices = Vec::new();
+    for (index, row) in left_rows.iter().enumerate() {
+        let owned = row.owned();
+        let keep = match op {
+            SetOperator::Intersect => {
+                if let Some(count) = right_counts.get_mut(&owned) {
+                    if *count > 0 {
+                        *count -= 1;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            SetOperator::Except => {
+                if let Some(count) = right_counts.get_mut(&owned) {
+                    if *count > 0 {
+                        *count -= 1;
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                }
+            }
+            _ => false,
+        };
+        if keep {
             let index = u32::try_from(index).map_err(|_| {
                 DodamError::UnsupportedSql(
                     "set operation currently supports up to u32::MAX rows".to_string(),

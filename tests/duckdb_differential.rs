@@ -783,12 +783,42 @@ async fn duckdb_differential_union_all() {
 
     assert_same_as_duckdb(
         &format!(
+            "SELECT key AS value FROM '{}' WHERE id <= 5 INTERSECT ALL SELECT key AS value FROM '{}' WHERE id >= 2 ORDER BY value",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT key AS value FROM read_parquet('{}') WHERE id <= 5 INTERSECT ALL SELECT key AS value FROM read_parquet('{}') WHERE id >= 2 ORDER BY value",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
             "SELECT key AS value, payload FROM '{}' WHERE id <= 5 EXCEPT SELECT key AS value, payload FROM '{}' WHERE id >= 2 ORDER BY value, payload",
             facts_path.display(),
             facts_path.display()
         ),
         &format!(
             "SELECT key AS value, payload FROM read_parquet('{}') WHERE id <= 5 EXCEPT SELECT key AS value, payload FROM read_parquet('{}') WHERE id >= 2 ORDER BY value, payload",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT key AS value FROM '{}' WHERE id <= 5 EXCEPT ALL SELECT key AS value FROM '{}' WHERE id >= 2 ORDER BY value",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT key AS value FROM read_parquet('{}') WHERE id <= 5 EXCEPT ALL SELECT key AS value FROM read_parquet('{}') WHERE id >= 2 ORDER BY value",
             facts_path.display(),
             facts_path.display()
         ),

@@ -71,7 +71,23 @@ Priority order:
      - Initial materialized fallback: Dodam `~44.6ms`, DuckDB `~22.5ms` (`1.98x`).
      - Lowered the same-source positive literal filter rule to `EXCEPT DISTINCT`: compatible operands over the same Parquet file/projection now turn filter predicates into a single literal-set difference and reuse the direct distinct scan path. Focused result improved to Dodam `~10.0ms`, DuckDB `~29.0ms` (`0.35x`).
    - `INTERSECT ALL` / `EXCEPT ALL`
-     - Later: requires row multiplicity counts, not just distinct row sets
+     - Implemented correctness-first materialized row-count fallback for `INTERSECT ALL` and `EXCEPT ALL`.
+       - `INTERSECT ALL` builds right-side row multiplicity counts and emits left rows while decrementing the available right count.
+       - `EXCEPT ALL` builds right-side row multiplicity counts and drops only the matching number of left rows.
+     - Added DuckDB differential coverage and generic benchmark cases:
+       - `intersect_all_rows`
+       - `except_all_rows`
+     - SF=1 focused initial results:
+       - `intersect_all_rows`: Dodam `~18.7ms`, DuckDB `~27.8ms` (`0.67x`)
+       - `except_all_rows`: Dodam `~18.7ms`, DuckDB `~28.1ms` (`0.67x`)
+     - Lowered same-source single-`i32` projection/filter `ALL` cases into a primitive block count rule:
+       - `INTERSECT ALL` emits `min(left_count, right_count)` for overlapping literal values.
+       - `EXCEPT ALL` emits `left_count - right_count` for left literal values.
+       - This avoids two operand scans, Arrow row conversion, and full row materialization for the covered shape.
+     - SF=1 focused after primitive count rule:
+       - `intersect_all_rows`: Dodam `~4.8ms`, DuckDB `~27.8ms` (`0.17x`)
+       - `except_all_rows`: Dodam `~5.2ms`, DuckDB `~29.2ms` (`0.18x`)
+     - Next performance step: widen the primitive count rule to nullable primitives, string dictionary ids, and multi-column primitive keys. The generic fallback remains correct but still uses Arrow row conversion and full operand materialization.
 2. JOIN generality
    - non-equi join fallback
    - complex `ON` residual predicates

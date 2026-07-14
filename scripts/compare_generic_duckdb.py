@@ -358,6 +358,16 @@ def generic_queries(data_dir: Path) -> list[GenericQuery]:
             f"SELECT bucket, value FROM read_parquet('{facts}') WHERE bucket IN (1, 7) EXCEPT SELECT bucket, value FROM read_parquet('{facts}') WHERE bucket IN (7, 9) ORDER BY bucket, value LIMIT 5000",
         ),
         GenericQuery(
+            "intersect_all_rows",
+            f"SELECT bucket FROM '{facts}' WHERE bucket IN (1, 7) INTERSECT ALL SELECT bucket FROM '{facts}' WHERE bucket IN (7, 9) ORDER BY bucket LIMIT 5000",
+            f"SELECT bucket FROM read_parquet('{facts}') WHERE bucket IN (1, 7) INTERSECT ALL SELECT bucket FROM read_parquet('{facts}') WHERE bucket IN (7, 9) ORDER BY bucket LIMIT 5000",
+        ),
+        GenericQuery(
+            "except_all_rows",
+            f"SELECT bucket FROM '{facts}' WHERE bucket IN (1, 7) EXCEPT ALL SELECT bucket FROM '{facts}' WHERE bucket IN (7, 9) ORDER BY bucket LIMIT 5000",
+            f"SELECT bucket FROM read_parquet('{facts}') WHERE bucket IN (1, 7) EXCEPT ALL SELECT bucket FROM read_parquet('{facts}') WHERE bucket IN (7, 9) ORDER BY bucket LIMIT 5000",
+        ),
+        GenericQuery(
             "select_distinct_low_cardinality",
             f"SELECT DISTINCT bucket FROM '{facts}' WHERE bucket IN (1, 7, 9) ORDER BY bucket",
             f"SELECT DISTINCT bucket FROM read_parquet('{facts}') WHERE bucket IN (1, 7, 9) ORDER BY bucket",
