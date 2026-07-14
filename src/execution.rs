@@ -32,6 +32,6 @@ pub use physical::{
     DirectPrimitiveFoldExec, DistinctExec, FilterExec, FinalMergeExec, HashJoinExec, IpcExec,
     JoinBuildSide, JoinType, LimitExec, LocalFoldExec, MemoryExec, PartitionedHashJoinExec,
     PartitionedHashJoinOptions, ProjectionExec, ScanExec, SortExec, SortMergeJoinExec,
-    collect_metrics, evaluate_filter_mask, filter_batch, scan_projection,
+    StripPrefixExec, collect_metrics, evaluate_filter_mask, filter_batch, scan_projection,
 };
 pub use typed_rows::{try_for_each_i64_date32_str, try_for_each_i64_i64_date32};

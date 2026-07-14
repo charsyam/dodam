@@ -65,6 +65,55 @@ pub fn partition_count(estimated_build_bytes: u64, memory_limit_bytes: u64) -> u
     partitions.clamp(2, 1024) as usize
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PipelineMemoryCostInput {
+    pub estimated_rows: u128,
+    pub estimated_row_width: u128,
+    pub memory_limit_bytes: u128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineMemoryStrategy {
+    InMemory,
+    Partitioned { partitions: usize },
+    External,
+}
+
+pub fn choose_pipeline_memory_strategy(input: PipelineMemoryCostInput) -> PipelineMemoryStrategy {
+    let estimated_bytes = input
+        .estimated_rows
+        .saturating_mul(input.estimated_row_width.max(1));
+    let memory_limit = input.memory_limit_bytes.max(1);
+    if estimated_bytes <= memory_limit {
+        return PipelineMemoryStrategy::InMemory;
+    }
+    if estimated_bytes <= memory_limit.saturating_mul(1024) {
+        return PipelineMemoryStrategy::Partitioned {
+            partitions: partition_count_u128(estimated_bytes, memory_limit),
+        };
+    }
+    PipelineMemoryStrategy::External
+}
+
+fn partition_count_u128(estimated_bytes: u128, memory_limit_bytes: u128) -> usize {
+    let partitions =
+        estimated_bytes.saturating_add(memory_limit_bytes - 1) / memory_limit_bytes.max(1);
+    partitions.clamp(2, 1024) as usize
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamingLeftDeepJoinCostInput {
+    pub table_count: usize,
+    pub projected_output_columns: usize,
+    pub estimated_final_rows: u128,
+}
+
+pub fn choose_streaming_left_deep_join(input: StreamingLeftDeepJoinCostInput) -> bool {
+    input.table_count == 3
+        && input.projected_output_columns <= 16
+        && input.estimated_final_rows <= 10_000_000
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DecimalRangeSelectivityInput {
     pub column_min: i128,
@@ -773,6 +822,59 @@ mod tests {
             }),
             PrimitiveOrderLimitStrategy::OrderedScan
         );
+    }
+
+    #[test]
+    fn pipeline_memory_strategy_escalates_from_memory_to_external() {
+        assert_eq!(
+            choose_pipeline_memory_strategy(PipelineMemoryCostInput {
+                estimated_rows: 1_000,
+                estimated_row_width: 64,
+                memory_limit_bytes: 128 * 1024,
+            }),
+            PipelineMemoryStrategy::InMemory
+        );
+        assert_eq!(
+            choose_pipeline_memory_strategy(PipelineMemoryCostInput {
+                estimated_rows: 10_000,
+                estimated_row_width: 64,
+                memory_limit_bytes: 128 * 1024,
+            }),
+            PipelineMemoryStrategy::Partitioned { partitions: 5 }
+        );
+        assert_eq!(
+            choose_pipeline_memory_strategy(PipelineMemoryCostInput {
+                estimated_rows: 1_000_000_000,
+                estimated_row_width: 1024,
+                memory_limit_bytes: 128 * 1024,
+            }),
+            PipelineMemoryStrategy::External
+        );
+    }
+
+    #[test]
+    fn streaming_left_deep_join_rule_is_conservative() {
+        assert!(choose_streaming_left_deep_join(
+            StreamingLeftDeepJoinCostInput {
+                table_count: 3,
+                projected_output_columns: 8,
+                estimated_final_rows: 1_000_000,
+            }
+        ));
+        assert!(!choose_streaming_left_deep_join(
+            StreamingLeftDeepJoinCostInput {
+                table_count: 4,
+                projected_output_columns: 8,
+                estimated_final_rows: 1_000_000,
+            }
+        ));
+        assert!(!choose_streaming_left_deep_join(
+            StreamingLeftDeepJoinCostInput {
+                table_count: 3,
+                projected_output_columns: 64,
+                estimated_final_rows: 1_000_000,
+            }
+        ));
     }
 
     #[test]

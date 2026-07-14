@@ -248,6 +248,26 @@ def generic_queries(data_dir: Path) -> list[GenericQuery]:
             f"SELECT id, key, bucket, value FROM read_parquet('{facts}') WHERE amount >= '10.00' AND event_date < '2024-01-20' ORDER BY value DESC LIMIT 5000",
         ),
         GenericQuery(
+            "optimizer_three_way_comma_join",
+            f"SELECT d.class, d2.name, count(*), sum(f.value) FROM '{facts}' f, '{dim}' d, '{dim}' d2 WHERE f.key = d.key AND f.bucket = d2.key GROUP BY d.class, d2.name ORDER BY d.class NULLS FIRST, d2.name",
+            f"SELECT d.class, d2.name, count(*), sum(f.value) FROM read_parquet('{facts}') f, read_parquet('{dim}') d, read_parquet('{dim}') d2 WHERE f.key = d.key AND f.bucket = d2.key GROUP BY d.class, d2.name ORDER BY d.class NULLS FIRST, d2.name",
+        ),
+        GenericQuery(
+            "optimizer_selective_three_way_comma_join",
+            f"SELECT d.class, d2.name, count(*), sum(f.value) FROM '{facts}' f, '{dim}' d, '{dim}' d2 WHERE f.key = d.key AND f.bucket = d2.key AND f.amount < '20.00' AND d.class IS NOT NULL GROUP BY d.class, d2.name ORDER BY d.class, d2.name",
+            f"SELECT d.class, d2.name, count(*), sum(f.value) FROM read_parquet('{facts}') f, read_parquet('{dim}') d, read_parquet('{dim}') d2 WHERE f.key = d.key AND f.bucket = d2.key AND f.amount < '20.00' AND d.class IS NOT NULL GROUP BY d.class, d2.name ORDER BY d.class, d2.name",
+        ),
+        GenericQuery(
+            "optimizer_four_way_comma_join",
+            f"SELECT d.class, d2.name, d3.class AS bucket_class, count(*), sum(f.value) FROM '{facts}' f, '{dim}' d, '{dim}' d2, '{dim}' d3 WHERE f.key = d.key AND f.bucket = d2.key AND f.bucket = d3.key GROUP BY d.class, d2.name, d3.class ORDER BY d.class NULLS FIRST, d2.name, bucket_class NULLS FIRST",
+            f"SELECT d.class, d2.name, d3.class AS bucket_class, count(*), sum(f.value) FROM read_parquet('{facts}') f, read_parquet('{dim}') d, read_parquet('{dim}') d2, read_parquet('{dim}') d3 WHERE f.key = d.key AND f.bucket = d2.key AND f.bucket = d3.key GROUP BY d.class, d2.name, d3.class ORDER BY d.class NULLS FIRST, d2.name, bucket_class NULLS FIRST",
+        ),
+        GenericQuery(
+            "optimizer_selective_four_way_comma_join",
+            f"SELECT d.class, d2.name, d3.class AS bucket_class, count(*), sum(f.value) FROM '{facts}' f, '{dim}' d, '{dim}' d2, '{dim}' d3 WHERE f.key = d.key AND f.bucket = d2.key AND f.bucket = d3.key AND f.amount < '20.00' AND d.class IS NOT NULL GROUP BY d.class, d2.name, d3.class ORDER BY d.class, d2.name, bucket_class NULLS FIRST",
+            f"SELECT d.class, d2.name, d3.class AS bucket_class, count(*), sum(f.value) FROM read_parquet('{facts}') f, read_parquet('{dim}') d, read_parquet('{dim}') d2, read_parquet('{dim}') d3 WHERE f.key = d.key AND f.bucket = d2.key AND f.bucket = d3.key AND f.amount < '20.00' AND d.class IS NOT NULL GROUP BY d.class, d2.name, d3.class ORDER BY d.class, d2.name, bucket_class NULLS FIRST",
+        ),
+        GenericQuery(
             "string_low_cardinality_group",
             f"SELECT label, count(*), sum(value) FROM '{facts}' WHERE id < 200000 GROUP BY label ORDER BY label NULLS FIRST",
             f"SELECT label, count(*), sum(value) FROM read_parquet('{facts}') WHERE id < 200000 GROUP BY label ORDER BY label NULLS FIRST",
@@ -326,6 +346,16 @@ def generic_queries(data_dir: Path) -> list[GenericQuery]:
             "union_distinct_rows",
             f"SELECT bucket, value FROM '{facts}' WHERE bucket IN (1, 7) UNION DISTINCT SELECT bucket, value FROM '{facts}' WHERE bucket IN (7, 9) ORDER BY bucket, value LIMIT 5000",
             f"SELECT bucket, value FROM read_parquet('{facts}') WHERE bucket IN (1, 7) UNION DISTINCT SELECT bucket, value FROM read_parquet('{facts}') WHERE bucket IN (7, 9) ORDER BY bucket, value LIMIT 5000",
+        ),
+        GenericQuery(
+            "intersect_distinct_rows",
+            f"SELECT bucket, value FROM '{facts}' WHERE bucket IN (1, 7) INTERSECT SELECT bucket, value FROM '{facts}' WHERE bucket IN (7, 9) ORDER BY bucket, value LIMIT 5000",
+            f"SELECT bucket, value FROM read_parquet('{facts}') WHERE bucket IN (1, 7) INTERSECT SELECT bucket, value FROM read_parquet('{facts}') WHERE bucket IN (7, 9) ORDER BY bucket, value LIMIT 5000",
+        ),
+        GenericQuery(
+            "except_distinct_rows",
+            f"SELECT bucket, value FROM '{facts}' WHERE bucket IN (1, 7) EXCEPT SELECT bucket, value FROM '{facts}' WHERE bucket IN (7, 9) ORDER BY bucket, value LIMIT 5000",
+            f"SELECT bucket, value FROM read_parquet('{facts}') WHERE bucket IN (1, 7) EXCEPT SELECT bucket, value FROM read_parquet('{facts}') WHERE bucket IN (7, 9) ORDER BY bucket, value LIMIT 5000",
         ),
         GenericQuery(
             "select_distinct_low_cardinality",

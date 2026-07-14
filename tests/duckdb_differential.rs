@@ -750,6 +750,66 @@ async fn duckdb_differential_union_all() {
         tempdir.path(),
     )
     .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT key AS value, payload FROM '{}' WHERE id <= 5 INTERSECT SELECT key AS value, payload FROM '{}' WHERE id >= 2 ORDER BY value, payload",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT key AS value, payload FROM read_parquet('{}') WHERE id <= 5 INTERSECT SELECT key AS value, payload FROM read_parquet('{}') WHERE id >= 2 ORDER BY value, payload",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT key AS value FROM '{}' WHERE id <= 5 INTERSECT DISTINCT SELECT key AS value FROM '{}' WHERE id >= 2 ORDER BY value",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT key AS value FROM read_parquet('{}') WHERE id <= 5 INTERSECT DISTINCT SELECT key AS value FROM read_parquet('{}') WHERE id >= 2 ORDER BY value",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT key AS value, payload FROM '{}' WHERE id <= 5 EXCEPT SELECT key AS value, payload FROM '{}' WHERE id >= 2 ORDER BY value, payload",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT key AS value, payload FROM read_parquet('{}') WHERE id <= 5 EXCEPT SELECT key AS value, payload FROM read_parquet('{}') WHERE id >= 2 ORDER BY value, payload",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT key AS value FROM '{}' WHERE id <= 5 EXCEPT DISTINCT SELECT key AS value FROM '{}' WHERE id >= 2 ORDER BY value",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT key AS value FROM read_parquet('{}') WHERE id <= 5 EXCEPT DISTINCT SELECT key AS value FROM read_parquet('{}') WHERE id >= 2 ORDER BY value",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -2701,6 +2761,19 @@ async fn duckdb_differential_nested_struct_field_projection() {
         ),
         &format!(
             "SELECT id, attrs.detail.score AS score, attrs.detail.code AS code FROM read_parquet('{}') WHERE attrs.detail.score >= 20 OR attrs.detail.code = 'a' ORDER BY id",
+            input_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, attrs.rank AS rank, tags[1] AS first_tag FROM '{}' WHERE array_length(tags) = 3 AND attrs.rank IN (10, 30, 40) ORDER BY id",
+            input_path.display()
+        ),
+        &format!(
+            "SELECT id, attrs.rank AS rank, tags[1] AS first_tag FROM read_parquet('{}') WHERE array_length(tags) = 3 AND attrs.rank IN (10, 30, 40) ORDER BY id",
             input_path.display()
         ),
         tempdir.path(),

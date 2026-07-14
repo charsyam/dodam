@@ -2,12 +2,54 @@ use std::collections::HashMap;
 
 use crate::execution::{ComparisonExpr, Expr, FilterExpr, Projection, SortKey};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnRangeStats {
+    pub min_i128: i128,
+    pub max_i128: i128,
+    pub null_count: u128,
+    pub rows: u128,
+}
+
+impl ColumnRangeStats {
+    pub fn range_selectivity(
+        self,
+        filter_min: Option<i128>,
+        filter_max: Option<i128>,
+        include_nulls: bool,
+    ) -> Option<f64> {
+        let domain_len = self
+            .max_i128
+            .checked_sub(self.min_i128)
+            .and_then(|value| value.checked_add(1))?;
+        if domain_len <= 0 {
+            return None;
+        }
+        let filter_min = filter_min.unwrap_or(self.min_i128).max(self.min_i128);
+        let filter_max = filter_max.unwrap_or(self.max_i128).min(self.max_i128);
+        let matched = if filter_min > filter_max {
+            0.0
+        } else {
+            let selected_len = filter_max
+                .checked_sub(filter_min)
+                .and_then(|value| value.checked_add(1))?;
+            selected_len as f64 / domain_len as f64
+        };
+        let null_ratio = if include_nulls && self.rows > 0 {
+            self.null_count.min(self.rows) as f64 / self.rows as f64
+        } else {
+            0.0
+        };
+        Some((matched + null_ratio).clamp(0.0, 1.0))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogicalJoinTableStats {
     pub base_rows: u128,
     pub rows: u128,
     pub row_width: u128,
     pub key_ndv: HashMap<String, u128>,
+    pub column_ranges: HashMap<String, ColumnRangeStats>,
 }
 
 impl LogicalJoinTableStats {
@@ -16,6 +58,21 @@ impl LogicalJoinTableStats {
             return 1.0;
         }
         (self.rows as f64 / self.base_rows as f64).clamp(0.0, 1.0)
+    }
+
+    pub fn estimated_rows_for_range_filter(
+        &self,
+        column: &str,
+        filter_min: Option<i128>,
+        filter_max: Option<i128>,
+        include_nulls: bool,
+    ) -> Option<u128> {
+        let selectivity = self.column_ranges.get(column)?.range_selectivity(
+            filter_min,
+            filter_max,
+            include_nulls,
+        )?;
+        Some(((self.base_rows.max(1) as f64) * selectivity).ceil() as u128)
     }
 }
 
@@ -43,9 +100,197 @@ pub struct LogicalJoinPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogicalJoinPlanTree {
+    Leaf {
+        table_index: usize,
+        estimated_rows: u128,
+        estimated_width: u128,
+        estimated_cost: u128,
+    },
+    Join {
+        left: Box<LogicalJoinPlanTree>,
+        right: Box<LogicalJoinPlanTree>,
+        estimated_rows: u128,
+        estimated_width: u128,
+        estimated_cost: u128,
+    },
+}
+
+impl LogicalJoinPlanTree {
+    pub fn estimated_rows(&self) -> u128 {
+        match self {
+            Self::Leaf { estimated_rows, .. } | Self::Join { estimated_rows, .. } => {
+                *estimated_rows
+            }
+        }
+    }
+
+    pub fn estimated_width(&self) -> u128 {
+        match self {
+            Self::Leaf {
+                estimated_width, ..
+            }
+            | Self::Join {
+                estimated_width, ..
+            } => *estimated_width,
+        }
+    }
+
+    pub fn estimated_cost(&self) -> u128 {
+        match self {
+            Self::Leaf { estimated_cost, .. } | Self::Join { estimated_cost, .. } => {
+                *estimated_cost
+            }
+        }
+    }
+
+    pub fn table_count(&self) -> usize {
+        match self {
+            Self::Leaf { .. } => 1,
+            Self::Join { left, right, .. } => left.table_count() + right.table_count(),
+        }
+    }
+
+    pub fn collect_tables(&self, output: &mut Vec<usize>) {
+        match self {
+            Self::Leaf { table_index, .. } => output.push(*table_index),
+            Self::Join { left, right, .. } => {
+                left.collect_tables(output);
+                right.collect_tables(output);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogicalJoinGraph {
     pub tables: Vec<LogicalJoinTableStats>,
     pub edges: Vec<LogicalJoinEdge>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LogicalPlanNode {
+    Scan {
+        table: String,
+        projection: Projection,
+        filter: Option<FilterExpr>,
+    },
+    Project {
+        input: Box<LogicalPlanNode>,
+        projection: Projection,
+    },
+    Filter {
+        input: Box<LogicalPlanNode>,
+        filter: FilterExpr,
+    },
+    Aggregate {
+        input: Box<LogicalPlanNode>,
+        group_by: Vec<String>,
+        aggregates: Vec<String>,
+    },
+    SortLimit {
+        input: Box<LogicalPlanNode>,
+        order_by: Option<SortKey>,
+        limit: Option<usize>,
+    },
+}
+
+impl LogicalPlanNode {
+    pub fn push_scan_projection_filter(self) -> Self {
+        match self {
+            Self::Project { input, projection } => match *input {
+                Self::Filter { input, filter } => match *input {
+                    Self::Scan {
+                        table,
+                        projection: scan_projection,
+                        filter: scan_filter,
+                    } => Self::Scan {
+                        table,
+                        projection: merge_scan_projection(scan_projection, projection, &filter),
+                        filter: combine_filter_exprs(scan_filter, Some(filter)),
+                    },
+                    other => Self::Project {
+                        input: Box::new(Self::Filter {
+                            input: Box::new(other.push_scan_projection_filter()),
+                            filter,
+                        }),
+                        projection,
+                    },
+                },
+                other => Self::Project {
+                    input: Box::new(other.push_scan_projection_filter()),
+                    projection,
+                },
+            },
+            Self::Filter { input, filter } => match *input {
+                Self::Scan {
+                    table,
+                    projection,
+                    filter: scan_filter,
+                } => Self::Scan {
+                    table,
+                    projection,
+                    filter: combine_filter_exprs(scan_filter, Some(filter)),
+                },
+                other => Self::Filter {
+                    input: Box::new(other.push_scan_projection_filter()),
+                    filter,
+                },
+            },
+            Self::Aggregate {
+                input,
+                group_by,
+                aggregates,
+            } => Self::Aggregate {
+                input: Box::new(input.push_scan_projection_filter()),
+                group_by,
+                aggregates,
+            },
+            Self::SortLimit {
+                input,
+                order_by,
+                limit,
+            } => Self::SortLimit {
+                input: Box::new(input.push_scan_projection_filter()),
+                order_by,
+                limit,
+            },
+            scan @ Self::Scan { .. } => scan,
+        }
+    }
+}
+
+fn merge_scan_projection(
+    scan_projection: Projection,
+    output_projection: Projection,
+    filter: &FilterExpr,
+) -> Projection {
+    let mut columns = match (scan_projection, output_projection) {
+        (Projection::All, Projection::All)
+        | (Projection::All, Projection::Columns(_))
+        | (Projection::Columns(_), Projection::All) => return Projection::All,
+        (Projection::Columns(mut scan), Projection::Columns(output)) => {
+            for column in output {
+                add_column_once(&mut scan, column);
+            }
+            scan
+        }
+    };
+    for column in filter.referenced_columns() {
+        add_column_once(&mut columns, column);
+    }
+    Projection::Columns(columns)
+}
+
+fn combine_filter_exprs(left: Option<FilterExpr>, right: Option<FilterExpr>) -> Option<FilterExpr> {
+    match (left, right) {
+        (None, None) => None,
+        (Some(filter), None) | (None, Some(filter)) => Some(filter),
+        (Some(left), Some(right)) => Some(FilterExpr::new(Expr::And(
+            Box::new(left.expr().clone()),
+            Box::new(right.expr().clone()),
+        ))),
+    }
 }
 
 impl LogicalJoinGraph {
@@ -91,6 +336,11 @@ impl LogicalJoinGraph {
     }
 
     pub fn choose_exhaustive_bushy_plan_cost(&self) -> Option<u128> {
+        self.choose_exhaustive_bushy_plan()
+            .map(|plan| plan.estimated_cost())
+    }
+
+    pub fn choose_exhaustive_bushy_plan(&self) -> Option<LogicalJoinPlanTree> {
         let table_count = self.tables.len();
         if table_count == 0 || table_count > 10 {
             return None;
@@ -105,6 +355,12 @@ impl LogicalJoinGraph {
                 rows,
                 width,
                 cost: rows.saturating_mul(width),
+                plan: LogicalJoinPlanTree::Leaf {
+                    table_index: index,
+                    estimated_rows: rows,
+                    estimated_width: width,
+                    estimated_cost: rows.saturating_mul(width),
+                },
             });
         }
         for mask in 1usize..subset_count {
@@ -130,7 +386,9 @@ impl LogicalJoinGraph {
             }
             states[mask] = best;
         }
-        states[subset_count - 1].as_ref().map(|state| state.cost)
+        states[subset_count - 1]
+            .as_ref()
+            .map(|state| state.plan.clone())
     }
 
     pub fn table_width(&self, table_index: usize) -> u128 {
@@ -352,15 +610,23 @@ impl LogicalJoinGraph {
             rows: rows.max(1),
             width,
             cost,
+            plan: LogicalJoinPlanTree::Join {
+                left: Box::new(left.plan.clone()),
+                right: Box::new(right.plan.clone()),
+                estimated_rows: rows.max(1),
+                estimated_width: width,
+                estimated_cost: cost,
+            },
         })
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct BushyJoinState {
     rows: u128,
     width: u128,
     cost: u128,
+    plan: LogicalJoinPlanTree,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -606,7 +872,10 @@ mod tests {
         ComparisonExpr, ComparisonOp, Expr, FilterExpr, LiteralValue, Projection, SortExpr, SortKey,
     };
 
-    use super::{LogicalJoinEdge, LogicalJoinGraph, LogicalJoinTableStats, plan_join_inputs};
+    use super::{
+        ColumnRangeStats, LogicalJoinEdge, LogicalJoinGraph, LogicalJoinPlanTree,
+        LogicalJoinTableStats, LogicalPlanNode, plan_join_inputs,
+    };
 
     fn table_stats(rows: u128, row_width: u128, keys: &[(&str, u128)]) -> LogicalJoinTableStats {
         LogicalJoinTableStats {
@@ -617,6 +886,7 @@ mod tests {
                 .iter()
                 .map(|(key, ndv)| ((*key).to_string(), *ndv))
                 .collect::<HashMap<_, _>>(),
+            column_ranges: HashMap::new(),
         }
     }
 
@@ -730,8 +1000,113 @@ mod tests {
             rows: 125,
             row_width: 8,
             key_ndv: HashMap::new(),
+            column_ranges: HashMap::new(),
         };
         assert_eq!(stats.filter_selectivity(), 0.125);
+    }
+
+    #[test]
+    fn logical_join_table_stats_estimates_range_filter_selectivity() {
+        let stats = LogicalJoinTableStats {
+            base_rows: 1_000,
+            rows: 1_000,
+            row_width: 8,
+            key_ndv: HashMap::new(),
+            column_ranges: HashMap::from([(
+                "amount".to_string(),
+                ColumnRangeStats {
+                    min_i128: 0,
+                    max_i128: 99,
+                    null_count: 25,
+                    rows: 1_000,
+                },
+            )]),
+        };
+        assert_eq!(
+            stats.estimated_rows_for_range_filter("amount", Some(10), Some(19), false),
+            Some(100)
+        );
+        assert_eq!(
+            stats.estimated_rows_for_range_filter("amount", Some(10), Some(19), true),
+            Some(125)
+        );
+    }
+
+    #[test]
+    fn logical_join_graph_returns_reconstructable_bushy_tree() {
+        let graph = LogicalJoinGraph {
+            tables: vec![
+                table_stats(1_000, 32, &[("a", 100)]),
+                table_stats(1_000, 32, &[("a", 100)]),
+                table_stats(10, 16, &[("b", 10)]),
+                table_stats(10, 16, &[("b", 10)]),
+            ],
+            edges: vec![
+                LogicalJoinEdge {
+                    left: 0,
+                    left_key: "a".to_string(),
+                    right: 1,
+                    right_key: "a".to_string(),
+                },
+                LogicalJoinEdge {
+                    left: 2,
+                    left_key: "b".to_string(),
+                    right: 3,
+                    right_key: "b".to_string(),
+                },
+                LogicalJoinEdge {
+                    left: 1,
+                    left_key: "a".to_string(),
+                    right: 2,
+                    right_key: "b".to_string(),
+                },
+            ],
+        };
+
+        let tree = graph.choose_exhaustive_bushy_plan().expect("bushy plan");
+        assert!(matches!(tree, LogicalJoinPlanTree::Join { .. }));
+        assert_eq!(tree.table_count(), 4);
+        assert_eq!(
+            graph.choose_exhaustive_bushy_plan_cost(),
+            Some(tree.estimated_cost())
+        );
+        let mut tables = Vec::new();
+        tree.collect_tables(&mut tables);
+        tables.sort_unstable();
+        assert_eq!(tables, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn logical_plan_rewrite_pushes_project_and_filter_into_scan() {
+        let filter = FilterExpr::new(Expr::Comparison(ComparisonExpr {
+            column: "bucket".to_string(),
+            op: ComparisonOp::Eq,
+            value: LiteralValue::Int64(7),
+        }));
+        let plan = LogicalPlanNode::Project {
+            input: Box::new(LogicalPlanNode::Filter {
+                input: Box::new(LogicalPlanNode::Scan {
+                    table: "facts".to_string(),
+                    projection: Projection::Columns(vec!["id".to_string()]),
+                    filter: None,
+                }),
+                filter: filter.clone(),
+            }),
+            projection: Projection::Columns(vec!["value".to_string()]),
+        };
+
+        assert_eq!(
+            plan.push_scan_projection_filter(),
+            LogicalPlanNode::Scan {
+                table: "facts".to_string(),
+                projection: Projection::Columns(vec![
+                    "id".to_string(),
+                    "value".to_string(),
+                    "bucket".to_string()
+                ]),
+                filter: Some(filter),
+            }
+        );
     }
 
     #[test]

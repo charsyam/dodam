@@ -18,6 +18,7 @@ use arrow::datatypes::{DataType, Field, Int32Type, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use arrow::util::display::array_value_to_string;
 use arrow_ord::sort::{SortColumn, SortOptions, lexsort_to_indices};
+use arrow_row::{OwnedRow, RowConverter, SortField};
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take_record_batch;
 use memchr::memmem::Finder;
@@ -36,13 +37,15 @@ use sqlparser::parser::Parser;
 use crate::cost::{
     DecimalRangeSelectivityInput, ExpressionAggregateLateChunkCostInput,
     FusedSelectedAggregateCostInput, OrderedPrimitiveChunkCostInput, OrderedPrimitiveSinkCostInput,
-    PrimitiveOrderLimitCostInput, PrimitiveOrderLimitStrategy, ProjectionSelectivityCostInput,
-    SelectedPayloadDecision, SelectedPayloadSpreadCostInput, SqlRuleCostInput, WorkerCostInput,
-    choose_expression_aggregate_late_row_group_chunk, choose_fused_selected_aggregate,
-    choose_late_materialization_projection_selected_ratio,
+    PipelineMemoryCostInput, PipelineMemoryStrategy, PrimitiveOrderLimitCostInput,
+    PrimitiveOrderLimitStrategy, ProjectionSelectivityCostInput, SelectedPayloadDecision,
+    SelectedPayloadSpreadCostInput, SqlRuleCostInput, StreamingLeftDeepJoinCostInput,
+    WorkerCostInput, choose_expression_aggregate_late_row_group_chunk,
+    choose_fused_selected_aggregate, choose_late_materialization_projection_selected_ratio,
     choose_ordered_primitive_row_group_chunk, choose_ordered_primitive_sink,
-    choose_parallel_workers, choose_primitive_order_limit_strategy,
-    choose_selected_payload_by_spread, estimate_sql_rule_cost,
+    choose_parallel_workers, choose_pipeline_memory_strategy,
+    choose_primitive_order_limit_strategy, choose_selected_payload_by_spread,
+    choose_streaming_left_deep_join, estimate_sql_rule_cost,
 };
 use crate::dense::{
     AdaptiveI64Map, AdaptiveI64Set, DenseAtomicU8, DenseI64BoolLookup, DenseI64F64Sum,
@@ -60,18 +63,19 @@ use crate::execution::{
     AggregateExpr, AggregateMetrics, AggregateResult, AggregateValue, CoalesceKeyCountSumCollector,
     ComparisonExpr, ComparisonOp, DecimalDateRangeFilter, DecimalInput, DistinctExec, Expr,
     FilterExpr, GroupAggregateResult, GroupKeyExpr, GroupKeyLiteral, GroupValue, HashJoinExec,
-    JoinBuildSide, LiteralValue, MemoryExec, PhysicalPlan, PredicateSet, PrimitiveBatch,
-    PrimitiveColumn, PrimitiveColumnValues, Projection, RecordBatchSink, ScanPlanMetrics,
-    SendableBatchStream, SortExpr, SortKey, aggregate_metrics_to_batches, collect_aggregates,
-    collect_grouped_aggregates, collect_grouped_aggregates_with_key_exprs,
-    decimal_discounted_revenue_raw, decimal_discounted_revenue_raw_i64,
-    decimal_discounted_revenue_scales, decimal_input, evaluate_filter_mask,
-    evaluate_projected_view_filter_mask, filter_batch, scan_projection,
+    JoinBuildSide, LiteralValue, MemoryExec, PartitionedHashJoinExec, PartitionedHashJoinOptions,
+    PhysicalPlan, PredicateSet, PrimitiveBatch, PrimitiveColumn, PrimitiveColumnValues, Projection,
+    RecordBatchSink, ScanPlanMetrics, SendableBatchStream, SortExpr, SortKey, StripPrefixExec,
+    aggregate_metrics_to_batches, collect_aggregates, collect_grouped_aggregates,
+    collect_grouped_aggregates_with_key_exprs, decimal_discounted_revenue_raw,
+    decimal_discounted_revenue_raw_i64, decimal_discounted_revenue_scales, decimal_input,
+    evaluate_filter_mask, evaluate_projected_view_filter_mask, filter_batch, scan_projection,
     try_for_each_i64_i64_date32,
 };
 use crate::hash::{FastHashMap, FastHashSet, fast_hash_map, fast_hash_map_with_capacity};
 use crate::optimizer::{
-    JoinInputPlan, LogicalJoinEdge, LogicalJoinGraph, LogicalJoinTableStats, plan_join_inputs,
+    ColumnRangeStats, JoinInputPlan, LogicalJoinEdge, LogicalJoinGraph, LogicalJoinPlanTree,
+    LogicalJoinTableStats, plan_join_inputs,
 };
 use crate::storage::{
     DirectColumnScanMetrics, DirectI64I32I32ScanMetrics, DirectOrderedPrimitiveBatch,
@@ -117,6 +121,7 @@ fn sql_nanos_to_millis(nanos: u64) -> f64 {
 
 const DEFAULT_MAX_DENSE_I64_KEY: usize = 20_000_000;
 const DEFAULT_Q09_ORDER_YEAR_DENSE_BYTES: usize = 384 * 1024 * 1024;
+const MAX_SQL_EXTERNAL_JOIN_PARTITIONS: usize = 1024;
 
 #[derive(Debug)]
 pub enum QueryOutput {
@@ -1662,12 +1667,25 @@ async fn try_execute_set_operation_sql(
         batches = apply_output_order_limit(batches, order_by.as_ref(), limit, offset)?;
         return Ok(Some(QueryOutput::Scan { batches }));
     }
+    if let Some(mut batches) = try_execute_same_source_distinct_set_scan(
+        engine,
+        query.body.as_ref(),
+        batch_size,
+        order_by.as_ref(),
+        limit,
+        offset,
+    )
+    .await?
+    {
+        batches = apply_output_order_limit(batches, order_by.as_ref(), limit, offset)?;
+        return Ok(Some(QueryOutput::Scan { batches }));
+    }
     let child_topk = if offset == 0 {
         order_by.as_ref().zip(limit)
     } else {
         None
     };
-    let mut batches = Box::pin(execute_union_set_expr(
+    let mut batches = Box::pin(execute_set_operation_expr(
         engine,
         query.body.as_ref(),
         batch_size,
@@ -4790,6 +4808,43 @@ async fn try_execute_same_source_union_distinct_scan(
     Ok(Some(batches))
 }
 
+async fn try_execute_same_source_distinct_set_scan(
+    engine: &DodamEngine,
+    expr: &SetExpr,
+    batch_size: usize,
+    order_by: Option<&SortKey>,
+    limit: Option<usize>,
+    offset: usize,
+) -> Result<Option<Vec<RecordBatch>>> {
+    let Some(shared) = plan_same_source_distinct_set_scan(expr)? else {
+        return Ok(None);
+    };
+    if let Some(batches) = try_execute_direct_distinct_scan(
+        engine,
+        DirectDistinctScan {
+            path: shared.path.clone(),
+            projection: shared.projection.clone(),
+            aliases: shared.aliases.clone(),
+            filter: Some(shared.filter.clone()),
+        },
+        batch_size,
+    )? {
+        return Ok(Some(batches));
+    }
+    let stream = engine
+        .scan_parquet_distinct_batches(
+            shared.path,
+            batch_size,
+            scan_limit_with_offset(limit, offset)?,
+            shared.projection,
+            Some(shared.filter),
+            order_by.cloned(),
+        )
+        .await?;
+    let batches = rename_output_batches(collect_batches(stream)?, &shared.aliases)?;
+    Ok(Some(batches))
+}
+
 #[derive(Clone)]
 struct DirectDistinctScan {
     path: PathBuf,
@@ -5365,6 +5420,34 @@ fn plan_same_source_union_distinct_scan(expr: &SetExpr) -> Result<Option<SameSou
     Ok(Some(shared))
 }
 
+fn plan_same_source_distinct_set_scan(expr: &SetExpr) -> Result<Option<SameSourceUnionAllScan>> {
+    let SetExpr::SetOperation {
+        op,
+        set_quantifier,
+        left,
+        right,
+    } = expr
+    else {
+        return Ok(None);
+    };
+    if !matches!(*op, SetOperator::Intersect | SetOperator::Except)
+        || !union_quantifier_is_distinct(*set_quantifier)
+    {
+        return Ok(None);
+    }
+    let Some(left_query) = single_set_operand_query(left.as_ref())? else {
+        return Ok(None);
+    };
+    let Some(right_query) = single_set_operand_query(right.as_ref())? else {
+        return Ok(None);
+    };
+    Ok(same_source_distinct_set_plan(
+        &left_query,
+        &right_query,
+        *op,
+    ))
+}
+
 struct SameSourceUnionAllScan {
     path: PathBuf,
     projection: Projection,
@@ -5379,6 +5462,25 @@ struct SameSourceUnionAllFilterScan {
     aliases: Vec<(String, String)>,
     filters: Vec<FilterExpr>,
     prefilter: FilterExpr,
+}
+
+fn single_set_operand_query(expr: &SetExpr) -> Result<Option<SqlQuery>> {
+    match expr {
+        SetExpr::Query(query) => {
+            if query_contains_set_operation(query.body.as_ref())
+                || query.order_by.is_some()
+                || query.limit_clause.is_some()
+                || parse_offset(query)? != 0
+                || query.fetch.is_some()
+                || !query.locks.is_empty()
+            {
+                return Ok(None);
+            }
+            Ok(Some(parse_sql(&query.to_string())?))
+        }
+        SetExpr::Select(_) => Ok(Some(parse_sql(&expr.to_string())?)),
+        _ => Ok(None),
+    }
 }
 
 fn collect_union_distinct_operand_queries(
@@ -5482,6 +5584,42 @@ fn same_source_union_distinct_plan(operands: &[SqlQuery]) -> Option<SameSourceUn
         aliases: first.aliases.clone(),
         filter: FilterExpr::new(Expr::InList {
             column: filter_column,
+            values,
+            negated: false,
+            has_null: false,
+        }),
+    })
+}
+
+fn same_source_distinct_set_plan(
+    left: &SqlQuery,
+    right: &SqlQuery,
+    op: SetOperator,
+) -> Option<SameSourceUnionAllScan> {
+    if !same_source_union_all_operand_supported(left)
+        || !same_source_union_all_operand_supported(right)
+        || left.path != right.path
+        || left.projection != right.projection
+        || left.aliases != right.aliases
+    {
+        return None;
+    }
+    let (left_column, left_values) = positive_literal_filter_values(left.filter.as_ref()?)?;
+    let (right_column, right_values) = positive_literal_filter_values(right.filter.as_ref()?)?;
+    if left_column != right_column {
+        return None;
+    }
+    let values = match op {
+        SetOperator::Intersect => intersect_literal_values(left_values, &right_values),
+        SetOperator::Except => except_literal_values(left_values, &right_values),
+        _ => return None,
+    };
+    Some(SameSourceUnionAllScan {
+        path: left.path.clone(),
+        projection: left.projection.clone(),
+        aliases: left.aliases.clone(),
+        filter: FilterExpr::new(Expr::InList {
+            column: left_column,
             values,
             negated: false,
             has_null: false,
@@ -5595,6 +5733,36 @@ fn append_unique_literal_values(output: &mut Vec<LiteralValue>, values: Vec<Lite
     }
 }
 
+fn intersect_literal_values(
+    left_values: Vec<LiteralValue>,
+    right_values: &[LiteralValue],
+) -> Vec<LiteralValue> {
+    let mut output = Vec::new();
+    for value in left_values {
+        if right_values.iter().any(|right| right == &value)
+            && !output.iter().any(|existing| existing == &value)
+        {
+            output.push(value);
+        }
+    }
+    output
+}
+
+fn except_literal_values(
+    left_values: Vec<LiteralValue>,
+    right_values: &[LiteralValue],
+) -> Vec<LiteralValue> {
+    let mut output = Vec::new();
+    for value in left_values {
+        if !right_values.iter().any(|right| right == &value)
+            && !output.iter().any(|existing| existing == &value)
+        {
+            output.push(value);
+        }
+    }
+    output
+}
+
 fn append_disjoint_literal_values(
     output: &mut Vec<LiteralValue>,
     values: Vec<LiteralValue>,
@@ -5637,7 +5805,7 @@ fn query_contains_set_operation(expr: &SetExpr) -> bool {
     }
 }
 
-async fn execute_union_set_expr(
+async fn execute_set_operation_expr(
     engine: &DodamEngine,
     expr: &SetExpr,
     batch_size: usize,
@@ -5652,7 +5820,7 @@ async fn execute_union_set_expr(
             right,
         } if *op == SetOperator::Union => {
             let distinct = union_quantifier_is_distinct(*set_quantifier);
-            let mut left_batches = Box::pin(execute_union_set_expr(
+            let mut left_batches = Box::pin(execute_set_operation_expr(
                 engine,
                 left.as_ref(),
                 batch_size,
@@ -5660,7 +5828,7 @@ async fn execute_union_set_expr(
                 child_distinct || distinct,
             ))
             .await?;
-            let right_batches = Box::pin(execute_union_set_expr(
+            let right_batches = Box::pin(execute_set_operation_expr(
                 engine,
                 right.as_ref(),
                 batch_size,
@@ -5675,13 +5843,43 @@ async fn execute_union_set_expr(
             Ok(left_batches)
         }
         SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } if *op == SetOperator::Intersect || *op == SetOperator::Except => {
+            if !union_quantifier_is_distinct(*set_quantifier) {
+                return Err(DodamError::UnsupportedSql(format!(
+                    "{op} {set_quantifier} is not supported yet"
+                )));
+            }
+            let left_batches = Box::pin(execute_set_operation_expr(
+                engine,
+                left.as_ref(),
+                batch_size,
+                None,
+                false,
+            ))
+            .await?;
+            let right_batches = Box::pin(execute_set_operation_expr(
+                engine,
+                right.as_ref(),
+                batch_size,
+                None,
+                false,
+            ))
+            .await?;
+            let batches = apply_distinct_row_set_operation(left_batches, right_batches, *op)?;
+            apply_output_distinct(batches, child_distinct)
+        }
+        SetExpr::SetOperation {
             op, set_quantifier, ..
         } => Err(DodamError::UnsupportedSql(format!(
             "{op} {set_quantifier} is not supported yet"
         ))),
         SetExpr::Query(query) => {
             if query_contains_set_operation(query.body.as_ref()) {
-                return Box::pin(execute_union_set_expr(
+                return Box::pin(execute_set_operation_expr(
                     engine,
                     query.body.as_ref(),
                     batch_size,
@@ -5712,7 +5910,7 @@ async fn execute_union_set_expr(
             apply_output_distinct(batches, child_distinct)
         }
         other => Err(DodamError::UnsupportedSql(format!(
-            "unsupported UNION operand: {other}"
+            "unsupported set operation operand: {other}"
         ))),
     }
 }
@@ -5763,6 +5961,99 @@ fn sort_key_to_sql(order_by: &SortKey) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn apply_distinct_row_set_operation(
+    left_batches: Vec<RecordBatch>,
+    right_batches: Vec<RecordBatch>,
+    op: SetOperator,
+) -> Result<Vec<RecordBatch>> {
+    let Some(left_schema) = set_operation_schema(&left_batches).cloned() else {
+        return Ok(Vec::new());
+    };
+    validate_union_all_batches(&left_schema, &left_batches)?;
+    validate_union_all_batches(&left_schema, &right_batches)?;
+
+    let left_batch = concat_or_empty_set_batches(&left_schema, &left_batches)?;
+    if left_batch.num_rows() == 0 {
+        return Ok(vec![left_batch]);
+    }
+
+    let right_batch = concat_or_empty_set_batches(&left_schema, &right_batches)?;
+    if right_batch.num_rows() == 0 {
+        return match op {
+            SetOperator::Except => apply_output_distinct(vec![left_batch], true),
+            SetOperator::Intersect => Ok(vec![RecordBatch::new_empty(left_schema)]),
+            _ => Err(DodamError::UnsupportedSql(format!(
+                "{op} is not supported by DISTINCT row set operation"
+            ))),
+        };
+    }
+
+    let converter = row_set_converter(left_schema.as_ref())?;
+    let right_rows = converter.convert_columns(right_batch.columns())?;
+    let right_set = right_rows
+        .iter()
+        .map(|row| row.owned())
+        .collect::<HashSet<OwnedRow>>();
+
+    let left_rows = converter.convert_columns(left_batch.columns())?;
+    let mut seen_left = HashSet::<OwnedRow>::new();
+    let mut indices = Vec::new();
+    for (index, row) in left_rows.iter().enumerate() {
+        let owned = row.owned();
+        let matches = right_set.contains(&owned);
+        let keep = match op {
+            SetOperator::Intersect => matches,
+            SetOperator::Except => !matches,
+            _ => false,
+        };
+        if keep && seen_left.insert(owned) {
+            let index = u32::try_from(index).map_err(|_| {
+                DodamError::UnsupportedSql(
+                    "set operation currently supports up to u32::MAX rows".to_string(),
+                )
+            })?;
+            indices.push(index);
+        }
+    }
+
+    if indices.is_empty() {
+        return Ok(vec![RecordBatch::new_empty(left_schema)]);
+    }
+    let indices = UInt32Array::from(indices);
+    Ok(vec![take_record_batch(&left_batch, &indices)?])
+}
+
+fn set_operation_schema(batches: &[RecordBatch]) -> Option<&Arc<Schema>> {
+    batches
+        .iter()
+        .find(|batch| batch.num_columns() > 0 || batch.num_rows() > 0)
+        .map(RecordBatch::schema_ref)
+        .or_else(|| batches.first().map(RecordBatch::schema_ref))
+}
+
+fn concat_or_empty_set_batches(
+    schema: &Arc<Schema>,
+    batches: &[RecordBatch],
+) -> Result<RecordBatch> {
+    let non_empty = batches
+        .iter()
+        .filter(|batch| batch.num_rows() > 0)
+        .collect::<Vec<_>>();
+    if non_empty.is_empty() {
+        return Ok(RecordBatch::new_empty(schema.clone()));
+    }
+    Ok(concat_batches(schema, non_empty)?)
+}
+
+fn row_set_converter(schema: &Schema) -> Result<RowConverter> {
+    let sort_fields = schema
+        .fields()
+        .iter()
+        .map(|field| SortField::new(field.data_type().clone()))
+        .collect::<Vec<_>>();
+    Ok(RowConverter::new(sort_fields)?)
 }
 
 fn append_union_all_batches(
@@ -11178,7 +11469,7 @@ fn predicate_requires_expression_path(expr: &SqlExpr) -> bool {
 fn scalar_predicate_side_requires_expression(expr: &SqlExpr) -> bool {
     match expr {
         SqlExpr::Identifier(_) => false,
-        SqlExpr::CompoundIdentifier(parts) => parts.len() > 2,
+        SqlExpr::CompoundIdentifier(parts) => parts.len() > 1,
         SqlExpr::Function(_)
         | SqlExpr::Substring { .. }
         | SqlExpr::Cast { .. }
@@ -39846,9 +40137,11 @@ fn build_unique_i64_to_utf8_id_lookup(
                 value_ids.insert(payload, value_id);
                 value_id
             };
-            if lookup.insert(key.value(row), value_id).is_some() {
+            let key_value = key.value(row);
+            if lookup.contains_key(&key_value) {
                 return Ok(None);
             }
+            lookup.insert(key_value, value_id);
         }
     }
     let lookup = AdaptiveI64Map::from_hash(lookup);
@@ -41166,6 +41459,26 @@ async fn try_execute_multi_comma_join_sql(
         &alias_refs,
     )?;
     let limit = parse_limit(query)?;
+    if let Some(output) = try_execute_multi_comma_lookup_count_sum_aggregate(
+        engine,
+        &tables,
+        &aliases,
+        &alias_refs,
+        &conjuncts,
+        &used_conjuncts,
+        &scan_filters,
+        &group_by,
+        &projection,
+        distinct,
+        having.as_ref(),
+        order_by.as_ref(),
+        limit,
+        batch_size,
+    )
+    .await?
+    {
+        return Ok(Some(output));
+    }
     let scan_projections = comma_join_scan_projections(
         &conjuncts,
         &aliases,
@@ -41210,135 +41523,35 @@ async fn try_execute_multi_comma_join_sql(
         &alias_refs,
         &conjuncts,
     )?;
-    let start_index = join_graph
-        .choose_best_plan()
-        .map(|plan| plan.start)
-        .unwrap_or_else(|| {
-            row_counts
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, rows)| *rows)
-                .map(|(index, _)| index)
-                .expect("at least one comma join table")
-        });
-    let mut current = scanned[start_index].take().expect("start input scanned");
-    let mut current_rows = row_counts[start_index];
-    let mut joined_aliases = vec![aliases[start_index].clone()];
-    let mut remaining = (0..tables.len())
-        .filter(|index| *index != start_index)
-        .collect::<Vec<_>>();
-    while !remaining.is_empty() {
-        let mut candidates = Vec::new();
-        for (remaining_index, table_index) in remaining.iter().copied().enumerate() {
-            let alias = &aliases[table_index];
-            let mut left_keys = Vec::new();
-            let mut right_keys = Vec::new();
-            let mut conjunct_indexes = Vec::new();
-            for (index, conjunct) in conjuncts.iter().enumerate() {
-                if used_conjuncts[index] {
-                    continue;
-                }
-                if let Some((left_key, right_key)) =
-                    comma_join_keys_for_next(conjunct, &joined_aliases, alias, &alias_refs)?
-                {
-                    left_keys.push(left_key);
-                    right_keys.push(right_key);
-                    conjunct_indexes.push(index);
-                }
-            }
-            if !left_keys.is_empty() {
-                candidates.push((
-                    remaining_index,
-                    table_index,
-                    left_keys,
-                    right_keys,
-                    conjunct_indexes,
-                ));
-            }
-        }
-        let selected = if candidates.len() <= 1 {
-            candidates.into_iter().next()
-        } else {
-            let joined = aliases
-                .iter()
-                .map(|alias| joined_aliases.iter().any(|joined| joined == alias))
-                .collect::<Vec<_>>();
-            let candidate_table_indexes = candidates
-                .iter()
-                .map(|(_, table_index, _, _, _)| *table_index)
-                .collect::<Vec<_>>();
-            let selected_step = join_graph.choose_next_join(
-                &joined,
-                current_rows as u128,
-                estimated_batches_row_width(&current),
-                &candidate_table_indexes,
-            );
-            selected_step
-                .and_then(|step| {
-                    candidates
-                        .iter()
-                        .position(|(_, table_index, _, _, _)| *table_index == step.table_index)
-                })
-                .map(|index| candidates.swap_remove(index))
-        };
-        let Some((remaining_index, table_index, left_keys, right_keys, conjunct_indexes)) =
-            selected
-        else {
-            return Err(DodamError::UnsupportedSql(format!(
-                "comma join could not find equality predicate for remaining tables: {}",
-                remaining
-                    .iter()
-                    .map(|index| aliases[*index].as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
-        };
-        for index in conjunct_indexes {
-            used_conjuncts[index] = true;
-        }
-        remaining.remove(remaining_index);
-        let alias = &aliases[table_index];
-        let right = scanned[table_index]
-            .take()
-            .expect("remaining input scanned");
-        let right_rows = row_counts[table_index];
-        let left_prefix = if joined_aliases.len() == 1 {
-            joined_aliases[0].as_str()
-        } else {
-            "__dodam_join"
-        };
-        let build_side = if current_rows <= right_rows {
-            JoinBuildSide::Left
-        } else {
-            JoinBuildSide::Right
-        };
-        let stream = Box::new(HashJoinExec::new(
-            Box::new(MemoryExec::new(current)),
-            Box::new(MemoryExec::new(right)),
-            left_keys,
-            right_keys,
-            left_prefix.to_string(),
-            alias.clone(),
-            build_side,
-            JoinType::Inner,
-            Projection::All,
-        ))
-        .execute()?;
-        current = collect_batches(stream)?;
-        current_rows = record_batch_rows(&current);
-        if left_prefix == "__dodam_join" {
-            current = strip_batch_field_prefix(current, "__dodam_join.")?;
-        }
-        joined_aliases.push(alias.clone());
-        current = prune_comma_join_current_columns(
-            current,
-            &joined_aliases,
+    let join_plan = join_graph.choose_best_plan();
+    log_comma_join_optimizer_plan(&join_graph, join_plan.as_ref());
+    let current = if let Some(tree) =
+        choose_bushy_comma_join_execution_tree(&join_graph, join_plan.as_ref())
+    {
+        execute_bushy_comma_join_tree(
+            &tree,
+            &mut scanned,
+            &row_counts,
+            &aliases,
             &alias_refs,
             &conjuncts,
-            &used_conjuncts,
+            &mut used_conjuncts,
             &final_columns,
-        )?;
-    }
+        )?
+        .batches
+    } else {
+        execute_left_deep_comma_join(
+            scanned,
+            &row_counts,
+            &aliases,
+            &alias_refs,
+            &conjuncts,
+            &mut used_conjuncts,
+            &final_columns,
+            &join_graph,
+            join_plan.as_ref(),
+        )?
+    };
 
     let residual = conjuncts
         .into_iter()
@@ -41426,6 +41639,697 @@ fn record_batch_rows(batches: &[RecordBatch]) -> usize {
     batches.iter().map(RecordBatch::num_rows).sum()
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn try_execute_multi_comma_lookup_count_sum_aggregate(
+    engine: &DodamEngine,
+    tables: &[SqlTableRef],
+    aliases: &[String],
+    alias_refs: &[&str],
+    conjuncts: &[SqlExpr],
+    used_conjuncts: &[bool],
+    scan_filters: &[Option<FilterExpr>],
+    group_by: &[String],
+    projection: &ParsedProjection,
+    distinct: bool,
+    having: Option<&FilterExpr>,
+    order_by: Option<&SortKey>,
+    limit: Option<usize>,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    if std::env::var("DODAM_DISABLE_MULTI_COMMA_LOOKUP_COUNT_SUM_FUSION")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return Ok(None);
+    }
+    if distinct
+        || having.is_some()
+        || !projection.aggregate_expressions.is_empty()
+        || !projection.filtered_aggregates.is_empty()
+        || group_by.is_empty()
+        || group_by.len() > 4
+    {
+        return Ok(None);
+    }
+    let [AggregateExpr::CountStar, AggregateExpr::Sum(sum_column)] =
+        projection.aggregates.as_slice()
+    else {
+        return Ok(None);
+    };
+    let Some(fact_alias) = join_column_owner(sum_column, alias_refs) else {
+        return Ok(None);
+    };
+    let Some(fact_index) = aliases
+        .iter()
+        .position(|alias| alias.eq_ignore_ascii_case(fact_alias))
+    else {
+        return Ok(None);
+    };
+
+    let mut dimensions = Vec::new();
+    let mut seen_dimension_aliases = HashSet::new();
+    for group_column in group_by {
+        let Some(group_alias) = join_column_owner(group_column, alias_refs) else {
+            return Ok(None);
+        };
+        if group_alias.eq_ignore_ascii_case(fact_alias) {
+            return Ok(None);
+        }
+        if !seen_dimension_aliases.insert(group_alias.to_string()) {
+            return Ok(None);
+        }
+        let Some(dimension_index) = aliases
+            .iter()
+            .position(|alias| alias.eq_ignore_ascii_case(group_alias))
+        else {
+            return Ok(None);
+        };
+        let Some((fact_key, dimension_key)) = comma_join_fact_dimension_key(
+            conjuncts,
+            used_conjuncts,
+            fact_alias,
+            group_alias,
+            alias_refs,
+        )?
+        else {
+            return Ok(None);
+        };
+        dimensions.push(MultiCommaLookupDimensionPlan {
+            table_index: dimension_index,
+            fact_key,
+            dimension_key,
+            payload_column: unqualified_join_column(group_column, group_alias),
+        });
+    }
+    if dimensions.is_empty() || dimensions.len() + 1 != tables.len() {
+        return Ok(None);
+    }
+    if !multi_comma_lookup_consumes_all_residual_join_edges(
+        conjuncts,
+        used_conjuncts,
+        fact_alias,
+        &dimensions,
+        aliases,
+        alias_refs,
+    )? {
+        return Ok(None);
+    }
+
+    let profile = join_profile_enabled_sql();
+    let total_started = profile.then(Instant::now);
+    let mut lookups = Vec::with_capacity(dimensions.len());
+    let lookup_started = profile.then(Instant::now);
+    for dimension in &dimensions {
+        let table = &tables[dimension.table_index];
+        let batches = scan_join_side_batches(
+            engine,
+            table,
+            batch_size,
+            scan_filters[dimension.table_index].as_ref(),
+            Projection::Columns(unique_columns([
+                dimension.dimension_key.clone(),
+                dimension.payload_column.clone(),
+            ])),
+        )
+        .await?;
+        let Some(lookup) = build_unique_i64_to_utf8_id_lookup(
+            &batches,
+            &dimension.dimension_key,
+            &dimension.payload_column,
+        )?
+        else {
+            return Ok(None);
+        };
+        lookups.push(MultiCommaLookupDimension {
+            fact_key: dimension.fact_key.clone(),
+            lookup,
+        });
+    }
+    let lookup_nanos = elapsed_optional_nanos(lookup_started);
+    let lookup_dense_slices = lookups
+        .iter()
+        .map(|lookup| lookup.lookup.lookup.dense_slices())
+        .collect::<Vec<_>>();
+
+    let fact_sum = strip_column_prefix(sum_column, fact_alias);
+    let fact_projection = Projection::Columns(unique_columns(
+        lookups
+            .iter()
+            .map(|lookup| lookup.fact_key.clone())
+            .chain(std::iter::once(fact_sum.clone())),
+    ));
+    let fact_scan_started = profile.then(Instant::now);
+    let mut fact_stream = engine
+        .scan_parquet_batches(
+            tables[fact_index].path.clone(),
+            batch_size,
+            None,
+            fact_projection,
+            scan_filters[fact_index].clone(),
+        )
+        .await?;
+    let mut groups = MultiCommaLookupCountSumGroups::new(&lookups);
+    let mut rows = 0usize;
+    let mut batches = 0usize;
+    let mut fact_array_view_nanos = 0u64;
+    let mut fact_update_nanos = 0u64;
+    while let Some(batch) = fact_stream.next() {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        batches += 1;
+        rows = rows.saturating_add(batch.num_rows());
+        let array_view_started = profile.then(Instant::now);
+        let fact_keys = lookups
+            .iter()
+            .map(|lookup| i64_array_like(&batch, &lookup.fact_key))
+            .collect::<Result<Vec<_>>>()?;
+        let sum_values = i64_array_like(&batch, &fact_sum)?;
+        fact_array_view_nanos =
+            fact_array_view_nanos.saturating_add(elapsed_optional_nanos(array_view_started));
+
+        let update_started = profile.then(Instant::now);
+        let keys_null_free = fact_keys.iter().all(|key| !key.has_nulls());
+        let sum_null_free = !sum_values.has_nulls();
+        if keys_null_free
+            && sum_null_free
+            && lookups.len() == 2
+            && lookup_dense_slices.iter().all(Option::is_some)
+        {
+            let (values0, present0) = lookup_dense_slices[0].expect("validated dense lookup");
+            let (values1, present1) = lookup_dense_slices[1].expect("validated dense lookup");
+            for row in 0..batch.num_rows() {
+                let Some(first_id) = dense_usize_lookup(values0, present0, fact_keys[0].value(row))
+                else {
+                    continue;
+                };
+                let Some(second_id) =
+                    dense_usize_lookup(values1, present1, fact_keys[1].value(row))
+                else {
+                    continue;
+                };
+                groups.update(&[first_id, second_id], Some(sum_values.value(row)));
+            }
+        } else if keys_null_free
+            && sum_null_free
+            && lookups.len() == 3
+            && lookup_dense_slices.iter().all(Option::is_some)
+        {
+            let (values0, present0) = lookup_dense_slices[0].expect("validated dense lookup");
+            let (values1, present1) = lookup_dense_slices[1].expect("validated dense lookup");
+            let (values2, present2) = lookup_dense_slices[2].expect("validated dense lookup");
+            for row in 0..batch.num_rows() {
+                let Some(first_id) = dense_usize_lookup(values0, present0, fact_keys[0].value(row))
+                else {
+                    continue;
+                };
+                let Some(second_id) =
+                    dense_usize_lookup(values1, present1, fact_keys[1].value(row))
+                else {
+                    continue;
+                };
+                let Some(third_id) = dense_usize_lookup(values2, present2, fact_keys[2].value(row))
+                else {
+                    continue;
+                };
+                groups.update(
+                    &[first_id, second_id, third_id],
+                    Some(sum_values.value(row)),
+                );
+            }
+        } else if keys_null_free && sum_null_free {
+            for row in 0..batch.num_rows() {
+                let mut key = [0usize; 4];
+                let mut key_len = 0usize;
+                let mut matched = true;
+                for ((fact_key, lookup), dense_lookup) in
+                    fact_keys.iter().zip(&lookups).zip(&lookup_dense_slices)
+                {
+                    let Some(value_id) = lookup
+                        .lookup
+                        .lookup
+                        .get_cached(*dense_lookup, fact_key.value(row))
+                    else {
+                        matched = false;
+                        break;
+                    };
+                    key[key_len] = value_id;
+                    key_len += 1;
+                }
+                if matched {
+                    groups.update(&key[..key_len], Some(sum_values.value(row)));
+                }
+            }
+        } else {
+            for row in 0..batch.num_rows() {
+                let mut key = [0usize; 4];
+                let mut key_len = 0usize;
+                let mut matched = true;
+                for ((fact_key, lookup), dense_lookup) in
+                    fact_keys.iter().zip(&lookups).zip(&lookup_dense_slices)
+                {
+                    if fact_key.is_null(row) {
+                        matched = false;
+                        break;
+                    }
+                    let Some(value_id) = lookup
+                        .lookup
+                        .lookup
+                        .get_cached(*dense_lookup, fact_key.value(row))
+                    else {
+                        matched = false;
+                        break;
+                    };
+                    key[key_len] = value_id;
+                    key_len += 1;
+                }
+                if !matched {
+                    continue;
+                }
+                groups.update(
+                    &key[..key_len],
+                    (!sum_values.is_null(row)).then(|| sum_values.value(row)),
+                );
+            }
+        }
+        fact_update_nanos =
+            fact_update_nanos.saturating_add(elapsed_optional_nanos(update_started));
+    }
+    let fact_scan_nanos = elapsed_optional_nanos(fact_scan_started);
+
+    let finish_started = profile.then(Instant::now);
+    let mut group_results = groups.finish(&lookups, sum_column);
+    group_results.sort_by(|left, right| compare_join_fused_group_keys(&left.keys, &right.keys));
+    let finish_nanos = elapsed_optional_nanos(finish_started);
+    let output_started = profile.then(Instant::now);
+    let metrics = AggregateMetrics {
+        fragments: tables.len(),
+        batches,
+        rows,
+        groups: group_results,
+        ..AggregateMetrics::default()
+    };
+    let mut output = aggregate_metrics_to_batches(&metrics, group_by, &projection.aggregates)?;
+    output = apply_output_order_limit(output, order_by, limit, 0)?;
+    output = rename_output_batches(output, &projection.aliases)?;
+    let output_nanos = elapsed_optional_nanos(output_started);
+    if profile {
+        eprintln!(
+            "[dodam:join-fusion-profile] rule=multi_comma_lookup_count_sum total={:.3}ms lookup={:.3}ms fact_scan_aggregate={:.3}ms fact_array_view={:.3}ms fact_update={:.3}ms finish={:.3}ms output={:.3}ms fact_batches={} fact_rows={} groups={}",
+            sql_nanos_to_millis(elapsed_optional_nanos(total_started)),
+            sql_nanos_to_millis(lookup_nanos),
+            sql_nanos_to_millis(fact_scan_nanos),
+            sql_nanos_to_millis(fact_array_view_nanos),
+            sql_nanos_to_millis(fact_update_nanos),
+            sql_nanos_to_millis(finish_nanos),
+            sql_nanos_to_millis(output_nanos),
+            batches,
+            rows,
+            metrics.groups.len(),
+        );
+    }
+    Ok(Some(QueryOutput::Aggregate {
+        metrics,
+        batches: output,
+    }))
+}
+
+struct MultiCommaLookupDimensionPlan {
+    table_index: usize,
+    fact_key: String,
+    dimension_key: String,
+    payload_column: String,
+}
+
+struct MultiCommaLookupDimension {
+    fact_key: String,
+    lookup: UniqueI64ToUtf8IdLookup,
+}
+
+#[inline]
+fn dense_usize_lookup(values: &[usize], present: &[bool], key: i64) -> Option<usize> {
+    let index = usize::try_from(key).ok()?;
+    present
+        .get(index)
+        .copied()
+        .filter(|present| *present)
+        .map(|_| values[index])
+}
+
+fn multi_comma_lookup_small_group_limit() -> usize {
+    std::env::var("DODAM_MULTI_COMMA_LOOKUP_SMALL_GROUP_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(64)
+}
+
+fn multi_comma_lookup_dense_group_slots() -> usize {
+    std::env::var("DODAM_MULTI_COMMA_LOOKUP_DENSE_GROUP_SLOTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(4096)
+}
+
+#[derive(Clone, Default)]
+struct MultiCommaLookupCountSumGroup {
+    count: u64,
+    sum: i64,
+    sum_count: u64,
+}
+
+enum MultiCommaLookupCountSumGroups {
+    TwoDense {
+        second_len: usize,
+        groups: Vec<Option<MultiCommaLookupCountSumGroup>>,
+    },
+    TwoSmall(Vec<((usize, usize), MultiCommaLookupCountSumGroup)>),
+    Two(FastHashMap<(usize, usize), MultiCommaLookupCountSumGroup>),
+    ThreeDense {
+        second_len: usize,
+        third_len: usize,
+        groups: Vec<Option<MultiCommaLookupCountSumGroup>>,
+    },
+    ThreeSmall(Vec<((usize, usize, usize), MultiCommaLookupCountSumGroup)>),
+    Three(FastHashMap<(usize, usize, usize), MultiCommaLookupCountSumGroup>),
+    Generic(FastHashMap<Vec<usize>, MultiCommaLookupCountSumGroup>),
+}
+
+impl MultiCommaLookupCountSumGroups {
+    fn new(lookups: &[MultiCommaLookupDimension]) -> Self {
+        match lookups.len() {
+            2 => {
+                let first_len = lookups[0].lookup.values.len();
+                let second_len = lookups[1].lookup.values.len();
+                let slots = first_len.saturating_mul(second_len);
+                if slots > 0 && slots <= multi_comma_lookup_dense_group_slots() {
+                    let mut groups = Vec::with_capacity(slots);
+                    groups.resize_with(slots, || None);
+                    Self::TwoDense { second_len, groups }
+                } else {
+                    Self::TwoSmall(Vec::new())
+                }
+            }
+            3 => {
+                let first_len = lookups[0].lookup.values.len();
+                let second_len = lookups[1].lookup.values.len();
+                let third_len = lookups[2].lookup.values.len();
+                let slots = first_len
+                    .saturating_mul(second_len)
+                    .saturating_mul(third_len);
+                if slots > 0 && slots <= multi_comma_lookup_dense_group_slots() {
+                    let mut groups = Vec::with_capacity(slots);
+                    groups.resize_with(slots, || None);
+                    Self::ThreeDense {
+                        second_len,
+                        third_len,
+                        groups,
+                    }
+                } else {
+                    Self::ThreeSmall(Vec::new())
+                }
+            }
+            _ => Self::Generic(FastHashMap::default()),
+        }
+    }
+
+    fn update(&mut self, key: &[usize], sum: Option<i64>) {
+        let group = match self {
+            Self::TwoDense { second_len, groups } if key.len() == 2 => {
+                let Some(slot) = key[0]
+                    .checked_mul(*second_len)
+                    .and_then(|slot| slot.checked_add(key[1]))
+                else {
+                    return;
+                };
+                let Some(group) = groups.get_mut(slot) else {
+                    return;
+                };
+                group.get_or_insert_with(MultiCommaLookupCountSumGroup::default)
+            }
+            Self::TwoSmall(groups) if key.len() == 2 => {
+                let tuple = (key[0], key[1]);
+                if let Some((_, group)) =
+                    groups.iter_mut().find(|(candidate, _)| *candidate == tuple)
+                {
+                    group
+                } else if groups.len() < multi_comma_lookup_small_group_limit() {
+                    groups.push((tuple, MultiCommaLookupCountSumGroup::default()));
+                    &mut groups.last_mut().expect("pushed small group").1
+                } else {
+                    let mut hash = FastHashMap::default();
+                    for (key, group) in std::mem::take(groups) {
+                        hash.insert(key, group);
+                    }
+                    *self = Self::Two(hash);
+                    let Self::Two(groups) = self else {
+                        unreachable!("converted to two-key hash groups");
+                    };
+                    groups.entry(tuple).or_default()
+                }
+            }
+            Self::Two(groups) if key.len() == 2 => groups.entry((key[0], key[1])).or_default(),
+            Self::ThreeDense {
+                second_len,
+                third_len,
+                groups,
+            } if key.len() == 3 => {
+                let Some(slot) = key[0]
+                    .checked_mul(*second_len)
+                    .and_then(|slot| slot.checked_add(key[1]))
+                    .and_then(|slot| slot.checked_mul(*third_len))
+                    .and_then(|slot| slot.checked_add(key[2]))
+                else {
+                    return;
+                };
+                let Some(group) = groups.get_mut(slot) else {
+                    return;
+                };
+                group.get_or_insert_with(MultiCommaLookupCountSumGroup::default)
+            }
+            Self::ThreeSmall(groups) if key.len() == 3 => {
+                let tuple = (key[0], key[1], key[2]);
+                if let Some((_, group)) =
+                    groups.iter_mut().find(|(candidate, _)| *candidate == tuple)
+                {
+                    group
+                } else if groups.len() < multi_comma_lookup_small_group_limit() {
+                    groups.push((tuple, MultiCommaLookupCountSumGroup::default()));
+                    &mut groups.last_mut().expect("pushed small group").1
+                } else {
+                    let mut hash = FastHashMap::default();
+                    for (key, group) in std::mem::take(groups) {
+                        hash.insert(key, group);
+                    }
+                    *self = Self::Three(hash);
+                    let Self::Three(groups) = self else {
+                        unreachable!("converted to three-key hash groups");
+                    };
+                    groups.entry(tuple).or_default()
+                }
+            }
+            Self::Three(groups) if key.len() == 3 => {
+                groups.entry((key[0], key[1], key[2])).or_default()
+            }
+            Self::Generic(groups) => groups.entry(key.to_vec()).or_default(),
+            _ => return,
+        };
+        group.count = group.count.saturating_add(1);
+        if let Some(sum) = sum {
+            group.sum = group.sum.saturating_add(sum);
+            group.sum_count = group.sum_count.saturating_add(1);
+        }
+    }
+
+    fn finish(
+        self,
+        lookups: &[MultiCommaLookupDimension],
+        sum_column: &str,
+    ) -> Vec<GroupAggregateResult> {
+        match self {
+            Self::TwoDense { second_len, groups } => groups
+                .into_iter()
+                .enumerate()
+                .filter_map(|(slot, state)| {
+                    let state = state?;
+                    let first = slot / second_len;
+                    let second = slot % second_len;
+                    Some(multi_comma_lookup_group_result(
+                        &[first, second],
+                        state,
+                        lookups,
+                        sum_column,
+                    ))
+                })
+                .collect(),
+            Self::TwoSmall(groups) => groups
+                .into_iter()
+                .map(|((first, second), state)| {
+                    multi_comma_lookup_group_result(&[first, second], state, lookups, sum_column)
+                })
+                .collect(),
+            Self::Two(groups) => groups
+                .into_iter()
+                .map(|((first, second), state)| {
+                    multi_comma_lookup_group_result(&[first, second], state, lookups, sum_column)
+                })
+                .collect(),
+            Self::ThreeDense {
+                second_len,
+                third_len,
+                groups,
+            } => groups
+                .into_iter()
+                .enumerate()
+                .filter_map(|(slot, state)| {
+                    let state = state?;
+                    let first = slot / (second_len * third_len);
+                    let remainder = slot % (second_len * third_len);
+                    let second = remainder / third_len;
+                    let third = remainder % third_len;
+                    Some(multi_comma_lookup_group_result(
+                        &[first, second, third],
+                        state,
+                        lookups,
+                        sum_column,
+                    ))
+                })
+                .collect(),
+            Self::ThreeSmall(groups) => groups
+                .into_iter()
+                .map(|((first, second, third), state)| {
+                    multi_comma_lookup_group_result(
+                        &[first, second, third],
+                        state,
+                        lookups,
+                        sum_column,
+                    )
+                })
+                .collect(),
+            Self::Three(groups) => groups
+                .into_iter()
+                .map(|((first, second, third), state)| {
+                    multi_comma_lookup_group_result(
+                        &[first, second, third],
+                        state,
+                        lookups,
+                        sum_column,
+                    )
+                })
+                .collect(),
+            Self::Generic(groups) => groups
+                .into_iter()
+                .map(|(key, state)| {
+                    multi_comma_lookup_group_result(&key, state, lookups, sum_column)
+                })
+                .collect(),
+        }
+    }
+}
+
+fn multi_comma_lookup_group_result(
+    key: &[usize],
+    state: MultiCommaLookupCountSumGroup,
+    lookups: &[MultiCommaLookupDimension],
+    sum_column: &str,
+) -> GroupAggregateResult {
+    let keys = key
+        .iter()
+        .enumerate()
+        .map(|(index, value_id)| GroupValue::Utf8(lookups[index].lookup.values[*value_id].clone()))
+        .collect::<Vec<_>>();
+    GroupAggregateResult {
+        keys,
+        values: vec![
+            AggregateResult {
+                expr: AggregateExpr::CountStar,
+                value: AggregateValue::Count(state.count),
+            },
+            AggregateResult {
+                expr: AggregateExpr::Sum(sum_column.to_string()),
+                value: if state.sum_count == 0 {
+                    AggregateValue::Int64(None)
+                } else {
+                    AggregateValue::Int64(Some(state.sum))
+                },
+            },
+        ],
+    }
+}
+
+fn comma_join_fact_dimension_key(
+    conjuncts: &[SqlExpr],
+    used_conjuncts: &[bool],
+    fact_alias: &str,
+    dimension_alias: &str,
+    alias_refs: &[&str],
+) -> Result<Option<(String, String)>> {
+    let mut output = None;
+    for (conjunct, used) in conjuncts.iter().zip(used_conjuncts) {
+        if *used {
+            continue;
+        }
+        let Some((left_alias, left_key, right_alias, right_key)) =
+            comma_join_base_edge(conjunct, alias_refs)?
+        else {
+            continue;
+        };
+        let candidate = if left_alias.eq_ignore_ascii_case(fact_alias)
+            && right_alias.eq_ignore_ascii_case(dimension_alias)
+        {
+            Some((left_key, right_key))
+        } else if right_alias.eq_ignore_ascii_case(fact_alias)
+            && left_alias.eq_ignore_ascii_case(dimension_alias)
+        {
+            Some((right_key, left_key))
+        } else {
+            None
+        };
+        if let Some(candidate) = candidate {
+            if output.is_some() {
+                return Ok(None);
+            }
+            output = Some(candidate);
+        }
+    }
+    Ok(output)
+}
+
+fn multi_comma_lookup_consumes_all_residual_join_edges(
+    conjuncts: &[SqlExpr],
+    used_conjuncts: &[bool],
+    fact_alias: &str,
+    dimensions: &[MultiCommaLookupDimensionPlan],
+    aliases: &[String],
+    alias_refs: &[&str],
+) -> Result<bool> {
+    let dimension_aliases = dimensions
+        .iter()
+        .map(|dimension| aliases[dimension.table_index].as_str())
+        .collect::<HashSet<_>>();
+    for (conjunct, used) in conjuncts.iter().zip(used_conjuncts) {
+        if *used {
+            continue;
+        }
+        let Some((left_alias, _, right_alias, _)) = comma_join_base_edge(conjunct, alias_refs)?
+        else {
+            return Ok(false);
+        };
+        let fact_left = left_alias.eq_ignore_ascii_case(fact_alias);
+        let fact_right = right_alias.eq_ignore_ascii_case(fact_alias);
+        if fact_left == fact_right {
+            return Ok(false);
+        }
+        let dimension_alias = if fact_left { right_alias } else { left_alias };
+        if !dimension_aliases
+            .iter()
+            .any(|alias| alias.eq_ignore_ascii_case(dimension_alias))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn estimated_batches_row_width(batches: &[RecordBatch]) -> u128 {
     batches
         .first()
@@ -41509,11 +42413,15 @@ fn build_logical_comma_join_graph(
     for (index, batches) in scanned.iter().enumerate() {
         let batches = batches.as_ref().expect("comma join input scanned");
         let mut key_ndv = HashMap::new();
+        let mut column_ranges = HashMap::new();
         for key in &key_columns[index] {
             key_ndv.insert(
                 key.clone(),
                 sampled_key_ndv(batches, std::slice::from_ref(key), 100_000)? as u128,
             );
+            if let Some(range) = primitive_column_range_stats(batches, key)? {
+                column_ranges.insert(key.clone(), range);
+            }
         }
         tables.push(LogicalJoinTableStats {
             base_rows: base_row_counts
@@ -41525,10 +42433,935 @@ fn build_logical_comma_join_graph(
             rows: row_counts[index].max(1) as u128,
             row_width: estimated_batches_row_width(batches),
             key_ndv,
+            column_ranges,
         });
     }
 
     Ok(LogicalJoinGraph { tables, edges })
+}
+
+fn log_comma_join_optimizer_plan(
+    join_graph: &LogicalJoinGraph,
+    left_deep_plan: Option<&crate::optimizer::LogicalJoinPlan>,
+) {
+    if !std::env::var("DODAM_OPTIMIZER_TRACE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return;
+    }
+    let left_deep_cost = left_deep_plan
+        .map(|plan| plan.estimated_cost.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let left_deep_order = left_deep_plan
+        .map(|plan| {
+            let mut order = vec![plan.start.to_string()];
+            order.extend(plan.steps.iter().map(|step| step.table_index.to_string()));
+            order.join(",")
+        })
+        .unwrap_or_else(|| "none".to_string());
+    let bushy = join_graph.choose_exhaustive_bushy_plan();
+    let bushy_cost = bushy
+        .as_ref()
+        .map(|plan| plan.estimated_cost().to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let mut bushy_tables = Vec::new();
+    if let Some(plan) = bushy.as_ref() {
+        plan.collect_tables(&mut bushy_tables);
+    }
+    eprintln!(
+        "[dodam:optimizer] rule=comma_join_order left_deep_order={} left_deep_cost={} bushy_cost={} bushy_tables={}",
+        left_deep_order,
+        left_deep_cost,
+        bushy_cost,
+        bushy_tables
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+}
+
+fn choose_bushy_comma_join_execution_tree(
+    join_graph: &LogicalJoinGraph,
+    left_deep_plan: Option<&crate::optimizer::LogicalJoinPlan>,
+) -> Option<LogicalJoinPlanTree> {
+    let tree = join_graph.choose_exhaustive_bushy_plan()?;
+    if tree.table_count() <= 2 {
+        return None;
+    }
+    if std::env::var("DODAM_FORCE_BUSHY_COMMA_JOIN")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return Some(tree);
+    }
+    let left_deep_cost = left_deep_plan?.estimated_cost;
+    (tree.estimated_cost().saturating_mul(100) < left_deep_cost.saturating_mul(95)).then_some(tree)
+}
+
+struct CommaJoinSubtreeResult {
+    batches: Vec<RecordBatch>,
+    aliases: Vec<String>,
+    rows: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_bushy_comma_join_tree(
+    tree: &LogicalJoinPlanTree,
+    scanned: &mut [Option<Vec<RecordBatch>>],
+    row_counts: &[usize],
+    aliases: &[String],
+    alias_refs: &[&str],
+    conjuncts: &[SqlExpr],
+    used_conjuncts: &mut [bool],
+    final_columns: &HashSet<String>,
+) -> Result<CommaJoinSubtreeResult> {
+    match tree {
+        LogicalJoinPlanTree::Leaf { table_index, .. } => {
+            let batches = scanned[*table_index]
+                .take()
+                .expect("bushy leaf input scanned");
+            Ok(CommaJoinSubtreeResult {
+                batches,
+                aliases: vec![aliases[*table_index].clone()],
+                rows: row_counts[*table_index],
+            })
+        }
+        LogicalJoinPlanTree::Join { left, right, .. } => {
+            let left = execute_bushy_comma_join_tree(
+                left,
+                scanned,
+                row_counts,
+                aliases,
+                alias_refs,
+                conjuncts,
+                used_conjuncts,
+                final_columns,
+            )?;
+            let right = execute_bushy_comma_join_tree(
+                right,
+                scanned,
+                row_counts,
+                aliases,
+                alias_refs,
+                conjuncts,
+                used_conjuncts,
+                final_columns,
+            )?;
+            let (left_keys, right_keys, conjunct_indexes) = comma_join_keys_between_subtrees(
+                conjuncts,
+                used_conjuncts,
+                &left.aliases,
+                &right.aliases,
+                alias_refs,
+            )?;
+            if left_keys.is_empty() {
+                return Err(DodamError::UnsupportedSql(format!(
+                    "bushy comma join could not find equality predicate between [{}] and [{}]",
+                    left.aliases.join(", "),
+                    right.aliases.join(", ")
+                )));
+            }
+            for index in conjunct_indexes {
+                used_conjuncts[index] = true;
+            }
+            let mut joined_aliases = left.aliases.clone();
+            joined_aliases.extend(right.aliases.clone());
+            let left_prefix = if left.aliases.len() == 1 {
+                left.aliases[0].clone()
+            } else {
+                "__dodam_bushy_left".to_string()
+            };
+            let right_prefix = if right.aliases.len() == 1 {
+                right.aliases[0].clone()
+            } else {
+                "__dodam_bushy_right".to_string()
+            };
+            let build_side = if left.rows <= right.rows {
+                JoinBuildSide::Left
+            } else {
+                JoinBuildSide::Right
+            };
+            let output_projection = comma_join_hash_output_projection(
+                &left.batches,
+                &right.batches,
+                &left_prefix,
+                &right_prefix,
+                &joined_aliases,
+                alias_refs,
+                conjuncts,
+                used_conjuncts,
+                final_columns,
+                &left_keys,
+                &right_keys,
+            )?;
+            let mut batches = execute_comma_hash_join(
+                left.batches,
+                right.batches,
+                left_keys,
+                right_keys,
+                left_prefix.clone(),
+                right_prefix.clone(),
+                build_side,
+                output_projection,
+            )?;
+            if left.aliases.len() > 1 {
+                batches = strip_batch_field_prefix(batches, "__dodam_bushy_left.")?;
+            }
+            if right.aliases.len() > 1 {
+                batches = strip_batch_field_prefix(batches, "__dodam_bushy_right.")?;
+            }
+            let rows = record_batch_rows(&batches);
+            batches = prune_comma_join_current_columns(
+                batches,
+                &joined_aliases,
+                alias_refs,
+                conjuncts,
+                used_conjuncts,
+                final_columns,
+            )?;
+            Ok(CommaJoinSubtreeResult {
+                batches,
+                aliases: joined_aliases,
+                rows,
+            })
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_left_deep_comma_join(
+    mut scanned: Vec<Option<Vec<RecordBatch>>>,
+    row_counts: &[usize],
+    aliases: &[String],
+    alias_refs: &[&str],
+    conjuncts: &[SqlExpr],
+    used_conjuncts: &mut [bool],
+    final_columns: &HashSet<String>,
+    join_graph: &LogicalJoinGraph,
+    join_plan: Option<&crate::optimizer::LogicalJoinPlan>,
+) -> Result<Vec<RecordBatch>> {
+    if let Some(plan) = join_plan
+        && choose_streaming_left_deep_comma_join_for_plan(plan, final_columns)
+    {
+        let mut trial_used_conjuncts = used_conjuncts.to_vec();
+        if let Some(output) = try_execute_streaming_left_deep_comma_join(
+            &mut scanned,
+            row_counts,
+            aliases,
+            alias_refs,
+            conjuncts,
+            &mut trial_used_conjuncts,
+            plan,
+            final_columns,
+        )? {
+            used_conjuncts.copy_from_slice(&trial_used_conjuncts);
+            return Ok(output);
+        }
+    }
+    let start_index = join_plan.map(|plan| plan.start).unwrap_or_else(|| {
+        row_counts
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, rows)| *rows)
+            .map(|(index, _)| index)
+            .expect("at least one comma join table")
+    });
+    let mut current = scanned[start_index].take().expect("start input scanned");
+    let mut current_rows = row_counts[start_index];
+    let mut joined_aliases = vec![aliases[start_index].clone()];
+    let mut remaining = (0..aliases.len())
+        .filter(|index| *index != start_index)
+        .collect::<Vec<_>>();
+    while !remaining.is_empty() {
+        let mut candidates = Vec::new();
+        for (remaining_index, table_index) in remaining.iter().copied().enumerate() {
+            let alias = &aliases[table_index];
+            let mut left_keys = Vec::new();
+            let mut right_keys = Vec::new();
+            let mut conjunct_indexes = Vec::new();
+            for (index, conjunct) in conjuncts.iter().enumerate() {
+                if used_conjuncts[index] {
+                    continue;
+                }
+                if let Some((left_key, right_key)) =
+                    comma_join_keys_for_next(conjunct, &joined_aliases, alias, alias_refs)?
+                {
+                    left_keys.push(left_key);
+                    right_keys.push(right_key);
+                    conjunct_indexes.push(index);
+                }
+            }
+            if !left_keys.is_empty() {
+                candidates.push((
+                    remaining_index,
+                    table_index,
+                    left_keys,
+                    right_keys,
+                    conjunct_indexes,
+                ));
+            }
+        }
+        let selected = if candidates.len() <= 1 {
+            candidates.into_iter().next()
+        } else {
+            let joined = aliases
+                .iter()
+                .map(|alias| joined_aliases.iter().any(|joined| joined == alias))
+                .collect::<Vec<_>>();
+            let candidate_table_indexes = candidates
+                .iter()
+                .map(|(_, table_index, _, _, _)| *table_index)
+                .collect::<Vec<_>>();
+            let selected_step = join_graph.choose_next_join(
+                &joined,
+                current_rows as u128,
+                estimated_batches_row_width(&current),
+                &candidate_table_indexes,
+            );
+            selected_step
+                .and_then(|step| {
+                    candidates
+                        .iter()
+                        .position(|(_, table_index, _, _, _)| *table_index == step.table_index)
+                })
+                .map(|index| candidates.swap_remove(index))
+        };
+        let Some((remaining_index, table_index, left_keys, right_keys, conjunct_indexes)) =
+            selected
+        else {
+            return Err(DodamError::UnsupportedSql(format!(
+                "comma join could not find equality predicate for remaining tables: {}",
+                remaining
+                    .iter()
+                    .map(|index| aliases[*index].as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        };
+        for index in conjunct_indexes {
+            used_conjuncts[index] = true;
+        }
+        remaining.remove(remaining_index);
+        let alias = &aliases[table_index];
+        let right = scanned[table_index]
+            .take()
+            .expect("remaining input scanned");
+        let right_rows = row_counts[table_index];
+        let left_prefix = if joined_aliases.len() == 1 {
+            joined_aliases[0].as_str()
+        } else {
+            "__dodam_join"
+        };
+        let build_side = if current_rows <= right_rows {
+            JoinBuildSide::Left
+        } else {
+            JoinBuildSide::Right
+        };
+        let mut next_joined_aliases = joined_aliases.clone();
+        next_joined_aliases.push(alias.clone());
+        let output_projection = comma_join_hash_output_projection(
+            &current,
+            &right,
+            left_prefix,
+            alias,
+            &next_joined_aliases,
+            alias_refs,
+            conjuncts,
+            used_conjuncts,
+            final_columns,
+            &left_keys,
+            &right_keys,
+        )?;
+        current = execute_comma_hash_join(
+            current,
+            right,
+            left_keys,
+            right_keys,
+            left_prefix.to_string(),
+            alias.clone(),
+            build_side,
+            output_projection,
+        )?;
+        current_rows = record_batch_rows(&current);
+        if left_prefix == "__dodam_join" {
+            current = strip_batch_field_prefix(current, "__dodam_join.")?;
+        }
+        joined_aliases = next_joined_aliases;
+        current = prune_comma_join_current_columns(
+            current,
+            &joined_aliases,
+            alias_refs,
+            conjuncts,
+            used_conjuncts,
+            final_columns,
+        )?;
+    }
+    Ok(current)
+}
+
+fn choose_streaming_left_deep_comma_join_for_plan(
+    plan: &crate::optimizer::LogicalJoinPlan,
+    final_columns: &HashSet<String>,
+) -> bool {
+    if std::env::var("DODAM_DISABLE_STREAM_LEFT_DEEP_COMMA_JOIN")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return false;
+    }
+    if std::env::var("DODAM_STREAM_LEFT_DEEP_COMMA_JOIN")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return true;
+    }
+    std::env::var("DODAM_AUTO_STREAM_LEFT_DEEP_COMMA_JOIN")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        && choose_streaming_left_deep_join(StreamingLeftDeepJoinCostInput {
+            table_count: plan.steps.len() + 1,
+            projected_output_columns: final_columns.len(),
+            estimated_final_rows: plan
+                .steps
+                .last()
+                .map(|step| step.estimated_rows)
+                .unwrap_or(1),
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_execute_streaming_left_deep_comma_join(
+    scanned: &mut [Option<Vec<RecordBatch>>],
+    row_counts: &[usize],
+    aliases: &[String],
+    alias_refs: &[&str],
+    conjuncts: &[SqlExpr],
+    used_conjuncts: &mut [bool],
+    plan: &crate::optimizer::LogicalJoinPlan,
+    final_columns: &HashSet<String>,
+) -> Result<Option<Vec<RecordBatch>>> {
+    if plan.steps.len() + 1 != aliases.len() {
+        return Ok(None);
+    }
+    let mut joined_aliases = vec![aliases[plan.start].clone()];
+    let start_batches = scanned[plan.start].take().expect("start input scanned");
+    let mut current_schema_batches = start_batches
+        .first()
+        .cloned()
+        .map(|batch| vec![batch])
+        .unwrap_or_default();
+    let mut current_rows = row_counts[plan.start];
+    let mut current: Box<dyn PhysicalPlan> = Box::new(MemoryExec::new(start_batches));
+    for step in &plan.steps {
+        let table_index = step.table_index;
+        let alias = &aliases[table_index];
+        let mut left_keys = Vec::new();
+        let mut right_keys = Vec::new();
+        let mut conjunct_indexes = Vec::new();
+        for (index, conjunct) in conjuncts.iter().enumerate() {
+            if used_conjuncts[index] {
+                continue;
+            }
+            if let Some((left_key, right_key)) =
+                comma_join_keys_for_next(conjunct, &joined_aliases, alias, alias_refs)?
+            {
+                left_keys.push(left_key);
+                right_keys.push(right_key);
+                conjunct_indexes.push(index);
+            }
+        }
+        if left_keys.is_empty() {
+            return Ok(None);
+        }
+        for index in conjunct_indexes {
+            used_conjuncts[index] = true;
+        }
+        let right = scanned[table_index]
+            .take()
+            .expect("remaining input scanned");
+        let right_schema_batches = right
+            .first()
+            .cloned()
+            .map(|batch| vec![batch])
+            .unwrap_or_default();
+        let left_prefix = if joined_aliases.len() == 1 {
+            joined_aliases[0].clone()
+        } else {
+            "__dodam_join".to_string()
+        };
+        let build_side = if row_counts[table_index] <= current_rows {
+            JoinBuildSide::Right
+        } else {
+            JoinBuildSide::Left
+        };
+        let mut next_joined_aliases = joined_aliases.clone();
+        next_joined_aliases.push(alias.clone());
+        let output_projection = comma_join_hash_output_projection(
+            &current_schema_batches,
+            &right_schema_batches,
+            &left_prefix,
+            alias,
+            &next_joined_aliases,
+            alias_refs,
+            conjuncts,
+            used_conjuncts,
+            final_columns,
+            &left_keys,
+            &right_keys,
+        )?;
+        let output_schema = comma_join_output_schema_from_projection(
+            current_schema_batches.first(),
+            right_schema_batches.first(),
+            &left_prefix,
+            alias,
+            build_side,
+            &output_projection,
+        )?;
+        if sql_join_profile_enabled() {
+            eprintln!(
+                "[dodam:sql-join-profile] mode=stream-plan step={} left_prefix={} right_prefix={} build_side={:?} estimated_rows={} left_schema_cols={} right_schema_cols={} output_cols={}",
+                joined_aliases.len(),
+                left_prefix,
+                alias,
+                build_side,
+                step.estimated_rows,
+                current_schema_batches
+                    .first()
+                    .map(RecordBatch::num_columns)
+                    .unwrap_or(0),
+                right_schema_batches
+                    .first()
+                    .map(RecordBatch::num_columns)
+                    .unwrap_or(0),
+                projection_column_count(&output_projection),
+            );
+        }
+        current = Box::new(HashJoinExec::new(
+            current,
+            Box::new(MemoryExec::new(right)),
+            left_keys,
+            right_keys,
+            left_prefix.clone(),
+            alias.clone(),
+            build_side,
+            JoinType::Inner,
+            output_projection,
+        ));
+        if left_prefix == "__dodam_join" {
+            current = Box::new(StripPrefixExec::new(current, "__dodam_join.".to_string()));
+            current_schema_batches = vec![strip_record_batch_prefix_for_schema(
+                output_schema,
+                "__dodam_join.",
+            )];
+        } else {
+            current_schema_batches = vec![schema_record_batch(output_schema)];
+        }
+        current_rows = step.estimated_rows.max(1) as usize;
+        joined_aliases = next_joined_aliases;
+    }
+    let started = Instant::now();
+    let output = collect_batches(current.execute()?)?;
+    if sql_join_profile_enabled() {
+        eprintln!(
+            "[dodam:sql-join-profile] mode=stream-total tables={} output_rows={} output_cols={} elapsed={:.3}ms",
+            aliases.len(),
+            record_batch_rows(&output),
+            output.first().map(RecordBatch::num_columns).unwrap_or(0),
+            elapsed_millis(started),
+        );
+    }
+    Ok(Some(output))
+}
+
+fn comma_join_output_schema_from_projection(
+    left: Option<&RecordBatch>,
+    right: Option<&RecordBatch>,
+    left_prefix: &str,
+    right_prefix: &str,
+    build_side: JoinBuildSide,
+    projection: &Projection,
+) -> Result<Arc<Schema>> {
+    let left_fields =
+        comma_join_projected_side_fields(left, left_prefix, projection, ProjectionSide::Left)?;
+    let right_fields =
+        comma_join_projected_side_fields(right, right_prefix, projection, ProjectionSide::Right)?;
+    let fields = match build_side {
+        JoinBuildSide::Left | JoinBuildSide::Right => left_fields
+            .into_iter()
+            .chain(right_fields)
+            .collect::<Vec<_>>(),
+    };
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProjectionSide {
+    Left,
+    Right,
+}
+
+fn comma_join_projected_side_fields(
+    batch: Option<&RecordBatch>,
+    prefix: &str,
+    projection: &Projection,
+    _side: ProjectionSide,
+) -> Result<Vec<Field>> {
+    let Some(batch) = batch else {
+        return Ok(Vec::new());
+    };
+    let field_indexes = match projection {
+        Projection::All => (0..batch.num_columns()).collect::<Vec<_>>(),
+        Projection::Columns(columns) => columns
+            .iter()
+            .filter_map(|column| {
+                column
+                    .strip_prefix(prefix)
+                    .and_then(|name| name.strip_prefix('.'))
+            })
+            .map(|name| batch_column_index(batch, name))
+            .collect::<Result<Vec<_>>>()?,
+    };
+    Ok(field_indexes
+        .into_iter()
+        .map(|index| {
+            let field = batch.schema().field(index).clone();
+            Field::new(
+                format!("{prefix}.{}", field.name()),
+                field.data_type().clone(),
+                true,
+            )
+        })
+        .collect())
+}
+
+fn schema_record_batch(schema: Arc<Schema>) -> RecordBatch {
+    RecordBatch::new_empty(schema)
+}
+
+fn strip_record_batch_prefix_for_schema(schema: Arc<Schema>, prefix: &str) -> RecordBatch {
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let name = field
+                .name()
+                .as_str()
+                .strip_prefix(prefix)
+                .unwrap_or(field.name().as_str())
+                .to_string();
+            Arc::new(Field::new(
+                name,
+                field.data_type().clone(),
+                field.is_nullable(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    RecordBatch::new_empty(Arc::new(Schema::new(fields)))
+}
+
+fn comma_join_keys_between_subtrees(
+    conjuncts: &[SqlExpr],
+    used_conjuncts: &[bool],
+    left_aliases: &[String],
+    right_aliases: &[String],
+    table_aliases: &[&str],
+) -> Result<(Vec<String>, Vec<String>, Vec<usize>)> {
+    let mut left_keys = Vec::new();
+    let mut right_keys = Vec::new();
+    let mut conjunct_indexes = Vec::new();
+    for (index, conjunct) in conjuncts.iter().enumerate() {
+        if used_conjuncts[index] {
+            continue;
+        }
+        if let Some((left_key, right_key)) =
+            comma_join_key_for_subtrees(conjunct, left_aliases, right_aliases, table_aliases)?
+        {
+            left_keys.push(left_key);
+            right_keys.push(right_key);
+            conjunct_indexes.push(index);
+        }
+    }
+    Ok((left_keys, right_keys, conjunct_indexes))
+}
+
+fn comma_join_key_for_subtrees(
+    expr: &SqlExpr,
+    left_aliases: &[String],
+    right_aliases: &[String],
+    table_aliases: &[&str],
+) -> Result<Option<(String, String)>> {
+    let SqlExpr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = expr
+    else {
+        return Ok(None);
+    };
+    let Some(left_column) = maybe_join_column_name(left, table_aliases)? else {
+        return Ok(None);
+    };
+    let Some(right_column) = maybe_join_column_name(right, table_aliases)? else {
+        return Ok(None);
+    };
+    let Some(left_owner) = join_column_owner(&left_column, table_aliases) else {
+        return Ok(None);
+    };
+    let Some(right_owner) = join_column_owner(&right_column, table_aliases) else {
+        return Ok(None);
+    };
+    let left_has_left = left_aliases.iter().any(|alias| alias == left_owner);
+    let left_has_right = left_aliases.iter().any(|alias| alias == right_owner);
+    let right_has_left = right_aliases.iter().any(|alias| alias == left_owner);
+    let right_has_right = right_aliases.iter().any(|alias| alias == right_owner);
+    if left_has_left && right_has_right {
+        return Ok(Some((
+            joined_comma_join_key(&left_column, left_owner, left_aliases),
+            joined_comma_join_key(&right_column, right_owner, right_aliases),
+        )));
+    }
+    if left_has_right && right_has_left {
+        return Ok(Some((
+            joined_comma_join_key(&right_column, right_owner, left_aliases),
+            joined_comma_join_key(&left_column, left_owner, right_aliases),
+        )));
+    }
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_comma_hash_join(
+    left: Vec<RecordBatch>,
+    right: Vec<RecordBatch>,
+    left_keys: Vec<String>,
+    right_keys: Vec<String>,
+    left_prefix: String,
+    right_prefix: String,
+    build_side: JoinBuildSide,
+    output_projection: Projection,
+) -> Result<Vec<RecordBatch>> {
+    let started = Instant::now();
+    let left_rows = record_batch_rows(&left);
+    let right_rows = record_batch_rows(&right);
+    let left_cols = left.first().map(RecordBatch::num_columns).unwrap_or(0);
+    let right_cols = right.first().map(RecordBatch::num_columns).unwrap_or(0);
+    let output_projection_cols = projection_column_count(&output_projection);
+    let profile_left_prefix = left_prefix.clone();
+    let profile_right_prefix = right_prefix.clone();
+    let estimated_rows = record_batch_rows(&left)
+        .max(record_batch_rows(&right))
+        .max(1) as u128;
+    let estimated_row_width = estimated_batches_row_width(&left)
+        .saturating_add(estimated_batches_row_width(&right))
+        .max(1);
+    let memory_strategy = choose_pipeline_memory_strategy(PipelineMemoryCostInput {
+        estimated_rows,
+        estimated_row_width,
+        memory_limit_bytes: default_join_memory_limit_bytes() as u128,
+    });
+    let stream = match memory_strategy {
+        PipelineMemoryStrategy::InMemory => Box::new(HashJoinExec::new(
+            Box::new(MemoryExec::new(left)),
+            Box::new(MemoryExec::new(right)),
+            left_keys,
+            right_keys,
+            left_prefix,
+            right_prefix,
+            build_side,
+            JoinType::Inner,
+            output_projection,
+        )) as Box<dyn PhysicalPlan>,
+        PipelineMemoryStrategy::Partitioned { partitions } => {
+            Box::new(PartitionedHashJoinExec::new(
+                Box::new(MemoryExec::new(left)),
+                Box::new(MemoryExec::new(right)),
+                left_keys,
+                right_keys,
+                left_prefix,
+                right_prefix,
+                PartitionedHashJoinOptions {
+                    partitions,
+                    memory_limit_bytes: default_join_memory_limit_bytes(),
+                    join_type: JoinType::Inner,
+                    output_projection,
+                },
+            )) as Box<dyn PhysicalPlan>
+        }
+        PipelineMemoryStrategy::External => Box::new(PartitionedHashJoinExec::new(
+            Box::new(MemoryExec::new(left)),
+            Box::new(MemoryExec::new(right)),
+            left_keys,
+            right_keys,
+            left_prefix,
+            right_prefix,
+            PartitionedHashJoinOptions {
+                partitions: MAX_SQL_EXTERNAL_JOIN_PARTITIONS,
+                memory_limit_bytes: default_join_memory_limit_bytes(),
+                join_type: JoinType::Inner,
+                output_projection,
+            },
+        )) as Box<dyn PhysicalPlan>,
+    }
+    .execute()?;
+    let output = collect_batches(stream)?;
+    if sql_join_profile_enabled() {
+        eprintln!(
+            "[dodam:sql-join-profile] mode=materialized left_prefix={} right_prefix={} build_side={:?} strategy={:?} left_rows={} right_rows={} output_rows={} left_cols={} right_cols={} output_cols={} elapsed={:.3}ms",
+            profile_left_prefix,
+            profile_right_prefix,
+            build_side,
+            memory_strategy,
+            left_rows,
+            right_rows,
+            record_batch_rows(&output),
+            left_cols,
+            right_cols,
+            output_projection_cols,
+            elapsed_millis(started),
+        );
+    }
+    Ok(output)
+}
+
+fn sql_join_profile_enabled() -> bool {
+    std::env::var("DODAM_JOIN_PROFILE").is_ok_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn elapsed_millis(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1_000.0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn comma_join_hash_output_projection(
+    left: &[RecordBatch],
+    right: &[RecordBatch],
+    left_prefix: &str,
+    right_prefix: &str,
+    joined_aliases: &[String],
+    alias_refs: &[&str],
+    conjuncts: &[SqlExpr],
+    used_conjuncts: &[bool],
+    final_columns: &HashSet<String>,
+    left_keys: &[String],
+    right_keys: &[String],
+) -> Result<Projection> {
+    let needed = comma_join_needed_columns(alias_refs, conjuncts, used_conjuncts, final_columns)?;
+    if needed.is_empty() {
+        return Ok(Projection::All);
+    }
+    let mut columns = Vec::new();
+    add_comma_join_output_projection_side(
+        &mut columns,
+        left.first().map(RecordBatch::schema).as_deref(),
+        left_prefix,
+        joined_aliases,
+        &needed,
+    );
+    add_comma_join_output_projection_side(
+        &mut columns,
+        right.first().map(RecordBatch::schema).as_deref(),
+        right_prefix,
+        joined_aliases,
+        &needed,
+    );
+    if !zero_column_join_output_enabled() {
+        ensure_comma_join_projection_side_key(&mut columns, left_prefix, left_keys);
+        ensure_comma_join_projection_side_key(&mut columns, right_prefix, right_keys);
+    }
+    log_comma_join_hash_output_projection(left_prefix, right_prefix, &columns, &needed);
+    if columns.is_empty() {
+        Ok(Projection::All)
+    } else {
+        Ok(Projection::Columns(columns))
+    }
+}
+
+fn zero_column_join_output_enabled() -> bool {
+    std::env::var("DODAM_ZERO_COLUMN_JOIN_OUTPUT")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn ensure_comma_join_projection_side_key(columns: &mut Vec<String>, prefix: &str, keys: &[String]) {
+    let side_prefix = format!("{prefix}.");
+    if columns
+        .iter()
+        .any(|column| column.starts_with(&side_prefix))
+    {
+        return;
+    }
+    if let Some(key) = keys.first() {
+        add_column_once(columns, format!("{prefix}.{key}"));
+    }
+}
+
+fn log_comma_join_hash_output_projection(
+    left_prefix: &str,
+    right_prefix: &str,
+    columns: &[String],
+    needed: &HashSet<String>,
+) {
+    if !std::env::var("DODAM_OPTIMIZER_TRACE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return;
+    }
+    eprintln!(
+        "[dodam:optimizer] rule=comma_join_output_projection left_prefix={} right_prefix={} columns=[{}] needed=[{}]",
+        left_prefix,
+        right_prefix,
+        columns.join(","),
+        {
+            let mut needed = needed.iter().cloned().collect::<Vec<_>>();
+            needed.sort();
+            needed.join(",")
+        }
+    );
+}
+
+fn add_comma_join_output_projection_side(
+    columns: &mut Vec<String>,
+    schema: Option<&Schema>,
+    prefix: &str,
+    joined_aliases: &[String],
+    needed: &HashSet<String>,
+) {
+    let Some(schema) = schema else {
+        return;
+    };
+    for field in schema.fields() {
+        let projected_name = format!("{prefix}.{}", field.name());
+        let output_name = if prefix.starts_with("__dodam_") {
+            field.name().to_string()
+        } else {
+            projected_name.clone()
+        };
+        if comma_join_field_needed(&output_name, joined_aliases, needed) {
+            add_column_once(columns, projected_name);
+        }
+    }
+}
+
+fn comma_join_needed_columns(
+    alias_refs: &[&str],
+    conjuncts: &[SqlExpr],
+    used_conjuncts: &[bool],
+    final_columns: &HashSet<String>,
+) -> Result<HashSet<String>> {
+    let mut needed = final_columns.clone();
+    for (conjunct, used) in conjuncts.iter().zip(used_conjuncts) {
+        if *used {
+            continue;
+        }
+        if expr_contains_materializable_subquery(conjunct) {
+            return Ok(HashSet::new());
+        }
+        let mut columns = Vec::new();
+        collect_join_column_candidates(conjunct, alias_refs, &mut columns)?;
+        needed.extend(columns);
+    }
+    Ok(needed)
 }
 
 fn sampled_key_ndv(batches: &[RecordBatch], keys: &[String], sample_rows: usize) -> Result<usize> {
@@ -41564,6 +43397,72 @@ fn sampled_key_ndv(batches: &[RecordBatch], keys: &[String], sample_rows: usize)
         }
     }
     Ok(values.len())
+}
+
+fn primitive_column_range_stats(
+    batches: &[RecordBatch],
+    column: &str,
+) -> Result<Option<ColumnRangeStats>> {
+    let mut min_value = None::<i128>;
+    let mut max_value = None::<i128>;
+    let mut null_count = 0u128;
+    let mut rows = 0u128;
+    for batch in batches {
+        let index = batch_column_index(batch, column)?;
+        let array = batch.column(index);
+        rows = rows.saturating_add(array.len() as u128);
+        if let Some(values) = array.as_any().downcast_ref::<Int32Array>() {
+            update_primitive_i32_range(values, &mut min_value, &mut max_value, &mut null_count);
+        } else if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
+            update_primitive_i64_range(values, &mut min_value, &mut max_value, &mut null_count);
+        } else {
+            return Ok(None);
+        }
+    }
+    let Some(min_i128) = min_value else {
+        return Ok(None);
+    };
+    Ok(Some(ColumnRangeStats {
+        min_i128,
+        max_i128: max_value.expect("max set with min"),
+        null_count,
+        rows,
+    }))
+}
+
+fn update_primitive_i32_range(
+    values: &Int32Array,
+    min_value: &mut Option<i128>,
+    max_value: &mut Option<i128>,
+    null_count: &mut u128,
+) {
+    for row in 0..values.len() {
+        if values.is_null(row) {
+            *null_count = null_count.saturating_add(1);
+            continue;
+        }
+        update_i128_range(values.value(row) as i128, min_value, max_value);
+    }
+}
+
+fn update_primitive_i64_range(
+    values: &Int64Array,
+    min_value: &mut Option<i128>,
+    max_value: &mut Option<i128>,
+    null_count: &mut u128,
+) {
+    for row in 0..values.len() {
+        if values.is_null(row) {
+            *null_count = null_count.saturating_add(1);
+            continue;
+        }
+        update_i128_range(values.value(row) as i128, min_value, max_value);
+    }
+}
+
+fn update_i128_range(value: i128, min_value: &mut Option<i128>, max_value: &mut Option<i128>) {
+    *min_value = Some(min_value.map_or(value, |current| current.min(value)));
+    *max_value = Some(max_value.map_or(value, |current| current.max(value)));
 }
 
 fn comma_join_single_table_filters(
@@ -41771,7 +43670,7 @@ fn comma_join_field_needed(
     {
         return true;
     }
-    needed.contains(&format!("{alias}.{column}"))
+    needed.contains(&format!("{alias}.{column}")) || needed.contains(column)
 }
 
 fn add_comma_join_expr_columns(
@@ -53557,6 +55456,8 @@ enum NativeFilteredAggregateState {
     MaxI64(Option<i64>),
 }
 
+const NATIVE_FILTERED_MAX_DENSE_GROUP_KEY: usize = 1_000_000;
+
 fn collect_native_filtered_aggregates(
     mut stream: SendableBatchStream,
     fragments: usize,
@@ -53585,10 +55486,13 @@ fn collect_native_filtered_aggregates(
     }
     debug_assert_eq!(group_by.len(), 1);
     let group_column = &group_by[0];
-    const MAX_DENSE_GROUP_KEY: usize = 1_000_000;
     let mut dense: Vec<Option<Vec<NativeFilteredAggregateState>>> = Vec::new();
     let mut null_i64_group: Option<Vec<NativeFilteredAggregateState>> = None;
     let mut groups: HashMap<GroupValue, Vec<NativeFilteredAggregateState>> = HashMap::new();
+    let profile = generic_profile_start().is_some();
+    let mut mask_nanos = 0u64;
+    let mut input_nanos = 0u64;
+    let mut update_nanos = 0u64;
     for batch in stream.by_ref() {
         let batch = batch?;
         if batch.num_rows() == 0 {
@@ -53598,15 +55502,64 @@ fn collect_native_filtered_aggregates(
         metrics.rows += batch.num_rows();
         let group_values = evaluated_column(&batch, group_column)?;
         let group_keys = NativeFilteredGroupKeys::new(&group_values);
+        let mask_started = profile.then(Instant::now);
         let masks = native_filtered_batch_masks(&batch, &specs)?;
+        mask_nanos = mask_nanos.saturating_add(elapsed_optional_nanos(mask_started));
+        let input_started = profile.then(Instant::now);
         let inputs = native_filtered_batch_inputs(&batch, &specs)?;
+        input_nanos = input_nanos.saturating_add(elapsed_optional_nanos(input_started));
+        let update_started = profile.then(Instant::now);
+        if let NativeFilteredGroupKeys::I32(values) = &group_keys
+            && values.null_count() == 0
+        {
+            for row in 0..batch.num_rows() {
+                let states = native_filtered_i64_group_states(
+                    i64::from(values.value(row)),
+                    &mut dense,
+                    &mut groups,
+                    &specs,
+                );
+                for (index, ((spec, mask), input)) in
+                    specs.iter().zip(&masks).zip(&inputs).enumerate()
+                {
+                    if mask.selected(row) {
+                        native_filtered_update_state_fast(&mut states[index], spec, input, row)?;
+                    }
+                }
+            }
+            update_nanos = update_nanos.saturating_add(elapsed_optional_nanos(update_started));
+            continue;
+        }
+        if let NativeFilteredGroupKeys::I64(values) = &group_keys
+            && values.null_count() == 0
+        {
+            for row in 0..batch.num_rows() {
+                let states = native_filtered_i64_group_states(
+                    values.value(row),
+                    &mut dense,
+                    &mut groups,
+                    &specs,
+                );
+                for (index, ((spec, mask), input)) in
+                    specs.iter().zip(&masks).zip(&inputs).enumerate()
+                {
+                    if mask.selected(row) {
+                        native_filtered_update_state_fast(&mut states[index], spec, input, row)?;
+                    }
+                }
+            }
+            update_nanos = update_nanos.saturating_add(elapsed_optional_nanos(update_started));
+            continue;
+        }
         for row in 0..batch.num_rows() {
             let states = if group_keys.is_i64_like() {
                 match group_keys.i64_key_at(row)? {
                     None => {
                         null_i64_group.get_or_insert_with(|| native_filtered_initial_states(&specs))
                     }
-                    Some(key) if key >= 0 && (key as usize) <= MAX_DENSE_GROUP_KEY => {
+                    Some(key)
+                        if key >= 0 && (key as usize) <= NATIVE_FILTERED_MAX_DENSE_GROUP_KEY =>
+                    {
                         let index = key as usize;
                         if dense.len() <= index {
                             dense.resize_with(index + 1, || None);
@@ -53626,10 +55579,11 @@ fn collect_native_filtered_aggregates(
             for (index, ((spec, mask), input)) in specs.iter().zip(&masks).zip(&inputs).enumerate()
             {
                 if mask.selected(row) {
-                    native_filtered_update_state(&mut states[index], spec, input, row)?;
+                    native_filtered_update_state_fast(&mut states[index], spec, input, row)?;
                 }
             }
         }
+        update_nanos = update_nanos.saturating_add(elapsed_optional_nanos(update_started));
     }
     metrics.groups = groups
         .into_iter()
@@ -53656,7 +55610,35 @@ fn collect_native_filtered_aggregates(
         .groups
         .sort_by(|left, right| compare_native_group_keys(&left.keys, &right.keys));
     metrics.aggregate_nanos = elapsed_micros_to_nanos(started.elapsed());
+    if profile {
+        eprintln!(
+            "[dodam:generic-profile] native filtered aggregate masks={:.3}ms inputs={:.3}ms update={:.3}ms groups={}",
+            sql_nanos_to_millis(mask_nanos),
+            sql_nanos_to_millis(input_nanos),
+            sql_nanos_to_millis(update_nanos),
+            metrics.groups.len()
+        );
+    }
     Ok(metrics)
+}
+
+fn native_filtered_i64_group_states<'a>(
+    key: i64,
+    dense: &'a mut Vec<Option<Vec<NativeFilteredAggregateState>>>,
+    groups: &'a mut HashMap<GroupValue, Vec<NativeFilteredAggregateState>>,
+    specs: &[NativeFilteredAggregateSpec],
+) -> &'a mut Vec<NativeFilteredAggregateState> {
+    if key >= 0 && (key as usize) <= NATIVE_FILTERED_MAX_DENSE_GROUP_KEY {
+        let index = key as usize;
+        if dense.len() <= index {
+            dense.resize_with(index + 1, || None);
+        }
+        dense[index].get_or_insert_with(|| native_filtered_initial_states(specs))
+    } else {
+        groups
+            .entry(GroupValue::Int64(Some(key)))
+            .or_insert_with(|| native_filtered_initial_states(specs))
+    }
 }
 
 enum NativeFilteredGroupKeys {
@@ -53965,6 +55947,58 @@ fn native_filtered_update_state(
     }
     let _ = spec;
     Ok(())
+}
+
+fn native_filtered_update_state_fast(
+    state: &mut NativeFilteredAggregateState,
+    spec: &NativeFilteredAggregateSpec,
+    input: &NativeFilteredBatchInput,
+    row: usize,
+) -> Result<()> {
+    match state {
+        NativeFilteredAggregateState::Count(count) => match input {
+            NativeFilteredBatchInput::AlwaysSome | NativeFilteredBatchInput::NonNull => {
+                *count += 1;
+                Ok(())
+            }
+            NativeFilteredBatchInput::I64Array(values) => {
+                if !values.is_null(row) {
+                    *count += 1;
+                }
+                Ok(())
+            }
+            NativeFilteredBatchInput::I32Array(values) => {
+                if !values.is_null(row) {
+                    *count += 1;
+                }
+                Ok(())
+            }
+            NativeFilteredBatchInput::Other(_) => {
+                native_filtered_update_state(state, spec, input, row)
+            }
+        },
+        NativeFilteredAggregateState::SumI64 { sum, count }
+        | NativeFilteredAggregateState::AvgI64 { sum, count } => match input {
+            NativeFilteredBatchInput::I64Array(values) => {
+                if !values.is_null(row) {
+                    *sum += values.value(row);
+                    *count += 1;
+                }
+                Ok(())
+            }
+            NativeFilteredBatchInput::I32Array(values) => {
+                if !values.is_null(row) {
+                    *sum += i64::from(values.value(row));
+                    *count += 1;
+                }
+                Ok(())
+            }
+            _ => native_filtered_update_state(state, spec, input, row),
+        },
+        NativeFilteredAggregateState::MinI64(_) | NativeFilteredAggregateState::MaxI64(_) => {
+            native_filtered_update_state(state, spec, input, row)
+        }
+    }
 }
 
 fn native_filtered_input_is_some(input: &NativeFilteredBatchInput, row: usize) -> Result<bool> {

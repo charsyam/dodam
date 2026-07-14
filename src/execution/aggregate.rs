@@ -35,6 +35,7 @@ use crate::vector::{
 const SMALL_GROUP_LINEAR_LIMIT: usize = 8;
 const SMALL_STRING_ID_CACHE_LIMIT: usize = 16;
 const TWO_UTF8_SMALL_GROUP_LIMIT: usize = 8;
+const THREE_UTF8_SMALL_GROUP_LIMIT: usize = 32;
 const DENSE_I32_GROUP_INDEX_MAX_SLOTS: usize = 65_536;
 const DENSE_U32_GROUP_INDEX_MAX_SLOTS: usize = 65_536;
 
@@ -59,6 +60,23 @@ fn two_utf8_small_group_limit() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(TWO_UTF8_SMALL_GROUP_LIMIT)
+}
+
+fn three_utf8_small_group_limit() -> usize {
+    std::env::var("DODAM_THREE_UTF8_SMALL_GROUP_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(THREE_UTF8_SMALL_GROUP_LIMIT)
+}
+
+fn dictionary_utf8_group_fast_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_DICTIONARY_UTF8_GROUP_FAST")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn three_utf8_key_count_sum_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_THREE_UTF8_COUNT_SUM_FAST")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 fn dense_i32_group_index_max_slots() -> usize {
@@ -280,25 +298,71 @@ pub fn collect_grouped_aggregates(
     aggregates: &[AggregateExpr],
 ) -> Result<AggregateMetrics> {
     let aggregate_started = Instant::now();
-    let mut metrics = if can_use_single_key_count_sum_min_max_path(group_by, aggregates) {
-        collect_single_key_count_sum_min_max_groups(stream, fragments, group_by, aggregates)?
+    let (path, mut metrics) = if can_use_single_key_count_sum_min_max_path(group_by, aggregates) {
+        (
+            "single_key_count_sum_min_max",
+            collect_single_key_count_sum_min_max_groups(stream, fragments, group_by, aggregates)?,
+        )
     } else if can_use_single_key_count_sum_path(group_by, aggregates) {
-        collect_single_key_count_sum_groups(stream, fragments, group_by, aggregates)?
+        (
+            "single_key_count_sum",
+            collect_single_key_count_sum_groups(stream, fragments, group_by, aggregates)?,
+        )
     } else if can_use_single_key_fast_path(group_by, aggregates) {
-        collect_single_key_groups(stream, fragments, group_by, aggregates)?
+        (
+            "single_key",
+            collect_single_key_groups(stream, fragments, group_by, aggregates)?,
+        )
     } else if can_use_two_utf8_key_fast_path(group_by, aggregates) {
-        collect_two_utf8_key_groups(stream, fragments, group_by, aggregates)?
+        (
+            "two_utf8_key",
+            collect_two_utf8_key_groups(stream, fragments, group_by, aggregates)?,
+        )
     } else if can_use_two_key_count_sum_path(group_by, aggregates) {
-        collect_two_key_count_sum_groups(stream, fragments, group_by, aggregates)?
+        (
+            "two_key_count_sum",
+            collect_two_key_count_sum_groups(stream, fragments, group_by, aggregates)?,
+        )
+    } else if can_use_three_utf8_key_count_sum_path(group_by, aggregates) {
+        (
+            "three_utf8_count_sum",
+            collect_three_utf8_key_count_sum_groups(stream, fragments, group_by, aggregates)?,
+        )
     } else if can_use_three_key_count_sum_path(group_by, aggregates) {
-        collect_three_key_count_sum_groups(stream, fragments, group_by, aggregates)?
+        (
+            "three_key_count_sum",
+            collect_three_key_count_sum_groups(stream, fragments, group_by, aggregates)?,
+        )
     } else if can_use_two_key_sum_path(group_by, aggregates) {
-        collect_two_key_sum_groups(stream, fragments, group_by, aggregates)?
+        (
+            "two_key_sum",
+            collect_two_key_sum_groups(stream, fragments, group_by, aggregates)?,
+        )
     } else {
-        collect_grouped_aggregates_generic(stream, fragments, group_by, aggregates, None, None)?
+        (
+            "generic",
+            collect_grouped_aggregates_generic(
+                stream, fragments, group_by, aggregates, None, None,
+            )?,
+        )
     };
     metrics.aggregate_nanos = elapsed_nanos(aggregate_started);
+    if grouped_aggregate_profile_enabled() {
+        eprintln!(
+            "[dodam:aggregate-profile] grouped path={} rows={} batches={} groups={} elapsed={:.3}ms",
+            path,
+            metrics.rows,
+            metrics.batches,
+            metrics.groups.len(),
+            metrics.aggregate_nanos as f64 / 1_000_000.0,
+        );
+    }
     Ok(metrics)
+}
+
+fn grouped_aggregate_profile_enabled() -> bool {
+    std::env::var("DODAM_AGGREGATE_PROFILE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9437,8 +9501,8 @@ fn collect_two_utf8_key_groups(
         let first_key = batch.column(column_index(&batch, &group_by[0])?);
         let second_key = batch.column(column_index(&batch, &group_by[1])?);
         let (Some(first_key), Some(second_key)) = (
-            first_key.as_any().downcast_ref::<StringArray>(),
-            second_key.as_any().downcast_ref::<StringArray>(),
+            Utf8GroupKeyReader::new(first_key),
+            Utf8GroupKeyReader::new(second_key),
         ) else {
             return collect_grouped_aggregates_generic(
                 stream,
@@ -9452,8 +9516,8 @@ fn collect_two_utf8_key_groups(
         let aggregate_inputs = typed_fast_inputs(&batch, aggregates)?;
 
         for row in 0..batch.num_rows() {
-            let first = first_key.is_valid(row).then(|| first_key.value(row));
-            let second = second_key.is_valid(row).then(|| second_key.value(row));
+            let first = first_key.key(row);
+            let second = second_key.key(row);
             let group_id = group_index.group_id(first, second, &mut groups, &aggregate_inputs);
             let group = &mut groups[group_id];
             for (state, input) in group.states.iter_mut().zip(&aggregate_inputs) {
@@ -9469,6 +9533,45 @@ fn collect_two_utf8_key_groups(
     group_results.sort_by(|left, right| compare_group_keys(&left.keys, &right.keys));
     metrics.groups = group_results;
     Ok(metrics)
+}
+
+enum Utf8GroupKeyReader<'a> {
+    Utf8(&'a StringArray),
+    Dictionary(&'a DictionaryArray<Int32Type>, DictionaryStringValues<'a>),
+}
+
+impl<'a> Utf8GroupKeyReader<'a> {
+    fn new(column: &'a ArrayRef) -> Option<Self> {
+        match column.data_type() {
+            DataType::Utf8 => Some(Self::Utf8(column.as_any().downcast_ref::<StringArray>()?)),
+            DataType::Dictionary(key, value)
+                if matches!((&**key, &**value), (DataType::Int32, DataType::Utf8)) =>
+            {
+                if !dictionary_utf8_group_fast_enabled() {
+                    return None;
+                }
+                let dictionary = column
+                    .as_any()
+                    .downcast_ref::<DictionaryArray<Int32Type>>()?;
+                Some(Self::Dictionary(
+                    dictionary,
+                    dictionary_i32_string_values(dictionary)?,
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    fn key(&self, row: usize) -> Utf8KeyRef<'_> {
+        match self {
+            Self::Utf8(values) => {
+                Utf8KeyRef::from_option(values.is_valid(row).then(|| values.value(row)))
+            }
+            Self::Dictionary(values, dictionary_values) => {
+                dictionary_utf8_key(values, *dictionary_values, row)
+            }
+        }
+    }
 }
 
 enum TwoUtf8KeyGroupIndex {
@@ -9491,15 +9594,17 @@ struct TwoUtf8SmallGroup {
 impl TwoUtf8KeyGroupIndex {
     fn group_id(
         &mut self,
-        first: Option<&str>,
-        second: Option<&str>,
+        first: Utf8KeyRef<'_>,
+        second: Utf8KeyRef<'_>,
         groups_out: &mut Vec<TwoKeyGroup>,
         inputs: &[FastAggregateInput<'_>],
     ) -> usize {
+        let first_str = first.as_option_str();
+        let second_str = second.as_option_str();
         match self {
             Self::Small(groups) => {
                 if let Some(group_id) = groups.iter().find_map(|group| {
-                    (group.first.as_deref() == first && group.second.as_deref() == second)
+                    (group.first.as_deref() == first_str && group.second.as_deref() == second_str)
                         .then_some(group.group_id)
                 }) {
                     return group_id;
@@ -9507,13 +9612,13 @@ impl TwoUtf8KeyGroupIndex {
                 if groups.len() < two_utf8_small_group_limit() {
                     let group_id = push_two_utf8_group(
                         groups_out,
-                        first.map(str::to_string),
-                        second.map(str::to_string),
+                        first.to_owned_string(),
+                        second.to_owned_string(),
                         inputs,
                     );
                     groups.push(TwoUtf8SmallGroup {
-                        first: first.map(str::to_string),
-                        second: second.map(str::to_string),
+                        first: first.to_owned_string(),
+                        second: second.to_owned_string(),
                         group_id,
                     });
                     return group_id;
@@ -9522,11 +9627,11 @@ impl TwoUtf8KeyGroupIndex {
                 for group in groups.drain(..) {
                     hash.insert_existing(group.first, group.second, group.group_id);
                 }
-                let group_id = hash.group_id(first, second, groups_out, inputs);
+                let group_id = hash.group_id(first_str, second_str, groups_out, inputs);
                 *self = Self::Hash(hash);
                 group_id
             }
-            Self::Hash(hash) => hash.group_id(first, second, groups_out, inputs),
+            Self::Hash(hash) => hash.group_id(first_str, second_str, groups_out, inputs),
         }
     }
 }
@@ -9691,6 +9796,189 @@ fn can_use_three_key_count_sum_path(group_by: &[String], aggregates: &[Aggregate
             aggregates,
             [AggregateExpr::CountStar, AggregateExpr::Sum(_)]
         )
+}
+
+fn can_use_three_utf8_key_count_sum_path(
+    group_by: &[String],
+    aggregates: &[AggregateExpr],
+) -> bool {
+    three_utf8_key_count_sum_enabled()
+        && group_by.len() == 3
+        && matches!(
+            aggregates,
+            [AggregateExpr::CountStar, AggregateExpr::Sum(_)]
+        )
+}
+
+fn collect_three_utf8_key_count_sum_groups(
+    mut stream: SendableBatchStream,
+    fragments: usize,
+    group_by: &[String],
+    aggregates: &[AggregateExpr],
+) -> Result<AggregateMetrics> {
+    let mut groups = Vec::<TwoKeyGroup>::new();
+    let mut group_index = ThreeUtf8KeyGroupIndex::default();
+    let mut metrics = AggregateMetrics {
+        fragments,
+        ..AggregateMetrics::default()
+    };
+
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        metrics.batches += 1;
+        metrics.rows += batch.num_rows();
+
+        let first = batch.column(column_index(&batch, &group_by[0])?);
+        let second = batch.column(column_index(&batch, &group_by[1])?);
+        let third = batch.column(column_index(&batch, &group_by[2])?);
+        let (Some(first), Some(second), Some(third)) = (
+            Utf8GroupKeyReader::new(first),
+            Utf8GroupKeyReader::new(second),
+            Utf8GroupKeyReader::new(third),
+        ) else {
+            return collect_grouped_aggregates_generic(
+                stream,
+                fragments,
+                group_by,
+                aggregates,
+                Some(batch),
+                Some(metrics),
+            );
+        };
+        let aggregate_inputs = typed_fast_inputs(&batch, aggregates)?;
+
+        for row in 0..batch.num_rows() {
+            let first = first.key(row);
+            let second = second.key(row);
+            let third = third.key(row);
+            let group_id =
+                group_index.group_id(first, second, third, &mut groups, &aggregate_inputs);
+            let group = &mut groups[group_id];
+            for (state, input) in group.states.iter_mut().zip(&aggregate_inputs) {
+                state.update(input, row);
+            }
+        }
+    }
+
+    let mut group_results = groups
+        .into_iter()
+        .map(TwoKeyGroup::finish)
+        .collect::<Vec<_>>();
+    group_results.sort_by(|left, right| compare_group_keys(&left.keys, &right.keys));
+    metrics.groups = group_results;
+    Ok(metrics)
+}
+
+enum ThreeUtf8KeyGroupIndex {
+    Small(Vec<ThreeUtf8SmallGroup>),
+    Hash(AggregateHashMap<(Option<String>, Option<String>, Option<String>), usize>),
+}
+
+impl Default for ThreeUtf8KeyGroupIndex {
+    fn default() -> Self {
+        Self::Small(Vec::new())
+    }
+}
+
+struct ThreeUtf8SmallGroup {
+    first: Option<String>,
+    second: Option<String>,
+    third: Option<String>,
+    group_id: usize,
+}
+
+impl ThreeUtf8KeyGroupIndex {
+    fn group_id(
+        &mut self,
+        first: Utf8KeyRef<'_>,
+        second: Utf8KeyRef<'_>,
+        third: Utf8KeyRef<'_>,
+        groups_out: &mut Vec<TwoKeyGroup>,
+        inputs: &[FastAggregateInput<'_>],
+    ) -> usize {
+        let first_str = first.as_option_str();
+        let second_str = second.as_option_str();
+        let third_str = third.as_option_str();
+        match self {
+            Self::Small(groups) => {
+                if let Some(group_id) = groups.iter().find_map(|group| {
+                    (group.first.as_deref() == first_str
+                        && group.second.as_deref() == second_str
+                        && group.third.as_deref() == third_str)
+                        .then_some(group.group_id)
+                }) {
+                    return group_id;
+                }
+                let first = first.to_owned_string();
+                let second = second.to_owned_string();
+                let third = third.to_owned_string();
+                let group_id = push_three_utf8_group(
+                    groups_out,
+                    first.clone(),
+                    second.clone(),
+                    third.clone(),
+                    inputs,
+                );
+                if groups.len() < three_utf8_small_group_limit() {
+                    groups.push(ThreeUtf8SmallGroup {
+                        first,
+                        second,
+                        third,
+                        group_id,
+                    });
+                    return group_id;
+                }
+                let mut hash = AggregateHashMap::default();
+                for group in groups.drain(..) {
+                    hash.insert((group.first, group.second, group.third), group.group_id);
+                }
+                hash.insert((first, second, third), group_id);
+                *self = Self::Hash(hash);
+                group_id
+            }
+            Self::Hash(hash) => {
+                let key = (
+                    first.to_owned_string(),
+                    second.to_owned_string(),
+                    third.to_owned_string(),
+                );
+                if let Some(group_id) = hash.get(&key) {
+                    return *group_id;
+                }
+                let group_id = push_three_utf8_group(
+                    groups_out,
+                    key.0.clone(),
+                    key.1.clone(),
+                    key.2.clone(),
+                    inputs,
+                );
+                hash.insert(key, group_id);
+                group_id
+            }
+        }
+    }
+}
+
+fn push_three_utf8_group(
+    groups_out: &mut Vec<TwoKeyGroup>,
+    first: Option<String>,
+    second: Option<String>,
+    third: Option<String>,
+    inputs: &[FastAggregateInput<'_>],
+) -> usize {
+    let group_id = groups_out.len();
+    groups_out.push(TwoKeyGroup::new(
+        vec![
+            GroupValue::Utf8(first),
+            GroupValue::Utf8(second),
+            GroupValue::Utf8(third),
+        ],
+        inputs,
+    ));
+    group_id
 }
 
 fn collect_three_key_count_sum_groups(

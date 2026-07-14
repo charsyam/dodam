@@ -21,7 +21,7 @@ use arrow::compute::kernels::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow::datatypes::{DataType, Field, Int32Type, Schema, TimeUnit};
 use arrow::ipc::reader::FileReader as IpcFileReader;
 use arrow::ipc::writer::FileWriter as IpcFileWriter;
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use arrow_ord::sort::{SortColumn, SortOptions, lexsort_to_indices};
 use arrow_row::{OwnedRow, RowConverter, SortField};
 use arrow_select::concat::concat_batches;
@@ -1622,6 +1622,71 @@ impl Drop for ProjectionStream {
     }
 }
 
+pub struct StripPrefixExec {
+    input: Box<dyn PhysicalPlan>,
+    prefix: String,
+}
+
+impl StripPrefixExec {
+    pub fn new(input: Box<dyn PhysicalPlan>, prefix: String) -> Self {
+        Self { input, prefix }
+    }
+}
+
+impl PhysicalPlan for StripPrefixExec {
+    fn execute(self: Box<Self>) -> Result<SendableBatchStream> {
+        let Self { input, prefix } = *self;
+        let input = input.execute()?;
+        let (input, metrics) = input.into_parts();
+        Ok(SendableBatchStream::new(
+            Box::new(StripPrefixStream { input, prefix }),
+            metrics,
+        ))
+    }
+}
+
+struct StripPrefixStream {
+    input: Box<dyn Iterator<Item = Result<RecordBatch>> + Send>,
+    prefix: String,
+}
+
+impl Iterator for StripPrefixStream {
+    type Item = Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.input.next().map(|batch| {
+            let batch = batch?;
+            strip_record_batch_field_prefix(batch, &self.prefix)
+        })
+    }
+}
+
+fn strip_record_batch_field_prefix(batch: RecordBatch, prefix: &str) -> Result<RecordBatch> {
+    let fields = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| {
+            let name = field
+                .name()
+                .as_str()
+                .strip_prefix(prefix)
+                .unwrap_or(field.name().as_str())
+                .to_string();
+            Arc::new(Field::new(
+                name,
+                field.data_type().clone(),
+                field.is_nullable(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    record_batch_with_row_count(
+        Arc::new(Schema::new(fields)),
+        batch.columns().to_vec(),
+        batch.num_rows(),
+    )
+}
+
 pub struct SortExec {
     input: Box<dyn PhysicalPlan>,
     sort: SortKey,
@@ -2150,6 +2215,12 @@ impl PhysicalPlan for HashJoinExec {
                 emitted_unmatched_build: false,
                 probe_template: None,
                 profile_logged: false,
+                local_build_rows: 0,
+                local_probe_rows: 0,
+                local_output_rows: 0,
+                local_build_nanos: 0,
+                local_probe_nanos: 0,
+                local_materialize_nanos: 0,
             }),
             metrics,
         ))
@@ -2425,6 +2496,12 @@ struct HashJoinStream {
     emitted_unmatched_build: bool,
     probe_template: Option<RecordBatch>,
     profile_logged: bool,
+    local_build_rows: usize,
+    local_probe_rows: usize,
+    local_output_rows: usize,
+    local_build_nanos: u64,
+    local_probe_nanos: u64,
+    local_materialize_nanos: u64,
 }
 
 impl Iterator for HashJoinStream {
@@ -2451,13 +2528,20 @@ impl Iterator for HashJoinStream {
                     } else {
                         HashBuildMode::FastSingleKey
                     };
-                    build_hash_join_input(
+                    let build_started = Instant::now();
+                    self.local_build_rows = left.iter().map(RecordBatch::num_rows).sum();
+                    let result = build_hash_join_input(
                         &left,
                         &self.left_keys,
                         mode,
                         should_emit_unmatched_build(self.join_type, self.build_side),
                         &self.metrics,
-                    )
+                    );
+                    if result.is_ok() {
+                        self.local_build_nanos =
+                            build_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    }
+                    result
                 }
                 JoinBuildSide::Right => {
                     let right = match collect_non_empty_batches(&mut self.right) {
@@ -2473,13 +2557,20 @@ impl Iterator for HashJoinStream {
                     } else {
                         HashBuildMode::FastSingleKey
                     };
-                    build_hash_join_input(
+                    let build_started = Instant::now();
+                    self.local_build_rows = right.iter().map(RecordBatch::num_rows).sum();
+                    let result = build_hash_join_input(
                         &right,
                         &self.right_keys,
                         mode,
                         should_emit_unmatched_build(self.join_type, self.build_side),
                         &self.metrics,
-                    )
+                    );
+                    if result.is_ok() {
+                        self.local_build_nanos =
+                            build_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    }
+                    result
                 }
             };
             self.build = match build {
@@ -2493,10 +2584,9 @@ impl Iterator for HashJoinStream {
             };
         }
 
-        let build = self.build.as_ref()?;
         match self.build_side {
             JoinBuildSide::Left => {
-                for right in self.right.by_ref() {
+                while let Some(right) = self.right.next() {
                     match right {
                         Ok(right) if right.num_rows() == 0 => {
                             self.probe_template.get_or_insert_with(|| right.clone());
@@ -2504,6 +2594,9 @@ impl Iterator for HashJoinStream {
                         }
                         Ok(right) => {
                             self.probe_template.get_or_insert_with(|| right.clone());
+                            let probe_started = Instant::now();
+                            let materialize_before = self.metrics.snapshot().join_materialize_nanos;
+                            let build = self.build.as_ref()?;
                             match probe_hash_join_batches(
                                 &right,
                                 build,
@@ -2518,8 +2611,22 @@ impl Iterator for HashJoinStream {
                                 &self.output_projection,
                                 &self.metrics,
                             ) {
-                                Ok(batches) if batches.is_empty() => continue,
+                                Ok(batches) if batches.is_empty() => {
+                                    self.record_local_probe_profile(
+                                        right.num_rows(),
+                                        &[],
+                                        probe_started,
+                                        materialize_before,
+                                    );
+                                    continue;
+                                }
                                 Ok(mut batches) => {
+                                    self.record_local_probe_profile(
+                                        right.num_rows(),
+                                        &batches,
+                                        probe_started,
+                                        materialize_before,
+                                    );
                                     self.pending_output.extend(batches.drain(1..));
                                     return Some(Ok(batches.remove(0)));
                                 }
@@ -2531,7 +2638,7 @@ impl Iterator for HashJoinStream {
                 }
             }
             JoinBuildSide::Right => {
-                for left in self.left.by_ref() {
+                while let Some(left) = self.left.next() {
                     match left {
                         Ok(left) if left.num_rows() == 0 => {
                             self.probe_template.get_or_insert_with(|| left.clone());
@@ -2539,6 +2646,9 @@ impl Iterator for HashJoinStream {
                         }
                         Ok(left) => {
                             self.probe_template.get_or_insert_with(|| left.clone());
+                            let probe_started = Instant::now();
+                            let materialize_before = self.metrics.snapshot().join_materialize_nanos;
+                            let build = self.build.as_ref()?;
                             match probe_hash_join_batches(
                                 &left,
                                 build,
@@ -2553,8 +2663,22 @@ impl Iterator for HashJoinStream {
                                 &self.output_projection,
                                 &self.metrics,
                             ) {
-                                Ok(batches) if batches.is_empty() => continue,
+                                Ok(batches) if batches.is_empty() => {
+                                    self.record_local_probe_profile(
+                                        left.num_rows(),
+                                        &[],
+                                        probe_started,
+                                        materialize_before,
+                                    );
+                                    continue;
+                                }
                                 Ok(mut batches) => {
+                                    self.record_local_probe_profile(
+                                        left.num_rows(),
+                                        &batches,
+                                        probe_started,
+                                        materialize_before,
+                                    );
                                     self.pending_output.extend(batches.drain(1..));
                                     return Some(Ok(batches.remove(0)));
                                 }
@@ -2567,6 +2691,7 @@ impl Iterator for HashJoinStream {
             }
         }
 
+        let build = self.build.as_ref()?;
         match emit_unmatched_build_if_needed(
             build,
             self.matched_build.as_ref(),
@@ -2592,6 +2717,26 @@ impl Iterator for HashJoinStream {
 }
 
 impl HashJoinStream {
+    fn record_local_probe_profile(
+        &mut self,
+        probe_rows: usize,
+        output: &[RecordBatch],
+        probe_started: Instant,
+        materialize_before: u64,
+    ) {
+        self.local_probe_rows = self.local_probe_rows.saturating_add(probe_rows);
+        self.local_output_rows = self
+            .local_output_rows
+            .saturating_add(output.iter().map(RecordBatch::num_rows).sum::<usize>());
+        self.local_probe_nanos = self
+            .local_probe_nanos
+            .saturating_add(probe_started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        let materialize_after = self.metrics.snapshot().join_materialize_nanos;
+        self.local_materialize_nanos = self
+            .local_materialize_nanos
+            .saturating_add(materialize_after.saturating_sub(materialize_before));
+    }
+
     fn log_profile_once(&mut self) {
         if self.profile_logged || !join_profile_enabled() {
             return;
@@ -2609,6 +2754,17 @@ impl HashJoinStream {
             metrics.join_bloom_filtered_rows,
             metrics.join_spill_files,
             metrics.join_spill_bytes,
+        );
+        eprintln!(
+            "[dodam:join-profile-local] build_side={:?} join_type={:?} build_rows={} probe_rows={} output_rows={} build={:.3}ms probe_total={:.3}ms materialize={:.3}ms",
+            self.build_side,
+            self.join_type,
+            self.local_build_rows,
+            self.local_probe_rows,
+            self.local_output_rows,
+            nanos_to_millis(self.local_build_nanos),
+            nanos_to_millis(self.local_probe_nanos),
+            nanos_to_millis(self.local_materialize_nanos),
         );
     }
 }
@@ -5508,6 +5664,8 @@ struct HashJoinMaterializeContext<'a> {
     build: &'a HashJoinBuild,
     build_side: JoinBuildSide,
     output_projection: &'a JoinOutputProjection,
+    probe_column_indices: Option<Vec<usize>>,
+    build_column_indices: Option<Vec<usize>>,
     join_output_schema: Arc<Schema>,
     semi_output_schema: Arc<Schema>,
     metrics: &'a ScanPlanMetricsCounter,
@@ -5531,11 +5689,23 @@ fn hash_join_materialize_context<'a>(
     output_projection: &'a JoinOutputProjection,
     metrics: &'a ScanPlanMetricsCounter,
 ) -> Result<HashJoinMaterializeContext<'a>> {
+    let (probe_columns, build_columns) = match build_side {
+        JoinBuildSide::Left => (
+            output_projection.right_columns.as_ref(),
+            output_projection.left_columns.as_ref(),
+        ),
+        JoinBuildSide::Right => (
+            output_projection.left_columns.as_ref(),
+            output_projection.right_columns.as_ref(),
+        ),
+    };
     Ok(HashJoinMaterializeContext {
         probe,
         build,
         build_side,
         output_projection,
+        probe_column_indices: projection_column_indices(probe, probe_columns)?,
+        build_column_indices: projection_column_indices(&build.batches[0], build_columns)?,
         join_output_schema: hash_join_output_schema(
             probe,
             build,
@@ -8500,19 +8670,15 @@ fn materialize_unmatched_probe_matches(
     probe_indices: &[u32],
 ) -> Result<RecordBatch> {
     let started = Instant::now();
-    let (probe_columns, build_columns) = match context.build_side {
-        JoinBuildSide::Left => (
-            context.output_projection.right_columns.as_ref(),
-            context.output_projection.left_columns.as_ref(),
-        ),
-        JoinBuildSide::Right => (
-            context.output_projection.left_columns.as_ref(),
-            context.output_projection.right_columns.as_ref(),
-        ),
-    };
-    let probe_taken =
-        take_record_batch_by_indices_projected(context.probe, probe_indices, probe_columns)?;
-    let build_template = project_batch_columns(&context.build.batches[0], build_columns)?;
+    let probe_taken = take_record_batch_by_indices_projected_indices(
+        context.probe,
+        probe_indices,
+        context.probe_column_indices.as_deref(),
+    )?;
+    let build_template = project_batch_columns_by_indices(
+        &context.build.batches[0],
+        context.build_column_indices.as_deref(),
+    )?;
     let null_build =
         null_record_batch_for_schema(build_template.schema().as_ref(), probe_indices.len())?;
     let (left_taken, right_taken) = match context.build_side {
@@ -8552,19 +8718,16 @@ fn materialize_hash_join_pairs(
     build_refs: &[BuildRowRef],
 ) -> Result<RecordBatch> {
     let started = Instant::now();
-    let (probe_columns, build_columns) = match context.build_side {
-        JoinBuildSide::Left => (
-            context.output_projection.right_columns.as_ref(),
-            context.output_projection.left_columns.as_ref(),
-        ),
-        JoinBuildSide::Right => (
-            context.output_projection.left_columns.as_ref(),
-            context.output_projection.right_columns.as_ref(),
-        ),
-    };
-    let probe_taken =
-        take_record_batch_by_indices_projected(context.probe, probe_indices, probe_columns)?;
-    let build_taken = take_build_row_refs_projected(context.build, build_refs, build_columns)?;
+    let probe_taken = take_record_batch_by_indices_projected_indices(
+        context.probe,
+        probe_indices,
+        context.probe_column_indices.as_deref(),
+    )?;
+    let build_taken = take_build_row_refs_projected_indices(
+        context.build,
+        build_refs,
+        context.build_column_indices.as_deref(),
+    )?;
     let (left_taken, right_taken) = match context.build_side {
         JoinBuildSide::Left => (build_taken, probe_taken),
         JoinBuildSide::Right => (probe_taken, build_taken),
@@ -8583,10 +8746,13 @@ fn single_side_output_batch_with_schema(
     batch: &RecordBatch,
     schema: Arc<Schema>,
 ) -> Result<RecordBatch> {
-    Ok(RecordBatch::try_new(schema, batch.columns().to_vec())?)
+    record_batch_with_row_count(schema, batch.columns().to_vec(), batch.num_rows())
 }
 
 fn take_record_batch_by_indices(batch: &RecordBatch, indices: &[u32]) -> Result<RecordBatch> {
+    if batch.num_columns() == 0 {
+        return record_batch_with_row_count(batch.schema(), Vec::new(), indices.len());
+    }
     if let Some((start, len)) = contiguous_index_range(indices) {
         return Ok(batch.slice(start, len));
     }
@@ -8601,16 +8767,25 @@ fn take_record_batch_by_indices_projected(
     indices: &[u32],
     columns: Option<&Vec<String>>,
 ) -> Result<RecordBatch> {
-    let projected = project_batch_columns(batch, columns)?;
+    let column_indices = projection_column_indices(batch, columns)?;
+    take_record_batch_by_indices_projected_indices(batch, indices, column_indices.as_deref())
+}
+
+fn take_record_batch_by_indices_projected_indices(
+    batch: &RecordBatch,
+    indices: &[u32],
+    columns: Option<&[usize]>,
+) -> Result<RecordBatch> {
+    let projected = project_batch_columns_by_indices(batch, columns)?;
     take_record_batch_by_indices(&projected, indices)
 }
 
-fn project_batch_columns(
+fn projection_column_indices(
     batch: &RecordBatch,
     columns: Option<&Vec<String>>,
-) -> Result<RecordBatch> {
+) -> Result<Option<Vec<usize>>> {
     let Some(columns) = columns else {
-        return Ok(batch.clone());
+        return Ok(None);
     };
     if columns.len() == batch.num_columns()
         && columns
@@ -8618,13 +8793,33 @@ fn project_batch_columns(
             .zip(batch.schema().fields())
             .all(|(column, field)| column == field.name())
     {
-        return Ok(batch.clone());
+        return Ok(None);
     }
-    let indices = columns
+    columns
         .iter()
         .map(|column| column_index(batch, column))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(batch.project(&indices)?)
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+fn project_batch_columns_by_indices(
+    batch: &RecordBatch,
+    columns: Option<&[usize]>,
+) -> Result<RecordBatch> {
+    let Some(indices) = columns else {
+        return Ok(batch.clone());
+    };
+    if indices.is_empty() {
+        return record_batch_with_row_count(
+            Arc::new(Schema::new(Vec::<Field>::new())),
+            Vec::new(),
+            batch.num_rows(),
+        );
+    }
+    if indices.len() == batch.num_columns() && indices.iter().copied().eq(0..batch.num_columns()) {
+        return Ok(batch.clone());
+    }
+    Ok(batch.project(indices)?)
 }
 
 fn contiguous_index_range(indices: &[u32]) -> Option<(usize, usize)> {
@@ -8648,20 +8843,29 @@ fn take_build_row_refs_projected(
     refs: &[BuildRowRef],
     columns: Option<&Vec<String>>,
 ) -> Result<RecordBatch> {
+    let column_indices = projection_column_indices(&build.batches[0], columns)?;
+    take_build_row_refs_projected_indices(build, refs, column_indices.as_deref())
+}
+
+fn take_build_row_refs_projected_indices(
+    build: &HashJoinBuild,
+    refs: &[BuildRowRef],
+    columns: Option<&[usize]>,
+) -> Result<RecordBatch> {
     if let Some((batch_index, start, len)) = contiguous_build_ref_range(refs) {
         let batch = build.batches.get(batch_index).ok_or_else(|| {
             DodamError::UnsupportedSql("hash join build row reference is out of range".to_string())
         })?;
-        let projected = project_batch_columns(batch, columns)?;
+        let projected = project_batch_columns_by_indices(batch, columns)?;
         return Ok(projected.slice(start, len));
     }
 
-    if let Some(batch) = try_take_build_row_refs_direct(build, refs, columns)? {
+    if let Some(batch) = try_take_build_row_refs_direct_indices(build, refs, columns)? {
         return Ok(batch);
     }
 
     if should_take_build_refs_via_global_indices(refs) {
-        return take_build_row_refs_via_global_indices(build, refs, columns);
+        return take_build_row_refs_via_global_indices_indices(build, refs, columns);
     }
 
     let schema = build.batches[0].schema();
@@ -8677,7 +8881,7 @@ fn take_build_row_refs_projected(
         let batch = build.batches.get(batch_index).ok_or_else(|| {
             DodamError::UnsupportedSql("hash join build row reference is out of range".to_string())
         })?;
-        chunks.push(take_record_batch_by_indices_projected(
+        chunks.push(take_record_batch_by_indices_projected_indices(
             batch, &rows, columns,
         )?);
     }
@@ -8688,22 +8892,25 @@ fn take_build_row_refs_projected(
     Ok(concat_batches(&schema, chunks.iter())?)
 }
 
-fn try_take_build_row_refs_direct(
+fn try_take_build_row_refs_direct_indices(
     build: &HashJoinBuild,
     refs: &[BuildRowRef],
-    columns: Option<&Vec<String>>,
+    columns: Option<&[usize]>,
 ) -> Result<Option<RecordBatch>> {
     if !should_take_build_refs_via_global_indices(refs) {
         return Ok(None);
     }
     let schema = build.batches[0].schema();
-    let column_indices = match columns {
-        Some(columns) => columns
-            .iter()
-            .map(|column| column_index(&build.batches[0], column))
-            .collect::<Result<Vec<_>>>()?,
-        None => (0..schema.fields().len()).collect(),
-    };
+    let column_indices = columns
+        .map(|columns| columns.to_vec())
+        .unwrap_or_else(|| (0..schema.fields().len()).collect());
+    if column_indices.is_empty() {
+        return Ok(Some(record_batch_with_row_count(
+            Arc::new(Schema::new(Vec::<Field>::new())),
+            Vec::new(),
+            refs.len(),
+        )?));
+    }
     let mut arrays = Vec::with_capacity(column_indices.len());
     let mut fields = Vec::with_capacity(column_indices.len());
     for column_index in column_indices {
@@ -8920,10 +9127,10 @@ fn should_take_build_refs_via_global_indices(refs: &[BuildRowRef]) -> bool {
     false
 }
 
-fn take_build_row_refs_via_global_indices(
+fn take_build_row_refs_via_global_indices_indices(
     build: &HashJoinBuild,
     refs: &[BuildRowRef],
-    columns: Option<&Vec<String>>,
+    columns: Option<&[usize]>,
 ) -> Result<RecordBatch> {
     let mut batch_indices = Vec::new();
     for row_ref in refs {
@@ -8940,7 +9147,7 @@ fn take_build_row_refs_via_global_indices(
         let batch = build.batches.get(batch_index).ok_or_else(|| {
             DodamError::UnsupportedSql("hash join build row reference is out of range".to_string())
         })?;
-        let projected = project_batch_columns(batch, columns)?;
+        let projected = project_batch_columns_by_indices(batch, columns)?;
         offsets.insert(batch_index, offset);
         offset = offset
             .checked_add(u32::try_from(projected.num_rows()).map_err(|_| {
@@ -8962,6 +9169,12 @@ fn take_build_row_refs_via_global_indices(
         .unwrap_or_else(|| build.batches[0].schema());
     let concatenated = if projected_batches.len() == 1 {
         projected_batches.remove(0)
+    } else if schema.fields().is_empty() {
+        let rows = projected_batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>();
+        record_batch_with_row_count(schema, Vec::new(), rows)?
     } else {
         concat_batches(&schema, projected_batches.iter())?
     };
@@ -9553,6 +9766,21 @@ fn join_output_batch_with_schema(
         .cloned()
         .chain(right.columns().iter().cloned())
         .collect::<Vec<_>>();
+    record_batch_with_row_count(schema, columns, left.num_rows().max(right.num_rows()))
+}
+
+fn record_batch_with_row_count(
+    schema: Arc<Schema>,
+    columns: Vec<ArrayRef>,
+    rows: usize,
+) -> Result<RecordBatch> {
+    if columns.is_empty() {
+        return Ok(RecordBatch::try_new_with_options(
+            schema,
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(rows)),
+        )?);
+    }
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
