@@ -1,4 +1,164 @@
+use std::collections::HashMap;
+
 use crate::execution::{ComparisonExpr, Expr, FilterExpr, Projection, SortKey};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogicalJoinTableStats {
+    pub rows: u128,
+    pub row_width: u128,
+    pub key_ndv: HashMap<String, u128>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogicalJoinEdge {
+    pub left: usize,
+    pub left_key: String,
+    pub right: usize,
+    pub right_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogicalJoinStep {
+    pub table_index: usize,
+    pub estimated_rows: u128,
+    pub estimated_cost: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogicalJoinPlan {
+    pub start: usize,
+    pub steps: Vec<LogicalJoinStep>,
+    pub estimated_cost: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogicalJoinGraph {
+    pub tables: Vec<LogicalJoinTableStats>,
+    pub edges: Vec<LogicalJoinEdge>,
+}
+
+impl LogicalJoinGraph {
+    pub fn choose_greedy_plan(&self) -> Option<LogicalJoinPlan> {
+        (0..self.tables.len())
+            .filter_map(|start| self.estimate_greedy_plan(start))
+            .min_by_key(|plan| plan.estimated_cost)
+    }
+
+    pub fn table_width(&self, table_index: usize) -> u128 {
+        self.tables[table_index].row_width
+    }
+
+    pub fn choose_next_join(
+        &self,
+        joined: &[bool],
+        current_rows: u128,
+        current_width: u128,
+        candidates: &[usize],
+    ) -> Option<LogicalJoinStep> {
+        candidates
+            .iter()
+            .copied()
+            .filter(|table_index| !joined.get(*table_index).copied().unwrap_or(false))
+            .filter_map(|table_index| {
+                let edges = self.connected_edges(joined, table_index);
+                if edges.is_empty() {
+                    return None;
+                }
+                let estimated_rows = self.estimate_join_rows(current_rows, table_index, &edges);
+                let output_width = current_width.saturating_add(self.tables[table_index].row_width);
+                let build_cost = current_rows.saturating_mul(current_width).min(
+                    self.tables[table_index]
+                        .rows
+                        .saturating_mul(self.tables[table_index].row_width),
+                );
+                let estimated_cost = estimated_rows
+                    .saturating_mul(output_width)
+                    .saturating_add(build_cost);
+                Some(LogicalJoinStep {
+                    table_index,
+                    estimated_rows,
+                    estimated_cost,
+                })
+            })
+            .min_by_key(|step| step.estimated_cost)
+    }
+
+    fn estimate_greedy_plan(&self, start: usize) -> Option<LogicalJoinPlan> {
+        if start >= self.tables.len() {
+            return None;
+        }
+        let mut joined = vec![false; self.tables.len()];
+        joined[start] = true;
+        let mut joined_count = 1usize;
+        let mut rows = self.tables[start].rows.max(1);
+        let mut row_width = self.tables[start].row_width.max(1);
+        let mut estimated_cost = rows.saturating_mul(row_width);
+        let mut steps = Vec::new();
+
+        while joined_count < self.tables.len() {
+            let candidates = (0..self.tables.len()).collect::<Vec<_>>();
+            let step = self.choose_next_join(&joined, rows, row_width, &candidates)?;
+            joined[step.table_index] = true;
+            joined_count += 1;
+            rows = step.estimated_rows.max(1);
+            row_width = row_width.saturating_add(self.tables[step.table_index].row_width);
+            estimated_cost = estimated_cost.saturating_add(step.estimated_cost);
+            steps.push(step);
+        }
+
+        Some(LogicalJoinPlan {
+            start,
+            steps,
+            estimated_cost,
+        })
+    }
+
+    fn connected_edges(&self, joined: &[bool], table_index: usize) -> Vec<&LogicalJoinEdge> {
+        self.edges
+            .iter()
+            .filter(|edge| {
+                (edge.left == table_index && joined.get(edge.right).copied().unwrap_or(false))
+                    || (edge.right == table_index
+                        && joined.get(edge.left).copied().unwrap_or(false))
+            })
+            .collect()
+    }
+
+    fn estimate_join_rows(
+        &self,
+        current_rows: u128,
+        next_table: usize,
+        edges: &[&LogicalJoinEdge],
+    ) -> u128 {
+        let next_rows = self.tables[next_table].rows.max(1);
+        let denominator = edges
+            .iter()
+            .map(|edge| {
+                let (left_ndv, right_ndv) = self.edge_ndv(edge);
+                left_ndv.max(right_ndv).max(1)
+            })
+            .max()
+            .unwrap_or(1);
+        current_rows.saturating_mul(next_rows) / denominator
+    }
+
+    fn edge_ndv(&self, edge: &LogicalJoinEdge) -> (u128, u128) {
+        (
+            self.tables[edge.left]
+                .key_ndv
+                .get(&edge.left_key)
+                .copied()
+                .unwrap_or(self.tables[edge.left].rows)
+                .max(1),
+            self.tables[edge.right]
+                .key_ndv
+                .get(&edge.right_key)
+                .copied()
+                .unwrap_or(self.tables[edge.right].rows)
+                .max(1),
+        )
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct JoinInputPlan {
@@ -237,11 +397,54 @@ fn strip_join_prefix<'a>(column: &'a str, prefix: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use crate::execution::{
         ComparisonExpr, ComparisonOp, Expr, FilterExpr, LiteralValue, Projection, SortExpr, SortKey,
     };
 
-    use super::plan_join_inputs;
+    use super::{LogicalJoinEdge, LogicalJoinGraph, LogicalJoinTableStats, plan_join_inputs};
+
+    fn table_stats(rows: u128, row_width: u128, keys: &[(&str, u128)]) -> LogicalJoinTableStats {
+        LogicalJoinTableStats {
+            rows,
+            row_width,
+            key_ndv: keys
+                .iter()
+                .map(|(key, ndv)| ((*key).to_string(), *ndv))
+                .collect::<HashMap<_, _>>(),
+        }
+    }
+
+    #[test]
+    fn logical_join_graph_chooses_low_cost_start_and_next_steps() {
+        let graph = LogicalJoinGraph {
+            tables: vec![
+                table_stats(1_000_000, 64, &[("customer_id", 100_000)]),
+                table_stats(100_000, 32, &[("id", 100_000), ("region_id", 5)]),
+                table_stats(5, 16, &[("id", 5)]),
+            ],
+            edges: vec![
+                LogicalJoinEdge {
+                    left: 0,
+                    left_key: "customer_id".to_string(),
+                    right: 1,
+                    right_key: "id".to_string(),
+                },
+                LogicalJoinEdge {
+                    left: 1,
+                    left_key: "region_id".to_string(),
+                    right: 2,
+                    right_key: "id".to_string(),
+                },
+            ],
+        };
+
+        let plan = graph.choose_greedy_plan().expect("connected join graph");
+        assert_eq!(plan.start, 2);
+        assert_eq!(plan.steps[0].table_index, 1);
+        assert_eq!(plan.steps[1].table_index, 0);
+    }
 
     #[test]
     fn join_input_plan_keeps_filter_and_order_columns_for_pruning() {

@@ -70,7 +70,9 @@ use crate::execution::{
     try_for_each_i64_i64_date32,
 };
 use crate::hash::{FastHashMap, FastHashSet, fast_hash_map, fast_hash_map_with_capacity};
-use crate::optimizer::{JoinInputPlan, plan_join_inputs};
+use crate::optimizer::{
+    JoinInputPlan, LogicalJoinEdge, LogicalJoinGraph, LogicalJoinTableStats, plan_join_inputs,
+};
 use crate::storage::{
     DirectColumnScanMetrics, DirectI64I32I32ScanMetrics, DirectOrderedPrimitiveBatch,
     DirectOrderedPrimitiveColumnValues, DirectPrimitiveColumnScanMetrics,
@@ -41194,17 +41196,19 @@ async fn try_execute_multi_comma_join_sql(
         row_counts.push(record_batch_rows(&batches));
         scanned.push(Some(batches));
     }
-    let join_cost_model =
-        CommaJoinCostModel::new(&scanned, &row_counts, &aliases, &alias_refs, &conjuncts)?;
-    let use_ndv_join_order = true;
-    let start_index = join_cost_model.choose_start_index().unwrap_or_else(|| {
-        row_counts
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, rows)| *rows)
-            .map(|(index, _)| index)
-            .expect("at least one comma join table")
-    });
+    let join_graph =
+        build_logical_comma_join_graph(&scanned, &row_counts, &aliases, &alias_refs, &conjuncts)?;
+    let start_index = join_graph
+        .choose_greedy_plan()
+        .map(|plan| plan.start)
+        .unwrap_or_else(|| {
+            row_counts
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, rows)| *rows)
+                .map(|(index, _)| index)
+                .expect("at least one comma join table")
+        });
     let mut current = scanned[start_index].take().expect("start input scanned");
     let mut current_rows = row_counts[start_index];
     let mut joined_aliases = vec![aliases[start_index].clone()];
@@ -41240,35 +41244,30 @@ async fn try_execute_multi_comma_join_sql(
                 ));
             }
         }
-        let selected = if candidates.len() <= 1 || !use_ndv_join_order {
+        let selected = if candidates.len() <= 1 {
             candidates.into_iter().next()
         } else {
-            let mut selected = None;
-            for candidate in candidates {
-                let (_, table_index, left_keys, right_keys, _) = &candidate;
-                let right = scanned[*table_index]
-                    .as_ref()
-                    .expect("remaining input scanned");
-                let score = estimate_join_output_rows(
-                    &current,
-                    right,
-                    current_rows,
-                    row_counts[*table_index],
-                    left_keys,
-                    right_keys,
-                )?
-                .saturating_mul(
-                    estimated_batches_row_width(&current)
-                        .saturating_add(join_cost_model.table_width(*table_index)),
-                );
-                if selected
-                    .as_ref()
-                    .is_none_or(|(_, selected_score)| score < *selected_score)
-                {
-                    selected = Some((candidate, score));
-                }
-            }
-            selected.map(|(candidate, _)| candidate)
+            let joined = aliases
+                .iter()
+                .map(|alias| joined_aliases.iter().any(|joined| joined == alias))
+                .collect::<Vec<_>>();
+            let candidate_table_indexes = candidates
+                .iter()
+                .map(|(_, table_index, _, _, _)| *table_index)
+                .collect::<Vec<_>>();
+            let selected_step = join_graph.choose_next_join(
+                &joined,
+                current_rows as u128,
+                estimated_batches_row_width(&current),
+                &candidate_table_indexes,
+            );
+            selected_step
+                .and_then(|step| {
+                    candidates
+                        .iter()
+                        .position(|(_, table_index, _, _, _)| *table_index == step.table_index)
+                })
+                .map(|index| candidates.swap_remove(index))
         };
         let Some((remaining_index, table_index, left_keys, right_keys, conjunct_indexes)) =
             selected
@@ -41456,199 +41455,61 @@ fn estimated_type_width(data_type: &DataType) -> u128 {
     }
 }
 
-fn estimate_join_output_rows(
-    left: &[RecordBatch],
-    right: &[RecordBatch],
-    left_rows: usize,
-    right_rows: usize,
-    left_keys: &[String],
-    right_keys: &[String],
-) -> Result<u128> {
-    let left_ndv = sampled_key_ndv(left, left_keys, 100_000)?.max(1);
-    let right_ndv = sampled_key_ndv(right, right_keys, 100_000)?.max(1);
-    let denominator = left_ndv.max(right_ndv) as u128;
-    Ok((left_rows as u128).saturating_mul(right_rows as u128) / denominator)
-}
-
-#[derive(Clone)]
-struct CommaJoinTableCostStats {
-    rows: u128,
-    row_width: u128,
-    key_ndv: HashMap<String, u128>,
-}
-
-#[derive(Clone)]
-struct CommaJoinCostEdge {
-    left: usize,
-    left_key: String,
-    right: usize,
-    right_key: String,
-}
-
-struct CommaJoinCostModel {
-    tables: Vec<CommaJoinTableCostStats>,
-    edges: Vec<CommaJoinCostEdge>,
-}
-
-impl CommaJoinCostModel {
-    fn new(
-        scanned: &[Option<Vec<RecordBatch>>],
-        row_counts: &[usize],
-        aliases: &[String],
-        alias_refs: &[&str],
-        conjuncts: &[SqlExpr],
-    ) -> Result<Self> {
-        let mut edges = Vec::new();
-        let mut key_columns = vec![Vec::<String>::new(); aliases.len()];
-        for conjunct in conjuncts {
-            let Some((left_alias, left_key, right_alias, right_key)) =
-                comma_join_base_edge(conjunct, alias_refs)?
-            else {
-                continue;
-            };
-            let Some(left) = aliases
-                .iter()
-                .position(|alias| alias.eq_ignore_ascii_case(left_alias))
-            else {
-                continue;
-            };
-            let Some(right) = aliases
-                .iter()
-                .position(|alias| alias.eq_ignore_ascii_case(right_alias))
-            else {
-                continue;
-            };
-            add_column_once(&mut key_columns[left], left_key.clone());
-            add_column_once(&mut key_columns[right], right_key.clone());
-            edges.push(CommaJoinCostEdge {
-                left,
-                left_key,
-                right,
-                right_key,
-            });
-        }
-
-        let mut tables = Vec::with_capacity(scanned.len());
-        for (index, batches) in scanned.iter().enumerate() {
-            let batches = batches.as_ref().expect("comma join input scanned");
-            let mut key_ndv = HashMap::new();
-            for key in &key_columns[index] {
-                key_ndv.insert(
-                    key.clone(),
-                    sampled_key_ndv(batches, &[key.clone()], 100_000)? as u128,
-                );
-            }
-            tables.push(CommaJoinTableCostStats {
-                rows: row_counts[index].max(1) as u128,
-                row_width: estimated_batches_row_width(batches),
-                key_ndv,
-            });
-        }
-
-        Ok(Self { tables, edges })
-    }
-
-    fn choose_start_index(&self) -> Option<usize> {
-        (0..self.tables.len())
-            .filter_map(|start| {
-                self.estimate_greedy_plan_cost(start)
-                    .map(|cost| (start, cost))
-            })
-            .min_by_key(|(_, cost)| *cost)
-            .map(|(start, _)| start)
-    }
-
-    fn table_width(&self, table_index: usize) -> u128 {
-        self.tables[table_index].row_width
-    }
-
-    fn estimate_greedy_plan_cost(&self, start: usize) -> Option<u128> {
-        let mut joined = vec![false; self.tables.len()];
-        joined[start] = true;
-        let mut joined_count = 1usize;
-        let mut rows = self.tables[start].rows;
-        let mut row_width = self.tables[start].row_width;
-        let mut total_cost = rows.saturating_mul(row_width);
-
-        while joined_count < self.tables.len() {
-            let mut selected = None;
-            for table_index in 0..self.tables.len() {
-                if joined[table_index] {
-                    continue;
-                }
-                let edges = self
-                    .edges
-                    .iter()
-                    .filter(|edge| {
-                        (edge.left == table_index && joined[edge.right])
-                            || (edge.right == table_index && joined[edge.left])
-                    })
-                    .collect::<Vec<_>>();
-                if edges.is_empty() {
-                    continue;
-                }
-                let output_rows = self.estimate_join_rows(rows, table_index, &edges);
-                let output_width = row_width.saturating_add(self.tables[table_index].row_width);
-                let build_cost = rows.saturating_mul(row_width).min(
-                    self.tables[table_index]
-                        .rows
-                        .saturating_mul(self.tables[table_index].row_width),
-                );
-                let step_cost = output_rows
-                    .saturating_mul(output_width)
-                    .saturating_add(build_cost);
-                if selected
-                    .as_ref()
-                    .is_none_or(|(_, selected_cost, _)| step_cost < *selected_cost)
-                {
-                    selected = Some((table_index, step_cost, output_rows));
-                }
-            }
-            let (table_index, step_cost, output_rows) = selected?;
-            joined[table_index] = true;
-            joined_count += 1;
-            rows = output_rows.max(1);
-            row_width = row_width.saturating_add(self.tables[table_index].row_width);
-            total_cost = total_cost.saturating_add(step_cost);
-        }
-
-        Some(total_cost)
-    }
-
-    fn estimate_join_rows(
-        &self,
-        current_rows: u128,
-        next_table: usize,
-        edges: &[&CommaJoinCostEdge],
-    ) -> u128 {
-        let next_rows = self.tables[next_table].rows;
-        let denominator = edges
+fn build_logical_comma_join_graph(
+    scanned: &[Option<Vec<RecordBatch>>],
+    row_counts: &[usize],
+    aliases: &[String],
+    alias_refs: &[&str],
+    conjuncts: &[SqlExpr],
+) -> Result<LogicalJoinGraph> {
+    let mut edges = Vec::new();
+    let mut key_columns = vec![Vec::<String>::new(); aliases.len()];
+    for conjunct in conjuncts {
+        let Some((left_alias, left_key, right_alias, right_key)) =
+            comma_join_base_edge(conjunct, alias_refs)?
+        else {
+            continue;
+        };
+        let Some(left) = aliases
             .iter()
-            .map(|edge| {
-                let (left_ndv, right_ndv) = self.edge_ndv(edge);
-                left_ndv.max(right_ndv).max(1)
-            })
-            .max()
-            .unwrap_or(1);
-        current_rows.saturating_mul(next_rows) / denominator
+            .position(|alias| alias.eq_ignore_ascii_case(left_alias))
+        else {
+            continue;
+        };
+        let Some(right) = aliases
+            .iter()
+            .position(|alias| alias.eq_ignore_ascii_case(right_alias))
+        else {
+            continue;
+        };
+        add_column_once(&mut key_columns[left], left_key.clone());
+        add_column_once(&mut key_columns[right], right_key.clone());
+        edges.push(LogicalJoinEdge {
+            left,
+            left_key,
+            right,
+            right_key,
+        });
     }
 
-    fn edge_ndv(&self, edge: &CommaJoinCostEdge) -> (u128, u128) {
-        (
-            self.tables[edge.left]
-                .key_ndv
-                .get(&edge.left_key)
-                .copied()
-                .unwrap_or(self.tables[edge.left].rows)
-                .max(1),
-            self.tables[edge.right]
-                .key_ndv
-                .get(&edge.right_key)
-                .copied()
-                .unwrap_or(self.tables[edge.right].rows)
-                .max(1),
-        )
+    let mut tables = Vec::with_capacity(scanned.len());
+    for (index, batches) in scanned.iter().enumerate() {
+        let batches = batches.as_ref().expect("comma join input scanned");
+        let mut key_ndv = HashMap::new();
+        for key in &key_columns[index] {
+            key_ndv.insert(
+                key.clone(),
+                sampled_key_ndv(batches, std::slice::from_ref(key), 100_000)? as u128,
+            );
+        }
+        tables.push(LogicalJoinTableStats {
+            rows: row_counts[index].max(1) as u128,
+            row_width: estimated_batches_row_width(batches),
+            key_ndv,
+        });
     }
+
+    Ok(LogicalJoinGraph { tables, edges })
 }
 
 fn sampled_key_ndv(batches: &[RecordBatch], keys: &[String], sample_rows: usize) -> Result<usize> {
