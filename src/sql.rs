@@ -41184,7 +41184,13 @@ async fn try_execute_multi_comma_join_sql(
     )?;
     let mut scanned = Vec::with_capacity(tables.len());
     let mut row_counts = Vec::with_capacity(tables.len());
+    let mut base_row_counts = Vec::with_capacity(tables.len());
     for index in 0..tables.len() {
+        base_row_counts.push(
+            engine
+                .parquet_total_row_count(&tables[index].path)
+                .unwrap_or_else(|_| 0),
+        );
         let batches = scan_table_for_comma_join(
             engine,
             &tables[index],
@@ -41196,10 +41202,16 @@ async fn try_execute_multi_comma_join_sql(
         row_counts.push(record_batch_rows(&batches));
         scanned.push(Some(batches));
     }
-    let join_graph =
-        build_logical_comma_join_graph(&scanned, &row_counts, &aliases, &alias_refs, &conjuncts)?;
+    let join_graph = build_logical_comma_join_graph(
+        &scanned,
+        &row_counts,
+        &base_row_counts,
+        &aliases,
+        &alias_refs,
+        &conjuncts,
+    )?;
     let start_index = join_graph
-        .choose_greedy_plan()
+        .choose_best_plan()
         .map(|plan| plan.start)
         .unwrap_or_else(|| {
             row_counts
@@ -41458,6 +41470,7 @@ fn estimated_type_width(data_type: &DataType) -> u128 {
 fn build_logical_comma_join_graph(
     scanned: &[Option<Vec<RecordBatch>>],
     row_counts: &[usize],
+    base_row_counts: &[usize],
     aliases: &[String],
     alias_refs: &[&str],
     conjuncts: &[SqlExpr],
@@ -41503,6 +41516,12 @@ fn build_logical_comma_join_graph(
             );
         }
         tables.push(LogicalJoinTableStats {
+            base_rows: base_row_counts
+                .get(index)
+                .copied()
+                .unwrap_or(row_counts[index])
+                .max(row_counts[index])
+                .max(1) as u128,
             rows: row_counts[index].max(1) as u128,
             row_width: estimated_batches_row_width(batches),
             key_ndv,

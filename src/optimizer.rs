@@ -4,9 +4,19 @@ use crate::execution::{ComparisonExpr, Expr, FilterExpr, Projection, SortKey};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogicalJoinTableStats {
+    pub base_rows: u128,
     pub rows: u128,
     pub row_width: u128,
     pub key_ndv: HashMap<String, u128>,
+}
+
+impl LogicalJoinTableStats {
+    pub fn filter_selectivity(&self) -> f64 {
+        if self.base_rows == 0 {
+            return 1.0;
+        }
+        (self.rows as f64 / self.base_rows as f64).clamp(0.0, 1.0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +39,7 @@ pub struct LogicalJoinPlan {
     pub start: usize,
     pub steps: Vec<LogicalJoinStep>,
     pub estimated_cost: u128,
+    pub bushy: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,10 +49,88 @@ pub struct LogicalJoinGraph {
 }
 
 impl LogicalJoinGraph {
+    pub fn choose_best_plan(&self) -> Option<LogicalJoinPlan> {
+        if self.tables.len() <= 6 {
+            self.choose_exhaustive_left_deep_plan()
+                .or_else(|| self.choose_greedy_plan())
+        } else {
+            self.choose_greedy_plan()
+        }
+    }
+
     pub fn choose_greedy_plan(&self) -> Option<LogicalJoinPlan> {
         (0..self.tables.len())
             .filter_map(|start| self.estimate_greedy_plan(start))
             .min_by_key(|plan| plan.estimated_cost)
+    }
+
+    pub fn choose_exhaustive_left_deep_plan(&self) -> Option<LogicalJoinPlan> {
+        let table_count = self.tables.len();
+        if table_count == 0 || table_count > 12 {
+            return None;
+        }
+        let mut best = None;
+        for start in 0..table_count {
+            let mut joined = vec![false; table_count];
+            joined[start] = true;
+            let mut steps = Vec::new();
+            self.enumerate_left_deep(
+                &mut joined,
+                self.tables[start].rows.max(1),
+                self.tables[start].row_width.max(1),
+                self.tables[start]
+                    .rows
+                    .max(1)
+                    .saturating_mul(self.tables[start].row_width.max(1)),
+                start,
+                &mut steps,
+                &mut best,
+            );
+        }
+        best
+    }
+
+    pub fn choose_exhaustive_bushy_plan_cost(&self) -> Option<u128> {
+        let table_count = self.tables.len();
+        if table_count == 0 || table_count > 10 {
+            return None;
+        }
+        let subset_count = 1usize.checked_shl(table_count as u32)?;
+        let mut states = vec![None::<BushyJoinState>; subset_count];
+        for index in 0..table_count {
+            let mask = 1usize << index;
+            let rows = self.tables[index].rows.max(1);
+            let width = self.tables[index].row_width.max(1);
+            states[mask] = Some(BushyJoinState {
+                rows,
+                width,
+                cost: rows.saturating_mul(width),
+            });
+        }
+        for mask in 1usize..subset_count {
+            if mask.count_ones() <= 1 {
+                continue;
+            }
+            let mut best = None;
+            let mut left_mask = (mask - 1) & mask;
+            while left_mask > 0 {
+                let right_mask = mask ^ left_mask;
+                if right_mask != 0 && left_mask < right_mask {
+                    if let (Some(left), Some(right)) = (&states[left_mask], &states[right_mask])
+                        && let Some(joined) =
+                            self.estimate_bushy_join(left_mask, left, right_mask, right)
+                        && best
+                            .as_ref()
+                            .is_none_or(|candidate: &BushyJoinState| joined.cost < candidate.cost)
+                    {
+                        best = Some(joined);
+                    }
+                }
+                left_mask = (left_mask - 1) & mask;
+            }
+            states[mask] = best;
+        }
+        states[subset_count - 1].as_ref().map(|state| state.cost)
     }
 
     pub fn table_width(&self, table_index: usize) -> u128 {
@@ -110,7 +199,65 @@ impl LogicalJoinGraph {
             start,
             steps,
             estimated_cost,
+            bushy: false,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enumerate_left_deep(
+        &self,
+        joined: &mut [bool],
+        current_rows: u128,
+        current_width: u128,
+        current_cost: u128,
+        start: usize,
+        steps: &mut Vec<LogicalJoinStep>,
+        best: &mut Option<LogicalJoinPlan>,
+    ) {
+        if joined.iter().all(|value| *value) {
+            if best
+                .as_ref()
+                .is_none_or(|plan| current_cost < plan.estimated_cost)
+            {
+                *best = Some(LogicalJoinPlan {
+                    start,
+                    steps: steps.clone(),
+                    estimated_cost: current_cost,
+                    bushy: false,
+                });
+            }
+            return;
+        }
+        if best
+            .as_ref()
+            .is_some_and(|plan| current_cost >= plan.estimated_cost)
+        {
+            return;
+        }
+        let candidates = (0..self.tables.len()).collect::<Vec<_>>();
+        let mut next_steps = candidates
+            .iter()
+            .copied()
+            .filter_map(|candidate| {
+                self.choose_next_join(joined, current_rows, current_width, &[candidate])
+            })
+            .collect::<Vec<_>>();
+        next_steps.sort_by_key(|step| step.estimated_cost);
+        for step in next_steps {
+            joined[step.table_index] = true;
+            steps.push(step.clone());
+            self.enumerate_left_deep(
+                joined,
+                step.estimated_rows.max(1),
+                current_width.saturating_add(self.tables[step.table_index].row_width),
+                current_cost.saturating_add(step.estimated_cost),
+                start,
+                steps,
+                best,
+            );
+            steps.pop();
+            joined[step.table_index] = false;
+        }
     }
 
     fn connected_edges(&self, joined: &[bool], table_index: usize) -> Vec<&LogicalJoinEdge> {
@@ -149,15 +296,71 @@ impl LogicalJoinGraph {
                 .get(&edge.left_key)
                 .copied()
                 .unwrap_or(self.tables[edge.left].rows)
+                .min(self.tables[edge.left].rows)
                 .max(1),
             self.tables[edge.right]
                 .key_ndv
                 .get(&edge.right_key)
                 .copied()
                 .unwrap_or(self.tables[edge.right].rows)
+                .min(self.tables[edge.right].rows)
                 .max(1),
         )
     }
+
+    fn estimate_bushy_join(
+        &self,
+        left_mask: usize,
+        left: &BushyJoinState,
+        right_mask: usize,
+        right: &BushyJoinState,
+    ) -> Option<BushyJoinState> {
+        let edges = self
+            .edges
+            .iter()
+            .filter(|edge| {
+                let left_has_left = (left_mask & (1usize << edge.left)) != 0;
+                let left_has_right = (left_mask & (1usize << edge.right)) != 0;
+                let right_has_left = (right_mask & (1usize << edge.left)) != 0;
+                let right_has_right = (right_mask & (1usize << edge.right)) != 0;
+                (left_has_left && right_has_right) || (left_has_right && right_has_left)
+            })
+            .collect::<Vec<_>>();
+        if edges.is_empty() {
+            return None;
+        }
+        let denominator = edges
+            .iter()
+            .map(|edge| {
+                let (left_ndv, right_ndv) = self.edge_ndv(edge);
+                left_ndv.max(right_ndv).max(1)
+            })
+            .max()
+            .unwrap_or(1);
+        let rows = left.rows.saturating_mul(right.rows) / denominator;
+        let width = left.width.saturating_add(right.width);
+        let build_cost = left
+            .rows
+            .saturating_mul(left.width)
+            .min(right.rows.saturating_mul(right.width));
+        let cost = left
+            .cost
+            .saturating_add(right.cost)
+            .saturating_add(rows.saturating_mul(width))
+            .saturating_add(build_cost);
+        Some(BushyJoinState {
+            rows: rows.max(1),
+            width,
+            cost,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BushyJoinState {
+    rows: u128,
+    width: u128,
+    cost: u128,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -407,6 +610,7 @@ mod tests {
 
     fn table_stats(rows: u128, row_width: u128, keys: &[(&str, u128)]) -> LogicalJoinTableStats {
         LogicalJoinTableStats {
+            base_rows: rows,
             rows,
             row_width,
             key_ndv: keys
@@ -444,6 +648,90 @@ mod tests {
         assert_eq!(plan.start, 2);
         assert_eq!(plan.steps[0].table_index, 1);
         assert_eq!(plan.steps[1].table_index, 0);
+    }
+
+    #[test]
+    fn logical_join_graph_exhaustive_left_deep_matches_best_order() {
+        let graph = LogicalJoinGraph {
+            tables: vec![
+                table_stats(10_000, 64, &[("k", 10_000)]),
+                table_stats(100, 16, &[("k", 100), ("d", 10)]),
+                table_stats(10, 16, &[("d", 10)]),
+                table_stats(1_000, 32, &[("k", 1_000)]),
+            ],
+            edges: vec![
+                LogicalJoinEdge {
+                    left: 0,
+                    left_key: "k".to_string(),
+                    right: 1,
+                    right_key: "k".to_string(),
+                },
+                LogicalJoinEdge {
+                    left: 1,
+                    left_key: "d".to_string(),
+                    right: 2,
+                    right_key: "d".to_string(),
+                },
+                LogicalJoinEdge {
+                    left: 0,
+                    left_key: "k".to_string(),
+                    right: 3,
+                    right_key: "k".to_string(),
+                },
+            ],
+        };
+
+        let plan = graph
+            .choose_exhaustive_left_deep_plan()
+            .expect("connected join graph");
+        let greedy = graph.choose_greedy_plan().expect("connected join graph");
+        assert_eq!(plan.steps.len(), 3);
+        assert!(plan.estimated_cost <= greedy.estimated_cost);
+    }
+
+    #[test]
+    fn logical_join_graph_computes_bushy_plan_cost() {
+        let graph = LogicalJoinGraph {
+            tables: vec![
+                table_stats(1_000, 32, &[("a", 100)]),
+                table_stats(1_000, 32, &[("a", 100)]),
+                table_stats(10, 16, &[("b", 10)]),
+                table_stats(10, 16, &[("b", 10)]),
+            ],
+            edges: vec![
+                LogicalJoinEdge {
+                    left: 0,
+                    left_key: "a".to_string(),
+                    right: 1,
+                    right_key: "a".to_string(),
+                },
+                LogicalJoinEdge {
+                    left: 2,
+                    left_key: "b".to_string(),
+                    right: 3,
+                    right_key: "b".to_string(),
+                },
+                LogicalJoinEdge {
+                    left: 1,
+                    left_key: "a".to_string(),
+                    right: 2,
+                    right_key: "b".to_string(),
+                },
+            ],
+        };
+
+        assert!(graph.choose_exhaustive_bushy_plan_cost().is_some());
+    }
+
+    #[test]
+    fn logical_join_table_stats_tracks_filter_selectivity() {
+        let stats = LogicalJoinTableStats {
+            base_rows: 1_000,
+            rows: 125,
+            row_width: 8,
+            key_ndv: HashMap::new(),
+        };
+        assert_eq!(stats.filter_selectivity(), 0.125);
     }
 
     #[test]

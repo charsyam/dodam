@@ -48,10 +48,11 @@ use crate::storage::{
     DirectSelectedPrimitivePageBatch, I64BloomPredicate, LocalFileSystemObjectStore, ObjectStore,
     ParquetBatchReader, ParquetFileCache, ParquetFileCacheStats, ParquetMetadataCache,
     PrimitiveRowGroupMinMax, parquet_column_monotonic_by_scan, parquet_row_group_count_with_store,
-    parquet_row_groups_monotonic_by_column, plan_parquet_scan_tasks, read_parquet_file_statistics,
-    read_parquet_i64_column_constant, read_parquet_i64_column_max,
-    read_parquet_i128_column_min_max, read_parquet_i128_column_min_max_relaxed,
-    read_parquet_primitive_column_min_max_by_row_group, read_parquet_projection_compressed_bytes,
+    parquet_row_groups_monotonic_by_column, parquet_total_row_count_with_store,
+    plan_parquet_scan_tasks, read_parquet_file_statistics, read_parquet_i64_column_constant,
+    read_parquet_i64_column_max, read_parquet_i128_column_min_max,
+    read_parquet_i128_column_min_max_relaxed, read_parquet_primitive_column_min_max_by_row_group,
+    read_parquet_projection_compressed_bytes,
     scan_parquet_i32_i32_dictionary_i64_decimal_selected_typed_with_store,
     scan_parquet_i32_i64_byte_array_columns_with_store,
     scan_parquet_i32_i64_decimal_i32_selected_typed_with_store,
@@ -1120,6 +1121,14 @@ impl DodamEngine {
 
     pub fn parquet_row_group_count(&self, path: impl AsRef<Path>) -> Result<usize> {
         parquet_row_group_count_with_store(
+            path.as_ref(),
+            self.file_cache.clone(),
+            self.object_store.as_ref(),
+        )
+    }
+
+    pub fn parquet_total_row_count(&self, path: impl AsRef<Path>) -> Result<usize> {
+        parquet_total_row_count_with_store(
             path.as_ref(),
             self.file_cache.clone(),
             self.object_store.as_ref(),

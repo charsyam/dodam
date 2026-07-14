@@ -1708,6 +1708,24 @@ pub(crate) fn parquet_row_group_count_with_store(
     Ok(reader.metadata().num_row_groups())
 }
 
+pub(crate) fn parquet_total_row_count_with_store(
+    path: &Path,
+    file_cache: Arc<ParquetFileCache>,
+    store: &dyn ObjectStore,
+) -> Result<usize> {
+    if file_cache.enabled() {
+        let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
+        let reader = SerializedFileReader::new(reader)?;
+        return usize::try_from(reader.metadata().file_metadata().num_rows()).map_err(|_| {
+            DodamError::UnsupportedSql("Parquet row count does not fit usize".to_string())
+        });
+    }
+    let file = store.open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    usize::try_from(reader.metadata().file_metadata().num_rows())
+        .map_err(|_| DodamError::UnsupportedSql("Parquet row count does not fit usize".to_string()))
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct DirectColumnScanMetrics {
     pub row_groups: usize,
