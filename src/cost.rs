@@ -134,6 +134,7 @@ pub struct SqlRuleCostInput {
     pub matched_features: usize,
     pub required_columns: usize,
     pub matched_required_columns: usize,
+    pub estimated_scan_bytes: Option<u64>,
 }
 
 pub fn estimate_sql_rule_cost(input: SqlRuleCostInput) -> u32 {
@@ -150,6 +151,9 @@ pub fn estimate_sql_rule_cost(input: SqlRuleCostInput) -> u32 {
     cost = cost.saturating_add(missing_columns * 5);
     cost = cost.saturating_sub(input.matched_features as u32 * 10);
     cost = cost.saturating_sub(input.matched_required_columns as u32);
+    if let Some(bytes) = input.estimated_scan_bytes {
+        cost = cost.saturating_add((bytes / (1024 * 1024)).min(10_000) as u32);
+    }
     cost
 }
 

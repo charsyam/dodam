@@ -858,13 +858,14 @@ impl SqlRule {
         }
     }
 
-    fn estimated_cost(self, context: &SqlRuleContext) -> u32 {
+    fn estimated_cost(self, context: &SqlRuleContext, estimated_scan_bytes: Option<u64>) -> u32 {
         estimate_sql_rule_cost(SqlRuleCostInput {
             base_rank: self.cost_rank(),
             required_features: self.required_features().len(),
             matched_features: context.matched_required_features(self.required_features()),
             required_columns: self.required_columns().len(),
             matched_required_columns: context.matched_required_columns(self.required_columns()),
+            estimated_scan_bytes,
         })
     }
 
@@ -1033,6 +1034,7 @@ fn sql_rule_registry() -> &'static [SqlRule] {
 struct SqlRuleCandidate {
     rule: SqlRule,
     estimated_cost: u32,
+    estimated_scan_bytes: Option<u64>,
 }
 
 async fn try_execute_registered_sql_rules(
@@ -1041,15 +1043,20 @@ async fn try_execute_registered_sql_rules(
     batch_size: usize,
 ) -> Result<Option<QueryOutput>> {
     let context = SqlRuleContext::from_sql(sql)?;
-    let mut candidates = sql_rule_registry()
+    let rules = sql_rule_registry()
         .iter()
         .copied()
         .filter(|rule| rule.is_candidate(&context))
-        .map(|rule| SqlRuleCandidate {
-            rule,
-            estimated_cost: rule.estimated_cost(&context),
-        })
         .collect::<Vec<_>>();
+    let mut candidates = Vec::with_capacity(rules.len());
+    for rule in rules {
+        let estimated_scan_bytes = estimate_sql_rule_scan_bytes(engine, &context, rule).await;
+        candidates.push(SqlRuleCandidate {
+            rule,
+            estimated_cost: rule.estimated_cost(&context, estimated_scan_bytes),
+            estimated_scan_bytes,
+        });
+    }
     candidates.sort_by_key(|candidate| (candidate.estimated_cost, candidate.rule.cost_rank()));
     if sql_rule_profile_enabled() {
         eprintln!(
@@ -1066,10 +1073,14 @@ async fn try_execute_registered_sql_rules(
         if let Some(output) = rule.execute(engine, sql, batch_size).await? {
             if sql_rule_profile_enabled() {
                 eprintln!(
-                    "[dodam:sql-rule] selected={} cost_rank={} estimated_cost={} required_features={} required_columns={}",
+                    "[dodam:sql-rule] selected={} cost_rank={} estimated_cost={} estimated_scan_bytes={} required_features={} required_columns={}",
                     rule.name(),
                     rule.cost_rank(),
                     candidate.estimated_cost,
+                    candidate
+                        .estimated_scan_bytes
+                        .map(|bytes| bytes.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
                     rule.required_features().join(","),
                     rule.required_columns().join(",")
                 );
@@ -1088,6 +1099,7 @@ struct SqlRuleContext {
     has_tpch_like_terms: bool,
     from_table_count: usize,
     lower_sql: String,
+    table_paths: Vec<PathBuf>,
 }
 
 impl SqlRuleContext {
@@ -1106,6 +1118,9 @@ impl SqlRuleContext {
             context.from_table_count = select.from.len();
             context.has_join = select.from.iter().any(|table| !table.joins.is_empty());
             context.has_derived_from = select.from.iter().any(table_with_derived_relation);
+            for table in &select.from {
+                collect_table_paths(table, &mut context.table_paths);
+            }
         }
         Ok(context)
     }
@@ -1128,6 +1143,7 @@ impl SqlRuleContext {
             has_tpch_like_terms,
             from_table_count: 0,
             lower_sql,
+            table_paths: Vec::new(),
         }
     }
 
@@ -1159,6 +1175,107 @@ impl SqlRuleContext {
 
     fn mentions_column(&self, column: &str) -> bool {
         self.lower_sql.contains(&column.to_ascii_lowercase())
+    }
+}
+
+async fn estimate_sql_rule_scan_bytes(
+    engine: &DodamEngine,
+    context: &SqlRuleContext,
+    rule: SqlRule,
+) -> Option<u64> {
+    let required_columns = rule.required_columns();
+    if required_columns.is_empty() || context.table_paths.is_empty() {
+        return None;
+    }
+    let mut total = 0_u64;
+    let mut matched = false;
+    for path in &context.table_paths {
+        let columns = required_columns_for_table(path, required_columns);
+        if columns.is_empty() {
+            continue;
+        }
+        let projection = Projection::Columns(columns);
+        if let Ok(bytes) = engine
+            .estimate_parquet_projection_compressed_bytes(path.clone(), &projection)
+            .await
+        {
+            total = total.saturating_add(bytes);
+            matched = true;
+        }
+    }
+    matched.then_some(total)
+}
+
+fn required_columns_for_table(path: &Path, required_columns: &[&str]) -> Vec<String> {
+    let table = path
+        .file_stem()
+        .or_else(|| path.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let prefixes: &[&str] = match table.as_str() {
+        "lineitem" => &["l_"],
+        "orders" => &["o_"],
+        "customer" => &["c_"],
+        "supplier" => &["s_"],
+        "partsupp" => &["ps_"],
+        "part" => &["p_"],
+        "nation" => &["n_"],
+        "region" => &["r_"],
+        _ => &[],
+    };
+    let columns = if prefixes.is_empty() {
+        required_columns
+            .iter()
+            .map(|column| (*column).to_string())
+            .collect::<Vec<_>>()
+    } else {
+        required_columns
+            .iter()
+            .filter(|column| prefixes.iter().any(|prefix| column.starts_with(prefix)))
+            .map(|column| (*column).to_string())
+            .collect::<Vec<_>>()
+    };
+    let mut unique = Vec::new();
+    for column in columns {
+        if !unique.iter().any(|existing| existing == &column) {
+            unique.push(column);
+        }
+    }
+    unique
+}
+
+fn collect_table_paths(table: &TableWithJoins, output: &mut Vec<PathBuf>) {
+    collect_table_factor_path(&table.relation, output);
+    for join in &table.joins {
+        collect_table_factor_path(&join.relation, output);
+    }
+}
+
+fn collect_table_factor_path(factor: &TableFactor, output: &mut Vec<PathBuf>) {
+    match factor {
+        TableFactor::Table { .. } => {
+            let Ok(table) = parse_table_factor(factor) else {
+                return;
+            };
+            let path = table.path;
+            if !output.iter().any(|existing| existing == &path) {
+                output.push(path);
+            }
+        }
+        TableFactor::Derived { subquery, .. } => {
+            if let SetExpr::Select(select) = subquery.body.as_ref() {
+                for table in &select.from {
+                    collect_table_paths(table, output);
+                }
+            }
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            collect_table_paths(table_with_joins, output);
+        }
+        _ => {}
     }
 }
 

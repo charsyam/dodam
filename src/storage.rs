@@ -10439,6 +10439,26 @@ pub fn read_parquet_file_statistics(
     })
 }
 
+pub fn read_parquet_projection_compressed_bytes(
+    path: impl AsRef<Path>,
+    projection: &Projection,
+    metadata_cache: &ParquetMetadataCache,
+    store: &dyn ObjectStore,
+) -> Result<u64> {
+    let path = path.as_ref();
+    let file = store.open(path)?;
+    let metadata = metadata_cache.get_with_store(path, store)?;
+    let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata);
+    let row_groups = builder.metadata().num_row_groups();
+    let all_row_groups = (0..row_groups).collect::<Vec<_>>();
+    let column_indices = projection_indices_for_schema(builder.schema(), projection)?;
+    Ok(compressed_bytes_for_row_groups(
+        &builder,
+        &column_indices,
+        &all_row_groups,
+    ))
+}
+
 pub fn read_parquet_i64_column_max(
     path: impl AsRef<Path>,
     column: &str,

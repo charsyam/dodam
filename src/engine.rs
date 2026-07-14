@@ -51,7 +51,7 @@ use crate::storage::{
     parquet_row_groups_monotonic_by_column, plan_parquet_scan_tasks, read_parquet_file_statistics,
     read_parquet_i64_column_constant, read_parquet_i64_column_max,
     read_parquet_i128_column_min_max, read_parquet_i128_column_min_max_relaxed,
-    read_parquet_primitive_column_min_max_by_row_group,
+    read_parquet_primitive_column_min_max_by_row_group, read_parquet_projection_compressed_bytes,
     scan_parquet_i32_i32_dictionary_i64_decimal_selected_typed_with_store,
     scan_parquet_i32_i64_byte_array_columns_with_store,
     scan_parquet_i32_i64_decimal_i32_selected_typed_with_store,
@@ -2372,6 +2372,20 @@ impl DodamEngine {
         let source = self.plan_table_source(path).await?;
         self.scan_table(source, batch_size, limit, projection, filter, None)
             .await
+    }
+
+    pub async fn estimate_parquet_projection_compressed_bytes(
+        &self,
+        path: PathBuf,
+        projection: &Projection,
+    ) -> Result<u64> {
+        let path = self.resolve_table_path(path)?;
+        read_parquet_projection_compressed_bytes(
+            path,
+            projection,
+            &self.metadata_cache,
+            self.object_store.as_ref(),
+        )
     }
 
     pub async fn scan_table(
