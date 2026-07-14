@@ -225,131 +225,7 @@ pub async fn execute_sql(
     if let Some(output) = try_execute_window_sql(engine, sql, batch_size).await? {
         return Ok(output);
     }
-    if let Some(output) = tpch_rules::try_execute_tpch_rule_sql(engine, sql, batch_size).await? {
-        return Ok(output);
-    }
-    if let Some(output) = try_execute_with_cte_sql(engine, sql, batch_size).await? {
-        return Ok(output);
-    }
-    if let Some(output) = try_execute_pricing_summary_sql(engine, sql, batch_size).await? {
-        return Ok(output);
-    }
-    if let Some(output) = try_execute_profit_by_nation_year_sql(engine, sql, batch_size).await? {
-        return Ok(output);
-    }
-    if let Some(output) = try_execute_returned_customer_revenue_sql(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) = try_execute_important_stock_value_sql(engine, sql, batch_size).await? {
-        return Ok(output);
-    }
-    if let Some(output) = try_execute_regional_supplier_revenue_sql(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) = try_execute_bilateral_shipping_volume_sql(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) = try_execute_nation_market_share_sql(engine, sql, batch_size).await? {
-        return Ok(output);
-    }
-    if let Some(output) =
-        try_execute_discounted_revenue_or_predicate_sql(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) =
-        try_execute_order_priority_exists_count_sql(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) = try_execute_shipping_priority_revenue_sql(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) =
-        try_execute_derived_prefix_avg_anti_join_aggregate_sql(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) =
-        try_execute_join_with_grouped_sum_semijoin_sql(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) =
-        try_execute_join_with_correlated_avg_threshold_sql(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) =
-        try_execute_shipping_mode_priority_counts_sql(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) =
-        try_execute_supplier_wait_count_antijoin_sql(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) =
-        try_execute_prefix_part_supplier_threshold_sql(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) = try_execute_derived_join_sql(engine, sql, batch_size).await? {
-        return Ok(output);
-    }
-    if let Some(output) =
-        try_execute_derived_left_join_count_distribution_sql(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) = try_execute_derived_sql(engine, sql, batch_size).await? {
-        return Ok(output);
-    }
-    if let Some(output) =
-        try_execute_correlated_join_subquery_filter_sql(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) =
-        try_execute_materialized_join_subquery_sql(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) = try_execute_multi_comma_join_sql(engine, sql, batch_size).await? {
-        return Ok(output);
-    }
-    if let Some(output) =
-        try_execute_correlated_exists_semijoin_sql(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) =
-        try_execute_correlated_in_pair_semijoin_sql(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) =
-        try_execute_correlated_subquery_filter_sql(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) =
-        try_execute_correlated_exists_subquery_sql(engine, sql, batch_size).await?
-    {
-        return Ok(output);
-    }
-    if let Some(output) = try_execute_exists_subquery_sql(engine, sql, batch_size).await? {
-        return Ok(output);
-    }
-    if let Some(output) = try_execute_in_subquery_sql(engine, sql, batch_size).await? {
-        return Ok(output);
-    }
-    if let Some(output) = try_execute_projection_expression_sql(engine, sql, batch_size).await? {
+    if let Some(output) = try_execute_registered_sql_rules(engine, sql, batch_size).await? {
         return Ok(output);
     }
     let query = parse_sql(sql)?;
@@ -731,6 +607,239 @@ pub async fn execute_sql(
         apply_output_order_limit(collect_batches(stream)?, None, query.limit, query.offset)?;
     let batches = rename_output_batches(batches, &query.aliases)?;
     Ok(QueryOutput::Scan { batches })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SqlRule {
+    Tpch,
+    WithCte,
+    PricingSummary,
+    ProfitByNationYear,
+    ReturnedCustomerRevenue,
+    ImportantStockValue,
+    RegionalSupplierRevenue,
+    BilateralShippingVolume,
+    NationMarketShare,
+    DiscountedRevenueOrPredicate,
+    OrderPriorityExistsCount,
+    ShippingPriorityRevenue,
+    DerivedPrefixAvgAntiJoinAggregate,
+    JoinWithGroupedSumSemijoin,
+    JoinWithCorrelatedAvgThreshold,
+    ShippingModePriorityCounts,
+    SupplierWaitCountAntijoin,
+    PrefixPartSupplierThreshold,
+    DerivedJoin,
+    DerivedLeftJoinCountDistribution,
+    Derived,
+    CorrelatedJoinSubqueryFilter,
+    MaterializedJoinSubquery,
+    MultiCommaJoin,
+    CorrelatedExistsSemijoin,
+    CorrelatedInPairSemijoin,
+    CorrelatedSubqueryFilter,
+    CorrelatedExistsSubquery,
+    ExistsSubquery,
+    InSubquery,
+    ProjectionExpression,
+}
+
+impl SqlRule {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Tpch => "tpch-rule-set",
+            Self::WithCte => "with-cte",
+            Self::PricingSummary => "pricing-summary",
+            Self::ProfitByNationYear => "profit-by-nation-year",
+            Self::ReturnedCustomerRevenue => "returned-customer-revenue",
+            Self::ImportantStockValue => "important-stock-value",
+            Self::RegionalSupplierRevenue => "regional-supplier-revenue",
+            Self::BilateralShippingVolume => "bilateral-shipping-volume",
+            Self::NationMarketShare => "nation-market-share",
+            Self::DiscountedRevenueOrPredicate => "discounted-revenue-or-predicate",
+            Self::OrderPriorityExistsCount => "order-priority-exists-count",
+            Self::ShippingPriorityRevenue => "shipping-priority-revenue",
+            Self::DerivedPrefixAvgAntiJoinAggregate => "derived-prefix-avg-anti-join-aggregate",
+            Self::JoinWithGroupedSumSemijoin => "join-with-grouped-sum-semijoin",
+            Self::JoinWithCorrelatedAvgThreshold => "join-with-correlated-avg-threshold",
+            Self::ShippingModePriorityCounts => "shipping-mode-priority-counts",
+            Self::SupplierWaitCountAntijoin => "supplier-wait-count-antijoin",
+            Self::PrefixPartSupplierThreshold => "prefix-part-supplier-threshold",
+            Self::DerivedJoin => "derived-join",
+            Self::DerivedLeftJoinCountDistribution => "derived-left-join-count-distribution",
+            Self::Derived => "derived",
+            Self::CorrelatedJoinSubqueryFilter => "correlated-join-subquery-filter",
+            Self::MaterializedJoinSubquery => "materialized-join-subquery",
+            Self::MultiCommaJoin => "multi-comma-join",
+            Self::CorrelatedExistsSemijoin => "correlated-exists-semijoin",
+            Self::CorrelatedInPairSemijoin => "correlated-in-pair-semijoin",
+            Self::CorrelatedSubqueryFilter => "correlated-subquery-filter",
+            Self::CorrelatedExistsSubquery => "correlated-exists-subquery",
+            Self::ExistsSubquery => "exists-subquery",
+            Self::InSubquery => "in-subquery",
+            Self::ProjectionExpression => "projection-expression",
+        }
+    }
+
+    fn cost_rank(self) -> u16 {
+        sql_rule_registry()
+            .iter()
+            .position(|rule| *rule == self)
+            .unwrap_or(usize::MAX) as u16
+    }
+
+    async fn execute(
+        self,
+        engine: &DodamEngine,
+        sql: &str,
+        batch_size: usize,
+    ) -> Result<Option<QueryOutput>> {
+        match self {
+            Self::Tpch => tpch_rules::try_execute_tpch_rule_sql(engine, sql, batch_size).await,
+            Self::WithCte => try_execute_with_cte_sql(engine, sql, batch_size).await,
+            Self::PricingSummary => try_execute_pricing_summary_sql(engine, sql, batch_size).await,
+            Self::ProfitByNationYear => {
+                try_execute_profit_by_nation_year_sql(engine, sql, batch_size).await
+            }
+            Self::ReturnedCustomerRevenue => {
+                try_execute_returned_customer_revenue_sql(engine, sql, batch_size).await
+            }
+            Self::ImportantStockValue => {
+                try_execute_important_stock_value_sql(engine, sql, batch_size).await
+            }
+            Self::RegionalSupplierRevenue => {
+                try_execute_regional_supplier_revenue_sql(engine, sql, batch_size).await
+            }
+            Self::BilateralShippingVolume => {
+                try_execute_bilateral_shipping_volume_sql(engine, sql, batch_size).await
+            }
+            Self::NationMarketShare => {
+                try_execute_nation_market_share_sql(engine, sql, batch_size).await
+            }
+            Self::DiscountedRevenueOrPredicate => {
+                try_execute_discounted_revenue_or_predicate_sql(engine, sql, batch_size).await
+            }
+            Self::OrderPriorityExistsCount => {
+                try_execute_order_priority_exists_count_sql(engine, sql, batch_size).await
+            }
+            Self::ShippingPriorityRevenue => {
+                try_execute_shipping_priority_revenue_sql(engine, sql, batch_size).await
+            }
+            Self::DerivedPrefixAvgAntiJoinAggregate => {
+                try_execute_derived_prefix_avg_anti_join_aggregate_sql(engine, sql, batch_size)
+                    .await
+            }
+            Self::JoinWithGroupedSumSemijoin => {
+                try_execute_join_with_grouped_sum_semijoin_sql(engine, sql, batch_size).await
+            }
+            Self::JoinWithCorrelatedAvgThreshold => {
+                try_execute_join_with_correlated_avg_threshold_sql(engine, sql, batch_size).await
+            }
+            Self::ShippingModePriorityCounts => {
+                try_execute_shipping_mode_priority_counts_sql(engine, sql, batch_size).await
+            }
+            Self::SupplierWaitCountAntijoin => {
+                try_execute_supplier_wait_count_antijoin_sql(engine, sql, batch_size).await
+            }
+            Self::PrefixPartSupplierThreshold => {
+                try_execute_prefix_part_supplier_threshold_sql(engine, sql, batch_size).await
+            }
+            Self::DerivedJoin => try_execute_derived_join_sql(engine, sql, batch_size).await,
+            Self::DerivedLeftJoinCountDistribution => {
+                try_execute_derived_left_join_count_distribution_sql(engine, sql, batch_size).await
+            }
+            Self::Derived => try_execute_derived_sql(engine, sql, batch_size).await,
+            Self::CorrelatedJoinSubqueryFilter => {
+                try_execute_correlated_join_subquery_filter_sql(engine, sql, batch_size).await
+            }
+            Self::MaterializedJoinSubquery => {
+                try_execute_materialized_join_subquery_sql(engine, sql, batch_size).await
+            }
+            Self::MultiCommaJoin => try_execute_multi_comma_join_sql(engine, sql, batch_size).await,
+            Self::CorrelatedExistsSemijoin => {
+                try_execute_correlated_exists_semijoin_sql(engine, sql, batch_size).await
+            }
+            Self::CorrelatedInPairSemijoin => {
+                try_execute_correlated_in_pair_semijoin_sql(engine, sql, batch_size).await
+            }
+            Self::CorrelatedSubqueryFilter => {
+                try_execute_correlated_subquery_filter_sql(engine, sql, batch_size).await
+            }
+            Self::CorrelatedExistsSubquery => {
+                try_execute_correlated_exists_subquery_sql(engine, sql, batch_size).await
+            }
+            Self::ExistsSubquery => try_execute_exists_subquery_sql(engine, sql, batch_size).await,
+            Self::InSubquery => try_execute_in_subquery_sql(engine, sql, batch_size).await,
+            Self::ProjectionExpression => {
+                try_execute_projection_expression_sql(engine, sql, batch_size).await
+            }
+        }
+    }
+}
+
+fn sql_rule_registry() -> &'static [SqlRule] {
+    &[
+        SqlRule::Tpch,
+        SqlRule::WithCte,
+        SqlRule::PricingSummary,
+        SqlRule::ProfitByNationYear,
+        SqlRule::ReturnedCustomerRevenue,
+        SqlRule::ImportantStockValue,
+        SqlRule::RegionalSupplierRevenue,
+        SqlRule::BilateralShippingVolume,
+        SqlRule::NationMarketShare,
+        SqlRule::DiscountedRevenueOrPredicate,
+        SqlRule::OrderPriorityExistsCount,
+        SqlRule::ShippingPriorityRevenue,
+        SqlRule::DerivedPrefixAvgAntiJoinAggregate,
+        SqlRule::JoinWithGroupedSumSemijoin,
+        SqlRule::JoinWithCorrelatedAvgThreshold,
+        SqlRule::ShippingModePriorityCounts,
+        SqlRule::SupplierWaitCountAntijoin,
+        SqlRule::PrefixPartSupplierThreshold,
+        SqlRule::DerivedJoin,
+        SqlRule::DerivedLeftJoinCountDistribution,
+        SqlRule::Derived,
+        SqlRule::CorrelatedJoinSubqueryFilter,
+        SqlRule::MaterializedJoinSubquery,
+        SqlRule::MultiCommaJoin,
+        SqlRule::CorrelatedExistsSemijoin,
+        SqlRule::CorrelatedInPairSemijoin,
+        SqlRule::CorrelatedSubqueryFilter,
+        SqlRule::CorrelatedExistsSubquery,
+        SqlRule::ExistsSubquery,
+        SqlRule::InSubquery,
+        SqlRule::ProjectionExpression,
+    ]
+}
+
+async fn try_execute_registered_sql_rules(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+) -> Result<Option<QueryOutput>> {
+    for rule in sql_rule_registry() {
+        if let Some(output) = rule.execute(engine, sql, batch_size).await? {
+            if sql_rule_profile_enabled() {
+                eprintln!(
+                    "[dodam:sql-rule] selected={} cost_rank={}",
+                    rule.name(),
+                    rule.cost_rank()
+                );
+            }
+            return Ok(Some(output));
+        }
+    }
+    Ok(None)
+}
+
+fn sql_rule_profile_enabled() -> bool {
+    std::env::var("DODAM_SQL_RULE_PROFILE").is_ok_and(|value| {
+        matches!(
+            value.as_str(),
+            "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+        )
+    })
 }
 
 fn semijoin_profile_enabled() -> bool {
