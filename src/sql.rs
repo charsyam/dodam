@@ -36,11 +36,13 @@ use sqlparser::parser::Parser;
 use crate::cost::{
     DecimalRangeSelectivityInput, ExpressionAggregateLateChunkCostInput,
     FusedSelectedAggregateCostInput, OrderedPrimitiveChunkCostInput, OrderedPrimitiveSinkCostInput,
-    ProjectionSelectivityCostInput, SelectedPayloadDecision, SelectedPayloadSpreadCostInput,
-    SqlRuleCostInput, WorkerCostInput, choose_expression_aggregate_late_row_group_chunk,
-    choose_fused_selected_aggregate, choose_late_materialization_projection_selected_ratio,
+    PrimitiveOrderLimitCostInput, PrimitiveOrderLimitStrategy, ProjectionSelectivityCostInput,
+    SelectedPayloadDecision, SelectedPayloadSpreadCostInput, SqlRuleCostInput, WorkerCostInput,
+    choose_expression_aggregate_late_row_group_chunk, choose_fused_selected_aggregate,
+    choose_late_materialization_projection_selected_ratio,
     choose_ordered_primitive_row_group_chunk, choose_ordered_primitive_sink,
-    choose_parallel_workers, choose_selected_payload_by_spread, estimate_sql_rule_cost,
+    choose_parallel_workers, choose_primitive_order_limit_strategy,
+    choose_selected_payload_by_spread, estimate_sql_rule_cost,
 };
 use crate::dense::{
     AdaptiveI64Map, AdaptiveI64Set, DenseAtomicU8, DenseI64BoolLookup, DenseI64F64Sum,
@@ -1464,10 +1466,17 @@ fn prefer_post_scan_primitive_desc_topk(
     else {
         return Ok(false);
     };
-    Ok(matches!(
-        column_types.as_slice(),
-        [DirectPrimitiveColumnType::I64]
-    ))
+    Ok(
+        choose_primitive_order_limit_strategy(PrimitiveOrderLimitCostInput {
+            has_limit: query.limit.is_some(),
+            offset: query.offset,
+            sort_keys: order_by.expressions.len(),
+            descending: sort.descending,
+            nulls_first: sort.nulls_first,
+            sort_key_projected: true,
+            sort_key_is_i64: matches!(column_types.as_slice(), [DirectPrimitiveColumnType::I64]),
+        }) == PrimitiveOrderLimitStrategy::PostScanTopK,
+    )
 }
 
 fn add_projection_column_once(projection: &mut Projection, column: String) {

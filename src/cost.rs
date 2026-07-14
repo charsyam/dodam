@@ -441,6 +441,40 @@ pub fn choose_ordered_primitive_row_group_chunk(input: OrderedPrimitiveChunkCost
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimitiveOrderLimitStrategy {
+    OrderedScan,
+    PostScanTopK,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrimitiveOrderLimitCostInput {
+    pub has_limit: bool,
+    pub offset: usize,
+    pub sort_keys: usize,
+    pub descending: bool,
+    pub nulls_first: bool,
+    pub sort_key_projected: bool,
+    pub sort_key_is_i64: bool,
+}
+
+pub fn choose_primitive_order_limit_strategy(
+    input: PrimitiveOrderLimitCostInput,
+) -> PrimitiveOrderLimitStrategy {
+    if input.has_limit
+        && input.offset == 0
+        && input.sort_keys == 1
+        && input.descending
+        && !input.nulls_first
+        && input.sort_key_projected
+        && input.sort_key_is_i64
+    {
+        PrimitiveOrderLimitStrategy::PostScanTopK
+    } else {
+        PrimitiveOrderLimitStrategy::OrderedScan
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DenseI32AggregateCostInput {
     pub rows: usize,
     pub min_rows: usize,
@@ -699,6 +733,46 @@ mod tests {
                 max_sample_unique: 32,
             }
         ));
+    }
+
+    #[test]
+    fn primitive_order_limit_strategy_prefers_post_scan_topk_only_for_safe_desc_limit() {
+        assert_eq!(
+            choose_primitive_order_limit_strategy(PrimitiveOrderLimitCostInput {
+                has_limit: true,
+                offset: 0,
+                sort_keys: 1,
+                descending: true,
+                nulls_first: false,
+                sort_key_projected: true,
+                sort_key_is_i64: true,
+            }),
+            PrimitiveOrderLimitStrategy::PostScanTopK
+        );
+        assert_eq!(
+            choose_primitive_order_limit_strategy(PrimitiveOrderLimitCostInput {
+                has_limit: true,
+                offset: 10,
+                sort_keys: 1,
+                descending: true,
+                nulls_first: false,
+                sort_key_projected: true,
+                sort_key_is_i64: true,
+            }),
+            PrimitiveOrderLimitStrategy::OrderedScan
+        );
+        assert_eq!(
+            choose_primitive_order_limit_strategy(PrimitiveOrderLimitCostInput {
+                has_limit: true,
+                offset: 0,
+                sort_keys: 1,
+                descending: false,
+                nulls_first: false,
+                sort_key_projected: true,
+                sort_key_is_i64: true,
+            }),
+            PrimitiveOrderLimitStrategy::OrderedScan
+        );
     }
 
     #[test]
