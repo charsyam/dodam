@@ -688,6 +688,189 @@ impl SqlRule {
             .unwrap_or(usize::MAX) as u16
     }
 
+    fn required_features(self) -> &'static [&'static str] {
+        match self {
+            Self::Tpch
+            | Self::PricingSummary
+            | Self::ProfitByNationYear
+            | Self::ReturnedCustomerRevenue
+            | Self::ImportantStockValue
+            | Self::RegionalSupplierRevenue
+            | Self::BilateralShippingVolume
+            | Self::NationMarketShare
+            | Self::DiscountedRevenueOrPredicate
+            | Self::OrderPriorityExistsCount
+            | Self::ShippingPriorityRevenue
+            | Self::ShippingModePriorityCounts
+            | Self::SupplierWaitCountAntijoin
+            | Self::PrefixPartSupplierThreshold => &["tpch-like"],
+            Self::WithCte => &["with"],
+            Self::DerivedPrefixAvgAntiJoinAggregate
+            | Self::DerivedJoin
+            | Self::DerivedLeftJoinCountDistribution
+            | Self::Derived => &["derived-from"],
+            Self::JoinWithGroupedSumSemijoin
+            | Self::JoinWithCorrelatedAvgThreshold
+            | Self::MultiCommaJoin => &["multi-input"],
+            Self::CorrelatedJoinSubqueryFilter
+            | Self::MaterializedJoinSubquery
+            | Self::CorrelatedExistsSemijoin
+            | Self::CorrelatedInPairSemijoin
+            | Self::CorrelatedSubqueryFilter
+            | Self::CorrelatedExistsSubquery
+            | Self::ExistsSubquery
+            | Self::InSubquery => &["subquery"],
+            Self::ProjectionExpression => &["projection-expression"],
+        }
+    }
+
+    fn required_columns(self) -> &'static [&'static str] {
+        match self {
+            Self::PricingSummary => &[
+                "l_returnflag",
+                "l_linestatus",
+                "l_quantity",
+                "l_extendedprice",
+                "l_discount",
+                "l_tax",
+                "l_shipdate",
+            ],
+            Self::ProfitByNationYear => &[
+                "l_orderkey",
+                "l_partkey",
+                "l_suppkey",
+                "l_quantity",
+                "l_extendedprice",
+                "l_discount",
+                "ps_supplycost",
+                "o_orderdate",
+                "n_name",
+            ],
+            Self::ReturnedCustomerRevenue => &[
+                "c_custkey",
+                "c_name",
+                "c_acctbal",
+                "o_orderkey",
+                "o_orderdate",
+                "l_returnflag",
+                "l_extendedprice",
+                "l_discount",
+            ],
+            Self::ImportantStockValue => &[
+                "ps_partkey",
+                "ps_suppkey",
+                "ps_supplycost",
+                "ps_availqty",
+                "s_nationkey",
+                "n_name",
+            ],
+            Self::RegionalSupplierRevenue => &[
+                "r_name",
+                "n_regionkey",
+                "c_nationkey",
+                "s_nationkey",
+                "o_orderdate",
+                "l_extendedprice",
+                "l_discount",
+            ],
+            Self::BilateralShippingVolume => &[
+                "n_name",
+                "s_nationkey",
+                "c_nationkey",
+                "o_orderdate",
+                "l_shipdate",
+                "l_extendedprice",
+                "l_discount",
+            ],
+            Self::NationMarketShare => &[
+                "r_name",
+                "p_type",
+                "o_orderdate",
+                "l_partkey",
+                "l_suppkey",
+                "l_extendedprice",
+                "l_discount",
+            ],
+            Self::DiscountedRevenueOrPredicate => &[
+                "p_brand",
+                "p_container",
+                "p_size",
+                "l_quantity",
+                "l_extendedprice",
+                "l_discount",
+                "l_shipmode",
+                "l_shipinstruct",
+            ],
+            Self::OrderPriorityExistsCount => &[
+                "o_orderkey",
+                "o_orderdate",
+                "o_orderpriority",
+                "l_orderkey",
+                "l_commitdate",
+                "l_receiptdate",
+            ],
+            Self::ShippingPriorityRevenue => &[
+                "c_mktsegment",
+                "o_orderkey",
+                "o_orderdate",
+                "o_shippriority",
+                "l_orderkey",
+                "l_extendedprice",
+                "l_discount",
+                "l_shipdate",
+            ],
+            Self::JoinWithCorrelatedAvgThreshold => &[
+                "p_partkey",
+                "p_brand",
+                "p_container",
+                "l_partkey",
+                "l_quantity",
+                "l_extendedprice",
+            ],
+            Self::ShippingModePriorityCounts => &[
+                "l_orderkey",
+                "l_shipmode",
+                "l_commitdate",
+                "l_receiptdate",
+                "l_shipdate",
+                "o_orderkey",
+                "o_orderpriority",
+            ],
+            Self::SupplierWaitCountAntijoin => &[
+                "s_suppkey",
+                "s_name",
+                "n_name",
+                "l_orderkey",
+                "l_suppkey",
+                "l_receiptdate",
+                "l_commitdate",
+            ],
+            Self::PrefixPartSupplierThreshold => &[
+                "p_name",
+                "ps_partkey",
+                "ps_suppkey",
+                "ps_availqty",
+                "l_partkey",
+                "l_suppkey",
+                "l_quantity",
+            ],
+            _ => &[],
+        }
+    }
+
+    fn estimated_cost(self, context: &SqlRuleContext) -> u32 {
+        let mut cost = u32::from(self.cost_rank()) * 100;
+        cost += self.required_features().len() as u32;
+        cost += self.required_columns().len() as u32;
+        if context.has_subquery && self.required_features().contains(&"subquery") {
+            cost = cost.saturating_sub(10);
+        }
+        if context.has_derived_from && self.required_features().contains(&"derived-from") {
+            cost = cost.saturating_sub(10);
+        }
+        cost
+    }
+
     async fn execute(
         self,
         engine: &DodamEngine,
@@ -849,23 +1032,49 @@ fn sql_rule_registry() -> &'static [SqlRule] {
     ]
 }
 
+#[derive(Clone, Copy)]
+struct SqlRuleCandidate {
+    rule: SqlRule,
+    estimated_cost: u32,
+}
+
 async fn try_execute_registered_sql_rules(
     engine: &DodamEngine,
     sql: &str,
     batch_size: usize,
 ) -> Result<Option<QueryOutput>> {
     let context = SqlRuleContext::from_sql(sql)?;
-    let candidates = sql_rule_registry()
+    let mut candidates = sql_rule_registry()
         .iter()
         .copied()
-        .filter(|rule| rule.is_candidate(&context));
-    for rule in candidates {
+        .filter(|rule| rule.is_candidate(&context))
+        .map(|rule| SqlRuleCandidate {
+            rule,
+            estimated_cost: rule.estimated_cost(&context),
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|candidate| (candidate.estimated_cost, candidate.rule.cost_rank()));
+    if sql_rule_profile_enabled() {
+        eprintln!(
+            "[dodam:sql-rule] candidates={}",
+            candidates
+                .iter()
+                .map(|candidate| format!("{}:{}", candidate.rule.name(), candidate.estimated_cost))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+    for candidate in candidates {
+        let rule = candidate.rule;
         if let Some(output) = rule.execute(engine, sql, batch_size).await? {
             if sql_rule_profile_enabled() {
                 eprintln!(
-                    "[dodam:sql-rule] selected={} cost_rank={}",
+                    "[dodam:sql-rule] selected={} cost_rank={} estimated_cost={} required_features={} required_columns={}",
                     rule.name(),
-                    rule.cost_rank()
+                    rule.cost_rank(),
+                    candidate.estimated_cost,
+                    rule.required_features().join(","),
+                    rule.required_columns().join(",")
                 );
             }
             return Ok(Some(output));
