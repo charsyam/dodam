@@ -1164,7 +1164,11 @@ async fn aggregates_decimal_values_sql() {
     let QueryOutput::Aggregate { batches, .. } = output else {
         panic!("expected aggregate output");
     };
-    assert_eq!(f64s_from_column(&batches, 0), vec![116.45]);
+    assert_eq!(
+        batches[0].schema().field(0).data_type(),
+        &DataType::Decimal128(38, 2)
+    );
+    assert_eq!(decimal128s_from_column(&batches, 0), vec![11645]);
     assert!((f64s_from_column(&batches, 1)[0] - 38.8166666667).abs() < 0.0000001);
     assert_eq!(
         batches[0].schema().field(2).data_type(),
@@ -2488,6 +2492,68 @@ async fn executes_grouped_aggregate_over_join_sql() {
 }
 
 #[tokio::test]
+async fn sums_decimal_over_explicit_join_exactly_sql() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let lineitem_path = tempdir.path().join("lineitem.parquet");
+    let orders_path = tempdir.path().join("orders.parquet");
+    write_decimal_lineitem_parquet(&lineitem_path);
+    write_status_orders_parquet(&orders_path);
+
+    let sql = format!(
+        "SELECT o.o_orderstatus, sum(l.l_extendedprice) FROM '{}' AS l JOIN '{}' AS o ON l.l_orderkey = o.o_orderkey GROUP BY o.o_orderstatus ORDER BY o.o_orderstatus",
+        lineitem_path.display(),
+        orders_path.display()
+    );
+    let QueryOutput::Aggregate { batches, .. } = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute explicit join decimal aggregate")
+    else {
+        panic!("expected aggregate output");
+    };
+
+    assert_eq!(strings_from_column(&batches, 0), vec!["F", "O"]);
+    assert_eq!(
+        batches[0].schema().field(1).data_type(),
+        &DataType::Decimal128(38, 2)
+    );
+    assert_eq!(
+        decimal128s_from_column(&batches, 1),
+        vec![300000000001, 123456789012]
+    );
+}
+
+#[tokio::test]
+async fn sums_decimal_over_comma_join_exactly_sql() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let lineitem_path = tempdir.path().join("lineitem.parquet");
+    let orders_path = tempdir.path().join("orders.parquet");
+    write_decimal_lineitem_parquet(&lineitem_path);
+    write_status_orders_parquet(&orders_path);
+
+    let sql = format!(
+        "SELECT o_orderstatus, sum(l_extendedprice) FROM '{}' AS lineitem, '{}' AS orders WHERE l_orderkey = o_orderkey GROUP BY o_orderstatus ORDER BY o_orderstatus",
+        lineitem_path.display(),
+        orders_path.display()
+    );
+    let QueryOutput::Aggregate { batches, .. } = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute comma join decimal aggregate")
+    else {
+        panic!("expected aggregate output");
+    };
+
+    assert_eq!(strings_from_column(&batches, 0), vec!["F", "O"]);
+    assert_eq!(
+        batches[0].schema().field(1).data_type(),
+        &DataType::Decimal128(38, 2)
+    );
+    assert_eq!(
+        decimal128s_from_column(&batches, 1),
+        vec![300000000001, 123456789012]
+    );
+}
+
+#[tokio::test]
 async fn filters_grouped_join_aggregate_with_having_sql() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let orders_path = tempdir.path().join("orders.parquet");
@@ -3160,6 +3226,54 @@ fn write_customers_parquet(path: &std::path::Path) {
     writer.close().expect("close parquet writer");
 }
 
+fn write_decimal_lineitem_parquet(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("l_orderkey", DataType::Int64, false),
+        Field::new("l_extendedprice", DataType::Decimal128(15, 2), true),
+    ]));
+    let orderkeys = Int64Array::from_iter_values([1, 1, 2, 3]);
+    let prices = Decimal128Array::from(vec![
+        Some(100000000000),
+        Some(200000000001),
+        Some(123456789012),
+        None,
+    ])
+    .with_precision_and_scale(15, 2)
+    .expect("decimal precision");
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(orderkeys), Arc::new(prices)])
+        .expect("record batch");
+
+    let file = File::create(path).expect("create parquet file");
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(2))
+        .build();
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props)).expect("parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+}
+
+fn write_status_orders_parquet(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("o_orderkey", DataType::Int64, false),
+        Field::new("o_orderstatus", DataType::Utf8, false),
+    ]));
+    let orderkeys = Int64Array::from_iter_values([1, 2, 4]);
+    let statuses = StringArray::from_iter_values(["F", "O", "P"]);
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(orderkeys), Arc::new(statuses)],
+    )
+    .expect("record batch");
+
+    let file = File::create(path).expect("create parquet file");
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(2))
+        .build();
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props)).expect("parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+}
+
 fn write_q13_customer_parquet(path: &std::path::Path) {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "c_custkey",
@@ -3803,6 +3917,22 @@ fn f64s_from_column(batches: &[RecordBatch], column: usize) -> Vec<f64> {
                 .expect("f64 column")
                 .iter()
                 .map(|value| value.expect("non-null f64"))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn decimal128s_from_column(batches: &[RecordBatch], column: usize) -> Vec<i128> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("decimal column")
+                .iter()
+                .map(|value| value.expect("non-null decimal"))
                 .collect::<Vec<_>>()
         })
         .collect()

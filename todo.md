@@ -2,6 +2,23 @@
 
 ## Next: General-Purpose SQL Compatibility
 
+Review follow-up:
+
+- TPC-H exact-shape fast paths are not a valid proxy for generic OLAP performance.
+  - SF=1 review data showed Q1 exact `~33ms` but small GROUP BY changes falling to `~565-675ms`, while DuckDB stayed around `~40-47ms`.
+  - Q6 exact stayed fast, but changing the aggregate expression to `sum(l_extendedprice * l_tax)` fell behind DuckDB.
+  - The next optimizer work should keep lowering TPC-H-derived techniques into general rules instead of counting exact-query wins as engine maturity.
+- Generic OLAP gaps to keep measuring:
+  - high-cardinality GROUP BY
+  - `count(DISTINCT ...)`
+  - LIKE filter + grouped aggregate
+  - filter + ORDER BY + LIMIT
+  - low-cardinality GROUP BY variants outside exact TPC-H shapes
+- Correctness fixes from review:
+  - `sum(Decimal128)` now accumulates raw decimal values and returns `Decimal128(38, scale)` instead of silently using `f64`.
+  - Added explicit JOIN and 2-table comma join decimal SUM coverage so semantically equivalent join syntaxes stay aligned.
+  - Multi comma join HAVING now rewrites uncorrelated scalar subqueries before filter parsing, covering aggregate-expression HAVING subqueries.
+
 Priority order:
 
 1. Set operations

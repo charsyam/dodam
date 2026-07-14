@@ -13393,6 +13393,12 @@ enum FastAggregateState {
         sum: f64,
         count: u64,
     },
+    SumDecimal128 {
+        expr: AggregateExpr,
+        sum: i128,
+        count: u64,
+        scale: i8,
+    },
     AvgInt {
         expr: AggregateExpr,
         sum: i64,
@@ -13425,9 +13431,19 @@ impl FastAggregateState {
             | FastAggregateInput::NumericInt64 { expr, .. } => numeric_fast_state(expr, false),
             FastAggregateInput::NumericFloat64 { expr, .. } => numeric_fast_state(expr, true),
             FastAggregateInput::Decimal128 { expr, .. }
-                if matches!(expr, AggregateExpr::Sum(_) | AggregateExpr::Avg(_)) =>
+                if matches!(expr, AggregateExpr::Avg(_)) =>
             {
                 numeric_fast_state(expr, true)
+            }
+            FastAggregateInput::Decimal128 { expr, scale, .. }
+                if matches!(expr, AggregateExpr::Sum(_)) =>
+            {
+                Self::SumDecimal128 {
+                    expr: expr.clone(),
+                    sum: 0,
+                    count: 0,
+                    scale: *scale,
+                }
             }
             FastAggregateInput::Date32 { expr, .. } => {
                 min_max_fast_state(expr, AggregateValue::Date32(None))
@@ -13557,7 +13573,11 @@ impl FastAggregateState {
                 scale,
                 ..
             } if values.is_valid(row) => match self {
-                Self::SumFloat { sum, count, .. } | Self::AvgFloat { sum, count, .. } => {
+                Self::SumDecimal128 { sum, count, .. } => {
+                    *sum += values.value(row);
+                    *count += 1;
+                }
+                Self::AvgFloat { sum, count, .. } => {
                     *sum += values.value(row) as f64 / decimal_scale_factor(*scale);
                     *count += 1;
                 }
@@ -13608,6 +13628,19 @@ impl FastAggregateState {
                     AggregateValue::Float64(Some(sum))
                 } else {
                     AggregateValue::Float64(None)
+                },
+            },
+            Self::SumDecimal128 {
+                expr,
+                sum,
+                count,
+                scale,
+            } => AggregateResult {
+                expr,
+                value: if count > 0 {
+                    AggregateValue::Decimal128(Some(sum), 38, scale)
+                } else {
+                    AggregateValue::Decimal128(None, 38, scale)
                 },
             },
             Self::AvgInt { expr, sum, count } => AggregateResult {
@@ -14070,6 +14103,7 @@ impl AggregateAccumulator {
 struct NumericState {
     sum_i64: i64,
     sum_f64: f64,
+    sum_decimal128: i128,
     count: u64,
     output: Option<NumericOutput>,
 }
@@ -14078,6 +14112,7 @@ struct NumericState {
 enum NumericOutput {
     Int64,
     Float64,
+    Decimal128 { scale: i8 },
 }
 
 impl NumericState {
@@ -14132,14 +14167,14 @@ impl NumericState {
                 Ok(())
             }
             DataType::Decimal128(_, scale) => {
-                self.output.get_or_insert(NumericOutput::Float64);
+                self.output
+                    .get_or_insert(NumericOutput::Decimal128 { scale: *scale });
                 let values = column
                     .as_any()
                     .downcast_ref::<Decimal128Array>()
                     .expect("Decimal128 data type");
-                let scale = decimal_scale_factor(*scale);
                 for value in values.iter().flatten() {
-                    self.sum_f64 += value as f64 / scale;
+                    self.sum_decimal128 += value;
                     self.count += 1;
                 }
                 Ok(())
@@ -14187,13 +14222,14 @@ impl NumericState {
                 Ok(())
             }
             DataType::Decimal128(_, scale) => {
-                self.output.get_or_insert(NumericOutput::Float64);
+                self.output
+                    .get_or_insert(NumericOutput::Decimal128 { scale: *scale });
                 let values = column
                     .as_any()
                     .downcast_ref::<Decimal128Array>()
                     .expect("Decimal128 data type");
                 if values.is_valid(row) {
-                    self.sum_f64 += values.value(row) as f64 / decimal_scale_factor(*scale);
+                    self.sum_decimal128 += values.value(row);
                     self.count += 1;
                 }
                 Ok(())
@@ -14210,8 +14246,14 @@ impl NumericState {
             Some(NumericOutput::Float64) if self.count > 0 => {
                 AggregateValue::Float64(Some(self.sum_f64))
             }
+            Some(NumericOutput::Decimal128 { scale }) if self.count > 0 => {
+                AggregateValue::Decimal128(Some(self.sum_decimal128), 38, scale)
+            }
             Some(NumericOutput::Int64) | None => AggregateValue::Int64(None),
             Some(NumericOutput::Float64) => AggregateValue::Float64(None),
+            Some(NumericOutput::Decimal128 { scale }) => {
+                AggregateValue::Decimal128(None, 38, scale)
+            }
         }
     }
 
@@ -14223,6 +14265,9 @@ impl NumericState {
             Some(NumericOutput::Float64) if self.count > 0 => {
                 AggregateValue::Float64(Some(self.sum_f64 / self.count as f64))
             }
+            Some(NumericOutput::Decimal128 { scale }) if self.count > 0 => AggregateValue::Float64(
+                Some(self.sum_decimal128 as f64 / decimal_scale_factor(scale) / self.count as f64),
+            ),
             _ => AggregateValue::Float64(None),
         }
     }
@@ -14236,6 +14281,11 @@ impl NumericState {
             Some(NumericOutput::Float64) => {
                 self.output.get_or_insert(NumericOutput::Float64);
                 self.sum_f64 += other.sum_f64;
+            }
+            Some(NumericOutput::Decimal128 { scale }) => {
+                self.output
+                    .get_or_insert(NumericOutput::Decimal128 { scale });
+                self.sum_decimal128 += other.sum_decimal128;
             }
             None => {}
         }

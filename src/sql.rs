@@ -37616,8 +37616,19 @@ async fn try_execute_with_cte_sql(
     )?;
     let (filter, expression_filter) =
         parse_join_filter_plan(residual.as_ref(), &projection.aliases, &alias_refs, false)?;
-    let having = select
-        .having
+    let rewritten_having = if let Some(expr) = select.having.as_ref() {
+        Some(
+            Box::pin(rewrite_uncorrelated_scalar_subqueries_to_literals(
+                engine,
+                expr.clone(),
+                batch_size,
+            ))
+            .await?,
+        )
+    } else {
+        None
+    };
+    let having = rewritten_having
         .as_ref()
         .map(|expr| parse_join_filter(expr, &projection.aliases, &alias_refs, true))
         .transpose()?;
@@ -40866,8 +40877,19 @@ async fn try_execute_multi_comma_join_sql(
         &projection.aggregates,
         None,
     )?;
-    let having = select
-        .having
+    let rewritten_having = if let Some(expr) = select.having.as_ref() {
+        Some(
+            Box::pin(rewrite_uncorrelated_scalar_subqueries_to_literals(
+                engine,
+                expr.clone(),
+                batch_size,
+            ))
+            .await?,
+        )
+    } else {
+        None
+    };
+    let having = rewritten_having
         .as_ref()
         .map(|expr| parse_join_filter(expr, &projection.aliases, &alias_refs, true))
         .transpose()?;
