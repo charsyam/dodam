@@ -37,10 +37,10 @@ use crate::cost::{
     DecimalRangeSelectivityInput, ExpressionAggregateLateChunkCostInput,
     FusedSelectedAggregateCostInput, OrderedPrimitiveChunkCostInput, OrderedPrimitiveSinkCostInput,
     ProjectionSelectivityCostInput, SelectedPayloadDecision, SelectedPayloadSpreadCostInput,
-    WorkerCostInput, choose_expression_aggregate_late_row_group_chunk,
+    SqlRuleCostInput, WorkerCostInput, choose_expression_aggregate_late_row_group_chunk,
     choose_fused_selected_aggregate, choose_late_materialization_projection_selected_ratio,
     choose_ordered_primitive_row_group_chunk, choose_ordered_primitive_sink,
-    choose_parallel_workers, choose_selected_payload_by_spread,
+    choose_parallel_workers, choose_selected_payload_by_spread, estimate_sql_rule_cost,
 };
 use crate::dense::{
     AdaptiveI64Map, AdaptiveI64Set, DenseAtomicU8, DenseI64BoolLookup, DenseI64F64Sum,
@@ -859,16 +859,13 @@ impl SqlRule {
     }
 
     fn estimated_cost(self, context: &SqlRuleContext) -> u32 {
-        let mut cost = u32::from(self.cost_rank()) * 100;
-        cost += self.required_features().len() as u32;
-        cost += self.required_columns().len() as u32;
-        if context.has_subquery && self.required_features().contains(&"subquery") {
-            cost = cost.saturating_sub(10);
-        }
-        if context.has_derived_from && self.required_features().contains(&"derived-from") {
-            cost = cost.saturating_sub(10);
-        }
-        cost
+        estimate_sql_rule_cost(SqlRuleCostInput {
+            base_rank: self.cost_rank(),
+            required_features: self.required_features().len(),
+            matched_features: context.matched_required_features(self.required_features()),
+            required_columns: self.required_columns().len(),
+            matched_required_columns: context.matched_required_columns(self.required_columns()),
+        })
     }
 
     async fn execute(
@@ -1090,6 +1087,7 @@ struct SqlRuleContext {
     has_derived_from: bool,
     has_tpch_like_terms: bool,
     from_table_count: usize,
+    lower_sql: String,
 }
 
 impl SqlRuleContext {
@@ -1129,7 +1127,38 @@ impl SqlRuleContext {
             has_derived_from: lower_sql.contains("from ("),
             has_tpch_like_terms,
             from_table_count: 0,
+            lower_sql,
         }
+    }
+
+    fn matched_required_features(&self, required_features: &[&str]) -> usize {
+        required_features
+            .iter()
+            .filter(|feature| self.has_feature(feature))
+            .count()
+    }
+
+    fn matched_required_columns(&self, required_columns: &[&str]) -> usize {
+        required_columns
+            .iter()
+            .filter(|column| self.mentions_column(column))
+            .count()
+    }
+
+    fn has_feature(&self, feature: &str) -> bool {
+        match feature {
+            "tpch-like" => self.has_tpch_like_terms,
+            "with" => self.has_with,
+            "derived-from" => self.has_derived_from,
+            "multi-input" => self.from_table_count > 1 || self.has_join,
+            "subquery" => self.has_subquery,
+            "projection-expression" => true,
+            _ => false,
+        }
+    }
+
+    fn mentions_column(&self, column: &str) -> bool {
+        self.lower_sql.contains(&column.to_ascii_lowercase())
     }
 }
 

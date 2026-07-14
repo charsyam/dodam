@@ -127,6 +127,32 @@ pub fn choose_parallel_workers(input: WorkerCostInput) -> usize {
         .min(input.row_groups.max(1))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SqlRuleCostInput {
+    pub base_rank: u16,
+    pub required_features: usize,
+    pub matched_features: usize,
+    pub required_columns: usize,
+    pub matched_required_columns: usize,
+}
+
+pub fn estimate_sql_rule_cost(input: SqlRuleCostInput) -> u32 {
+    let mut cost = u32::from(input.base_rank) * 1_000;
+    let missing_features = input
+        .required_features
+        .saturating_sub(input.matched_features) as u32;
+    let missing_columns = input
+        .required_columns
+        .saturating_sub(input.matched_required_columns) as u32;
+    cost = cost.saturating_add(input.required_features as u32);
+    cost = cost.saturating_add(input.required_columns as u32);
+    cost = cost.saturating_add(missing_features * 100);
+    cost = cost.saturating_add(missing_columns * 5);
+    cost = cost.saturating_sub(input.matched_features as u32 * 10);
+    cost = cost.saturating_sub(input.matched_required_columns as u32);
+    cost
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SelectedPayloadCostInput {
     pub records: usize,
