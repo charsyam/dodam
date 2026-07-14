@@ -798,6 +798,21 @@ async fn duckdb_differential_union_all() {
 
     assert_same_as_duckdb(
         &format!(
+            "SELECT id AS value FROM '{}' WHERE id IN (1, 2, 3, 4) INTERSECT ALL SELECT id AS value FROM '{}' WHERE id IN (3, 4, 5) ORDER BY value",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id AS value FROM read_parquet('{}') WHERE id IN (1, 2, 3, 4) INTERSECT ALL SELECT id AS value FROM read_parquet('{}') WHERE id IN (3, 4, 5) ORDER BY value",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
             "SELECT key AS value, payload FROM '{}' WHERE id <= 5 EXCEPT SELECT key AS value, payload FROM '{}' WHERE id >= 2 ORDER BY value, payload",
             facts_path.display(),
             facts_path.display()
@@ -819,6 +834,21 @@ async fn duckdb_differential_union_all() {
         ),
         &format!(
             "SELECT key AS value FROM read_parquet('{}') WHERE id <= 5 EXCEPT ALL SELECT key AS value FROM read_parquet('{}') WHERE id >= 2 ORDER BY value",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id AS value FROM '{}' WHERE id IN (1, 2, 3, 4) EXCEPT ALL SELECT id AS value FROM '{}' WHERE id IN (3, 4, 5) ORDER BY value",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id AS value FROM read_parquet('{}') WHERE id IN (1, 2, 3, 4) EXCEPT ALL SELECT id AS value FROM read_parquet('{}') WHERE id IN (3, 4, 5) ORDER BY value",
             facts_path.display(),
             facts_path.display()
         ),

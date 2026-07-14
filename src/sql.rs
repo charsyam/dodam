@@ -4864,7 +4864,7 @@ fn try_execute_same_source_all_set_scan(
     _limit: Option<usize>,
     _offset: usize,
 ) -> Result<Option<Vec<RecordBatch>>> {
-    let Some(scan) = plan_same_source_all_set_i32_scan(expr)? else {
+    let Some(scan) = plan_same_source_all_set_primitive_scan(expr)? else {
         return Ok(None);
     };
     let Some(column_types) = engine
@@ -4872,7 +4872,13 @@ fn try_execute_same_source_all_set_scan(
     else {
         return Ok(None);
     };
-    if !matches!(column_types.as_slice(), [DirectPrimitiveColumnType::I32]) {
+    let [column_type] = column_types.as_slice() else {
+        return Ok(None);
+    };
+    if !matches!(
+        column_type,
+        DirectPrimitiveColumnType::I32 | DirectPrimitiveColumnType::I64
+    ) {
         return Ok(None);
     }
     let row_group_count = engine.parquet_row_group_count(&scan.path)?;
@@ -4882,9 +4888,9 @@ fn try_execute_same_source_all_set_scan(
         scan.path.clone(),
         batch_size,
         row_groups,
-        vec![(scan.column.clone(), DirectPrimitiveColumnType::I32)],
-        || I32SetAllCounts::new(candidates.clone()),
-        |state, view| state.consume(view),
+        vec![(scan.column.clone(), *column_type)],
+        || PrimitiveSetAllCounts::new(candidates.clone()),
+        move |state, view| state.consume(view, *column_type),
         |state, partial| {
             state.merge(partial);
             Ok(())
@@ -4897,12 +4903,22 @@ fn try_execute_same_source_all_set_scan(
         return Ok(None);
     }
     let output = state.finish(&scan.left_values, &scan.right_values, scan.op);
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        &scan.column,
-        DataType::Int32,
-        true,
-    )]));
-    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(output))])?;
+    let (data_type, column): (DataType, ArrayRef) = match column_type {
+        DirectPrimitiveColumnType::I32 => {
+            let values = output
+                .into_iter()
+                .map(|value| {
+                    i32::try_from(value)
+                        .map_err(|_| DodamError::InvalidFilter(format!("{}={value}", scan.column)))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            (DataType::Int32, Arc::new(Int32Array::from(values)))
+        }
+        DirectPrimitiveColumnType::I64 => (DataType::Int64, Arc::new(Int64Array::from(output))),
+        _ => return Ok(None),
+    };
+    let schema = Arc::new(Schema::new(vec![Field::new(&scan.column, data_type, true)]));
+    let batch = RecordBatch::try_new(schema, vec![column])?;
     rename_output_batches(vec![batch], &scan.aliases).map(Some)
 }
 
@@ -4915,17 +4931,17 @@ struct DirectDistinctScan {
 }
 
 #[derive(Clone)]
-struct SameSourceAllSetI32Scan {
+struct SameSourceAllSetPrimitiveScan {
     path: PathBuf,
     column: String,
     aliases: Vec<(String, String)>,
-    left_values: Vec<i32>,
-    right_values: Vec<i32>,
+    left_values: Vec<i64>,
+    right_values: Vec<i64>,
     op: SetOperator,
 }
 
-impl SameSourceAllSetI32Scan {
-    fn candidates(&self) -> Vec<i32> {
+impl SameSourceAllSetPrimitiveScan {
+    fn candidates(&self) -> Vec<i64> {
         let mut candidates = Vec::new();
         for value in self.left_values.iter().chain(self.right_values.iter()) {
             if !candidates.iter().any(|candidate| candidate == value) {
@@ -5391,14 +5407,14 @@ impl I32CandidatePresence {
     }
 }
 
-struct I32SetAllCounts {
-    candidates: Vec<i32>,
+struct PrimitiveSetAllCounts {
+    candidates: Vec<i64>,
     counts: Vec<usize>,
     unsupported: bool,
 }
 
-impl I32SetAllCounts {
-    fn new(candidates: Vec<i32>) -> Self {
+impl PrimitiveSetAllCounts {
+    fn new(candidates: Vec<i64>) -> Self {
         let counts = vec![0; candidates.len()];
         Self {
             candidates,
@@ -5407,19 +5423,49 @@ impl I32SetAllCounts {
         }
     }
 
-    fn consume(&mut self, view: BatchView<'_>) -> Result<()> {
-        let Some(values) = view
-            .i32_vector(0)
-            .and_then(|column| column.values_if_null_free())
-        else {
-            self.unsupported = true;
-            return Ok(());
-        };
+    fn consume(
+        &mut self,
+        view: BatchView<'_>,
+        column_type: DirectPrimitiveColumnType,
+    ) -> Result<()> {
+        match column_type {
+            DirectPrimitiveColumnType::I32 => {
+                let Some(values) = view
+                    .i32_vector(0)
+                    .and_then(|column| column.values_if_null_free())
+                else {
+                    self.unsupported = true;
+                    return Ok(());
+                };
+                self.consume_values(values.iter().map(|value| i64::from(*value)))
+            }
+            DirectPrimitiveColumnType::I64 => {
+                let Some(values) = view
+                    .i64_vector(0)
+                    .and_then(|column| column.values_if_null_free())
+                else {
+                    self.unsupported = true;
+                    return Ok(());
+                };
+                self.consume_values(values.iter().copied())
+            }
+            _ => {
+                self.unsupported = true;
+                Ok(())
+            }
+        }
+    }
+
+    fn consume_values<I>(&mut self, values: I) -> Result<()>
+    where
+        I: IntoIterator<Item = i64>,
+    {
+        let values = values.into_iter();
         match self.candidates.as_slice() {
-            [] => {}
+            [] => for _ in values {},
             [a] => {
                 let mut count = 0usize;
-                for &value in values {
+                for value in values {
                     count += usize::from(value == *a);
                 }
                 self.counts[0] += count;
@@ -5427,7 +5473,7 @@ impl I32SetAllCounts {
             [a, b] => {
                 let mut count_a = 0usize;
                 let mut count_b = 0usize;
-                for &value in values {
+                for value in values {
                     if value == *a {
                         count_a += 1;
                     } else if value == *b {
@@ -5441,7 +5487,7 @@ impl I32SetAllCounts {
                 let mut count_a = 0usize;
                 let mut count_b = 0usize;
                 let mut count_c = 0usize;
-                for &value in values {
+                for value in values {
                     if value == *a {
                         count_a += 1;
                     } else if value == *b {
@@ -5455,14 +5501,14 @@ impl I32SetAllCounts {
                 self.counts[2] += count_c;
             }
             candidates => {
-                for &value in values {
+                for value in values {
                     if let Some(index) = candidates.iter().position(|candidate| *candidate == value)
                     {
                         self.counts[index] += 1;
                     }
                 }
             }
-        }
+        };
         Ok(())
     }
 
@@ -5473,7 +5519,7 @@ impl I32SetAllCounts {
         }
     }
 
-    fn finish(&self, left_values: &[i32], right_values: &[i32], op: SetOperator) -> Vec<i32> {
+    fn finish(&self, left_values: &[i64], right_values: &[i64], op: SetOperator) -> Vec<i64> {
         let mut output = Vec::new();
         for &value in left_values {
             let left_count = self.count_for(value);
@@ -5492,7 +5538,7 @@ impl I32SetAllCounts {
         output
     }
 
-    fn count_for(&self, value: i32) -> usize {
+    fn count_for(&self, value: i64) -> usize {
         self.candidates
             .iter()
             .position(|candidate| *candidate == value)
@@ -5641,7 +5687,9 @@ fn plan_same_source_distinct_set_scan(expr: &SetExpr) -> Result<Option<SameSourc
     ))
 }
 
-fn plan_same_source_all_set_i32_scan(expr: &SetExpr) -> Result<Option<SameSourceAllSetI32Scan>> {
+fn plan_same_source_all_set_primitive_scan(
+    expr: &SetExpr,
+) -> Result<Option<SameSourceAllSetPrimitiveScan>> {
     let SetExpr::SetOperation {
         op,
         set_quantifier,
@@ -5662,7 +5710,11 @@ fn plan_same_source_all_set_i32_scan(expr: &SetExpr) -> Result<Option<SameSource
     let Some(right_query) = single_set_operand_query(right.as_ref())? else {
         return Ok(None);
     };
-    Ok(same_source_all_set_i32_plan(&left_query, &right_query, *op))
+    Ok(same_source_all_set_primitive_plan(
+        &left_query,
+        &right_query,
+        *op,
+    ))
 }
 
 struct SameSourceUnionAllScan {
@@ -5844,11 +5896,11 @@ fn same_source_distinct_set_plan(
     })
 }
 
-fn same_source_all_set_i32_plan(
+fn same_source_all_set_primitive_plan(
     left: &SqlQuery,
     right: &SqlQuery,
     op: SetOperator,
-) -> Option<SameSourceAllSetI32Scan> {
+) -> Option<SameSourceAllSetPrimitiveScan> {
     if !same_source_union_all_operand_supported(left)
         || !same_source_union_all_operand_supported(right)
         || left.path != right.path
@@ -5868,12 +5920,12 @@ fn same_source_all_set_i32_plan(
     if left_column != right_column || left_column != *projected_column {
         return None;
     }
-    Some(SameSourceAllSetI32Scan {
+    Some(SameSourceAllSetPrimitiveScan {
         path: left.path.clone(),
         column: projected_column.clone(),
         aliases: left.aliases.clone(),
-        left_values: literal_values_to_unique_i32(left_values, projected_column).ok()?,
-        right_values: literal_values_to_unique_i32(right_values, projected_column).ok()?,
+        left_values: literal_values_to_unique_i64(left_values, projected_column).ok()?,
+        right_values: literal_values_to_unique_i64(right_values, projected_column).ok()?,
         op,
     })
 }
@@ -5984,10 +6036,10 @@ fn append_unique_literal_values(output: &mut Vec<LiteralValue>, values: Vec<Lite
     }
 }
 
-fn literal_values_to_unique_i32(values: Vec<LiteralValue>, column: &str) -> Result<Vec<i32>> {
+fn literal_values_to_unique_i64(values: Vec<LiteralValue>, column: &str) -> Result<Vec<i64>> {
     let mut output = Vec::new();
     for value in values {
-        let value = value.as_i32(column)?;
+        let value = value.as_i64(column)?;
         if !output.iter().any(|existing| *existing == value) {
             output.push(value);
         }

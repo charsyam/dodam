@@ -368,6 +368,16 @@ def generic_queries(data_dir: Path) -> list[GenericQuery]:
             f"SELECT bucket FROM read_parquet('{facts}') WHERE bucket IN (1, 7) EXCEPT ALL SELECT bucket FROM read_parquet('{facts}') WHERE bucket IN (7, 9) ORDER BY bucket LIMIT 5000",
         ),
         GenericQuery(
+            "intersect_all_i64_rows",
+            f"SELECT id FROM '{facts}' WHERE id IN (1, 2, 3, 4, 5, 6, 7, 8) INTERSECT ALL SELECT id FROM '{facts}' WHERE id IN (5, 6, 7, 8, 9, 10, 11, 12) ORDER BY id",
+            f"SELECT id FROM read_parquet('{facts}') WHERE id IN (1, 2, 3, 4, 5, 6, 7, 8) INTERSECT ALL SELECT id FROM read_parquet('{facts}') WHERE id IN (5, 6, 7, 8, 9, 10, 11, 12) ORDER BY id",
+        ),
+        GenericQuery(
+            "except_all_i64_rows",
+            f"SELECT id FROM '{facts}' WHERE id IN (1, 2, 3, 4, 5, 6, 7, 8) EXCEPT ALL SELECT id FROM '{facts}' WHERE id IN (5, 6, 7, 8, 9, 10, 11, 12) ORDER BY id",
+            f"SELECT id FROM read_parquet('{facts}') WHERE id IN (1, 2, 3, 4, 5, 6, 7, 8) EXCEPT ALL SELECT id FROM read_parquet('{facts}') WHERE id IN (5, 6, 7, 8, 9, 10, 11, 12) ORDER BY id",
+        ),
+        GenericQuery(
             "select_distinct_low_cardinality",
             f"SELECT DISTINCT bucket FROM '{facts}' WHERE bucket IN (1, 7, 9) ORDER BY bucket",
             f"SELECT DISTINCT bucket FROM read_parquet('{facts}') WHERE bucket IN (1, 7, 9) ORDER BY bucket",

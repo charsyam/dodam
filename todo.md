@@ -87,9 +87,18 @@ Priority order:
      - SF=1 focused after primitive count rule:
        - `intersect_all_rows`: Dodam `~4.8ms`, DuckDB `~27.8ms` (`0.17x`)
        - `except_all_rows`: Dodam `~5.2ms`, DuckDB `~29.2ms` (`0.18x`)
+     - Widened the primitive count rule from `i32` only to null-free `i32/i64`.
+       - Added DuckDB differential coverage for `INTERSECT ALL`/`EXCEPT ALL` over `id` (`Int64`).
+       - Added generic benchmark cases `intersect_all_i64_rows` and `except_all_i64_rows`.
+       - SF=1 focused after widening:
+         - `intersect_all_rows`: Dodam `~4.0ms`, DuckDB `~22.8ms` (`0.17x`)
+         - `except_all_rows`: Dodam `~4.1ms`, DuckDB `~24.2ms` (`0.17x`)
+         - `intersect_all_i64_rows`: Dodam `~5.6ms`, DuckDB `~16.5ms` (`0.34x`)
+         - `except_all_i64_rows`: Dodam `~6.2ms`, DuckDB `~14.7ms` (`0.42x`)
      - Next performance step: widen the primitive count rule to nullable primitives, string dictionary ids, and multi-column primitive keys. The generic fallback remains correct but still uses Arrow row conversion and full operand materialization.
 2. JOIN generality
    - non-equi join fallback
+     - Added an explicit SQL error test for pure non-equi `JOIN ... ON` without an equality key. Current behavior is intentionally rejected because the residual filter references both inputs; a future nested-loop/range join operator should replace this test with DuckDB differential correctness.
    - complex `ON` residual predicates
    - expression join keys
 3. Window functions
@@ -100,6 +109,7 @@ Priority order:
    - `FILTER (WHERE ...)`
    - broader aggregate/window integration for joins, grouped inputs, and explicit frames
    - `WITHIN GROUP` later
+   - Large-data follow-up: grouped aggregate and set-op fallbacks still need spill-aware physical operators. The current `INTERSECT/EXCEPT ALL` generic fallback materializes both operands and uses Arrow row conversion; only the same-source primitive rule avoids that boundary.
 5. Scalar expression/function coverage
    - `ILIKE`
    - `LIKE ANY`

@@ -1540,6 +1540,30 @@ async fn filters_with_column_to_column_comparison_sql() {
 }
 
 #[tokio::test]
+async fn rejects_join_without_equality_key_sql() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let orders_path = tempdir.path().join("orders.parquet");
+    let customers_path = tempdir.path().join("customers.parquet");
+    write_orders_parquet(&orders_path);
+    write_customers_parquet(&customers_path);
+
+    let sql = format!(
+        "SELECT o.id FROM '{}' AS o JOIN '{}' AS c ON o.customer_id < c.id ORDER BY o.id",
+        orders_path.display(),
+        customers_path.display()
+    );
+    let error = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect_err("non-equi join without equality key should be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("JOIN ON residual filters may only reference the right input"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn executes_comma_join_with_join_key_inside_or_sql() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let orders_path = tempdir.path().join("orders.parquet");
