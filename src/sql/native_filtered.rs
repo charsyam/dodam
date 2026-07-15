@@ -38,6 +38,10 @@ pub(super) fn collect_native_filtered_aggregates(
     };
     if group_by.is_empty() {
         let mut states = native_filtered_initial_states(&specs);
+        let profile = generic_profile_start().is_some();
+        let mut mask_nanos = 0u64;
+        let mut input_nanos = 0u64;
+        let mut update_nanos = 0u64;
         for batch in stream.by_ref() {
             let batch = batch?;
             if batch.num_rows() == 0 {
@@ -45,10 +49,26 @@ pub(super) fn collect_native_filtered_aggregates(
             }
             metrics.batches += 1;
             metrics.rows += batch.num_rows();
-            native_filtered_update_states(&batch, &specs, &mut states)?;
+            native_filtered_update_states_profiled(
+                &batch,
+                &specs,
+                &mut states,
+                profile,
+                &mut mask_nanos,
+                &mut input_nanos,
+                &mut update_nanos,
+            )?;
         }
         metrics.values = native_filtered_finish_states(&specs, states);
         metrics.aggregate_nanos = elapsed_micros_to_nanos(started.elapsed());
+        if profile {
+            eprintln!(
+                "[dodam:generic-profile] native filtered global masks={:.3}ms inputs={:.3}ms update={:.3}ms",
+                sql_nanos_to_millis(mask_nanos),
+                sql_nanos_to_millis(input_nanos),
+                sql_nanos_to_millis(update_nanos),
+            );
+        }
         return Ok(metrics);
     }
     debug_assert_eq!(group_by.len(), 1);
@@ -70,7 +90,21 @@ pub(super) fn collect_native_filtered_aggregates(
         let group_values = evaluated_column(&batch, group_column)?;
         let group_keys = NativeFilteredGroupKeys::new(&group_values);
         let mask_started = profile.then(Instant::now);
-        let masks = native_filtered_batch_masks(&batch, &specs)?;
+        let direct_group_path = match &group_keys {
+            NativeFilteredGroupKeys::I32(values) => values.null_count() == 0,
+            NativeFilteredGroupKeys::I64(values) => values.null_count() == 0,
+            NativeFilteredGroupKeys::Other => false,
+        };
+        let direct_predicates = if direct_group_path {
+            native_filtered_batch_direct_predicates(&batch, &specs)?
+        } else {
+            None
+        };
+        let masks = if direct_predicates.is_some() {
+            Vec::new()
+        } else {
+            native_filtered_batch_masks_sparse(&batch, &specs)?
+        };
         mask_nanos = mask_nanos.saturating_add(elapsed_optional_nanos(mask_started));
         let input_started = profile.then(Instant::now);
         let inputs = native_filtered_batch_inputs(&batch, &specs)?;
@@ -79,7 +113,16 @@ pub(super) fn collect_native_filtered_aggregates(
         if let NativeFilteredGroupKeys::I32(values) = &group_keys
             && values.null_count() == 0
         {
-            if !native_filtered_update_i32_group_sparse_masks(
+            if let Some(predicates) = direct_predicates.as_ref() {
+                native_filtered_update_i32_group_direct_predicates(
+                    values,
+                    predicates,
+                    &inputs,
+                    &specs,
+                    &mut dense,
+                    &mut groups,
+                )?;
+            } else if !native_filtered_update_i32_group_sparse_masks(
                 values,
                 &masks,
                 &inputs,
@@ -114,7 +157,16 @@ pub(super) fn collect_native_filtered_aggregates(
         if let NativeFilteredGroupKeys::I64(values) = &group_keys
             && values.null_count() == 0
         {
-            if !native_filtered_update_i64_group_sparse_masks(
+            if let Some(predicates) = direct_predicates.as_ref() {
+                native_filtered_update_i64_group_direct_predicates(
+                    values,
+                    predicates,
+                    &inputs,
+                    &specs,
+                    &mut dense,
+                    &mut groups,
+                )?;
+            } else if !native_filtered_update_i64_group_sparse_masks(
                 values,
                 &masks,
                 &inputs,
@@ -272,6 +324,66 @@ fn native_filtered_update_i64_group_sparse_masks(
         dense,
         groups,
     )
+}
+
+fn native_filtered_update_i32_group_direct_predicates(
+    values: &Int32Array,
+    predicates: &[NativeFilteredDirectPredicate],
+    inputs: &[NativeFilteredBatchInput],
+    specs: &[NativeFilteredAggregateSpec],
+    dense: &mut Vec<Option<Vec<NativeFilteredAggregateState>>>,
+    groups: &mut HashMap<GroupValue, Vec<NativeFilteredAggregateState>>,
+) -> Result<()> {
+    native_filtered_update_integer_group_direct_predicates(
+        values.len(),
+        |row| i64::from(values.value(row)),
+        predicates,
+        inputs,
+        specs,
+        dense,
+        groups,
+    )
+}
+
+fn native_filtered_update_i64_group_direct_predicates(
+    values: &Int64Array,
+    predicates: &[NativeFilteredDirectPredicate],
+    inputs: &[NativeFilteredBatchInput],
+    specs: &[NativeFilteredAggregateSpec],
+    dense: &mut Vec<Option<Vec<NativeFilteredAggregateState>>>,
+    groups: &mut HashMap<GroupValue, Vec<NativeFilteredAggregateState>>,
+) -> Result<()> {
+    native_filtered_update_integer_group_direct_predicates(
+        values.len(),
+        |row| values.value(row),
+        predicates,
+        inputs,
+        specs,
+        dense,
+        groups,
+    )
+}
+
+fn native_filtered_update_integer_group_direct_predicates(
+    row_count: usize,
+    key_at: impl Fn(usize) -> i64,
+    predicates: &[NativeFilteredDirectPredicate],
+    inputs: &[NativeFilteredBatchInput],
+    specs: &[NativeFilteredAggregateSpec],
+    dense: &mut Vec<Option<Vec<NativeFilteredAggregateState>>>,
+    groups: &mut HashMap<GroupValue, Vec<NativeFilteredAggregateState>>,
+) -> Result<()> {
+    for row in 0..row_count {
+        let states = native_filtered_i64_group_states(key_at(row), dense, groups, specs);
+        for (index, ((spec, predicate), input)) in
+            specs.iter().zip(predicates).zip(inputs).enumerate()
+        {
+            if predicate.selected(row) {
+                native_filtered_update_state_fast(&mut states[index], spec, input, row)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn native_filtered_update_integer_group_sparse_masks(
@@ -477,18 +589,123 @@ fn native_filtered_initial_states(
         .collect()
 }
 
-fn native_filtered_update_states(
+fn native_filtered_update_states_profiled(
     batch: &RecordBatch,
     specs: &[NativeFilteredAggregateSpec],
     states: &mut [NativeFilteredAggregateState],
+    profile: bool,
+    mask_nanos: &mut u64,
+    input_nanos: &mut u64,
+    update_nanos: &mut u64,
 ) -> Result<()> {
+    let mask_started = profile.then(Instant::now);
     let masks = native_filtered_batch_masks(batch, specs)?;
+    *mask_nanos = mask_nanos.saturating_add(elapsed_optional_nanos(mask_started));
+    let input_started = profile.then(Instant::now);
     let inputs = native_filtered_batch_inputs(batch, specs)?;
-    for row in 0..batch.num_rows() {
-        for (index, spec) in specs.iter().enumerate() {
-            if masks[index].selected(row) {
-                native_filtered_update_state(&mut states[index], spec, &inputs[index], row)?;
+    *input_nanos = input_nanos.saturating_add(elapsed_optional_nanos(input_started));
+    let update_started = profile.then(Instant::now);
+    for (index, ((spec, mask), input)) in specs.iter().zip(&masks).zip(&inputs).enumerate() {
+        native_filtered_update_global_state_typed(&mut states[index], spec, mask, input)?;
+    }
+    *update_nanos = update_nanos.saturating_add(elapsed_optional_nanos(update_started));
+    Ok(())
+}
+
+fn native_filtered_update_global_state_typed(
+    state: &mut NativeFilteredAggregateState,
+    spec: &NativeFilteredAggregateSpec,
+    mask: &NativeFilteredBatchMask,
+    input: &NativeFilteredBatchInput,
+) -> Result<()> {
+    match state {
+        NativeFilteredAggregateState::Count(count)
+            if matches!(
+                input,
+                NativeFilteredBatchInput::AlwaysSome | NativeFilteredBatchInput::NonNull
+            ) =>
+        {
+            for row in 0..mask.mask.len() {
+                if mask.selected(row) {
+                    *count += 1;
+                }
             }
+            Ok(())
+        }
+        NativeFilteredAggregateState::Count(count) => match input {
+            NativeFilteredBatchInput::I64Array(values) => {
+                for row in 0..values.len() {
+                    if mask.selected(row) && values.is_valid(row) {
+                        *count += 1;
+                    }
+                }
+                Ok(())
+            }
+            NativeFilteredBatchInput::I32Array(values) => {
+                for row in 0..values.len() {
+                    if mask.selected(row) && values.is_valid(row) {
+                        *count += 1;
+                    }
+                }
+                Ok(())
+            }
+            _ => native_filtered_update_global_state_typed_fallback(state, spec, mask, input),
+        },
+        NativeFilteredAggregateState::SumI64 { sum, count }
+        | NativeFilteredAggregateState::AvgI64 { sum, count } => match input {
+            NativeFilteredBatchInput::I64Array(values) => {
+                if values.null_count() == 0 {
+                    for row in 0..values.len() {
+                        if mask.selected(row) {
+                            *sum = sum.saturating_add(values.value(row));
+                            *count += 1;
+                        }
+                    }
+                } else {
+                    for row in 0..values.len() {
+                        if mask.selected(row) && values.is_valid(row) {
+                            *sum = sum.saturating_add(values.value(row));
+                            *count += 1;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            NativeFilteredBatchInput::I32Array(values) => {
+                if values.null_count() == 0 {
+                    for row in 0..values.len() {
+                        if mask.selected(row) {
+                            *sum = sum.saturating_add(i64::from(values.value(row)));
+                            *count += 1;
+                        }
+                    }
+                } else {
+                    for row in 0..values.len() {
+                        if mask.selected(row) && values.is_valid(row) {
+                            *sum = sum.saturating_add(i64::from(values.value(row)));
+                            *count += 1;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            _ => native_filtered_update_global_state_typed_fallback(state, spec, mask, input),
+        },
+        NativeFilteredAggregateState::MinI64(_) | NativeFilteredAggregateState::MaxI64(_) => {
+            native_filtered_update_global_state_typed_fallback(state, spec, mask, input)
+        }
+    }
+}
+
+fn native_filtered_update_global_state_typed_fallback(
+    state: &mut NativeFilteredAggregateState,
+    spec: &NativeFilteredAggregateSpec,
+    mask: &NativeFilteredBatchMask,
+    input: &NativeFilteredBatchInput,
+) -> Result<()> {
+    for row in 0..mask.mask.len() {
+        if mask.selected(row) {
+            native_filtered_update_state_fast(state, spec, input, row)?;
         }
     }
     Ok(())
@@ -503,29 +720,27 @@ struct NativeFilteredBatchMask {
 }
 
 impl NativeFilteredBatchMask {
-    fn new(mask: BooleanArray) -> Self {
+    fn new_with_sparse(mask: BooleanArray, build_sparse_rows: bool) -> Self {
         let nullable = mask.null_count() > 0;
-        let (selected_count, selected_rows) =
-            if env_flag_enabled("DODAM_NATIVE_FILTERED_SPARSE_MASKS") {
-                let mut selected_rows = Vec::new();
-                for row in 0..mask.len() {
-                    let selected = if nullable {
-                        mask.is_valid(row) && mask.value(row)
-                    } else {
-                        mask.value(row)
-                    };
-                    if selected {
-                        selected_rows.push(row);
-                    }
+        let (selected_count, selected_rows) = if build_sparse_rows {
+            let mut selected_rows = Vec::new();
+            for row in 0..mask.len() {
+                let selected = if nullable {
+                    mask.is_valid(row) && mask.value(row)
+                } else {
+                    mask.value(row)
+                };
+                if selected {
+                    selected_rows.push(row);
                 }
-                let selected_count = selected_rows.len();
-                let selected_rows = (selected_count.saturating_mul(4)
-                    <= mask.len().saturating_mul(3))
+            }
+            let selected_count = selected_rows.len();
+            let selected_rows = (selected_count.saturating_mul(4) <= mask.len().saturating_mul(3))
                 .then_some(selected_rows);
-                (selected_count, selected_rows)
-            } else {
-                (mask.len(), None)
-            };
+            (selected_count, selected_rows)
+        } else {
+            (mask.len(), None)
+        };
         Self {
             mask,
             nullable,
@@ -551,9 +766,256 @@ impl NativeFilteredBatchMask {
     }
 }
 
+enum NativeFilteredDirectPredicate {
+    IsNotNull(ArrayRef),
+    I32Compare {
+        values: Int32Array,
+        op: BinaryOperator,
+        literal: i64,
+    },
+    I64Compare {
+        values: Int64Array,
+        op: BinaryOperator,
+        literal: i64,
+    },
+    Decimal128Compare {
+        values: Decimal128Array,
+        op: BinaryOperator,
+        literal: i128,
+    },
+    Utf8PrefixLike {
+        values: StringArray,
+        prefix: String,
+        negated: bool,
+    },
+}
+
+impl NativeFilteredDirectPredicate {
+    fn selected(&self, row: usize) -> bool {
+        match self {
+            Self::IsNotNull(values) => values.is_valid(row),
+            Self::I32Compare {
+                values,
+                op,
+                literal,
+            } => {
+                values.is_valid(row)
+                    && compare_optional_values(
+                        Some(i64::from(values.value(row))),
+                        op,
+                        Some(*literal),
+                    )
+                    .unwrap_or(false)
+            }
+            Self::I64Compare {
+                values,
+                op,
+                literal,
+            } => {
+                values.is_valid(row)
+                    && compare_optional_values(Some(values.value(row)), op, Some(*literal))
+                        .unwrap_or(false)
+            }
+            Self::Decimal128Compare {
+                values,
+                op,
+                literal,
+            } => {
+                values.is_valid(row)
+                    && compare_optional_values(Some(values.value(row)), op, Some(*literal))
+                        .unwrap_or(false)
+            }
+            Self::Utf8PrefixLike {
+                values,
+                prefix,
+                negated,
+            } => {
+                let matched = values.is_valid(row) && values.value(row).starts_with(prefix);
+                if *negated { !matched } else { matched }
+            }
+        }
+    }
+}
+
+fn native_filtered_batch_direct_predicates(
+    batch: &RecordBatch,
+    specs: &[NativeFilteredAggregateSpec],
+) -> Result<Option<Vec<NativeFilteredDirectPredicate>>> {
+    let mut predicates = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let Some(predicate) = native_filtered_direct_predicate(batch, &spec.condition)? else {
+            return Ok(None);
+        };
+        predicates.push(predicate);
+    }
+    Ok(Some(predicates))
+}
+
+fn native_filtered_direct_predicate(
+    batch: &RecordBatch,
+    condition: &SqlExpr,
+) -> Result<Option<NativeFilteredDirectPredicate>> {
+    match condition {
+        SqlExpr::IsNotNull(expr) => {
+            let column = sql_column_name(expr, None)?;
+            let index = output_batch_column_index(batch, &column)?;
+            Ok(Some(NativeFilteredDirectPredicate::IsNotNull(
+                batch.column(index).clone(),
+            )))
+        }
+        SqlExpr::BinaryOp { left, op, right }
+            if matches!(
+                op,
+                BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+            ) =>
+        {
+            native_filtered_direct_column_literal_compare(batch, left, op, right).or_else(|_| {
+                native_filtered_direct_column_literal_compare(
+                    batch,
+                    right,
+                    &reverse_binary_operator(op),
+                    left,
+                )
+            })
+        }
+        SqlExpr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => {
+            if *any || escape_char.is_some() {
+                return Ok(None);
+            }
+            let column = sql_column_name(expr, None)?;
+            let pattern = sql_like_pattern(pattern)?;
+            let Some(prefix) = simple_prefix_like_pattern(&pattern) else {
+                return Ok(None);
+            };
+            let index = output_batch_column_index(batch, &column)?;
+            let values = batch.column(index);
+            let Some(values) = values.as_any().downcast_ref::<StringArray>() else {
+                return Ok(None);
+            };
+            Ok(Some(NativeFilteredDirectPredicate::Utf8PrefixLike {
+                values: values.clone(),
+                prefix,
+                negated: *negated,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn native_filtered_direct_column_literal_compare(
+    batch: &RecordBatch,
+    column_expr: &SqlExpr,
+    op: &BinaryOperator,
+    literal_expr: &SqlExpr,
+) -> Result<Option<NativeFilteredDirectPredicate>> {
+    let column = sql_column_name(column_expr, None)?;
+    let literal = sql_literal_value(literal_expr)?;
+    if matches!(literal, LiteralValue::Null) {
+        return Ok(None);
+    }
+    let index = output_batch_column_index(batch, &column)?;
+    let array = batch.column(index);
+    match array.data_type() {
+        DataType::Int32 => {
+            let literal = literal_as_i64_for_type(&literal)?.ok_or_else(|| {
+                DodamError::UnsupportedSql("native filtered integer literal is NULL".to_string())
+            })?;
+            Ok(Some(NativeFilteredDirectPredicate::I32Compare {
+                values: array
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("Int32")
+                    .clone(),
+                op: op.clone(),
+                literal,
+            }))
+        }
+        DataType::Int64 => {
+            let literal = literal_as_i64_for_type(&literal)?.ok_or_else(|| {
+                DodamError::UnsupportedSql("native filtered integer literal is NULL".to_string())
+            })?;
+            Ok(Some(NativeFilteredDirectPredicate::I64Compare {
+                values: array
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64")
+                    .clone(),
+                op: op.clone(),
+                literal,
+            }))
+        }
+        DataType::Decimal128(precision, scale) => {
+            let literal = native_filtered_decimal_literal(&literal, *precision, *scale)?;
+            Ok(Some(NativeFilteredDirectPredicate::Decimal128Compare {
+                values: array
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("Decimal128")
+                    .clone(),
+                op: op.clone(),
+                literal,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn native_filtered_decimal_literal(
+    literal: &LiteralValue,
+    precision: u8,
+    scale: i8,
+) -> Result<i128> {
+    match literal {
+        LiteralValue::Int64(value) => {
+            parse_decimal_literal_to_scaled(&value.to_string(), scale, precision)
+        }
+        LiteralValue::Float64(value) => {
+            parse_decimal_literal_to_scaled(&value.to_string(), scale, precision)
+        }
+        LiteralValue::Utf8(value) => parse_decimal_literal_to_scaled(value, scale, precision),
+        value => Err(DodamError::UnsupportedSql(format!(
+            "native filtered decimal literal must be numeric or string, got {value}"
+        ))),
+    }
+}
+
+fn simple_prefix_like_pattern(pattern: &str) -> Option<String> {
+    let prefix = pattern.strip_suffix('%')?;
+    if prefix.contains('%') || prefix.contains('_') {
+        return None;
+    }
+    Some(prefix.to_string())
+}
+
 fn native_filtered_batch_masks(
     batch: &RecordBatch,
     specs: &[NativeFilteredAggregateSpec],
+) -> Result<Vec<NativeFilteredBatchMask>> {
+    native_filtered_batch_masks_impl(batch, specs, false)
+}
+
+fn native_filtered_batch_masks_sparse(
+    batch: &RecordBatch,
+    specs: &[NativeFilteredAggregateSpec],
+) -> Result<Vec<NativeFilteredBatchMask>> {
+    native_filtered_batch_masks_impl(batch, specs, true)
+}
+
+fn native_filtered_batch_masks_impl(
+    batch: &RecordBatch,
+    specs: &[NativeFilteredAggregateSpec],
+    build_sparse_rows: bool,
 ) -> Result<Vec<NativeFilteredBatchMask>> {
     let mut cache = HashMap::<String, usize>::new();
     let mut unique = Vec::<NativeFilteredBatchMask>::new();
@@ -564,11 +1026,10 @@ fn native_filtered_batch_masks(
             index
         } else {
             let index = unique.len();
-            unique.push(NativeFilteredBatchMask::new(evaluate_scalar_predicate(
-                batch,
-                &spec.condition,
-                None,
-            )?));
+            unique.push(NativeFilteredBatchMask::new_with_sparse(
+                evaluate_scalar_predicate(batch, &spec.condition, None)?,
+                build_sparse_rows,
+            ));
             cache.insert(key, index);
             index
         };
@@ -580,6 +1041,7 @@ fn native_filtered_batch_masks(
         .collect())
 }
 
+#[derive(Clone)]
 enum NativeFilteredBatchInput {
     AlwaysSome,
     NonNull,
@@ -592,10 +1054,41 @@ fn native_filtered_batch_inputs(
     batch: &RecordBatch,
     specs: &[NativeFilteredAggregateSpec],
 ) -> Result<Vec<NativeFilteredBatchInput>> {
-    specs
-        .iter()
-        .map(|spec| native_filtered_batch_input(batch, spec))
-        .collect()
+    let mut cache = HashMap::<String, usize>::new();
+    let mut unique = Vec::<NativeFilteredBatchInput>::new();
+    let mut mapping = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let key = native_filtered_input_cache_key(spec);
+        let index = if let Some(index) = cache.get(&key).copied() {
+            index
+        } else {
+            let index = unique.len();
+            unique.push(native_filtered_batch_input(batch, spec)?);
+            cache.insert(key, index);
+            index
+        };
+        mapping.push(index);
+    }
+    Ok(mapping
+        .into_iter()
+        .map(|index| unique[index].clone())
+        .collect())
+}
+
+fn native_filtered_input_cache_key(spec: &NativeFilteredAggregateSpec) -> String {
+    format!(
+        "{:?}:{}",
+        spec.input_kind,
+        scalar_expression_cache_key(&spec.input)
+    )
+}
+
+fn scalar_expression_cache_key(expr: &ScalarSqlExpression) -> String {
+    match expr {
+        ScalarSqlExpression::Column(column) => format!("column:{column}"),
+        ScalarSqlExpression::Literal(value) => format!("literal:{value:?}"),
+        _ => format!("expr:{expr:?}"),
+    }
 }
 
 fn native_filtered_batch_input(

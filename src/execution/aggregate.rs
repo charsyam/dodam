@@ -1327,6 +1327,11 @@ fn collect_two_expression_key_count_sum_groups(
     aggregates: &[AggregateExpr],
     plan: TwoExpressionKeyCountSumPlan,
 ) -> Result<AggregateMetrics> {
+    let profile = grouped_aggregate_profile_enabled();
+    let total_started = profile.then(Instant::now);
+    let mut bind_nanos = 0_u64;
+    let mut update_nanos = 0_u64;
+    let mut finish_nanos = 0_u64;
     let mut metrics = AggregateMetrics {
         fragments,
         ..AggregateMetrics::default()
@@ -1350,12 +1355,17 @@ fn collect_two_expression_key_count_sum_groups(
         }
         metrics.batches += 1;
         metrics.rows += batch.num_rows();
+        let bind_started = profile.then(Instant::now);
         let lower_column = batch.column(column_index(&batch, &plan.lower_column)?);
         let add_column = batch.column(column_index(&batch, &plan.add_column)?);
         let sum_column = batch.column(column_index(&batch, &plan.sum_column)?);
         let sum_input = CountSumValueInput::new(sum_column, &aggregates[1])?;
         let lower_reader = LowerCoalesceUtf8Reader::new(lower_column, &plan.lower_fallback)?;
         let add_reader = Int64AddLiteralReader::new(add_column, plan.add_value)?;
+        if let Some(started) = bind_started {
+            bind_nanos += started.elapsed().as_nanos() as u64;
+        }
+        let update_started = profile.then(Instant::now);
         if plan.lower_first {
             if let Some(dictionary_len) = lower_reader.dictionary_len() {
                 let cache =
@@ -1373,6 +1383,23 @@ fn collect_two_expression_key_count_sum_groups(
         ) && add_values.null_count() == 0
         {
             let add_values = add_values.values();
+            if let Some((values, fallback)) = lower_reader.utf8_values()
+                && update_two_expression_utf8_int_dense(
+                    values,
+                    fallback,
+                    add_values,
+                    *add_value,
+                    sum_values,
+                    &mut index,
+                    &mut groups,
+                    &sum_input,
+                )?
+            {
+                if let Some(started) = update_started {
+                    update_nanos += started.elapsed().as_nanos() as u64;
+                }
+                continue;
+            }
             if let Some(dictionary_len) = lower_reader.dictionary_len()
                 && dictionary_dense_group_cache.reset_for_batch(
                     dictionary_len,
@@ -1397,6 +1424,9 @@ fn collect_two_expression_key_count_sum_groups(
                         dictionary_dense_group_cache.store(dictionary_id, add_key, group_id);
                     }
                     groups[group_id].update_i64_non_null(sum_values[row]);
+                }
+                if let Some(started) = update_started {
+                    update_nanos += started.elapsed().as_nanos() as u64;
                 }
                 continue;
             }
@@ -1452,13 +1482,32 @@ fn collect_two_expression_key_count_sum_groups(
                 groups[group_id].update(&sum_input, row);
             }
         }
+        if let Some(started) = update_started {
+            update_nanos += started.elapsed().as_nanos() as u64;
+        }
     }
+    let finish_started = profile.then(Instant::now);
     let mut group_results = groups
         .into_iter()
         .map(|group| group.finish(aggregates[0].clone(), aggregates[1].clone()))
         .collect::<Vec<_>>();
     group_results.sort_by(|left, right| compare_group_keys(&left.keys, &right.keys));
     metrics.groups = group_results;
+    if let Some(started) = finish_started {
+        finish_nanos += started.elapsed().as_nanos() as u64;
+    }
+    if let Some(started) = total_started {
+        eprintln!(
+            "[dodam:aggregate-profile] two-expression-count-sum rows={} batches={} groups={} bind={:.3}ms update={:.3}ms finish={:.3}ms total={:.3}ms",
+            metrics.rows,
+            metrics.batches,
+            metrics.groups.len(),
+            bind_nanos as f64 / 1_000_000.0,
+            update_nanos as f64 / 1_000_000.0,
+            finish_nanos as f64 / 1_000_000.0,
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     Ok(metrics)
 }
 
@@ -1569,6 +1618,106 @@ impl<'a> LowerCoalesceUtf8Reader<'a> {
             _ => None,
         }
     }
+
+    fn utf8_values(&self) -> Option<(&'a StringArray, &'a str)> {
+        match self {
+            Self::Utf8 { values, fallback } => Some((values, fallback)),
+            Self::Dictionary { .. } => None,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_two_expression_utf8_int_dense(
+    values: &StringArray,
+    fallback: &str,
+    add_values: &[i32],
+    add_value: i64,
+    sums: &[i64],
+    index: &mut TwoKeyCountSumIndex,
+    groups: &mut Vec<TwoKeyCountSumGroup>,
+    sum_input: &CountSumValueInput<'_>,
+) -> Result<bool> {
+    if values.len() != add_values.len() || values.len() != sums.len() || values.is_empty() {
+        return Ok(false);
+    }
+    let Some(min_value) = add_values.iter().copied().min() else {
+        return Ok(false);
+    };
+    let Some(max_value) = add_values.iter().copied().max() else {
+        return Ok(false);
+    };
+    let min = i64::from(min_value).saturating_add(add_value);
+    let max = i64::from(max_value).saturating_add(add_value);
+    let Some(width) = max
+        .checked_sub(min)
+        .and_then(|value| value.checked_add(1))
+        .and_then(|value| usize::try_from(value).ok())
+    else {
+        return Ok(false);
+    };
+    if width == 0 || width > 256 {
+        return Ok(false);
+    }
+
+    if ascii_needs_lower(fallback) {
+        return Ok(false);
+    }
+
+    let mut string_ids = Vec::with_capacity(values.len());
+    let mut string_index = AggregateHashMap::<&str, usize>::default();
+    let mut strings = Vec::<&str>::new();
+    for row in 0..values.len() {
+        let key = if values.is_valid(row) {
+            values.value(row)
+        } else {
+            fallback
+        };
+        if ascii_needs_lower(key) {
+            return Ok(false);
+        }
+        let id = match string_index.entry(key) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                let id = strings.len();
+                strings.push(key);
+                entry.insert(id);
+                id
+            }
+        };
+        string_ids.push(id);
+    }
+    let Some(slots) = strings.len().checked_mul(width) else {
+        return Ok(false);
+    };
+    if slots == 0 || slots > 64 * 1024 {
+        return Ok(false);
+    }
+    let mut group_slots = vec![usize::MAX; slots];
+    for row in 0..values.len() {
+        let string_id = string_ids[row];
+        let add_key = i64::from(add_values[row]).saturating_add(add_value);
+        let offset = usize::try_from(add_key - min).map_err(|_| {
+            DodamError::UnsupportedSql("integer expression group key out of range".to_string())
+        })?;
+        let slot = string_id
+            .checked_mul(width)
+            .and_then(|slot| slot.checked_add(offset))
+            .ok_or_else(|| {
+                DodamError::UnsupportedSql("expression aggregate group slot overflow".to_string())
+            })?;
+        let group_id = if group_slots[slot] != usize::MAX {
+            group_slots[slot]
+        } else {
+            let first = Utf8KeyRef::Str(strings[string_id]);
+            let key = TwoKeyCountSumBorrowedKey::Utf8Int(first, Some(add_key));
+            let group_id = index.group_id(key, groups, sum_input)?;
+            group_slots[slot] = group_id;
+            group_id
+        };
+        groups[group_id].update_i64_non_null(sums[row]);
+    }
+    Ok(true)
 }
 
 #[derive(Default)]

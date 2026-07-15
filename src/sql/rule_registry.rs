@@ -448,7 +448,9 @@ impl SqlRule {
             | Self::CorrelatedExistsSubquery
             | Self::ExistsSubquery
             | Self::InSubquery => context.has_subquery,
-            Self::ProjectionExpression => true,
+            Self::ProjectionExpression => {
+                context.has_projection_expression || context.has_predicate_expression
+            }
         }
     }
 }
@@ -519,7 +521,8 @@ pub(super) async fn try_execute_registered_sql_rules(
     candidates.sort_by_key(|candidate| (candidate.estimated_cost, candidate.rule.cost_rank()));
     if sql_rule_profile_enabled() {
         eprintln!(
-            "[dodam:sql-rule] candidates={}",
+            "[dodam:sql-rule] logical_shape={} candidates={}",
+            context.logical_shape(),
             candidates
                 .iter()
                 .map(|candidate| format!(
@@ -576,6 +579,12 @@ struct SqlRuleContext {
     has_join: bool,
     has_subquery: bool,
     has_derived_from: bool,
+    has_projection_expression: bool,
+    has_predicate_expression: bool,
+    has_aggregate: bool,
+    has_group_by: bool,
+    has_order_by: bool,
+    has_limit: bool,
     has_tpch_like_terms: bool,
     from_table_count: usize,
     lower_sql: String,
@@ -599,17 +608,26 @@ impl SqlRuleContext {
             context.from_table_count = select.from.len();
             context.has_join = select.from.iter().any(|table| !table.joins.is_empty());
             context.has_derived_from = select.from.iter().any(table_with_derived_relation);
+            context.has_projection_expression = select_has_projection_expression(select);
+            context.has_predicate_expression = select
+                .selection
+                .as_ref()
+                .is_some_and(predicate_requires_expression_path);
+            context.has_aggregate = select_has_aggregate(select);
+            context.has_group_by =
+                matches!(&select.group_by, GroupByExpr::Expressions(exprs, _) if !exprs.is_empty());
             for table in &select.from {
                 collect_table_paths(table, &mut context.table_paths);
             }
         }
+        context.has_order_by = query.order_by.is_some();
+        context.has_limit = parse_limit(query).ok().flatten().is_some();
         Ok(context)
     }
 
     fn from_lower_sql(lower_sql: String) -> Self {
         let has_tpch_like_terms = [
             "lineitem", "orders", "customer", "supplier", "partsupp", "part", "nation", "region",
-            "l_", "o_", "c_", "s_", "ps_", "p_", "n_", "r_",
         ]
         .iter()
         .any(|term| lower_sql.contains(term));
@@ -621,6 +639,16 @@ impl SqlRuleContext {
                     || lower_sql.contains(" in (select")
                     || lower_sql.contains("(select")),
             has_derived_from: lower_sql.contains("from ("),
+            has_projection_expression: false,
+            has_predicate_expression: false,
+            has_aggregate: lower_sql.contains("count(")
+                || lower_sql.contains("sum(")
+                || lower_sql.contains("avg(")
+                || lower_sql.contains("min(")
+                || lower_sql.contains("max("),
+            has_group_by: lower_sql.contains(" group by "),
+            has_order_by: lower_sql.contains(" order by "),
+            has_limit: lower_sql.contains(" limit "),
             has_tpch_like_terms,
             from_table_count: 0,
             lower_sql,
@@ -649,13 +677,114 @@ impl SqlRuleContext {
             "derived-from" => self.has_derived_from,
             "multi-input" => self.from_table_count > 1 || self.has_join,
             "subquery" => self.has_subquery,
-            "projection-expression" => true,
+            "projection-expression" => {
+                self.has_projection_expression || self.has_predicate_expression
+            }
             _ => false,
         }
     }
 
     fn mentions_column(&self, column: &str) -> bool {
         self.lower_sql.contains(&column.to_ascii_lowercase())
+    }
+
+    fn logical_shape(&self) -> String {
+        let mut features = Vec::new();
+        if self.has_with {
+            features.push("with");
+        }
+        if self.has_derived_from {
+            features.push("derived");
+        }
+        if self.from_table_count > 1 || self.has_join {
+            features.push("multi-input");
+        }
+        if self.has_subquery {
+            features.push("subquery");
+        }
+        if self.has_projection_expression {
+            features.push("project-expr");
+        }
+        if self.has_predicate_expression {
+            features.push("predicate-expr");
+        }
+        if self.has_aggregate {
+            features.push("aggregate");
+        }
+        if self.has_group_by {
+            features.push("group-by");
+        }
+        if self.has_order_by {
+            features.push("order-by");
+        }
+        if self.has_limit {
+            features.push("limit");
+        }
+        if features.is_empty() {
+            "scan".to_string()
+        } else {
+            features.join("+")
+        }
+    }
+}
+
+fn select_has_projection_expression(select: &Select) -> bool {
+    select.projection.iter().any(|item| match item {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+            !matches!(
+                expr,
+                SqlExpr::Identifier(_)
+                    | SqlExpr::CompoundIdentifier(_)
+                    | SqlExpr::Wildcard(_)
+                    | SqlExpr::QualifiedWildcard(_, _)
+            ) && !sql_expr_is_aggregate(expr)
+        }
+        _ => false,
+    })
+}
+
+fn select_has_aggregate(select: &Select) -> bool {
+    select.projection.iter().any(|item| match item {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+            sql_expr_is_aggregate(expr)
+        }
+        _ => false,
+    })
+}
+
+fn sql_expr_is_aggregate(expr: &SqlExpr) -> bool {
+    match expr {
+        SqlExpr::Function(function) => {
+            object_name_to_string(&function.name)
+                .ok()
+                .is_some_and(|name| {
+                    matches!(
+                        name.to_ascii_lowercase().as_str(),
+                        "count" | "sum" | "avg" | "min" | "max"
+                    )
+                })
+        }
+        SqlExpr::BinaryOp { left, right, .. } => {
+            sql_expr_is_aggregate(left) || sql_expr_is_aggregate(right)
+        }
+        SqlExpr::Nested(expr)
+        | SqlExpr::UnaryOp { expr, .. }
+        | SqlExpr::Cast { expr, .. }
+        | SqlExpr::IsNull(expr)
+        | SqlExpr::IsNotNull(expr) => sql_expr_is_aggregate(expr),
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand.as_deref().is_some_and(sql_expr_is_aggregate)
+                || conditions.iter().any(|when| {
+                    sql_expr_is_aggregate(&when.condition) || sql_expr_is_aggregate(&when.result)
+                })
+                || else_result.as_deref().is_some_and(sql_expr_is_aggregate)
+        }
+        _ => false,
     }
 }
 

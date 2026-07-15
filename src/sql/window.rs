@@ -809,52 +809,34 @@ fn try_shift_column_window_values(
     };
     let index = output_batch_column_index(batch, column)?;
     let array = batch.column(index);
-    Ok(match array.data_type() {
-        DataType::Int64 => array.as_any().downcast_ref::<Int64Array>().map(|values| {
-            Arc::new(Int64Array::from(shift_primitive_array_window_values(
-                batch.num_rows(),
-                ranges,
-                window,
-                |row| (!values.is_null(row)).then(|| values.value(row)),
-            ))) as ArrayRef
-        }),
-        DataType::Int32 => array.as_any().downcast_ref::<Int32Array>().map(|values| {
-            Arc::new(Int32Array::from(shift_primitive_array_window_values(
-                batch.num_rows(),
-                ranges,
-                window,
-                |row| (!values.is_null(row)).then(|| values.value(row)),
-            ))) as ArrayRef
-        }),
-        DataType::Utf8 => array.as_any().downcast_ref::<StringArray>().map(|values| {
-            Arc::new(StringArray::from(shift_string_array_window_values(
-                batch.num_rows(),
-                ranges,
-                window,
-                values,
-            ))) as ArrayRef
-        }),
-        _ => None,
-    })
+    if !matches!(
+        array.data_type(),
+        DataType::Int32 | DataType::Int64 | DataType::Utf8
+    ) {
+        return Ok(None);
+    }
+    let indices = shift_window_take_indices(batch.num_rows(), ranges, window)?;
+    Ok(Some(arrow_select::take::take(
+        array.as_ref(),
+        &indices,
+        None,
+    )?))
 }
 
-fn shift_primitive_array_window_values<T, F>(
+fn shift_window_take_indices(
     row_count: usize,
     ranges: &[(usize, usize)],
     window: &WindowProjectionFunction,
-    value_at: F,
-) -> Vec<Option<T>>
-where
-    T: Copy,
-    F: Fn(usize) -> Option<T>,
-{
+) -> Result<UInt32Array> {
     let mut output = vec![None; row_count];
     let offset = window.offset;
     if offset == 0 {
         for (row, slot) in output.iter_mut().enumerate() {
-            *slot = value_at(row);
+            *slot = Some(u32::try_from(row).map_err(|_| {
+                DodamError::UnsupportedSql("window offset row index overflow".to_string())
+            })?);
         }
-        return output;
+        return Ok(UInt32Array::from(output));
     }
     for &(start, end) in ranges {
         if end.saturating_sub(start) <= offset {
@@ -863,55 +845,22 @@ where
         match window.function {
             WindowFunctionKind::Lag => {
                 for row in start + offset..end {
-                    output[row] = value_at(row - offset);
+                    output[row] = Some(u32::try_from(row - offset).map_err(|_| {
+                        DodamError::UnsupportedSql("window offset row index overflow".to_string())
+                    })?);
                 }
             }
             WindowFunctionKind::Lead => {
                 for row in start..end - offset {
-                    output[row] = value_at(row + offset);
+                    output[row] = Some(u32::try_from(row + offset).map_err(|_| {
+                        DodamError::UnsupportedSql("window offset row index overflow".to_string())
+                    })?);
                 }
             }
             _ => unreachable!("checked by caller"),
         }
     }
-    output
-}
-
-fn shift_string_array_window_values(
-    row_count: usize,
-    ranges: &[(usize, usize)],
-    window: &WindowProjectionFunction,
-    values: &StringArray,
-) -> Vec<Option<String>> {
-    let mut output = vec![None; row_count];
-    let offset = window.offset;
-    if offset == 0 {
-        for (row, slot) in output.iter_mut().enumerate() {
-            *slot = (!values.is_null(row)).then(|| values.value(row).to_string());
-        }
-        return output;
-    }
-    for &(start, end) in ranges {
-        if end.saturating_sub(start) <= offset {
-            continue;
-        }
-        match window.function {
-            WindowFunctionKind::Lag => {
-                for row in start + offset..end {
-                    output[row] = (!values.is_null(row - offset))
-                        .then(|| values.value(row - offset).to_string());
-                }
-            }
-            WindowFunctionKind::Lead => {
-                for row in start..end - offset {
-                    output[row] = (!values.is_null(row + offset))
-                        .then(|| values.value(row + offset).to_string());
-                }
-            }
-            _ => unreachable!("checked by caller"),
-        }
-    }
-    output
+    Ok(UInt32Array::from(output))
 }
 
 fn append_ranking_window_columns(

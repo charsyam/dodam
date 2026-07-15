@@ -97,6 +97,7 @@ use crate::vector::{
 mod expression_aggregate;
 mod join_lookup_fusion;
 mod native_filtered;
+mod projection_types;
 mod projection_utils;
 mod rule_registry;
 mod semijoin;
@@ -119,6 +120,9 @@ use join_lookup_fusion::{
 use native_filtered::{
     NativeFilteredAggregateSpec, collect_native_filtered_aggregates,
     legacy_case_filtered_aggregate_specs, native_filtered_input_kind,
+};
+use projection_types::{
+    GroupExpressionBinding, ParsedProjection, ProjectionExpression, ScalarSqlExpression,
 };
 use projection_utils::{
     add_projection_columns, projection_expressions_are_plain_columns,
@@ -44992,30 +44996,6 @@ fn is_tpch_column_prefix(prefix: &str) -> bool {
     )
 }
 
-#[derive(Debug)]
-struct ParsedProjection {
-    projection: Projection,
-    aggregates: Vec<AggregateExpr>,
-    filtered_aggregates: Vec<NativeFilteredAggregateSpec>,
-    aggregate_expressions: Vec<ProjectionExpression>,
-    aliases: Vec<(String, String)>,
-    expressions: Vec<ProjectionExpression>,
-    ordinal_targets: Vec<String>,
-    qualified_wildcards: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct ProjectionExpression {
-    output_name: String,
-    expr: ScalarSqlExpression,
-}
-
-#[derive(Debug, Clone)]
-struct GroupExpressionBinding {
-    source: String,
-    expression: ProjectionExpression,
-}
-
 fn group_by_synthetic_column(index: usize) -> String {
     format!("__dodam_group_expr_{index}")
 }
@@ -45274,60 +45254,6 @@ fn join_group_expression_bindings(
             )
         })
         .collect()
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum ScalarSqlExpression {
-    Column(String),
-    StructField {
-        column: String,
-        field: String,
-    },
-    ListIndex {
-        column: String,
-        field: Option<String>,
-        index: Box<ScalarSqlExpression>,
-    },
-    ListLength {
-        column: String,
-        field: Option<String>,
-    },
-    Literal(LiteralValue),
-    Binary {
-        left: Box<ScalarSqlExpression>,
-        op: BinaryOperator,
-        right: Box<ScalarSqlExpression>,
-    },
-    Cast {
-        expr: Box<ScalarSqlExpression>,
-        target: String,
-    },
-    Coalesce(Vec<ScalarSqlExpression>),
-    Lower(Box<ScalarSqlExpression>),
-    Upper(Box<ScalarSqlExpression>),
-    Length(Box<ScalarSqlExpression>),
-    Trim(Box<ScalarSqlExpression>),
-    Abs(Box<ScalarSqlExpression>),
-    Round(Box<ScalarSqlExpression>),
-    Floor(Box<ScalarSqlExpression>),
-    Ceil(Box<ScalarSqlExpression>),
-    Replace {
-        expr: Box<ScalarSqlExpression>,
-        from: Box<ScalarSqlExpression>,
-        to: Box<ScalarSqlExpression>,
-    },
-    Concat(Vec<ScalarSqlExpression>),
-    ExtractYear(Box<ScalarSqlExpression>),
-    Substring {
-        expr: Box<ScalarSqlExpression>,
-        start: Box<ScalarSqlExpression>,
-        length: Option<Box<ScalarSqlExpression>>,
-    },
-    Case {
-        conditions: Vec<SqlExpr>,
-        results: Vec<ScalarSqlExpression>,
-        else_result: Option<Box<ScalarSqlExpression>>,
-    },
 }
 
 fn parse_projection(
