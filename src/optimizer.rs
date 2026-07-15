@@ -195,6 +195,53 @@ pub enum LogicalPlanNode {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JoinAggregateLookupFusionCostInput {
+    pub fact_index: usize,
+    pub dimension_count: usize,
+    pub dimension_table_indices: [usize; 4],
+    pub small_group_cardinality_cap: u128,
+}
+
+pub fn estimate_join_aggregate_lookup_fusion_cost(
+    graph: &LogicalJoinGraph,
+    input: JoinAggregateLookupFusionCostInput,
+) -> u128 {
+    let Some(fact) = graph.tables.get(input.fact_index) else {
+        return u128::MAX;
+    };
+    let mut lookup_cost = 0u128;
+    let mut group_state_cost = 1u128;
+    for dimension_index in input
+        .dimension_table_indices
+        .iter()
+        .copied()
+        .take(input.dimension_count)
+    {
+        let Some(table) = graph.tables.get(dimension_index) else {
+            return u128::MAX;
+        };
+        lookup_cost =
+            lookup_cost.saturating_add(table.rows.max(1).saturating_mul(table.row_width.max(1)));
+        group_state_cost =
+            group_state_cost.saturating_mul(table.rows.clamp(1, input.small_group_cardinality_cap));
+    }
+    let fact_key_width = ((input.dimension_count as u128).saturating_add(1)).saturating_mul(8);
+    let fact_probe_cost = fact
+        .rows
+        .max(1)
+        .saturating_mul(fact_key_width)
+        .saturating_add(
+            fact.rows
+                .max(1)
+                .saturating_mul(input.dimension_count as u128)
+                .saturating_mul(8),
+        );
+    lookup_cost
+        .saturating_add(fact_probe_cost)
+        .saturating_add(group_state_cost.saturating_mul(32))
+}
+
 impl LogicalPlanNode {
     pub fn push_scan_projection_filter(self) -> Self {
         match self {
@@ -873,8 +920,9 @@ mod tests {
     };
 
     use super::{
-        ColumnRangeStats, LogicalJoinEdge, LogicalJoinGraph, LogicalJoinPlanTree,
-        LogicalJoinTableStats, LogicalPlanNode, plan_join_inputs,
+        ColumnRangeStats, JoinAggregateLookupFusionCostInput, LogicalJoinEdge, LogicalJoinGraph,
+        LogicalJoinPlanTree, LogicalJoinTableStats, LogicalPlanNode,
+        estimate_join_aggregate_lookup_fusion_cost, plan_join_inputs,
     };
 
     fn table_stats(rows: u128, row_width: u128, keys: &[(&str, u128)]) -> LogicalJoinTableStats {
@@ -1286,5 +1334,54 @@ mod tests {
                 })),
             )))
         );
+    }
+
+    #[test]
+    fn lookup_fusion_cost_caps_dimension_group_state() {
+        let graph = LogicalJoinGraph {
+            tables: vec![
+                LogicalJoinTableStats {
+                    base_rows: 600_000,
+                    rows: 600_000,
+                    row_width: 16,
+                    key_ndv: HashMap::new(),
+                    column_ranges: HashMap::new(),
+                },
+                LogicalJoinTableStats {
+                    base_rows: 1_000,
+                    rows: 1_000,
+                    row_width: 16,
+                    key_ndv: HashMap::new(),
+                    column_ranges: HashMap::new(),
+                },
+                LogicalJoinTableStats {
+                    base_rows: 1_000,
+                    rows: 1_000,
+                    row_width: 16,
+                    key_ndv: HashMap::new(),
+                    column_ranges: HashMap::new(),
+                },
+                LogicalJoinTableStats {
+                    base_rows: 1_000,
+                    rows: 1_000,
+                    row_width: 16,
+                    key_ndv: HashMap::new(),
+                    column_ranges: HashMap::new(),
+                },
+            ],
+            edges: Vec::new(),
+        };
+
+        let cost = estimate_join_aggregate_lookup_fusion_cost(
+            &graph,
+            JoinAggregateLookupFusionCostInput {
+                fact_index: 0,
+                dimension_count: 3,
+                dimension_table_indices: [1, 2, 3, usize::MAX],
+                small_group_cardinality_cap: 64,
+            },
+        );
+
+        assert!(cost < 100_000_000, "cost was {cost}");
     }
 }

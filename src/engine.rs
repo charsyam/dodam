@@ -52,12 +52,15 @@ use crate::storage::{
     plan_parquet_scan_tasks, read_parquet_file_statistics, read_parquet_i64_column_constant,
     read_parquet_i64_column_max, read_parquet_i128_column_min_max,
     read_parquet_i128_column_min_max_relaxed, read_parquet_primitive_column_min_max_by_row_group,
-    read_parquet_projection_compressed_bytes,
+    read_parquet_projection_compressed_bytes, scan_parquet_i32_byte_array_columns_with_store,
+    scan_parquet_i32_byte_array_selected_by_i32_with_store,
+    scan_parquet_i32_dictionary_id_columns_with_store, scan_parquet_i32_i32_columns_with_store,
     scan_parquet_i32_i32_dictionary_i64_decimal_selected_typed_with_store,
     scan_parquet_i32_i64_byte_array_columns_with_store,
     scan_parquet_i32_i64_decimal_i32_selected_typed_with_store,
     scan_parquet_i32_i64_decimal_i32_selected_with_store,
     scan_parquet_i32_i64_dictionary_id_columns_with_store,
+    scan_parquet_i32_selected_by_byte_array_prefix_with_store,
     scan_parquet_i64_byte_array_payload_columns_with_store,
     scan_parquet_i64_byte_array_selected_by_i32x3_dictionary_with_store,
     scan_parquet_i64_dictionary_i32x3_columns_with_store,
@@ -1824,6 +1827,125 @@ impl DodamEngine {
         )
     }
 
+    pub(crate) fn scan_parquet_i32_byte_array_columns<F>(
+        &self,
+        path: impl AsRef<Path>,
+        batch_size: usize,
+        row_groups: &[usize],
+        columns: [&str; 2],
+        consume: F,
+    ) -> Result<Option<DirectColumnScanMetrics>>
+    where
+        F: FnMut(&[i32], &[i16], &[parquet::data_type::ByteArray]) -> Result<Option<()>>,
+    {
+        let path = path.as_ref();
+        let metrics = scan_parquet_i32_byte_array_columns_with_store(
+            path,
+            batch_size,
+            row_groups,
+            columns,
+            self.file_cache.clone(),
+            self.object_store.as_ref(),
+            consume,
+        )?;
+        if let Some(metrics) = metrics.as_ref() {
+            log_direct_column_scan_profile(path, &columns, "i32-bytearray", metrics);
+        }
+        Ok(metrics)
+    }
+
+    pub(crate) fn scan_parquet_i32_i32_columns<F>(
+        &self,
+        path: impl AsRef<Path>,
+        batch_size: usize,
+        row_groups: &[usize],
+        columns: [&str; 2],
+        consume: F,
+    ) -> Result<Option<DirectColumnScanMetrics>>
+    where
+        F: FnMut(&[i32], Option<&[i16]>, &[i32], Option<&[i16]>) -> Result<Option<()>>,
+    {
+        let path = path.as_ref();
+        let metrics = scan_parquet_i32_i32_columns_with_store(
+            path,
+            batch_size,
+            row_groups,
+            columns,
+            self.file_cache.clone(),
+            self.object_store.as_ref(),
+            consume,
+        )?;
+        if let Some(metrics) = metrics.as_ref() {
+            log_direct_column_scan_profile(path, &columns, "i32-i32", metrics);
+        }
+        Ok(metrics)
+    }
+
+    pub(crate) fn scan_parquet_i32_byte_array_selected_by_i32<P, F>(
+        &self,
+        path: impl AsRef<Path>,
+        row_groups: &[usize],
+        columns: [&str; 2],
+        predicate: P,
+        consume: F,
+    ) -> Result<Option<DirectColumnScanMetrics>>
+    where
+        P: Fn(i32) -> bool,
+        F: FnMut(&[i32], &[i32], &[bytes::Bytes]) -> Result<Option<()>>,
+    {
+        let path = path.as_ref();
+        let metrics = scan_parquet_i32_byte_array_selected_by_i32_with_store(
+            path,
+            row_groups,
+            columns,
+            self.file_cache.clone(),
+            self.object_store.as_ref(),
+            predicate,
+            consume,
+        )?;
+        if let Some(metrics) = metrics.as_ref() {
+            log_direct_column_scan_profile(
+                path,
+                &columns,
+                "i32-bytearray-selected-by-i32",
+                metrics,
+            );
+        }
+        Ok(metrics)
+    }
+
+    pub(crate) fn scan_parquet_i32_selected_by_byte_array_prefix<F>(
+        &self,
+        path: impl AsRef<Path>,
+        row_groups: &[usize],
+        columns: [&str; 2],
+        prefix: &[u8],
+        consume: F,
+    ) -> Result<Option<DirectColumnScanMetrics>>
+    where
+        F: FnMut(&[i32], &[i32], &[bytes::Bytes]) -> Result<Option<()>>,
+    {
+        let path = path.as_ref();
+        let metrics = scan_parquet_i32_selected_by_byte_array_prefix_with_store(
+            path,
+            row_groups,
+            columns,
+            prefix,
+            self.file_cache.clone(),
+            self.object_store.as_ref(),
+            consume,
+        )?;
+        if let Some(metrics) = metrics.as_ref() {
+            log_direct_column_scan_profile(
+                path,
+                &columns,
+                "i32-selected-by-bytearray-prefix",
+                metrics,
+            );
+        }
+        Ok(metrics)
+    }
+
     pub(crate) fn scan_parquet_i32_i64_dictionary_id_columns<F>(
         &self,
         path: &Path,
@@ -1847,10 +1969,45 @@ impl DodamEngine {
         )?;
         if let Some(metrics) = metrics {
             let planning_nanos = elapsed_nanos(planning_start.elapsed());
-            return Ok(Some(DirectColumnScanMetrics {
+            let metrics = DirectColumnScanMetrics {
                 read_nanos: metrics.read_nanos.saturating_add(planning_nanos),
                 ..metrics
-            }));
+            };
+            log_direct_column_scan_profile(path, &columns, "i32-dictionary-id", &metrics);
+            return Ok(Some(metrics));
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn scan_parquet_i32_dictionary_id_columns<F>(
+        &self,
+        path: &Path,
+        batch_size: usize,
+        row_groups: &[usize],
+        columns: [&str; 2],
+        consume: F,
+    ) -> Result<Option<DirectColumnScanMetrics>>
+    where
+        F: FnMut(&[i32], Option<&[i16]>, &[i32], &[bytes::Bytes]) -> Result<Option<()>>,
+    {
+        let planning_start = Instant::now();
+        let metrics = scan_parquet_i32_dictionary_id_columns_with_store(
+            path,
+            batch_size,
+            row_groups,
+            columns,
+            self.file_cache.clone(),
+            self.object_store.as_ref(),
+            consume,
+        )?;
+        if let Some(metrics) = metrics {
+            let planning_nanos = elapsed_nanos(planning_start.elapsed());
+            let metrics = DirectColumnScanMetrics {
+                read_nanos: metrics.read_nanos.saturating_add(planning_nanos),
+                ..metrics
+            };
+            log_direct_column_scan_profile(path, &columns, "i32-dictionary-id", &metrics);
+            return Ok(Some(metrics));
         }
         Ok(None)
     }
@@ -2586,6 +2743,35 @@ impl DodamEngine {
             estimated_bytes,
             operators: vec![ScanOperator::Scan],
             preserve_order: false,
+        };
+        self.execute_scan_plan(plan)
+    }
+
+    pub async fn scan_parquet_batches_row_filtered_preserve_order(
+        &self,
+        path: PathBuf,
+        batch_size: usize,
+        projection: Projection,
+        predicates: Vec<Expr>,
+    ) -> Result<SendableBatchStream> {
+        let source = self.plan_table_source(path).await?;
+        let estimated_bytes = source.statistics.compressed_bytes;
+        let plan = ScanPlan {
+            source,
+            batch_size,
+            limit: None,
+            output_projection: projection.clone(),
+            scan_projection: projection,
+            filter: None,
+            residual_filter: None,
+            pushdown_predicates: predicates.clone(),
+            row_filter_predicates: predicates,
+            has_filter: true,
+            distinct: false,
+            order_by: None,
+            estimated_bytes,
+            operators: vec![ScanOperator::Scan],
+            preserve_order: true,
         };
         self.execute_scan_plan(plan)
     }
@@ -7277,6 +7463,30 @@ fn log_direct_i64_byte_array_selected_by_i32x3_dictionary_profile(
         metrics.selected_rows,
         selected_ratio,
         metrics.selected_runs,
+    );
+}
+
+fn log_direct_column_scan_profile(
+    path: &Path,
+    columns: &[&str],
+    label: &str,
+    metrics: &DirectColumnScanMetrics,
+) {
+    if !direct_primitive_profile_enabled() {
+        return;
+    }
+    let table = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("scan");
+    let columns = columns.join(",");
+    eprintln!(
+        "[dodam:direct-column-profile] kind={label} {table}[{columns}]: row_groups={} rows={} batches={} read={:.3} ms consume={:.3} ms",
+        metrics.row_groups,
+        metrics.rows,
+        metrics.batches,
+        nanos_to_millis(metrics.read_nanos),
+        nanos_to_millis(metrics.consume_nanos),
     );
 }
 

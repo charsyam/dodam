@@ -226,6 +226,32 @@ async fn duckdb_differential_aggregate_matrix() {
 
     assert_same_as_duckdb(
         &format!(
+            "SELECT key, count(*), sum(value) FROM '{}' GROUP BY ALL ORDER BY key NULLS FIRST",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT key, count(*), sum(value) FROM read_parquet('{}') GROUP BY ALL ORDER BY key NULLS FIRST",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT lower(payload) AS bucket, key + 1 AS key_plus_one, count(*) FROM '{}' GROUP BY ALL ORDER BY bucket, key_plus_one",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT lower(payload) AS bucket, key + 1 AS key_plus_one, count(*) FROM read_parquet('{}') GROUP BY ALL ORDER BY bucket, key_plus_one",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
             "SELECT CASE WHEN key IS NULL THEN 'missing' ELSE 'present' END AS key_state, count(*), sum(value) AS total_value FROM '{}' GROUP BY CASE WHEN key IS NULL THEN 'missing' ELSE 'present' END HAVING total_value > 0 ORDER BY 1",
             facts_path.display()
         ),
@@ -322,6 +348,58 @@ async fn duckdb_differential_aggregate_matrix() {
         ),
         &format!(
             "SELECT id, key, dense_rank() OVER (PARTITION BY key ORDER BY value) AS drnk FROM read_parquet('{}') ORDER BY key NULLS FIRST, id",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, key, lag(value) OVER (PARTITION BY key ORDER BY id) AS prev_value, lead(payload, 2) OVER (PARTITION BY key ORDER BY id) AS next_payload FROM '{}' ORDER BY key NULLS FIRST, id",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id, key, lag(value) OVER (PARTITION BY key ORDER BY id) AS prev_value, lead(payload, 2) OVER (PARTITION BY key ORDER BY id) AS next_payload FROM read_parquet('{}') ORDER BY key NULLS FIRST, id",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, key, lag(payload) OVER (PARTITION BY key ORDER BY id) AS prev_payload, lead(value) OVER (PARTITION BY key ORDER BY id) AS next_value FROM '{}' ORDER BY key NULLS FIRST, id",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id, key, lag(payload) OVER (PARTITION BY key ORDER BY id) AS prev_payload, lead(value) OVER (PARTITION BY key ORDER BY id) AS next_value FROM read_parquet('{}') ORDER BY key NULLS FIRST, id",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "WITH grouped AS (SELECT key, count(*) AS row_count, sum(value) AS total_value FROM '{}' GROUP BY key) SELECT key, row_count, total_value FROM grouped WHERE row_count >= 1 ORDER BY key",
+            facts_path.display()
+        ),
+        &format!(
+            "WITH grouped AS (SELECT key, count(*) AS row_count, sum(value) AS total_value FROM read_parquet('{}') GROUP BY key) SELECT key, row_count, total_value FROM grouped WHERE row_count >= 1 ORDER BY key",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT CASE key WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END AS key_class, count(*) AS rows FROM '{}' GROUP BY CASE key WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END HAVING rows > 0 ORDER BY key_class",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT CASE key WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END AS key_class, count(*) AS rows FROM read_parquet('{}') GROUP BY CASE key WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END HAVING rows > 0 ORDER BY key_class",
             facts_path.display()
         ),
         tempdir.path(),
@@ -588,6 +666,36 @@ async fn duckdb_differential_join_matrix() {
 
     assert_same_as_duckdb(
         &format!(
+            "SELECT f.id, d.name FROM '{}' f JOIN '{}' d ON f.key = d.key WHERE CASE d.name WHEN 'two' THEN 1 ELSE 0 END = 1 ORDER BY f.id",
+            facts_path.display(),
+            dim_path.display()
+        ),
+        &format!(
+            "SELECT f.id, d.name FROM read_parquet('{}') f JOIN read_parquet('{}') d ON f.key = d.key WHERE CASE d.name WHEN 'two' THEN 1 ELSE 0 END = 1 ORDER BY f.id",
+            facts_path.display(),
+            dim_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT COALESCE(d.name, 'missing') AS dim_name, f.key + 1 AS key_plus_one, count(*) FROM '{}' f LEFT JOIN '{}' d ON f.key = d.key GROUP BY ALL ORDER BY dim_name, key_plus_one",
+            facts_path.display(),
+            dim_path.display()
+        ),
+        &format!(
+            "SELECT COALESCE(d.name, 'missing') AS dim_name, f.key + 1 AS key_plus_one, count(*) FROM read_parquet('{}') f LEFT JOIN read_parquet('{}') d ON f.key = d.key GROUP BY ALL ORDER BY dim_name, key_plus_one",
+            facts_path.display(),
+            dim_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
             "SELECT DISTINCT f.key, d.name FROM '{}' f JOIN '{}' d ON f.key = d.key ORDER BY f.key, d.name",
             facts_path.display(),
             dim_path.display()
@@ -610,6 +718,23 @@ async fn duckdb_differential_join_matrix() {
         &format!(
             "SELECT DISTINCT f.key FROM read_parquet('{}') f JOIN read_parquet('{}') d ON f.key = d.key ORDER BY f.key NULLS LAST LIMIT 2 OFFSET 1",
             facts_path.display(),
+            dim_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT d.name AS key_name, d2.name AS id_name, count(*), sum(f.value) FROM '{}' f JOIN '{}' d ON f.key = d.key JOIN '{}' d2 ON f.id = d2.key GROUP BY d.name, d2.name ORDER BY key_name, id_name",
+            facts_path.display(),
+            dim_path.display(),
+            dim_path.display()
+        ),
+        &format!(
+            "SELECT d.name AS key_name, d2.name AS id_name, count(*), sum(f.value) FROM read_parquet('{}') f JOIN read_parquet('{}') d ON f.key = d.key JOIN read_parquet('{}') d2 ON f.id = d2.key GROUP BY d.name, d2.name ORDER BY key_name, id_name",
+            facts_path.display(),
+            dim_path.display(),
             dim_path.display()
         ),
         tempdir.path(),
@@ -805,6 +930,21 @@ async fn duckdb_differential_union_all() {
         ),
         &format!(
             "SELECT key AS value FROM read_parquet('{}') WHERE id <= 5 INTERSECT DISTINCT SELECT key AS value FROM read_parquet('{}') WHERE id >= 2 ORDER BY value",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT CASE key WHEN 1 THEN 'one' ELSE 'other' END AS value FROM '{}' WHERE id <= 5 EXCEPT DISTINCT SELECT CASE key WHEN 1 THEN 'one' ELSE 'other' END AS value FROM '{}' WHERE id >= 2 ORDER BY value",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT CASE key WHEN 1 THEN 'one' ELSE 'other' END AS value FROM read_parquet('{}') WHERE id <= 5 EXCEPT DISTINCT SELECT CASE key WHEN 1 THEN 'one' ELSE 'other' END AS value FROM read_parquet('{}') WHERE id >= 2 ORDER BY value",
             facts_path.display(),
             facts_path.display()
         ),
@@ -1554,7 +1694,11 @@ async fn duckdb_differential_in_subquery() {
     };
     let tempdir = tempfile::tempdir().expect("tempdir");
     let facts_path = tempdir.path().join("facts.parquet");
+    let duplicate_path = tempdir.path().join("duplicate_pairs.parquet");
+    let dense_edge_path = tempdir.path().join("dense_pair_edges.parquet");
     write_facts_parquet(&facts_path);
+    write_duplicate_pairs_parquet(&duplicate_path);
+    write_dense_pair_edges_parquet(&dense_edge_path);
 
     assert_same_as_duckdb(
         &format!(
@@ -1656,6 +1800,126 @@ async fn duckdb_differential_in_subquery() {
             "SELECT id, payload FROM read_parquet('{}') WHERE payload = (SELECT payload FROM read_parquet('{}') WHERE id = 3) ORDER BY id",
             facts_path.display(),
             facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id FROM '{}' WHERE key IN (SELECT key FROM (SELECT key FROM '{}' WHERE key IS NOT NULL) AS keys) ORDER BY id",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id FROM read_parquet('{}') WHERE key IN (SELECT key FROM (SELECT key FROM read_parquet('{}') WHERE key IS NOT NULL) AS keys) ORDER BY id",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, key, payload FROM '{}' WHERE (id, key) IN (SELECT id, key FROM '{}' WHERE key >= 2 AND key IS NOT NULL) ORDER BY id",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id, key, payload FROM read_parquet('{}') WHERE (id, key) IN (SELECT id, key FROM read_parquet('{}') WHERE key >= 2 AND key IS NOT NULL) ORDER BY id",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, key, flag FROM '{}' WHERE (id, key) IN (SELECT id, key FROM '{}' WHERE key >= 2) ORDER BY id, key, flag",
+            duplicate_path.display(),
+            duplicate_path.display()
+        ),
+        &format!(
+            "SELECT id, key, flag FROM read_parquet('{}') WHERE (id, key) IN (SELECT id, key FROM read_parquet('{}') WHERE key >= 2) ORDER BY id, key, flag",
+            duplicate_path.display(),
+            duplicate_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, key, flag FROM '{}' WHERE (id, key) IN (SELECT id, key FROM '{}' WHERE flag = true) ORDER BY id, key, flag",
+            duplicate_path.display(),
+            duplicate_path.display()
+        ),
+        &format!(
+            "SELECT id, key, flag FROM read_parquet('{}') WHERE (id, key) IN (SELECT id, key FROM read_parquet('{}') WHERE flag = true) ORDER BY id, key, flag",
+            duplicate_path.display(),
+            duplicate_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, key, flag FROM '{}' WHERE (id, key) NOT IN (SELECT id, key FROM '{}' WHERE key < 2) ORDER BY id, key, flag",
+            duplicate_path.display(),
+            duplicate_path.display()
+        ),
+        &format!(
+            "SELECT id, key, flag FROM read_parquet('{}') WHERE (id, key) NOT IN (SELECT id, key FROM read_parquet('{}') WHERE key < 2) ORDER BY id, key, flag",
+            duplicate_path.display(),
+            duplicate_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, payload FROM '{}' WHERE payload IS NOT NULL AND (id, payload) IN (SELECT id, payload FROM '{}' WHERE payload LIKE 'f') ORDER BY id, payload",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id, payload FROM read_parquet('{}') WHERE payload IS NOT NULL AND (id, payload) IN (SELECT id, payload FROM read_parquet('{}') WHERE payload LIKE 'f') ORDER BY id, payload",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, key, tag FROM '{}' WHERE (id, key) IN (SELECT id, key FROM '{}' WHERE key IS NOT NULL AND key >= 2) ORDER BY id, key, tag",
+            dense_edge_path.display(),
+            dense_edge_path.display()
+        ),
+        &format!(
+            "SELECT id, key, tag FROM read_parquet('{}') WHERE (id, key) IN (SELECT id, key FROM read_parquet('{}') WHERE key IS NOT NULL AND key >= 2) ORDER BY id, key, tag",
+            dense_edge_path.display(),
+            dense_edge_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, key, tag FROM '{}' WHERE (id, key) IN (SELECT id, key FROM '{}' WHERE id >= -2 AND key IS NOT NULL) ORDER BY id, key, tag",
+            dense_edge_path.display(),
+            dense_edge_path.display()
+        ),
+        &format!(
+            "SELECT id, key, tag FROM read_parquet('{}') WHERE (id, key) IN (SELECT id, key FROM read_parquet('{}') WHERE id >= -2 AND key IS NOT NULL) ORDER BY id, key, tag",
+            dense_edge_path.display(),
+            dense_edge_path.display()
         ),
         tempdir.path(),
     )
@@ -2088,6 +2352,104 @@ async fn duckdb_differential_seeded_randomized_join_smoke() {
 }
 
 #[tokio::test]
+async fn duckdb_differential_seeded_randomized_filtered_aggregate_smoke() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let facts_path = tempdir.path().join("facts.parquet");
+    write_facts_parquet(&facts_path);
+
+    const SEED: u64 = 0xD0DA_2026_0003;
+    let mut rng = TestRng::new(SEED);
+    let cases = (0..48)
+        .map(|case_id| random_filtered_aggregate_query(&mut rng, &facts_path, case_id))
+        .collect::<Vec<_>>();
+
+    for case in cases {
+        assert_same_as_duckdb_case(
+            &format!("filtered_aggregate seed={SEED:#x} case={}", case.case_id),
+            &case.dodam_sql,
+            &case.duckdb_sql,
+            tempdir.path(),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn duckdb_differential_generic_performance_shapes() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let facts_path = tempdir.path().join("facts.parquet");
+    let dim_path = tempdir.path().join("dim.parquet");
+    write_facts_parquet(&facts_path);
+    write_dim_parquet(&dim_path);
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT lower(coalesce(payload, 'missing')) AS payload_class, key + 1 AS key_plus_one, count(*) AS rows, sum(value) AS total_value FROM '{}' GROUP BY ALL ORDER BY payload_class, key_plus_one",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT lower(coalesce(payload, 'missing')) AS payload_class, key + 1 AS key_plus_one, count(*) AS rows, sum(value) AS total_value FROM read_parquet('{}') GROUP BY ALL ORDER BY payload_class, key_plus_one",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT key, count(*) FILTER (WHERE value >= 20) AS high_rows, sum(value) FILTER (WHERE payload LIKE 'payload-%') AS payload_sum, avg(value) FILTER (WHERE key IS NOT NULL) AS keyed_avg FROM '{}' GROUP BY key ORDER BY key NULLS FIRST",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT key, count(*) FILTER (WHERE value >= 20) AS high_rows, sum(value) FILTER (WHERE payload LIKE 'payload-%') AS payload_sum, avg(value) FILTER (WHERE key IS NOT NULL) AS keyed_avg FROM read_parquet('{}') GROUP BY key ORDER BY key NULLS FIRST",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT id, key, payload FROM '{}' WHERE key IS NOT NULL AND (id, key) IN (SELECT id, key FROM '{}' WHERE key >= 1 AND key IS NOT NULL) ORDER BY id",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT id, key, payload FROM read_parquet('{}') WHERE key IS NOT NULL AND (id, key) IN (SELECT id, key FROM read_parquet('{}') WHERE key >= 1 AND key IS NOT NULL) ORDER BY id",
+            facts_path.display(),
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT d.name, d2.name AS key_name, d3.name AS bucket_name, count(*), sum(f.value) FROM '{}' f, '{}' d, '{}' d2, '{}' d3 WHERE f.key = d.key AND f.key = d2.key AND f.key = d3.key GROUP BY d.name, d2.name, d3.name ORDER BY d.name, key_name, bucket_name",
+            facts_path.display(),
+            dim_path.display(),
+            dim_path.display(),
+            dim_path.display()
+        ),
+        &format!(
+            "SELECT d.name, d2.name AS key_name, d3.name AS bucket_name, count(*), sum(f.value) FROM read_parquet('{}') f, read_parquet('{}') d, read_parquet('{}') d2, read_parquet('{}') d3 WHERE f.key = d.key AND f.key = d2.key AND f.key = d3.key GROUP BY d.name, d2.name, d3.name ORDER BY d.name, key_name, bucket_name",
+            facts_path.display(),
+            dim_path.display(),
+            dim_path.display(),
+            dim_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn duckdb_differential_error_semantics_matrix() {
     let Some(_duckdb) = DuckDbGuard::new() else {
         return;
@@ -2191,10 +2553,29 @@ async fn dodam_sql_error_contract_matrix() {
     .await;
     assert_dodam_error_contains(
         &format!(
-            "SELECT key, count(*) FROM '{}' GROUP BY ALL",
+            "SELECT id FROM '{}' WHERE id IN (SELECT id, key FROM '{}')",
+            facts_path.display(),
             facts_path.display()
         ),
-        "GROUP BY ALL",
+        "IN subquery must return exactly one column",
+    )
+    .await;
+    assert_dodam_unknown_column(
+        &format!(
+            "SELECT count(*) FROM '{}' GROUP BY missing",
+            facts_path.display()
+        ),
+        "missing",
+    )
+    .await;
+    assert_dodam_error_contains(
+        &format!("SELECT id FROM '{}' ORDER BY 99", facts_path.display()),
+        "ORDER BY position 99 is out of range",
+    )
+    .await;
+    assert_dodam_error_contains(
+        &format!("SELECT count(*) FILTER () FROM '{}'", facts_path.display()),
+        "sql parser error",
     )
     .await;
     assert_dodam_error_contains(
@@ -3435,6 +3816,56 @@ fn random_facts_query(rng: &mut TestRng, facts_path: &Path, case_id: usize) -> G
     }
 }
 
+fn random_filtered_aggregate_query(
+    rng: &mut TestRng,
+    facts_path: &Path,
+    case_id: usize,
+) -> GeneratedSql {
+    let dodam_table = format!("'{}'", facts_path.display());
+    let duckdb_table = format!("read_parquet('{}')", facts_path.display());
+    let group_by = rng.chance(2, 3);
+    let first_filter = rng.choose(&[
+        "value IS NOT NULL",
+        "value >= 20",
+        "key IS NOT NULL",
+        "key = 2",
+        "payload LIKE 'payload-%'",
+        "payload IS NULL OR value < 30",
+    ]);
+    let second_filter = rng.choose(&[
+        "value < 40",
+        "key IN (1, 3)",
+        "key NOT IN (1, NULL) OR id = 1",
+        "COALESCE(payload, 'missing') <> 'missing'",
+        "id >= 2 AND id <= 6",
+    ]);
+    let third_filter = rng.choose(&[
+        "true",
+        "key IS NULL",
+        "payload LIKE 'payload-2%'",
+        "value IS NULL OR key = 3",
+    ]);
+    let select = if group_by {
+        format!(
+            "key, count(*) FILTER (WHERE {first_filter}) AS c1, sum(value) FILTER (WHERE {second_filter}) AS s1, avg(value) FILTER (WHERE {third_filter}) AS a1, min(value) FILTER (WHERE {first_filter}) AS mn, max(value) FILTER (WHERE {second_filter}) AS mx"
+        )
+    } else {
+        format!(
+            "count(*) FILTER (WHERE {first_filter}) AS c1, count(value) FILTER (WHERE {second_filter}) AS c2, sum(value) FILTER (WHERE {third_filter}) AS s1, avg(value) FILTER (WHERE {first_filter}) AS a1"
+        )
+    };
+    let suffix = if group_by {
+        " GROUP BY key ORDER BY key NULLS FIRST"
+    } else {
+        ""
+    };
+    GeneratedSql {
+        case_id,
+        dodam_sql: format!("SELECT {select} FROM {dodam_table}{suffix}"),
+        duckdb_sql: format!("SELECT {select} FROM {duckdb_table}{suffix}"),
+    }
+}
+
 fn random_facts_predicate(
     rng: &mut TestRng,
     facts_path: &Path,
@@ -3668,6 +4099,56 @@ fn write_dim_parquet(path: &Path) {
     let keys = Int32Array::from_iter_values([1, 2, 2, 4]);
     let names = StringArray::from_iter_values(["one", "two-a", "two-b", "four"]);
     write_parquet(path, schema, vec![Arc::new(keys), Arc::new(names)]);
+}
+
+fn write_duplicate_pairs_parquet(path: &Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("key", DataType::Int32, false),
+        Field::new("flag", DataType::Boolean, false),
+    ]));
+    let ids = Int32Array::from_iter_values([1, 1, 2, 2, 3, 3, 4]);
+    let keys = Int32Array::from_iter_values([1, 1, 2, 2, 2, 2, 4]);
+    let flags = BooleanArray::from(vec![false, true, false, false, false, true, false]);
+    write_parquet(
+        path,
+        schema,
+        vec![Arc::new(ids), Arc::new(keys), Arc::new(flags)],
+    );
+}
+
+fn write_dense_pair_edges_parquet(path: &Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("key", DataType::Int32, true),
+        Field::new("tag", DataType::Utf8, false),
+    ]));
+    let ids = Int32Array::from_iter_values([-3, -2, -2, -1, 0, 1, 1, 50000]);
+    let keys = Int32Array::from(vec![
+        Some(1),
+        Some(2),
+        Some(3),
+        None,
+        Some(0),
+        Some(4),
+        Some(5),
+        Some(9),
+    ]);
+    let tags = StringArray::from_iter_values([
+        "negative-out",
+        "duplicate-conflict-a",
+        "duplicate-conflict-b",
+        "null-key",
+        "zero",
+        "duplicate-conflict-c",
+        "duplicate-conflict-d",
+        "wide-range",
+    ]);
+    write_parquet(
+        path,
+        schema,
+        vec![Arc::new(ids), Arc::new(keys), Arc::new(tags)],
+    );
 }
 
 fn write_like_values_parquet(path: &Path) {

@@ -318,9 +318,74 @@ def generic_queries(data_dir: Path) -> list[GenericQuery]:
             f"SELECT bucket, count(*) FILTER (WHERE amount >= '50.00') AS high_amount_rows, count(value) FILTER (WHERE key IS NOT NULL) AS keyed_values, sum(value) FILTER (WHERE label LIKE 'label-2%') AS label_two_sum, avg(value) FILTER (WHERE amount < '25.00') AS low_amount_avg FROM read_parquet('{facts}') GROUP BY bucket ORDER BY bucket",
         ),
         GenericQuery(
+            "standard_group_by_all_expression",
+            f"SELECT lower(coalesce(label, 'missing')) AS label_class, bucket + 1 AS bucket_plus_one, count(*) AS rows, sum(value) AS total_value FROM '{facts}' GROUP BY ALL ORDER BY label_class, bucket_plus_one LIMIT 5000",
+            f"SELECT lower(coalesce(label, 'missing')) AS label_class, bucket + 1 AS bucket_plus_one, count(*) AS rows, sum(value) AS total_value FROM read_parquet('{facts}') GROUP BY ALL ORDER BY label_class, bucket_plus_one LIMIT 5000",
+        ),
+        GenericQuery(
+            "standard_having_simple_case",
+            f"SELECT CASE bucket WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END AS bucket_class, count(*) AS rows, sum(value) AS total_value FROM '{facts}' GROUP BY CASE bucket WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END HAVING rows > 0 ORDER BY bucket_class",
+            f"SELECT CASE bucket WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END AS bucket_class, count(*) AS rows, sum(value) AS total_value FROM read_parquet('{facts}') GROUP BY CASE bucket WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END HAVING rows > 0 ORDER BY bucket_class",
+        ),
+        GenericQuery(
+            "standard_nested_in_subquery",
+            f"SELECT id, key, label FROM '{facts}' WHERE key IN (SELECT key FROM (SELECT DISTINCT key FROM '{facts}' WHERE key IS NOT NULL) AS keys) ORDER BY id LIMIT 100000",
+            f"SELECT id, key, label FROM read_parquet('{facts}') WHERE key IN (SELECT key FROM (SELECT DISTINCT key FROM read_parquet('{facts}') WHERE key IS NOT NULL) AS keys) ORDER BY id LIMIT 100000",
+        ),
+        GenericQuery(
+            "standard_not_in_subquery_null_safe",
+            f"SELECT id, key, label FROM '{facts}' WHERE key NOT IN (SELECT key FROM '{facts}' WHERE key IS NOT NULL AND key < 3) ORDER BY id LIMIT 100000",
+            f"SELECT id, key, label FROM read_parquet('{facts}') WHERE key NOT IN (SELECT key FROM read_parquet('{facts}') WHERE key IS NOT NULL AND key < 3) ORDER BY id LIMIT 100000",
+        ),
+        GenericQuery(
+            "standard_tuple_in_subquery",
+            f"SELECT id, key, label FROM '{facts}' WHERE (id, key) IN (SELECT id, key FROM '{facts}' WHERE key >= 2 AND key IS NOT NULL) ORDER BY id LIMIT 100000",
+            f"SELECT id, key, label FROM read_parquet('{facts}') WHERE (id, key) IN (SELECT id, key FROM read_parquet('{facts}') WHERE key >= 2 AND key IS NOT NULL) ORDER BY id LIMIT 100000",
+        ),
+        GenericQuery(
+            "standard_tuple_in_direct_filter_equiv",
+            f"SELECT id, key, label FROM '{facts}' WHERE key >= 2 AND key IS NOT NULL ORDER BY id LIMIT 100000",
+            f"SELECT id, key, label FROM read_parquet('{facts}') WHERE key >= 2 AND key IS NOT NULL ORDER BY id LIMIT 100000",
+        ),
+        GenericQuery(
+            "standard_tuple_in_non_key_predicate",
+            f"SELECT id, key, label FROM '{facts}' WHERE (id, key) IN (SELECT id, key FROM '{facts}' WHERE label LIKE 'label-2%') ORDER BY id LIMIT 100000",
+            f"SELECT id, key, label FROM read_parquet('{facts}') WHERE (id, key) IN (SELECT id, key FROM read_parquet('{facts}') WHERE label LIKE 'label-2%') ORDER BY id LIMIT 100000",
+        ),
+        GenericQuery(
+            "standard_tuple_in_other_file",
+            f"SELECT id, key, label FROM '{facts}' WHERE (id, key) IN (SELECT id, key FROM '{facts_scrambled}' WHERE key >= 2 AND key IS NOT NULL) ORDER BY id LIMIT 100000",
+            f"SELECT id, key, label FROM read_parquet('{facts}') WHERE (id, key) IN (SELECT id, key FROM read_parquet('{facts_scrambled}') WHERE key >= 2 AND key IS NOT NULL) ORDER BY id LIMIT 100000",
+        ),
+        GenericQuery(
+            "standard_tuple_not_in_null_safe",
+            f"SELECT id, key, label FROM '{facts}' WHERE key IS NOT NULL AND (id, key) NOT IN (SELECT id, key FROM '{facts_scrambled}' WHERE key IS NOT NULL AND key < 3) ORDER BY id LIMIT 100000",
+            f"SELECT id, key, label FROM read_parquet('{facts}') WHERE key IS NOT NULL AND (id, key) NOT IN (SELECT id, key FROM read_parquet('{facts_scrambled}') WHERE key IS NOT NULL AND key < 3) ORDER BY id LIMIT 100000",
+        ),
+        GenericQuery(
+            "standard_tuple_in_mixed_key_other_file",
+            f"SELECT id, key, label FROM '{facts}' WHERE label IS NOT NULL AND (id, label) IN (SELECT id, label FROM '{facts_scrambled}' WHERE label LIKE 'label-2%') ORDER BY id LIMIT 100000",
+            f"SELECT id, key, label FROM read_parquet('{facts}') WHERE label IS NOT NULL AND (id, label) IN (SELECT id, label FROM read_parquet('{facts_scrambled}') WHERE label LIKE 'label-2%') ORDER BY id LIMIT 100000",
+        ),
+        GenericQuery(
+            "standard_direct_cte_aggregate",
+            f"WITH grouped AS (SELECT bucket, count(*) AS row_count, sum(value) AS total_value FROM '{facts}' GROUP BY bucket) SELECT bucket, row_count, total_value FROM grouped WHERE row_count >= 1 ORDER BY bucket",
+            f"WITH grouped AS (SELECT bucket, count(*) AS row_count, sum(value) AS total_value FROM read_parquet('{facts}') GROUP BY bucket) SELECT bucket, row_count, total_value FROM grouped WHERE row_count >= 1 ORDER BY bucket",
+        ),
+        GenericQuery(
+            "standard_join_simple_case_residual",
+            f"SELECT f.id, d.name FROM '{facts}' f JOIN '{dim}' d ON f.key = d.key WHERE CASE d.name WHEN 'two' THEN 1 ELSE 0 END = 1 ORDER BY f.id LIMIT 100000",
+            f"SELECT f.id, d.name FROM read_parquet('{facts}') f JOIN read_parquet('{dim}') d ON f.key = d.key WHERE CASE d.name WHEN 'two' THEN 1 ELSE 0 END = 1 ORDER BY f.id LIMIT 100000",
+        ),
+        GenericQuery(
             "window_rank_partition_order",
             f"SELECT id, bucket, value, row_number() OVER (PARTITION BY bucket ORDER BY value) AS rn, rank() OVER (PARTITION BY bucket ORDER BY value) AS rnk, dense_rank() OVER (PARTITION BY bucket ORDER BY value) AS drnk FROM '{facts}' ORDER BY bucket, value, id LIMIT 100000",
             f"SELECT id, bucket, value, row_number() OVER (PARTITION BY bucket ORDER BY value) AS rn, rank() OVER (PARTITION BY bucket ORDER BY value) AS rnk, dense_rank() OVER (PARTITION BY bucket ORDER BY value) AS drnk FROM read_parquet('{facts}') ORDER BY bucket, value, id LIMIT 100000",
+        ),
+        GenericQuery(
+            "window_lag_lead_partition_order",
+            f"SELECT id, bucket, lag(value) OVER (PARTITION BY bucket ORDER BY id) AS prev_value, lead(label, 2) OVER (PARTITION BY bucket ORDER BY id) AS next_label FROM '{facts}' ORDER BY bucket, id LIMIT 100000",
+            f"SELECT id, bucket, lag(value) OVER (PARTITION BY bucket ORDER BY id) AS prev_value, lead(label, 2) OVER (PARTITION BY bucket ORDER BY id) AS next_label FROM read_parquet('{facts}') ORDER BY bucket, id LIMIT 100000",
         ),
         GenericQuery(
             "window_aggregate_partition",
@@ -366,6 +431,11 @@ def generic_queries(data_dir: Path) -> list[GenericQuery]:
             "except_distinct_rows",
             f"SELECT bucket, value FROM '{facts}' WHERE bucket IN (1, 7) EXCEPT SELECT bucket, value FROM '{facts}' WHERE bucket IN (7, 9) ORDER BY bucket, value LIMIT 5000",
             f"SELECT bucket, value FROM read_parquet('{facts}') WHERE bucket IN (1, 7) EXCEPT SELECT bucket, value FROM read_parquet('{facts}') WHERE bucket IN (7, 9) ORDER BY bucket, value LIMIT 5000",
+        ),
+        GenericQuery(
+            "except_distinct_simple_case_rows",
+            f"SELECT CASE bucket WHEN 1 THEN 'one' ELSE 'other' END AS bucket_class FROM '{facts}' WHERE bucket IN (1, 7) EXCEPT DISTINCT SELECT CASE bucket WHEN 1 THEN 'one' ELSE 'other' END AS bucket_class FROM '{facts}' WHERE bucket IN (7, 9) ORDER BY bucket_class",
+            f"SELECT CASE bucket WHEN 1 THEN 'one' ELSE 'other' END AS bucket_class FROM read_parquet('{facts}') WHERE bucket IN (1, 7) EXCEPT DISTINCT SELECT CASE bucket WHEN 1 THEN 'one' ELSE 'other' END AS bucket_class FROM read_parquet('{facts}') WHERE bucket IN (7, 9) ORDER BY bucket_class",
         ),
         GenericQuery(
             "intersect_all_rows",
