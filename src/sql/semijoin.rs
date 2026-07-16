@@ -905,7 +905,7 @@ fn collect_semijoin_i64_pair_filtered_limit_batches(
     left_column: &str,
     right_column: &str,
     keys: &TupleSemijoinPairSet,
-    pre_filter: Option<&FilterExpr>,
+    pre_filter: Option<FilterExpr>,
     negated: bool,
     limit: usize,
 ) -> Result<Vec<RecordBatch>> {
@@ -919,7 +919,7 @@ fn collect_semijoin_i64_pair_filtered_limit_batches(
         if batch.num_rows() == 0 {
             continue;
         }
-        if let Some(pre_filter) = pre_filter {
+        if let Some(pre_filter) = pre_filter.as_ref() {
             let mask = evaluate_filter_mask(&batch, pre_filter)?;
             batch = filter_record_batch(&batch, &mask)?;
             if batch.num_rows() == 0 {
@@ -939,6 +939,40 @@ fn collect_semijoin_i64_pair_filtered_limit_batches(
         }
     }
     Ok(output)
+}
+
+fn semijoin_pair_non_redundant_prefilter(
+    filter: Option<&FilterExpr>,
+    left_column: &str,
+    right_column: &str,
+) -> Option<FilterExpr> {
+    strip_semijoin_pair_redundant_non_null_filter(filter?.expr(), left_column, right_column)
+        .map(FilterExpr::new)
+}
+
+fn strip_semijoin_pair_redundant_non_null_filter(
+    expr: &Expr,
+    left_column: &str,
+    right_column: &str,
+) -> Option<Expr> {
+    match expr {
+        Expr::IsNull {
+            column,
+            negated: true,
+        } if column == left_column || column == right_column => None,
+        Expr::And(left, right) => {
+            let left =
+                strip_semijoin_pair_redundant_non_null_filter(left, left_column, right_column);
+            let right =
+                strip_semijoin_pair_redundant_non_null_filter(right, left_column, right_column);
+            match (left, right) {
+                (Some(left), Some(right)) => Some(Expr::And(Box::new(left), Box::new(right))),
+                (Some(expr), None) | (None, Some(expr)) => Some(expr),
+                (None, None) => None,
+            }
+        }
+        _ => Some(expr.clone()),
+    }
 }
 
 fn same_source_tuple_semijoin_transferred_filter(
@@ -2657,9 +2691,6 @@ fn semijoin_mixed_prefix_precheck_accepts(
     path: &Path,
     keys: &SemijoinMixedPrefixCandidateKeys,
 ) -> Result<bool> {
-    if std::env::var_os("DODAM_DISABLE_MIXED_TUPLE_PREFIX_PRECHECK").is_some() {
-        return Ok(false);
-    }
     let total_rows = engine.parquet_total_row_count(path)?;
     if total_rows == 0 {
         return Ok(true);
@@ -2676,6 +2707,11 @@ fn semijoin_mixed_prefix_precheck_accepts(
         );
     }
     Ok(accepted)
+}
+
+fn mixed_tuple_prefix_precheck_enabled() -> bool {
+    std::env::var_os("DODAM_MIXED_TUPLE_PREFIX_PRECHECK").is_some()
+        && std::env::var_os("DODAM_DISABLE_MIXED_TUPLE_PREFIX_PRECHECK").is_none()
 }
 
 fn mixed_tuple_early_empty_max_numeric_ratio() -> f64 {
@@ -4957,7 +4993,7 @@ async fn try_execute_uncorrelated_i64_pair_in_semijoin_sql(
         return Ok(Some(QueryOutput::Scan { batches }));
     }
 
-    if std::env::var_os("DODAM_MIXED_TUPLE_PREFIX_PRECHECK").is_some()
+    if mixed_tuple_prefix_precheck_enabled()
         && !negated
         && !distinct
         && parsed_projection.aggregates.is_empty()
@@ -5121,6 +5157,11 @@ async fn try_execute_uncorrelated_i64_pair_in_semijoin_sql(
             } else {
                 outer_left.clone()
             };
+            let pre_filter = semijoin_pair_non_redundant_prefilter(
+                outer_filter.as_ref(),
+                &outer_left,
+                &outer_right,
+            );
             (
                 engine
                     .scan_parquet_batches_dictionary_columns(
@@ -5130,7 +5171,7 @@ async fn try_execute_uncorrelated_i64_pair_in_semijoin_sql(
                         vec![dictionary_column],
                     )
                     .await?,
-                outer_filter.as_ref(),
+                pre_filter,
             )
         } else {
             (
@@ -5193,6 +5234,8 @@ async fn try_execute_uncorrelated_i64_pair_in_semijoin_sql(
         } else {
             outer_left.clone()
         };
+        let pre_filter =
+            semijoin_pair_non_redundant_prefilter(outer_filter.as_ref(), &outer_left, &outer_right);
         (
             engine
                 .scan_parquet_batches_dictionary_columns(
@@ -5202,7 +5245,7 @@ async fn try_execute_uncorrelated_i64_pair_in_semijoin_sql(
                     vec![dictionary_column],
                 )
                 .await?,
-            outer_filter.as_ref(),
+            pre_filter,
         )
     } else {
         (
@@ -5220,7 +5263,7 @@ async fn try_execute_uncorrelated_i64_pair_in_semijoin_sql(
     };
     let mut filtered = Vec::new();
     for batch in collect_batches(stream)? {
-        let batch = if let Some(pre_filter) = pre_filter {
+        let batch = if let Some(pre_filter) = pre_filter.as_ref() {
             let mask = evaluate_filter_mask(&batch, pre_filter)?;
             filter_record_batch(&batch, &mask)?
         } else {

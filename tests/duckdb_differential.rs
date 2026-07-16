@@ -14,7 +14,10 @@ use dodam::copy::{CopyFileQuerySink, parse_copy_to_select};
 use dodam::engine::DodamEngine;
 use dodam::error::DodamError;
 use dodam::execution::RecordBatchSink;
-use dodam::sql::{QueryOutput, SqlSinkExecutionOptions, execute_sql, execute_sql_to_result_sink};
+use dodam::sql::{
+    QueryOutput, SqlExecutionOptions, SqlSinkExecutionOptions, execute_sql,
+    execute_sql_to_result_sink, execute_sql_with_options,
+};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -473,6 +476,29 @@ async fn duckdb_differential_aggregate_matrix() {
 }
 
 #[tokio::test]
+async fn duckdb_differential_filtered_aggregate_shared_input_cache() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let facts_path = tempdir.path().join("facts.parquet");
+    write_facts_parquet(&facts_path);
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT count(*) FILTER (WHERE payload IS NULL OR value < 30) AS c1, count(value) FILTER (WHERE value < 40) AS c2, sum(value) FILTER (WHERE value IS NULL OR key = 3) AS s1, avg(value) FILTER (WHERE payload IS NULL OR value < 30) AS a1 FROM '{}'",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT count(*) FILTER (WHERE payload IS NULL OR value < 30) AS c1, count(value) FILTER (WHERE value < 40) AS c2, sum(value) FILTER (WHERE value IS NULL OR key = 3) AS s1, avg(value) FILTER (WHERE payload IS NULL OR value < 30) AS a1 FROM read_parquet('{}')",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn duckdb_differential_join_matrix() {
     let Some(_duckdb) = DuckDbGuard::new() else {
         return;
@@ -755,6 +781,50 @@ async fn duckdb_differential_join_matrix() {
         tempdir.path(),
     )
     .await;
+}
+
+#[tokio::test]
+async fn duckdb_differential_join_low_memory_limit() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let facts_path = tempdir.path().join("facts.parquet");
+    let dim_path = tempdir.path().join("dim.parquet");
+    write_facts_parquet(&facts_path);
+    write_dim_parquet(&dim_path);
+
+    let dodam_sql = format!(
+        "SELECT f.id, f.key, d.name FROM '{}' f JOIN '{}' d ON f.key = d.key ORDER BY f.id, d.name",
+        facts_path.display(),
+        dim_path.display()
+    );
+    let duckdb_sql = format!(
+        "SELECT f.id, f.key, d.name FROM read_parquet('{}') f JOIN read_parquet('{}') d ON f.key = d.key ORDER BY f.id, d.name",
+        facts_path.display(),
+        dim_path.display()
+    );
+    let output = execute_sql_with_options(
+        &DodamEngine::default(),
+        &dodam_sql,
+        BATCH_SIZE,
+        SqlExecutionOptions {
+            join_memory_limit_bytes: Some(1),
+        },
+    )
+    .await
+    .expect("execute low-memory Dodam join");
+    let dodam_rows = match output {
+        QueryOutput::Scan { batches } | QueryOutput::Aggregate { batches, .. } => {
+            canonical_rows(&batches)
+        }
+        QueryOutput::Explain { .. } => panic!("unexpected EXPLAIN output"),
+    };
+    let duckdb_rows = run_duckdb(&duckdb_sql, tempdir.path());
+    assert_eq!(
+        dodam_rows, duckdb_rows,
+        "\nDodam SQL:\n{dodam_sql}\n\nDuckDB SQL:\n{duckdb_sql}"
+    );
 }
 
 #[tokio::test]

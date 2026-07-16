@@ -800,21 +800,14 @@ impl NativeFilteredDirectPredicate {
                 literal,
             } => {
                 values.is_valid(row)
-                    && compare_optional_values(
-                        Some(i64::from(values.value(row))),
-                        op,
-                        Some(*literal),
-                    )
-                    .unwrap_or(false)
+                    && native_filtered_compare_i64(i64::from(values.value(row)), op, *literal)
             }
             Self::I64Compare {
                 values,
                 op,
                 literal,
             } => {
-                values.is_valid(row)
-                    && compare_optional_values(Some(values.value(row)), op, Some(*literal))
-                        .unwrap_or(false)
+                values.is_valid(row) && native_filtered_compare_i64(values.value(row), op, *literal)
             }
             Self::Decimal128Compare {
                 values,
@@ -822,8 +815,7 @@ impl NativeFilteredDirectPredicate {
                 literal,
             } => {
                 values.is_valid(row)
-                    && compare_optional_values(Some(values.value(row)), op, Some(*literal))
-                        .unwrap_or(false)
+                    && native_filtered_compare_i128(values.value(row), op, *literal)
             }
             Self::Utf8PrefixLike {
                 values,
@@ -834,6 +826,30 @@ impl NativeFilteredDirectPredicate {
                 if *negated { !matched } else { matched }
             }
         }
+    }
+}
+
+fn native_filtered_compare_i64(left: i64, op: &BinaryOperator, right: i64) -> bool {
+    match op {
+        BinaryOperator::Eq => left == right,
+        BinaryOperator::NotEq => left != right,
+        BinaryOperator::Gt => left > right,
+        BinaryOperator::GtEq => left >= right,
+        BinaryOperator::Lt => left < right,
+        BinaryOperator::LtEq => left <= right,
+        _ => false,
+    }
+}
+
+fn native_filtered_compare_i128(left: i128, op: &BinaryOperator, right: i128) -> bool {
+    match op {
+        BinaryOperator::Eq => left == right,
+        BinaryOperator::NotEq => left != right,
+        BinaryOperator::Gt => left > right,
+        BinaryOperator::GtEq => left >= right,
+        BinaryOperator::Lt => left < right,
+        BinaryOperator::LtEq => left <= right,
+        _ => false,
     }
 }
 
@@ -919,8 +935,12 @@ fn native_filtered_direct_column_literal_compare(
     op: &BinaryOperator,
     literal_expr: &SqlExpr,
 ) -> Result<Option<NativeFilteredDirectPredicate>> {
-    let column = sql_column_name(column_expr, None)?;
-    let literal = sql_literal_value(literal_expr)?;
+    let Ok(column) = sql_column_name(column_expr, None) else {
+        return Ok(None);
+    };
+    let Ok(literal) = sql_literal_value(literal_expr) else {
+        return Ok(None);
+    };
     if matches!(literal, LiteralValue::Null) {
         return Ok(None);
     }
@@ -1077,10 +1097,23 @@ fn native_filtered_batch_inputs(
 
 fn native_filtered_input_cache_key(spec: &NativeFilteredAggregateSpec) -> String {
     format!(
-        "{:?}:{}",
+        "{}:{:?}:{}",
+        native_filtered_aggregate_cache_key(&spec.expr),
         spec.input_kind,
         scalar_expression_cache_key(&spec.input)
     )
+}
+
+fn native_filtered_aggregate_cache_key(expr: &AggregateExpr) -> &'static str {
+    match expr {
+        AggregateExpr::CountStar => "count_star",
+        AggregateExpr::Count(_) => "count",
+        AggregateExpr::Sum(_) => "sum",
+        AggregateExpr::Avg(_) => "avg",
+        AggregateExpr::Min(_) => "min",
+        AggregateExpr::Max(_) => "max",
+        AggregateExpr::CountDistinct(_) => "count_distinct",
+    }
 }
 
 fn scalar_expression_cache_key(expr: &ScalarSqlExpression) -> String {

@@ -188,6 +188,11 @@ pub trait SqlResultSink {
     fn write_output(&mut self, output: QueryOutput) -> Result<()>;
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SqlExecutionOptions {
+    pub join_memory_limit_bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SqlSinkExecutionOptions {
     pub allow_direct_or_streaming: bool,
@@ -271,6 +276,15 @@ pub async fn execute_sql(
     sql: &str,
     batch_size: usize,
 ) -> Result<QueryOutput> {
+    execute_sql_with_options(engine, sql, batch_size, SqlExecutionOptions::default()).await
+}
+
+pub async fn execute_sql_with_options(
+    engine: &DodamEngine,
+    sql: &str,
+    batch_size: usize,
+    options: SqlExecutionOptions,
+) -> Result<QueryOutput> {
     if let Some(plan) = explain_sql(engine, sql, batch_size).await? {
         return Ok(QueryOutput::Explain { plan });
     }
@@ -353,7 +367,7 @@ pub async fn execute_sql(
                     join.right_filter.clone(),
                 ),
                 output_projection,
-                join_memory_limit_bytes: default_join_memory_limit_bytes(),
+                join_memory_limit_bytes: join_memory_limit_bytes(options),
                 join_algorithm: JoinAlgorithm::Auto,
                 join_type: join.join_type,
             })
@@ -42533,6 +42547,13 @@ fn default_join_memory_limit_bytes() -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(128 * 1024 * 1024)
+}
+
+fn join_memory_limit_bytes(options: SqlExecutionOptions) -> u64 {
+    options
+        .join_memory_limit_bytes
+        .filter(|value| *value > 0)
+        .unwrap_or_else(default_join_memory_limit_bytes)
 }
 
 fn parse_select(query: &Query, select: &Select) -> Result<SqlQuery> {

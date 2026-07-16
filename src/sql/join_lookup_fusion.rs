@@ -387,6 +387,16 @@ fn update_join_aggregate_lookup_dense_null_free(
     groups: &mut JoinAggregateLookupCountSumGroups,
     rows: usize,
 ) {
+    if update_join_aggregate_lookup_dense_groups_direct(
+        fact_keys,
+        sum_values,
+        lookup_dense_slices,
+        lookups,
+        groups,
+        rows,
+    ) {
+        return;
+    }
     match lookups.len() {
         2 => {
             let (values0, present0) = lookup_dense_slices[0].expect("validated dense lookup");
@@ -470,6 +480,118 @@ fn update_join_aggregate_lookup_dense_null_free(
                 }
             }
         }
+    }
+}
+
+fn update_join_aggregate_lookup_dense_groups_direct(
+    fact_keys: &[I64LikeColumn<'_>],
+    sum_values: &I64LikeColumn<'_>,
+    lookup_dense_slices: &[Option<(&[usize], &[bool])>],
+    lookups: &[JoinAggregateLookupDimension],
+    groups: &mut JoinAggregateLookupCountSumGroups,
+    rows: usize,
+) -> bool {
+    match groups {
+        JoinAggregateLookupCountSumGroups::TwoDense { second_len, groups }
+            if lookups.len() == 2 =>
+        {
+            let (values0, present0) = lookup_dense_slices[0].expect("validated dense lookup");
+            let (values1, present1) = lookup_dense_slices[1].expect("validated dense lookup");
+            let second_len = *second_len;
+            for row in 0..rows {
+                let Some(first_id) = dense_usize_lookup(values0, present0, fact_keys[0].value(row))
+                else {
+                    continue;
+                };
+                let Some(second_id) =
+                    dense_usize_lookup(values1, present1, fact_keys[1].value(row))
+                else {
+                    continue;
+                };
+                let slot = first_id * second_len + second_id;
+                join_aggregate_lookup_update_group_slot(
+                    &mut groups[slot],
+                    Some(sum_values.value(row)),
+                );
+            }
+            true
+        }
+        JoinAggregateLookupCountSumGroups::ThreeDense {
+            second_len,
+            third_len,
+            groups,
+        } if lookups.len() == 3 && lookups[1].fact_key == lookups[2].fact_key => {
+            let (values0, present0) = lookup_dense_slices[0].expect("validated dense lookup");
+            let (values1, present1) = lookup_dense_slices[1].expect("validated dense lookup");
+            let (values2, present2) = lookup_dense_slices[2].expect("validated dense lookup");
+            let second_len = *second_len;
+            let third_len = *third_len;
+            for row in 0..rows {
+                let Some(first_id) = dense_usize_lookup(values0, present0, fact_keys[0].value(row))
+                else {
+                    continue;
+                };
+                let shared_key = fact_keys[1].value(row);
+                let Some(second_id) = dense_usize_lookup(values1, present1, shared_key) else {
+                    continue;
+                };
+                let Some(third_id) = dense_usize_lookup(values2, present2, shared_key) else {
+                    continue;
+                };
+                let slot = (first_id * second_len + second_id) * third_len + third_id;
+                join_aggregate_lookup_update_group_slot(
+                    &mut groups[slot],
+                    Some(sum_values.value(row)),
+                );
+            }
+            true
+        }
+        JoinAggregateLookupCountSumGroups::ThreeDense {
+            second_len,
+            third_len,
+            groups,
+        } if lookups.len() == 3 => {
+            let (values0, present0) = lookup_dense_slices[0].expect("validated dense lookup");
+            let (values1, present1) = lookup_dense_slices[1].expect("validated dense lookup");
+            let (values2, present2) = lookup_dense_slices[2].expect("validated dense lookup");
+            let second_len = *second_len;
+            let third_len = *third_len;
+            for row in 0..rows {
+                let Some(first_id) = dense_usize_lookup(values0, present0, fact_keys[0].value(row))
+                else {
+                    continue;
+                };
+                let Some(second_id) =
+                    dense_usize_lookup(values1, present1, fact_keys[1].value(row))
+                else {
+                    continue;
+                };
+                let Some(third_id) = dense_usize_lookup(values2, present2, fact_keys[2].value(row))
+                else {
+                    continue;
+                };
+                let slot = (first_id * second_len + second_id) * third_len + third_id;
+                join_aggregate_lookup_update_group_slot(
+                    &mut groups[slot],
+                    Some(sum_values.value(row)),
+                );
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+#[inline]
+fn join_aggregate_lookup_update_group_slot(
+    slot: &mut Option<JoinAggregateLookupCountSumGroup>,
+    sum: Option<i64>,
+) {
+    let group = slot.get_or_insert_with(JoinAggregateLookupCountSumGroup::default);
+    group.count = group.count.saturating_add(1);
+    if let Some(sum) = sum {
+        group.sum = group.sum.saturating_add(sum);
+        group.sum_count = group.sum_count.saturating_add(1);
     }
 }
 
