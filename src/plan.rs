@@ -192,6 +192,7 @@ pub enum DirectPrimitiveFoldMode {
         aggregates: Vec<AggregateExpr>,
         decimal_precision: u8,
         decimal_scale: i8,
+        max_decimal: bool,
         decimal_min: Option<i64>,
         decimal_max: Option<i64>,
         date_min: Option<i32>,

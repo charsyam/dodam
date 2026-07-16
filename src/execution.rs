@@ -6,8 +6,9 @@ pub mod physical;
 pub mod typed_rows;
 
 pub(crate) use aggregate::{
-    CoalesceKeyCountSumCollector, DecimalDateRangeFilter, SingleKeyCountSumBatchAccumulator,
-    SingleKeyCountSumMinMaxVectorState, SingleKeyCountSumVectorState,
+    CoalesceKeyCountSumCollector, CountSumMinMaxMaxKind, DecimalDateRangeFilter,
+    SingleKeyCountSumBatchAccumulator, SingleKeyCountSumMinMaxVectorState,
+    SingleKeyCountSumVectorState,
 };
 pub use aggregate::{
     GroupKeyExpr, GroupKeyLiteral, aggregate_metrics_to_batches, can_merge_partial_aggregates,

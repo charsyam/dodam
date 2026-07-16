@@ -38,8 +38,9 @@ use crate::execution::metrics::{
     RecordBatchSink, ScanMetrics, ScanPlanMetrics, ScanPlanMetricsCounter, SendableBatchStream,
 };
 use crate::execution::{
-    DecimalDateRangeFilter, SingleKeyCountSumMinMaxVectorState, SingleKeyCountSumVectorState,
-    aggregate_metrics_to_batches, collect_aggregates, collect_grouped_aggregates,
+    CountSumMinMaxMaxKind, DecimalDateRangeFilter, SingleKeyCountSumMinMaxVectorState,
+    SingleKeyCountSumVectorState, aggregate_metrics_to_batches, collect_aggregates,
+    collect_grouped_aggregates,
 };
 use crate::hash::{FastHashMap as JoinKeyHashMap, FastHashSet as JoinKeyHashSet};
 use crate::plan::DirectPrimitiveFoldMode;
@@ -341,12 +342,21 @@ impl DirectPrimitiveFoldExec {
                 aggregates,
                 decimal_precision,
                 decimal_scale,
+                max_decimal,
                 decimal_min,
                 decimal_max,
                 date_min,
                 date_max,
                 ..
             } => {
+                let max_kind = if max_decimal {
+                    CountSumMinMaxMaxKind::Decimal128 {
+                        precision: decimal_precision,
+                        scale: decimal_scale,
+                    }
+                } else {
+                    CountSumMinMaxMaxKind::Date32
+                };
                 let filter = DecimalDateRangeFilter {
                     decimal_min: decimal_min.map(i128::from),
                     decimal_max: decimal_max.map(i128::from),
@@ -363,17 +373,19 @@ impl DirectPrimitiveFoldExec {
                     false,
                     || match key_type.as_str() {
                         "i32" | "I32" | "int32" | "Int32" => {
-                            Ok(SingleKeyCountSumMinMaxVectorState::new_i32(
+                            Ok(SingleKeyCountSumMinMaxVectorState::new_i32_with_max_kind(
                                 aggregates.clone(),
                                 decimal_precision,
                                 decimal_scale,
+                                max_kind,
                             ))
                         }
                         "i64" | "I64" | "int64" | "Int64" => {
-                            Ok(SingleKeyCountSumMinMaxVectorState::new_i64(
+                            Ok(SingleKeyCountSumMinMaxVectorState::new_i64_with_max_kind(
                                 aggregates.clone(),
                                 decimal_precision,
                                 decimal_scale,
+                                max_kind,
                             ))
                         }
                         _ => Err(DodamError::UnsupportedSql(format!(

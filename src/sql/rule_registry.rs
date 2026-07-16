@@ -333,10 +333,11 @@ impl SqlRule {
         engine: &DodamEngine,
         sql: &str,
         batch_size: usize,
+        options: SqlExecutionOptions,
     ) -> Result<Option<QueryOutput>> {
         match self {
             Self::Tpch => tpch_rules::try_execute_tpch_rule_sql(engine, sql, batch_size).await,
-            Self::WithCte => try_execute_with_cte_sql(engine, sql, batch_size).await,
+            Self::WithCte => try_execute_with_cte_sql(engine, sql, batch_size, options).await,
             Self::PricingSummary => try_execute_pricing_summary_sql(engine, sql, batch_size).await,
             Self::ProfitByNationYear => {
                 try_execute_profit_by_nation_year_sql(engine, sql, batch_size).await
@@ -384,18 +385,23 @@ impl SqlRule {
             Self::PrefixPartSupplierThreshold => {
                 try_execute_prefix_part_supplier_threshold_sql(engine, sql, batch_size).await
             }
-            Self::DerivedJoin => try_execute_derived_join_sql(engine, sql, batch_size).await,
+            Self::DerivedJoin => {
+                try_execute_derived_join_sql(engine, sql, batch_size, options).await
+            }
             Self::DerivedLeftJoinCountDistribution => {
                 try_execute_derived_left_join_count_distribution_sql(engine, sql, batch_size).await
             }
-            Self::Derived => try_execute_derived_sql(engine, sql, batch_size).await,
+            Self::Derived => try_execute_derived_sql(engine, sql, batch_size, options).await,
             Self::CorrelatedJoinSubqueryFilter => {
-                try_execute_correlated_join_subquery_filter_sql(engine, sql, batch_size).await
+                try_execute_correlated_join_subquery_filter_sql(engine, sql, batch_size, options)
+                    .await
             }
             Self::MaterializedJoinSubquery => {
-                try_execute_materialized_join_subquery_sql(engine, sql, batch_size).await
+                try_execute_materialized_join_subquery_sql(engine, sql, batch_size, options).await
             }
-            Self::MultiCommaJoin => try_execute_multi_comma_join_sql(engine, sql, batch_size).await,
+            Self::MultiCommaJoin => {
+                try_execute_multi_comma_join_sql(engine, sql, batch_size, options).await
+            }
             Self::CorrelatedExistsSemijoin => {
                 try_execute_correlated_exists_semijoin_sql(engine, sql, batch_size).await
             }
@@ -502,6 +508,7 @@ pub(super) async fn try_execute_registered_sql_rules(
     engine: &DodamEngine,
     sql: &str,
     batch_size: usize,
+    options: SqlExecutionOptions,
 ) -> Result<Option<QueryOutput>> {
     let context = SqlRuleContext::from_sql(sql)?;
     let rules = sql_rule_registry()
@@ -537,7 +544,7 @@ pub(super) async fn try_execute_registered_sql_rules(
     }
     for candidate in candidates {
         let rule = candidate.rule;
-        let output = match rule.execute(engine, sql, batch_size).await {
+        let output = match rule.execute(engine, sql, batch_size, options).await {
             Ok(output) => output,
             Err(DodamError::UnsupportedSql(message)) if sql_rule_shape_mismatch_error(&message) => {
                 None

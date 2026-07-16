@@ -84,7 +84,7 @@ use crate::storage::{
     DirectColumnScanMetrics, DirectI64I32I32ScanMetrics, DirectOrderedPrimitiveBatch,
     DirectOrderedPrimitiveColumnValues, DirectPrimitiveColumnScanMetrics,
     DirectPrimitiveColumnSpec, DirectPrimitiveColumnType, DirectSelectedPrimitiveColumnPageView,
-    DirectSelectedPrimitivePageBatch, PrimitiveRowGroupMinMax,
+    DirectSelectedPrimitivePageBatch, PrimitiveRowGroupMinMax, read_i32_le_unchecked,
 };
 use crate::vector::{
     BatchConsumer, BatchView, Date32VectorView, Decimal128VectorView, DictionaryI32View,
@@ -302,7 +302,8 @@ pub async fn execute_sql_with_options(
     } {
         return Ok(output);
     }
-    if let Some(output) = try_execute_registered_sql_rules(engine, sql, batch_size).await? {
+    if let Some(output) = try_execute_registered_sql_rules(engine, sql, batch_size, options).await?
+    {
         return Ok(output);
     }
     let query = parse_sql(sql)?;
@@ -32948,6 +32949,7 @@ async fn try_execute_correlated_join_subquery_filter_sql(
     engine: &DodamEngine,
     sql: &str,
     batch_size: usize,
+    options: SqlExecutionOptions,
 ) -> Result<Option<QueryOutput>> {
     let dialect = GenericDialect {};
     let statements = Parser::parse_sql(&dialect, sql)
@@ -33035,7 +33037,7 @@ async fn try_execute_correlated_join_subquery_filter_sql(
             left_filter: join_plan.left_filter,
             right_filter: join_plan.right_filter,
             output_projection,
-            join_memory_limit_bytes: default_join_memory_limit_bytes(),
+            join_memory_limit_bytes: join_memory_limit_bytes(options),
             join_algorithm: JoinAlgorithm::Auto,
             join_type: JoinType::Inner,
         })
@@ -33097,6 +33099,7 @@ async fn try_execute_materialized_join_subquery_sql(
     engine: &DodamEngine,
     sql: &str,
     batch_size: usize,
+    options: SqlExecutionOptions,
 ) -> Result<Option<QueryOutput>> {
     let dialect = GenericDialect {};
     let statements = Parser::parse_sql(&dialect, sql)
@@ -33131,6 +33134,7 @@ async fn try_execute_materialized_join_subquery_sql(
             engine,
             rewritten_selection,
             batch_size,
+            options,
             &mut changed,
         ))
         .await?
@@ -33144,6 +33148,7 @@ async fn try_execute_materialized_join_subquery_sql(
             engine,
             rewritten_having,
             batch_size,
+            options,
             &mut changed,
         ))
         .await?
@@ -33155,10 +33160,11 @@ async fn try_execute_materialized_join_subquery_sql(
     if !changed {
         return Ok(None);
     }
-    Box::pin(execute_sql(
+    Box::pin(execute_sql_with_options(
         engine,
         &rewritten_query.to_string(),
         batch_size,
+        options,
     ))
     .await
     .map(Some)
@@ -33168,20 +33174,27 @@ async fn rewrite_materializable_subqueries_to_literals(
     engine: &DodamEngine,
     expr: SqlExpr,
     batch_size: usize,
+    options: SqlExecutionOptions,
     changed: &mut bool,
 ) -> Result<Option<SqlExpr>> {
     match expr {
         SqlExpr::Exists { subquery, negated } => {
-            let output =
-                match Box::pin(execute_sql(engine, &subquery.to_string(), batch_size)).await {
-                    Ok(output) => output,
-                    Err(DodamError::UnsupportedSql(_))
-                    | Err(DodamError::UnknownColumn(_))
-                    | Err(DodamError::UnknownTableQualifier(_)) => {
-                        return Ok(None);
-                    }
-                    Err(error) => return Err(error),
-                };
+            let output = match Box::pin(execute_sql_with_options(
+                engine,
+                &subquery.to_string(),
+                batch_size,
+                options,
+            ))
+            .await
+            {
+                Ok(output) => output,
+                Err(DodamError::UnsupportedSql(_))
+                | Err(DodamError::UnknownColumn(_))
+                | Err(DodamError::UnknownTableQualifier(_)) => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
             let exists = query_output_batches(output)?
                 .iter()
                 .any(|batch| batch.num_rows() > 0);
@@ -33195,16 +33208,22 @@ async fn rewrite_materializable_subqueries_to_literals(
             subquery,
             negated,
         } => {
-            let output =
-                match Box::pin(execute_sql(engine, &subquery.to_string(), batch_size)).await {
-                    Ok(output) => output,
-                    Err(DodamError::UnsupportedSql(_))
-                    | Err(DodamError::UnknownColumn(_))
-                    | Err(DodamError::UnknownTableQualifier(_)) => {
-                        return Ok(None);
-                    }
-                    Err(error) => return Err(error),
-                };
+            let output = match Box::pin(execute_sql_with_options(
+                engine,
+                &subquery.to_string(),
+                batch_size,
+                options,
+            ))
+            .await
+            {
+                Ok(output) => output,
+                Err(DodamError::UnsupportedSql(_))
+                | Err(DodamError::UnknownColumn(_))
+                | Err(DodamError::UnknownTableQualifier(_)) => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
             let values = literal_values_from_single_column_batches(query_output_batches(output)?)?;
             *changed = true;
             if values.is_empty() {
@@ -33219,30 +33238,36 @@ async fn rewrite_materializable_subqueries_to_literals(
             }))
         }
         SqlExpr::Subquery(subquery) => {
-            let output =
-                match Box::pin(execute_sql(engine, &subquery.to_string(), batch_size)).await {
-                    Ok(output) => output,
-                    Err(DodamError::UnsupportedSql(_))
-                    | Err(DodamError::UnknownColumn(_))
-                    | Err(DodamError::UnknownTableQualifier(_)) => {
-                        return Ok(None);
-                    }
-                    Err(error) => return Err(error),
-                };
+            let output = match Box::pin(execute_sql_with_options(
+                engine,
+                &subquery.to_string(),
+                batch_size,
+                options,
+            ))
+            .await
+            {
+                Ok(output) => output,
+                Err(DodamError::UnsupportedSql(_))
+                | Err(DodamError::UnknownColumn(_))
+                | Err(DodamError::UnknownTableQualifier(_)) => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
             let value = scalar_literal_value_from_batches(query_output_batches(output)?)?;
             *changed = true;
             Ok(Some(literal_value_to_sql_expr(value)))
         }
         SqlExpr::BinaryOp { left, op, right } => {
             let Some(left) = Box::pin(rewrite_materializable_subqueries_to_literals(
-                engine, *left, batch_size, changed,
+                engine, *left, batch_size, options, changed,
             ))
             .await?
             else {
                 return Ok(None);
             };
             let Some(right) = Box::pin(rewrite_materializable_subqueries_to_literals(
-                engine, *right, batch_size, changed,
+                engine, *right, batch_size, options, changed,
             ))
             .await?
             else {
@@ -33256,7 +33281,7 @@ async fn rewrite_materializable_subqueries_to_literals(
         }
         SqlExpr::Nested(expr) => {
             let Some(expr) = Box::pin(rewrite_materializable_subqueries_to_literals(
-                engine, *expr, batch_size, changed,
+                engine, *expr, batch_size, options, changed,
             ))
             .await?
             else {
@@ -33266,7 +33291,7 @@ async fn rewrite_materializable_subqueries_to_literals(
         }
         SqlExpr::UnaryOp { op, expr } => {
             let Some(expr) = Box::pin(rewrite_materializable_subqueries_to_literals(
-                engine, *expr, batch_size, changed,
+                engine, *expr, batch_size, options, changed,
             ))
             .await?
             else {
@@ -33279,7 +33304,7 @@ async fn rewrite_materializable_subqueries_to_literals(
         }
         SqlExpr::IsNull(expr) => {
             let Some(expr) = Box::pin(rewrite_materializable_subqueries_to_literals(
-                engine, *expr, batch_size, changed,
+                engine, *expr, batch_size, options, changed,
             ))
             .await?
             else {
@@ -33289,7 +33314,7 @@ async fn rewrite_materializable_subqueries_to_literals(
         }
         SqlExpr::IsNotNull(expr) => {
             let Some(expr) = Box::pin(rewrite_materializable_subqueries_to_literals(
-                engine, *expr, batch_size, changed,
+                engine, *expr, batch_size, options, changed,
             ))
             .await?
             else {
@@ -33303,7 +33328,7 @@ async fn rewrite_materializable_subqueries_to_literals(
             negated,
         } => {
             let Some(expr) = Box::pin(rewrite_materializable_subqueries_to_literals(
-                engine, *expr, batch_size, changed,
+                engine, *expr, batch_size, options, changed,
             ))
             .await?
             else {
@@ -33312,7 +33337,7 @@ async fn rewrite_materializable_subqueries_to_literals(
             let mut rewritten_list = Vec::with_capacity(list.len());
             for item in list {
                 let Some(item) = Box::pin(rewrite_materializable_subqueries_to_literals(
-                    engine, item, batch_size, changed,
+                    engine, item, batch_size, options, changed,
                 ))
                 .await?
                 else {
@@ -33333,21 +33358,21 @@ async fn rewrite_materializable_subqueries_to_literals(
             high,
         } => {
             let Some(expr) = Box::pin(rewrite_materializable_subqueries_to_literals(
-                engine, *expr, batch_size, changed,
+                engine, *expr, batch_size, options, changed,
             ))
             .await?
             else {
                 return Ok(None);
             };
             let Some(low) = Box::pin(rewrite_materializable_subqueries_to_literals(
-                engine, *low, batch_size, changed,
+                engine, *low, batch_size, options, changed,
             ))
             .await?
             else {
                 return Ok(None);
             };
             let Some(high) = Box::pin(rewrite_materializable_subqueries_to_literals(
-                engine, *high, batch_size, changed,
+                engine, *high, batch_size, options, changed,
             ))
             .await?
             else {
@@ -33368,14 +33393,14 @@ async fn rewrite_materializable_subqueries_to_literals(
             escape_char,
         } => {
             let Some(expr) = Box::pin(rewrite_materializable_subqueries_to_literals(
-                engine, *expr, batch_size, changed,
+                engine, *expr, batch_size, options, changed,
             ))
             .await?
             else {
                 return Ok(None);
             };
             let Some(pattern) = Box::pin(rewrite_materializable_subqueries_to_literals(
-                engine, *pattern, batch_size, changed,
+                engine, *pattern, batch_size, options, changed,
             ))
             .await?
             else {
@@ -33626,6 +33651,7 @@ async fn try_execute_with_cte_sql(
     engine: &DodamEngine,
     sql: &str,
     batch_size: usize,
+    options: SqlExecutionOptions,
 ) -> Result<Option<QueryOutput>> {
     let dialect = GenericDialect {};
     let statements = Parser::parse_sql(&dialect, sql)
@@ -33652,7 +33678,13 @@ async fn try_execute_with_cte_sql(
     };
     reject_select_features(select)?;
     let cte_alias = cte.alias.name.value.clone();
-    let cte_output = Box::pin(execute_sql(engine, &cte.query.to_string(), batch_size)).await?;
+    let cte_output = Box::pin(execute_sql_with_options(
+        engine,
+        &cte.query.to_string(),
+        batch_size,
+        options,
+    ))
+    .await?;
     let cte_batches = query_output_batches(cte_output)?;
     if let Some(output) = try_execute_single_cte_select(&cte_alias, &cte_batches, select, query)? {
         return Ok(Some(output));
@@ -33672,6 +33704,7 @@ async fn try_execute_with_cte_sql(
                 &cte_alias,
                 &cte_batches,
                 batch_size,
+                options,
             )
             .await?,
         );
@@ -33889,6 +33922,7 @@ async fn materialize_cte_join_relation(
     cte_alias: &str,
     cte_batches: &[RecordBatch],
     batch_size: usize,
+    options: SqlExecutionOptions,
 ) -> Result<MaterializedJoinRelation> {
     match relation {
         TableFactor::Table { name, alias, .. }
@@ -33901,7 +33935,9 @@ async fn materialize_cte_join_relation(
                 batches: cte_batches.to_vec(),
             })
         }
-        TableFactor::Table { .. } => materialize_join_relation(engine, relation, batch_size).await,
+        TableFactor::Table { .. } => {
+            materialize_join_relation(engine, relation, batch_size, options).await
+        }
         _ => Err(DodamError::UnsupportedSql(
             "WITH joins currently support direct table references".to_string(),
         )),
@@ -34014,6 +34050,7 @@ async fn try_execute_derived_join_sql(
     engine: &DodamEngine,
     sql: &str,
     batch_size: usize,
+    options: SqlExecutionOptions,
 ) -> Result<Option<QueryOutput>> {
     let dialect = GenericDialect {};
     let statements = Parser::parse_sql(&dialect, sql)
@@ -34039,8 +34076,8 @@ async fn try_execute_derived_join_sql(
     reject_select_features(select)?;
     let distinct = parse_distinct(select)?;
 
-    let left = materialize_join_relation(engine, &table.relation, batch_size).await?;
-    let right = materialize_join_relation(engine, &join.relation, batch_size).await?;
+    let left = materialize_join_relation(engine, &table.relation, batch_size, options).await?;
+    let right = materialize_join_relation(engine, &join.relation, batch_size, options).await?;
     let left_alias = left.alias.clone();
     let right_alias = right.alias.clone();
     let (join_type, left_keys, right_keys, right_filter) =
@@ -34169,6 +34206,7 @@ async fn materialize_join_relation(
     engine: &DodamEngine,
     relation: &TableFactor,
     batch_size: usize,
+    options: SqlExecutionOptions,
 ) -> Result<MaterializedJoinRelation> {
     match relation {
         TableFactor::Derived {
@@ -34190,7 +34228,13 @@ async fn materialize_join_relation(
                     "derived table column aliases and AT aliases are not supported".to_string(),
                 ));
             }
-            let output = Box::pin(execute_sql(engine, &subquery.to_string(), batch_size)).await?;
+            let output = Box::pin(execute_sql_with_options(
+                engine,
+                &subquery.to_string(),
+                batch_size,
+                options,
+            ))
+            .await?;
             Ok(MaterializedJoinRelation {
                 alias: alias.name.value.clone(),
                 batches: query_output_batches(output)?,
@@ -34279,6 +34323,7 @@ async fn execute_parsed_join_query(
     engine: &DodamEngine,
     query: SqlQuery,
     batch_size: usize,
+    options: SqlExecutionOptions,
 ) -> Result<Option<QueryOutput>> {
     let Some(join) = query.join.clone() else {
         return Ok(None);
@@ -34332,7 +34377,7 @@ async fn execute_parsed_join_query(
             left_filter: join_plan.left_filter,
             right_filter: combine_filter_options(join_plan.right_filter, join.right_filter.clone()),
             output_projection,
-            join_memory_limit_bytes: default_join_memory_limit_bytes(),
+            join_memory_limit_bytes: join_memory_limit_bytes(options),
             join_algorithm: JoinAlgorithm::Auto,
             join_type: join.join_type,
         })
@@ -35961,6 +36006,29 @@ impl I64LikeColumn<'_> {
             Self::Int64(values) => values.value(row),
         }
     }
+
+    fn raw_values(&self) -> I64LikeValues<'_> {
+        match self {
+            Self::Int32(values) => I64LikeValues::I32(values.values().as_ref()),
+            Self::Int64(values) => I64LikeValues::I64(values.values().as_ref()),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum I64LikeValues<'a> {
+    I32(&'a [i32]),
+    I64(&'a [i64]),
+}
+
+impl I64LikeValues<'_> {
+    #[inline]
+    fn value(self, row: usize) -> i64 {
+        match self {
+            Self::I32(values) => i64::from(values[row]),
+            Self::I64(values) => values[row],
+        }
+    }
 }
 
 fn string_array<'a>(batch: &'a RecordBatch, column: &str) -> Result<&'a StringArray> {
@@ -37020,6 +37088,7 @@ async fn try_execute_derived_sql(
     engine: &DodamEngine,
     sql: &str,
     batch_size: usize,
+    options: SqlExecutionOptions,
 ) -> Result<Option<QueryOutput>> {
     let dialect = GenericDialect {};
     let statements = Parser::parse_sql(&dialect, sql)
@@ -37054,14 +37123,26 @@ async fn try_execute_derived_sql(
     let inner_output = if let Some(parsed_inner) = parsed_inner {
         if !inner_has_materializable_subquery
             && let Some(output) =
-                execute_parsed_join_query(engine, parsed_inner, batch_size).await?
+                execute_parsed_join_query(engine, parsed_inner, batch_size, options).await?
         {
             output
         } else {
-            Box::pin(execute_sql(engine, &subquery.to_string(), batch_size)).await?
+            Box::pin(execute_sql_with_options(
+                engine,
+                &subquery.to_string(),
+                batch_size,
+                options,
+            ))
+            .await?
         }
     } else {
-        Box::pin(execute_sql(engine, &subquery.to_string(), batch_size)).await?
+        Box::pin(execute_sql_with_options(
+            engine,
+            &subquery.to_string(),
+            batch_size,
+            options,
+        ))
+        .await?
     };
     let group_by = parse_group_by(select, Some(&alias))?;
     let parsed_projection = parse_projection(select, &group_by, Some(&alias))?;
@@ -37160,6 +37241,7 @@ async fn try_execute_multi_comma_join_sql(
     engine: &DodamEngine,
     sql: &str,
     batch_size: usize,
+    options: SqlExecutionOptions,
 ) -> Result<Option<QueryOutput>> {
     let dialect = GenericDialect {};
     let statements = Parser::parse_sql(&dialect, sql)
@@ -37228,6 +37310,7 @@ async fn try_execute_multi_comma_join_sql(
         &alias_refs,
     )?;
     let limit = parse_limit(query)?;
+    let memory_limit_bytes = join_memory_limit_bytes(options);
     let lookup_fusion_plan = if join_aggregate_lookup_fusion_disabled() {
         None
     } else {
@@ -37338,6 +37421,7 @@ async fn try_execute_multi_comma_join_sql(
             &conjuncts,
             &mut used_conjuncts,
             &final_columns,
+            memory_limit_bytes,
         )?
         .batches
     } else {
@@ -37351,6 +37435,7 @@ async fn try_execute_multi_comma_join_sql(
             &final_columns,
             &join_graph,
             join_plan.as_ref(),
+            memory_limit_bytes,
         )?
     };
 
@@ -37749,6 +37834,7 @@ fn execute_bushy_comma_join_tree(
     conjuncts: &[SqlExpr],
     used_conjuncts: &mut [bool],
     final_columns: &HashSet<String>,
+    memory_limit_bytes: u64,
 ) -> Result<CommaJoinSubtreeResult> {
     match tree {
         LogicalJoinPlanTree::Leaf { table_index, .. } => {
@@ -37771,6 +37857,7 @@ fn execute_bushy_comma_join_tree(
                 conjuncts,
                 used_conjuncts,
                 final_columns,
+                memory_limit_bytes,
             )?;
             let right = execute_bushy_comma_join_tree(
                 right,
@@ -37781,6 +37868,7 @@ fn execute_bushy_comma_join_tree(
                 conjuncts,
                 used_conjuncts,
                 final_columns,
+                memory_limit_bytes,
             )?;
             let (left_keys, right_keys, conjunct_indexes) = comma_join_keys_between_subtrees(
                 conjuncts,
@@ -37838,6 +37926,7 @@ fn execute_bushy_comma_join_tree(
                 right_prefix.clone(),
                 build_side,
                 output_projection,
+                memory_limit_bytes,
             )?;
             if left.aliases.len() > 1 {
                 batches = strip_batch_field_prefix(batches, "__dodam_bushy_left.")?;
@@ -37874,6 +37963,7 @@ fn execute_left_deep_comma_join(
     final_columns: &HashSet<String>,
     join_graph: &LogicalJoinGraph,
     join_plan: Option<&crate::optimizer::LogicalJoinPlan>,
+    memory_limit_bytes: u64,
 ) -> Result<Vec<RecordBatch>> {
     if let Some(plan) = join_plan
         && choose_streaming_left_deep_comma_join_for_plan(plan, final_columns)
@@ -38016,6 +38106,7 @@ fn execute_left_deep_comma_join(
             alias.clone(),
             build_side,
             output_projection,
+            memory_limit_bytes,
         )?;
         current_rows = record_batch_rows(&current);
         if left_prefix == "__dodam_join" {
@@ -38371,6 +38462,7 @@ fn execute_comma_hash_join(
     right_prefix: String,
     build_side: JoinBuildSide,
     output_projection: Projection,
+    memory_limit_bytes: u64,
 ) -> Result<Vec<RecordBatch>> {
     let started = Instant::now();
     let left_rows = record_batch_rows(&left);
@@ -38389,7 +38481,7 @@ fn execute_comma_hash_join(
     let memory_strategy = choose_pipeline_memory_strategy(PipelineMemoryCostInput {
         estimated_rows,
         estimated_row_width,
-        memory_limit_bytes: default_join_memory_limit_bytes() as u128,
+        memory_limit_bytes: memory_limit_bytes as u128,
     });
     let stream = match memory_strategy {
         PipelineMemoryStrategy::InMemory => Box::new(HashJoinExec::new(
@@ -38413,7 +38505,7 @@ fn execute_comma_hash_join(
                 right_prefix,
                 PartitionedHashJoinOptions {
                     partitions,
-                    memory_limit_bytes: default_join_memory_limit_bytes(),
+                    memory_limit_bytes,
                     join_type: JoinType::Inner,
                     output_projection,
                 },
@@ -38428,7 +38520,7 @@ fn execute_comma_hash_join(
             right_prefix,
             PartitionedHashJoinOptions {
                 partitions: MAX_SQL_EXTERNAL_JOIN_PARTITIONS,
-                memory_limit_bytes: default_join_memory_limit_bytes(),
+                memory_limit_bytes,
                 join_type: JoinType::Inner,
                 output_projection,
             },

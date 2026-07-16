@@ -26,15 +26,16 @@ use crate::dense::DenseI64BoolLookup;
 use crate::error::{DodamError, Result};
 use crate::execution::metrics::ScanPlanMetricsCounter;
 use crate::execution::{
-    AggregateExpr, AggregateMetrics, ComparisonExpr, ComparisonOp, DecimalDateRangeFilter,
-    DirectPrimitiveFoldExec, DistinctExec, Expr, FilterExec, FilterExpr, FinalMergeExec,
-    GroupAggregateResult, HashJoinExec, IpcExec, JoinBuildSide, JoinType, LimitExec, LiteralValue,
-    LocalFoldExec, MemoryExec, PartitionedHashJoinExec, PartitionedHashJoinOptions, PhysicalPlan,
-    PredicateSet, Projection, ProjectionExec, RecordBatchSink, ScanExec, ScanMetrics,
-    ScanPlanMetrics, SendableBatchStream, SingleKeyCountSumBatchAccumulator,
-    SingleKeyCountSumMinMaxVectorState, SortExec, SortExpr, SortKey, SortMergeJoinExec,
-    can_merge_partial_aggregates, collect_aggregates, collect_grouped_aggregates, collect_metrics,
-    evaluate_filter_mask, merge_partial_aggregate_metrics, scan_projection, write_stream_to_sink,
+    AggregateExpr, AggregateMetrics, ComparisonExpr, ComparisonOp, CountSumMinMaxMaxKind,
+    DecimalDateRangeFilter, DirectPrimitiveFoldExec, DistinctExec, Expr, FilterExec, FilterExpr,
+    FinalMergeExec, GroupAggregateResult, HashJoinExec, IpcExec, JoinBuildSide, JoinType,
+    LimitExec, LiteralValue, LocalFoldExec, MemoryExec, PartitionedHashJoinExec,
+    PartitionedHashJoinOptions, PhysicalPlan, PredicateSet, Projection, ProjectionExec,
+    RecordBatchSink, ScanExec, ScanMetrics, ScanPlanMetrics, SendableBatchStream,
+    SingleKeyCountSumBatchAccumulator, SingleKeyCountSumMinMaxVectorState, SortExec, SortExpr,
+    SortKey, SortMergeJoinExec, can_merge_partial_aggregates, collect_aggregates,
+    collect_grouped_aggregates, collect_metrics, evaluate_filter_mask,
+    merge_partial_aggregate_metrics, scan_projection, write_stream_to_sink,
 };
 use crate::plan::{
     DirectPrimitiveFoldMode, ExchangeKind, ExecutionGraphPlan, LogicalPlan, LogicalScan,
@@ -54,6 +55,7 @@ use crate::storage::{
     read_parquet_i128_column_min_max_relaxed, read_parquet_primitive_column_min_max_by_row_group,
     read_parquet_projection_compressed_bytes, scan_parquet_i32_byte_array_columns_with_store,
     scan_parquet_i32_byte_array_selected_by_i32_with_store,
+    scan_parquet_i32_dictionary_id_columns_raw_with_store,
     scan_parquet_i32_dictionary_id_columns_with_store, scan_parquet_i32_i32_columns_with_store,
     scan_parquet_i32_i32_dictionary_i64_decimal_selected_typed_with_store,
     scan_parquet_i32_i64_byte_array_columns_with_store,
@@ -1995,6 +1997,33 @@ impl DodamEngine {
         )?;
         if let Some(metrics) = metrics {
             log_direct_column_scan_profile(path, &columns, "i32-dictionary-id", &metrics);
+            return Ok(Some(metrics));
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn scan_parquet_i32_dictionary_id_columns_raw<F>(
+        &self,
+        path: &Path,
+        batch_size: usize,
+        row_groups: &[usize],
+        columns: [&str; 2],
+        consume: F,
+    ) -> Result<Option<DirectColumnScanMetrics>>
+    where
+        F: FnMut(&[u8], usize, Option<&[i16]>, &[i32], &[bytes::Bytes]) -> Result<Option<()>>,
+    {
+        let metrics = scan_parquet_i32_dictionary_id_columns_raw_with_store(
+            path,
+            batch_size,
+            row_groups,
+            columns,
+            self.file_cache.clone(),
+            self.object_store.as_ref(),
+            consume,
+        )?;
+        if let Some(metrics) = metrics {
+            log_direct_column_scan_profile(path, &columns, "i32-dictionary-id-raw", &metrics);
             return Ok(Some(metrics));
         }
         Ok(None)
@@ -6579,7 +6608,7 @@ impl DodamEngine {
                                 shape.decimal_precision, shape.decimal_scale
                             ),
                         ),
-                        (shape.max_date_column.clone(), "date32".to_string()),
+                        (shape.filter_date_column.clone(), "date32".to_string()),
                     ],
                     mode: DirectPrimitiveFoldMode::SingleKeyCountSumMinMax {
                         group_by: shape.key_column.clone(),
@@ -6587,6 +6616,10 @@ impl DodamEngine {
                         aggregates: aggregates.to_vec(),
                         decimal_precision: shape.decimal_precision,
                         decimal_scale: shape.decimal_scale,
+                        max_decimal: matches!(
+                            shape.max_kind,
+                            CountSumMinMaxMaxKind::Decimal128 { .. }
+                        ),
                         decimal_min,
                         decimal_max,
                         date_min: shape.filter.date_min,
@@ -6669,7 +6702,7 @@ impl DodamEngine {
             shape.key_column.as_str(),
             shape.sum_column.as_str(),
             shape.min_decimal_column.as_str(),
-            shape.max_date_column.as_str(),
+            shape.filter_date_column.as_str(),
         ];
         if decimal_date_selected_typed_agg_enabled() {
             return self.scan_parquet_i32_i64_decimal_i32_selected_typed_fold(
@@ -6681,10 +6714,11 @@ impl DodamEngine {
                 shape.decimal_scale,
                 shape.filter,
                 || {
-                    SingleKeyCountSumMinMaxVectorState::new_i32(
+                    SingleKeyCountSumMinMaxVectorState::new_i32_with_max_kind(
                         aggregates.to_vec(),
                         shape.decimal_precision,
                         shape.decimal_scale,
+                        shape.max_kind,
                     )
                 },
                 |state, batch| {
@@ -6709,10 +6743,11 @@ impl DodamEngine {
             shape.decimal_scale,
             shape.filter,
             || {
-                SingleKeyCountSumMinMaxVectorState::new_i32(
+                SingleKeyCountSumMinMaxVectorState::new_i32_with_max_kind(
                     aggregates.to_vec(),
                     shape.decimal_precision,
                     shape.decimal_scale,
+                    shape.max_kind,
                 )
             },
             |state, batch| state.consume_i32_i64_decimal_date_batch(batch, &shape.filter),
@@ -6783,6 +6818,21 @@ impl DodamEngine {
             DataType::Decimal128(precision, scale) => Ok(Some((*precision, *scale))),
             _ => Ok(None),
         }
+    }
+
+    pub(crate) fn parquet_is_date32_column(
+        &self,
+        path: impl AsRef<Path>,
+        column: &str,
+    ) -> Result<bool> {
+        let path = path.as_ref();
+        let metadata = self
+            .metadata_cache
+            .get_with_store(path, self.object_store.as_ref())?;
+        let Ok(field) = metadata.schema().field_with_name(column) else {
+            return Ok(false);
+        };
+        Ok(matches!(field.data_type(), DataType::Date32))
     }
 
     pub(crate) fn parquet_i128_column_min_max(
@@ -7677,7 +7727,8 @@ struct DirectCountSumMinMaxShape {
     key_type: DirectPrimitiveKeyType,
     sum_column: String,
     min_decimal_column: String,
-    max_date_column: String,
+    filter_date_column: String,
+    max_kind: CountSumMinMaxMaxKind,
     decimal_precision: u8,
     decimal_scale: i8,
     filter: DecimalDateRangeFilter,
@@ -7711,10 +7762,37 @@ impl DirectCountSumMinMaxShape {
         let Some(key_type) = engine.parquet_primitive_key_type(path, key_column)? else {
             return Ok(None);
         };
+        let (filter_date_column, max_kind) =
+            if engine.parquet_is_date32_column(path, max_date_column)? {
+                (max_date_column.clone(), CountSumMinMaxMaxKind::Date32)
+            } else if max_date_column == min_decimal_column
+                && engine
+                    .parquet_decimal128_type(path, max_date_column)?
+                    .is_some()
+            {
+                let Some(date_column) = direct_count_sum_min_max_filter_date_column(
+                    filter,
+                    engine,
+                    path,
+                    &[key_column, sum_column, min_decimal_column],
+                )?
+                else {
+                    return Ok(None);
+                };
+                (
+                    date_column,
+                    CountSumMinMaxMaxKind::Decimal128 {
+                        precision: decimal_precision,
+                        scale: decimal_scale,
+                    },
+                )
+            } else {
+                return Ok(None);
+            };
         let Some(filter) = DecimalDateRangeFilter::try_new(
             filter.expr(),
             min_decimal_column,
-            max_date_column,
+            &filter_date_column,
             decimal_scale,
         )?
         else {
@@ -7725,7 +7803,8 @@ impl DirectCountSumMinMaxShape {
             key_type,
             sum_column: sum_column.clone(),
             min_decimal_column: min_decimal_column.clone(),
-            max_date_column: max_date_column.clone(),
+            filter_date_column,
+            max_kind,
             decimal_precision,
             decimal_scale,
             filter,
@@ -7738,7 +7817,7 @@ impl DirectCountSumMinMaxShape {
             &self.key_column,
             &self.sum_column,
             &self.min_decimal_column,
-            &self.max_date_column,
+            &self.filter_date_column,
         ] {
             if !columns.iter().any(|existing| existing == column) {
                 columns.push(column.clone());
@@ -7746,6 +7825,26 @@ impl DirectCountSumMinMaxShape {
         }
         columns
     }
+}
+
+fn direct_count_sum_min_max_filter_date_column(
+    filter: &FilterExpr,
+    engine: &DodamEngine,
+    path: &Path,
+    excluded: &[&String],
+) -> Result<Option<String>> {
+    for column in filter.referenced_columns() {
+        if excluded
+            .iter()
+            .any(|excluded| excluded.as_str() == column.as_str())
+        {
+            continue;
+        }
+        if engine.parquet_is_date32_column(path, &column)? {
+            return Ok(Some(column));
+        }
+    }
+    Ok(None)
 }
 
 fn aggregate_projection(aggregates: &[AggregateExpr], group_by: &[String]) -> Projection {

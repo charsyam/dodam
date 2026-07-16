@@ -189,6 +189,7 @@ async fn direct_primitive_fold_exec_runs_count_sum_min_max() {
                 ],
                 decimal_precision: 15,
                 decimal_scale: 2,
+                max_decimal: false,
                 decimal_min: Some(1_000),
                 decimal_max: Some(4_000),
                 date_min: Some(10),
@@ -237,6 +238,87 @@ async fn direct_primitive_fold_exec_runs_count_sum_min_max() {
     assert_eq!(sums.values(), &[30, 20]);
     assert_eq!(min_amounts.values(), &[1_000, 2_500]);
     assert_eq!(max_dates.values(), &[20, 25]);
+}
+
+#[tokio::test]
+async fn direct_primitive_fold_exec_runs_count_sum_min_decimal_max_decimal() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let path = tempdir.path().join("minmax-decimal.parquet");
+    write_direct_minmax_parquet(&path);
+
+    let plan = PhysicalPlanNode::new("DirectPrimitiveFoldExec").execution(
+        PhysicalExecutionConfig::DirectPrimitiveFold {
+            path: path.clone(),
+            batch_size: 3,
+            row_groups: vec![0, 1],
+            columns: vec![
+                ("bucket".to_string(), "i32".to_string()),
+                ("value".to_string(), "i64".to_string()),
+                ("amount".to_string(), "decimal128_i64_raw:15:2".to_string()),
+                ("event_date".to_string(), "date32".to_string()),
+            ],
+            mode: DirectPrimitiveFoldMode::SingleKeyCountSumMinMax {
+                group_by: "bucket".to_string(),
+                key_type: "i32".to_string(),
+                aggregates: vec![
+                    AggregateExpr::CountStar,
+                    AggregateExpr::Sum("value".to_string()),
+                    AggregateExpr::Min("amount".to_string()),
+                    AggregateExpr::Max("amount".to_string()),
+                ],
+                decimal_precision: 15,
+                decimal_scale: 2,
+                max_decimal: true,
+                decimal_min: Some(1_000),
+                decimal_max: Some(4_000),
+                date_min: Some(10),
+                date_max: Some(30),
+            },
+        },
+    );
+
+    let mut stream = DodamEngine::default()
+        .build_physical_plan_node(plan)
+        .expect("physical plan")
+        .execute()
+        .expect("execute");
+    let batch = stream
+        .next()
+        .expect("output batch")
+        .expect("output batch ok");
+    assert!(stream.next().is_none());
+    let buckets = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("bucket output");
+    let counts = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("count output");
+    let sums = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("sum output");
+    let min_amounts = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("min amount output");
+    let max_amounts = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("max amount output");
+    assert_eq!(buckets.values(), &[1, 2]);
+    assert_eq!(counts.values(), &[2, 2]);
+    assert_eq!(sums.values(), &[30, 20]);
+    assert_eq!(min_amounts.values(), &[1_000, 2_500]);
+    assert_eq!(max_amounts.values(), &[2_000, 3_500]);
+    assert_eq!(max_amounts.precision(), 15);
+    assert_eq!(max_amounts.scale(), 2);
 }
 
 #[tokio::test]

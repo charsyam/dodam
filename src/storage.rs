@@ -1912,12 +1912,35 @@ where
     P: Fn(i32) -> bool,
     F: FnMut(&[i32], &[i32], &[Bytes]) -> Result<Option<()>>,
 {
+    let mut consume = consume;
     if file_cache.enabled() {
+        let reader = CachedParquetChunkReader::new(path, store, file_cache.clone())?;
+        let reader = SerializedFileReader::new(reader)?;
+        if let Some(metrics) = scan_parquet_i32_byte_array_selected_by_i32_page_reader(
+            reader,
+            row_groups,
+            columns,
+            &predicate,
+            &mut consume,
+        )? {
+            return Ok(Some(metrics));
+        }
         let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
         let reader = SerializedFileReader::new(reader)?;
         return scan_parquet_i32_byte_array_selected_by_i32_reader(
             reader, row_groups, columns, predicate, consume,
         );
+    }
+    let file = store.open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    if let Some(metrics) = scan_parquet_i32_byte_array_selected_by_i32_page_reader(
+        reader,
+        row_groups,
+        columns,
+        &predicate,
+        &mut consume,
+    )? {
+        return Ok(Some(metrics));
     }
     let file = store.open(path)?;
     let reader = SerializedFileReader::new(file)?;
@@ -1938,12 +1961,35 @@ pub(crate) fn scan_parquet_i32_selected_by_byte_array_prefix_with_store<F>(
 where
     F: FnMut(&[i32], &[i32], &[Bytes]) -> Result<Option<()>>,
 {
+    let mut consume = consume;
     if file_cache.enabled() {
+        let reader = CachedParquetChunkReader::new(path, store, file_cache.clone())?;
+        let reader = SerializedFileReader::new(reader)?;
+        if let Some(metrics) = scan_parquet_i32_selected_by_byte_array_prefix_page_reader(
+            reader,
+            row_groups,
+            columns,
+            prefix,
+            &mut consume,
+        )? {
+            return Ok(Some(metrics));
+        }
         let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
         let reader = SerializedFileReader::new(reader)?;
         return scan_parquet_i32_selected_by_byte_array_prefix_reader(
             reader, row_groups, columns, prefix, consume,
         );
+    }
+    let file = store.open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    if let Some(metrics) = scan_parquet_i32_selected_by_byte_array_prefix_page_reader(
+        reader,
+        row_groups,
+        columns,
+        prefix,
+        &mut consume,
+    )? {
+        return Ok(Some(metrics));
     }
     let file = store.open(path)?;
     let reader = SerializedFileReader::new(file)?;
@@ -1991,7 +2037,19 @@ pub(crate) fn scan_parquet_i32_dictionary_id_columns_with_store<F>(
 where
     F: FnMut(&[i32], Option<&[i16]>, &[i32], &[Bytes]) -> Result<Option<()>>,
 {
+    let mut consume = consume;
     if file_cache.enabled() {
+        let reader = CachedParquetChunkReader::new(path, store, file_cache.clone())?;
+        let reader = SerializedFileReader::new(reader)?;
+        if let Some(metrics) = scan_parquet_i32_dictionary_id_columns_page_reader(
+            reader,
+            batch_size,
+            row_groups,
+            columns,
+            &mut consume,
+        )? {
+            return Ok(Some(metrics));
+        }
         let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
         let reader = SerializedFileReader::new(reader)?;
         return scan_parquet_i32_dictionary_id_columns_reader(
@@ -2000,7 +2058,44 @@ where
     }
     let file = store.open(path)?;
     let reader = SerializedFileReader::new(file)?;
+    if let Some(metrics) = scan_parquet_i32_dictionary_id_columns_page_reader(
+        reader,
+        batch_size,
+        row_groups,
+        columns,
+        &mut consume,
+    )? {
+        return Ok(Some(metrics));
+    }
+    let file = store.open(path)?;
+    let reader = SerializedFileReader::new(file)?;
     scan_parquet_i32_dictionary_id_columns_reader(reader, batch_size, row_groups, columns, consume)
+}
+
+pub(crate) fn scan_parquet_i32_dictionary_id_columns_raw_with_store<F>(
+    path: &Path,
+    batch_size: usize,
+    row_groups: &[usize],
+    columns: [&str; 2],
+    file_cache: Arc<ParquetFileCache>,
+    store: &dyn ObjectStore,
+    consume: F,
+) -> Result<Option<DirectColumnScanMetrics>>
+where
+    F: FnMut(&[u8], usize, Option<&[i16]>, &[i32], &[Bytes]) -> Result<Option<()>>,
+{
+    if file_cache.enabled() {
+        let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
+        let reader = SerializedFileReader::new(reader)?;
+        return scan_parquet_i32_dictionary_id_columns_raw_page_reader(
+            reader, batch_size, row_groups, columns, consume,
+        );
+    }
+    let file = store.open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    scan_parquet_i32_dictionary_id_columns_raw_page_reader(
+        reader, batch_size, row_groups, columns, consume,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3176,6 +3271,478 @@ where
     Ok(Some(metrics))
 }
 
+fn scan_parquet_i32_dictionary_id_columns_page_reader<R, F>(
+    reader: SerializedFileReader<R>,
+    batch_size: usize,
+    row_groups: &[usize],
+    columns: [&str; 2],
+    consume: F,
+) -> Result<Option<DirectColumnScanMetrics>>
+where
+    R: ChunkReader + 'static,
+    F: FnMut(&[i32], Option<&[i16]>, &[i32], &[Bytes]) -> Result<Option<()>>,
+{
+    let mut consume = consume;
+    let mut numbers = Vec::<i32>::with_capacity(batch_size);
+    scan_parquet_i32_dictionary_id_columns_raw_page_reader(
+        reader,
+        batch_size,
+        row_groups,
+        columns,
+        |numeric_bytes, records, dictionary_def_levels, dictionary_ids, dictionary| {
+            numbers.clear();
+            numbers.reserve(records);
+            for row in 0..records {
+                numbers.push(read_i32_le_unchecked(numeric_bytes, row));
+            }
+            consume(&numbers, dictionary_def_levels, dictionary_ids, dictionary)
+        },
+    )
+}
+
+fn scan_parquet_i32_dictionary_id_columns_raw_page_reader<R, F>(
+    reader: SerializedFileReader<R>,
+    batch_size: usize,
+    row_groups: &[usize],
+    columns: [&str; 2],
+    mut consume: F,
+) -> Result<Option<DirectColumnScanMetrics>>
+where
+    R: ChunkReader + 'static,
+    F: FnMut(&[u8], usize, Option<&[i16]>, &[i32], &[Bytes]) -> Result<Option<()>>,
+{
+    let Some(column_indices) = parquet_column_indices_by_name(&reader, &columns) else {
+        return Ok(None);
+    };
+    let [numeric_column, dictionary_column] =
+        <[usize; 2]>::try_from(column_indices).map_err(|_| {
+            DodamError::UnsupportedSql("direct parquet column index shape mismatch".to_string())
+        })?;
+    let schema = reader.metadata().file_metadata().schema_descr();
+    if schema.column(numeric_column).physical_type() != ParquetPhysicalType::INT32
+        || schema.column(dictionary_column).physical_type() != ParquetPhysicalType::BYTE_ARRAY
+        || schema.column(numeric_column).max_rep_level() != 0
+        || schema.column(dictionary_column).max_rep_level() != 0
+    {
+        return Ok(None);
+    }
+    let mut metrics = DirectColumnScanMetrics {
+        row_groups: row_groups.len(),
+        ..DirectColumnScanMetrics::default()
+    };
+    for &row_group_index in row_groups {
+        let row_group = reader.get_row_group(row_group_index)?;
+        let row_count = usize::try_from(row_group.metadata().num_rows()).map_err(|_| {
+            DodamError::UnsupportedSql("row group row count out of range".to_string())
+        })?;
+        let mut numeric_cursor = RequiredPlainPrimitivePageCursor::new(
+            row_group.get_column_page_reader(numeric_column)?,
+            DirectPrimitiveColumnType::I32,
+            schema.column(numeric_column).max_def_level(),
+        );
+        let mut dictionary_cursor = ByteArrayDictionaryPageCursor::new(
+            row_group.get_column_page_reader(dictionary_column)?,
+            schema.column(dictionary_column).max_def_level(),
+        );
+        let mut rows_read = 0usize;
+        while rows_read < row_count {
+            let read_started = Instant::now();
+            let numeric_started = Instant::now();
+            let numeric_loaded = numeric_cursor.ensure_page()?;
+            let numeric_nanos = elapsed_nanos(numeric_started);
+            metrics.add_selected_payload_nanos(numeric_nanos);
+            let dictionary_started = Instant::now();
+            let dictionary_loaded = dictionary_cursor.ensure_page()?;
+            let dictionary_nanos = elapsed_nanos(dictionary_started);
+            metrics.add_selected_predicate_nanos(dictionary_nanos);
+            if !numeric_loaded || !dictionary_loaded {
+                metrics.add_read_nanos(elapsed_nanos(read_started));
+                return Ok(None);
+            }
+            let records = batch_size
+                .min(row_count - rows_read)
+                .min(numeric_cursor.available_rows())
+                .min(dictionary_cursor.available_rows());
+            if records == 0 {
+                metrics.add_read_nanos(elapsed_nanos(read_started));
+                return Ok(None);
+            }
+            let Some(numeric_bytes) = numeric_cursor.raw_bytes(records) else {
+                metrics.add_read_nanos(elapsed_nanos(read_started));
+                return Ok(None);
+            };
+            if numeric_bytes.len() < records.saturating_mul(std::mem::size_of::<i32>()) {
+                metrics.add_read_nanos(elapsed_nanos(read_started));
+                return Ok(None);
+            }
+            let Some((dictionary_def_levels, dictionary_ids, dictionary)) =
+                dictionary_cursor.current(records)?
+            else {
+                metrics.add_read_nanos(elapsed_nanos(read_started));
+                return Ok(None);
+            };
+            metrics.add_read_nanos(elapsed_nanos(read_started));
+            metrics.batches += 1;
+            metrics.rows = metrics.rows.saturating_add(records);
+            let consume_started = Instant::now();
+            if consume(
+                numeric_bytes,
+                records,
+                dictionary_def_levels,
+                dictionary_ids,
+                dictionary,
+            )?
+            .is_none()
+            {
+                return Ok(None);
+            }
+            metrics.add_consume_nanos(elapsed_nanos(consume_started));
+            numeric_cursor.advance(records);
+            dictionary_cursor.advance(records);
+            rows_read += records;
+        }
+    }
+    Ok(Some(metrics))
+}
+
+fn scan_parquet_i32_byte_array_selected_by_i32_page_reader<R, P, F>(
+    reader: SerializedFileReader<R>,
+    row_groups: &[usize],
+    columns: [&str; 2],
+    predicate: P,
+    mut consume: F,
+) -> Result<Option<DirectColumnScanMetrics>>
+where
+    R: ChunkReader + 'static,
+    P: Fn(i32) -> bool,
+    F: FnMut(&[i32], &[i32], &[Bytes]) -> Result<Option<()>>,
+{
+    let Some(column_indices) = parquet_column_indices_by_name(&reader, &columns) else {
+        return Ok(None);
+    };
+    let [numeric_column, dictionary_column] =
+        <[usize; 2]>::try_from(column_indices).map_err(|_| {
+            DodamError::UnsupportedSql("direct parquet column index shape mismatch".to_string())
+        })?;
+    let schema = reader.metadata().file_metadata().schema_descr();
+    if schema.column(numeric_column).physical_type() != ParquetPhysicalType::INT32
+        || schema.column(dictionary_column).physical_type() != ParquetPhysicalType::BYTE_ARRAY
+        || schema.column(numeric_column).max_rep_level() != 0
+        || schema.column(dictionary_column).max_rep_level() != 0
+        || schema.column(numeric_column).max_def_level() != 0
+    {
+        return Ok(None);
+    }
+    let mut metrics = DirectColumnScanMetrics {
+        row_groups: row_groups.len(),
+        ..DirectColumnScanMetrics::default()
+    };
+    let mut selected_numbers = Vec::<i32>::new();
+    let mut selected_dictionary_ids = Vec::<i32>::new();
+    for &row_group_index in row_groups {
+        let row_group = reader.get_row_group(row_group_index)?;
+        let row_count = usize::try_from(row_group.metadata().num_rows()).map_err(|_| {
+            DodamError::UnsupportedSql("row group row count out of range".to_string())
+        })?;
+        let mut numeric_cursor = RequiredPlainPrimitivePageCursor::new(
+            row_group.get_column_page_reader(numeric_column)?,
+            DirectPrimitiveColumnType::I32,
+            schema.column(numeric_column).max_def_level(),
+        );
+        let mut dictionary_cursor = ByteArrayDictionaryPageCursor::new(
+            row_group.get_column_page_reader(dictionary_column)?,
+            schema.column(dictionary_column).max_def_level(),
+        );
+        let mut rows_read = 0usize;
+        while rows_read < row_count {
+            let read_started = Instant::now();
+            let numeric_started = Instant::now();
+            let numeric_loaded = numeric_cursor.ensure_page()?;
+            metrics.add_selected_predicate_nanos(elapsed_nanos(numeric_started));
+            let dictionary_started = Instant::now();
+            let dictionary_loaded = dictionary_cursor.ensure_page()?;
+            metrics.add_selected_payload_nanos(elapsed_nanos(dictionary_started));
+            if !numeric_loaded || !dictionary_loaded {
+                metrics.add_read_nanos(elapsed_nanos(read_started));
+                return Ok(None);
+            }
+            let records = row_count
+                .saturating_sub(rows_read)
+                .min(numeric_cursor.available_rows())
+                .min(dictionary_cursor.available_rows());
+            if records == 0 {
+                metrics.add_read_nanos(elapsed_nanos(read_started));
+                return Ok(None);
+            }
+            let Some(numeric_bytes) = numeric_cursor.raw_bytes(records) else {
+                metrics.add_read_nanos(elapsed_nanos(read_started));
+                return Ok(None);
+            };
+            if numeric_bytes.len() < records.saturating_mul(std::mem::size_of::<i32>()) {
+                metrics.add_read_nanos(elapsed_nanos(read_started));
+                return Ok(None);
+            }
+            let Some((dictionary_def_levels, dictionary_ids, dictionary)) =
+                dictionary_cursor.current(records)?
+            else {
+                metrics.add_read_nanos(elapsed_nanos(read_started));
+                return Ok(None);
+            };
+            selected_numbers.clear();
+            selected_dictionary_ids.clear();
+            match dictionary_def_levels {
+                Some(levels) => {
+                    let mut value_offset = 0usize;
+                    for row in 0..records {
+                        let number = read_i32_le_unchecked(numeric_bytes, row);
+                        let present =
+                            levels[row] == schema.column(dictionary_column).max_def_level();
+                        if present {
+                            let Some(dictionary_id) = dictionary_ids.get(value_offset) else {
+                                metrics.add_read_nanos(elapsed_nanos(read_started));
+                                return Ok(None);
+                            };
+                            value_offset += 1;
+                            if predicate(number) {
+                                selected_numbers.push(number);
+                                selected_dictionary_ids.push(*dictionary_id);
+                            }
+                        }
+                    }
+                    if value_offset != dictionary_ids.len() {
+                        metrics.add_read_nanos(elapsed_nanos(read_started));
+                        return Ok(None);
+                    }
+                }
+                None => {
+                    if dictionary_ids.len() < records {
+                        metrics.add_read_nanos(elapsed_nanos(read_started));
+                        return Ok(None);
+                    }
+                    for (row, dictionary_id) in dictionary_ids.iter().take(records).enumerate() {
+                        let number = read_i32_le_unchecked(numeric_bytes, row);
+                        if predicate(number) {
+                            selected_numbers.push(number);
+                            selected_dictionary_ids.push(*dictionary_id);
+                        }
+                    }
+                }
+            }
+            metrics.add_read_nanos(elapsed_nanos(read_started));
+            metrics.rows = metrics.rows.saturating_add(records);
+            metrics.selected_rows = metrics.selected_rows.saturating_add(selected_numbers.len());
+            if !selected_numbers.is_empty() {
+                metrics.batches += 1;
+                let consume_started = Instant::now();
+                if consume(&selected_numbers, &selected_dictionary_ids, dictionary)?.is_none() {
+                    return Ok(None);
+                }
+                metrics.add_consume_nanos(elapsed_nanos(consume_started));
+            }
+            numeric_cursor.advance(records);
+            dictionary_cursor.advance(records);
+            rows_read += records;
+        }
+    }
+    Ok(Some(metrics))
+}
+
+fn scan_parquet_i32_selected_by_byte_array_prefix_page_reader<R, F>(
+    reader: SerializedFileReader<R>,
+    row_groups: &[usize],
+    columns: [&str; 2],
+    prefix: &[u8],
+    mut consume: F,
+) -> Result<Option<DirectColumnScanMetrics>>
+where
+    R: ChunkReader + 'static,
+    F: FnMut(&[i32], &[i32], &[Bytes]) -> Result<Option<()>>,
+{
+    let Some(column_indices) = parquet_column_indices_by_name(&reader, &columns) else {
+        return Ok(None);
+    };
+    let [numeric_column, dictionary_column] =
+        <[usize; 2]>::try_from(column_indices).map_err(|_| {
+            DodamError::UnsupportedSql("direct parquet column index shape mismatch".to_string())
+        })?;
+    let schema = reader.metadata().file_metadata().schema_descr();
+    if schema.column(numeric_column).physical_type() != ParquetPhysicalType::INT32
+        || schema.column(dictionary_column).physical_type() != ParquetPhysicalType::BYTE_ARRAY
+        || schema.column(numeric_column).max_rep_level() != 0
+        || schema.column(dictionary_column).max_rep_level() != 0
+        || schema.column(numeric_column).max_def_level() != 0
+    {
+        return Ok(None);
+    }
+    let mut metrics = DirectColumnScanMetrics {
+        row_groups: row_groups.len(),
+        ..DirectColumnScanMetrics::default()
+    };
+    let mut selected_numbers = Vec::<i32>::new();
+    let mut selected_dictionary_ids = Vec::<i32>::new();
+    let mut selected_dictionary = Vec::<bool>::new();
+    for &row_group_index in row_groups {
+        let row_group = reader.get_row_group(row_group_index)?;
+        let row_count = usize::try_from(row_group.metadata().num_rows()).map_err(|_| {
+            DodamError::UnsupportedSql("row group row count out of range".to_string())
+        })?;
+        let mut numeric_cursor = RequiredPlainPrimitivePageCursor::new(
+            row_group.get_column_page_reader(numeric_column)?,
+            DirectPrimitiveColumnType::I32,
+            schema.column(numeric_column).max_def_level(),
+        );
+        let mut dictionary_cursor = ByteArrayDictionaryPageCursor::new(
+            row_group.get_column_page_reader(dictionary_column)?,
+            schema.column(dictionary_column).max_def_level(),
+        );
+        let mut rows_read = 0usize;
+        while rows_read < row_count {
+            let read_started = Instant::now();
+            let numeric_started = Instant::now();
+            let numeric_loaded = numeric_cursor.ensure_page()?;
+            metrics.add_selected_payload_nanos(elapsed_nanos(numeric_started));
+            let dictionary_started = Instant::now();
+            let dictionary_loaded = dictionary_cursor.ensure_page()?;
+            metrics.add_selected_predicate_nanos(elapsed_nanos(dictionary_started));
+            if !numeric_loaded || !dictionary_loaded {
+                metrics.add_read_nanos(elapsed_nanos(read_started));
+                return Ok(None);
+            }
+            let records = row_count
+                .saturating_sub(rows_read)
+                .min(numeric_cursor.available_rows())
+                .min(dictionary_cursor.available_rows());
+            if records == 0 {
+                metrics.add_read_nanos(elapsed_nanos(read_started));
+                return Ok(None);
+            }
+            let Some(numeric_bytes) = numeric_cursor.raw_bytes(records) else {
+                metrics.add_read_nanos(elapsed_nanos(read_started));
+                return Ok(None);
+            };
+            if numeric_bytes.len() < records.saturating_mul(std::mem::size_of::<i32>()) {
+                metrics.add_read_nanos(elapsed_nanos(read_started));
+                return Ok(None);
+            }
+            let Some(dictionary) = dictionary_cursor.dictionary.as_deref() else {
+                metrics.add_read_nanos(elapsed_nanos(read_started));
+                return Ok(None);
+            };
+            selected_dictionary.clear();
+            selected_dictionary.extend(
+                dictionary
+                    .iter()
+                    .map(|value| value.as_ref().starts_with(prefix)),
+            );
+            selected_numbers.clear();
+            selected_dictionary_ids.clear();
+            if dictionary_cursor.def_levels.is_empty() {
+                let matcher = DictionaryIdMatcher::from_selected(&selected_dictionary);
+                if dictionary_cursor.select_i32_by_dictionary_matcher(
+                    records,
+                    numeric_bytes,
+                    &matcher,
+                    &mut selected_numbers,
+                    &mut selected_dictionary_ids,
+                )? {
+                    metrics.add_read_nanos(elapsed_nanos(read_started));
+                    metrics.rows = metrics.rows.saturating_add(records);
+                    metrics.selected_rows =
+                        metrics.selected_rows.saturating_add(selected_numbers.len());
+                    if !selected_numbers.is_empty() {
+                        metrics.batches += 1;
+                        let consume_started = Instant::now();
+                        if consume(&selected_numbers, &selected_dictionary_ids, dictionary)?
+                            .is_none()
+                        {
+                            return Ok(None);
+                        }
+                        metrics.add_consume_nanos(elapsed_nanos(consume_started));
+                    }
+                    numeric_cursor.advance(records);
+                    dictionary_cursor.advance(records);
+                    rows_read += records;
+                    continue;
+                }
+            }
+            let Some((dictionary_def_levels, dictionary_ids, dictionary)) =
+                dictionary_cursor.current(records)?
+            else {
+                metrics.add_read_nanos(elapsed_nanos(read_started));
+                return Ok(None);
+            };
+            match dictionary_def_levels {
+                Some(levels) => {
+                    let mut value_offset = 0usize;
+                    for row in 0..records {
+                        if levels[row] != schema.column(dictionary_column).max_def_level() {
+                            continue;
+                        }
+                        let Some(dictionary_id) = dictionary_ids.get(value_offset) else {
+                            metrics.add_read_nanos(elapsed_nanos(read_started));
+                            return Ok(None);
+                        };
+                        value_offset += 1;
+                        let Ok(dictionary_index) = usize::try_from(*dictionary_id) else {
+                            metrics.add_read_nanos(elapsed_nanos(read_started));
+                            return Ok(None);
+                        };
+                        if selected_dictionary
+                            .get(dictionary_index)
+                            .copied()
+                            .unwrap_or(false)
+                        {
+                            selected_numbers.push(read_i32_le_unchecked(numeric_bytes, row));
+                            selected_dictionary_ids.push(*dictionary_id);
+                        }
+                    }
+                    if value_offset != dictionary_ids.len() {
+                        metrics.add_read_nanos(elapsed_nanos(read_started));
+                        return Ok(None);
+                    }
+                }
+                None => {
+                    if dictionary_ids.len() < records {
+                        metrics.add_read_nanos(elapsed_nanos(read_started));
+                        return Ok(None);
+                    } else {
+                        for (row, dictionary_id) in dictionary_ids.iter().take(records).enumerate()
+                        {
+                            let Ok(dictionary_index) = usize::try_from(*dictionary_id) else {
+                                metrics.add_read_nanos(elapsed_nanos(read_started));
+                                return Ok(None);
+                            };
+                            if selected_dictionary
+                                .get(dictionary_index)
+                                .copied()
+                                .unwrap_or(false)
+                            {
+                                selected_numbers.push(read_i32_le_unchecked(numeric_bytes, row));
+                                selected_dictionary_ids.push(*dictionary_id);
+                            }
+                        }
+                    }
+                }
+            }
+            metrics.add_read_nanos(elapsed_nanos(read_started));
+            metrics.rows = metrics.rows.saturating_add(records);
+            metrics.selected_rows = metrics.selected_rows.saturating_add(selected_numbers.len());
+            if !selected_numbers.is_empty() {
+                metrics.batches += 1;
+                let consume_started = Instant::now();
+                if consume(&selected_numbers, &selected_dictionary_ids, dictionary)?.is_none() {
+                    return Ok(None);
+                }
+                metrics.add_consume_nanos(elapsed_nanos(consume_started));
+            }
+            numeric_cursor.advance(records);
+            dictionary_cursor.advance(records);
+            rows_read += records;
+        }
+    }
+    Ok(Some(metrics))
+}
+
 fn read_byte_array_dictionary_ids_for_row_group(
     row_group: &dyn parquet::file::reader::RowGroupReader,
     column: usize,
@@ -3694,6 +4261,323 @@ impl I32DictionaryPageCursor {
                         return Ok(false);
                     }
                     self.offset = 0;
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+}
+
+struct ByteArrayDictionaryPageCursor {
+    page_reader: Box<dyn PageReader>,
+    max_def_level: i16,
+    dictionary: Option<Vec<Bytes>>,
+    def_levels: Vec<i16>,
+    ids: Vec<i32>,
+    encoded_ids: Option<Bytes>,
+    encoded_values: usize,
+    row_offset: usize,
+    id_offset: usize,
+}
+
+impl ByteArrayDictionaryPageCursor {
+    fn new(page_reader: Box<dyn PageReader>, max_def_level: i16) -> Self {
+        Self {
+            page_reader,
+            max_def_level,
+            dictionary: None,
+            def_levels: Vec::new(),
+            ids: Vec::new(),
+            encoded_ids: None,
+            encoded_values: 0,
+            row_offset: 0,
+            id_offset: 0,
+        }
+    }
+
+    fn ensure_page(&mut self) -> Result<bool> {
+        if self.available_rows() > 0 {
+            return Ok(true);
+        }
+        self.load_next_data_page()
+    }
+
+    fn available_rows(&self) -> usize {
+        if self.def_levels.is_empty() {
+            self.encoded_values.saturating_sub(self.row_offset)
+        } else {
+            self.def_levels.len().saturating_sub(self.row_offset)
+        }
+    }
+
+    fn current(&mut self, records: usize) -> Result<Option<(Option<&[i16]>, &[i32], &[Bytes])>> {
+        if records > self.available_rows() {
+            return Ok(None);
+        }
+        self.ensure_ids_decoded()?;
+        let Some(dictionary) = self.dictionary.as_deref() else {
+            return Ok(None);
+        };
+        if self.def_levels.is_empty() {
+            let start = self.row_offset;
+            let Some(end) = start.checked_add(records) else {
+                return Ok(None);
+            };
+            return Ok((end <= self.ids.len()).then(|| (None, &self.ids[start..end], dictionary)));
+        }
+        let level_start = self.row_offset;
+        let Some(level_end) = level_start.checked_add(records) else {
+            return Ok(None);
+        };
+        if level_end > self.def_levels.len() {
+            return Ok(None);
+        }
+        let levels = &self.def_levels[level_start..level_end];
+        let present = levels
+            .iter()
+            .filter(|level| **level == self.max_def_level)
+            .count();
+        let id_start = self.id_offset;
+        let Some(id_end) = id_start.checked_add(present) else {
+            return Ok(None);
+        };
+        Ok((id_end <= self.ids.len())
+            .then(|| (Some(levels), &self.ids[id_start..id_end], dictionary)))
+    }
+
+    fn advance(&mut self, records: usize) {
+        if self.def_levels.is_empty() {
+            self.row_offset += records;
+            self.id_offset += records;
+            if self.row_offset >= self.encoded_values {
+                self.clear_page();
+            }
+            return;
+        }
+        let level_end = (self.row_offset + records).min(self.def_levels.len());
+        let present = self.def_levels[self.row_offset..level_end]
+            .iter()
+            .filter(|level| **level == self.max_def_level)
+            .count();
+        self.row_offset = level_end;
+        self.id_offset += present;
+        if self.row_offset >= self.def_levels.len() {
+            self.clear_page();
+        }
+    }
+
+    fn clear_page(&mut self) {
+        self.def_levels.clear();
+        self.ids.clear();
+        self.encoded_ids = None;
+        self.encoded_values = 0;
+        self.row_offset = 0;
+        self.id_offset = 0;
+    }
+
+    fn select_i32_by_dictionary_matcher(
+        &self,
+        records: usize,
+        numeric_bytes: &[u8],
+        matcher: &DictionaryIdMatcher,
+        selected_numbers: &mut Vec<i32>,
+        selected_dictionary_ids: &mut Vec<i32>,
+    ) -> Result<bool> {
+        if !self.def_levels.is_empty() || records > self.available_rows() {
+            return Ok(false);
+        }
+        let Some(dictionary) = self.dictionary.as_deref() else {
+            return Ok(false);
+        };
+        let Some(encoded) = self.encoded_ids.as_ref() else {
+            return Ok(false);
+        };
+        if self.row_offset.saturating_add(records) > self.encoded_values {
+            return Ok(false);
+        }
+        if numeric_bytes.len() < records.saturating_mul(std::mem::size_of::<i32>()) {
+            return Ok(false);
+        }
+        if encoded.is_empty() {
+            return Ok(false);
+        }
+        emit_selected_i32_dictionary_ids_from_encoded(
+            encoded.clone(),
+            self.encoded_values,
+            dictionary.len(),
+            self.row_offset,
+            records,
+            numeric_bytes,
+            matcher,
+            selected_numbers,
+            selected_dictionary_ids,
+        )
+    }
+
+    fn ensure_ids_decoded(&mut self) -> Result<()> {
+        if !self.ids.is_empty() || self.encoded_values == 0 {
+            return Ok(());
+        }
+        let Some(dictionary) = self.dictionary.as_ref() else {
+            return Ok(());
+        };
+        let Some(encoded) = self.encoded_ids.as_ref() else {
+            return Ok(());
+        };
+        decode_dictionary_indices(
+            encoded.clone(),
+            self.encoded_values,
+            dictionary.len(),
+            &mut self.ids,
+        )?;
+        Ok(())
+    }
+
+    fn load_next_data_page(&mut self) -> Result<bool> {
+        while let Some(page) = self.page_reader.get_next_page()? {
+            match page {
+                Page::DictionaryPage {
+                    buf,
+                    num_values,
+                    encoding,
+                    ..
+                } => {
+                    if encoding != Encoding::PLAIN || self.dictionary.is_some() {
+                        return Ok(false);
+                    }
+                    self.dictionary = Some(decode_plain_byte_array_dictionary(
+                        buf,
+                        num_values as usize,
+                    )?);
+                }
+                Page::DataPage {
+                    buf,
+                    num_values,
+                    encoding,
+                    def_level_encoding,
+                    ..
+                } => {
+                    if !matches!(
+                        encoding,
+                        Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
+                    ) {
+                        return Ok(false);
+                    }
+                    let Some(dictionary) = self.dictionary.as_ref() else {
+                        return Ok(false);
+                    };
+                    let mut offset = 0usize;
+                    let values = if self.max_def_level > 0 {
+                        if def_level_encoding != Encoding::RLE {
+                            return Ok(false);
+                        }
+                        let (bytes_read, level_data) =
+                            parse_v1_rle_level_data(buf.slice(offset..))?;
+                        offset += bytes_read;
+                        self.def_levels.clear();
+                        decode_rle_i16_values(
+                            level_data,
+                            num_required_bits_i16(self.max_def_level),
+                            num_values as usize,
+                            &mut self.def_levels,
+                        )?;
+                        if self.def_levels.len() != num_values as usize {
+                            return Ok(false);
+                        }
+                        self.def_levels
+                            .iter()
+                            .filter(|level| **level == self.max_def_level)
+                            .count()
+                    } else {
+                        self.def_levels.clear();
+                        num_values as usize
+                    };
+                    self.encoded_ids = (self.max_def_level == 0).then(|| buf.slice(offset..));
+                    self.encoded_values = values;
+                    self.ids.clear();
+                    if self.max_def_level > 0 {
+                        decode_dictionary_indices(
+                            buf.slice(offset..),
+                            values,
+                            dictionary.len(),
+                            &mut self.ids,
+                        )?;
+                        if self.ids.len() != values {
+                            return Ok(false);
+                        }
+                    }
+                    self.row_offset = 0;
+                    self.id_offset = 0;
+                    return Ok(true);
+                }
+                Page::DataPageV2 {
+                    buf,
+                    num_values,
+                    encoding,
+                    num_nulls,
+                    def_levels_byte_len,
+                    rep_levels_byte_len,
+                    ..
+                } => {
+                    if !matches!(
+                        encoding,
+                        Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
+                    ) {
+                        return Ok(false);
+                    }
+                    let Some(dictionary) = self.dictionary.as_ref() else {
+                        return Ok(false);
+                    };
+                    let values = if self.max_def_level > 0 {
+                        let def_start = rep_levels_byte_len as usize;
+                        let def_end = def_start + def_levels_byte_len as usize;
+                        if def_end > buf.len() {
+                            return Ok(false);
+                        }
+                        self.def_levels.clear();
+                        decode_rle_i16_values(
+                            buf.slice(def_start..def_end),
+                            num_required_bits_i16(self.max_def_level),
+                            num_values as usize,
+                            &mut self.def_levels,
+                        )?;
+                        if self.def_levels.len() != num_values as usize {
+                            return Ok(false);
+                        }
+                        let values = self
+                            .def_levels
+                            .iter()
+                            .filter(|level| **level == self.max_def_level)
+                            .count();
+                        if values != (num_values - num_nulls) as usize {
+                            return Ok(false);
+                        }
+                        values
+                    } else {
+                        self.def_levels.clear();
+                        num_values as usize
+                    };
+                    let value_start = (rep_levels_byte_len + def_levels_byte_len) as usize;
+                    if value_start > buf.len() {
+                        return Ok(false);
+                    }
+                    self.encoded_ids = (self.max_def_level == 0).then(|| buf.slice(value_start..));
+                    self.encoded_values = values;
+                    self.ids.clear();
+                    if self.max_def_level > 0 {
+                        decode_dictionary_indices(
+                            buf.slice(value_start..),
+                            values,
+                            dictionary.len(),
+                            &mut self.ids,
+                        )?;
+                        if self.ids.len() != values {
+                            return Ok(false);
+                        }
+                    }
+                    self.row_offset = 0;
+                    self.id_offset = 0;
                     return Ok(true);
                 }
             }
@@ -4914,6 +5798,43 @@ impl<'a> BitpackedDictionaryIdBlockReader<'a> {
                 self.pos += len;
                 Ok(Some(mask))
             }
+            7 => {
+                if len % 8 != 0 {
+                    return Ok(None);
+                }
+                let required = len / 8 * 7;
+                if self.pos + required > self.end {
+                    return Err(DodamError::Parquet(ParquetError::General(
+                        "not enough data to decode parquet dictionary id block".to_string(),
+                    )));
+                }
+                let mut mask = 0u64;
+                let mut lane = 0usize;
+                let end = self.pos + required;
+                while self.pos < end {
+                    let word = u64::from(self.data[self.pos])
+                        | (u64::from(self.data[self.pos + 1]) << 8)
+                        | (u64::from(self.data[self.pos + 2]) << 16)
+                        | (u64::from(self.data[self.pos + 3]) << 24)
+                        | (u64::from(self.data[self.pos + 4]) << 32)
+                        | (u64::from(self.data[self.pos + 5]) << 40)
+                        | (u64::from(self.data[self.pos + 6]) << 48);
+                    let ids = [
+                        (word & 0x7f) as u32,
+                        ((word >> 7) & 0x7f) as u32,
+                        ((word >> 14) & 0x7f) as u32,
+                        ((word >> 21) & 0x7f) as u32,
+                        ((word >> 28) & 0x7f) as u32,
+                        ((word >> 35) & 0x7f) as u32,
+                        ((word >> 42) & 0x7f) as u32,
+                        ((word >> 49) & 0x7f) as u32,
+                    ];
+                    mask |= matcher.mask_ids(&ids, lane, dictionary_len)?;
+                    lane += ids.len();
+                    self.pos += 7;
+                }
+                Ok(Some(mask))
+            }
             14 => {
                 if len % 4 != 0 {
                     return Ok(None);
@@ -4997,6 +5918,26 @@ impl<'a> BitpackedDictionaryIdBlockReader<'a> {
                 while output.len < len && self.pos < self.end {
                     output.push(u32::from(self.data[self.pos]));
                     self.pos += 1;
+                }
+            }
+            7 => {
+                while output.len + 8 <= len && self.pos + 7 <= self.end {
+                    let word = u64::from(self.data[self.pos])
+                        | (u64::from(self.data[self.pos + 1]) << 8)
+                        | (u64::from(self.data[self.pos + 2]) << 16)
+                        | (u64::from(self.data[self.pos + 3]) << 24)
+                        | (u64::from(self.data[self.pos + 4]) << 32)
+                        | (u64::from(self.data[self.pos + 5]) << 40)
+                        | (u64::from(self.data[self.pos + 6]) << 48);
+                    output.push((word & 0x7f) as u32);
+                    output.push(((word >> 7) & 0x7f) as u32);
+                    output.push(((word >> 14) & 0x7f) as u32);
+                    output.push(((word >> 21) & 0x7f) as u32);
+                    output.push(((word >> 28) & 0x7f) as u32);
+                    output.push(((word >> 35) & 0x7f) as u32);
+                    output.push(((word >> 42) & 0x7f) as u32);
+                    output.push(((word >> 49) & 0x7f) as u32);
+                    self.pos += 7;
                 }
             }
             14 => {
@@ -5120,6 +6061,119 @@ fn decode_dictionary_indices(
         ));
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_selected_i32_dictionary_ids_from_encoded(
+    data: Bytes,
+    values: usize,
+    dictionary_len: usize,
+    start: usize,
+    records: usize,
+    numeric_bytes: &[u8],
+    matcher: &DictionaryIdMatcher,
+    selected_numbers: &mut Vec<i32>,
+    selected_dictionary_ids: &mut Vec<i32>,
+) -> Result<bool> {
+    if data.is_empty() || start.saturating_add(records) > values {
+        return Ok(false);
+    }
+    let bit_width = data[0];
+    if bit_width > 32 {
+        return Ok(false);
+    }
+    let data = data.slice(1..);
+    let end_row = start + records;
+    let bytes_per_rle_value = usize::from(bit_width).div_ceil(8);
+    let mut pos = 0usize;
+    let mut decoded = 0usize;
+    let mut block = DictionaryIdBlock::new();
+    while decoded < values {
+        let Some(header) = read_hybrid_varint(&data, &mut pos)? else {
+            return Ok(false);
+        };
+        if header & 1 == 0 {
+            let run_len = ((header >> 1) as usize).min(values - decoded);
+            if pos + bytes_per_rle_value > data.len() {
+                return Ok(false);
+            }
+            let mut id = 0u32;
+            for index in 0..bytes_per_rle_value {
+                id |= u32::from(data[pos + index]) << (index * 8);
+            }
+            pos += bytes_per_rle_value;
+            if id as usize >= dictionary_len {
+                return Err(invalid_dictionary_id_error());
+            }
+            let run_start = decoded;
+            let run_end = decoded + run_len;
+            if run_end > start && run_start < end_row && matcher.contains(id) {
+                let emit_start = run_start.max(start);
+                let emit_end = run_end.min(end_row);
+                selected_numbers.reserve(emit_end - emit_start);
+                selected_dictionary_ids.reserve(emit_end - emit_start);
+                for row in emit_start..emit_end {
+                    let local = row - start;
+                    selected_numbers.push(read_i32_le_unchecked(numeric_bytes, local));
+                    selected_dictionary_ids.push(id as i32);
+                }
+            }
+            decoded = run_end;
+            if decoded >= end_row {
+                return Ok(true);
+            }
+            continue;
+        }
+
+        let groups = (header >> 1) as usize;
+        let count = groups.saturating_mul(8).min(values - decoded);
+        let bytes = groups
+            .saturating_mul(8)
+            .saturating_mul(usize::from(bit_width))
+            .div_ceil(8);
+        if pos + bytes > data.len() {
+            return Ok(false);
+        }
+        let run_start = decoded;
+        let run_end = decoded + count;
+        if run_end <= start || run_start >= end_row {
+            pos += bytes;
+            decoded = run_end;
+            continue;
+        }
+        let mut bitpacked_reader =
+            BitpackedDictionaryIdBlockReader::new(&data, pos, pos + bytes, bit_width);
+        let mut local = 0usize;
+        while local < count {
+            let block_len = DICTIONARY_ID_BLOCK.min(count - local);
+            bitpacked_reader.decode_block(block_len, &mut block)?;
+            let block_start = run_start + local;
+            let block_end = block_start + block_len;
+            let emit_start = block_start.max(start);
+            let emit_end = block_end.min(end_row);
+            let local_start = emit_start.saturating_sub(block_start);
+            let local_end = emit_end.saturating_sub(block_start);
+            for (lane, id) in block.as_slice().iter().copied().enumerate() {
+                if id as usize >= dictionary_len {
+                    return Err(invalid_dictionary_id_error());
+                }
+                if lane >= local_start && lane < local_end && matcher.contains(id) {
+                    selected_numbers.push(read_i32_le_unchecked(
+                        numeric_bytes,
+                        emit_start - start + lane - local_start,
+                    ));
+                    selected_dictionary_ids.push(id as i32);
+                }
+            }
+            local += block_len;
+        }
+        pos += bytes;
+        decoded = run_end;
+        if decoded >= end_row {
+            return Ok(true);
+        }
+    }
+    Ok(decoded >= end_row)
 }
 
 fn decode_dictionary_indices_selected_ranges(
@@ -5451,6 +6505,38 @@ impl SimpleRleBitpackedDecoder {
                         .map(|value| i32::from(*value)),
                 );
                 self.bitpack_bit_offset += len * 8;
+                return Ok(true);
+            }
+            7 => {
+                let byte_len = len.saturating_mul(7).div_ceil(8);
+                if byte_pos + byte_len > self.bitpack_end {
+                    return Ok(false);
+                }
+                output.reserve(len);
+                let mut pos = byte_pos;
+                let groups = len / 8;
+                for _ in 0..groups {
+                    let word = u64::from(self.data[pos])
+                        | (u64::from(self.data[pos + 1]) << 8)
+                        | (u64::from(self.data[pos + 2]) << 16)
+                        | (u64::from(self.data[pos + 3]) << 24)
+                        | (u64::from(self.data[pos + 4]) << 32)
+                        | (u64::from(self.data[pos + 5]) << 40)
+                        | (u64::from(self.data[pos + 6]) << 48);
+                    output.push((word & 0x7f) as i32);
+                    output.push(((word >> 7) & 0x7f) as i32);
+                    output.push(((word >> 14) & 0x7f) as i32);
+                    output.push(((word >> 21) & 0x7f) as i32);
+                    output.push(((word >> 28) & 0x7f) as i32);
+                    output.push(((word >> 35) & 0x7f) as i32);
+                    output.push(((word >> 42) & 0x7f) as i32);
+                    output.push(((word >> 49) & 0x7f) as i32);
+                    pos += 7;
+                }
+                self.bitpack_bit_offset += groups * 56;
+                for _ in 0..(len % 8) {
+                    output.push(self.read_bitpacked_value()? as i32);
+                }
                 return Ok(true);
             }
             16 => {
@@ -6448,6 +7534,31 @@ where
             let file = store.open(path)?;
             let reader = SerializedFileReader::new(file)?;
             scan_parquet_primitive_columns_page_reader(
+                reader,
+                batch_size,
+                row_groups,
+                columns,
+                &mut consume,
+            )?
+        };
+        if page_result.is_some() {
+            return Ok(page_result);
+        }
+    } else if direct_required_primitive_page_stream_auto_enabled() {
+        let page_result = if file_cache.enabled() {
+            let reader = CachedParquetChunkReader::new(path, store, file_cache.clone())?;
+            let reader = SerializedFileReader::new(reader)?;
+            scan_parquet_primitive_columns_required_page_stream_reader(
+                reader,
+                batch_size,
+                row_groups,
+                columns,
+                &mut consume,
+            )?
+        } else {
+            let file = store.open(path)?;
+            let reader = SerializedFileReader::new(file)?;
+            scan_parquet_primitive_columns_required_page_stream_reader(
                 reader,
                 batch_size,
                 row_groups,
@@ -8709,7 +9820,7 @@ fn gather_i32_dictionary_positions(
     Ok(())
 }
 
-fn read_i32_le_unchecked(bytes: &[u8], row: usize) -> i32 {
+pub(crate) fn read_i32_le_unchecked(bytes: &[u8], row: usize) -> i32 {
     let start = row * std::mem::size_of::<i32>();
     i32::from_le_bytes([
         bytes[start],
@@ -10916,6 +12027,11 @@ fn direct_skip_required_def_levels_enabled() -> bool {
 
 fn direct_primitive_page_reader_enabled() -> bool {
     std::env::var("DODAM_ENABLE_PRIMITIVE_PAGE_READER")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn direct_required_primitive_page_stream_auto_enabled() -> bool {
+    !std::env::var("DODAM_DISABLE_REQUIRED_PRIMITIVE_PAGE_STREAM_AUTO")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 

@@ -303,6 +303,11 @@ pub fn collect_grouped_aggregates(
             "single_key_count_sum_min_max",
             collect_single_key_count_sum_min_max_groups(stream, fragments, group_by, aggregates)?,
         )
+    } else if can_use_two_key_count_sum_min_max_path(group_by, aggregates) {
+        (
+            "two_key_count_sum_min_max",
+            collect_two_key_count_sum_min_max_groups(stream, fragments, group_by, aggregates)?,
+        )
     } else if can_use_single_key_count_sum_path(group_by, aggregates) {
         (
             "single_key_count_sum",
@@ -8439,17 +8444,23 @@ fn consume_i32_i64_decimal_date_predicate_applied_dense_block(
     dates: &[i32],
     decimal_precision: u8,
     decimal_scale: i8,
+    max_kind: CountSumMinMaxMaxKind,
 ) {
     if !dense_i32_block_accumulate_worthwhile(keys) {
         for row in 0..keys.len() {
-            let group_id = count_sum_min_max_group_id_for_i32(
+            let group_id = count_sum_min_max_group_id_for_i32_with_max_kind(
                 index,
                 keys[row],
                 groups,
                 decimal_precision,
                 decimal_scale,
+                max_kind,
             );
-            groups[group_id].update_raw_non_null(sums[row], i128::from(decimals[row]), dates[row]);
+            groups[group_id].update_raw_non_null(
+                sums[row],
+                i128::from(decimals[row]),
+                direct_count_sum_min_max_value(max_kind, i128::from(decimals[row]), dates[row]),
+            );
         }
         return;
     }
@@ -8462,30 +8473,34 @@ fn consume_i32_i64_decimal_date_predicate_applied_dense_block(
         let mut local_sums = [0i64; 64];
         let mut local_min_decimals = [i128::MAX; 64];
         let mut local_max_dates = [i32::MIN; 64];
+        let mut local_max_decimals = [i128::MIN; 64];
         let mut local_len = 0usize;
         while row < start + 64 {
-            let group_id = count_sum_min_max_group_id_for_i32(
+            let group_id = count_sum_min_max_group_id_for_i32_with_max_kind(
                 index,
                 keys[row],
                 groups,
                 decimal_precision,
                 decimal_scale,
+                max_kind,
             );
+            let decimal = i128::from(decimals[row]);
             if let Some(local_index) = local_group_ids[..local_len]
                 .iter()
                 .position(|existing| *existing == group_id)
             {
                 local_counts[local_index] += 1;
                 local_sums[local_index] = local_sums[local_index].saturating_add(sums[row]);
-                local_min_decimals[local_index] =
-                    local_min_decimals[local_index].min(i128::from(decimals[row]));
+                local_min_decimals[local_index] = local_min_decimals[local_index].min(decimal);
                 local_max_dates[local_index] = local_max_dates[local_index].max(dates[row]);
+                local_max_decimals[local_index] = local_max_decimals[local_index].max(decimal);
             } else {
                 local_group_ids[local_len] = group_id;
                 local_counts[local_len] = 1;
                 local_sums[local_len] = sums[row];
-                local_min_decimals[local_len] = i128::from(decimals[row]);
+                local_min_decimals[local_len] = decimal;
                 local_max_dates[local_len] = dates[row];
+                local_max_decimals[local_len] = decimal;
                 local_len += 1;
             }
             row += 1;
@@ -8495,19 +8510,28 @@ fn consume_i32_i64_decimal_date_predicate_applied_dense_block(
                 u64::from(local_counts[local_index]),
                 local_sums[local_index],
                 local_min_decimals[local_index],
-                local_max_dates[local_index],
+                direct_count_sum_min_max_value(
+                    max_kind,
+                    local_max_decimals[local_index],
+                    local_max_dates[local_index],
+                ),
             );
         }
     }
     while row < keys.len() {
-        let group_id = count_sum_min_max_group_id_for_i32(
+        let group_id = count_sum_min_max_group_id_for_i32_with_max_kind(
             index,
             keys[row],
             groups,
             decimal_precision,
             decimal_scale,
+            max_kind,
         );
-        groups[group_id].update_raw_non_null(sums[row], i128::from(decimals[row]), dates[row]);
+        groups[group_id].update_raw_non_null(
+            sums[row],
+            i128::from(decimals[row]),
+            direct_count_sum_min_max_value(max_kind, i128::from(decimals[row]), dates[row]),
+        );
         row += 1;
     }
 }
@@ -9077,20 +9101,23 @@ pub(crate) struct SingleKeyCountSumMinMaxVectorState {
     aggregates: Vec<AggregateExpr>,
     decimal_precision: u8,
     decimal_scale: i8,
+    max_kind: CountSumMinMaxMaxKind,
     group_index: SingleKeyCountSumMinMaxIndex,
     groups: Vec<SingleKeyCountSumMinMaxGroup>,
 }
 
 impl SingleKeyCountSumMinMaxVectorState {
-    pub(crate) fn new_i32(
+    pub(crate) fn new_i32_with_max_kind(
         aggregates: Vec<AggregateExpr>,
         decimal_precision: u8,
         decimal_scale: i8,
+        max_kind: CountSumMinMaxMaxKind,
     ) -> Self {
         Self {
             aggregates,
             decimal_precision,
             decimal_scale,
+            max_kind,
             group_index: SingleKeyCountSumMinMaxIndex::Int32 {
                 groups: DenseI32GroupIndex::default(),
                 null_group: None,
@@ -9099,15 +9126,17 @@ impl SingleKeyCountSumMinMaxVectorState {
         }
     }
 
-    pub(crate) fn new_i64(
+    pub(crate) fn new_i64_with_max_kind(
         aggregates: Vec<AggregateExpr>,
         decimal_precision: u8,
         decimal_scale: i8,
+        max_kind: CountSumMinMaxMaxKind,
     ) -> Self {
         Self {
             aggregates,
             decimal_precision,
             decimal_scale,
+            max_kind,
             group_index: SingleKeyCountSumMinMaxIndex::Int64 {
                 groups: AdaptiveCopyGroupIndex::default(),
                 null_group: None,
@@ -9156,6 +9185,7 @@ impl SingleKeyCountSumMinMaxVectorState {
                 "direct primitive aggregate requires non-null date input".to_string(),
             ));
         };
+        let max_kind = self.max_kind;
         let SingleKeyCountSumMinMaxIndex::Int32 { groups: index, .. } = &mut self.group_index
         else {
             unreachable!("vector state uses Int32 group index")
@@ -9174,29 +9204,35 @@ impl SingleKeyCountSumMinMaxVectorState {
                     if !filter.matches_i64(decimal, date) {
                         continue;
                     }
-                    let group_id = count_sum_min_max_group_id_for_i32(
+                    let group_id = count_sum_min_max_group_id_for_i32_with_max_kind(
                         index,
                         keys[row],
                         &mut self.groups,
                         self.decimal_precision,
                         self.decimal_scale,
+                        max_kind,
                     );
-                    self.groups[group_id].update_raw_non_null(sums[row], i128::from(decimal), date);
+                    self.groups[group_id].update_raw_non_null(
+                        sums[row],
+                        i128::from(decimal),
+                        direct_count_sum_min_max_value(max_kind, i128::from(decimal), date),
+                    );
                 }
                 return Ok(());
             };
             if for_each_decimal_only_match_i64(decimals, raw_filter, |row| {
-                let group_id = count_sum_min_max_group_id_for_i32(
+                let group_id = count_sum_min_max_group_id_for_i32_with_max_kind(
                     index,
                     keys[row],
                     &mut self.groups,
                     self.decimal_precision,
                     self.decimal_scale,
+                    max_kind,
                 );
                 self.groups[group_id].update_raw_non_null(
                     sums[row],
                     i128::from(decimals[row]),
-                    dates[row],
+                    direct_count_sum_min_max_value(max_kind, i128::from(decimals[row]), dates[row]),
                 );
             }) {
                 return Ok(());
@@ -9207,14 +9243,19 @@ impl SingleKeyCountSumMinMaxVectorState {
                 if !raw_filter.matches(decimal, date) {
                     continue;
                 }
-                let group_id = count_sum_min_max_group_id_for_i32(
+                let group_id = count_sum_min_max_group_id_for_i32_with_max_kind(
                     index,
                     keys[row],
                     &mut self.groups,
                     self.decimal_precision,
                     self.decimal_scale,
+                    max_kind,
                 );
-                self.groups[group_id].update_raw_non_null(sums[row], i128::from(decimal), date);
+                self.groups[group_id].update_raw_non_null(
+                    sums[row],
+                    i128::from(decimal),
+                    direct_count_sum_min_max_value(max_kind, i128::from(decimal), date),
+                );
             }
         } else if let Some((decimal_bytes, decimal_len)) = decimal_values.raw_i64_bytes() {
             if keys.len() != sums.len() || keys.len() != decimal_len || keys.len() != dates.len() {
@@ -9229,14 +9270,19 @@ impl SingleKeyCountSumMinMaxVectorState {
                     if !filter.matches_i64(decimal, date) {
                         continue;
                     }
-                    let group_id = count_sum_min_max_group_id_for_i32(
+                    let group_id = count_sum_min_max_group_id_for_i32_with_max_kind(
                         index,
                         keys[row],
                         &mut self.groups,
                         self.decimal_precision,
                         self.decimal_scale,
+                        max_kind,
                     );
-                    self.groups[group_id].update_raw_non_null(sums[row], i128::from(decimal), date);
+                    self.groups[group_id].update_raw_non_null(
+                        sums[row],
+                        i128::from(decimal),
+                        direct_count_sum_min_max_value(max_kind, i128::from(decimal), date),
+                    );
                 }
                 return Ok(());
             };
@@ -9246,14 +9292,19 @@ impl SingleKeyCountSumMinMaxVectorState {
                 if !raw_filter.matches(decimal, date) {
                     continue;
                 }
-                let group_id = count_sum_min_max_group_id_for_i32(
+                let group_id = count_sum_min_max_group_id_for_i32_with_max_kind(
                     index,
                     keys[row],
                     &mut self.groups,
                     self.decimal_precision,
                     self.decimal_scale,
+                    max_kind,
                 );
-                self.groups[group_id].update_raw_non_null(sums[row], i128::from(decimal), date);
+                self.groups[group_id].update_raw_non_null(
+                    sums[row],
+                    i128::from(decimal),
+                    direct_count_sum_min_max_value(max_kind, i128::from(decimal), date),
+                );
             }
         } else {
             let decimals = decimal_values.raw_values();
@@ -9269,14 +9320,19 @@ impl SingleKeyCountSumMinMaxVectorState {
                 if !filter.matches(decimal, date) {
                     continue;
                 }
-                let group_id = count_sum_min_max_group_id_for_i32(
+                let group_id = count_sum_min_max_group_id_for_i32_with_max_kind(
                     index,
                     keys[row],
                     &mut self.groups,
                     self.decimal_precision,
                     self.decimal_scale,
+                    max_kind,
                 );
-                self.groups[group_id].update_raw_non_null(sums[row], decimal, date);
+                self.groups[group_id].update_raw_non_null(
+                    sums[row],
+                    decimal,
+                    direct_count_sum_min_max_value(max_kind, decimal, date),
+                );
             }
         }
         Ok(())
@@ -9301,6 +9357,7 @@ impl SingleKeyCountSumMinMaxVectorState {
         else {
             unreachable!("vector state uses Int32 group index")
         };
+        let max_kind = self.max_kind;
         if predicate_applied {
             consume_i32_i64_decimal_date_predicate_applied_dense_block(
                 index,
@@ -9311,6 +9368,7 @@ impl SingleKeyCountSumMinMaxVectorState {
                 dates,
                 self.decimal_precision,
                 self.decimal_scale,
+                max_kind,
             );
             return Ok(());
         }
@@ -9321,33 +9379,35 @@ impl SingleKeyCountSumMinMaxVectorState {
                 if !filter.matches_i64(decimal, date) {
                     continue;
                 }
-                let group_id = count_sum_min_max_group_id_for_i32(
+                let group_id = count_sum_min_max_group_id_for_i32_with_max_kind(
                     index,
                     keys[row],
                     &mut self.groups,
                     self.decimal_precision,
                     self.decimal_scale,
+                    max_kind,
                 );
                 self.groups[group_id].update_raw_non_null(
                     sums[row],
                     i128::from(decimals[row]),
-                    dates[row],
+                    direct_count_sum_min_max_value(max_kind, i128::from(decimals[row]), dates[row]),
                 );
             }
             return Ok(());
         };
         if for_each_decimal_only_match_i64(decimals, raw_filter, |row| {
-            let group_id = count_sum_min_max_group_id_for_i32(
+            let group_id = count_sum_min_max_group_id_for_i32_with_max_kind(
                 index,
                 keys[row],
                 &mut self.groups,
                 self.decimal_precision,
                 self.decimal_scale,
+                max_kind,
             );
             self.groups[group_id].update_raw_non_null(
                 sums[row],
                 i128::from(decimals[row]),
-                dates[row],
+                direct_count_sum_min_max_value(max_kind, i128::from(decimals[row]), dates[row]),
             );
         }) {
             return Ok(());
@@ -9358,14 +9418,19 @@ impl SingleKeyCountSumMinMaxVectorState {
             if !raw_filter.matches(decimal, date) {
                 continue;
             }
-            let group_id = count_sum_min_max_group_id_for_i32(
+            let group_id = count_sum_min_max_group_id_for_i32_with_max_kind(
                 index,
                 keys[row],
                 &mut self.groups,
                 self.decimal_precision,
                 self.decimal_scale,
+                max_kind,
             );
-            self.groups[group_id].update_raw_non_null(sums[row], i128::from(decimal), date);
+            self.groups[group_id].update_raw_non_null(
+                sums[row],
+                i128::from(decimal),
+                direct_count_sum_min_max_value(max_kind, i128::from(decimal), date),
+            );
         }
         Ok(())
     }
@@ -9410,6 +9475,7 @@ impl SingleKeyCountSumMinMaxVectorState {
                 "direct primitive aggregate requires non-null date input".to_string(),
             ));
         };
+        let max_kind = self.max_kind;
         let SingleKeyCountSumMinMaxIndex::Int64 { groups: index, .. } = &mut self.group_index
         else {
             unreachable!("vector state uses Int64 group index")
@@ -9428,29 +9494,35 @@ impl SingleKeyCountSumMinMaxVectorState {
                     if !filter.matches_i64(decimal, date) {
                         continue;
                     }
-                    let group_id = count_sum_min_max_group_id_for_i64(
+                    let group_id = count_sum_min_max_group_id_for_i64_with_max_kind(
                         index,
                         keys[row],
                         &mut self.groups,
                         self.decimal_precision,
                         self.decimal_scale,
+                        max_kind,
                     );
-                    self.groups[group_id].update_raw_non_null(sums[row], i128::from(decimal), date);
+                    self.groups[group_id].update_raw_non_null(
+                        sums[row],
+                        i128::from(decimal),
+                        direct_count_sum_min_max_value(max_kind, i128::from(decimal), date),
+                    );
                 }
                 return Ok(());
             };
             if for_each_decimal_only_match_i64(decimals, raw_filter, |row| {
-                let group_id = count_sum_min_max_group_id_for_i64(
+                let group_id = count_sum_min_max_group_id_for_i64_with_max_kind(
                     index,
                     keys[row],
                     &mut self.groups,
                     self.decimal_precision,
                     self.decimal_scale,
+                    max_kind,
                 );
                 self.groups[group_id].update_raw_non_null(
                     sums[row],
                     i128::from(decimals[row]),
-                    dates[row],
+                    direct_count_sum_min_max_value(max_kind, i128::from(decimals[row]), dates[row]),
                 );
             }) {
                 return Ok(());
@@ -9461,14 +9533,19 @@ impl SingleKeyCountSumMinMaxVectorState {
                 if !raw_filter.matches(decimal, date) {
                     continue;
                 }
-                let group_id = count_sum_min_max_group_id_for_i64(
+                let group_id = count_sum_min_max_group_id_for_i64_with_max_kind(
                     index,
                     keys[row],
                     &mut self.groups,
                     self.decimal_precision,
                     self.decimal_scale,
+                    max_kind,
                 );
-                self.groups[group_id].update_raw_non_null(sums[row], i128::from(decimal), date);
+                self.groups[group_id].update_raw_non_null(
+                    sums[row],
+                    i128::from(decimal),
+                    direct_count_sum_min_max_value(max_kind, i128::from(decimal), date),
+                );
             }
         } else if let Some((decimal_bytes, decimal_len)) = decimal_values.raw_i64_bytes() {
             if keys.len() != sums.len() || keys.len() != decimal_len || keys.len() != dates.len() {
@@ -9483,14 +9560,19 @@ impl SingleKeyCountSumMinMaxVectorState {
                     if !filter.matches_i64(decimal, date) {
                         continue;
                     }
-                    let group_id = count_sum_min_max_group_id_for_i64(
+                    let group_id = count_sum_min_max_group_id_for_i64_with_max_kind(
                         index,
                         keys[row],
                         &mut self.groups,
                         self.decimal_precision,
                         self.decimal_scale,
+                        max_kind,
                     );
-                    self.groups[group_id].update_raw_non_null(sums[row], i128::from(decimal), date);
+                    self.groups[group_id].update_raw_non_null(
+                        sums[row],
+                        i128::from(decimal),
+                        direct_count_sum_min_max_value(max_kind, i128::from(decimal), date),
+                    );
                 }
                 return Ok(());
             };
@@ -9500,14 +9582,19 @@ impl SingleKeyCountSumMinMaxVectorState {
                 if !raw_filter.matches(decimal, date) {
                     continue;
                 }
-                let group_id = count_sum_min_max_group_id_for_i64(
+                let group_id = count_sum_min_max_group_id_for_i64_with_max_kind(
                     index,
                     keys[row],
                     &mut self.groups,
                     self.decimal_precision,
                     self.decimal_scale,
+                    max_kind,
                 );
-                self.groups[group_id].update_raw_non_null(sums[row], i128::from(decimal), date);
+                self.groups[group_id].update_raw_non_null(
+                    sums[row],
+                    i128::from(decimal),
+                    direct_count_sum_min_max_value(max_kind, i128::from(decimal), date),
+                );
             }
         } else {
             let decimals = decimal_values.raw_values();
@@ -9523,20 +9610,26 @@ impl SingleKeyCountSumMinMaxVectorState {
                 if !filter.matches(decimal, date) {
                     continue;
                 }
-                let group_id = count_sum_min_max_group_id_for_i64(
+                let group_id = count_sum_min_max_group_id_for_i64_with_max_kind(
                     index,
                     keys[row],
                     &mut self.groups,
                     self.decimal_precision,
                     self.decimal_scale,
+                    max_kind,
                 );
-                self.groups[group_id].update_raw_non_null(sums[row], decimal, date);
+                self.groups[group_id].update_raw_non_null(
+                    sums[row],
+                    decimal,
+                    direct_count_sum_min_max_value(max_kind, decimal, date),
+                );
             }
         }
         Ok(())
     }
 
     pub(crate) fn merge(&mut self, partial: Self) -> Result<()> {
+        let max_kind = self.max_kind;
         match &mut self.group_index {
             SingleKeyCountSumMinMaxIndex::Int32 { groups: index, .. } => {
                 for partial_group in partial.groups {
@@ -9550,12 +9643,13 @@ impl SingleKeyCountSumMinMaxVectorState {
                             "direct primitive aggregate partial key out of Int32 range".to_string(),
                         )
                     })?;
-                    let group_id = count_sum_min_max_group_id_for_i32(
+                    let group_id = count_sum_min_max_group_id_for_i32_with_max_kind(
                         index,
                         key,
                         &mut self.groups,
                         self.decimal_precision,
                         self.decimal_scale,
+                        max_kind,
                     );
                     self.groups[group_id].merge_group(partial_group);
                 }
@@ -9567,12 +9661,13 @@ impl SingleKeyCountSumMinMaxVectorState {
                             "direct primitive aggregate partial key shape mismatch".to_string(),
                         ));
                     };
-                    let group_id = count_sum_min_max_group_id_for_i64(
+                    let group_id = count_sum_min_max_group_id_for_i64_with_max_kind(
                         index,
                         key,
                         &mut self.groups,
                         self.decimal_precision,
                         self.decimal_scale,
+                        max_kind,
                     );
                     self.groups[group_id].merge_group(partial_group);
                 }
@@ -13841,6 +13936,382 @@ fn can_use_single_key_count_sum_min_max_path(
         )
 }
 
+fn can_use_two_key_count_sum_min_max_path(
+    group_by: &[String],
+    aggregates: &[AggregateExpr],
+) -> bool {
+    group_by.len() == 2
+        && matches!(
+            aggregates,
+            [
+                AggregateExpr::CountStar,
+                AggregateExpr::Sum(_),
+                AggregateExpr::Min(_),
+                AggregateExpr::Max(_)
+            ]
+        )
+}
+
+fn collect_two_key_count_sum_min_max_groups(
+    mut stream: SendableBatchStream,
+    fragments: usize,
+    group_by: &[String],
+    aggregates: &[AggregateExpr],
+) -> Result<AggregateMetrics> {
+    let (
+        AggregateExpr::CountStar,
+        AggregateExpr::Sum(sum_column),
+        AggregateExpr::Min(min_column),
+        AggregateExpr::Max(max_column),
+    ) = (
+        &aggregates[0],
+        &aggregates[1],
+        &aggregates[2],
+        &aggregates[3],
+    )
+    else {
+        unreachable!("two-key count/sum/min/max fast path precondition");
+    };
+    let mut index = TwoKeyCountSumMinMaxIndex::default();
+    let mut groups = Vec::<TwoKeyCountSumMinMaxGroup>::new();
+    let mut bound_plan = None;
+    let mut batch_partials = Vec::<Option<SingleKeyCountSumMinMaxBatchPartial>>::new();
+    let mut batch_touched = Vec::<usize>::new();
+    let mut metrics = AggregateMetrics {
+        fragments,
+        ..AggregateMetrics::default()
+    };
+    let profile = grouped_aggregate_profile_enabled();
+    let mut update_nanos = 0u64;
+
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        metrics.batches += 1;
+        metrics.rows += batch.num_rows();
+
+        let bound = match &bound_plan {
+            Some(bound) => bound,
+            None => {
+                bound_plan = Some(BoundTwoKeyCountSumMinMaxPlan::bind(
+                    &batch,
+                    &group_by[0],
+                    &group_by[1],
+                    sum_column,
+                    min_column,
+                    max_column,
+                )?);
+                bound_plan
+                    .as_ref()
+                    .expect("bound two-key count/sum/min/max plan")
+            }
+        };
+        let first_key = batch.column(bound.first_key);
+        let second_key = batch.column(bound.second_key);
+        let Some(first_key) = TwoKeyCountSumMinMaxFirstKey::new(first_key) else {
+            return collect_grouped_aggregates_generic(
+                stream,
+                fragments,
+                group_by,
+                aggregates,
+                Some(batch),
+                Some(metrics),
+            );
+        };
+        let Some(second_key) = second_key.as_any().downcast_ref::<Date32Array>() else {
+            return collect_grouped_aggregates_generic(
+                stream,
+                fragments,
+                group_by,
+                aggregates,
+                Some(batch),
+                Some(metrics),
+            );
+        };
+        let Some(sum_values) = Int64LikeArray::new(batch.column(bound.sum)) else {
+            return collect_grouped_aggregates_generic(
+                stream,
+                fragments,
+                group_by,
+                aggregates,
+                Some(batch),
+                Some(metrics),
+            );
+        };
+        let min_column_ref = batch.column(bound.min);
+        let DataType::Decimal128(decimal_precision, decimal_scale) = min_column_ref.data_type()
+        else {
+            return collect_grouped_aggregates_generic(
+                stream,
+                fragments,
+                group_by,
+                aggregates,
+                Some(batch),
+                Some(metrics),
+            );
+        };
+        let Some(min_values) = min_column_ref.as_any().downcast_ref::<Decimal128Array>() else {
+            return collect_grouped_aggregates_generic(
+                stream,
+                fragments,
+                group_by,
+                aggregates,
+                Some(batch),
+                Some(metrics),
+            );
+        };
+        let Some(max_values) = CountSumMinMaxMaxInput::new(batch.column(bound.max)) else {
+            return collect_grouped_aggregates_generic(
+                stream,
+                fragments,
+                group_by,
+                aggregates,
+                Some(batch),
+                Some(metrics),
+            );
+        };
+        if max_values.is_decimal128() && !decimal_max_count_sum_min_max_typed_enabled() {
+            return collect_grouped_aggregates_generic(
+                stream,
+                fragments,
+                group_by,
+                aggregates,
+                Some(batch),
+                Some(metrics),
+            );
+        }
+
+        let inputs_null_free = first_key.null_count() == 0
+            && second_key.null_count() == 0
+            && sum_values.null_count() == 0
+            && min_values.null_count() == 0
+            && max_values.null_count() == 0;
+        let update_started = profile.then(Instant::now);
+        if inputs_null_free {
+            for row in 0..batch.num_rows() {
+                let group_id = index.group_id(
+                    Some(first_key.value_i64_non_null(row)),
+                    Some(second_key.value(row)),
+                    &mut groups,
+                    *decimal_precision,
+                    *decimal_scale,
+                    max_values.kind(),
+                );
+                update_single_key_count_sum_min_max_partial(
+                    &mut batch_partials,
+                    &mut batch_touched,
+                    group_id,
+                    sum_values.value_non_null(row),
+                    min_values.value(row),
+                    max_values.value(row),
+                );
+            }
+            merge_two_key_count_sum_min_max_batch_partials(
+                &mut groups,
+                &mut batch_partials,
+                &mut batch_touched,
+            );
+        } else {
+            for row in 0..batch.num_rows() {
+                let group_id = index.group_id(
+                    first_key.value(row),
+                    second_key.is_valid(row).then(|| second_key.value(row)),
+                    &mut groups,
+                    *decimal_precision,
+                    *decimal_scale,
+                    max_values.kind(),
+                );
+                groups[group_id].update(&sum_values, min_values, &max_values, row);
+            }
+        }
+        if let Some(started) = update_started {
+            update_nanos = update_nanos.saturating_add(elapsed_nanos(started));
+        }
+    }
+
+    let finish_started = profile.then(Instant::now);
+    let mut group_results = groups
+        .into_iter()
+        .map(|group| group.finish(aggregates))
+        .collect::<Vec<_>>();
+    group_results.sort_by(|left, right| compare_group_keys(&left.keys, &right.keys));
+    let finish_nanos = finish_started.map(elapsed_nanos).unwrap_or(0);
+    if profile {
+        eprintln!(
+            "[dodam:aggregate-profile] two_key_count_sum_min_max_detail update={:.3}ms finish={:.3}ms groups={}",
+            update_nanos as f64 / 1_000_000.0,
+            finish_nanos as f64 / 1_000_000.0,
+            group_results.len(),
+        );
+    }
+    metrics.groups = group_results;
+    Ok(metrics)
+}
+
+struct BoundTwoKeyCountSumMinMaxPlan {
+    first_key: usize,
+    second_key: usize,
+    sum: usize,
+    min: usize,
+    max: usize,
+}
+
+impl BoundTwoKeyCountSumMinMaxPlan {
+    fn bind(
+        batch: &RecordBatch,
+        first_key: &str,
+        second_key: &str,
+        sum_column: &str,
+        min_column: &str,
+        max_column: &str,
+    ) -> Result<Self> {
+        Ok(Self {
+            first_key: column_index(batch, first_key)?,
+            second_key: column_index(batch, second_key)?,
+            sum: column_index(batch, sum_column)?,
+            min: column_index(batch, min_column)?,
+            max: column_index(batch, max_column)?,
+        })
+    }
+}
+
+enum TwoKeyCountSumMinMaxFirstKey<'a> {
+    Int32(&'a Int32Array),
+    Int64(&'a Int64Array),
+}
+
+impl<'a> TwoKeyCountSumMinMaxFirstKey<'a> {
+    fn new(column: &'a ArrayRef) -> Option<Self> {
+        match column.data_type() {
+            DataType::Int32 => Some(Self::Int32(column.as_any().downcast_ref::<Int32Array>()?)),
+            DataType::Int64 => Some(Self::Int64(column.as_any().downcast_ref::<Int64Array>()?)),
+            _ => None,
+        }
+    }
+
+    fn null_count(&self) -> usize {
+        match self {
+            Self::Int32(values) => values.null_count(),
+            Self::Int64(values) => values.null_count(),
+        }
+    }
+
+    fn value(&self, row: usize) -> Option<i64> {
+        match self {
+            Self::Int32(values) => values.is_valid(row).then(|| i64::from(values.value(row))),
+            Self::Int64(values) => values.is_valid(row).then(|| values.value(row)),
+        }
+    }
+
+    fn value_i64_non_null(&self, row: usize) -> i64 {
+        match self {
+            Self::Int32(values) => i64::from(values.value(row)),
+            Self::Int64(values) => values.value(row),
+        }
+    }
+}
+
+#[derive(Default)]
+struct TwoKeyCountSumMinMaxIndex {
+    groups: AggregateHashMap<(Option<i64>, Option<i32>), usize>,
+}
+
+impl TwoKeyCountSumMinMaxIndex {
+    fn group_id(
+        &mut self,
+        first: Option<i64>,
+        second: Option<i32>,
+        groups: &mut Vec<TwoKeyCountSumMinMaxGroup>,
+        decimal_precision: u8,
+        decimal_scale: i8,
+        max_kind: CountSumMinMaxMaxKind,
+    ) -> usize {
+        let key = (first, second);
+        if let Some(group_id) = self.groups.get(&key).copied() {
+            return group_id;
+        }
+        let group_id = groups.len();
+        self.groups.insert(key, group_id);
+        groups.push(TwoKeyCountSumMinMaxGroup::new(
+            vec![GroupValue::Int64(first), GroupValue::Date32(second)],
+            decimal_precision,
+            decimal_scale,
+            max_kind,
+        ));
+        group_id
+    }
+}
+
+struct TwoKeyCountSumMinMaxGroup {
+    keys: Vec<GroupValue>,
+    state: SingleKeyCountSumMinMaxGroup,
+}
+
+impl TwoKeyCountSumMinMaxGroup {
+    fn new(
+        keys: Vec<GroupValue>,
+        decimal_precision: u8,
+        decimal_scale: i8,
+        max_kind: CountSumMinMaxMaxKind,
+    ) -> Self {
+        Self {
+            keys,
+            state: SingleKeyCountSumMinMaxGroup::new(
+                GroupValue::Int64(None),
+                decimal_precision,
+                decimal_scale,
+                max_kind,
+            ),
+        }
+    }
+
+    fn update(
+        &mut self,
+        sum_values: &Int64LikeArray<'_>,
+        min_values: &Decimal128Array,
+        max_values: &CountSumMinMaxMaxInput<'_>,
+        row: usize,
+    ) {
+        self.state.update(sum_values, min_values, max_values, row);
+    }
+
+    fn update_raw_many(
+        &mut self,
+        count: u64,
+        sum: i64,
+        min_value: i128,
+        max_value: CountSumMinMaxMaxValue,
+    ) {
+        self.state.update_raw_many(count, sum, min_value, max_value);
+    }
+
+    fn finish(self, aggregates: &[AggregateExpr]) -> GroupAggregateResult {
+        let mut result = self.state.finish(aggregates);
+        result.keys = self.keys;
+        result
+    }
+}
+
+fn merge_two_key_count_sum_min_max_batch_partials(
+    groups: &mut [TwoKeyCountSumMinMaxGroup],
+    partials: &mut [Option<SingleKeyCountSumMinMaxBatchPartial>],
+    touched: &mut Vec<usize>,
+) {
+    for group_id in touched.drain(..) {
+        if let Some(partial) = partials[group_id].take() {
+            let max_value = partial.max_value(groups[group_id].state.max_value.kind());
+            groups[group_id].update_raw_many(
+                partial.count,
+                partial.sum,
+                partial.min_decimal,
+                max_value,
+            );
+        }
+    }
+}
+
 fn collect_single_key_count_sum_min_max_groups(
     mut stream: SendableBatchStream,
     fragments: usize,
@@ -13864,10 +14335,14 @@ fn collect_single_key_count_sum_min_max_groups(
     let mut group_index = SingleKeyCountSumMinMaxIndex::Unset;
     let mut groups = Vec::<SingleKeyCountSumMinMaxGroup>::new();
     let mut bound_plan = None;
+    let mut batch_partials = Vec::<Option<SingleKeyCountSumMinMaxBatchPartial>>::new();
+    let mut batch_touched = Vec::<usize>::new();
     let mut metrics = AggregateMetrics {
         fragments,
         ..AggregateMetrics::default()
     };
+    let profile = grouped_aggregate_profile_enabled();
+    let mut update_nanos = 0u64;
 
     while let Some(batch) = stream.next() {
         let batch = batch?;
@@ -13927,7 +14402,7 @@ fn collect_single_key_count_sum_min_max_groups(
                 Some(metrics),
             );
         };
-        let Some(max_values) = max_column_ref.as_any().downcast_ref::<Date32Array>() else {
+        let Some(max_values) = CountSumMinMaxMaxInput::new(max_column_ref) else {
             return collect_grouped_aggregates_generic(
                 stream,
                 fragments,
@@ -13937,6 +14412,16 @@ fn collect_single_key_count_sum_min_max_groups(
                 Some(metrics),
             );
         };
+        if max_values.is_decimal128() && !decimal_max_count_sum_min_max_typed_enabled() {
+            return collect_grouped_aggregates_generic(
+                stream,
+                fragments,
+                group_by,
+                aggregates,
+                Some(batch),
+                Some(metrics),
+            );
+        }
         if !matches!(
             key_column.data_type(),
             DataType::Utf8 | DataType::Int32 | DataType::Int64 | DataType::UInt64
@@ -13952,6 +14437,7 @@ fn collect_single_key_count_sum_min_max_groups(
         }
         group_index.ensure_type(key_column.data_type());
 
+        let update_started = profile.then(Instant::now);
         match &mut group_index {
             SingleKeyCountSumMinMaxIndex::Int32 {
                 groups: index,
@@ -13967,35 +14453,50 @@ fn collect_single_key_count_sum_min_max_groups(
                     && max_values.null_count() == 0
                 {
                     for row in 0..batch.num_rows() {
-                        let group_id = count_sum_min_max_group_id_for_i32(
+                        let group_id = count_sum_min_max_group_id_for_i32_with_max_kind(
                             index,
                             key_values.value(row),
                             &mut groups,
                             *decimal_precision,
                             *decimal_scale,
+                            max_values.kind(),
                         );
-                        groups[group_id].update_non_null(&sum_values, min_values, max_values, row);
+                        update_single_key_count_sum_min_max_partial(
+                            &mut batch_partials,
+                            &mut batch_touched,
+                            group_id,
+                            sum_values.value_non_null(row),
+                            min_values.value(row),
+                            max_values.value(row),
+                        );
                     }
+                    merge_single_key_count_sum_min_max_batch_partials(
+                        &mut groups,
+                        &mut batch_partials,
+                        &mut batch_touched,
+                    );
                 } else {
                     for row in 0..batch.num_rows() {
                         let group_id = if key_values.is_null(row) {
-                            count_sum_min_max_group_id_for_null(
+                            count_sum_min_max_group_id_for_null_with_max_kind(
                                 null_group,
                                 &mut groups,
                                 GroupValue::Int64(None),
                                 *decimal_precision,
                                 *decimal_scale,
+                                max_values.kind(),
                             )
                         } else {
-                            count_sum_min_max_group_id_for_i32(
+                            count_sum_min_max_group_id_for_i32_with_max_kind(
                                 index,
                                 key_values.value(row),
                                 &mut groups,
                                 *decimal_precision,
                                 *decimal_scale,
+                                max_values.kind(),
                             )
                         };
-                        groups[group_id].update(&sum_values, min_values, max_values, row);
+                        groups[group_id].update(&sum_values, min_values, &max_values, row);
                     }
                 }
             }
@@ -14013,35 +14514,50 @@ fn collect_single_key_count_sum_min_max_groups(
                     && max_values.null_count() == 0
                 {
                     for row in 0..batch.num_rows() {
-                        let group_id = count_sum_min_max_group_id_for_i64(
+                        let group_id = count_sum_min_max_group_id_for_i64_with_max_kind(
                             index,
                             key_values.value(row),
                             &mut groups,
                             *decimal_precision,
                             *decimal_scale,
+                            max_values.kind(),
                         );
-                        groups[group_id].update_non_null(&sum_values, min_values, max_values, row);
+                        update_single_key_count_sum_min_max_partial(
+                            &mut batch_partials,
+                            &mut batch_touched,
+                            group_id,
+                            sum_values.value_non_null(row),
+                            min_values.value(row),
+                            max_values.value(row),
+                        );
                     }
+                    merge_single_key_count_sum_min_max_batch_partials(
+                        &mut groups,
+                        &mut batch_partials,
+                        &mut batch_touched,
+                    );
                 } else {
                     for row in 0..batch.num_rows() {
                         let group_id = if key_values.is_null(row) {
-                            count_sum_min_max_group_id_for_null(
+                            count_sum_min_max_group_id_for_null_with_max_kind(
                                 null_group,
                                 &mut groups,
                                 GroupValue::Int64(None),
                                 *decimal_precision,
                                 *decimal_scale,
+                                max_values.kind(),
                             )
                         } else {
-                            count_sum_min_max_group_id_for_i64(
+                            count_sum_min_max_group_id_for_i64_with_max_kind(
                                 index,
                                 key_values.value(row),
                                 &mut groups,
                                 *decimal_precision,
                                 *decimal_scale,
+                                max_values.kind(),
                             )
                         };
-                        groups[group_id].update(&sum_values, min_values, max_values, row);
+                        groups[group_id].update(&sum_values, min_values, &max_values, row);
                     }
                 }
             }
@@ -14059,35 +14575,50 @@ fn collect_single_key_count_sum_min_max_groups(
                     && max_values.null_count() == 0
                 {
                     for row in 0..batch.num_rows() {
-                        let group_id = count_sum_min_max_group_id_for_u64(
+                        let group_id = count_sum_min_max_group_id_for_u64_with_max_kind(
                             index,
                             key_values.value(row),
                             &mut groups,
                             *decimal_precision,
                             *decimal_scale,
+                            max_values.kind(),
                         );
-                        groups[group_id].update_non_null(&sum_values, min_values, max_values, row);
+                        update_single_key_count_sum_min_max_partial(
+                            &mut batch_partials,
+                            &mut batch_touched,
+                            group_id,
+                            sum_values.value_non_null(row),
+                            min_values.value(row),
+                            max_values.value(row),
+                        );
                     }
+                    merge_single_key_count_sum_min_max_batch_partials(
+                        &mut groups,
+                        &mut batch_partials,
+                        &mut batch_touched,
+                    );
                 } else {
                     for row in 0..batch.num_rows() {
                         let group_id = if key_values.is_null(row) {
-                            count_sum_min_max_group_id_for_null(
+                            count_sum_min_max_group_id_for_null_with_max_kind(
                                 null_group,
                                 &mut groups,
                                 GroupValue::UInt64(None),
                                 *decimal_precision,
                                 *decimal_scale,
+                                max_values.kind(),
                             )
                         } else {
-                            count_sum_min_max_group_id_for_u64(
+                            count_sum_min_max_group_id_for_u64_with_max_kind(
                                 index,
                                 key_values.value(row),
                                 &mut groups,
                                 *decimal_precision,
                                 *decimal_scale,
+                                max_values.kind(),
                             )
                         };
-                        groups[group_id].update(&sum_values, min_values, max_values, row);
+                        groups[group_id].update(&sum_values, min_values, &max_values, row);
                     }
                 }
             }
@@ -14099,39 +14630,72 @@ fn collect_single_key_count_sum_min_max_groups(
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .expect("Utf8 group key");
-                let mut local_cache = AggregateHashMap::<&str, usize>::default();
                 let inputs_null_free = sum_values.null_count() == 0
                     && min_values.null_count() == 0
                     && max_values.null_count() == 0;
-                for row in 0..batch.num_rows() {
-                    let group_id = if key_values.is_null(row) {
-                        count_sum_min_max_group_id_for_null(
-                            null_group,
-                            &mut groups,
-                            GroupValue::Utf8(None),
-                            *decimal_precision,
-                            *decimal_scale,
-                        )
-                    } else {
-                        let key = key_values.value(row);
-                        if let Some(group_id) = local_cache.get(key).copied() {
-                            group_id
+                if inputs_null_free {
+                    let mut batch_group_ids = AggregateHashMap::<&str, usize>::default();
+                    for row in 0..batch.num_rows() {
+                        let group_id = if key_values.is_null(row) {
+                            count_sum_min_max_group_id_for_null_with_max_kind(
+                                null_group,
+                                &mut groups,
+                                GroupValue::Utf8(None),
+                                *decimal_precision,
+                                *decimal_scale,
+                                max_values.kind(),
+                            )
                         } else {
-                            let group_id = count_sum_min_max_group_id_for_utf8(
+                            let key = key_values.value(row);
+                            count_sum_min_max_group_id_for_utf8_cached_with_max_kind(
                                 index,
+                                &mut batch_group_ids,
                                 key,
                                 &mut groups,
                                 *decimal_precision,
                                 *decimal_scale,
-                            );
-                            local_cache.insert(key, group_id);
-                            group_id
-                        }
-                    };
-                    if inputs_null_free {
-                        groups[group_id].update_non_null(&sum_values, min_values, max_values, row);
-                    } else {
-                        groups[group_id].update(&sum_values, min_values, max_values, row);
+                                max_values.kind(),
+                            )
+                        };
+                        update_single_key_count_sum_min_max_partial(
+                            &mut batch_partials,
+                            &mut batch_touched,
+                            group_id,
+                            sum_values.value_non_null(row),
+                            min_values.value(row),
+                            max_values.value(row),
+                        );
+                    }
+                    merge_single_key_count_sum_min_max_batch_partials(
+                        &mut groups,
+                        &mut batch_partials,
+                        &mut batch_touched,
+                    );
+                } else {
+                    let mut batch_group_ids = AggregateHashMap::<&str, usize>::default();
+                    for row in 0..batch.num_rows() {
+                        let group_id = if key_values.is_null(row) {
+                            count_sum_min_max_group_id_for_null_with_max_kind(
+                                null_group,
+                                &mut groups,
+                                GroupValue::Utf8(None),
+                                *decimal_precision,
+                                *decimal_scale,
+                                max_values.kind(),
+                            )
+                        } else {
+                            let key = key_values.value(row);
+                            count_sum_min_max_group_id_for_utf8_cached_with_max_kind(
+                                index,
+                                &mut batch_group_ids,
+                                key,
+                                &mut groups,
+                                *decimal_precision,
+                                *decimal_scale,
+                                max_values.kind(),
+                            )
+                        };
+                        groups[group_id].update(&sum_values, min_values, &max_values, row);
                     }
                 }
             }
@@ -14139,9 +14703,22 @@ fn collect_single_key_count_sum_min_max_groups(
                 unreachable!("group index type should be initialized")
             }
         }
+        if let Some(started) = update_started {
+            update_nanos = update_nanos.saturating_add(elapsed_nanos(started));
+        }
     }
 
+    let finish_started = profile.then(Instant::now);
     metrics.groups = finish_single_key_count_sum_min_max_groups(group_index, groups, aggregates);
+    let finish_nanos = finish_started.map(elapsed_nanos).unwrap_or(0);
+    if profile {
+        eprintln!(
+            "[dodam:aggregate-profile] single_key_count_sum_min_max_detail update={:.3}ms finish={:.3}ms groups={}",
+            update_nanos as f64 / 1_000_000.0,
+            finish_nanos as f64 / 1_000_000.0,
+            metrics.groups.len(),
+        );
+    }
     Ok(metrics)
 }
 
@@ -14308,12 +14885,13 @@ impl SingleKeyCountSumMinMaxIndex {
     }
 }
 
-fn count_sum_min_max_group_id_for_null(
+fn count_sum_min_max_group_id_for_null_with_max_kind(
     null_group: &mut Option<usize>,
     groups: &mut Vec<SingleKeyCountSumMinMaxGroup>,
     key: GroupValue,
     decimal_precision: u8,
     decimal_scale: i8,
+    max_kind: CountSumMinMaxMaxKind,
 ) -> usize {
     if let Some(group_id) = *null_group {
         return group_id;
@@ -14323,17 +14901,36 @@ fn count_sum_min_max_group_id_for_null(
         key,
         decimal_precision,
         decimal_scale,
+        max_kind,
     ));
     *null_group = Some(group_id);
     group_id
 }
 
-fn count_sum_min_max_group_id_for_utf8(
+fn count_sum_min_max_group_id_for_null(
+    null_group: &mut Option<usize>,
+    groups: &mut Vec<SingleKeyCountSumMinMaxGroup>,
+    key: GroupValue,
+    decimal_precision: u8,
+    decimal_scale: i8,
+) -> usize {
+    count_sum_min_max_group_id_for_null_with_max_kind(
+        null_group,
+        groups,
+        key,
+        decimal_precision,
+        decimal_scale,
+        CountSumMinMaxMaxKind::Date32,
+    )
+}
+
+fn count_sum_min_max_group_id_for_utf8_with_max_kind(
     index: &mut AggregateHashMap<String, usize>,
     key: &str,
     groups: &mut Vec<SingleKeyCountSumMinMaxGroup>,
     decimal_precision: u8,
     decimal_scale: i8,
+    max_kind: CountSumMinMaxMaxKind,
 ) -> usize {
     if let Some(group_id) = index.get(key).copied() {
         return group_id;
@@ -14344,16 +14941,42 @@ fn count_sum_min_max_group_id_for_utf8(
         GroupValue::Utf8(Some(key.to_string())),
         decimal_precision,
         decimal_scale,
+        max_kind,
     ));
     group_id
 }
 
-fn count_sum_min_max_group_id_for_i32(
+fn count_sum_min_max_group_id_for_utf8_cached_with_max_kind<'a>(
+    index: &mut AggregateHashMap<String, usize>,
+    batch_cache: &mut AggregateHashMap<&'a str, usize>,
+    key: &'a str,
+    groups: &mut Vec<SingleKeyCountSumMinMaxGroup>,
+    decimal_precision: u8,
+    decimal_scale: i8,
+    max_kind: CountSumMinMaxMaxKind,
+) -> usize {
+    if let Some(group_id) = batch_cache.get(key).copied() {
+        return group_id;
+    }
+    let group_id = count_sum_min_max_group_id_for_utf8_with_max_kind(
+        index,
+        key,
+        groups,
+        decimal_precision,
+        decimal_scale,
+        max_kind,
+    );
+    batch_cache.insert(key, group_id);
+    group_id
+}
+
+fn count_sum_min_max_group_id_for_i32_with_max_kind(
     index: &mut DenseI32GroupIndex,
     key: i32,
     groups: &mut Vec<SingleKeyCountSumMinMaxGroup>,
     decimal_precision: u8,
     decimal_scale: i8,
+    max_kind: CountSumMinMaxMaxKind,
 ) -> usize {
     if let Some(group_id) = index.get(key) {
         return group_id;
@@ -14364,6 +14987,29 @@ fn count_sum_min_max_group_id_for_i32(
         GroupValue::Int64(Some(i64::from(key))),
         decimal_precision,
         decimal_scale,
+        max_kind,
+    ));
+    group_id
+}
+
+fn count_sum_min_max_group_id_for_i64_with_max_kind(
+    index: &mut AdaptiveCopyGroupIndex<i64>,
+    key: i64,
+    groups: &mut Vec<SingleKeyCountSumMinMaxGroup>,
+    decimal_precision: u8,
+    decimal_scale: i8,
+    max_kind: CountSumMinMaxMaxKind,
+) -> usize {
+    if let Some(group_id) = index.get(key) {
+        return group_id;
+    }
+    let group_id = groups.len();
+    index.insert(key, group_id);
+    groups.push(SingleKeyCountSumMinMaxGroup::new(
+        GroupValue::Int64(Some(key)),
+        decimal_precision,
+        decimal_scale,
+        max_kind,
     ));
     group_id
 }
@@ -14375,15 +15021,34 @@ fn count_sum_min_max_group_id_for_i64(
     decimal_precision: u8,
     decimal_scale: i8,
 ) -> usize {
+    count_sum_min_max_group_id_for_i64_with_max_kind(
+        index,
+        key,
+        groups,
+        decimal_precision,
+        decimal_scale,
+        CountSumMinMaxMaxKind::Date32,
+    )
+}
+
+fn count_sum_min_max_group_id_for_u64_with_max_kind(
+    index: &mut AdaptiveCopyGroupIndex<u64>,
+    key: u64,
+    groups: &mut Vec<SingleKeyCountSumMinMaxGroup>,
+    decimal_precision: u8,
+    decimal_scale: i8,
+    max_kind: CountSumMinMaxMaxKind,
+) -> usize {
     if let Some(group_id) = index.get(key) {
         return group_id;
     }
     let group_id = groups.len();
     index.insert(key, group_id);
     groups.push(SingleKeyCountSumMinMaxGroup::new(
-        GroupValue::Int64(Some(key)),
+        GroupValue::UInt64(Some(key)),
         decimal_precision,
         decimal_scale,
+        max_kind,
     ));
     group_id
 }
@@ -14395,17 +15060,14 @@ fn count_sum_min_max_group_id_for_u64(
     decimal_precision: u8,
     decimal_scale: i8,
 ) -> usize {
-    if let Some(group_id) = index.get(key) {
-        return group_id;
-    }
-    let group_id = groups.len();
-    index.insert(key, group_id);
-    groups.push(SingleKeyCountSumMinMaxGroup::new(
-        GroupValue::UInt64(Some(key)),
+    count_sum_min_max_group_id_for_u64_with_max_kind(
+        index,
+        key,
+        groups,
         decimal_precision,
         decimal_scale,
-    ));
-    group_id
+        CountSumMinMaxMaxKind::Date32,
+    )
 }
 
 struct SingleKeyCountSumMinMaxGroup {
@@ -14416,11 +15078,262 @@ struct SingleKeyCountSumMinMaxGroup {
     min_decimal: Option<i128>,
     decimal_precision: u8,
     decimal_scale: i8,
-    max_date32: Option<i32>,
+    max_value: CountSumMinMaxMaxState,
+}
+
+#[derive(Default)]
+struct SingleKeyCountSumMinMaxBatchPartial {
+    count: u64,
+    sum: i64,
+    min_decimal: i128,
+    max_date32: i32,
+    max_decimal: i128,
+}
+
+impl SingleKeyCountSumMinMaxBatchPartial {
+    #[inline]
+    fn update<M>(&mut self, sum_value: i64, min_value: i128, max_value: M)
+    where
+        M: Into<CountSumMinMaxMaxValue>,
+    {
+        let max_value = max_value.into();
+        if self.count == 0 {
+            self.min_decimal = min_value;
+            match max_value {
+                CountSumMinMaxMaxValue::Date32(value) => self.max_date32 = value,
+                CountSumMinMaxMaxValue::Decimal128(value) => self.max_decimal = value,
+            }
+        } else {
+            self.min_decimal = self.min_decimal.min(min_value);
+            match max_value {
+                CountSumMinMaxMaxValue::Date32(value) => {
+                    self.max_date32 = self.max_date32.max(value);
+                }
+                CountSumMinMaxMaxValue::Decimal128(value) => {
+                    self.max_decimal = self.max_decimal.max(value);
+                }
+            }
+        }
+        self.count += 1;
+        self.sum += sum_value;
+    }
+
+    fn max_value(&self, kind: CountSumMinMaxMaxKind) -> CountSumMinMaxMaxValue {
+        match kind {
+            CountSumMinMaxMaxKind::Date32 => CountSumMinMaxMaxValue::Date32(self.max_date32),
+            CountSumMinMaxMaxKind::Decimal128 { .. } => {
+                CountSumMinMaxMaxValue::Decimal128(self.max_decimal)
+            }
+        }
+    }
+}
+
+#[inline]
+fn update_single_key_count_sum_min_max_partial(
+    partials: &mut Vec<Option<SingleKeyCountSumMinMaxBatchPartial>>,
+    touched: &mut Vec<usize>,
+    group_id: usize,
+    sum_value: i64,
+    min_value: i128,
+    max_value: impl Into<CountSumMinMaxMaxValue>,
+) {
+    if partials.len() <= group_id {
+        partials.resize_with(group_id + 1, || None);
+    }
+    let partial = match &mut partials[group_id] {
+        Some(partial) => partial,
+        slot @ None => {
+            touched.push(group_id);
+            slot.insert(SingleKeyCountSumMinMaxBatchPartial::default())
+        }
+    };
+    partial.update(sum_value, min_value, max_value);
+}
+
+fn merge_single_key_count_sum_min_max_batch_partials(
+    groups: &mut [SingleKeyCountSumMinMaxGroup],
+    partials: &mut [Option<SingleKeyCountSumMinMaxBatchPartial>],
+    touched: &mut Vec<usize>,
+) {
+    for group_id in touched.drain(..) {
+        if let Some(partial) = partials[group_id].take() {
+            let max_value = partial.max_value(groups[group_id].max_value.kind());
+            groups[group_id].update_raw_many(
+                partial.count,
+                partial.sum,
+                partial.min_decimal,
+                max_value,
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CountSumMinMaxMaxKind {
+    Date32,
+    Decimal128 { precision: u8, scale: i8 },
+}
+
+#[derive(Clone, Copy)]
+enum CountSumMinMaxMaxValue {
+    Date32(i32),
+    Decimal128(i128),
+}
+
+impl From<i32> for CountSumMinMaxMaxValue {
+    fn from(value: i32) -> Self {
+        Self::Date32(value)
+    }
+}
+
+#[inline]
+fn direct_count_sum_min_max_value(
+    max_kind: CountSumMinMaxMaxKind,
+    decimal: i128,
+    date: i32,
+) -> CountSumMinMaxMaxValue {
+    match max_kind {
+        CountSumMinMaxMaxKind::Date32 => CountSumMinMaxMaxValue::Date32(date),
+        CountSumMinMaxMaxKind::Decimal128 { .. } => CountSumMinMaxMaxValue::Decimal128(decimal),
+    }
+}
+
+enum CountSumMinMaxMaxState {
+    Date32(Option<i32>),
+    Decimal128 {
+        value: Option<i128>,
+        precision: u8,
+        scale: i8,
+    },
+}
+
+impl CountSumMinMaxMaxState {
+    fn new(kind: CountSumMinMaxMaxKind) -> Self {
+        match kind {
+            CountSumMinMaxMaxKind::Date32 => Self::Date32(None),
+            CountSumMinMaxMaxKind::Decimal128 { precision, scale } => Self::Decimal128 {
+                value: None,
+                precision,
+                scale,
+            },
+        }
+    }
+
+    fn kind(&self) -> CountSumMinMaxMaxKind {
+        match self {
+            Self::Date32(_) => CountSumMinMaxMaxKind::Date32,
+            Self::Decimal128 {
+                precision, scale, ..
+            } => CountSumMinMaxMaxKind::Decimal128 {
+                precision: *precision,
+                scale: *scale,
+            },
+        }
+    }
+
+    fn update(&mut self, value: CountSumMinMaxMaxValue) {
+        match (self, value) {
+            (Self::Date32(current), CountSumMinMaxMaxValue::Date32(value)) => {
+                *current = Some(current.map_or(value, |current| current.max(value)));
+            }
+            (
+                Self::Decimal128 { value: current, .. },
+                CountSumMinMaxMaxValue::Decimal128(value),
+            ) => {
+                *current = Some(current.map_or(value, |current| current.max(value)));
+            }
+            _ => {}
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        match other {
+            Self::Date32(Some(value)) => self.update(CountSumMinMaxMaxValue::Date32(value)),
+            Self::Decimal128 {
+                value: Some(value), ..
+            } => self.update(CountSumMinMaxMaxValue::Decimal128(value)),
+            Self::Date32(None) | Self::Decimal128 { value: None, .. } => {}
+        }
+    }
+
+    fn aggregate_value(self) -> AggregateValue {
+        match self {
+            Self::Date32(value) => AggregateValue::Date32(value),
+            Self::Decimal128 {
+                value,
+                precision,
+                scale,
+            } => AggregateValue::Decimal128(value, precision, scale),
+        }
+    }
+}
+
+enum CountSumMinMaxMaxInput<'a> {
+    Date32(&'a Date32Array),
+    Decimal128(&'a Decimal128Array, u8, i8),
+}
+
+impl<'a> CountSumMinMaxMaxInput<'a> {
+    fn new(column: &'a ArrayRef) -> Option<Self> {
+        match column.data_type() {
+            DataType::Date32 => Some(Self::Date32(column.as_any().downcast_ref::<Date32Array>()?)),
+            DataType::Decimal128(precision, scale) => Some(Self::Decimal128(
+                column.as_any().downcast_ref::<Decimal128Array>()?,
+                *precision,
+                *scale,
+            )),
+            _ => None,
+        }
+    }
+
+    fn null_count(&self) -> usize {
+        match self {
+            Self::Date32(values) => values.null_count(),
+            Self::Decimal128(values, _, _) => values.null_count(),
+        }
+    }
+
+    fn is_valid(&self, row: usize) -> bool {
+        match self {
+            Self::Date32(values) => values.is_valid(row),
+            Self::Decimal128(values, _, _) => values.is_valid(row),
+        }
+    }
+
+    fn value(&self, row: usize) -> CountSumMinMaxMaxValue {
+        match self {
+            Self::Date32(values) => CountSumMinMaxMaxValue::Date32(values.value(row)),
+            Self::Decimal128(values, _, _) => CountSumMinMaxMaxValue::Decimal128(values.value(row)),
+        }
+    }
+
+    fn kind(&self) -> CountSumMinMaxMaxKind {
+        match self {
+            Self::Date32(_) => CountSumMinMaxMaxKind::Date32,
+            Self::Decimal128(_, precision, scale) => CountSumMinMaxMaxKind::Decimal128 {
+                precision: *precision,
+                scale: *scale,
+            },
+        }
+    }
+
+    fn is_decimal128(&self) -> bool {
+        matches!(self, Self::Decimal128(_, _, _))
+    }
+}
+
+fn decimal_max_count_sum_min_max_typed_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_DECIMAL_MAX_COUNT_SUM_MIN_MAX_TYPED")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 impl SingleKeyCountSumMinMaxGroup {
-    fn new(key: GroupValue, decimal_precision: u8, decimal_scale: i8) -> Self {
+    fn new(
+        key: GroupValue,
+        decimal_precision: u8,
+        decimal_scale: i8,
+        max_kind: CountSumMinMaxMaxKind,
+    ) -> Self {
         Self {
             key,
             count: 0,
@@ -14429,7 +15342,7 @@ impl SingleKeyCountSumMinMaxGroup {
             min_decimal: None,
             decimal_precision,
             decimal_scale,
-            max_date32: None,
+            max_value: CountSumMinMaxMaxState::new(max_kind),
         }
     }
 
@@ -14437,7 +15350,7 @@ impl SingleKeyCountSumMinMaxGroup {
         &mut self,
         sum_values: &Int64LikeArray<'_>,
         min_values: &Decimal128Array,
-        max_values: &Date32Array,
+        max_values: &CountSumMinMaxMaxInput<'_>,
         row: usize,
     ) {
         self.count += 1;
@@ -14453,39 +15366,14 @@ impl SingleKeyCountSumMinMaxGroup {
             });
         }
         if max_values.is_valid(row) {
-            let value = max_values.value(row);
-            self.max_date32 = Some(match self.max_date32 {
-                Some(current) => current.max(value),
-                None => value,
-            });
+            self.max_value.update(max_values.value(row));
         }
     }
 
-    fn update_non_null(
-        &mut self,
-        sum_values: &Int64LikeArray<'_>,
-        min_values: &Decimal128Array,
-        max_values: &Date32Array,
-        row: usize,
-    ) {
-        self.count += 1;
-        self.sum += sum_values.value_non_null(row);
-        self.sum_count += 1;
-
-        let min_value = min_values.value(row);
-        self.min_decimal = Some(match self.min_decimal {
-            Some(current) => current.min(min_value),
-            None => min_value,
-        });
-
-        let max_value = max_values.value(row);
-        self.max_date32 = Some(match self.max_date32 {
-            Some(current) => current.max(max_value),
-            None => max_value,
-        });
-    }
-
-    fn update_raw_non_null(&mut self, sum_value: i64, min_value: i128, max_value: i32) {
+    fn update_raw_non_null<M>(&mut self, sum_value: i64, min_value: i128, max_value: M)
+    where
+        M: Into<CountSumMinMaxMaxValue>,
+    {
         self.count += 1;
         self.sum += sum_value;
         self.sum_count += 1;
@@ -14493,13 +15381,13 @@ impl SingleKeyCountSumMinMaxGroup {
             Some(current) => current.min(min_value),
             None => min_value,
         });
-        self.max_date32 = Some(match self.max_date32 {
-            Some(current) => current.max(max_value),
-            None => max_value,
-        });
+        self.max_value.update(max_value.into());
     }
 
-    fn update_raw_many(&mut self, count: u64, sum: i64, min_value: i128, max_value: i32) {
+    fn update_raw_many<M>(&mut self, count: u64, sum: i64, min_value: i128, max_value: M)
+    where
+        M: Into<CountSumMinMaxMaxValue>,
+    {
         self.count = self.count.saturating_add(count);
         self.sum = self.sum.saturating_add(sum);
         self.sum_count = self.sum_count.saturating_add(count);
@@ -14507,10 +15395,7 @@ impl SingleKeyCountSumMinMaxGroup {
             Some(current) => current.min(min_value),
             None => min_value,
         });
-        self.max_date32 = Some(match self.max_date32 {
-            Some(current) => current.max(max_value),
-            None => max_value,
-        });
+        self.max_value.update(max_value.into());
     }
 
     fn merge_group(&mut self, partial: Self) {
@@ -14523,12 +15408,7 @@ impl SingleKeyCountSumMinMaxGroup {
                 None => value,
             });
         }
-        if let Some(value) = partial.max_date32 {
-            self.max_date32 = Some(match self.max_date32 {
-                Some(current) => current.max(value),
-                None => value,
-            });
-        }
+        self.max_value.merge(partial.max_value);
     }
 
     fn merge_partial_values(&mut self, values: &[AggregateResult]) -> Result<()> {
@@ -14581,12 +15461,15 @@ impl SingleKeyCountSumMinMaxGroup {
         }
         match max_value {
             AggregateValue::Date32(Some(value)) => {
-                self.max_date32 = Some(match self.max_date32 {
-                    Some(current) => current.max(*value),
-                    None => *value,
-                });
+                self.max_value
+                    .update(CountSumMinMaxMaxValue::Date32(*value));
             }
             AggregateValue::Date32(None) => {}
+            AggregateValue::Decimal128(Some(value), _, _) => {
+                self.max_value
+                    .update(CountSumMinMaxMaxValue::Decimal128(*value));
+            }
+            AggregateValue::Decimal128(None, _, _) => {}
             _ => {
                 return Err(DodamError::InvalidAggregate(
                     "partial count/sum/min/max max type mismatch".to_string(),
@@ -14622,7 +15505,7 @@ impl SingleKeyCountSumMinMaxGroup {
                 },
                 AggregateResult {
                     expr: aggregates[3].clone(),
-                    value: AggregateValue::Date32(self.max_date32),
+                    value: self.max_value.aggregate_value(),
                 },
             ],
         }

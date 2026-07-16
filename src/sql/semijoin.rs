@@ -1981,8 +1981,11 @@ fn collect_semijoin_i32_utf8_prefix_candidate_keys_direct(
         row_groups,
         [numeric_column, string_column],
         |numbers, dictionary_def_levels, dictionary_ids, dictionary| {
-            let selected_string_ids =
-                string_id_cache.refresh_prefix(dictionary, &mut string_ids, prefix.as_bytes())?;
+            let selected_string_ids = string_id_cache.refresh_prefix_dense(
+                dictionary,
+                &mut string_ids,
+                prefix.as_bytes(),
+            )?;
             numeric_values.reserve(numbers.len());
             let mut dictionary_value_offset = 0usize;
             match dictionary_def_levels {
@@ -1996,11 +1999,11 @@ fn collect_semijoin_i32_utf8_prefix_candidate_keys_direct(
                             return Ok(None);
                         };
                         dictionary_value_offset += 1;
-                        if usize::try_from(*dictionary_id)
-                            .ok()
-                            .and_then(|index| selected_string_ids.get(index))
-                            .and_then(|id| *id)
-                            .is_some()
+                        if *dictionary_id >= 0
+                            && selected_string_ids
+                                .get(*dictionary_id as usize)
+                                .copied()
+                                .is_some_and(|id| id != u32::MAX)
                         {
                             numeric_values.insert_i32(numbers[row]);
                         }
@@ -2008,11 +2011,11 @@ fn collect_semijoin_i32_utf8_prefix_candidate_keys_direct(
                 }
                 None => {
                     for (row, dictionary_id) in dictionary_ids.iter().copied().enumerate() {
-                        if usize::try_from(dictionary_id)
-                            .ok()
-                            .and_then(|index| selected_string_ids.get(index))
-                            .and_then(|id| *id)
-                            .is_some()
+                        if dictionary_id >= 0
+                            && selected_string_ids
+                                .get(dictionary_id as usize)
+                                .copied()
+                                .is_some_and(|id| id != u32::MAX)
                         {
                             numeric_values.insert_i32(numbers[row]);
                         }
@@ -2073,16 +2076,19 @@ fn collect_semijoin_i32_utf8_pair_set_direct(
         return Ok(Some(keys));
     }
     let mut string_id_cache = SemijoinDictionaryStringIdCache::default();
-    let metrics = engine.scan_parquet_i32_dictionary_id_columns(
+    let raw_metrics = engine.scan_parquet_i32_dictionary_id_columns_raw(
         path,
         batch_size,
         row_groups,
         [numeric_column, string_column],
-        |numbers, dictionary_def_levels, dictionary_ids, dictionary| {
-            let selected_string_ids =
-                string_id_cache.refresh_prefix(dictionary, &mut string_ids, prefix.as_bytes())?;
-            pair_values.reserve(numbers.len());
-            numeric_values.reserve(numbers.len());
+        |number_bytes, records, dictionary_def_levels, dictionary_ids, dictionary| {
+            let selected_string_ids = string_id_cache.refresh_prefix_dense(
+                dictionary,
+                &mut string_ids,
+                prefix.as_bytes(),
+            )?;
+            pair_values.reserve(records);
+            numeric_values.reserve(records);
             let mut dictionary_value_offset = 0usize;
             match dictionary_def_levels {
                 Some(levels) => {
@@ -2096,25 +2102,24 @@ fn collect_semijoin_i32_utf8_pair_set_direct(
                             return Ok(None);
                         };
                         dictionary_value_offset += 1;
-                        insert_direct_semijoin_i32_utf8_pair_value(
-                            numbers[row],
+                        insert_direct_semijoin_i32_utf8_pair_value_dense(
+                            read_i32_le_unchecked(number_bytes, row),
                             *dictionary_id,
-                            &selected_string_ids,
+                            selected_string_ids,
                             &mut pair_values,
                             &mut numeric_values,
                         );
                     }
                 }
                 None => {
-                    for (row, dictionary_id) in dictionary_ids.iter().copied().enumerate() {
-                        insert_direct_semijoin_i32_utf8_pair_value(
-                            numbers[row],
-                            dictionary_id,
-                            &selected_string_ids,
-                            &mut pair_values,
-                            &mut numeric_values,
-                        );
-                    }
+                    insert_direct_semijoin_i32_utf8_pair_batch_dense_from_bytes(
+                        number_bytes,
+                        records,
+                        dictionary_ids,
+                        selected_string_ids,
+                        &mut pair_values,
+                        &mut numeric_values,
+                    );
                     dictionary_value_offset = dictionary_ids.len();
                 }
             }
@@ -2124,6 +2129,67 @@ fn collect_semijoin_i32_utf8_pair_set_direct(
             Ok(Some(()))
         },
     )?;
+    let metrics = if raw_metrics.is_some() {
+        raw_metrics
+    } else {
+        pair_values.clear();
+        numeric_values = SemijoinNumericValues::empty_i32();
+        string_ids.clear();
+        has_null = false;
+        string_id_cache = SemijoinDictionaryStringIdCache::default();
+        engine.scan_parquet_i32_dictionary_id_columns(
+            path,
+            batch_size,
+            row_groups,
+            [numeric_column, string_column],
+            |numbers, dictionary_def_levels, dictionary_ids, dictionary| {
+                let selected_string_ids = string_id_cache.refresh_prefix_dense(
+                    dictionary,
+                    &mut string_ids,
+                    prefix.as_bytes(),
+                )?;
+                pair_values.reserve(numbers.len());
+                numeric_values.reserve(numbers.len());
+                let mut dictionary_value_offset = 0usize;
+                match dictionary_def_levels {
+                    Some(levels) => {
+                        has_null |= levels.iter().any(|level| *level == 0);
+                        for (row, level) in levels.iter().copied().enumerate() {
+                            if level == 0 {
+                                continue;
+                            }
+                            let Some(dictionary_id) = dictionary_ids.get(dictionary_value_offset)
+                            else {
+                                return Ok(None);
+                            };
+                            dictionary_value_offset += 1;
+                            insert_direct_semijoin_i32_utf8_pair_value_dense(
+                                numbers[row],
+                                *dictionary_id,
+                                selected_string_ids,
+                                &mut pair_values,
+                                &mut numeric_values,
+                            );
+                        }
+                    }
+                    None => {
+                        insert_direct_semijoin_i32_utf8_pair_batch_dense(
+                            numbers,
+                            dictionary_ids,
+                            selected_string_ids,
+                            &mut pair_values,
+                            &mut numeric_values,
+                        );
+                        dictionary_value_offset = dictionary_ids.len();
+                    }
+                }
+                if dictionary_value_offset != dictionary_ids.len() {
+                    return Ok(None);
+                }
+                Ok(Some(()))
+            },
+        )?
+    };
     if metrics.is_none() {
         if semijoin_profile_enabled() {
             eprintln!(
@@ -2180,24 +2246,23 @@ fn collect_semijoin_i32_utf8_pair_set_direct_selected_inner(
         [numeric_column, string_column],
         prefix.as_bytes(),
         |numbers, dictionary_ids, dictionary| {
-            let selected_string_ids =
-                string_id_cache.refresh_prefix(dictionary, &mut string_ids, prefix.as_bytes())?;
+            let selected_string_ids = string_id_cache.refresh_prefix_dense(
+                dictionary,
+                &mut string_ids,
+                prefix.as_bytes(),
+            )?;
             if numbers.len() != dictionary_ids.len() {
                 return Ok(None);
             }
             pair_values.reserve(numbers.len());
             numeric_values.reserve(numbers.len());
-            for (number, dictionary_id) in
-                numbers.iter().copied().zip(dictionary_ids.iter().copied())
-            {
-                insert_direct_semijoin_i32_utf8_pair_value(
-                    number,
-                    dictionary_id,
-                    selected_string_ids,
-                    &mut pair_values,
-                    &mut numeric_values,
-                );
-            }
+            insert_direct_semijoin_i32_utf8_pair_batch_dense(
+                numbers,
+                dictionary_ids,
+                selected_string_ids,
+                &mut pair_values,
+                &mut numeric_values,
+            );
             Ok(Some(()))
         },
     )?;
@@ -2301,6 +2366,7 @@ struct SemijoinDictionaryStringIdCache {
     len: usize,
     fingerprint: u64,
     ids: Vec<Option<u32>>,
+    dense_ids: Vec<u32>,
 }
 
 impl SemijoinDictionaryStringIdCache {
@@ -2321,15 +2387,29 @@ impl SemijoinDictionaryStringIdCache {
         self.len = dictionary.len();
         self.fingerprint = fingerprint;
         self.ids.clear();
+        self.dense_ids.clear();
         self.ids.reserve(dictionary.len());
+        self.dense_ids.reserve(dictionary.len());
         for value in dictionary {
-            self.ids.push(if value.as_ref().starts_with(prefix) {
-                Some(semijoin_intern_string_id(string_ids, value.as_ref())?)
+            let id = if value.as_ref().starts_with(prefix) {
+                semijoin_intern_string_id(string_ids, value.as_ref())?
             } else {
-                None
-            });
+                u32::MAX
+            };
+            self.ids.push((id != u32::MAX).then_some(id));
+            self.dense_ids.push(id);
         }
         Ok(&self.ids)
+    }
+
+    fn refresh_prefix_dense<'a>(
+        &'a mut self,
+        dictionary: &[bytes::Bytes],
+        string_ids: &mut FastHashMap<Vec<u8>, u32>,
+        prefix: &[u8],
+    ) -> Result<&'a [u32]> {
+        let _ = self.refresh_prefix(dictionary, string_ids, prefix)?;
+        Ok(&self.dense_ids)
     }
 
     fn refresh_existing<'a>(
@@ -2348,12 +2428,14 @@ impl SemijoinDictionaryStringIdCache {
         self.len = dictionary.len();
         self.fingerprint = fingerprint;
         self.ids.clear();
+        self.dense_ids.clear();
         self.ids.reserve(dictionary.len());
-        self.ids.extend(
-            dictionary
-                .iter()
-                .map(|value| string_ids.get(value.as_ref()).copied()),
-        );
+        self.dense_ids.reserve(dictionary.len());
+        for value in dictionary {
+            let id = string_ids.get(value.as_ref()).copied();
+            self.ids.push(id);
+            self.dense_ids.push(id.unwrap_or(u32::MAX));
+        }
         &self.ids
     }
 }
@@ -2371,21 +2453,79 @@ fn semijoin_dictionary_fingerprint(dictionary: &[bytes::Bytes]) -> u64 {
     hash
 }
 
-fn insert_direct_semijoin_i32_utf8_pair_value(
+fn insert_direct_semijoin_i32_utf8_pair_value_dense(
     number: i32,
     dictionary_id: i32,
-    selected_string_ids: &[Option<u32>],
+    selected_string_ids: &[u32],
     pair_values: &mut Vec<(i32, u32)>,
     numeric_values: &mut SemijoinNumericValues,
 ) {
     let Ok(dictionary_id) = usize::try_from(dictionary_id) else {
         return;
     };
-    let Some(Some(string_id)) = selected_string_ids.get(dictionary_id) else {
+    let Some(&string_id) = selected_string_ids.get(dictionary_id) else {
         return;
     };
+    if string_id == u32::MAX {
+        return;
+    }
     numeric_values.insert_i32(number);
-    pair_values.push((number, *string_id));
+    pair_values.push((number, string_id));
+}
+
+fn insert_direct_semijoin_i32_utf8_pair_batch_dense(
+    numbers: &[i32],
+    dictionary_ids: &[i32],
+    selected_string_ids: &[u32],
+    pair_values: &mut Vec<(i32, u32)>,
+    numeric_values: &mut SemijoinNumericValues,
+) {
+    let rows = numbers.len().min(dictionary_ids.len());
+    for row in 0..rows {
+        let dictionary_id = dictionary_ids[row];
+        if dictionary_id < 0 {
+            continue;
+        }
+        let dictionary_id = dictionary_id as usize;
+        if dictionary_id >= selected_string_ids.len() {
+            continue;
+        }
+        let string_id = selected_string_ids[dictionary_id];
+        if string_id == u32::MAX {
+            continue;
+        }
+        let number = numbers[row];
+        numeric_values.insert_i32(number);
+        pair_values.push((number, string_id));
+    }
+}
+
+fn insert_direct_semijoin_i32_utf8_pair_batch_dense_from_bytes(
+    number_bytes: &[u8],
+    records: usize,
+    dictionary_ids: &[i32],
+    selected_string_ids: &[u32],
+    pair_values: &mut Vec<(i32, u32)>,
+    numeric_values: &mut SemijoinNumericValues,
+) {
+    let rows = records.min(dictionary_ids.len());
+    for row in 0..rows {
+        let dictionary_id = dictionary_ids[row];
+        if dictionary_id < 0 {
+            continue;
+        }
+        let dictionary_id = dictionary_id as usize;
+        if dictionary_id >= selected_string_ids.len() {
+            continue;
+        }
+        let string_id = selected_string_ids[dictionary_id];
+        if string_id == u32::MAX {
+            continue;
+        }
+        let number = read_i32_le_unchecked(number_bytes, row);
+        numeric_values.insert_i32(number);
+        pair_values.push((number, string_id));
+    }
 }
 
 fn semijoin_like_prefix_filter(filter: Option<&FilterExpr>) -> Option<(&str, &str)> {
@@ -2766,7 +2906,7 @@ fn direct_mixed_tuple_semijoin_outer_has_match(
                 for (number, dictionary_id) in
                     numbers.iter().copied().zip(dictionary_ids.iter().copied())
                 {
-                    if direct_mixed_tuple_semijoin_dictionary_row_matches(
+                    if direct_mixed_tuple_semijoin_selected_dictionary_row_matches(
                         number,
                         dictionary_id,
                         selected_string_ids,
@@ -2786,12 +2926,12 @@ fn direct_mixed_tuple_semijoin_outer_has_match(
             return Ok(Some(found));
         }
     }
-    let metrics = engine.scan_parquet_i32_dictionary_id_columns(
+    let raw_metrics = engine.scan_parquet_i32_dictionary_id_columns_raw(
         path,
         batch_size,
         &row_groups,
         [numeric_column, string_column],
-        |numbers, dictionary_def_levels, dictionary_ids, dictionary| {
+        |number_bytes, _records, dictionary_def_levels, dictionary_ids, dictionary| {
             let selected_string_ids =
                 string_id_cache.refresh_existing(dictionary, &keys.string_ids);
             let mut dictionary_value_offset = 0usize;
@@ -2807,7 +2947,7 @@ fn direct_mixed_tuple_semijoin_outer_has_match(
                         };
                         dictionary_value_offset += 1;
                         if direct_mixed_tuple_semijoin_dictionary_row_matches(
-                            numbers[row],
+                            read_i32_le_unchecked(number_bytes, row),
                             *dictionary_id,
                             &selected_string_ids,
                             keys,
@@ -2820,7 +2960,7 @@ fn direct_mixed_tuple_semijoin_outer_has_match(
                 None => {
                     for (row, dictionary_id) in dictionary_ids.iter().copied().enumerate() {
                         if direct_mixed_tuple_semijoin_dictionary_row_matches(
-                            numbers[row],
+                            read_i32_le_unchecked(number_bytes, row),
                             dictionary_id,
                             &selected_string_ids,
                             keys,
@@ -2838,6 +2978,62 @@ fn direct_mixed_tuple_semijoin_outer_has_match(
             Ok(Some(()))
         },
     )?;
+    let metrics = if raw_metrics.is_some() {
+        raw_metrics
+    } else {
+        engine.scan_parquet_i32_dictionary_id_columns(
+            path,
+            batch_size,
+            &row_groups,
+            [numeric_column, string_column],
+            |numbers, dictionary_def_levels, dictionary_ids, dictionary| {
+                let selected_string_ids =
+                    string_id_cache.refresh_existing(dictionary, &keys.string_ids);
+                let mut dictionary_value_offset = 0usize;
+                match dictionary_def_levels {
+                    Some(levels) => {
+                        for (row, level) in levels.iter().copied().enumerate() {
+                            if level == 0 {
+                                continue;
+                            }
+                            let Some(dictionary_id) = dictionary_ids.get(dictionary_value_offset)
+                            else {
+                                return Ok(None);
+                            };
+                            dictionary_value_offset += 1;
+                            if direct_mixed_tuple_semijoin_dictionary_row_matches(
+                                numbers[row],
+                                *dictionary_id,
+                                &selected_string_ids,
+                                keys,
+                            ) {
+                                found = true;
+                                return Ok(Some(()));
+                            }
+                        }
+                    }
+                    None => {
+                        for (row, dictionary_id) in dictionary_ids.iter().copied().enumerate() {
+                            if direct_mixed_tuple_semijoin_dictionary_row_matches(
+                                numbers[row],
+                                dictionary_id,
+                                &selected_string_ids,
+                                keys,
+                            ) {
+                                found = true;
+                                return Ok(Some(()));
+                            }
+                        }
+                        dictionary_value_offset = dictionary_ids.len();
+                    }
+                }
+                if dictionary_value_offset != dictionary_ids.len() {
+                    return Ok(None);
+                }
+                Ok(Some(()))
+            },
+        )?
+    };
     if metrics.is_none() {
         let metrics = engine.scan_parquet_i32_byte_array_columns(
             path,
@@ -3023,6 +3219,19 @@ fn direct_mixed_tuple_semijoin_dictionary_row_matches(
     if !keys.numeric_values.contains_i32(number) {
         return false;
     }
+    let number = i64::from(number);
+    usize::try_from(dictionary_id)
+        .ok()
+        .and_then(|dictionary_id| selected_string_ids.get(dictionary_id).copied().flatten())
+        .is_some_and(|string_id| keys.values.contains(number, string_id))
+}
+
+fn direct_mixed_tuple_semijoin_selected_dictionary_row_matches(
+    number: i32,
+    dictionary_id: i32,
+    selected_string_ids: &[Option<u32>],
+    keys: &SemijoinI64Utf8PairKeys,
+) -> bool {
     let number = i64::from(number);
     usize::try_from(dictionary_id)
         .ok()

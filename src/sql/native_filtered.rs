@@ -95,11 +95,12 @@ pub(super) fn collect_native_filtered_aggregates(
             NativeFilteredGroupKeys::I64(values) => values.null_count() == 0,
             NativeFilteredGroupKeys::Other => false,
         };
-        let direct_predicates = if direct_group_path {
-            native_filtered_batch_direct_predicates(&batch, &specs)?
-        } else {
-            None
-        };
+        let direct_predicates =
+            if direct_group_path && !native_filtered_direct_predicates_disabled() {
+                native_filtered_batch_direct_predicates(&batch, &specs, false)?
+            } else {
+                None
+            };
         let masks = if direct_predicates.is_some() {
             Vec::new()
         } else {
@@ -334,6 +335,16 @@ fn native_filtered_update_i32_group_direct_predicates(
     dense: &mut Vec<Option<Vec<NativeFilteredAggregateState>>>,
     groups: &mut HashMap<GroupValue, Vec<NativeFilteredAggregateState>>,
 ) -> Result<()> {
+    if native_filtered_update_i32_group_direct_predicates_columnar_batch(
+        values, predicates, inputs, specs, dense,
+    )? {
+        return Ok(());
+    }
+    if native_filtered_update_i32_group_direct_predicates_dense(
+        values, predicates, inputs, specs, dense,
+    )? {
+        return Ok(());
+    }
     native_filtered_update_integer_group_direct_predicates(
         values.len(),
         |row| i64::from(values.value(row)),
@@ -345,6 +356,109 @@ fn native_filtered_update_i32_group_direct_predicates(
     )
 }
 
+fn native_filtered_update_i32_group_direct_predicates_columnar_batch(
+    values: &Int32Array,
+    predicates: &[NativeFilteredDirectPredicate],
+    inputs: &[NativeFilteredBatchInput],
+    specs: &[NativeFilteredAggregateSpec],
+    dense: &mut Vec<Option<Vec<NativeFilteredAggregateState>>>,
+) -> Result<bool> {
+    if !native_filtered_columnar_direct_enabled()
+        || values.len() == 0
+        || values.null_count() != 0
+        || specs.is_empty()
+    {
+        return Ok(false);
+    }
+    let mut max_key = 0usize;
+    for row in 0..values.len() {
+        let key = values.value(row);
+        if key < 0 {
+            return Ok(false);
+        }
+        max_key = max_key.max(key as usize);
+    }
+    if max_key > native_filtered_eager_dense_max_key() {
+        return Ok(false);
+    }
+    let Some(mut columnar) = native_filtered_columnar_agg_states(specs, inputs, max_key + 1) else {
+        return Ok(false);
+    };
+    let mut present = vec![false; max_key + 1];
+    for row in 0..values.len() {
+        let key = values.value(row) as usize;
+        present[key] = true;
+    }
+    for ((state, predicate), input) in columnar.iter_mut().zip(predicates).zip(inputs) {
+        state.update_with_i32_keys(predicate, input, values);
+    }
+    if dense.len() <= max_key {
+        dense.resize_with(max_key + 1, || None);
+    }
+    for (key, present) in present.into_iter().enumerate() {
+        if !present {
+            continue;
+        }
+        let states = dense[key].get_or_insert_with(|| native_filtered_initial_states(specs));
+        for (target, source) in states.iter_mut().zip(&columnar) {
+            source.merge_into(target, key);
+        }
+    }
+    Ok(true)
+}
+
+fn native_filtered_update_i32_group_direct_predicates_dense(
+    values: &Int32Array,
+    predicates: &[NativeFilteredDirectPredicate],
+    inputs: &[NativeFilteredBatchInput],
+    specs: &[NativeFilteredAggregateSpec],
+    dense: &mut Vec<Option<Vec<NativeFilteredAggregateState>>>,
+) -> Result<bool> {
+    if values.len() == 0 || values.null_count() != 0 {
+        return Ok(true);
+    }
+    let mut max_key = 0usize;
+    for row in 0..values.len() {
+        let key = values.value(row);
+        if key < 0 {
+            return Ok(false);
+        }
+        max_key = max_key.max(key as usize);
+    }
+    if max_key > native_filtered_eager_dense_max_key() {
+        return Ok(false);
+    }
+    if dense.len() <= max_key {
+        dense.resize_with(max_key + 1, || None);
+    }
+    let mut present_keys = vec![false; max_key + 1];
+    for row in 0..values.len() {
+        present_keys[values.value(row) as usize] = true;
+    }
+    for (key, present) in present_keys.into_iter().enumerate() {
+        if present && dense[key].is_none() {
+            dense[key] = Some(native_filtered_initial_states(specs));
+        }
+    }
+    if let Some(row_masks) = native_filtered_direct_predicate_row_masks(predicates, values.len()) {
+        native_filtered_update_i32_dense_row_masks(values, &row_masks, inputs, specs, dense)?;
+        return Ok(true);
+    }
+    for row in 0..values.len() {
+        let states = dense[values.value(row) as usize]
+            .as_mut()
+            .expect("eager dense group initialized");
+        for (index, ((spec, predicate), input)) in
+            specs.iter().zip(predicates).zip(inputs).enumerate()
+        {
+            if predicate.selected(row) {
+                native_filtered_update_state_fast_direct(&mut states[index], spec, input, row)?;
+            }
+        }
+    }
+    Ok(true)
+}
+
 fn native_filtered_update_i64_group_direct_predicates(
     values: &Int64Array,
     predicates: &[NativeFilteredDirectPredicate],
@@ -353,6 +467,11 @@ fn native_filtered_update_i64_group_direct_predicates(
     dense: &mut Vec<Option<Vec<NativeFilteredAggregateState>>>,
     groups: &mut HashMap<GroupValue, Vec<NativeFilteredAggregateState>>,
 ) -> Result<()> {
+    if native_filtered_update_i64_group_direct_predicates_dense(
+        values, predicates, inputs, specs, dense,
+    )? {
+        return Ok(());
+    }
     native_filtered_update_integer_group_direct_predicates(
         values.len(),
         |row| values.value(row),
@@ -362,6 +481,295 @@ fn native_filtered_update_i64_group_direct_predicates(
         dense,
         groups,
     )
+}
+
+enum NativeFilteredColumnarAggState {
+    Count(Vec<u64>),
+    SumI64 { sums: Vec<i64>, counts: Vec<u64> },
+    AvgI64 { sums: Vec<i64>, counts: Vec<u64> },
+}
+
+impl NativeFilteredColumnarAggState {
+    fn new(
+        spec: &NativeFilteredAggregateSpec,
+        input: &NativeFilteredBatchInput,
+        groups: usize,
+    ) -> Option<Self> {
+        match (&spec.expr, input) {
+            (
+                AggregateExpr::Count(_),
+                NativeFilteredBatchInput::AlwaysSome
+                | NativeFilteredBatchInput::NonNull
+                | NativeFilteredBatchInput::I64Array(_)
+                | NativeFilteredBatchInput::I32Array(_),
+            ) => Some(Self::Count(vec![0; groups])),
+            (
+                AggregateExpr::Sum(_),
+                NativeFilteredBatchInput::I64Array(_) | NativeFilteredBatchInput::I32Array(_),
+            ) => Some(Self::SumI64 {
+                sums: vec![0; groups],
+                counts: vec![0; groups],
+            }),
+            (
+                AggregateExpr::Avg(_),
+                NativeFilteredBatchInput::I64Array(_) | NativeFilteredBatchInput::I32Array(_),
+            ) => Some(Self::AvgI64 {
+                sums: vec![0; groups],
+                counts: vec![0; groups],
+            }),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn update(&mut self, input: &NativeFilteredBatchInput, key: usize, row: usize) {
+        match self {
+            Self::Count(counts) => match input {
+                NativeFilteredBatchInput::AlwaysSome | NativeFilteredBatchInput::NonNull => {
+                    counts[key] += 1;
+                }
+                NativeFilteredBatchInput::I64Array(values) => {
+                    if values.is_valid(row) {
+                        counts[key] += 1;
+                    }
+                }
+                NativeFilteredBatchInput::I32Array(values) => {
+                    if values.is_valid(row) {
+                        counts[key] += 1;
+                    }
+                }
+                NativeFilteredBatchInput::Other(_) => {}
+            },
+            Self::SumI64 { sums, counts } | Self::AvgI64 { sums, counts } => match input {
+                NativeFilteredBatchInput::I64Array(values) => {
+                    if values.is_valid(row) {
+                        sums[key] += values.value(row);
+                        counts[key] += 1;
+                    }
+                }
+                NativeFilteredBatchInput::I32Array(values) => {
+                    if values.is_valid(row) {
+                        sums[key] += i64::from(values.value(row));
+                        counts[key] += 1;
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+
+    fn update_with_i32_keys(
+        &mut self,
+        predicate: &NativeFilteredDirectPredicate,
+        input: &NativeFilteredBatchInput,
+        keys: &Int32Array,
+    ) {
+        for row in 0..keys.len() {
+            if predicate.selected(row) {
+                let key = keys.value(row) as usize;
+                self.update(input, key, row);
+            }
+        }
+    }
+
+    fn merge_into(&self, target: &mut NativeFilteredAggregateState, key: usize) {
+        match (self, target) {
+            (Self::Count(counts), NativeFilteredAggregateState::Count(count)) => {
+                *count = count.saturating_add(counts[key]);
+            }
+            (
+                Self::SumI64 { sums, counts },
+                NativeFilteredAggregateState::SumI64 { sum, count },
+            )
+            | (
+                Self::AvgI64 { sums, counts },
+                NativeFilteredAggregateState::AvgI64 { sum, count },
+            ) => {
+                *sum = sum.saturating_add(sums[key]);
+                *count = count.saturating_add(counts[key]);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn native_filtered_columnar_agg_states(
+    specs: &[NativeFilteredAggregateSpec],
+    inputs: &[NativeFilteredBatchInput],
+    groups: usize,
+) -> Option<Vec<NativeFilteredColumnarAggState>> {
+    specs
+        .iter()
+        .zip(inputs)
+        .map(|(spec, input)| NativeFilteredColumnarAggState::new(spec, input, groups))
+        .collect()
+}
+
+fn native_filtered_columnar_direct_enabled() -> bool {
+    !std::env::var("DODAM_DISABLE_NATIVE_FILTERED_COLUMNAR_DIRECT")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn native_filtered_update_i64_group_direct_predicates_dense(
+    values: &Int64Array,
+    predicates: &[NativeFilteredDirectPredicate],
+    inputs: &[NativeFilteredBatchInput],
+    specs: &[NativeFilteredAggregateSpec],
+    dense: &mut Vec<Option<Vec<NativeFilteredAggregateState>>>,
+) -> Result<bool> {
+    if values.len() == 0 || values.null_count() != 0 {
+        return Ok(true);
+    }
+    let mut max_key = 0usize;
+    for row in 0..values.len() {
+        let key = values.value(row);
+        if key < 0 {
+            return Ok(false);
+        }
+        let Ok(key) = usize::try_from(key) else {
+            return Ok(false);
+        };
+        max_key = max_key.max(key);
+    }
+    if max_key > native_filtered_eager_dense_max_key() {
+        return Ok(false);
+    }
+    if dense.len() <= max_key {
+        dense.resize_with(max_key + 1, || None);
+    }
+    let mut present_keys = vec![false; max_key + 1];
+    for row in 0..values.len() {
+        present_keys[values.value(row) as usize] = true;
+    }
+    for (key, present) in present_keys.into_iter().enumerate() {
+        if present && dense[key].is_none() {
+            dense[key] = Some(native_filtered_initial_states(specs));
+        }
+    }
+    if let Some(row_masks) = native_filtered_direct_predicate_row_masks(predicates, values.len()) {
+        native_filtered_update_i64_dense_row_masks(values, &row_masks, inputs, specs, dense)?;
+        return Ok(true);
+    }
+    for row in 0..values.len() {
+        let states = dense[values.value(row) as usize]
+            .as_mut()
+            .expect("eager dense group initialized");
+        for (index, ((spec, predicate), input)) in
+            specs.iter().zip(predicates).zip(inputs).enumerate()
+        {
+            if predicate.selected(row) {
+                native_filtered_update_state_fast_direct(&mut states[index], spec, input, row)?;
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn native_filtered_direct_predicate_row_masks(
+    predicates: &[NativeFilteredDirectPredicate],
+    rows: usize,
+) -> Option<Vec<u8>> {
+    if predicates.is_empty() || predicates.len() > u8::BITS as usize {
+        return None;
+    }
+    let mut masks = vec![0u8; rows];
+    for (index, predicate) in predicates.iter().enumerate() {
+        let bit = 1u8 << index;
+        match predicate {
+            NativeFilteredDirectPredicate::Precomputed(selected) => {
+                if selected.len() < rows {
+                    return None;
+                }
+                for row in 0..rows {
+                    if selected[row] {
+                        masks[row] |= bit;
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(masks)
+}
+
+fn native_filtered_update_i32_dense_row_masks(
+    values: &Int32Array,
+    row_masks: &[u8],
+    inputs: &[NativeFilteredBatchInput],
+    specs: &[NativeFilteredAggregateSpec],
+    dense: &mut [Option<Vec<NativeFilteredAggregateState>>],
+) -> Result<()> {
+    for row in 0..values.len() {
+        let mut mask = row_masks[row];
+        if mask == 0 {
+            continue;
+        }
+        let states = dense[values.value(row) as usize]
+            .as_mut()
+            .expect("eager dense group initialized");
+        while mask != 0 {
+            let index = mask.trailing_zeros() as usize;
+            if !native_filtered_update_state_infallible(&mut states[index], &inputs[index], row) {
+                native_filtered_update_state_fast(
+                    &mut states[index],
+                    &specs[index],
+                    &inputs[index],
+                    row,
+                )?;
+            }
+            mask &= mask - 1;
+        }
+    }
+    Ok(())
+}
+
+fn native_filtered_update_i64_dense_row_masks(
+    values: &Int64Array,
+    row_masks: &[u8],
+    inputs: &[NativeFilteredBatchInput],
+    specs: &[NativeFilteredAggregateSpec],
+    dense: &mut [Option<Vec<NativeFilteredAggregateState>>],
+) -> Result<()> {
+    for row in 0..values.len() {
+        let mut mask = row_masks[row];
+        if mask == 0 {
+            continue;
+        }
+        let states = dense[values.value(row) as usize]
+            .as_mut()
+            .expect("eager dense group initialized");
+        while mask != 0 {
+            let index = mask.trailing_zeros() as usize;
+            if !native_filtered_update_state_infallible(&mut states[index], &inputs[index], row) {
+                native_filtered_update_state_fast(
+                    &mut states[index],
+                    &specs[index],
+                    &inputs[index],
+                    row,
+                )?;
+            }
+            mask &= mask - 1;
+        }
+    }
+    Ok(())
+}
+
+fn native_filtered_eager_dense_max_key() -> usize {
+    std::env::var("DODAM_NATIVE_FILTERED_EAGER_DENSE_MAX_KEY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(65_536)
+        .min(NATIVE_FILTERED_MAX_DENSE_GROUP_KEY)
+}
+
+fn native_filtered_direct_predicates_disabled() -> bool {
+    std::env::var("DODAM_DISABLE_NATIVE_FILTERED_DIRECT_PREDICATES")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn native_filtered_precomputed_direct_predicates_enabled() -> bool {
+    !std::env::var("DODAM_DISABLE_NATIVE_FILTERED_PRECOMPUTED_DIRECT_PREDICATES")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 fn native_filtered_update_integer_group_direct_predicates(
@@ -379,7 +787,7 @@ fn native_filtered_update_integer_group_direct_predicates(
             specs.iter().zip(predicates).zip(inputs).enumerate()
         {
             if predicate.selected(row) {
-                native_filtered_update_state_fast(&mut states[index], spec, input, row)?;
+                native_filtered_update_state_fast_direct(&mut states[index], spec, input, row)?;
             }
         }
     }
@@ -767,6 +1175,7 @@ impl NativeFilteredBatchMask {
 }
 
 enum NativeFilteredDirectPredicate {
+    Precomputed(Vec<bool>),
     IsNotNull(ArrayRef),
     I32Compare {
         values: Int32Array,
@@ -793,6 +1202,7 @@ enum NativeFilteredDirectPredicate {
 impl NativeFilteredDirectPredicate {
     fn selected(&self, row: usize) -> bool {
         match self {
+            Self::Precomputed(selected) => selected.get(row).copied().unwrap_or(false),
             Self::IsNotNull(values) => values.is_valid(row),
             Self::I32Compare {
                 values,
@@ -856,15 +1266,33 @@ fn native_filtered_compare_i128(left: i128, op: &BinaryOperator, right: i128) ->
 fn native_filtered_batch_direct_predicates(
     batch: &RecordBatch,
     specs: &[NativeFilteredAggregateSpec],
+    precompute: bool,
 ) -> Result<Option<Vec<NativeFilteredDirectPredicate>>> {
     let mut predicates = Vec::with_capacity(specs.len());
     for spec in specs {
         let Some(predicate) = native_filtered_direct_predicate(batch, &spec.condition)? else {
             return Ok(None);
         };
-        predicates.push(predicate);
+        predicates.push(if precompute {
+            native_filtered_maybe_precompute_direct_predicate(predicate, batch.num_rows())
+        } else {
+            predicate
+        });
     }
     Ok(Some(predicates))
+}
+
+fn native_filtered_maybe_precompute_direct_predicate(
+    predicate: NativeFilteredDirectPredicate,
+    rows: usize,
+) -> NativeFilteredDirectPredicate {
+    if !native_filtered_precomputed_direct_predicates_enabled() || rows == 0 {
+        return predicate;
+    }
+    let selected = (0..rows)
+        .map(|row| predicate.selected(row))
+        .collect::<Vec<_>>();
+    NativeFilteredDirectPredicate::Precomputed(selected)
 }
 
 fn native_filtered_direct_predicate(
@@ -1249,6 +1677,68 @@ fn native_filtered_update_state_fast(
         NativeFilteredAggregateState::MinI64(_) | NativeFilteredAggregateState::MaxI64(_) => {
             native_filtered_update_state(state, spec, input, row)
         }
+    }
+}
+
+#[inline]
+fn native_filtered_update_state_fast_direct(
+    state: &mut NativeFilteredAggregateState,
+    spec: &NativeFilteredAggregateSpec,
+    input: &NativeFilteredBatchInput,
+    row: usize,
+) -> Result<()> {
+    if native_filtered_update_state_infallible(state, input, row) {
+        Ok(())
+    } else {
+        native_filtered_update_state_fast(state, spec, input, row)
+    }
+}
+
+#[inline]
+fn native_filtered_update_state_infallible(
+    state: &mut NativeFilteredAggregateState,
+    input: &NativeFilteredBatchInput,
+    row: usize,
+) -> bool {
+    match state {
+        NativeFilteredAggregateState::Count(count) => match input {
+            NativeFilteredBatchInput::AlwaysSome | NativeFilteredBatchInput::NonNull => {
+                *count += 1;
+                true
+            }
+            NativeFilteredBatchInput::I64Array(values) => {
+                if !values.is_null(row) {
+                    *count += 1;
+                }
+                true
+            }
+            NativeFilteredBatchInput::I32Array(values) => {
+                if !values.is_null(row) {
+                    *count += 1;
+                }
+                true
+            }
+            NativeFilteredBatchInput::Other(_) => false,
+        },
+        NativeFilteredAggregateState::SumI64 { sum, count }
+        | NativeFilteredAggregateState::AvgI64 { sum, count } => match input {
+            NativeFilteredBatchInput::I64Array(values) => {
+                if !values.is_null(row) {
+                    *sum += values.value(row);
+                    *count += 1;
+                }
+                true
+            }
+            NativeFilteredBatchInput::I32Array(values) => {
+                if !values.is_null(row) {
+                    *sum += i64::from(values.value(row));
+                    *count += 1;
+                }
+                true
+            }
+            _ => false,
+        },
+        NativeFilteredAggregateState::MinI64(_) | NativeFilteredAggregateState::MaxI64(_) => false,
     }
 }
 
