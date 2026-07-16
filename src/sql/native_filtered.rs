@@ -521,54 +521,58 @@ impl NativeFilteredColumnarAggState {
         }
     }
 
-    #[inline]
-    fn update(&mut self, input: &NativeFilteredBatchInput, key: usize, row: usize) {
-        match self {
-            Self::Count(counts) => match input {
-                NativeFilteredBatchInput::AlwaysSome | NativeFilteredBatchInput::NonNull => {
-                    counts[key] += 1;
-                }
-                NativeFilteredBatchInput::I64Array(values) => {
-                    if values.is_valid(row) {
-                        counts[key] += 1;
-                    }
-                }
-                NativeFilteredBatchInput::I32Array(values) => {
-                    if values.is_valid(row) {
-                        counts[key] += 1;
-                    }
-                }
-                NativeFilteredBatchInput::Other(_) => {}
-            },
-            Self::SumI64 { sums, counts } | Self::AvgI64 { sums, counts } => match input {
-                NativeFilteredBatchInput::I64Array(values) => {
-                    if values.is_valid(row) {
-                        sums[key] += values.value(row);
-                        counts[key] += 1;
-                    }
-                }
-                NativeFilteredBatchInput::I32Array(values) => {
-                    if values.is_valid(row) {
-                        sums[key] += i64::from(values.value(row));
-                        counts[key] += 1;
-                    }
-                }
-                _ => {}
-            },
-        }
-    }
-
     fn update_with_i32_keys(
         &mut self,
         predicate: &NativeFilteredDirectPredicate,
         input: &NativeFilteredBatchInput,
         keys: &Int32Array,
     ) {
-        for row in 0..keys.len() {
-            if predicate.selected(row) {
-                let key = keys.value(row) as usize;
-                self.update(input, key, row);
-            }
+        match self {
+            Self::Count(counts) => match input {
+                NativeFilteredBatchInput::AlwaysSome | NativeFilteredBatchInput::NonNull => {
+                    for row in 0..keys.len() {
+                        if predicate.selected(row) {
+                            counts[keys.value(row) as usize] += 1;
+                        }
+                    }
+                }
+                NativeFilteredBatchInput::I64Array(values) => {
+                    for row in 0..keys.len() {
+                        if predicate.selected(row) && values.is_valid(row) {
+                            counts[keys.value(row) as usize] += 1;
+                        }
+                    }
+                }
+                NativeFilteredBatchInput::I32Array(values) => {
+                    for row in 0..keys.len() {
+                        if predicate.selected(row) && values.is_valid(row) {
+                            counts[keys.value(row) as usize] += 1;
+                        }
+                    }
+                }
+                NativeFilteredBatchInput::Other(_) => {}
+            },
+            Self::SumI64 { sums, counts } | Self::AvgI64 { sums, counts } => match input {
+                NativeFilteredBatchInput::I64Array(values) => {
+                    for row in 0..keys.len() {
+                        if predicate.selected(row) && values.is_valid(row) {
+                            let key = keys.value(row) as usize;
+                            sums[key] += values.value(row);
+                            counts[key] += 1;
+                        }
+                    }
+                }
+                NativeFilteredBatchInput::I32Array(values) => {
+                    for row in 0..keys.len() {
+                        if predicate.selected(row) && values.is_valid(row) {
+                            let key = keys.value(row) as usize;
+                            sums[key] += i64::from(values.value(row));
+                            counts[key] += 1;
+                        }
+                    }
+                }
+                _ => {}
+            },
         }
     }
 

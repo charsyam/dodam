@@ -2755,24 +2755,24 @@ fn semijoin_i64_utf8_pair_mask(
             semijoin_dictionary_existing_string_ids(dictionary, &keys.string_ids);
         if let Some(local_string_ids) = local_string_ids {
             let dictionary_keys = dictionary.keys();
-            return Ok(BooleanArray::from(
-                (0..batch.num_rows())
-                    .map(|row| {
-                        if !semijoin_i64_array_is_valid(&numbers, row) || dictionary.is_null(row) {
-                            return Some(false);
-                        }
-                        let number = semijoin_i64_array_value(&numbers, row);
-                        if !keys.numeric_values.contains_i64(number) {
-                            return Some(negated);
-                        }
-                        let matched = usize::try_from(dictionary_keys[row])
-                            .ok()
-                            .and_then(|local_id| local_string_ids.get(local_id).copied().flatten())
-                            .is_some_and(|string_id| keys.values.contains(number, string_id));
-                        Some(if negated { !matched } else { matched })
-                    })
-                    .collect::<Vec<_>>(),
-            ));
+            let mut selected = BooleanBufferBuilder::new(batch.num_rows());
+            for row in 0..batch.num_rows() {
+                if !semijoin_i64_array_is_valid(&numbers, row) || dictionary.is_null(row) {
+                    selected.append(false);
+                    continue;
+                }
+                let number = semijoin_i64_array_value(&numbers, row);
+                if !keys.numeric_values.contains_i64(number) {
+                    selected.append(negated);
+                    continue;
+                }
+                let matched = usize::try_from(dictionary_keys[row])
+                    .ok()
+                    .and_then(|local_id| local_string_ids.get(local_id).copied().flatten())
+                    .is_some_and(|string_id| keys.values.contains(number, string_id));
+                selected.append(if negated { !matched } else { matched });
+            }
+            return Ok(BooleanArray::new(selected.finish(), None));
         }
     }
     let Some(strings) = string_array else {
@@ -2780,24 +2780,24 @@ fn semijoin_i64_utf8_pair_mask(
             "integer/string semijoin dictionary values must be Utf8".to_string(),
         ));
     };
-    Ok(BooleanArray::from(
-        (0..batch.num_rows())
-            .map(|row| {
-                if !semijoin_i64_array_is_valid(&numbers, row) || strings.is_null(row) {
-                    return Some(false);
-                }
-                let number = semijoin_i64_array_value(&numbers, row);
-                if !keys.numeric_values.contains_i64(number) {
-                    return Some(negated);
-                }
-                let matched = keys
-                    .string_ids
-                    .get(strings.value(row).as_bytes())
-                    .is_some_and(|string_id| keys.values.contains(number, *string_id));
-                Some(if negated { !matched } else { matched })
-            })
-            .collect::<Vec<_>>(),
-    ))
+    let mut selected = BooleanBufferBuilder::new(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        if !semijoin_i64_array_is_valid(&numbers, row) || strings.is_null(row) {
+            selected.append(false);
+            continue;
+        }
+        let number = semijoin_i64_array_value(&numbers, row);
+        if !keys.numeric_values.contains_i64(number) {
+            selected.append(negated);
+            continue;
+        }
+        let matched = keys
+            .string_ids
+            .get(strings.value(row).as_bytes())
+            .is_some_and(|string_id| keys.values.contains(number, *string_id));
+        selected.append(if negated { !matched } else { matched });
+    }
+    Ok(BooleanArray::new(selected.finish(), None))
 }
 
 fn semijoin_mixed_early_empty_probe_accepts(
