@@ -1073,6 +1073,12 @@ struct SemijoinI64Utf8PairKeys {
     has_null: bool,
 }
 
+struct SemijoinMixedPrefixCandidateKeys {
+    numeric_values: SemijoinNumericValues,
+    string_ids: FastHashMap<Vec<u8>, u32>,
+    numeric_left: bool,
+}
+
 enum SemijoinNumericValues {
     I64(FastHashSet<i64>),
     I32(FastHashSet<i32>),
@@ -1876,6 +1882,135 @@ fn collect_semijoin_i64_utf8_pair_set_direct(
     Ok(None)
 }
 
+fn collect_semijoin_mixed_prefix_candidate_keys_direct(
+    engine: &DodamEngine,
+    path: &Path,
+    left_column: &str,
+    right_column: &str,
+    filter: Option<&FilterExpr>,
+    batch_size: usize,
+) -> Result<Option<SemijoinMixedPrefixCandidateKeys>> {
+    let Some((filter_column, prefix)) = semijoin_like_prefix_filter(filter) else {
+        return Ok(None);
+    };
+    let row_groups = (0..engine.parquet_row_group_count(path)?).collect::<Vec<_>>();
+    if row_groups.is_empty() {
+        return Ok(Some(SemijoinMixedPrefixCandidateKeys {
+            numeric_values: SemijoinNumericValues::empty_i32(),
+            string_ids: FastHashMap::default(),
+            numeric_left: true,
+        }));
+    }
+    if filter_column == right_column {
+        collect_semijoin_i32_utf8_prefix_candidate_keys_direct(
+            engine,
+            path,
+            batch_size,
+            &row_groups,
+            left_column,
+            right_column,
+            prefix,
+            true,
+        )
+    } else if filter_column == left_column {
+        collect_semijoin_i32_utf8_prefix_candidate_keys_direct(
+            engine,
+            path,
+            batch_size,
+            &row_groups,
+            right_column,
+            left_column,
+            prefix,
+            false,
+        )
+    } else {
+        Ok(None)
+    }
+}
+
+fn collect_semijoin_i32_utf8_prefix_candidate_keys_direct(
+    engine: &DodamEngine,
+    path: &Path,
+    batch_size: usize,
+    row_groups: &[usize],
+    numeric_column: &str,
+    string_column: &str,
+    prefix: &str,
+    numeric_left: bool,
+) -> Result<Option<SemijoinMixedPrefixCandidateKeys>> {
+    let mut numeric_values = SemijoinNumericValues::empty_i32();
+    let mut string_ids = FastHashMap::<Vec<u8>, u32>::default();
+    let mut string_id_cache = SemijoinDictionaryStringIdCache::default();
+    let metrics = engine.scan_parquet_i32_dictionary_id_columns(
+        path,
+        batch_size,
+        row_groups,
+        [numeric_column, string_column],
+        |numbers, dictionary_def_levels, dictionary_ids, dictionary| {
+            let selected_string_ids =
+                string_id_cache.refresh_prefix(dictionary, &mut string_ids, prefix.as_bytes())?;
+            numeric_values.reserve(numbers.len());
+            let mut dictionary_value_offset = 0usize;
+            match dictionary_def_levels {
+                Some(levels) => {
+                    for (row, level) in levels.iter().copied().enumerate() {
+                        if level == 0 {
+                            continue;
+                        }
+                        let Some(dictionary_id) = dictionary_ids.get(dictionary_value_offset)
+                        else {
+                            return Ok(None);
+                        };
+                        dictionary_value_offset += 1;
+                        if usize::try_from(*dictionary_id)
+                            .ok()
+                            .and_then(|index| selected_string_ids.get(index))
+                            .and_then(|id| *id)
+                            .is_some()
+                        {
+                            numeric_values.insert_i32(numbers[row]);
+                        }
+                    }
+                }
+                None => {
+                    for (row, dictionary_id) in dictionary_ids.iter().copied().enumerate() {
+                        if usize::try_from(dictionary_id)
+                            .ok()
+                            .and_then(|index| selected_string_ids.get(index))
+                            .and_then(|id| *id)
+                            .is_some()
+                        {
+                            numeric_values.insert_i32(numbers[row]);
+                        }
+                    }
+                    dictionary_value_offset = dictionary_ids.len();
+                }
+            }
+            if dictionary_value_offset != dictionary_ids.len() {
+                return Ok(None);
+            }
+            Ok(Some(()))
+        },
+    )?;
+    if metrics.is_none() {
+        return Ok(None);
+    }
+    numeric_values = numeric_values.optimize_dense_i32();
+    if semijoin_profile_enabled() {
+        eprintln!(
+            "[dodam:semijoin-profile] mixed-prefix-precheck rhs numeric_values={} strings={} numeric={}",
+            numeric_values.len(),
+            string_ids.len(),
+            numeric_values.kind()
+        );
+    }
+    Ok(Some(SemijoinMixedPrefixCandidateKeys {
+        numeric_values,
+        string_ids,
+        numeric_left,
+    }))
+}
+
 fn collect_semijoin_i32_utf8_pair_set_direct(
     engine: &DodamEngine,
     path: &Path,
@@ -2243,6 +2378,16 @@ fn semijoin_like_prefix_filter(filter: Option<&FilterExpr>) -> Option<(&str, &st
     Some((column.as_str(), prefix))
 }
 
+fn semijoin_filter_prefers_mixed_tuple(
+    filter: Option<&FilterExpr>,
+    left_column: &str,
+    right_column: &str,
+) -> bool {
+    semijoin_like_prefix_filter(filter)
+        .map(|(column, _)| column == left_column || column == right_column)
+        .unwrap_or(false)
+}
+
 enum SemijoinI64Array<'a> {
     I32(&'a Int32Array),
     I64(&'a Int64Array),
@@ -2507,6 +2652,32 @@ fn semijoin_mixed_early_empty_probe_accepts(
     Ok(accepted)
 }
 
+fn semijoin_mixed_prefix_precheck_accepts(
+    engine: &DodamEngine,
+    path: &Path,
+    keys: &SemijoinMixedPrefixCandidateKeys,
+) -> Result<bool> {
+    if std::env::var_os("DODAM_DISABLE_MIXED_TUPLE_PREFIX_PRECHECK").is_some() {
+        return Ok(false);
+    }
+    let total_rows = engine.parquet_total_row_count(path)?;
+    if total_rows == 0 {
+        return Ok(true);
+    }
+    let ratio = keys.numeric_values.len() as f64 / total_rows as f64;
+    let accepted = ratio <= mixed_tuple_early_empty_max_numeric_ratio();
+    if semijoin_profile_enabled() {
+        eprintln!(
+            "[dodam:semijoin-profile] mixed-prefix-precheck numeric_values={} total_rows={} ratio={:.6} accepted={}",
+            keys.numeric_values.len(),
+            total_rows,
+            ratio,
+            accepted
+        );
+    }
+    Ok(accepted)
+}
+
 fn mixed_tuple_early_empty_max_numeric_ratio() -> f64 {
     std::env::var("DODAM_MIXED_TUPLE_EARLY_EMPTY_MAX_NUMERIC_RATIO")
         .ok()
@@ -2677,6 +2848,132 @@ fn direct_mixed_tuple_semijoin_outer_has_match(
     }
     if semijoin_profile_enabled() {
         eprintln!("[dodam:semijoin-profile] mixed-early-empty found={found}");
+    }
+    Ok(Some(found))
+}
+
+fn direct_mixed_tuple_semijoin_outer_has_prefix_candidate(
+    engine: &DodamEngine,
+    path: &Path,
+    batch_size: usize,
+    left_column: &str,
+    right_column: &str,
+    keys: &SemijoinMixedPrefixCandidateKeys,
+    outer_filter: Option<&FilterExpr>,
+) -> Result<Option<bool>> {
+    let (numeric_column, string_column) = if keys.numeric_left {
+        (left_column, right_column)
+    } else {
+        (right_column, left_column)
+    };
+    if keys.numeric_values.len() == 0 || keys.string_ids.is_empty() {
+        return Ok(Some(false));
+    }
+    if !semijoin_direct_outer_filter_compatible(outer_filter, string_column) {
+        return Ok(None);
+    }
+    let row_groups = (0..engine.parquet_row_group_count(path)?).collect::<Vec<_>>();
+    if row_groups.is_empty() {
+        return Ok(Some(false));
+    }
+    let mut found = false;
+    let mut string_id_cache = SemijoinDictionaryStringIdCache::default();
+    if std::env::var_os("DODAM_DISABLE_MIXED_TUPLE_NUMERIC_SELECTED_OUTER").is_none() {
+        let metrics = engine.scan_parquet_i32_byte_array_selected_by_i32(
+            path,
+            &row_groups,
+            [numeric_column, string_column],
+            |number| keys.numeric_values.contains_i32(number),
+            |numbers, dictionary_ids, dictionary| {
+                let selected_string_ids =
+                    string_id_cache.refresh_existing(dictionary, &keys.string_ids);
+                if numbers.len() != dictionary_ids.len() {
+                    return Ok(None);
+                }
+                for dictionary_id in dictionary_ids.iter().copied() {
+                    if usize::try_from(dictionary_id)
+                        .ok()
+                        .and_then(|index| selected_string_ids.get(index))
+                        .and_then(|id| *id)
+                        .is_some()
+                    {
+                        found = true;
+                        return Ok(Some(()));
+                    }
+                }
+                Ok(Some(()))
+            },
+        )?;
+        if metrics.is_some() {
+            if semijoin_profile_enabled() {
+                eprintln!("[dodam:semijoin-profile] mixed-prefix-precheck outer_found={found}");
+            }
+            return Ok(Some(found));
+        }
+    }
+    let metrics = engine.scan_parquet_i32_dictionary_id_columns(
+        path,
+        batch_size,
+        &row_groups,
+        [numeric_column, string_column],
+        |numbers, dictionary_def_levels, dictionary_ids, dictionary| {
+            let selected_string_ids =
+                string_id_cache.refresh_existing(dictionary, &keys.string_ids);
+            let mut dictionary_value_offset = 0usize;
+            match dictionary_def_levels {
+                Some(levels) => {
+                    for (row, level) in levels.iter().copied().enumerate() {
+                        if level == 0 {
+                            continue;
+                        }
+                        let Some(dictionary_id) = dictionary_ids.get(dictionary_value_offset)
+                        else {
+                            return Ok(None);
+                        };
+                        dictionary_value_offset += 1;
+                        if !keys.numeric_values.contains_i32(numbers[row]) {
+                            continue;
+                        }
+                        if usize::try_from(*dictionary_id)
+                            .ok()
+                            .and_then(|index| selected_string_ids.get(index))
+                            .and_then(|id| *id)
+                            .is_some()
+                        {
+                            found = true;
+                            return Ok(Some(()));
+                        }
+                    }
+                }
+                None => {
+                    for (row, dictionary_id) in dictionary_ids.iter().copied().enumerate() {
+                        if !keys.numeric_values.contains_i32(numbers[row]) {
+                            continue;
+                        }
+                        if usize::try_from(dictionary_id)
+                            .ok()
+                            .and_then(|index| selected_string_ids.get(index))
+                            .and_then(|id| *id)
+                            .is_some()
+                        {
+                            found = true;
+                            return Ok(Some(()));
+                        }
+                    }
+                    dictionary_value_offset = dictionary_ids.len();
+                }
+            }
+            if dictionary_value_offset != dictionary_ids.len() {
+                return Ok(None);
+            }
+            Ok(Some(()))
+        },
+    )?;
+    if metrics.is_none() {
+        return Ok(None);
+    }
+    if semijoin_profile_enabled() {
+        eprintln!("[dodam:semijoin-profile] mixed-prefix-precheck outer_found={found}");
     }
     Ok(Some(found))
 }
@@ -4660,20 +4957,53 @@ async fn try_execute_uncorrelated_i64_pair_in_semijoin_sql(
         return Ok(Some(QueryOutput::Scan { batches }));
     }
 
-    let inner_started = profile.then(Instant::now);
-    let pair_set = match collect_semijoin_i64_pair_set(
-        engine,
-        inner_path.path.clone(),
-        &inner_left,
-        &inner_right,
-        inner_filter.clone(),
-        batch_size,
-    )
-    .await
+    if std::env::var_os("DODAM_MIXED_TUPLE_PREFIX_PRECHECK").is_some()
+        && !negated
+        && !distinct
+        && parsed_projection.aggregates.is_empty()
+        && group_by.is_empty()
+        && select.having.is_none()
+        && !projection_requires_expression_path(&parsed_projection.expressions)
     {
-        Ok(values) => TupleSemijoinPairSet::I64(values),
-        Err(DodamError::UnsupportedSql(message)) if message.contains("integer semijoin key") => {
-            if let Some(values) = collect_semijoin_i64_utf8_pair_set(
+        let precheck_started = profile.then(Instant::now);
+        if let Some(candidate_keys) = collect_semijoin_mixed_prefix_candidate_keys_direct(
+            engine,
+            &inner_path.path,
+            &inner_left,
+            &inner_right,
+            inner_filter.as_ref(),
+            batch_size,
+        )? && semijoin_mixed_prefix_precheck_accepts(engine, &outer_path.path, &candidate_keys)?
+            && let Some(false) = direct_mixed_tuple_semijoin_outer_has_prefix_candidate(
+                engine,
+                &outer_path.path,
+                batch_size,
+                &outer_left,
+                &outer_right,
+                &candidate_keys,
+                outer_filter.as_ref(),
+            )?
+        {
+            if let (true, Some(total_started)) = (profile, total_started) {
+                eprintln!(
+                    "[dodam:semijoin-profile] kind=tuple-in total={}ms inner={}ms outer=0ms projection=0ms output_rows=0 negated={} branch=mixed-prefix-empty",
+                    total_started.elapsed().as_millis(),
+                    precheck_started
+                        .map(|started| started.elapsed().as_millis())
+                        .unwrap_or(0),
+                    negated,
+                );
+            }
+            return Ok(Some(QueryOutput::Scan {
+                batches: Vec::new(),
+            }));
+        }
+    }
+
+    let inner_started = profile.then(Instant::now);
+    let pair_set =
+        if semijoin_filter_prefers_mixed_tuple(inner_filter.as_ref(), &inner_left, &inner_right)
+            && let Some(values) = collect_semijoin_i64_utf8_pair_set(
                 engine,
                 inner_path.path.clone(),
                 &inner_left,
@@ -4682,24 +5012,51 @@ async fn try_execute_uncorrelated_i64_pair_in_semijoin_sql(
                 batch_size,
             )
             .await?
+        {
+            TupleSemijoinPairSet::I64Utf8(values)
+        } else {
+            match collect_semijoin_i64_pair_set(
+                engine,
+                inner_path.path.clone(),
+                &inner_left,
+                &inner_right,
+                inner_filter.clone(),
+                batch_size,
+            )
+            .await
             {
-                TupleSemijoinPairSet::I64Utf8(values)
-            } else {
-                TupleSemijoinPairSet::Literal(
-                    collect_semijoin_literal_pair_set(
+                Ok(values) => TupleSemijoinPairSet::I64(values),
+                Err(DodamError::UnsupportedSql(message))
+                    if message.contains("integer semijoin key") =>
+                {
+                    if let Some(values) = collect_semijoin_i64_utf8_pair_set(
                         engine,
-                        inner_path.path,
+                        inner_path.path.clone(),
                         &inner_left,
                         &inner_right,
-                        inner_filter,
+                        inner_filter.clone(),
                         batch_size,
                     )
-                    .await?,
-                )
+                    .await?
+                    {
+                        TupleSemijoinPairSet::I64Utf8(values)
+                    } else {
+                        TupleSemijoinPairSet::Literal(
+                            collect_semijoin_literal_pair_set(
+                                engine,
+                                inner_path.path,
+                                &inner_left,
+                                &inner_right,
+                                inner_filter,
+                                batch_size,
+                            )
+                            .await?,
+                        )
+                    }
+                }
+                Err(error) => return Err(error),
             }
-        }
-        Err(error) => return Err(error),
-    };
+        };
     let inner_elapsed = inner_started.map(|started| started.elapsed());
     if negated && pair_set.has_null() {
         return Ok(None);
@@ -4713,7 +5070,9 @@ async fn try_execute_uncorrelated_i64_pair_in_semijoin_sql(
         && !projection_requires_expression_path(&parsed_projection.expressions)
         && let TupleSemijoinPairSet::I64Utf8(keys) = &pair_set
         && semijoin_mixed_early_empty_probe_accepts(engine, &outer_path.path, keys)?
-        && let Some(false) = direct_mixed_tuple_semijoin_outer_has_match(
+    {
+        let outer_started = profile.then(Instant::now);
+        if let Some(false) = direct_mixed_tuple_semijoin_outer_has_match(
             engine,
             &outer_path.path,
             batch_size,
@@ -4721,21 +5080,25 @@ async fn try_execute_uncorrelated_i64_pair_in_semijoin_sql(
             &outer_right,
             keys,
             outer_filter.as_ref(),
-        )?
-    {
-        if let (true, Some(total_started)) = (profile, total_started) {
-            eprintln!(
-                "[dodam:semijoin-profile] kind=tuple-in total={}ms inner={}ms outer=0ms projection=0ms output_rows=0 negated={} branch=mixed-direct-empty",
-                total_started.elapsed().as_millis(),
-                inner_elapsed
-                    .map(|elapsed| elapsed.as_millis())
-                    .unwrap_or(0),
-                negated,
-            );
+        )? {
+            let outer_elapsed = outer_started.map(|started| started.elapsed());
+            if let (true, Some(total_started)) = (profile, total_started) {
+                eprintln!(
+                    "[dodam:semijoin-profile] kind=tuple-in total={}ms inner={}ms outer={}ms projection=0ms output_rows=0 negated={} branch=mixed-direct-empty",
+                    total_started.elapsed().as_millis(),
+                    inner_elapsed
+                        .map(|elapsed| elapsed.as_millis())
+                        .unwrap_or(0),
+                    outer_elapsed
+                        .map(|elapsed| elapsed.as_millis())
+                        .unwrap_or(0),
+                    negated,
+                );
+            }
+            return Ok(Some(QueryOutput::Scan {
+                batches: Vec::new(),
+            }));
         }
-        return Ok(Some(QueryOutput::Scan {
-            batches: Vec::new(),
-        }));
     }
 
     if !distinct

@@ -1957,7 +1957,6 @@ impl DodamEngine {
     where
         F: FnMut(&[i32], &[i64], Option<&[i16]>, &[i32], &[bytes::Bytes]) -> Result<Option<()>>,
     {
-        let planning_start = Instant::now();
         let metrics = scan_parquet_i32_i64_dictionary_id_columns_with_store(
             path,
             batch_size,
@@ -1968,11 +1967,6 @@ impl DodamEngine {
             consume,
         )?;
         if let Some(metrics) = metrics {
-            let planning_nanos = elapsed_nanos(planning_start.elapsed());
-            let metrics = DirectColumnScanMetrics {
-                read_nanos: metrics.read_nanos.saturating_add(planning_nanos),
-                ..metrics
-            };
             log_direct_column_scan_profile(path, &columns, "i32-dictionary-id", &metrics);
             return Ok(Some(metrics));
         }
@@ -1990,7 +1984,6 @@ impl DodamEngine {
     where
         F: FnMut(&[i32], Option<&[i16]>, &[i32], &[bytes::Bytes]) -> Result<Option<()>>,
     {
-        let planning_start = Instant::now();
         let metrics = scan_parquet_i32_dictionary_id_columns_with_store(
             path,
             batch_size,
@@ -2001,11 +1994,6 @@ impl DodamEngine {
             consume,
         )?;
         if let Some(metrics) = metrics {
-            let planning_nanos = elapsed_nanos(planning_start.elapsed());
-            let metrics = DirectColumnScanMetrics {
-                read_nanos: metrics.read_nanos.saturating_add(planning_nanos),
-                ..metrics
-            };
             log_direct_column_scan_profile(path, &columns, "i32-dictionary-id", &metrics);
             return Ok(Some(metrics));
         }
@@ -7481,12 +7469,14 @@ fn log_direct_column_scan_profile(
         .unwrap_or("scan");
     let columns = columns.join(",");
     eprintln!(
-        "[dodam:direct-column-profile] kind={label} {table}[{columns}]: row_groups={} rows={} batches={} read={:.3} ms consume={:.3} ms",
+        "[dodam:direct-column-profile] kind={label} {table}[{columns}]: row_groups={} rows={} batches={} read={:.3} ms consume={:.3} ms dict_read={:.3} ms numeric_read={:.3} ms",
         metrics.row_groups,
         metrics.rows,
         metrics.batches,
         nanos_to_millis(metrics.read_nanos),
         nanos_to_millis(metrics.consume_nanos),
+        nanos_to_millis(metrics.selected_predicate_nanos),
+        nanos_to_millis(metrics.selected_payload_nanos),
     );
 }
 

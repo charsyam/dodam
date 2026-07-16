@@ -3102,7 +3102,9 @@ where
         else {
             return Ok(None);
         };
-        metrics.add_read_nanos(elapsed_nanos(read_started));
+        let dictionary_read_nanos = elapsed_nanos(read_started);
+        metrics.add_read_nanos(dictionary_read_nanos);
+        metrics.add_selected_predicate_nanos(dictionary_read_nanos);
 
         let mut numeric_reader = match row_group.get_column_reader(numeric_column)? {
             ColumnReader::Int32ColumnReader(reader) => reader,
@@ -3122,7 +3124,9 @@ where
                 None,
                 &mut numeric_values,
             )?;
-            metrics.add_read_nanos(elapsed_nanos(read_started));
+            let numeric_read_nanos = elapsed_nanos(read_started);
+            metrics.add_read_nanos(numeric_read_nanos);
+            metrics.add_selected_payload_nanos(numeric_read_nanos);
             if records == 0 {
                 break;
             }
