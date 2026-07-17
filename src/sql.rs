@@ -103,6 +103,7 @@ mod literal_values;
 mod literals;
 mod metadata_predicate;
 mod native_filtered;
+mod profiling;
 mod projection_types;
 mod projection_utils;
 mod query_features;
@@ -159,6 +160,10 @@ use native_filtered::{
     NativeFilteredAggregateSpec, collect_native_filtered_aggregates,
     legacy_case_filtered_aggregate_specs, native_filtered_input_kind,
 };
+use profiling::{
+    generic_profile_elapsed, generic_profile_start, semijoin_profile_enabled, sql_elapsed_nanos,
+    sql_nanos_to_millis, tpch_profile_elapsed, tpch_profile_enabled, tpch_profile_start,
+};
 use projection_types::{
     GroupExpressionBinding, ParsedProjection, ProjectionExpression, ScalarSqlExpression,
 };
@@ -202,32 +207,6 @@ pub use types::{
     SqlSinkExecutionProfile,
 };
 use window::try_execute_window_sql;
-
-fn tpch_profile_enabled() -> bool {
-    std::env::var("DODAM_TPCH_PROFILE")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-}
-
-fn tpch_profile_start() -> Option<Instant> {
-    tpch_profile_enabled().then(Instant::now)
-}
-
-fn tpch_profile_elapsed(label: &str, started: Option<Instant>) {
-    if let Some(started) = started {
-        eprintln!(
-            "[dodam:tpch-profile] {label}: {:.3} ms",
-            started.elapsed().as_secs_f64() * 1000.0
-        );
-    }
-}
-
-fn sql_elapsed_nanos(started: Instant) -> u64 {
-    started.elapsed().as_nanos().min(u64::MAX as u128) as u64
-}
-
-fn sql_nanos_to_millis(nanos: u64) -> f64 {
-    nanos as f64 / 1_000_000.0
-}
 
 const DEFAULT_MAX_DENSE_I64_KEY: usize = 20_000_000;
 const DEFAULT_Q09_ORDER_YEAR_DENSE_BYTES: usize = 384 * 1024 * 1024;
@@ -734,11 +713,6 @@ pub async fn execute_sql_with_options(
     )?;
     let batches = rename_output_batches(batches, &query.aliases)?;
     Ok(QueryOutput::Scan { batches })
-}
-
-fn semijoin_profile_enabled() -> bool {
-    std::env::var("DODAM_SEMIJOIN_PROFILE")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 async fn try_execute_monotonic_row_group_order_limit_scan(
@@ -49081,21 +49055,6 @@ fn apply_output_expression_projection(
             )?)
         })
         .collect()
-}
-
-fn generic_profile_start() -> Option<Instant> {
-    std::env::var("DODAM_GENERIC_PROFILE")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .then(Instant::now)
-}
-
-fn generic_profile_elapsed(label: &str, started: Option<Instant>) {
-    if let Some(started) = started {
-        eprintln!(
-            "[dodam:generic-profile] {label}: {:.3} ms",
-            started.elapsed().as_secs_f64() * 1000.0
-        );
-    }
 }
 
 #[derive(Clone)]
