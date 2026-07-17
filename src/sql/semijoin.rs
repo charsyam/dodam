@@ -1357,6 +1357,10 @@ impl SemijoinI64Utf8PairValues {
             Self::DenseI32ToU32 { .. } => "i32-u32-dense",
         }
     }
+
+    fn is_dense_i32_to_u32(&self) -> bool {
+        matches!(self, Self::DenseI32ToU32 { .. })
+    }
 }
 
 fn mixed_tuple_dense_pair_max_span_factor() -> usize {
@@ -3059,13 +3063,19 @@ fn semijoin_mixed_early_empty_probe_accepts(
         return Ok(true);
     }
     let ratio = keys.numeric_values.len() as f64 / total_rows as f64;
-    let accepted = ratio <= mixed_tuple_early_empty_max_numeric_ratio()
-        && keys.values.len() <= mixed_tuple_early_empty_max_pairs();
+    let max_pairs = if keys.values.is_dense_i32_to_u32() && keys.string_ids.len() <= 64 {
+        mixed_tuple_early_empty_max_dense_pairs()
+    } else {
+        mixed_tuple_early_empty_max_pairs()
+    };
+    let accepted =
+        ratio <= mixed_tuple_early_empty_max_numeric_ratio() && keys.values.len() <= max_pairs;
     if semijoin_profile_enabled() {
         eprintln!(
-            "[dodam:semijoin-profile] mixed-early-empty numeric_values={} pairs={} total_rows={} ratio={:.6} accepted={}",
+            "[dodam:semijoin-profile] mixed-early-empty numeric_values={} pairs={} max_pairs={} total_rows={} ratio={:.6} accepted={}",
             keys.numeric_values.len(),
             keys.values.len(),
+            max_pairs,
             total_rows,
             ratio,
             accepted
@@ -3114,6 +3124,13 @@ fn mixed_tuple_early_empty_max_pairs() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(4096)
+}
+
+fn mixed_tuple_early_empty_max_dense_pairs() -> usize {
+    std::env::var("DODAM_MIXED_TUPLE_EARLY_EMPTY_MAX_DENSE_PAIRS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(200_000)
 }
 
 fn direct_mixed_tuple_semijoin_outer_has_match(

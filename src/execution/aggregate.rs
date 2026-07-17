@@ -9148,6 +9148,25 @@ impl SingleKeyCountSumMinMaxVectorState {
         }
     }
 
+    pub(crate) fn new_utf8_with_max_kind(
+        aggregates: Vec<AggregateExpr>,
+        decimal_precision: u8,
+        decimal_scale: i8,
+        max_kind: CountSumMinMaxMaxKind,
+    ) -> Self {
+        Self {
+            aggregates,
+            decimal_precision,
+            decimal_scale,
+            max_kind,
+            group_index: SingleKeyCountSumMinMaxIndex::Utf8 {
+                groups: AggregateHashMap::default(),
+                null_group: None,
+            },
+            groups: Vec::new(),
+        }
+    }
+
     pub(crate) fn consume_i32_i64_decimal_date_batch(
         &mut self,
         batch: BatchView<'_>,
@@ -9338,6 +9357,115 @@ impl SingleKeyCountSumMinMaxVectorState {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn consume_dictionary_i64_decimal_date_slices(
+        &mut self,
+        group_def_levels: Option<&[i16]>,
+        dictionary_ids: &[i32],
+        dictionary: &[Bytes],
+        sums: &[i64],
+        decimals: &[i64],
+        dates: &[i32],
+        filter: &DecimalDateRangeFilter,
+    ) -> Result<()> {
+        if sums.len() != decimals.len() || sums.len() != dates.len() {
+            return Err(DodamError::UnsupportedSql(
+                "direct dictionary aggregate column length mismatch".to_string(),
+            ));
+        }
+        let SingleKeyCountSumMinMaxIndex::Utf8 {
+            groups: index,
+            null_group,
+        } = &mut self.group_index
+        else {
+            unreachable!("vector state uses Utf8 group index")
+        };
+        if let Some(levels) = group_def_levels
+            && levels.len() != sums.len()
+        {
+            return Err(DodamError::UnsupportedSql(
+                "direct dictionary aggregate def-level length mismatch".to_string(),
+            ));
+        }
+        let dictionary_values = DictionaryStringValues::Bytes(dictionary);
+        let mut group_ids = vec![usize::MAX; dictionary.len()];
+        let mut batch_partials = Vec::<Option<SingleKeyCountSumMinMaxBatchPartial>>::new();
+        let mut batch_touched = Vec::<usize>::new();
+        let mut dictionary_offset = 0usize;
+        for row in 0..sums.len() {
+            let group_id = if let Some(levels) = group_def_levels {
+                if levels[row] == 0 {
+                    count_sum_min_max_group_id_for_null_with_max_kind(
+                        null_group,
+                        &mut self.groups,
+                        GroupValue::Utf8(None),
+                        self.decimal_precision,
+                        self.decimal_scale,
+                        self.max_kind,
+                    )
+                } else {
+                    let Some(dictionary_key) = dictionary_ids.get(dictionary_offset).copied()
+                    else {
+                        return Err(DodamError::UnsupportedSql(
+                            "direct dictionary aggregate id length mismatch".to_string(),
+                        ));
+                    };
+                    dictionary_offset += 1;
+                    count_sum_min_max_group_id_for_dictionary_utf8_cached_with_max_kind(
+                        index,
+                        &dictionary_values,
+                        dictionary_key,
+                        &mut group_ids,
+                        &mut self.groups,
+                        self.decimal_precision,
+                        self.decimal_scale,
+                        self.max_kind,
+                    )?
+                }
+            } else {
+                let Some(dictionary_key) = dictionary_ids.get(row).copied() else {
+                    return Err(DodamError::UnsupportedSql(
+                        "direct dictionary aggregate id length mismatch".to_string(),
+                    ));
+                };
+                count_sum_min_max_group_id_for_dictionary_utf8_cached_with_max_kind(
+                    index,
+                    &dictionary_values,
+                    dictionary_key,
+                    &mut group_ids,
+                    &mut self.groups,
+                    self.decimal_precision,
+                    self.decimal_scale,
+                    self.max_kind,
+                )?
+            };
+            let decimal = decimals[row];
+            let date = dates[row];
+            if !filter.matches_i64(decimal, date) {
+                continue;
+            }
+            update_single_key_count_sum_min_max_partial(
+                &mut batch_partials,
+                &mut batch_touched,
+                group_id,
+                sums[row],
+                i128::from(decimal),
+                direct_count_sum_min_max_value(self.max_kind, i128::from(decimal), date),
+            );
+        }
+        if group_def_levels.is_some() && dictionary_offset != dictionary_ids.len() {
+            return Err(DodamError::UnsupportedSql(
+                "direct dictionary aggregate unused dictionary ids".to_string(),
+            ));
+        }
+        merge_single_key_count_sum_min_max_batch_partials(
+            &mut self.groups,
+            &mut batch_partials,
+            &mut batch_touched,
+        );
         Ok(())
     }
 
@@ -9634,6 +9762,42 @@ impl SingleKeyCountSumMinMaxVectorState {
     pub(crate) fn merge(&mut self, partial: Self) -> Result<()> {
         let max_kind = self.max_kind;
         match &mut self.group_index {
+            SingleKeyCountSumMinMaxIndex::Utf8 {
+                groups: index,
+                null_group,
+            } => {
+                for partial_group in partial.groups {
+                    let group_id = match &partial_group.key {
+                        GroupValue::Utf8(Some(key)) => {
+                            count_sum_min_max_group_id_for_utf8_with_max_kind(
+                                index,
+                                key,
+                                &mut self.groups,
+                                self.decimal_precision,
+                                self.decimal_scale,
+                                max_kind,
+                            )
+                        }
+                        GroupValue::Utf8(None) => {
+                            count_sum_min_max_group_id_for_null_with_max_kind(
+                                null_group,
+                                &mut self.groups,
+                                GroupValue::Utf8(None),
+                                self.decimal_precision,
+                                self.decimal_scale,
+                                max_kind,
+                            )
+                        }
+                        _ => {
+                            return Err(DodamError::UnsupportedSql(
+                                "direct dictionary aggregate partial key shape mismatch"
+                                    .to_string(),
+                            ));
+                        }
+                    };
+                    self.groups[group_id].merge_group(partial_group);
+                }
+            }
             SingleKeyCountSumMinMaxIndex::Int32 { groups: index, .. } => {
                 for partial_group in partial.groups {
                     let GroupValue::Int64(Some(key)) = partial_group.key else {
@@ -9675,7 +9839,7 @@ impl SingleKeyCountSumMinMaxVectorState {
                     self.groups[group_id].merge_group(partial_group);
                 }
             }
-            _ => unreachable!("vector state uses primitive numeric group index"),
+            _ => unreachable!("vector state uses supported group index"),
         }
         Ok(())
     }

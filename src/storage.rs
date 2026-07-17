@@ -2025,6 +2025,33 @@ where
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scan_parquet_i32_i64_i64_dictionary_id_columns_with_store<F>(
+    path: &Path,
+    batch_size: usize,
+    row_groups: &[usize],
+    columns: [&str; 4],
+    file_cache: Arc<ParquetFileCache>,
+    store: &dyn ObjectStore,
+    consume: F,
+) -> Result<Option<DirectColumnScanMetrics>>
+where
+    F: FnMut(&[i32], &[i64], &[i64], Option<&[i16]>, &[i32], &[Bytes]) -> Result<Option<()>>,
+{
+    if file_cache.enabled() {
+        let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
+        let reader = SerializedFileReader::new(reader)?;
+        return scan_parquet_i32_i64_i64_dictionary_id_columns_reader(
+            reader, batch_size, row_groups, columns, consume,
+        );
+    }
+    let file = store.open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    scan_parquet_i32_i64_i64_dictionary_id_columns_reader(
+        reader, batch_size, row_groups, columns, consume,
+    )
+}
+
 pub(crate) fn scan_parquet_i32_dictionary_id_columns_with_store<F>(
     path: &Path,
     batch_size: usize,
@@ -3144,6 +3171,148 @@ where
             if consume(
                 &predicate_values,
                 &sum_values,
+                batch_group_levels,
+                batch_group_ids,
+                &dictionary,
+            )?
+            .is_none()
+            {
+                return Ok(None);
+            }
+            metrics.add_consume_nanos(elapsed_nanos(consume_started));
+            row_offset += records;
+            group_value_offset += batch_group_values;
+        }
+        if row_offset != row_group.metadata().num_rows() as usize
+            || group_value_offset != group_ids.len()
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some(metrics))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_parquet_i32_i64_i64_dictionary_id_columns_reader<R, F>(
+    reader: SerializedFileReader<R>,
+    batch_size: usize,
+    row_groups: &[usize],
+    columns: [&str; 4],
+    mut consume: F,
+) -> Result<Option<DirectColumnScanMetrics>>
+where
+    R: ChunkReader + 'static,
+    F: FnMut(&[i32], &[i64], &[i64], Option<&[i16]>, &[i32], &[Bytes]) -> Result<Option<()>>,
+{
+    let Some(column_indices) = parquet_column_indices_by_name(&reader, &columns) else {
+        return Ok(None);
+    };
+    let [date_column, sum_column, decimal_column, group_column] =
+        <[usize; 4]>::try_from(column_indices).map_err(|_| {
+            DodamError::UnsupportedSql("direct parquet column index shape mismatch".to_string())
+        })?;
+    let schema = reader.metadata().file_metadata().schema_descr();
+    let date_required = schema.column(date_column).max_def_level() == 0;
+    let sum_required = schema.column(sum_column).max_def_level() == 0;
+    let decimal_required = schema.column(decimal_column).max_def_level() == 0;
+    let mut metrics = DirectColumnScanMetrics {
+        row_groups: row_groups.len(),
+        ..DirectColumnScanMetrics::default()
+    };
+    for &row_group_index in row_groups {
+        let row_group = reader.get_row_group(row_group_index)?;
+        let read_started = Instant::now();
+        let Some((group_def_levels, group_ids, dictionary)) =
+            read_byte_array_dictionary_ids_for_row_group(&*row_group, group_column)?
+        else {
+            return Ok(None);
+        };
+        metrics.add_read_nanos(elapsed_nanos(read_started));
+
+        let mut date_reader = match row_group.get_column_reader(date_column)? {
+            ColumnReader::Int32ColumnReader(reader) => reader,
+            _ => return Ok(None),
+        };
+        let mut sum_reader = match row_group.get_column_reader(sum_column)? {
+            ColumnReader::Int64ColumnReader(reader) => reader,
+            _ => return Ok(None),
+        };
+        let mut decimal_reader = match row_group.get_column_reader(decimal_column)? {
+            ColumnReader::Int64ColumnReader(reader) => reader,
+            _ => return Ok(None),
+        };
+        let mut date_values = Vec::<i32>::with_capacity(batch_size);
+        let mut date_def_levels = Vec::<i16>::with_capacity(batch_size);
+        let mut sum_values = Vec::<i64>::with_capacity(batch_size);
+        let mut sum_def_levels = Vec::<i16>::with_capacity(batch_size);
+        let mut decimal_values = Vec::<i64>::with_capacity(batch_size);
+        let mut decimal_def_levels = Vec::<i16>::with_capacity(batch_size);
+        let mut row_offset = 0usize;
+        let mut group_value_offset = 0usize;
+        loop {
+            date_values.clear();
+            date_def_levels.clear();
+            sum_values.clear();
+            sum_def_levels.clear();
+            decimal_values.clear();
+            decimal_def_levels.clear();
+            let read_started = Instant::now();
+            let (records, date_value_count, _) = date_reader.read_records(
+                batch_size,
+                (!date_required).then_some(&mut date_def_levels),
+                None,
+                &mut date_values,
+            )?;
+            if records == 0 {
+                metrics.add_read_nanos(elapsed_nanos(read_started));
+                break;
+            }
+            let (sum_records, sum_value_count, _) = sum_reader.read_records(
+                records,
+                (!sum_required).then_some(&mut sum_def_levels),
+                None,
+                &mut sum_values,
+            )?;
+            let (decimal_records, decimal_value_count, _) = decimal_reader.read_records(
+                records,
+                (!decimal_required).then_some(&mut decimal_def_levels),
+                None,
+                &mut decimal_values,
+            )?;
+            metrics.add_read_nanos(elapsed_nanos(read_started));
+            if sum_records != records
+                || decimal_records != records
+                || date_value_count != records
+                || sum_value_count != records
+                || decimal_value_count != records
+                || (!date_required && !direct_all_present(false, &date_def_levels))
+                || (!sum_required && !direct_all_present(false, &sum_def_levels))
+                || (!decimal_required && !direct_all_present(false, &decimal_def_levels))
+                || row_offset + records > row_group.metadata().num_rows() as usize
+            {
+                return Ok(None);
+            }
+            let batch_group_levels = if group_def_levels.is_empty() {
+                None
+            } else {
+                Some(&group_def_levels[row_offset..row_offset + records])
+            };
+            let batch_group_values = match batch_group_levels {
+                Some(levels) => levels.iter().filter(|level| **level == 1).count(),
+                None => records,
+            };
+            if group_value_offset + batch_group_values > group_ids.len() {
+                return Ok(None);
+            }
+            let batch_group_ids =
+                &group_ids[group_value_offset..group_value_offset + batch_group_values];
+            metrics.batches += 1;
+            metrics.rows = metrics.rows.saturating_add(records);
+            let consume_started = Instant::now();
+            if consume(
+                &date_values,
+                &sum_values,
+                &decimal_values,
                 batch_group_levels,
                 batch_group_ids,
                 &dictionary,

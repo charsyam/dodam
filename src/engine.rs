@@ -171,6 +171,7 @@ impl RowGroupBatchScanProfile {
 enum DirectPrimitiveKeyType {
     I32,
     I64,
+    DictionaryI32Utf8,
 }
 
 impl DirectPrimitiveKeyType {
@@ -178,6 +179,7 @@ impl DirectPrimitiveKeyType {
         match self {
             Self::I32 => "i32",
             Self::I64 => "i64",
+            Self::DictionaryI32Utf8 => "dictionary_i32_utf8",
         }
     }
 }
@@ -6972,6 +6974,12 @@ impl DodamEngine {
         match field.data_type() {
             DataType::Int32 => Ok(Some(DirectPrimitiveKeyType::I32)),
             DataType::Int64 => Ok(Some(DirectPrimitiveKeyType::I64)),
+            DataType::Utf8 => Ok(Some(DirectPrimitiveKeyType::DictionaryI32Utf8)),
+            DataType::Dictionary(_, value_type)
+                if matches!(value_type.as_ref(), DataType::Utf8) =>
+            {
+                Ok(Some(DirectPrimitiveKeyType::DictionaryI32Utf8))
+            }
             _ => Ok(None),
         }
     }
@@ -7839,6 +7847,11 @@ impl DirectCountSumMinMaxShape {
         let Some(key_type) = engine.parquet_primitive_key_type(path, key_column)? else {
             return Ok(None);
         };
+        if second_key_column.is_some()
+            && matches!(key_type, DirectPrimitiveKeyType::DictionaryI32Utf8)
+        {
+            return Ok(None);
+        }
         let (filter_date_column, max_kind) =
             if engine.parquet_is_date32_column(path, max_date_column)? {
                 (max_date_column.clone(), CountSumMinMaxMaxKind::Date32)

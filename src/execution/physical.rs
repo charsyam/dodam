@@ -48,6 +48,7 @@ use crate::storage::{
     DirectPrimitiveColumnSpec, DirectPrimitiveColumnType, DirectPrimitiveCountSumPageBatch,
     ObjectStore, ParquetBatchReader, ParquetFileCache, ParquetMetadataCache, ParquetScanTask,
     plan_parquet_scan_tasks, read_parquet_i32_column_min_max_for_row_groups_with_store,
+    scan_parquet_i32_i64_i64_dictionary_id_columns_with_store,
     scan_parquet_primitive_columns_with_store,
     scan_parquet_primitive_columns_with_store_page_reader,
     scan_parquet_required_primitive_count_sum_pages_with_store,
@@ -372,6 +373,44 @@ impl DirectPrimitiveFoldExec {
                     date_min,
                     date_max,
                 };
+                if matches!(
+                    key_type.as_str(),
+                    "dictionary_i32_utf8" | "DictionaryI32Utf8" | "dictionary_utf8"
+                ) {
+                    let names = self
+                        .columns
+                        .iter()
+                        .map(|(name, _)| name.as_str())
+                        .collect::<Vec<_>>();
+                    let [group_column, sum_column, decimal_column, date_column] =
+                        <[&str; 4]>::try_from(names).map_err(|_| {
+                            DodamError::UnsupportedSql(
+                                "direct dictionary aggregate column shape mismatch".to_string(),
+                            )
+                        })?;
+                    let Some((state, scan_metrics)) =
+                        scan_direct_dictionary_count_sum_min_max_fold(
+                            self.path,
+                            self.batch_size,
+                            self.row_groups,
+                            [date_column, sum_column, decimal_column, group_column],
+                            self.file_cache,
+                            self.object_store,
+                            aggregates.clone(),
+                            decimal_precision,
+                            decimal_scale,
+                            max_kind,
+                            filter,
+                        )?
+                    else {
+                        return Ok(None);
+                    };
+                    let mut metrics = state.finish();
+                    metrics.fragments = 1;
+                    metrics.batches = scan_metrics.batches;
+                    metrics.rows = scan_metrics.rows;
+                    return Ok(Some(metrics));
+                }
                 let Some((state, scan_metrics)) = scan_direct_primitive_parallel_fold(
                     self.path,
                     self.batch_size,
@@ -802,6 +841,114 @@ where
     Ok(Some((state, scan_metrics)))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn scan_direct_dictionary_count_sum_min_max_fold(
+    path: PathBuf,
+    batch_size: usize,
+    row_groups: Vec<usize>,
+    columns: [&str; 4],
+    file_cache: Arc<ParquetFileCache>,
+    object_store: Arc<dyn ObjectStore>,
+    aggregates: Vec<AggregateExpr>,
+    decimal_precision: u8,
+    decimal_scale: i8,
+    max_kind: CountSumMinMaxMaxKind,
+    filter: DecimalDateRangeFilter,
+) -> Result<
+    Option<(
+        SingleKeyCountSumMinMaxVectorState,
+        crate::storage::DirectColumnScanMetrics,
+    )>,
+> {
+    let mut state = SingleKeyCountSumMinMaxVectorState::new_utf8_with_max_kind(
+        aggregates.clone(),
+        decimal_precision,
+        decimal_scale,
+        max_kind,
+    );
+    let mut scan_metrics = crate::storage::DirectColumnScanMetrics::default();
+    if row_groups.is_empty() {
+        return Ok(Some((state, scan_metrics)));
+    }
+    let workers = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .min(row_groups.len());
+    let row_group_partitions = partition_row_groups_balanced(&row_groups, workers);
+    let columns = columns.map(str::to_string);
+    let (sender, receiver) = mpsc::channel();
+    std::thread::scope(|scope| {
+        for row_group_partition in row_group_partitions {
+            let sender = sender.clone();
+            let path = path.clone();
+            let columns = columns.clone();
+            let file_cache = file_cache.clone();
+            let object_store = object_store.clone();
+            let aggregates = aggregates.clone();
+            let filter = filter;
+            scope.spawn(move || {
+                let result: Result<
+                    Option<(
+                        SingleKeyCountSumMinMaxVectorState,
+                        crate::storage::DirectColumnScanMetrics,
+                    )>,
+                > = (|| {
+                    let mut state = SingleKeyCountSumMinMaxVectorState::new_utf8_with_max_kind(
+                        aggregates,
+                        decimal_precision,
+                        decimal_scale,
+                        max_kind,
+                    );
+                    let column_refs = [
+                        columns[0].as_str(),
+                        columns[1].as_str(),
+                        columns[2].as_str(),
+                        columns[3].as_str(),
+                    ];
+                    let metrics = scan_parquet_i32_i64_i64_dictionary_id_columns_with_store(
+                        &path,
+                        batch_size,
+                        &row_group_partition,
+                        column_refs,
+                        file_cache,
+                        object_store.as_ref(),
+                        |dates, sums, decimals, group_def_levels, dictionary_ids, dictionary| {
+                            state.consume_dictionary_i64_decimal_date_slices(
+                                group_def_levels,
+                                dictionary_ids,
+                                dictionary,
+                                sums,
+                                decimals,
+                                dates,
+                                &filter,
+                            )?;
+                            Ok(Some(()))
+                        },
+                    )?;
+                    Ok(metrics.map(|metrics| (state, metrics)))
+                })();
+                let _ = sender.send(result);
+            });
+        }
+        drop(sender);
+        for result in receiver {
+            let Some((partial, metrics)) = result? else {
+                return Ok::<Option<()>, DodamError>(None);
+            };
+            state.merge(partial)?;
+            scan_metrics.row_groups = scan_metrics.row_groups.saturating_add(metrics.row_groups);
+            scan_metrics.batches = scan_metrics.batches.saturating_add(metrics.batches);
+            scan_metrics.rows = scan_metrics.rows.saturating_add(metrics.rows);
+            scan_metrics.read_nanos = scan_metrics.read_nanos.saturating_add(metrics.read_nanos);
+            scan_metrics.consume_nanos = scan_metrics
+                .consume_nanos
+                .saturating_add(metrics.consume_nanos);
+        }
+        Ok::<Option<()>, DodamError>(Some(()))
+    })?;
+    Ok(Some((state, scan_metrics)))
+}
+
 fn log_direct_primitive_exec_profile(
     path: &PathBuf,
     columns: &[(String, DirectPrimitiveColumnType)],
@@ -931,6 +1078,9 @@ fn parse_direct_primitive_column_type(input: &str) -> Result<DirectPrimitiveColu
     match input {
         "i64" | "I64" | "int64" | "Int64" => Ok(DirectPrimitiveColumnType::I64),
         "i32" | "I32" | "int32" | "Int32" => Ok(DirectPrimitiveColumnType::I32),
+        "dictionary_i32_utf8" | "DictionaryI32Utf8" | "dictionary_utf8" => {
+            Ok(DirectPrimitiveColumnType::I32)
+        }
         "date32" | "Date32" => Ok(DirectPrimitiveColumnType::Date32),
         input if input.starts_with("decimal128_i64_raw:") => {
             let mut parts = input.split(':');
