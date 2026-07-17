@@ -383,6 +383,13 @@ fn native_filtered_update_i32_group_direct_predicates_columnar_batch(
     if max_key > native_filtered_eager_dense_max_key() {
         return Ok(false);
     }
+    if native_filtered_fused_vector_sink_enabled()
+        && native_filtered_update_i32_group_direct_predicates_fused_vector_sink(
+            values, predicates, inputs, specs, dense, max_key,
+        )?
+    {
+        return Ok(true);
+    }
     let Some(mut columnar) = native_filtered_columnar_agg_states(specs, inputs, max_key + 1) else {
         return Ok(false);
     };
@@ -404,6 +411,48 @@ fn native_filtered_update_i32_group_direct_predicates_columnar_batch(
             state.update_with_i32_keys(&selected_rows, input, values);
         } else {
             state.update_with_i32_keys_predicate(predicate, input, values);
+        }
+    }
+    if dense.len() <= max_key {
+        dense.resize_with(max_key + 1, || None);
+    }
+    for (key, present) in present.into_iter().enumerate() {
+        if !present {
+            continue;
+        }
+        let states = dense[key].get_or_insert_with(|| native_filtered_initial_states(specs));
+        for (target, source) in states.iter_mut().zip(&columnar) {
+            source.merge_into(target, key);
+        }
+    }
+    Ok(true)
+}
+
+fn native_filtered_update_i32_group_direct_predicates_fused_vector_sink(
+    values: &Int32Array,
+    predicates: &[NativeFilteredDirectPredicate],
+    inputs: &[NativeFilteredBatchInput],
+    specs: &[NativeFilteredAggregateSpec],
+    dense: &mut Vec<Option<Vec<NativeFilteredAggregateState>>>,
+    max_key: usize,
+) -> Result<bool> {
+    if predicates.len() != specs.len()
+        || inputs.len() != specs.len()
+        || specs.len() > u8::BITS as usize
+    {
+        return Ok(false);
+    }
+    let Some(mut columnar) = native_filtered_columnar_agg_states(specs, inputs, max_key + 1) else {
+        return Ok(false);
+    };
+    let mut present = vec![false; max_key + 1];
+    for row in 0..values.len() {
+        let key = values.value(row) as usize;
+        present[key] = true;
+        for ((state, predicate), input) in columnar.iter_mut().zip(predicates).zip(inputs) {
+            if predicate.selected(row) {
+                state.update_one_key(key, input, row);
+            }
         }
     }
     if dense.len() <= max_key {
@@ -588,6 +637,42 @@ impl NativeFilteredColumnarAggState {
         }
     }
 
+    fn update_one_key(&mut self, key: usize, input: &NativeFilteredBatchInput, row: usize) {
+        match self {
+            Self::Count(counts) => match input {
+                NativeFilteredBatchInput::AlwaysSome | NativeFilteredBatchInput::NonNull => {
+                    counts[key] += 1;
+                }
+                NativeFilteredBatchInput::I64Array(values) => {
+                    if values.is_valid(row) {
+                        counts[key] += 1;
+                    }
+                }
+                NativeFilteredBatchInput::I32Array(values) => {
+                    if values.is_valid(row) {
+                        counts[key] += 1;
+                    }
+                }
+                NativeFilteredBatchInput::Other(_) => {}
+            },
+            Self::SumI64 { sums, counts } | Self::AvgI64 { sums, counts } => match input {
+                NativeFilteredBatchInput::I64Array(values) => {
+                    if values.is_valid(row) {
+                        sums[key] += values.value(row);
+                        counts[key] += 1;
+                    }
+                }
+                NativeFilteredBatchInput::I32Array(values) => {
+                    if values.is_valid(row) {
+                        sums[key] += i64::from(values.value(row));
+                        counts[key] += 1;
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+
     fn update_with_i32_keys_predicate(
         &mut self,
         predicate: &NativeFilteredDirectPredicate,
@@ -762,6 +847,11 @@ fn native_filtered_columnar_agg_states(
 
 fn native_filtered_columnar_direct_enabled() -> bool {
     !std::env::var("DODAM_DISABLE_NATIVE_FILTERED_COLUMNAR_DIRECT")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn native_filtered_fused_vector_sink_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_NATIVE_FILTERED_FUSED_VECTOR_SINK")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
