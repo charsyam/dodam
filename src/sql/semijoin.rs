@@ -2082,6 +2082,20 @@ fn collect_semijoin_i32_utf8_pair_set_direct(
     {
         return Ok(Some(keys));
     }
+    if std::env::var_os("DODAM_DISABLE_MIXED_TUPLE_PARALLEL_RAW_INNER").is_none()
+        && let Some(keys) = collect_semijoin_i32_utf8_pair_set_direct_parallel_raw(
+            engine,
+            path,
+            batch_size,
+            row_groups,
+            numeric_column,
+            string_column,
+            prefix,
+            numeric_left,
+        )?
+    {
+        return Ok(Some(keys));
+    }
     let mut string_id_cache = SemijoinDictionaryStringIdCache::default();
     let raw_metrics = engine.scan_parquet_i32_dictionary_id_columns_raw(
         path,
@@ -2243,6 +2257,176 @@ fn collect_semijoin_i32_utf8_pair_set_direct(
         numeric_left,
         has_null,
     }))
+}
+
+struct SemijoinI32Utf8PairPartial {
+    pair_values: Vec<(i32, u32)>,
+    has_null: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_semijoin_i32_utf8_pair_set_direct_parallel_raw(
+    engine: &DodamEngine,
+    path: &Path,
+    batch_size: usize,
+    row_groups: &[usize],
+    numeric_column: &str,
+    string_column: &str,
+    prefix: &str,
+    numeric_left: bool,
+) -> Result<Option<SemijoinI64Utf8PairKeys>> {
+    if row_groups.len() <= 1 {
+        return Ok(None);
+    }
+    let workers = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .min(row_groups.len());
+    if workers <= 1 {
+        return Ok(None);
+    }
+    let partitions = semijoin_partition_row_groups(row_groups, workers);
+    let shared_string_ids = Arc::new(std::sync::Mutex::new(FastHashMap::<Vec<u8>, u32>::default()));
+    let (sender, receiver) = mpsc::channel();
+    std::thread::scope(|scope| {
+        for partition in partitions {
+            let sender = sender.clone();
+            let engine = engine.clone();
+            let path = path.to_path_buf();
+            let numeric_column = numeric_column.to_string();
+            let string_column = string_column.to_string();
+            let prefix = prefix.as_bytes().to_vec();
+            let shared_string_ids = shared_string_ids.clone();
+            scope.spawn(move || {
+                let result: Result<Option<SemijoinI32Utf8PairPartial>> = (|| {
+                    let mut partial = SemijoinI32Utf8PairPartial {
+                        pair_values: Vec::new(),
+                        has_null: false,
+                    };
+                    let mut string_id_cache = SemijoinDictionaryStringIdCache::default();
+                    let metrics = engine.scan_parquet_i32_dictionary_id_columns_raw(
+                        &path,
+                        batch_size,
+                        &partition,
+                        [&numeric_column, &string_column],
+                        |number_bytes,
+                         records,
+                         dictionary_def_levels,
+                         dictionary_ids,
+                         dictionary| {
+                            let mut string_ids = shared_string_ids.lock().map_err(|_| {
+                                DodamError::UnsupportedSql(
+                                    "mixed tuple string id mutex poisoned".to_string(),
+                                )
+                            })?;
+                            let (selected_string_ids, selected_count) = string_id_cache
+                                .refresh_prefix_dense(dictionary, &mut string_ids, &prefix)?;
+                            drop(string_ids);
+                            if selected_count == 0 {
+                                if let Some(levels) = dictionary_def_levels {
+                                    partial.has_null |= levels.iter().any(|level| *level == 0);
+                                }
+                                return Ok(Some(()));
+                            }
+                            partial.pair_values.reserve(records);
+                            let mut dictionary_value_offset = 0usize;
+                            match dictionary_def_levels {
+                                Some(levels) => {
+                                    partial.has_null |= levels.iter().any(|level| *level == 0);
+                                    for (row, level) in levels.iter().copied().enumerate() {
+                                        if level == 0 {
+                                            continue;
+                                        }
+                                        let Some(dictionary_id) =
+                                            dictionary_ids.get(dictionary_value_offset)
+                                        else {
+                                            return Ok(None);
+                                        };
+                                        dictionary_value_offset += 1;
+                                        insert_direct_semijoin_i32_utf8_pair_value_dense_no_numeric(
+                                            read_i32_le_unchecked(number_bytes, row),
+                                            *dictionary_id,
+                                            selected_string_ids,
+                                            &mut partial.pair_values,
+                                        );
+                                    }
+                                }
+                                None => {
+                                    insert_direct_semijoin_i32_utf8_pair_batch_dense_from_bytes_no_numeric(
+                                        number_bytes,
+                                        records,
+                                        dictionary_ids,
+                                        selected_string_ids,
+                                        &mut partial.pair_values,
+                                    );
+                                    dictionary_value_offset = dictionary_ids.len();
+                                }
+                            }
+                            if dictionary_value_offset != dictionary_ids.len() {
+                                return Ok(None);
+                            }
+                            Ok(Some(()))
+                        },
+                    )?;
+                    Ok(metrics.map(|_| partial))
+                })();
+                let _ = sender.send(result);
+            });
+        }
+        drop(sender);
+        let mut pair_values = Vec::<(i32, u32)>::new();
+        let mut numeric_values = SemijoinNumericValues::empty_i32();
+        let mut has_null = false;
+        for result in receiver {
+            let Some(partial) = result? else {
+                return Ok::<Option<SemijoinI64Utf8PairKeys>, DodamError>(None);
+            };
+            has_null |= partial.has_null;
+            pair_values.reserve(partial.pair_values.len());
+            numeric_values.reserve(partial.pair_values.len());
+            for (number, string_id) in partial.pair_values {
+                numeric_values.insert_i32(number);
+                pair_values.push((number, string_id));
+            }
+        }
+        let string_ids = Arc::try_unwrap(shared_string_ids)
+            .map_err(|_| {
+                DodamError::UnsupportedSql(
+                    "mixed tuple string id map still shared after parallel build".to_string(),
+                )
+            })?
+            .into_inner()
+            .map_err(|_| {
+                DodamError::UnsupportedSql("mixed tuple string id mutex poisoned".to_string())
+            })?;
+        numeric_values = numeric_values.optimize_dense_i32();
+        let values = semijoin_i32_u32_pairs_to_values(pair_values);
+        if semijoin_profile_enabled() {
+            eprintln!(
+                "[dodam:semijoin-profile] mixed-direct-build parallel-raw ok values={} pair={} strings={} numeric={}",
+                values.len(),
+                values.kind(),
+                string_ids.len(),
+                numeric_values.kind()
+            );
+        }
+        Ok(Some(SemijoinI64Utf8PairKeys {
+            values,
+            numeric_values,
+            string_ids,
+            numeric_left,
+            has_null,
+        }))
+    })
+}
+
+fn semijoin_partition_row_groups(row_groups: &[usize], partitions: usize) -> Vec<Vec<usize>> {
+    let partitions = partitions.min(row_groups.len()).max(1);
+    let chunk_size = row_groups.len().div_ceil(partitions).max(1);
+    row_groups
+        .chunks(chunk_size)
+        .map(|chunk| chunk.to_vec())
+        .collect()
 }
 
 fn collect_semijoin_i32_utf8_pair_set_direct_selected_inner(
@@ -2512,6 +2696,24 @@ fn insert_direct_semijoin_i32_utf8_pair_value_dense(
     pair_values.push((number, string_id));
 }
 
+fn insert_direct_semijoin_i32_utf8_pair_value_dense_no_numeric(
+    number: i32,
+    dictionary_id: i32,
+    selected_string_ids: &[u32],
+    pair_values: &mut Vec<(i32, u32)>,
+) {
+    let Ok(dictionary_id) = usize::try_from(dictionary_id) else {
+        return;
+    };
+    let Some(&string_id) = selected_string_ids.get(dictionary_id) else {
+        return;
+    };
+    if string_id == u32::MAX {
+        return;
+    }
+    pair_values.push((number, string_id));
+}
+
 fn insert_direct_semijoin_i32_utf8_pair_batch_dense(
     numbers: &[i32],
     dictionary_ids: &[i32],
@@ -2564,6 +2766,31 @@ fn insert_direct_semijoin_i32_utf8_pair_batch_dense_from_bytes(
         let number = read_i32_le_unchecked(number_bytes, row);
         numeric_values.insert_i32(number);
         pair_values.push((number, string_id));
+    }
+}
+
+fn insert_direct_semijoin_i32_utf8_pair_batch_dense_from_bytes_no_numeric(
+    number_bytes: &[u8],
+    records: usize,
+    dictionary_ids: &[i32],
+    selected_string_ids: &[u32],
+    pair_values: &mut Vec<(i32, u32)>,
+) {
+    let rows = records.min(dictionary_ids.len());
+    for row in 0..rows {
+        let dictionary_id = dictionary_ids[row];
+        if dictionary_id < 0 {
+            continue;
+        }
+        let dictionary_id = dictionary_id as usize;
+        if dictionary_id >= selected_string_ids.len() {
+            continue;
+        }
+        let string_id = selected_string_ids[dictionary_id];
+        if string_id == u32::MAX {
+            continue;
+        }
+        pair_values.push((read_i32_le_unchecked(number_bytes, row), string_id));
     }
 }
 
