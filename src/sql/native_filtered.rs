@@ -1601,6 +1601,7 @@ impl NativeFilteredBatchMask {
 
 enum NativeFilteredDirectPredicate {
     AlwaysTrue,
+    AlwaysFalse,
     Precomputed(Vec<bool>),
     IsNotNull(ArrayRef),
     I32Compare {
@@ -1629,6 +1630,7 @@ impl NativeFilteredDirectPredicate {
     fn selected(&self, row: usize) -> bool {
         match self {
             Self::AlwaysTrue => true,
+            Self::AlwaysFalse => false,
             Self::Precomputed(selected) => selected.get(row).copied().unwrap_or(false),
             Self::IsNotNull(values) => values.is_valid(row),
             Self::I32Compare {
@@ -1668,6 +1670,7 @@ impl NativeFilteredDirectPredicate {
     fn append_selected_rows(&self, rows: usize, selected_rows: &mut Vec<usize>) {
         match self {
             Self::AlwaysTrue => selected_rows.extend(0..rows),
+            Self::AlwaysFalse => {}
             Self::Precomputed(selected) => {
                 for row in 0..rows.min(selected.len()) {
                     if selected[row] {
@@ -1737,7 +1740,10 @@ impl NativeFilteredDirectPredicate {
     }
 
     fn prefers_selected_rows(&self) -> bool {
-        matches!(self, Self::Utf8PrefixLike { .. } | Self::Precomputed(_))
+        matches!(
+            self,
+            Self::Utf8PrefixLike { .. } | Self::Precomputed(_) | Self::AlwaysFalse
+        )
     }
 }
 
@@ -1845,6 +1851,11 @@ fn native_filtered_direct_predicate(
     condition: &SqlExpr,
 ) -> Result<Option<NativeFilteredDirectPredicate>> {
     match condition {
+        SqlExpr::Value(value) => match &value.value {
+            Value::Boolean(true) => Ok(Some(NativeFilteredDirectPredicate::AlwaysTrue)),
+            Value::Boolean(false) => Ok(Some(NativeFilteredDirectPredicate::AlwaysFalse)),
+            _ => Ok(None),
+        },
         SqlExpr::IsNotNull(expr) => {
             let column = sql_column_name(expr, None)?;
             let index = output_batch_column_index(batch, &column)?;
