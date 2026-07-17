@@ -507,6 +507,12 @@ fn native_filtered_update_i32_group_direct_predicates_dense(
         native_filtered_update_i32_dense_row_masks(values, &row_masks, inputs, specs, dense)?;
         return Ok(true);
     }
+    if let Some(row_masks) =
+        native_filtered_direct_predicate_row_masks_blocked(predicates, values.len())
+    {
+        native_filtered_update_i32_dense_row_masks(values, &row_masks, inputs, specs, dense)?;
+        return Ok(true);
+    }
     for row in 0..values.len() {
         let states = dense[values.value(row) as usize]
             .as_mut()
@@ -895,6 +901,12 @@ fn native_filtered_update_i64_group_direct_predicates_dense(
         native_filtered_update_i64_dense_row_masks(values, &row_masks, inputs, specs, dense)?;
         return Ok(true);
     }
+    if let Some(row_masks) =
+        native_filtered_direct_predicate_row_masks_blocked(predicates, values.len())
+    {
+        native_filtered_update_i64_dense_row_masks(values, &row_masks, inputs, specs, dense)?;
+        return Ok(true);
+    }
     for row in 0..values.len() {
         let states = dense[values.value(row) as usize]
             .as_mut()
@@ -940,6 +952,33 @@ fn native_filtered_direct_predicate_row_masks(
         }
     }
     Some(masks)
+}
+
+fn native_filtered_direct_predicate_row_masks_blocked(
+    predicates: &[NativeFilteredDirectPredicate],
+    rows: usize,
+) -> Option<Vec<u8>> {
+    if !native_filtered_blocked_direct_predicate_masks_enabled()
+        || predicates.is_empty()
+        || predicates.len() > u8::BITS as usize
+    {
+        return None;
+    }
+    let mut masks = vec![0u8; rows];
+    for (index, predicate) in predicates.iter().enumerate() {
+        let bit = 1u8 << index;
+        for row in 0..rows {
+            if predicate.selected(row) {
+                masks[row] |= bit;
+            }
+        }
+    }
+    Some(masks)
+}
+
+fn native_filtered_blocked_direct_predicate_masks_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_NATIVE_FILTERED_BLOCKED_DIRECT_PREDICATE_MASKS")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 fn native_filtered_update_i32_dense_row_masks(

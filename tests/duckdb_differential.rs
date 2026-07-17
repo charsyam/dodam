@@ -825,6 +825,38 @@ async fn duckdb_differential_join_low_memory_limit() {
         dodam_rows, duckdb_rows,
         "\nDodam SQL:\n{dodam_sql}\n\nDuckDB SQL:\n{duckdb_sql}"
     );
+
+    let dodam_sql = format!(
+        "SELECT d.name, count(*), sum(f.value) FROM '{}' f JOIN '{}' d ON f.key = d.key GROUP BY d.name ORDER BY d.name",
+        facts_path.display(),
+        dim_path.display()
+    );
+    let duckdb_sql = format!(
+        "SELECT d.name, count(*), sum(f.value) FROM read_parquet('{}') f JOIN read_parquet('{}') d ON f.key = d.key GROUP BY d.name ORDER BY d.name",
+        facts_path.display(),
+        dim_path.display()
+    );
+    let output = execute_sql_with_options(
+        &DodamEngine::default(),
+        &dodam_sql,
+        BATCH_SIZE,
+        SqlExecutionOptions {
+            join_memory_limit_bytes: Some(1),
+        },
+    )
+    .await
+    .expect("execute low-memory Dodam join aggregate");
+    let dodam_rows = match output {
+        QueryOutput::Scan { batches } | QueryOutput::Aggregate { batches, .. } => {
+            canonical_rows(&batches)
+        }
+        QueryOutput::Explain { .. } => panic!("unexpected EXPLAIN output"),
+    };
+    let duckdb_rows = run_duckdb(&duckdb_sql, tempdir.path());
+    assert_eq!(
+        dodam_rows, duckdb_rows,
+        "\nDodam SQL:\n{dodam_sql}\n\nDuckDB SQL:\n{duckdb_sql}"
+    );
 }
 
 #[tokio::test]

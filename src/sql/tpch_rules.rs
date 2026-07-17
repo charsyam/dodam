@@ -123,11 +123,11 @@ pub(super) async fn try_execute_minimum_cost_supplier_sql(
     if parts.is_empty() {
         return Ok(Some(q02_output(Vec::new())?));
     }
-    tpch_profile_elapsed("Q02 dimensions", stage);
+    tpch_profile_elapsed("minimum-cost-supplier dimensions", stage);
 
     let stage = tpch_profile_start();
     let mut rows = q02_min_cost_rows(engine, partsupp.path, batch_size, &parts, &suppliers).await?;
-    tpch_profile_elapsed("Q02 partsupp min cost", stage);
+    tpch_profile_elapsed("minimum-cost-supplier partsupp min cost", stage);
     rows.sort_by(|left, right| {
         right
             .acctbal
@@ -583,7 +583,7 @@ pub(super) async fn try_execute_parts_supplier_relationship_sql(
     let stage = tpch_profile_start();
     let bad_suppliers =
         q16_bad_suppliers(engine, supplier_path, batch_size, &comment_parts).await?;
-    tpch_profile_elapsed("Q16 bad suppliers", stage);
+    tpch_profile_elapsed("parts-supplier-relationship bad suppliers", stage);
 
     let stage = tpch_profile_start();
     let part_groups = q16_part_groups(
@@ -595,7 +595,7 @@ pub(super) async fn try_execute_parts_supplier_relationship_sql(
         &sizes,
     )
     .await?;
-    tpch_profile_elapsed("Q16 part groups", stage);
+    tpch_profile_elapsed("parts-supplier-relationship part groups", stage);
     if part_groups.groups.is_empty() {
         return Ok(Some(q16_output(Vec::new())?));
     }
@@ -609,7 +609,7 @@ pub(super) async fn try_execute_parts_supplier_relationship_sql(
         bad_suppliers,
     )
     .await?;
-    tpch_profile_elapsed("Q16 supplier counts", stage);
+    tpch_profile_elapsed("parts-supplier-relationship supplier counts", stage);
     Ok(Some(q16_output(rows)?))
 }
 
@@ -721,7 +721,7 @@ pub(super) async fn try_execute_promo_revenue_ratio_sql(
 
     let stage = tpch_profile_start();
     let promo_parts = q14_promo_parts(engine, part.path, batch_size).await?;
-    tpch_profile_elapsed("Q14 promo parts", stage);
+    tpch_profile_elapsed("promo-revenue-ratio promo parts", stage);
     if promo_parts.is_empty() {
         return Ok(Some(q17_output("promo_revenue".to_string(), None)?));
     }
@@ -736,7 +736,7 @@ pub(super) async fn try_execute_promo_revenue_ratio_sql(
         promo_parts,
     )
     .await?;
-    tpch_profile_elapsed("Q14 promo revenue", stage);
+    tpch_profile_elapsed("promo-revenue-ratio promo revenue", stage);
     let value = (total != 0.0).then_some(100.0 * promo / total);
     Ok(Some(q17_output("promo_revenue".to_string(), value)?))
 }
@@ -877,7 +877,7 @@ pub(super) async fn try_execute_top_supplier_revenue_sql(
     let stage = tpch_profile_start();
     let revenues =
         q15_revenue_by_supplier(engine, lineitem.path, batch_size, start_days, end_days).await?;
-    tpch_profile_elapsed("Q15 revenue by supplier", stage);
+    tpch_profile_elapsed("top-supplier-revenue revenue by supplier", stage);
     let Some(max_revenue) = revenues
         .values()
         .copied()
@@ -893,6 +893,6 @@ pub(super) async fn try_execute_top_supplier_revenue_sql(
 
     let stage = tpch_profile_start();
     let rows = q15_supplier_rows(engine, supplier.path, batch_size, &top_suppliers).await?;
-    tpch_profile_elapsed("Q15 supplier rows", stage);
+    tpch_profile_elapsed("top-supplier-revenue supplier rows", stage);
     Ok(Some(q15_output(rows)?))
 }

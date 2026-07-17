@@ -102,6 +102,7 @@ mod projection_utils;
 mod rule_registry;
 mod semijoin;
 mod tpch_rules;
+mod types;
 mod window;
 
 use expression_aggregate::{
@@ -137,6 +138,10 @@ use semijoin::{
     try_execute_correlated_subquery_filter_sql, try_execute_exists_subquery_sql,
     try_execute_in_subquery_sql, unqualified_semijoin_column,
 };
+pub use types::{
+    QueryOutput, SqlExecutionOptions, SqlResultSink, SqlSinkExecutionOptions,
+    SqlSinkExecutionProfile,
+};
 use window::try_execute_window_sql;
 
 fn tpch_profile_enabled() -> bool {
@@ -168,52 +173,6 @@ fn sql_nanos_to_millis(nanos: u64) -> f64 {
 const DEFAULT_MAX_DENSE_I64_KEY: usize = 20_000_000;
 const DEFAULT_Q09_ORDER_YEAR_DENSE_BYTES: usize = 384 * 1024 * 1024;
 const MAX_SQL_EXTERNAL_JOIN_PARTITIONS: usize = 1024;
-
-#[derive(Debug)]
-pub enum QueryOutput {
-    Scan {
-        batches: Vec<RecordBatch>,
-    },
-    Aggregate {
-        metrics: AggregateMetrics,
-        batches: Vec<RecordBatch>,
-    },
-    Explain {
-        plan: String,
-    },
-}
-
-pub trait SqlResultSink {
-    fn record_batch_sink(&mut self) -> &mut dyn RecordBatchSink;
-    fn write_output(&mut self, output: QueryOutput) -> Result<()>;
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SqlExecutionOptions {
-    pub join_memory_limit_bytes: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct SqlSinkExecutionOptions {
-    pub allow_direct_or_streaming: bool,
-}
-
-impl Default for SqlSinkExecutionOptions {
-    fn default() -> Self {
-        Self {
-            allow_direct_or_streaming: true,
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct SqlSinkExecutionProfile {
-    pub direct_sink: Option<Duration>,
-    pub streaming: Option<Duration>,
-    pub execute: Option<Duration>,
-    pub write_output: Option<Duration>,
-    pub scan_plan_metrics: Option<ScanPlanMetrics>,
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SqlQuery {
