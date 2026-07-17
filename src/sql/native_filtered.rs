@@ -97,7 +97,9 @@ pub(super) fn collect_native_filtered_aggregates(
         };
         let direct_predicates =
             if direct_group_path && !native_filtered_direct_predicates_disabled() {
-                native_filtered_batch_direct_predicates(&batch, &specs, false)?
+                native_filtered_batch_direct_predicates(&batch, &specs, false)?.map(|predicates| {
+                    native_filtered_simplify_direct_predicates(predicates, batch.num_rows())
+                })
             } else {
                 None
             };
@@ -1528,6 +1530,49 @@ fn native_filtered_maybe_precompute_direct_predicate(
         .map(|row| predicate.selected(row))
         .collect::<Vec<_>>();
     NativeFilteredDirectPredicate::Precomputed(selected)
+}
+
+fn native_filtered_simplify_direct_predicates(
+    predicates: Vec<NativeFilteredDirectPredicate>,
+    rows: usize,
+) -> Vec<NativeFilteredDirectPredicate> {
+    if !native_filtered_simplify_direct_predicates_enabled() || rows == 0 {
+        return predicates;
+    }
+    predicates
+        .into_iter()
+        .map(|predicate| native_filtered_simplify_direct_predicate(predicate, rows))
+        .collect()
+}
+
+fn native_filtered_simplify_direct_predicate(
+    predicate: NativeFilteredDirectPredicate,
+    rows: usize,
+) -> NativeFilteredDirectPredicate {
+    if matches!(
+        predicate,
+        NativeFilteredDirectPredicate::AlwaysTrue | NativeFilteredDirectPredicate::Precomputed(_)
+    ) {
+        return predicate;
+    }
+    let mut selected_count = 0usize;
+    for row in 0..rows {
+        if predicate.selected(row) {
+            selected_count += 1;
+        }
+    }
+    if selected_count == rows {
+        NativeFilteredDirectPredicate::AlwaysTrue
+    } else if selected_count == 0 {
+        NativeFilteredDirectPredicate::Precomputed(vec![false; rows])
+    } else {
+        predicate
+    }
+}
+
+fn native_filtered_simplify_direct_predicates_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_NATIVE_FILTERED_DIRECT_PREDICATE_SIMPLIFY")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 fn native_filtered_direct_predicate(

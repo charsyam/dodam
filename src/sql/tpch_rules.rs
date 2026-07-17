@@ -1,104 +1,5 @@
 use super::*;
 
-#[derive(Clone, Copy)]
-enum TpchRule {
-    MinimumCostSupplier,
-    PromoRevenueRatio,
-    TopSupplierRevenue,
-    PartsSupplierRelationship,
-}
-
-impl TpchRule {
-    fn name(self) -> &'static str {
-        match self {
-            Self::MinimumCostSupplier => "minimum-cost-supplier",
-            Self::PromoRevenueRatio => "promo-revenue-ratio",
-            Self::TopSupplierRevenue => "top-supplier-revenue",
-            Self::PartsSupplierRelationship => "parts-supplier-relationship",
-        }
-    }
-
-    fn estimated_cost_rank(self) -> u8 {
-        match self {
-            Self::MinimumCostSupplier => 20,
-            Self::PromoRevenueRatio => 30,
-            Self::TopSupplierRevenue => 30,
-            Self::PartsSupplierRelationship => 40,
-        }
-    }
-
-    async fn execute(
-        self,
-        engine: &DodamEngine,
-        sql: &str,
-        batch_size: usize,
-    ) -> Result<Option<QueryOutput>> {
-        match self {
-            Self::MinimumCostSupplier => {
-                try_execute_minimum_cost_supplier_sql(engine, sql, batch_size).await
-            }
-            Self::PromoRevenueRatio => {
-                try_execute_promo_revenue_ratio_sql(engine, sql, batch_size).await
-            }
-            Self::TopSupplierRevenue => {
-                try_execute_top_supplier_revenue_sql(engine, sql, batch_size).await
-            }
-            Self::PartsSupplierRelationship => {
-                try_execute_parts_supplier_relationship_sql(engine, sql, batch_size).await
-            }
-        }
-    }
-}
-
-pub(super) async fn try_execute_tpch_rule_sql(
-    engine: &DodamEngine,
-    sql: &str,
-    batch_size: usize,
-) -> Result<Option<QueryOutput>> {
-    let candidates = tpch_rule_candidates(sql)?;
-    for rule in candidates {
-        if let Some(output) = rule.execute(engine, sql, batch_size).await? {
-            if tpch_profile_enabled() {
-                eprintln!(
-                    "[dodam:tpch-rule] selected={} cost_rank={}",
-                    rule.name(),
-                    rule.estimated_cost_rank()
-                );
-            }
-            return Ok(Some(output));
-        }
-    }
-    Ok(None)
-}
-
-fn tpch_rule_candidates(sql: &str) -> Result<Vec<TpchRule>> {
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Ok(Vec::new());
-    };
-    let mut rules = Vec::new();
-    if q15_shape(query) {
-        rules.push(TpchRule::TopSupplierRevenue);
-    }
-    if let SetExpr::Select(select) = query.body.as_ref()
-        && let Some(selection) = select.selection.as_ref()
-    {
-        if q02_shape(select, query, selection) {
-            rules.push(TpchRule::MinimumCostSupplier);
-        }
-        if q14_shape(select, query, selection) {
-            rules.push(TpchRule::PromoRevenueRatio);
-        }
-        if q16_shape(select, query, selection) {
-            rules.push(TpchRule::PartsSupplierRelationship);
-        }
-    }
-    rules.sort_by_key(|rule| rule.estimated_cost_rank());
-    Ok(rules)
-}
-
 fn q02_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
     if !matches!(parse_limit(query), Ok(Some(_))) || !matches!(parse_offset(query), Ok(0)) {
         return false;
@@ -138,7 +39,7 @@ fn q02_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
         && order_by.contains("p_partkey")
 }
 
-async fn try_execute_minimum_cost_supplier_sql(
+pub(super) async fn try_execute_minimum_cost_supplier_sql(
     engine: &DodamEngine,
     sql: &str,
     batch_size: usize,
@@ -616,7 +517,7 @@ fn q16_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
         && selection.contains("s_comment like")
 }
 
-async fn try_execute_parts_supplier_relationship_sql(
+pub(super) async fn try_execute_parts_supplier_relationship_sql(
     engine: &DodamEngine,
     sql: &str,
     batch_size: usize,
@@ -771,7 +672,7 @@ fn q14_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
         && selection.contains("l_shipdate")
 }
 
-async fn try_execute_promo_revenue_ratio_sql(
+pub(super) async fn try_execute_promo_revenue_ratio_sql(
     engine: &DodamEngine,
     sql: &str,
     batch_size: usize,
@@ -907,7 +808,7 @@ fn q15_shape(query: &Query) -> bool {
         && order_by.contains("s_suppkey")
 }
 
-async fn try_execute_top_supplier_revenue_sql(
+pub(super) async fn try_execute_top_supplier_revenue_sql(
     engine: &DodamEngine,
     sql: &str,
     batch_size: usize,

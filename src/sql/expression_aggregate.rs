@@ -126,35 +126,49 @@ fn collect_global_sum_product_expression(
     let started = Instant::now();
     let mut rows = 0usize;
     let mut batches = 0usize;
-    let mut sum = 0i64;
+    let mut int_sum = 0i64;
+    let mut float_sum = 0f64;
     let mut count = 0u64;
+    let mut float_result = false;
     while let Some(batch) = stream.next() {
         let batch = batch?;
         if batch.num_rows() == 0 {
             continue;
         }
-        let Some(left) = SumProductI64Input::new(&batch, left_column)? else {
+        let Some(left) = SumProductInput::new(&batch, left_column)? else {
             return Err(DodamError::UnsupportedSql(format!(
-                "SUM product input column is not integer: {left_column}"
+                "SUM product input column is not numeric: {left_column}"
             )));
         };
-        let Some(right) = SumProductI64Input::new(&batch, right_column)? else {
+        let Some(right) = SumProductInput::new(&batch, right_column)? else {
             return Err(DodamError::UnsupportedSql(format!(
-                "SUM product input column is not integer: {right_column}"
+                "SUM product input column is not numeric: {right_column}"
             )));
         };
         rows = rows.saturating_add(batch.num_rows());
         batches += 1;
-        let (batch_sum, batch_count) = left.sum_product(&right, batch.num_rows())?;
-        sum = sum.checked_add(batch_sum).ok_or_else(|| {
-            DodamError::UnsupportedSql("SUM integer expression overflow".to_string())
-        })?;
-        count += batch_count;
+        if left.is_integer() && right.is_integer() && !float_result {
+            let (batch_sum, batch_count) = left.sum_product_i64(&right, batch.num_rows())?;
+            int_sum = int_sum.checked_add(batch_sum).ok_or_else(|| {
+                DodamError::UnsupportedSql("SUM integer expression overflow".to_string())
+            })?;
+            count += batch_count;
+        } else {
+            if !float_result {
+                float_sum = int_sum as f64;
+                float_result = true;
+            }
+            let (batch_sum, batch_count) = left.sum_product_f64(&right, batch.num_rows());
+            float_sum += batch_sum;
+            count += batch_count;
+        }
     }
-    let value = if count == 0 {
+    let value = if float_result {
+        AggregateValue::Float64((count > 0).then_some(float_sum))
+    } else if count == 0 {
         AggregateValue::Int64(None)
     } else {
-        AggregateValue::Int64(Some(sum))
+        AggregateValue::Int64(Some(int_sum))
     };
     Ok(AggregateMetrics {
         fragments,
@@ -204,12 +218,14 @@ fn sum_product_i64_columns(expr: &ScalarSqlExpression) -> Option<(&str, &str)> {
     Some((left.as_str(), right.as_str()))
 }
 
-enum SumProductI64Input<'a> {
+enum SumProductInput<'a> {
     Int32(&'a Int32Array),
     Int64(&'a Int64Array),
+    Float64(&'a Float64Array),
+    Decimal128(DecimalInput<'a>),
 }
 
-impl<'a> SumProductI64Input<'a> {
+impl<'a> SumProductInput<'a> {
     fn new(batch: &'a RecordBatch, column: &str) -> Result<Option<Self>> {
         let values = batch.column(sum_product_column_index(batch, column)?);
         match values.data_type() {
@@ -225,8 +241,19 @@ impl<'a> SumProductI64Input<'a> {
                     .downcast_ref::<Int64Array>()
                     .expect("Int64 sum-product input"),
             ))),
+            DataType::Float64 => Ok(Some(Self::Float64(
+                values
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .expect("Float64 sum-product input"),
+            ))),
+            DataType::Decimal128(_, _) => Ok(decimal_input(values)?.map(Self::Decimal128)),
             _ => Ok(None),
         }
+    }
+
+    fn is_integer(&self) -> bool {
+        matches!(self, Self::Int32(_) | Self::Int64(_))
     }
 
     #[inline]
@@ -234,10 +261,22 @@ impl<'a> SumProductI64Input<'a> {
         match self {
             Self::Int32(values) => values.is_valid(row).then(|| i64::from(values.value(row))),
             Self::Int64(values) => values.is_valid(row).then(|| values.value(row)),
+            Self::Float64(_) => None,
+            Self::Decimal128(_) => None,
         }
     }
 
-    fn sum_product(&self, other: &Self, rows: usize) -> Result<(i64, u64)> {
+    #[inline]
+    fn value_f64(&self, row: usize) -> Option<f64> {
+        match self {
+            Self::Int32(values) => values.is_valid(row).then(|| f64::from(values.value(row))),
+            Self::Int64(values) => values.is_valid(row).then(|| values.value(row) as f64),
+            Self::Float64(values) => values.is_valid(row).then(|| values.value(row)),
+            Self::Decimal128(values) => (!values.is_null(row)).then(|| values.value(row)),
+        }
+    }
+
+    fn sum_product_i64(&self, other: &Self, rows: usize) -> Result<(i64, u64)> {
         match (self, other) {
             (Self::Int32(left), Self::Int32(right))
                 if left.null_count() == 0 && right.null_count() == 0 =>
@@ -263,6 +302,22 @@ impl<'a> SumProductI64Input<'a> {
         }
     }
 
+    fn sum_product_f64(&self, other: &Self, rows: usize) -> (f64, u64) {
+        match (self, other) {
+            (Self::Decimal128(left), Self::Decimal128(right))
+                if left.null_count() == 0 && right.null_count() == 0 =>
+            {
+                sum_product_non_null_decimal_decimal(left, right)
+            }
+            (Self::Float64(left), Self::Float64(right))
+                if left.null_count() == 0 && right.null_count() == 0 =>
+            {
+                sum_product_non_null_f64_f64(left.values(), right.values())
+            }
+            _ => self.sum_product_nullable_f64(other, rows),
+        }
+    }
+
     fn sum_product_nullable(&self, other: &Self, rows: usize) -> Result<(i64, u64)> {
         let mut sum = 0i64;
         let mut count = 0u64;
@@ -282,6 +337,22 @@ impl<'a> SumProductI64Input<'a> {
             count += 1;
         }
         Ok((sum, count))
+    }
+
+    fn sum_product_nullable_f64(&self, other: &Self, rows: usize) -> (f64, u64) {
+        let mut sum = 0f64;
+        let mut count = 0u64;
+        for row in 0..rows {
+            let Some(left) = self.value_f64(row) else {
+                continue;
+            };
+            let Some(right) = other.value_f64(row) else {
+                continue;
+            };
+            sum += left * right;
+            count += 1;
+        }
+        (sum, count)
     }
 }
 
@@ -348,6 +419,27 @@ fn sum_product_non_null_i64_i64(left: &[i64], right: &[i64]) -> Result<(i64, u64
         count += 1;
     }
     Ok((sum, count))
+}
+
+fn sum_product_non_null_decimal_decimal(
+    left: &DecimalInput<'_>,
+    right: &DecimalInput<'_>,
+) -> (f64, u64) {
+    let mut sum = 0f64;
+    let left_scale = left.scale;
+    let right_scale = right.scale;
+    for (&left_value, &right_value) in left.raw_values().iter().zip(right.raw_values()) {
+        sum += (left_value as f64 / left_scale) * (right_value as f64 / right_scale);
+    }
+    (sum, left.raw_values().len() as u64)
+}
+
+fn sum_product_non_null_f64_f64(left: &[f64], right: &[f64]) -> (f64, u64) {
+    let mut sum = 0f64;
+    for (&left, &right) in left.iter().zip(right) {
+        sum += left * right;
+    }
+    (sum, left.len() as u64)
 }
 
 #[allow(clippy::too_many_arguments)]

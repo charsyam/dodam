@@ -2,8 +2,11 @@ use super::*;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SqlRule {
-    Tpch,
     WithCte,
+    MinimumCostSupplier,
+    PromoRevenueRatio,
+    TopSupplierRevenue,
+    PartsSupplierRelationship,
     PricingSummary,
     ProfitByNationYear,
     ReturnedCustomerRevenue,
@@ -37,7 +40,6 @@ enum SqlRule {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SqlRuleKind {
-    LegacyTpchDispatcher,
     VectorAggregate,
     VectorJoinAggregate,
     DerivedAggregate,
@@ -49,7 +51,6 @@ enum SqlRuleKind {
 impl SqlRuleKind {
     fn name(self) -> &'static str {
         match self {
-            Self::LegacyTpchDispatcher => "legacy-tpch-dispatcher",
             Self::VectorAggregate => "vector-aggregate",
             Self::VectorJoinAggregate => "vector-join-aggregate",
             Self::DerivedAggregate => "derived-aggregate",
@@ -61,7 +62,6 @@ impl SqlRuleKind {
 
     fn fallback_penalty(self) -> u32 {
         match self {
-            Self::LegacyTpchDispatcher => 100_000,
             _ => 0,
         }
     }
@@ -70,8 +70,11 @@ impl SqlRuleKind {
 impl SqlRule {
     fn name(self) -> &'static str {
         match self {
-            Self::Tpch => "tpch-rule-set",
             Self::WithCte => "with-cte",
+            Self::MinimumCostSupplier => "minimum-cost-supplier",
+            Self::PromoRevenueRatio => "promo-revenue-ratio",
+            Self::TopSupplierRevenue => "top-supplier-revenue",
+            Self::PartsSupplierRelationship => "parts-supplier-relationship",
             Self::PricingSummary => "pricing-summary",
             Self::ProfitByNationYear => "profit-by-nation-year",
             Self::ReturnedCustomerRevenue => "returned-customer-revenue",
@@ -113,9 +116,13 @@ impl SqlRule {
 
     fn kind(self) -> SqlRuleKind {
         match self {
-            Self::Tpch => SqlRuleKind::LegacyTpchDispatcher,
             Self::WithCte => SqlRuleKind::Cte,
-            Self::PricingSummary | Self::ImportantStockValue => SqlRuleKind::VectorAggregate,
+            Self::PricingSummary
+            | Self::ImportantStockValue
+            | Self::PromoRevenueRatio
+            | Self::TopSupplierRevenue
+            | Self::PartsSupplierRelationship => SqlRuleKind::VectorAggregate,
+            Self::MinimumCostSupplier => SqlRuleKind::DerivedAggregate,
             Self::ProfitByNationYear
             | Self::ReturnedCustomerRevenue
             | Self::RegionalSupplierRevenue
@@ -148,8 +155,11 @@ impl SqlRule {
 
     fn required_features(self) -> &'static [&'static str] {
         match self {
-            Self::Tpch
-            | Self::PricingSummary
+            Self::PricingSummary
+            | Self::MinimumCostSupplier
+            | Self::PromoRevenueRatio
+            | Self::TopSupplierRevenue
+            | Self::PartsSupplierRelationship
             | Self::ProfitByNationYear
             | Self::ReturnedCustomerRevenue
             | Self::ImportantStockValue
@@ -184,6 +194,55 @@ impl SqlRule {
 
     fn required_columns(self) -> &'static [&'static str] {
         match self {
+            Self::MinimumCostSupplier => &[
+                "s_acctbal",
+                "s_name",
+                "s_address",
+                "s_phone",
+                "s_comment",
+                "s_suppkey",
+                "s_nationkey",
+                "n_name",
+                "n_nationkey",
+                "n_regionkey",
+                "r_name",
+                "r_regionkey",
+                "p_partkey",
+                "p_mfgr",
+                "p_size",
+                "p_type",
+                "ps_partkey",
+                "ps_suppkey",
+                "ps_supplycost",
+            ],
+            Self::PromoRevenueRatio => &[
+                "p_partkey",
+                "p_type",
+                "l_partkey",
+                "l_extendedprice",
+                "l_discount",
+                "l_shipdate",
+            ],
+            Self::TopSupplierRevenue => &[
+                "l_suppkey",
+                "l_extendedprice",
+                "l_discount",
+                "l_shipdate",
+                "s_suppkey",
+                "s_name",
+                "s_address",
+                "s_phone",
+            ],
+            Self::PartsSupplierRelationship => &[
+                "p_partkey",
+                "p_brand",
+                "p_type",
+                "p_size",
+                "ps_partkey",
+                "ps_suppkey",
+                "s_suppkey",
+                "s_comment",
+            ],
             Self::PricingSummary => &[
                 "l_returnflag",
                 "l_linestatus",
@@ -336,8 +395,20 @@ impl SqlRule {
         options: SqlExecutionOptions,
     ) -> Result<Option<QueryOutput>> {
         match self {
-            Self::Tpch => tpch_rules::try_execute_tpch_rule_sql(engine, sql, batch_size).await,
             Self::WithCte => try_execute_with_cte_sql(engine, sql, batch_size, options).await,
+            Self::MinimumCostSupplier => {
+                tpch_rules::try_execute_minimum_cost_supplier_sql(engine, sql, batch_size).await
+            }
+            Self::PromoRevenueRatio => {
+                tpch_rules::try_execute_promo_revenue_ratio_sql(engine, sql, batch_size).await
+            }
+            Self::TopSupplierRevenue => {
+                tpch_rules::try_execute_top_supplier_revenue_sql(engine, sql, batch_size).await
+            }
+            Self::PartsSupplierRelationship => {
+                tpch_rules::try_execute_parts_supplier_relationship_sql(engine, sql, batch_size)
+                    .await
+            }
             Self::PricingSummary => try_execute_pricing_summary_sql(engine, sql, batch_size).await,
             Self::ProfitByNationYear => {
                 try_execute_profit_by_nation_year_sql(engine, sql, batch_size).await
@@ -424,9 +495,12 @@ impl SqlRule {
 
     fn is_candidate(self, context: &SqlRuleContext) -> bool {
         match self {
-            Self::Tpch => context.has_tpch_like_terms,
             Self::WithCte => context.has_with,
-            Self::PricingSummary
+            Self::MinimumCostSupplier
+            | Self::PromoRevenueRatio
+            | Self::TopSupplierRevenue
+            | Self::PartsSupplierRelationship
+            | Self::PricingSummary
             | Self::ProfitByNationYear
             | Self::ReturnedCustomerRevenue
             | Self::ImportantStockValue
@@ -463,8 +537,11 @@ impl SqlRule {
 
 fn sql_rule_registry() -> &'static [SqlRule] {
     &[
-        SqlRule::Tpch,
         SqlRule::WithCte,
+        SqlRule::MinimumCostSupplier,
+        SqlRule::PromoRevenueRatio,
+        SqlRule::TopSupplierRevenue,
+        SqlRule::PartsSupplierRelationship,
         SqlRule::PricingSummary,
         SqlRule::ProfitByNationYear,
         SqlRule::ReturnedCustomerRevenue,
