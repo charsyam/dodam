@@ -643,6 +643,19 @@ pub(super) async fn try_collect_expression_aggregate_scan_fold(
     let Some(group_keys) = group_key_exprs_for_aggregate(group_by, aggregates, expressions) else {
         return Ok(None);
     };
+    if let Some(metrics) = try_collect_two_expression_dictionary_scan_fold(
+        engine,
+        &path,
+        batch_size,
+        filter.as_ref(),
+        group_by,
+        aggregates,
+        &group_keys,
+        ordered_output,
+        output_limit,
+    )? {
+        return Ok(Some(metrics));
+    }
     let Some(collector) = CoalesceKeyCountSumCollector::new_with_composite_hash(
         &group_keys,
         aggregates,
@@ -660,11 +673,8 @@ pub(super) async fn try_collect_expression_aggregate_scan_fold(
     let projected_columns = projected_columns.clone();
     let aggregates = aggregates.to_vec();
     let dictionary_columns = expression_aggregate_dictionary_columns(&group_keys);
-    if !dictionary_columns.is_empty()
-        && expression_aggregate_dictionary_scan_fold_enabled()
-        && let Some(filter_for_dictionary) = filter.clone()
-    {
-        let predicates = PredicateSet::new(Some(filter_for_dictionary.clone()));
+    if !dictionary_columns.is_empty() && expression_aggregate_dictionary_scan_fold_enabled() {
+        let predicates = PredicateSet::new(filter.clone());
         let group_keys_for_state = group_keys.clone();
         let aggregates_for_state = aggregates.clone();
         if let Some(partials) = engine
@@ -685,36 +695,54 @@ pub(super) async fn try_collect_expression_aggregate_scan_fold(
                 },
                 {
                     let projected_columns = projected_columns.clone();
+                    let filter_for_dictionary = filter.clone();
                     move |view, collector: &mut CoalesceKeyCountSumCollector| {
-                        let mask = if let Some(mask) = evaluate_projected_view_filter_mask(
-                            view,
-                            &projected_columns,
-                            &filter_for_dictionary,
-                        )? {
-                            mask
-                        } else {
-                            if !expression_aggregate_row_at_time_fallback_enabled() {
-                                return Ok(None);
-                            }
-                            let Some(batch) = view.try_record_batch() else {
-                                return Ok(None);
+                        if let Some(filter_for_dictionary) = filter_for_dictionary.as_ref() {
+                            let mask = if let Some(mask) = evaluate_projected_view_filter_mask(
+                                view,
+                                &projected_columns,
+                                filter_for_dictionary,
+                            )? {
+                                mask
+                            } else {
+                                if !expression_aggregate_row_at_time_fallback_enabled() {
+                                    return Ok(None);
+                                }
+                                let Some(batch) = view.try_record_batch() else {
+                                    return Ok(None);
+                                };
+                                evaluate_filter_mask(batch, filter_for_dictionary)?
                             };
-                            evaluate_filter_mask(batch, &filter_for_dictionary)?
-                        };
-                        if mask.true_count() == 0 {
-                            return Ok(Some(()));
-                        }
-                        if expression_aggregate_row_at_time_fallback_enabled() {
-                            collector.consume_projected_view_masked_with_record_batch_fallback(
+                            if mask.true_count() == 0 {
+                                return Ok(Some(()));
+                            }
+                            if collector.try_consume_projected_view_masked_vectorized(
                                 view,
                                 &projected_columns,
                                 &mask,
-                            )?;
-                        } else if !collector.try_consume_projected_view_masked_vectorized(
-                            view,
-                            &projected_columns,
-                            &mask,
-                        )? {
+                            )? {
+                                return Ok(Some(()));
+                            }
+                            if expression_aggregate_row_at_time_fallback_enabled() {
+                                collector
+                                    .consume_projected_view_masked_with_record_batch_fallback(
+                                        view,
+                                        &projected_columns,
+                                        &mask,
+                                    )?;
+                            } else {
+                                return Ok(None);
+                            }
+                            return Ok(Some(()));
+                        }
+                        if collector
+                            .try_consume_projected_view_vectorized(view, &projected_columns)?
+                        {
+                            return Ok(Some(()));
+                        }
+                        if expression_aggregate_row_at_time_fallback_enabled() {
+                            collector.consume_projected_view(view, &projected_columns)?;
+                        } else {
                             return Ok(None);
                         }
                         Ok(Some(()))
@@ -758,6 +786,331 @@ pub(super) async fn try_collect_expression_aggregate_scan_fold(
             output_limit,
         )?,
     ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_collect_two_expression_dictionary_scan_fold(
+    engine: &DodamEngine,
+    path: &Path,
+    batch_size: usize,
+    filter: Option<&FilterExpr>,
+    group_by: &[String],
+    aggregates: &[AggregateExpr],
+    group_keys: &[GroupKeyExpr],
+    ordered_output: bool,
+    output_limit: Option<usize>,
+) -> Result<Option<AggregateMetrics>> {
+    if filter.is_some() {
+        return Ok(None);
+    }
+    let [AggregateExpr::CountStar, AggregateExpr::Sum(sum_column)] = aggregates else {
+        return Ok(None);
+    };
+    let (lower_column, lower_fallback, add_column, add_value, lower_first) = match group_keys {
+        [
+            GroupKeyExpr::LowerCoalesceLiteral { column, fallback },
+            GroupKeyExpr::Int64AddLiteral {
+                column: add_column,
+                value,
+            },
+        ] => (
+            column.as_str(),
+            fallback.as_str(),
+            add_column.as_str(),
+            *value,
+            true,
+        ),
+        [
+            GroupKeyExpr::Int64AddLiteral { column, value },
+            GroupKeyExpr::LowerCoalesceLiteral {
+                column: lower_column,
+                fallback,
+            },
+        ] => (
+            lower_column.as_str(),
+            fallback.as_str(),
+            column.as_str(),
+            *value,
+            false,
+        ),
+        _ => return Ok(None),
+    };
+    let row_groups = (0..engine.parquet_row_group_count(path)?).collect::<Vec<_>>();
+    let mut state = TwoExpressionDictionaryScanFoldState::new(
+        lower_fallback,
+        aggregates[0].clone(),
+        aggregates[1].clone(),
+        lower_first,
+    );
+    let started = Instant::now();
+    let Some(scan_metrics) = engine.scan_parquet_i32_i64_dictionary_id_columns(
+        path,
+        batch_size,
+        &row_groups,
+        [add_column, sum_column.as_str(), lower_column],
+        |add_values, sum_values, lower_def_levels, lower_ids, dictionary| {
+            state.consume_dictionary_ids(
+                add_values,
+                add_value,
+                sum_values,
+                lower_def_levels,
+                lower_ids,
+                dictionary,
+            )?;
+            Ok(Some(()))
+        },
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut metrics = state.finish(1, group_by, ordered_output, output_limit);
+    metrics.batches = scan_metrics.batches;
+    metrics.rows = scan_metrics.rows;
+    metrics.aggregate_nanos = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+    generic_profile_elapsed(
+        "aggregate two-expression dictionary scan-fold",
+        Some(started),
+    );
+    Ok(Some(metrics))
+}
+
+struct TwoExpressionDictionaryScanFoldState {
+    groups: std::collections::HashMap<(String, i64), usize>,
+    group_values: Vec<(String, i64, u64, i64)>,
+    fallback: String,
+    count_expr: AggregateExpr,
+    sum_expr: AggregateExpr,
+    lower_first: bool,
+    dictionary_cache: Vec<String>,
+    dictionary_group_slots: Vec<usize>,
+    fallback_group_slots: Vec<usize>,
+}
+
+impl TwoExpressionDictionaryScanFoldState {
+    fn new(
+        fallback: &str,
+        count_expr: AggregateExpr,
+        sum_expr: AggregateExpr,
+        lower_first: bool,
+    ) -> Self {
+        Self {
+            groups: std::collections::HashMap::new(),
+            group_values: Vec::new(),
+            fallback: ascii_lower_if_needed(fallback),
+            count_expr,
+            sum_expr,
+            lower_first,
+            dictionary_cache: Vec::new(),
+            dictionary_group_slots: Vec::new(),
+            fallback_group_slots: Vec::new(),
+        }
+    }
+
+    fn consume_dictionary_ids(
+        &mut self,
+        add_values: &[i32],
+        add_value: i64,
+        sum_values: &[i64],
+        lower_def_levels: Option<&[i16]>,
+        lower_ids: &[i32],
+        dictionary: &[bytes::Bytes],
+    ) -> Result<()> {
+        if add_values.len() != sum_values.len() {
+            return Err(DodamError::UnsupportedSql(
+                "two-expression dictionary scan-fold input length mismatch".to_string(),
+            ));
+        }
+        self.refresh_dictionary_cache(dictionary)?;
+        let Some((min_key, width)) = add_key_range(add_values, add_value) else {
+            return Ok(());
+        };
+        let Some(dictionary_slots) = dictionary.len().checked_mul(width) else {
+            return Err(DodamError::UnsupportedSql(
+                "expression aggregate dictionary slot overflow".to_string(),
+            ));
+        };
+        if width > 4096 || dictionary_slots > 1_048_576 {
+            return Err(DodamError::UnsupportedSql(
+                "expression aggregate dictionary slot range too large".to_string(),
+            ));
+        }
+        self.dictionary_group_slots.clear();
+        self.dictionary_group_slots
+            .resize(dictionary_slots, usize::MAX);
+        self.fallback_group_slots.clear();
+        self.fallback_group_slots.resize(width, usize::MAX);
+        let mut dictionary_offset = 0usize;
+        for row in 0..add_values.len() {
+            let add_key = i64::from(add_values[row]).saturating_add(add_value);
+            let offset = usize::try_from(add_key - min_key).map_err(|_| {
+                DodamError::UnsupportedSql(
+                    "expression aggregate add-key offset out of range".to_string(),
+                )
+            })?;
+            let group_id = if lower_def_levels.is_some_and(|levels| levels[row] == 0) {
+                if self.fallback_group_slots[offset] != usize::MAX {
+                    self.fallback_group_slots[offset]
+                } else {
+                    let group_id = self.group_id_for_key(self.fallback.clone(), add_key);
+                    self.fallback_group_slots[offset] = group_id;
+                    group_id
+                }
+            } else {
+                let Some(&dictionary_id) = lower_ids.get(dictionary_offset) else {
+                    return Err(DodamError::UnsupportedSql(
+                        "dictionary id missing in expression aggregate scan-fold".to_string(),
+                    ));
+                };
+                dictionary_offset += 1;
+                let dictionary_id = usize::try_from(dictionary_id).map_err(|_| {
+                    DodamError::UnsupportedSql(
+                        "negative dictionary id in expression aggregate scan-fold".to_string(),
+                    )
+                })?;
+                if dictionary_id >= self.dictionary_cache.len() {
+                    return Err(DodamError::UnsupportedSql(
+                        "dictionary id out of range in expression aggregate scan-fold".to_string(),
+                    ));
+                }
+                let slot = dictionary_id
+                    .checked_mul(width)
+                    .and_then(|slot| slot.checked_add(offset))
+                    .ok_or_else(|| {
+                        DodamError::UnsupportedSql(
+                            "expression aggregate dictionary slot overflow".to_string(),
+                        )
+                    })?;
+                if self.dictionary_group_slots[slot] != usize::MAX {
+                    self.dictionary_group_slots[slot]
+                } else {
+                    let group_id = self
+                        .group_id_for_key(self.dictionary_cache[dictionary_id].clone(), add_key);
+                    self.dictionary_group_slots[slot] = group_id;
+                    group_id
+                }
+            };
+            let entry = &mut self.group_values[group_id];
+            entry.2 = entry.2.saturating_add(1);
+            entry.3 = entry.3.saturating_add(sum_values[row]);
+        }
+        if dictionary_offset != lower_ids.len() {
+            return Err(DodamError::UnsupportedSql(
+                "unused dictionary ids in expression aggregate scan-fold".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn group_id_for_key(&mut self, key: String, add_key: i64) -> usize {
+        if let Some(group_id) = self.groups.get(&(key.clone(), add_key)).copied() {
+            return group_id;
+        }
+        let group_id = self.group_values.len();
+        self.groups.insert((key.clone(), add_key), group_id);
+        self.group_values.push((key, add_key, 0, 0));
+        group_id
+    }
+
+    fn refresh_dictionary_cache(&mut self, dictionary: &[bytes::Bytes]) -> Result<()> {
+        self.dictionary_cache.clear();
+        self.dictionary_cache.reserve(dictionary.len());
+        for value in dictionary {
+            let value = std::str::from_utf8(value.as_ref()).map_err(|_| {
+                DodamError::UnsupportedSql(
+                    "invalid UTF8 dictionary value in expression aggregate scan-fold".to_string(),
+                )
+            })?;
+            self.dictionary_cache.push(ascii_lower_if_needed(value));
+        }
+        Ok(())
+    }
+
+    fn finish(
+        self,
+        fragments: usize,
+        _group_by: &[String],
+        ordered_output: bool,
+        output_limit: Option<usize>,
+    ) -> AggregateMetrics {
+        let mut groups = self
+            .group_values
+            .into_iter()
+            .map(|(lower_key, add_key, count, sum)| {
+                let keys = if self.lower_first {
+                    vec![
+                        GroupValue::Utf8(Some(lower_key)),
+                        GroupValue::Int64(Some(add_key)),
+                    ]
+                } else {
+                    vec![
+                        GroupValue::Int64(Some(add_key)),
+                        GroupValue::Utf8(Some(lower_key)),
+                    ]
+                };
+                GroupAggregateResult {
+                    keys,
+                    values: vec![
+                        AggregateResult {
+                            expr: self.count_expr.clone(),
+                            value: AggregateValue::Count(count),
+                        },
+                        AggregateResult {
+                            expr: self.sum_expr.clone(),
+                            value: AggregateValue::Int64(Some(sum)),
+                        },
+                    ],
+                }
+            })
+            .collect::<Vec<_>>();
+        if ordered_output {
+            groups.sort_by(|left, right| {
+                compare_group_keys_for_expression_fold(&left.keys, &right.keys)
+            });
+            if let Some(limit) = output_limit {
+                groups.truncate(limit);
+            }
+        }
+        AggregateMetrics {
+            fragments,
+            groups,
+            ..AggregateMetrics::default()
+        }
+    }
+}
+
+fn add_key_range(values: &[i32], add_value: i64) -> Option<(i64, usize)> {
+    let min = i64::from(values.iter().copied().min()?).saturating_add(add_value);
+    let max = i64::from(values.iter().copied().max()?).saturating_add(add_value);
+    let width = max
+        .checked_sub(min)
+        .and_then(|value| value.checked_add(1))
+        .and_then(|value| usize::try_from(value).ok())?;
+    Some((min, width))
+}
+
+fn ascii_lower_if_needed(value: &str) -> String {
+    if value.as_bytes().iter().any(u8::is_ascii_uppercase) {
+        value.to_ascii_lowercase()
+    } else {
+        value.to_string()
+    }
+}
+
+fn compare_group_keys_for_expression_fold(
+    left: &[GroupValue],
+    right: &[GroupValue],
+) -> std::cmp::Ordering {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| match (left, right) {
+            (GroupValue::Utf8(left), GroupValue::Utf8(right)) => left.cmp(right),
+            (GroupValue::Int64(left), GroupValue::Int64(right)) => left.cmp(right),
+            (GroupValue::Utf8(_), _) => std::cmp::Ordering::Greater,
+            (GroupValue::Int64(_), _) => std::cmp::Ordering::Less,
+            _ => std::cmp::Ordering::Equal,
+        })
+        .find(|ordering| *ordering != std::cmp::Ordering::Equal)
+        .unwrap_or_else(|| left.len().cmp(&right.len()))
 }
 
 pub(super) fn expression_aggregate_output_limit(
@@ -1618,7 +1971,7 @@ fn expression_aggregate_scan_fold_enabled() -> bool {
 }
 
 fn expression_aggregate_dictionary_scan_fold_enabled() -> bool {
-    std::env::var("DODAM_ENABLE_EXPRESSION_AGG_DICTIONARY_SCAN_FOLD")
+    !std::env::var("DODAM_DISABLE_EXPRESSION_AGG_DICTIONARY_SCAN_FOLD")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
@@ -2098,7 +2451,8 @@ fn expression_aggregate_dictionary_columns(group_keys: &[GroupKeyExpr]) -> Vec<S
             GroupKeyExpr::CoalesceLiteral {
                 column,
                 fallback: GroupKeyLiteral::Utf8(_),
-            } => Some(column.clone()),
+            }
+            | GroupKeyExpr::LowerCoalesceLiteral { column, .. } => Some(column.clone()),
             _ => None,
         })
         .collect()
