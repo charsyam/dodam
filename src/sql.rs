@@ -167,7 +167,8 @@ use projection_utils::{
     projection_requires_expression_path,
 };
 use query_features::{
-    parse_distinct, reject_query_features, reject_select_features, validate_distinct,
+    expr_contains_materializable_subquery, parse_distinct, query_contains_set_operation,
+    reject_query_features, reject_select_features, validate_distinct,
 };
 use query_modifiers::{
     alias_target, parse_limit, parse_offset, parse_order_by, resolve_alias,
@@ -5703,14 +5704,6 @@ fn same_source_union_all_operand_supported(query: &SqlQuery) -> bool {
         && query.qualified_wildcards.is_empty()
 }
 
-fn query_contains_set_operation(expr: &SetExpr) -> bool {
-    match expr {
-        SetExpr::SetOperation { .. } => true,
-        SetExpr::Query(query) => query_contains_set_operation(query.body.as_ref()),
-        _ => false,
-    }
-}
-
 async fn execute_set_operation_expr(
     engine: &DodamEngine,
     expr: &SetExpr,
@@ -7083,27 +7076,6 @@ fn function_arg_exprs(function: &sqlparser::ast::Function) -> Vec<&SqlExpr> {
             _ => None,
         })
         .collect()
-}
-
-fn expr_contains_materializable_subquery(expr: &SqlExpr) -> bool {
-    match expr {
-        SqlExpr::Exists { .. } | SqlExpr::InSubquery { .. } | SqlExpr::Subquery(_) => true,
-        SqlExpr::BinaryOp { left, right, .. } => {
-            expr_contains_materializable_subquery(left)
-                || expr_contains_materializable_subquery(right)
-        }
-        SqlExpr::Nested(expr) | SqlExpr::UnaryOp { expr, .. } => {
-            expr_contains_materializable_subquery(expr)
-        }
-        SqlExpr::IsNull(expr) | SqlExpr::IsNotNull(expr) => {
-            expr_contains_materializable_subquery(expr)
-        }
-        SqlExpr::InList { expr, list, .. } => {
-            expr_contains_materializable_subquery(expr)
-                || list.iter().any(expr_contains_materializable_subquery)
-        }
-        _ => false,
-    }
 }
 
 fn expr_contains_scalar_subquery(expr: &SqlExpr) -> bool {

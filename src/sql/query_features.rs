@@ -74,3 +74,32 @@ pub(super) fn validate_distinct(
 
     Ok(())
 }
+
+pub(super) fn query_contains_set_operation(expr: &SetExpr) -> bool {
+    match expr {
+        SetExpr::SetOperation { .. } => true,
+        SetExpr::Query(query) => query_contains_set_operation(query.body.as_ref()),
+        _ => false,
+    }
+}
+
+pub(super) fn expr_contains_materializable_subquery(expr: &SqlExpr) -> bool {
+    match expr {
+        SqlExpr::Exists { .. } | SqlExpr::InSubquery { .. } | SqlExpr::Subquery(_) => true,
+        SqlExpr::BinaryOp { left, right, .. } => {
+            expr_contains_materializable_subquery(left)
+                || expr_contains_materializable_subquery(right)
+        }
+        SqlExpr::Nested(expr) | SqlExpr::UnaryOp { expr, .. } => {
+            expr_contains_materializable_subquery(expr)
+        }
+        SqlExpr::IsNull(expr) | SqlExpr::IsNotNull(expr) => {
+            expr_contains_materializable_subquery(expr)
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            expr_contains_materializable_subquery(expr)
+                || list.iter().any(expr_contains_materializable_subquery)
+        }
+        _ => false,
+    }
+}
