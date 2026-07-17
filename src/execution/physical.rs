@@ -39,8 +39,8 @@ use crate::execution::metrics::{
 };
 use crate::execution::{
     CountSumMinMaxMaxKind, DecimalDateRangeFilter, SingleKeyCountSumMinMaxVectorState,
-    SingleKeyCountSumVectorState, aggregate_metrics_to_batches, collect_aggregates,
-    collect_grouped_aggregates,
+    SingleKeyCountSumVectorState, TwoKeyCountSumMinMaxVectorState, aggregate_metrics_to_batches,
+    collect_aggregates, collect_grouped_aggregates,
 };
 use crate::hash::{FastHashMap as JoinKeyHashMap, FastHashSet as JoinKeyHashSet};
 use crate::plan::DirectPrimitiveFoldMode;
@@ -224,6 +224,15 @@ impl DirectPrimitiveFoldExec {
                 aggregates,
                 ..
             } => (vec![group_by.clone()], aggregates.clone()),
+            DirectPrimitiveFoldMode::TwoKeyCountSumMinMax {
+                first_group_by,
+                second_group_by,
+                aggregates,
+                ..
+            } => (
+                vec![first_group_by.clone(), second_group_by.clone()],
+                aggregates.clone(),
+            ),
         }
     }
 
@@ -398,6 +407,73 @@ impl DirectPrimitiveFoldExec {
                         }
                         "i64" | "I64" | "int64" | "Int64" => {
                             state.consume_i64_i64_decimal_date_batch(batch, &filter)
+                        }
+                        _ => unreachable!("key type checked before scan"),
+                    },
+                    |state, partial| state.merge(partial),
+                )?
+                else {
+                    return Ok(None);
+                };
+                let mut metrics = state.finish();
+                metrics.fragments = 1;
+                metrics.batches = scan_metrics.batches;
+                metrics.rows = scan_metrics.rows;
+                Ok(Some(metrics))
+            }
+            DirectPrimitiveFoldMode::TwoKeyCountSumMinMax {
+                first_key_type,
+                aggregates,
+                decimal_precision,
+                decimal_scale,
+                max_decimal,
+                decimal_min,
+                decimal_max,
+                date_min,
+                date_max,
+                ..
+            } => {
+                let max_kind = if max_decimal {
+                    CountSumMinMaxMaxKind::Decimal128 {
+                        precision: decimal_precision,
+                        scale: decimal_scale,
+                    }
+                } else {
+                    CountSumMinMaxMaxKind::Date32
+                };
+                let filter = DecimalDateRangeFilter {
+                    decimal_min: decimal_min.map(i128::from),
+                    decimal_max: decimal_max.map(i128::from),
+                    date_min,
+                    date_max,
+                };
+                let Some((state, scan_metrics)) = scan_direct_primitive_parallel_fold(
+                    self.path,
+                    self.batch_size,
+                    self.row_groups,
+                    columns,
+                    self.file_cache,
+                    self.object_store,
+                    false,
+                    || match first_key_type.as_str() {
+                        "i32" | "I32" | "int32" | "Int32" | "i64" | "I64" | "int64" | "Int64" => {
+                            Ok(TwoKeyCountSumMinMaxVectorState::new_with_max_kind(
+                                aggregates.clone(),
+                                decimal_precision,
+                                decimal_scale,
+                                max_kind,
+                            ))
+                        }
+                        _ => Err(DodamError::UnsupportedSql(format!(
+                            "unsupported DirectPrimitiveFoldExec two-key count/sum/min/max first key type: {first_key_type}"
+                        ))),
+                    },
+                    |state, batch| match first_key_type.as_str() {
+                        "i32" | "I32" | "int32" | "Int32" => {
+                            state.consume_i32_date_i64_decimal_batch(batch, &filter)
+                        }
+                        "i64" | "I64" | "int64" | "Int64" => {
+                            state.consume_i64_date_i64_decimal_batch(batch, &filter)
                         }
                         _ => unreachable!("key type checked before scan"),
                     },

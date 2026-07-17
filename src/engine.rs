@@ -251,7 +251,8 @@ struct DirectUtf8CountSumShape {
 
 #[derive(Default)]
 struct DirectUtf8CountSumState {
-    groups: HashMap<Vec<u8>, (u64, i64)>,
+    groups: HashMap<Vec<u8>, usize>,
+    group_values: Vec<(Vec<u8>, u64, i64)>,
     null_group: Option<(u64, i64)>,
     local_dictionary_groups: Vec<(u64, i64)>,
     local_dictionary_touched: Vec<usize>,
@@ -260,6 +261,24 @@ struct DirectUtf8CountSumState {
 }
 
 impl DirectUtf8CountSumState {
+    fn group_id(&mut self, key: &[u8]) -> usize {
+        if let Some(group_id) = self.groups.get(key).copied() {
+            return group_id;
+        }
+        let group_id = self.group_values.len();
+        let key = key.to_vec();
+        self.groups.insert(key.clone(), group_id);
+        self.group_values.push((key, 0, 0));
+        group_id
+    }
+
+    fn update_group(&mut self, key: &[u8], count: u64, sum: i64) {
+        let group_id = self.group_id(key);
+        let (_, group_count, group_sum) = &mut self.group_values[group_id];
+        *group_count = group_count.saturating_add(count);
+        *group_sum = group_sum.saturating_add(sum);
+    }
+
     fn consume(
         &mut self,
         predicate_values: &[i32],
@@ -284,11 +303,9 @@ impl DirectUtf8CountSumState {
                 entry.0 = entry.0.saturating_add(1);
                 entry.1 = entry.1.saturating_add(sum_values[row]);
             } else {
-                let group = group_values[group_index].data().to_vec();
+                let group = group_values[group_index].data();
                 group_index += 1;
-                let entry = self.groups.entry(group).or_insert((0, 0));
-                entry.0 = entry.0.saturating_add(1);
-                entry.1 = entry.1.saturating_add(sum_values[row]);
+                self.update_group(group, 1, sum_values[row]);
             }
         }
     }
@@ -333,13 +350,12 @@ impl DirectUtf8CountSumState {
                 entry.1 = entry.1.saturating_add(sum_values[row]);
             }
         }
-        for &id in &self.local_dictionary_touched {
+        let touched = self.local_dictionary_touched.drain(..).collect::<Vec<_>>();
+        for id in touched {
             let entry = &mut self.local_dictionary_groups[id];
             let (count, sum) = *entry;
             *entry = (0, 0);
-            let entry = self.groups.entry(dictionary[id].to_vec()).or_insert((0, 0));
-            entry.0 = entry.0.saturating_add(count);
-            entry.1 = entry.1.saturating_add(sum);
+            self.update_group(dictionary[id].as_ref(), count, sum);
         }
     }
 
@@ -350,7 +366,7 @@ impl DirectUtf8CountSumState {
         sum_expr: AggregateExpr,
     ) -> Result<AggregateMetrics> {
         let mut groups =
-            Vec::with_capacity(self.groups.len() + usize::from(self.null_group.is_some()));
+            Vec::with_capacity(self.group_values.len() + usize::from(self.null_group.is_some()));
         if let Some((count, sum)) = self.null_group {
             groups.push(GroupAggregateResult {
                 keys: vec![crate::execution::GroupValue::Utf8(None)],
@@ -366,7 +382,7 @@ impl DirectUtf8CountSumState {
                 ],
             });
         }
-        for (key, (count, sum)) in self.groups {
+        for (key, count, sum) in self.group_values {
             let key = String::from_utf8(key).map_err(|_| {
                 DodamError::UnsupportedSql("invalid UTF8 group key in direct aggregate".to_string())
             })?;
@@ -6482,6 +6498,9 @@ impl DodamEngine {
         if !filtered_dictionary_aggregate_enabled() {
             return Ok(None);
         }
+        if SingleKeyCountSumBatchAccumulator::try_new(1, group_by, aggregates).is_none() {
+            return Ok(None);
+        }
         let dictionary_columns =
             late_materialized_aggregate_dictionary_columns(aggregates, group_by);
         if dictionary_columns.is_empty() {
@@ -6582,54 +6601,103 @@ impl DodamEngine {
                 self.direct_primitive_row_groups(&local_path, &projection, predicates.pushdown())?;
             let decimal_min = option_i128_to_i64(shape.filter.decimal_min)?;
             let decimal_max = option_i128_to_i64(shape.filter.decimal_max)?;
-            let node = PhysicalPlanNode::new("DirectPrimitiveFoldExec")
-                .attr("mode", "single_key_count_sum_min_max")
-                .attr("rule", "direct_primitive_fold")
-                .attr("group_by", shape.key_column.clone())
-                .attr("row_groups", row_groups.len())
-                .attr(
-                    "columns",
-                    format!("[{}]", shape.projection_columns().join(",")),
-                )
-                .execution(PhysicalExecutionConfig::DirectPrimitiveFold {
-                    path: local_path,
-                    batch_size,
-                    row_groups,
-                    columns: vec![
-                        (
-                            shape.key_column.clone(),
-                            shape.key_type.column_type_descriptor().to_string(),
-                        ),
-                        (shape.sum_column.clone(), "i64".to_string()),
-                        (
-                            shape.min_decimal_column.clone(),
-                            format!(
-                                "decimal128_i64_raw:{}:{}",
-                                shape.decimal_precision, shape.decimal_scale
+            let columns_attr = format!("[{}]", shape.projection_columns().join(","));
+            let max_decimal = matches!(shape.max_kind, CountSumMinMaxMaxKind::Decimal128 { .. });
+            let node = if let Some(second_key_column) = &shape.second_key_column {
+                if second_key_column != &shape.filter_date_column {
+                    log_optimizer_rule_trace(
+                        "direct_primitive_fold",
+                        "reject",
+                        "two-key count/sum/min/max requires Date32 group key to be filter date",
+                    );
+                    return Ok(None);
+                }
+                PhysicalPlanNode::new("DirectPrimitiveFoldExec")
+                    .attr("mode", "two_key_count_sum_min_max")
+                    .attr("rule", "direct_primitive_fold")
+                    .attr(
+                        "group_by",
+                        format!("{},{}", shape.key_column, second_key_column),
+                    )
+                    .attr("row_groups", row_groups.len())
+                    .attr("columns", columns_attr)
+                    .execution(PhysicalExecutionConfig::DirectPrimitiveFold {
+                        path: local_path,
+                        batch_size,
+                        row_groups,
+                        columns: vec![
+                            (
+                                shape.key_column.clone(),
+                                shape.key_type.column_type_descriptor().to_string(),
                             ),
-                        ),
-                        (shape.filter_date_column.clone(), "date32".to_string()),
-                    ],
-                    mode: DirectPrimitiveFoldMode::SingleKeyCountSumMinMax {
-                        group_by: shape.key_column.clone(),
-                        key_type: shape.key_type.column_type_descriptor().to_string(),
-                        aggregates: aggregates.to_vec(),
-                        decimal_precision: shape.decimal_precision,
-                        decimal_scale: shape.decimal_scale,
-                        max_decimal: matches!(
-                            shape.max_kind,
-                            CountSumMinMaxMaxKind::Decimal128 { .. }
-                        ),
-                        decimal_min,
-                        decimal_max,
-                        date_min: shape.filter.date_min,
-                        date_max: shape.filter.date_max,
-                    },
-                });
+                            (second_key_column.clone(), "date32".to_string()),
+                            (shape.sum_column.clone(), "i64".to_string()),
+                            (
+                                shape.min_decimal_column.clone(),
+                                format!(
+                                    "decimal128_i64_raw:{}:{}",
+                                    shape.decimal_precision, shape.decimal_scale
+                                ),
+                            ),
+                        ],
+                        mode: DirectPrimitiveFoldMode::TwoKeyCountSumMinMax {
+                            first_group_by: shape.key_column.clone(),
+                            first_key_type: shape.key_type.column_type_descriptor().to_string(),
+                            second_group_by: second_key_column.clone(),
+                            aggregates: aggregates.to_vec(),
+                            decimal_precision: shape.decimal_precision,
+                            decimal_scale: shape.decimal_scale,
+                            max_decimal,
+                            decimal_min,
+                            decimal_max,
+                            date_min: shape.filter.date_min,
+                            date_max: shape.filter.date_max,
+                        },
+                    })
+            } else {
+                PhysicalPlanNode::new("DirectPrimitiveFoldExec")
+                    .attr("mode", "single_key_count_sum_min_max")
+                    .attr("rule", "direct_primitive_fold")
+                    .attr("group_by", shape.key_column.clone())
+                    .attr("row_groups", row_groups.len())
+                    .attr("columns", columns_attr)
+                    .execution(PhysicalExecutionConfig::DirectPrimitiveFold {
+                        path: local_path,
+                        batch_size,
+                        row_groups,
+                        columns: vec![
+                            (
+                                shape.key_column.clone(),
+                                shape.key_type.column_type_descriptor().to_string(),
+                            ),
+                            (shape.sum_column.clone(), "i64".to_string()),
+                            (
+                                shape.min_decimal_column.clone(),
+                                format!(
+                                    "decimal128_i64_raw:{}:{}",
+                                    shape.decimal_precision, shape.decimal_scale
+                                ),
+                            ),
+                            (shape.filter_date_column.clone(), "date32".to_string()),
+                        ],
+                        mode: DirectPrimitiveFoldMode::SingleKeyCountSumMinMax {
+                            group_by: shape.key_column.clone(),
+                            key_type: shape.key_type.column_type_descriptor().to_string(),
+                            aggregates: aggregates.to_vec(),
+                            decimal_precision: shape.decimal_precision,
+                            decimal_scale: shape.decimal_scale,
+                            max_decimal,
+                            decimal_min,
+                            decimal_max,
+                            date_min: shape.filter.date_min,
+                            date_max: shape.filter.date_max,
+                        },
+                    })
+            };
             log_optimizer_rule_trace(
                 "direct_primitive_fold",
                 "accept",
-                "single-key count/sum/min/max primitive aggregate",
+                "count/sum/min/max primitive aggregate",
             );
             return Ok(Some(node));
         }
@@ -6694,6 +6762,7 @@ impl DodamEngine {
         )>,
     > {
         if !direct_selection_fold_enabled()
+            || !shape.is_single_key()
             || !matches!(shape.key_type, DirectPrimitiveKeyType::I32)
         {
             return Ok(None);
@@ -7725,6 +7794,7 @@ impl DirectCountSumShape {
 struct DirectCountSumMinMaxShape {
     key_column: String,
     key_type: DirectPrimitiveKeyType,
+    second_key_column: Option<String>,
     sum_column: String,
     min_decimal_column: String,
     filter_date_column: String,
@@ -7742,8 +7812,15 @@ impl DirectCountSumMinMaxShape {
         engine: &DodamEngine,
         path: &Path,
     ) -> Result<Option<Self>> {
-        let [key_column] = group_by else {
+        let [key_column, rest @ ..] = group_by else {
             return Ok(None);
+        };
+        let second_key_column = match rest {
+            [] => None,
+            [second_key_column] if engine.parquet_is_date32_column(path, second_key_column)? => {
+                Some(second_key_column.clone())
+            }
+            _ => return Ok(None),
         };
         let [
             AggregateExpr::CountStar,
@@ -7801,6 +7878,7 @@ impl DirectCountSumMinMaxShape {
         Ok(Some(Self {
             key_column: key_column.clone(),
             key_type,
+            second_key_column,
             sum_column: sum_column.clone(),
             min_decimal_column: min_decimal_column.clone(),
             filter_date_column,
@@ -7812,18 +7890,26 @@ impl DirectCountSumMinMaxShape {
     }
 
     fn projection_columns(&self) -> Vec<String> {
-        let mut columns = Vec::with_capacity(4);
-        for column in [
-            &self.key_column,
+        let mut columns = Vec::with_capacity(5);
+        let mut ordered = vec![&self.key_column];
+        if let Some(second_key_column) = &self.second_key_column {
+            ordered.push(second_key_column);
+        }
+        ordered.extend([
             &self.sum_column,
             &self.min_decimal_column,
             &self.filter_date_column,
-        ] {
+        ]);
+        for column in ordered {
             if !columns.iter().any(|existing| existing == column) {
                 columns.push(column.clone());
             }
         }
         columns
+    }
+
+    fn is_single_key(&self) -> bool {
+        self.second_key_column.is_none()
     }
 }
 
@@ -7967,6 +8053,11 @@ fn late_materialized_aggregate_dictionary_columns(
             [
                 AggregateExpr::CountStar | AggregateExpr::Count(_),
                 AggregateExpr::Sum(_)
+            ] | [
+                AggregateExpr::CountStar,
+                AggregateExpr::Sum(_),
+                AggregateExpr::Min(_),
+                AggregateExpr::Max(_)
             ]
         )
     {

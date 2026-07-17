@@ -389,8 +389,20 @@ fn native_filtered_update_i32_group_direct_predicates_columnar_batch(
         let key = values.value(row) as usize;
         present[key] = true;
     }
+    let mut selected_rows = Vec::new();
     for ((state, predicate), input) in columnar.iter_mut().zip(predicates).zip(inputs) {
-        state.update_with_i32_keys(predicate, input, values);
+        if predicate.prefers_selected_rows() {
+            selected_rows.clear();
+            selected_rows.reserve(values.len().min(1024));
+            predicate.append_selected_rows(values.len(), &mut selected_rows);
+        }
+        if predicate.prefers_selected_rows()
+            && native_filtered_selected_rows_are_sparse(selected_rows.len(), values.len())
+        {
+            state.update_with_i32_keys(&selected_rows, input, values);
+        } else {
+            state.update_with_i32_keys_predicate(predicate, input, values);
+        }
     }
     if dense.len() <= max_key {
         dense.resize_with(max_key + 1, || None);
@@ -523,6 +535,59 @@ impl NativeFilteredColumnarAggState {
 
     fn update_with_i32_keys(
         &mut self,
+        selected_rows: &[usize],
+        input: &NativeFilteredBatchInput,
+        keys: &Int32Array,
+    ) {
+        match self {
+            Self::Count(counts) => match input {
+                NativeFilteredBatchInput::AlwaysSome | NativeFilteredBatchInput::NonNull => {
+                    for row in selected_rows.iter().copied() {
+                        counts[keys.value(row) as usize] += 1;
+                    }
+                }
+                NativeFilteredBatchInput::I64Array(values) => {
+                    for row in selected_rows.iter().copied() {
+                        if values.is_valid(row) {
+                            counts[keys.value(row) as usize] += 1;
+                        }
+                    }
+                }
+                NativeFilteredBatchInput::I32Array(values) => {
+                    for row in selected_rows.iter().copied() {
+                        if values.is_valid(row) {
+                            counts[keys.value(row) as usize] += 1;
+                        }
+                    }
+                }
+                NativeFilteredBatchInput::Other(_) => {}
+            },
+            Self::SumI64 { sums, counts } | Self::AvgI64 { sums, counts } => match input {
+                NativeFilteredBatchInput::I64Array(values) => {
+                    for row in selected_rows.iter().copied() {
+                        if values.is_valid(row) {
+                            let key = keys.value(row) as usize;
+                            sums[key] += values.value(row);
+                            counts[key] += 1;
+                        }
+                    }
+                }
+                NativeFilteredBatchInput::I32Array(values) => {
+                    for row in selected_rows.iter().copied() {
+                        if values.is_valid(row) {
+                            let key = keys.value(row) as usize;
+                            sums[key] += i64::from(values.value(row));
+                            counts[key] += 1;
+                        }
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+
+    fn update_with_i32_keys_predicate(
+        &mut self,
         predicate: &NativeFilteredDirectPredicate,
         input: &NativeFilteredBatchInput,
         keys: &Int32Array,
@@ -595,6 +660,10 @@ impl NativeFilteredColumnarAggState {
             _ => {}
         }
     }
+}
+
+fn native_filtered_selected_rows_are_sparse(selected_rows: usize, rows: usize) -> bool {
+    rows > 0 && selected_rows.saturating_mul(4) < rows.saturating_mul(3)
 }
 
 fn native_filtered_columnar_agg_states(
@@ -1240,6 +1309,80 @@ impl NativeFilteredDirectPredicate {
                 if *negated { !matched } else { matched }
             }
         }
+    }
+
+    fn append_selected_rows(&self, rows: usize, selected_rows: &mut Vec<usize>) {
+        match self {
+            Self::Precomputed(selected) => {
+                for row in 0..rows.min(selected.len()) {
+                    if selected[row] {
+                        selected_rows.push(row);
+                    }
+                }
+            }
+            Self::IsNotNull(values) => {
+                for row in 0..rows {
+                    if values.is_valid(row) {
+                        selected_rows.push(row);
+                    }
+                }
+            }
+            Self::I32Compare {
+                values,
+                op,
+                literal,
+            } => {
+                for row in 0..rows {
+                    if values.is_valid(row)
+                        && native_filtered_compare_i64(i64::from(values.value(row)), op, *literal)
+                    {
+                        selected_rows.push(row);
+                    }
+                }
+            }
+            Self::I64Compare {
+                values,
+                op,
+                literal,
+            } => {
+                for row in 0..rows {
+                    if values.is_valid(row)
+                        && native_filtered_compare_i64(values.value(row), op, *literal)
+                    {
+                        selected_rows.push(row);
+                    }
+                }
+            }
+            Self::Decimal128Compare {
+                values,
+                op,
+                literal,
+            } => {
+                for row in 0..rows {
+                    if values.is_valid(row)
+                        && native_filtered_compare_i128(values.value(row), op, *literal)
+                    {
+                        selected_rows.push(row);
+                    }
+                }
+            }
+            Self::Utf8PrefixLike {
+                values,
+                prefix,
+                negated,
+            } => {
+                for row in 0..rows {
+                    let matched = values.is_valid(row) && values.value(row).starts_with(prefix);
+                    if if *negated { !matched } else { matched } {
+                        selected_rows.push(row);
+                    }
+                }
+            }
+        }
+    }
+
+    fn prefers_selected_rows(&self) -> bool {
+        matches!(self, Self::Utf8PrefixLike { .. } | Self::Precomputed(_))
     }
 }
 

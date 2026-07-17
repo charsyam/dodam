@@ -1981,11 +1981,14 @@ fn collect_semijoin_i32_utf8_prefix_candidate_keys_direct(
         row_groups,
         [numeric_column, string_column],
         |numbers, dictionary_def_levels, dictionary_ids, dictionary| {
-            let selected_string_ids = string_id_cache.refresh_prefix_dense(
+            let (selected_string_ids, selected_count) = string_id_cache.refresh_prefix_dense(
                 dictionary,
                 &mut string_ids,
                 prefix.as_bytes(),
             )?;
+            if selected_count == 0 {
+                return Ok(Some(()));
+            }
             numeric_values.reserve(numbers.len());
             let mut dictionary_value_offset = 0usize;
             match dictionary_def_levels {
@@ -2082,11 +2085,17 @@ fn collect_semijoin_i32_utf8_pair_set_direct(
         row_groups,
         [numeric_column, string_column],
         |number_bytes, records, dictionary_def_levels, dictionary_ids, dictionary| {
-            let selected_string_ids = string_id_cache.refresh_prefix_dense(
+            let (selected_string_ids, selected_count) = string_id_cache.refresh_prefix_dense(
                 dictionary,
                 &mut string_ids,
                 prefix.as_bytes(),
             )?;
+            if selected_count == 0 {
+                if let Some(levels) = dictionary_def_levels {
+                    has_null |= levels.iter().any(|level| *level == 0);
+                }
+                return Ok(Some(()));
+            }
             pair_values.reserve(records);
             numeric_values.reserve(records);
             let mut dictionary_value_offset = 0usize;
@@ -2129,67 +2138,72 @@ fn collect_semijoin_i32_utf8_pair_set_direct(
             Ok(Some(()))
         },
     )?;
-    let metrics = if raw_metrics.is_some() {
-        raw_metrics
-    } else {
-        pair_values.clear();
-        numeric_values = SemijoinNumericValues::empty_i32();
-        string_ids.clear();
-        has_null = false;
-        string_id_cache = SemijoinDictionaryStringIdCache::default();
-        engine.scan_parquet_i32_dictionary_id_columns(
-            path,
-            batch_size,
-            row_groups,
-            [numeric_column, string_column],
-            |numbers, dictionary_def_levels, dictionary_ids, dictionary| {
-                let selected_string_ids = string_id_cache.refresh_prefix_dense(
-                    dictionary,
-                    &mut string_ids,
-                    prefix.as_bytes(),
-                )?;
-                pair_values.reserve(numbers.len());
-                numeric_values.reserve(numbers.len());
-                let mut dictionary_value_offset = 0usize;
-                match dictionary_def_levels {
-                    Some(levels) => {
-                        has_null |= levels.iter().any(|level| *level == 0);
-                        for (row, level) in levels.iter().copied().enumerate() {
-                            if level == 0 {
-                                continue;
+    let metrics =
+        if raw_metrics.is_some() {
+            raw_metrics
+        } else {
+            pair_values.clear();
+            numeric_values = SemijoinNumericValues::empty_i32();
+            string_ids.clear();
+            has_null = false;
+            string_id_cache = SemijoinDictionaryStringIdCache::default();
+            engine.scan_parquet_i32_dictionary_id_columns(
+                path,
+                batch_size,
+                row_groups,
+                [numeric_column, string_column],
+                |numbers, dictionary_def_levels, dictionary_ids, dictionary| {
+                    let (selected_string_ids, selected_count) = string_id_cache
+                        .refresh_prefix_dense(dictionary, &mut string_ids, prefix.as_bytes())?;
+                    if selected_count == 0 {
+                        if let Some(levels) = dictionary_def_levels {
+                            has_null |= levels.iter().any(|level| *level == 0);
+                        }
+                        return Ok(Some(()));
+                    }
+                    pair_values.reserve(numbers.len());
+                    numeric_values.reserve(numbers.len());
+                    let mut dictionary_value_offset = 0usize;
+                    match dictionary_def_levels {
+                        Some(levels) => {
+                            has_null |= levels.iter().any(|level| *level == 0);
+                            for (row, level) in levels.iter().copied().enumerate() {
+                                if level == 0 {
+                                    continue;
+                                }
+                                let Some(dictionary_id) =
+                                    dictionary_ids.get(dictionary_value_offset)
+                                else {
+                                    return Ok(None);
+                                };
+                                dictionary_value_offset += 1;
+                                insert_direct_semijoin_i32_utf8_pair_value_dense(
+                                    numbers[row],
+                                    *dictionary_id,
+                                    selected_string_ids,
+                                    &mut pair_values,
+                                    &mut numeric_values,
+                                );
                             }
-                            let Some(dictionary_id) = dictionary_ids.get(dictionary_value_offset)
-                            else {
-                                return Ok(None);
-                            };
-                            dictionary_value_offset += 1;
-                            insert_direct_semijoin_i32_utf8_pair_value_dense(
-                                numbers[row],
-                                *dictionary_id,
+                        }
+                        None => {
+                            insert_direct_semijoin_i32_utf8_pair_batch_dense(
+                                numbers,
+                                dictionary_ids,
                                 selected_string_ids,
                                 &mut pair_values,
                                 &mut numeric_values,
                             );
+                            dictionary_value_offset = dictionary_ids.len();
                         }
                     }
-                    None => {
-                        insert_direct_semijoin_i32_utf8_pair_batch_dense(
-                            numbers,
-                            dictionary_ids,
-                            selected_string_ids,
-                            &mut pair_values,
-                            &mut numeric_values,
-                        );
-                        dictionary_value_offset = dictionary_ids.len();
+                    if dictionary_value_offset != dictionary_ids.len() {
+                        return Ok(None);
                     }
-                }
-                if dictionary_value_offset != dictionary_ids.len() {
-                    return Ok(None);
-                }
-                Ok(Some(()))
-            },
-        )?
-    };
+                    Ok(Some(()))
+                },
+            )?
+        };
     if metrics.is_none() {
         if semijoin_profile_enabled() {
             eprintln!(
@@ -2246,11 +2260,14 @@ fn collect_semijoin_i32_utf8_pair_set_direct_selected_inner(
         [numeric_column, string_column],
         prefix.as_bytes(),
         |numbers, dictionary_ids, dictionary| {
-            let selected_string_ids = string_id_cache.refresh_prefix_dense(
+            let (selected_string_ids, selected_count) = string_id_cache.refresh_prefix_dense(
                 dictionary,
                 &mut string_ids,
                 prefix.as_bytes(),
             )?;
+            if selected_count == 0 {
+                return Ok(Some(()));
+            }
             if numbers.len() != dictionary_ids.len() {
                 return Ok(None);
             }
@@ -2365,6 +2382,7 @@ struct SemijoinDictionaryStringIdCache {
     ptr: *const bytes::Bytes,
     len: usize,
     fingerprint: u64,
+    selected_count: usize,
     ids: Vec<Option<u32>>,
     dense_ids: Vec<u32>,
 }
@@ -2386,6 +2404,7 @@ impl SemijoinDictionaryStringIdCache {
         self.ptr = dictionary.as_ptr();
         self.len = dictionary.len();
         self.fingerprint = fingerprint;
+        self.selected_count = 0;
         self.ids.clear();
         self.dense_ids.clear();
         self.ids.reserve(dictionary.len());
@@ -2396,6 +2415,9 @@ impl SemijoinDictionaryStringIdCache {
             } else {
                 u32::MAX
             };
+            if id != u32::MAX {
+                self.selected_count += 1;
+            }
             self.ids.push((id != u32::MAX).then_some(id));
             self.dense_ids.push(id);
         }
@@ -2407,9 +2429,9 @@ impl SemijoinDictionaryStringIdCache {
         dictionary: &[bytes::Bytes],
         string_ids: &mut FastHashMap<Vec<u8>, u32>,
         prefix: &[u8],
-    ) -> Result<&'a [u32]> {
+    ) -> Result<(&'a [u32], usize)> {
         let _ = self.refresh_prefix(dictionary, string_ids, prefix)?;
-        Ok(&self.dense_ids)
+        Ok((&self.dense_ids, self.selected_count))
     }
 
     fn refresh_existing<'a>(
@@ -2427,16 +2449,29 @@ impl SemijoinDictionaryStringIdCache {
         self.ptr = dictionary.as_ptr();
         self.len = dictionary.len();
         self.fingerprint = fingerprint;
+        self.selected_count = 0;
         self.ids.clear();
         self.dense_ids.clear();
         self.ids.reserve(dictionary.len());
         self.dense_ids.reserve(dictionary.len());
         for value in dictionary {
             let id = string_ids.get(value.as_ref()).copied();
+            if id.is_some() {
+                self.selected_count += 1;
+            }
             self.ids.push(id);
             self.dense_ids.push(id.unwrap_or(u32::MAX));
         }
         &self.ids
+    }
+
+    fn refresh_existing_dense<'a>(
+        &'a mut self,
+        dictionary: &[bytes::Bytes],
+        string_ids: &FastHashMap<Vec<u8>, u32>,
+    ) -> &'a [u32] {
+        let _ = self.refresh_existing(dictionary, string_ids);
+        &self.dense_ids
     }
 }
 
@@ -2755,24 +2790,15 @@ fn semijoin_i64_utf8_pair_mask(
             semijoin_dictionary_existing_string_ids(dictionary, &keys.string_ids);
         if let Some(local_string_ids) = local_string_ids {
             let dictionary_keys = dictionary.keys();
-            let mut selected = BooleanBufferBuilder::new(batch.num_rows());
-            for row in 0..batch.num_rows() {
-                if !semijoin_i64_array_is_valid(&numbers, row) || dictionary.is_null(row) {
-                    selected.append(false);
-                    continue;
-                }
-                let number = semijoin_i64_array_value(&numbers, row);
-                if !keys.numeric_values.contains_i64(number) {
-                    selected.append(negated);
-                    continue;
-                }
-                let matched = usize::try_from(dictionary_keys[row])
-                    .ok()
-                    .and_then(|local_id| local_string_ids.get(local_id).copied().flatten())
-                    .is_some_and(|string_id| keys.values.contains(number, string_id));
-                selected.append(if negated { !matched } else { matched });
-            }
-            return Ok(BooleanArray::new(selected.finish(), None));
+            return Ok(semijoin_i64_utf8_dictionary_pair_mask(
+                &numbers,
+                dictionary,
+                dictionary_keys,
+                &local_string_ids,
+                keys,
+                negated,
+                batch.num_rows(),
+            ));
         }
     }
     let Some(strings) = string_array else {
@@ -2780,13 +2806,233 @@ fn semijoin_i64_utf8_pair_mask(
             "integer/string semijoin dictionary values must be Utf8".to_string(),
         ));
     };
-    let mut selected = BooleanBufferBuilder::new(batch.num_rows());
-    for row in 0..batch.num_rows() {
-        if !semijoin_i64_array_is_valid(&numbers, row) || strings.is_null(row) {
+    Ok(semijoin_i64_utf8_plain_pair_mask(
+        &numbers,
+        strings,
+        keys,
+        negated,
+        batch.num_rows(),
+    ))
+}
+
+fn semijoin_i64_utf8_dictionary_pair_mask(
+    numbers: &SemijoinI64Array<'_>,
+    dictionary: DictionaryI32View<'_>,
+    dictionary_keys: &[i32],
+    local_string_ids: &[Option<u32>],
+    keys: &SemijoinI64Utf8PairKeys,
+    negated: bool,
+    rows: usize,
+) -> BooleanArray {
+    match numbers {
+        SemijoinI64Array::I32(values) => semijoin_i32_utf8_dictionary_pair_mask(
+            values,
+            dictionary,
+            dictionary_keys,
+            local_string_ids,
+            keys,
+            negated,
+            rows,
+        ),
+        SemijoinI64Array::I64(values) => semijoin_i64_utf8_dictionary_pair_mask_typed(
+            values,
+            dictionary,
+            dictionary_keys,
+            local_string_ids,
+            keys,
+            negated,
+            rows,
+        ),
+    }
+}
+
+fn semijoin_i32_utf8_dictionary_pair_mask(
+    numbers: &Int32Array,
+    dictionary: DictionaryI32View<'_>,
+    dictionary_keys: &[i32],
+    local_string_ids: &[Option<u32>],
+    keys: &SemijoinI64Utf8PairKeys,
+    negated: bool,
+    rows: usize,
+) -> BooleanArray {
+    if numbers.null_count() == 0 && dictionary.null_count() == 0 {
+        return semijoin_i32_utf8_dictionary_pair_mask_null_free(
+            numbers.values().as_ref(),
+            dictionary_keys,
+            local_string_ids,
+            keys,
+            negated,
+            rows,
+        );
+    }
+    let mut selected = BooleanBufferBuilder::new(rows);
+    for row in 0..rows {
+        if numbers.is_null(row) || dictionary.is_null(row) {
             selected.append(false);
             continue;
         }
-        let number = semijoin_i64_array_value(&numbers, row);
+        let number = numbers.value(row);
+        if !keys.numeric_values.contains_i32(number) {
+            selected.append(negated);
+            continue;
+        }
+        let number = i64::from(number);
+        let matched = usize::try_from(dictionary_keys[row])
+            .ok()
+            .and_then(|local_id| local_string_ids.get(local_id).copied().flatten())
+            .is_some_and(|string_id| keys.values.contains(number, string_id));
+        selected.append(if negated { !matched } else { matched });
+    }
+    BooleanArray::new(selected.finish(), None)
+}
+
+fn semijoin_i32_utf8_dictionary_pair_mask_null_free(
+    numbers: &[i32],
+    dictionary_keys: &[i32],
+    local_string_ids: &[Option<u32>],
+    keys: &SemijoinI64Utf8PairKeys,
+    negated: bool,
+    rows: usize,
+) -> BooleanArray {
+    let mut selected = BooleanBufferBuilder::new(rows);
+    for row in 0..rows {
+        let number = numbers[row];
+        if !keys.numeric_values.contains_i32(number) {
+            selected.append(negated);
+            continue;
+        }
+        let number = i64::from(number);
+        let matched = usize::try_from(dictionary_keys[row])
+            .ok()
+            .and_then(|local_id| local_string_ids.get(local_id).copied().flatten())
+            .is_some_and(|string_id| keys.values.contains(number, string_id));
+        selected.append(if negated { !matched } else { matched });
+    }
+    BooleanArray::new(selected.finish(), None)
+}
+
+fn semijoin_i64_utf8_dictionary_pair_mask_typed(
+    numbers: &Int64Array,
+    dictionary: DictionaryI32View<'_>,
+    dictionary_keys: &[i32],
+    local_string_ids: &[Option<u32>],
+    keys: &SemijoinI64Utf8PairKeys,
+    negated: bool,
+    rows: usize,
+) -> BooleanArray {
+    if numbers.null_count() == 0 && dictionary.null_count() == 0 {
+        return semijoin_i64_utf8_dictionary_pair_mask_null_free(
+            numbers.values().as_ref(),
+            dictionary_keys,
+            local_string_ids,
+            keys,
+            negated,
+            rows,
+        );
+    }
+    let mut selected = BooleanBufferBuilder::new(rows);
+    for row in 0..rows {
+        if numbers.is_null(row) || dictionary.is_null(row) {
+            selected.append(false);
+            continue;
+        }
+        let number = numbers.value(row);
+        if !keys.numeric_values.contains_i64(number) {
+            selected.append(negated);
+            continue;
+        }
+        let matched = usize::try_from(dictionary_keys[row])
+            .ok()
+            .and_then(|local_id| local_string_ids.get(local_id).copied().flatten())
+            .is_some_and(|string_id| keys.values.contains(number, string_id));
+        selected.append(if negated { !matched } else { matched });
+    }
+    BooleanArray::new(selected.finish(), None)
+}
+
+fn semijoin_i64_utf8_dictionary_pair_mask_null_free(
+    numbers: &[i64],
+    dictionary_keys: &[i32],
+    local_string_ids: &[Option<u32>],
+    keys: &SemijoinI64Utf8PairKeys,
+    negated: bool,
+    rows: usize,
+) -> BooleanArray {
+    let mut selected = BooleanBufferBuilder::new(rows);
+    for row in 0..rows {
+        let number = numbers[row];
+        if !keys.numeric_values.contains_i64(number) {
+            selected.append(negated);
+            continue;
+        }
+        let matched = usize::try_from(dictionary_keys[row])
+            .ok()
+            .and_then(|local_id| local_string_ids.get(local_id).copied().flatten())
+            .is_some_and(|string_id| keys.values.contains(number, string_id));
+        selected.append(if negated { !matched } else { matched });
+    }
+    BooleanArray::new(selected.finish(), None)
+}
+
+fn semijoin_i64_utf8_plain_pair_mask(
+    numbers: &SemijoinI64Array<'_>,
+    strings: &StringArray,
+    keys: &SemijoinI64Utf8PairKeys,
+    negated: bool,
+    rows: usize,
+) -> BooleanArray {
+    match numbers {
+        SemijoinI64Array::I32(values) => {
+            semijoin_i32_utf8_plain_pair_mask(values, strings, keys, negated, rows)
+        }
+        SemijoinI64Array::I64(values) => {
+            semijoin_i64_utf8_plain_pair_mask_typed(values, strings, keys, negated, rows)
+        }
+    }
+}
+
+fn semijoin_i32_utf8_plain_pair_mask(
+    numbers: &Int32Array,
+    strings: &StringArray,
+    keys: &SemijoinI64Utf8PairKeys,
+    negated: bool,
+    rows: usize,
+) -> BooleanArray {
+    let mut selected = BooleanBufferBuilder::new(rows);
+    for row in 0..rows {
+        if numbers.is_null(row) || strings.is_null(row) {
+            selected.append(false);
+            continue;
+        }
+        let number = numbers.value(row);
+        if !keys.numeric_values.contains_i32(number) {
+            selected.append(negated);
+            continue;
+        }
+        let number = i64::from(number);
+        let matched = keys
+            .string_ids
+            .get(strings.value(row).as_bytes())
+            .is_some_and(|string_id| keys.values.contains(number, *string_id));
+        selected.append(if negated { !matched } else { matched });
+    }
+    BooleanArray::new(selected.finish(), None)
+}
+
+fn semijoin_i64_utf8_plain_pair_mask_typed(
+    numbers: &Int64Array,
+    strings: &StringArray,
+    keys: &SemijoinI64Utf8PairKeys,
+    negated: bool,
+    rows: usize,
+) -> BooleanArray {
+    let mut selected = BooleanBufferBuilder::new(rows);
+    for row in 0..rows {
+        if numbers.is_null(row) || strings.is_null(row) {
+            selected.append(false);
+            continue;
+        }
+        let number = numbers.value(row);
         if !keys.numeric_values.contains_i64(number) {
             selected.append(negated);
             continue;
@@ -2797,7 +3043,7 @@ fn semijoin_i64_utf8_pair_mask(
             .is_some_and(|string_id| keys.values.contains(number, *string_id));
         selected.append(if negated { !matched } else { matched });
     }
-    Ok(BooleanArray::new(selected.finish(), None))
+    BooleanArray::new(selected.finish(), None)
 }
 
 fn semijoin_mixed_early_empty_probe_accepts(
@@ -2813,11 +3059,13 @@ fn semijoin_mixed_early_empty_probe_accepts(
         return Ok(true);
     }
     let ratio = keys.numeric_values.len() as f64 / total_rows as f64;
-    let accepted = ratio <= mixed_tuple_early_empty_max_numeric_ratio();
+    let accepted = ratio <= mixed_tuple_early_empty_max_numeric_ratio()
+        && keys.values.len() <= mixed_tuple_early_empty_max_pairs();
     if semijoin_profile_enabled() {
         eprintln!(
-            "[dodam:semijoin-profile] mixed-early-empty numeric_values={} total_rows={} ratio={:.6} accepted={}",
+            "[dodam:semijoin-profile] mixed-early-empty numeric_values={} pairs={} total_rows={} ratio={:.6} accepted={}",
             keys.numeric_values.len(),
+            keys.values.len(),
             total_rows,
             ratio,
             accepted
@@ -2861,6 +3109,13 @@ fn mixed_tuple_early_empty_max_numeric_ratio() -> f64 {
         .unwrap_or(0.25)
 }
 
+fn mixed_tuple_early_empty_max_pairs() -> usize {
+    std::env::var("DODAM_MIXED_TUPLE_EARLY_EMPTY_MAX_PAIRS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(4096)
+}
+
 fn direct_mixed_tuple_semijoin_outer_has_match(
     engine: &DodamEngine,
     path: &Path,
@@ -2899,14 +3154,14 @@ fn direct_mixed_tuple_semijoin_outer_has_match(
             |number| keys.numeric_values.contains_i32(number),
             |numbers, dictionary_ids, dictionary| {
                 let selected_string_ids =
-                    string_id_cache.refresh_existing(dictionary, &keys.string_ids);
+                    string_id_cache.refresh_existing_dense(dictionary, &keys.string_ids);
                 if numbers.len() != dictionary_ids.len() {
                     return Ok(None);
                 }
                 for (number, dictionary_id) in
                     numbers.iter().copied().zip(dictionary_ids.iter().copied())
                 {
-                    if direct_mixed_tuple_semijoin_selected_dictionary_row_matches(
+                    if direct_mixed_tuple_semijoin_selected_dictionary_row_matches_dense(
                         number,
                         dictionary_id,
                         selected_string_ids,
@@ -3226,17 +3481,19 @@ fn direct_mixed_tuple_semijoin_dictionary_row_matches(
         .is_some_and(|string_id| keys.values.contains(number, string_id))
 }
 
-fn direct_mixed_tuple_semijoin_selected_dictionary_row_matches(
+fn direct_mixed_tuple_semijoin_selected_dictionary_row_matches_dense(
     number: i32,
     dictionary_id: i32,
-    selected_string_ids: &[Option<u32>],
+    selected_string_ids: &[u32],
     keys: &SemijoinI64Utf8PairKeys,
 ) -> bool {
-    let number = i64::from(number);
-    usize::try_from(dictionary_id)
-        .ok()
-        .and_then(|dictionary_id| selected_string_ids.get(dictionary_id).copied().flatten())
-        .is_some_and(|string_id| keys.values.contains(number, string_id))
+    let Ok(dictionary_id) = usize::try_from(dictionary_id) else {
+        return false;
+    };
+    let Some(&string_id) = selected_string_ids.get(dictionary_id) else {
+        return false;
+    };
+    string_id != u32::MAX && keys.values.contains(i64::from(number), string_id)
 }
 
 fn semijoin_direct_outer_filter_compatible(

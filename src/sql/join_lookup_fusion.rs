@@ -236,6 +236,14 @@ pub(super) async fn execute_join_aggregate_lookup_fusion(
     } else {
         None
     };
+    let shared_dense_pairs = if lookups.len() == 3 && lookups[1].fact_key == lookups[2].fact_key {
+        match (lookup_dense_views[1], lookup_dense_views[2]) {
+            (Some(left), Some(right)) => JoinLookupCombinedPairDenseView::new(left, right),
+            _ => None,
+        }
+    } else {
+        None
+    };
 
     let fact_sum = strip_column_prefix(&plan.sum_column, &plan.fact_alias);
     let fact_projection = Projection::Columns(unique_columns(
@@ -244,6 +252,10 @@ pub(super) async fn execute_join_aggregate_lookup_fusion(
             .map(|lookup| lookup.fact_key.clone())
             .chain(std::iter::once(fact_sum.clone())),
     ));
+    let fact_filter = combine_filter_options(
+        scan_filters[plan.fact_index].clone(),
+        join_aggregate_lookup_fact_not_null_filter(&lookups),
+    );
     let fact_scan_started = profile.then(Instant::now);
     let mut fact_stream = engine
         .scan_parquet_batches(
@@ -251,10 +263,10 @@ pub(super) async fn execute_join_aggregate_lookup_fusion(
             batch_size,
             None,
             fact_projection,
-            scan_filters[plan.fact_index].clone(),
+            fact_filter,
         )
         .await?;
-    let mut groups = JoinAggregateLookupCountSumGroups::new(&lookups);
+    let mut groups = JoinAggregateLookupCountSumGroups::new(&lookups, shared_dense_pairs.as_ref());
     let mut rows = 0usize;
     let mut batches = 0usize;
     let mut fact_array_view_nanos = 0u64;
@@ -287,7 +299,20 @@ pub(super) async fn execute_join_aggregate_lookup_fusion(
                 &mut groups,
                 batch.num_rows(),
                 shared_dense_slots.as_ref(),
+                shared_dense_pairs.as_ref(),
             );
+        } else if sum_null_free
+            && lookup_dense_views.iter().all(Option::is_some)
+            && update_join_aggregate_lookup_dense_nullable_sum_null_free(
+                &fact_keys,
+                &sum_values,
+                &lookup_dense_views,
+                &lookups,
+                &mut groups,
+                batch.num_rows(),
+                shared_dense_pairs.as_ref(),
+            )
+        {
         } else if keys_null_free && sum_null_free {
             for row in 0..batch.num_rows() {
                 let mut key = [0usize; 4];
@@ -395,6 +420,24 @@ struct JoinAggregateLookupDimension {
     lookup: UniqueI64ToUtf8IdLookup,
 }
 
+fn join_aggregate_lookup_fact_not_null_filter(
+    lookups: &[JoinAggregateLookupDimension],
+) -> Option<FilterExpr> {
+    let mut columns = Vec::<String>::new();
+    for lookup in lookups {
+        add_column_once(&mut columns, lookup.fact_key.clone());
+    }
+    combine_expr_filters(
+        columns
+            .into_iter()
+            .map(|column| Expr::IsNull {
+                column,
+                negated: true,
+            })
+            .collect(),
+    )
+}
+
 #[derive(Clone, Copy)]
 enum JoinLookupDenseView<'a> {
     Full {
@@ -455,6 +498,50 @@ impl JoinLookupCombinedDenseView {
     }
 }
 
+struct JoinLookupCombinedPairDenseView {
+    values: Vec<usize>,
+    present: Vec<bool>,
+    pairs: Vec<(usize, usize)>,
+}
+
+impl JoinLookupCombinedPairDenseView {
+    fn new(left: JoinLookupDenseView<'_>, right: JoinLookupDenseView<'_>) -> Option<Self> {
+        let len = join_lookup_dense_len(left).max(join_lookup_dense_len(right));
+        if len == 0 {
+            return None;
+        }
+        let mut values = vec![0usize; len];
+        let mut present = vec![false; len];
+        let mut pair_ids = FastHashMap::<(usize, usize), usize>::default();
+        let mut pairs = Vec::<(usize, usize)>::new();
+        for index in 0..len {
+            let key = i64::try_from(index).ok()?;
+            let Some(left_id) = dense_usize_lookup_view(left, key) else {
+                continue;
+            };
+            let Some(right_id) = dense_usize_lookup_view(right, key) else {
+                continue;
+            };
+            let pair = (left_id, right_id);
+            let pair_id = if let Some(pair_id) = pair_ids.get(&pair).copied() {
+                pair_id
+            } else {
+                let pair_id = pairs.len();
+                pairs.push(pair);
+                pair_ids.insert(pair, pair_id);
+                pair_id
+            };
+            values[index] = pair_id;
+            present[index] = true;
+        }
+        Some(Self {
+            values,
+            present,
+            pairs,
+        })
+    }
+}
+
 #[inline]
 fn join_lookup_dense_len(lookup: JoinLookupDenseView<'_>) -> usize {
     match lookup {
@@ -473,6 +560,7 @@ fn update_join_aggregate_lookup_dense_null_free(
     groups: &mut JoinAggregateLookupCountSumGroups,
     rows: usize,
     shared_dense_slots: Option<&JoinLookupCombinedDenseView>,
+    shared_dense_pairs: Option<&JoinLookupCombinedPairDenseView>,
 ) {
     if update_join_aggregate_lookup_dense_groups_direct(
         fact_keys,
@@ -482,6 +570,7 @@ fn update_join_aggregate_lookup_dense_null_free(
         groups,
         rows,
         shared_dense_slots,
+        shared_dense_pairs,
     ) {
         return;
     }
@@ -577,6 +666,7 @@ fn update_join_aggregate_lookup_dense_groups_direct(
     groups: &mut JoinAggregateLookupCountSumGroups,
     rows: usize,
     shared_dense_slots: Option<&JoinLookupCombinedDenseView>,
+    shared_dense_pairs: Option<&JoinLookupCombinedPairDenseView>,
 ) -> bool {
     match groups {
         JoinAggregateLookupCountSumGroups::TwoDense { second_len, groups }
@@ -596,6 +686,43 @@ fn update_join_aggregate_lookup_dense_groups_direct(
                     continue;
                 };
                 let slot = first_id * second_len + second_id;
+                join_aggregate_lookup_update_group_slot(&mut groups[slot], sums.value(row));
+            }
+            true
+        }
+        JoinAggregateLookupCountSumGroups::ThreeSharedPairDense {
+            pair_len, groups, ..
+        } if lookups.len() == 3 && lookups[1].fact_key == lookups[2].fact_key => {
+            let lookup0 = lookup_dense_slices[0].expect("validated dense lookup");
+            let Some(shared_pairs) = shared_dense_pairs else {
+                return false;
+            };
+            let key0 = fact_keys[0].raw_values();
+            let shared_keys = fact_keys[1].raw_values();
+            let sums = sum_values.raw_values();
+            let pair_len = *pair_len;
+            if update_join_aggregate_lookup_three_shared_pair_dense_i32_i32_i64(
+                lookup0,
+                shared_pairs,
+                key0,
+                shared_keys,
+                sums,
+                pair_len,
+                groups,
+                rows,
+            ) {
+                return true;
+            }
+            for row in 0..rows {
+                let Some(first_id) = dense_usize_lookup_view(lookup0, key0.value(row)) else {
+                    continue;
+                };
+                let Some(pair_id) =
+                    dense_usize_lookup_combined_pair(shared_pairs, shared_keys.value(row))
+                else {
+                    continue;
+                };
+                let slot = first_id * pair_len + pair_id;
                 join_aggregate_lookup_update_group_slot(&mut groups[slot], sums.value(row));
             }
             true
@@ -716,6 +843,122 @@ fn update_join_aggregate_lookup_dense_groups_direct(
     }
 }
 
+fn update_join_aggregate_lookup_dense_nullable_sum_null_free(
+    fact_keys: &[I64LikeColumn<'_>],
+    sum_values: &I64LikeColumn<'_>,
+    lookup_dense_slices: &[Option<JoinLookupDenseView<'_>>],
+    lookups: &[JoinAggregateLookupDimension],
+    groups: &mut JoinAggregateLookupCountSumGroups,
+    rows: usize,
+    shared_dense_pairs: Option<&JoinLookupCombinedPairDenseView>,
+) -> bool {
+    match groups {
+        JoinAggregateLookupCountSumGroups::ThreeSharedPairDense {
+            pair_len, groups, ..
+        } if lookups.len() == 3 && lookups[1].fact_key == lookups[2].fact_key => {
+            let lookup0 = lookup_dense_slices[0].expect("validated dense lookup");
+            let Some(shared_pairs) = shared_dense_pairs else {
+                return false;
+            };
+            let pair_len = *pair_len;
+            if update_join_aggregate_lookup_three_shared_pair_dense_nullable_i32_i32_i64(
+                lookup0,
+                shared_pairs,
+                &fact_keys[0],
+                &fact_keys[1],
+                sum_values,
+                pair_len,
+                groups,
+                rows,
+            ) {
+                return true;
+            }
+            for row in 0..rows {
+                if fact_keys[0].is_null(row) || fact_keys[1].is_null(row) {
+                    continue;
+                }
+                let Some(first_id) = dense_usize_lookup_view(lookup0, fact_keys[0].value(row))
+                else {
+                    continue;
+                };
+                let Some(pair_id) =
+                    dense_usize_lookup_combined_pair(shared_pairs, fact_keys[1].value(row))
+                else {
+                    continue;
+                };
+                let slot = first_id * pair_len + pair_id;
+                join_aggregate_lookup_update_group_slot(&mut groups[slot], sum_values.value(row));
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_join_aggregate_lookup_three_shared_pair_dense_i32_i32_i64(
+    lookup0: JoinLookupDenseView<'_>,
+    shared_pairs: &JoinLookupCombinedPairDenseView,
+    key0: I64LikeValues<'_>,
+    shared_keys: I64LikeValues<'_>,
+    sums: I64LikeValues<'_>,
+    pair_len: usize,
+    groups: &mut [JoinAggregateLookupCountSumGroup],
+    rows: usize,
+) -> bool {
+    let (I64LikeValues::I32(key0), I64LikeValues::I32(shared_keys), I64LikeValues::I64(sums)) =
+        (key0, shared_keys, sums)
+    else {
+        return false;
+    };
+    for row in 0..rows {
+        let Some(first_id) = dense_usize_lookup_i32_view(lookup0, key0[row]) else {
+            continue;
+        };
+        let Some(pair_id) = dense_usize_lookup_combined_pair_i32(shared_pairs, shared_keys[row])
+        else {
+            continue;
+        };
+        let slot = first_id * pair_len + pair_id;
+        join_aggregate_lookup_update_group_slot(&mut groups[slot], sums[row]);
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_join_aggregate_lookup_three_shared_pair_dense_nullable_i32_i32_i64(
+    lookup0: JoinLookupDenseView<'_>,
+    shared_pairs: &JoinLookupCombinedPairDenseView,
+    key0: &I64LikeColumn<'_>,
+    shared_keys: &I64LikeColumn<'_>,
+    sum_values: &I64LikeColumn<'_>,
+    pair_len: usize,
+    groups: &mut [JoinAggregateLookupCountSumGroup],
+    rows: usize,
+) -> bool {
+    let (I64LikeColumn::Int32(key0), I64LikeColumn::Int32(shared_keys), I64LikeColumn::Int64(sums)) =
+        (key0, shared_keys, sum_values)
+    else {
+        return false;
+    };
+    for row in 0..rows {
+        if key0.is_null(row) || shared_keys.is_null(row) {
+            continue;
+        }
+        let Some(first_id) = dense_usize_lookup_i32_view(lookup0, key0.value(row)) else {
+            continue;
+        };
+        let Some(pair_id) =
+            dense_usize_lookup_combined_pair_i32(shared_pairs, shared_keys.value(row))
+        else {
+            continue;
+        };
+        let slot = first_id * pair_len + pair_id;
+        join_aggregate_lookup_update_group_slot(&mut groups[slot], sums.value(row));
+    }
+    true
+}
+
 #[inline]
 fn join_aggregate_lookup_update_group_slot(group: &mut JoinAggregateLookupCountSumGroup, sum: i64) {
     group.count = group.count.saturating_add(1);
@@ -742,7 +985,48 @@ fn dense_usize_lookup_view(lookup: JoinLookupDenseView<'_>, key: i64) -> Option<
 }
 
 #[inline]
+fn dense_usize_lookup_i32_view(lookup: JoinLookupDenseView<'_>, key: i32) -> Option<usize> {
+    let index = usize::try_from(key).ok()?;
+    match lookup {
+        JoinLookupDenseView::Full { values } => values.get(index).copied(),
+        JoinLookupDenseView::Sparse { values, present } => present
+            .get(index)
+            .copied()
+            .filter(|present| *present)
+            .map(|_| values[index]),
+    }
+}
+
+#[inline]
 fn dense_usize_lookup_combined(lookup: &JoinLookupCombinedDenseView, key: i64) -> Option<usize> {
+    let index = usize::try_from(key).ok()?;
+    lookup
+        .present
+        .get(index)
+        .copied()
+        .filter(|present| *present)
+        .map(|_| lookup.values[index])
+}
+
+#[inline]
+fn dense_usize_lookup_combined_pair(
+    lookup: &JoinLookupCombinedPairDenseView,
+    key: i64,
+) -> Option<usize> {
+    let index = usize::try_from(key).ok()?;
+    lookup
+        .present
+        .get(index)
+        .copied()
+        .filter(|present| *present)
+        .map(|_| lookup.values[index])
+}
+
+#[inline]
+fn dense_usize_lookup_combined_pair_i32(
+    lookup: &JoinLookupCombinedPairDenseView,
+    key: i32,
+) -> Option<usize> {
     let index = usize::try_from(key).ok()?;
     lookup
         .present
@@ -765,6 +1049,14 @@ fn join_aggregate_lookup_dense_group_slots() -> usize {
         "DODAM_JOIN_AGGREGATE_LOOKUP_DENSE_GROUP_SLOTS",
         "DODAM_MULTI_COMMA_LOOKUP_DENSE_GROUP_SLOTS",
         4096,
+    )
+}
+
+fn join_aggregate_lookup_shared_pair_dense_group_slots() -> usize {
+    env_usize_with_legacy_alias(
+        "DODAM_JOIN_AGGREGATE_LOOKUP_SHARED_PAIR_DENSE_GROUP_SLOTS",
+        "DODAM_MULTI_COMMA_LOOKUP_SHARED_PAIR_DENSE_GROUP_SLOTS",
+        131_072,
     )
 }
 
@@ -795,6 +1087,11 @@ enum JoinAggregateLookupCountSumGroups {
         third_len: usize,
         groups: Vec<JoinAggregateLookupCountSumGroup>,
     },
+    ThreeSharedPairDense {
+        pair_len: usize,
+        pairs: Vec<(usize, usize)>,
+        groups: Vec<JoinAggregateLookupCountSumGroup>,
+    },
     ThreeSmall(Vec<((usize, usize, usize), JoinAggregateLookupCountSumGroup)>),
     Three(FastHashMap<(usize, usize, usize), JoinAggregateLookupCountSumGroup>),
     FourDense {
@@ -807,7 +1104,10 @@ enum JoinAggregateLookupCountSumGroups {
 }
 
 impl JoinAggregateLookupCountSumGroups {
-    fn new(lookups: &[JoinAggregateLookupDimension]) -> Self {
+    fn new(
+        lookups: &[JoinAggregateLookupDimension],
+        shared_dense_pairs: Option<&JoinLookupCombinedPairDenseView>,
+    ) -> Self {
         match lookups.len() {
             2 => {
                 let first_len = lookups[0].lookup.values.len();
@@ -824,6 +1124,20 @@ impl JoinAggregateLookupCountSumGroups {
                 let first_len = lookups[0].lookup.values.len();
                 let second_len = lookups[1].lookup.values.len();
                 let third_len = lookups[2].lookup.values.len();
+                if lookups[1].fact_key == lookups[2].fact_key
+                    && let Some(shared_pairs) = shared_dense_pairs
+                {
+                    let pair_len = shared_pairs.pairs.len();
+                    let slots = first_len.saturating_mul(pair_len);
+                    if slots > 0 && slots <= join_aggregate_lookup_shared_pair_dense_group_slots() {
+                        let groups = vec![JoinAggregateLookupCountSumGroup::default(); slots];
+                        return Self::ThreeSharedPairDense {
+                            pair_len,
+                            pairs: shared_pairs.pairs.clone(),
+                            groups,
+                        };
+                    }
+                }
                 let slots = first_len
                     .saturating_mul(second_len)
                     .saturating_mul(third_len);
@@ -909,6 +1223,28 @@ impl JoinAggregateLookupCountSumGroups {
                     .and_then(|slot| slot.checked_add(key[1]))
                     .and_then(|slot| slot.checked_mul(*third_len))
                     .and_then(|slot| slot.checked_add(key[2]))
+                else {
+                    return;
+                };
+                let Some(group) = groups.get_mut(slot) else {
+                    return;
+                };
+                group
+            }
+            Self::ThreeSharedPairDense {
+                pair_len,
+                pairs,
+                groups,
+            } if key.len() == 3 => {
+                let Some(pair_id) = pairs
+                    .iter()
+                    .position(|pair| pair.0 == key[1] && pair.1 == key[2])
+                else {
+                    return;
+                };
+                let Some(slot) = key[0]
+                    .checked_mul(*pair_len)
+                    .and_then(|slot| slot.checked_add(pair_id))
                 else {
                     return;
                 };
@@ -1022,6 +1358,28 @@ impl JoinAggregateLookupCountSumGroups {
                     let remainder = slot % (second_len * third_len);
                     let second = remainder / third_len;
                     let third = remainder % third_len;
+                    Some(join_aggregate_lookup_group_result(
+                        &[first, second, third],
+                        state,
+                        lookups,
+                        sum_column,
+                    ))
+                })
+                .collect(),
+            Self::ThreeSharedPairDense {
+                pair_len,
+                pairs,
+                groups,
+            } => groups
+                .into_iter()
+                .enumerate()
+                .filter_map(|(slot, state)| {
+                    if state.count == 0 {
+                        return None;
+                    }
+                    let first = slot / pair_len;
+                    let pair_id = slot % pair_len;
+                    let (second, third) = pairs[pair_id];
                     Some(join_aggregate_lookup_group_result(
                         &[first, second, third],
                         state,

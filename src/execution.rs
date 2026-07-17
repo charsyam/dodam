@@ -8,7 +8,7 @@ pub mod typed_rows;
 pub(crate) use aggregate::{
     CoalesceKeyCountSumCollector, CountSumMinMaxMaxKind, DecimalDateRangeFilter,
     SingleKeyCountSumBatchAccumulator, SingleKeyCountSumMinMaxVectorState,
-    SingleKeyCountSumVectorState,
+    SingleKeyCountSumVectorState, TwoKeyCountSumMinMaxVectorState,
 };
 pub use aggregate::{
     GroupKeyExpr, GroupKeyLiteral, aggregate_metrics_to_batches, can_merge_partial_aggregates,

@@ -318,6 +318,16 @@ def generic_queries(data_dir: Path) -> list[GenericQuery]:
             f"SELECT bucket, count(*) FILTER (WHERE amount >= '50.00') AS high_amount_rows, count(value) FILTER (WHERE key IS NOT NULL) AS keyed_values, sum(value) FILTER (WHERE label LIKE 'label-2%') AS label_two_sum, avg(value) FILTER (WHERE amount < '25.00') AS low_amount_avg FROM read_parquet('{facts}') GROUP BY bucket ORDER BY bucket",
         ),
         GenericQuery(
+            "standard_aggregate_filter_sparse",
+            f"SELECT bucket, count(*) FILTER (WHERE id < 1000) AS tiny_rows, sum(value) FILTER (WHERE label LIKE 'label-999%') AS tiny_label_sum, avg(value) FILTER (WHERE amount < '1.00') AS tiny_amount_avg FROM '{facts}' GROUP BY bucket ORDER BY bucket",
+            f"SELECT bucket, count(*) FILTER (WHERE id < 1000) AS tiny_rows, sum(value) FILTER (WHERE label LIKE 'label-999%') AS tiny_label_sum, avg(value) FILTER (WHERE amount < '1.00') AS tiny_amount_avg FROM read_parquet('{facts}') GROUP BY bucket ORDER BY bucket",
+        ),
+        GenericQuery(
+            "standard_aggregate_filter_dense",
+            f"SELECT bucket, count(*) FILTER (WHERE id >= 0) AS all_rows, sum(value) FILTER (WHERE amount >= '0.00') AS all_amount_sum, avg(value) FILTER (WHERE label IS NOT NULL) AS labeled_avg FROM '{facts}' GROUP BY bucket ORDER BY bucket",
+            f"SELECT bucket, count(*) FILTER (WHERE id >= 0) AS all_rows, sum(value) FILTER (WHERE amount >= '0.00') AS all_amount_sum, avg(value) FILTER (WHERE label IS NOT NULL) AS labeled_avg FROM read_parquet('{facts}') GROUP BY bucket ORDER BY bucket",
+        ),
+        GenericQuery(
             "standard_group_by_all_expression",
             f"SELECT lower(coalesce(label, 'missing')) AS label_class, bucket + 1 AS bucket_plus_one, count(*) AS rows, sum(value) AS total_value FROM '{facts}' GROUP BY ALL ORDER BY label_class, bucket_plus_one LIMIT 5000",
             f"SELECT lower(coalesce(label, 'missing')) AS label_class, bucket + 1 AS bucket_plus_one, count(*) AS rows, sum(value) AS total_value FROM read_parquet('{facts}') GROUP BY ALL ORDER BY label_class, bucket_plus_one LIMIT 5000",

@@ -198,6 +198,19 @@ pub enum DirectPrimitiveFoldMode {
         date_min: Option<i32>,
         date_max: Option<i32>,
     },
+    TwoKeyCountSumMinMax {
+        first_group_by: String,
+        first_key_type: String,
+        second_group_by: String,
+        aggregates: Vec<AggregateExpr>,
+        decimal_precision: u8,
+        decimal_scale: i8,
+        max_decimal: bool,
+        decimal_min: Option<i64>,
+        decimal_max: Option<i64>,
+        date_min: Option<i32>,
+        date_max: Option<i32>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

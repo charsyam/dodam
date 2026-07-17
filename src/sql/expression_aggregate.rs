@@ -79,6 +79,20 @@ pub(super) fn collect_aggregates_with_optional_expression_views(
     }
     let started = generic_profile_start();
     if group_by.is_empty() {
+        if filtered_aggregates.is_empty()
+            && let Some((sum_expr, left_column, right_column)) =
+                global_sum_product_expression_shape(aggregates, expressions)
+        {
+            let metrics = collect_global_sum_product_expression(
+                stream,
+                fragments,
+                sum_expr.clone(),
+                left_column,
+                right_column,
+            )?;
+            generic_profile_elapsed("aggregate global sum-product direct", started);
+            return Ok(metrics);
+        }
         let stream = append_aggregate_expression_stream(stream, expressions.to_vec());
         let metrics = collect_aggregates(stream, fragments, aggregates)?;
         generic_profile_elapsed("aggregate global append/fold", started);
@@ -100,6 +114,240 @@ pub(super) fn collect_aggregates_with_optional_expression_views(
     let metrics = collect_grouped_aggregates(stream, fragments, group_by, aggregates)?;
     generic_profile_elapsed("aggregate grouped append/fold", started);
     Ok(metrics)
+}
+
+fn collect_global_sum_product_expression(
+    mut stream: SendableBatchStream,
+    fragments: usize,
+    sum_expr: AggregateExpr,
+    left_column: &str,
+    right_column: &str,
+) -> Result<AggregateMetrics> {
+    let started = Instant::now();
+    let mut rows = 0usize;
+    let mut batches = 0usize;
+    let mut sum = 0i64;
+    let mut count = 0u64;
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let Some(left) = SumProductI64Input::new(&batch, left_column)? else {
+            return Err(DodamError::UnsupportedSql(format!(
+                "SUM product input column is not integer: {left_column}"
+            )));
+        };
+        let Some(right) = SumProductI64Input::new(&batch, right_column)? else {
+            return Err(DodamError::UnsupportedSql(format!(
+                "SUM product input column is not integer: {right_column}"
+            )));
+        };
+        rows = rows.saturating_add(batch.num_rows());
+        batches += 1;
+        let (batch_sum, batch_count) = left.sum_product(&right, batch.num_rows())?;
+        sum = sum.checked_add(batch_sum).ok_or_else(|| {
+            DodamError::UnsupportedSql("SUM integer expression overflow".to_string())
+        })?;
+        count += batch_count;
+    }
+    let value = if count == 0 {
+        AggregateValue::Int64(None)
+    } else {
+        AggregateValue::Int64(Some(sum))
+    };
+    Ok(AggregateMetrics {
+        fragments,
+        batches,
+        rows,
+        values: vec![AggregateResult {
+            expr: sum_expr,
+            value,
+        }],
+        aggregate_nanos: started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        ..AggregateMetrics::default()
+    })
+}
+
+fn global_sum_product_expression_shape<'a>(
+    aggregates: &'a [AggregateExpr],
+    expressions: &'a [ProjectionExpression],
+) -> Option<(&'a AggregateExpr, &'a str, &'a str)> {
+    let [AggregateExpr::Sum(sum_column)] = aggregates else {
+        return None;
+    };
+    let [expression] = expressions else {
+        return None;
+    };
+    if expression.output_name != *sum_column {
+        return None;
+    }
+    let Some((left_column, right_column)) = sum_product_i64_columns(&expression.expr) else {
+        return None;
+    };
+    Some((&aggregates[0], left_column, right_column))
+}
+
+fn sum_product_i64_columns(expr: &ScalarSqlExpression) -> Option<(&str, &str)> {
+    let ScalarSqlExpression::Binary { left, op, right } = expr else {
+        return None;
+    };
+    if *op != BinaryOperator::Multiply {
+        return None;
+    }
+    let ScalarSqlExpression::Column(left) = left.as_ref() else {
+        return None;
+    };
+    let ScalarSqlExpression::Column(right) = right.as_ref() else {
+        return None;
+    };
+    Some((left.as_str(), right.as_str()))
+}
+
+enum SumProductI64Input<'a> {
+    Int32(&'a Int32Array),
+    Int64(&'a Int64Array),
+}
+
+impl<'a> SumProductI64Input<'a> {
+    fn new(batch: &'a RecordBatch, column: &str) -> Result<Option<Self>> {
+        let values = batch.column(sum_product_column_index(batch, column)?);
+        match values.data_type() {
+            DataType::Int32 => Ok(Some(Self::Int32(
+                values
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("Int32 sum-product input"),
+            ))),
+            DataType::Int64 => Ok(Some(Self::Int64(
+                values
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64 sum-product input"),
+            ))),
+            _ => Ok(None),
+        }
+    }
+
+    #[inline]
+    fn value(&self, row: usize) -> Option<i64> {
+        match self {
+            Self::Int32(values) => values.is_valid(row).then(|| i64::from(values.value(row))),
+            Self::Int64(values) => values.is_valid(row).then(|| values.value(row)),
+        }
+    }
+
+    fn sum_product(&self, other: &Self, rows: usize) -> Result<(i64, u64)> {
+        match (self, other) {
+            (Self::Int32(left), Self::Int32(right))
+                if left.null_count() == 0 && right.null_count() == 0 =>
+            {
+                sum_product_non_null_i32_i32(left.values(), right.values())
+            }
+            (Self::Int32(left), Self::Int64(right))
+                if left.null_count() == 0 && right.null_count() == 0 =>
+            {
+                sum_product_non_null_i32_i64(left.values(), right.values())
+            }
+            (Self::Int64(left), Self::Int32(right))
+                if left.null_count() == 0 && right.null_count() == 0 =>
+            {
+                sum_product_non_null_i64_i32(left.values(), right.values())
+            }
+            (Self::Int64(left), Self::Int64(right))
+                if left.null_count() == 0 && right.null_count() == 0 =>
+            {
+                sum_product_non_null_i64_i64(left.values(), right.values())
+            }
+            _ => self.sum_product_nullable(other, rows),
+        }
+    }
+
+    fn sum_product_nullable(&self, other: &Self, rows: usize) -> Result<(i64, u64)> {
+        let mut sum = 0i64;
+        let mut count = 0u64;
+        for row in 0..rows {
+            let Some(left) = self.value(row) else {
+                continue;
+            };
+            let Some(right) = other.value(row) else {
+                continue;
+            };
+            let Some(product) = left.checked_mul(right) else {
+                continue;
+            };
+            sum = sum.checked_add(product).ok_or_else(|| {
+                DodamError::UnsupportedSql("SUM integer expression overflow".to_string())
+            })?;
+            count += 1;
+        }
+        Ok((sum, count))
+    }
+}
+
+fn sum_product_column_index(batch: &RecordBatch, column: &str) -> Result<usize> {
+    batch
+        .schema()
+        .fields()
+        .iter()
+        .position(|field| field.name() == column)
+        .ok_or_else(|| DodamError::UnknownColumn(column.to_string()))
+}
+
+fn sum_product_non_null_i32_i32(left: &[i32], right: &[i32]) -> Result<(i64, u64)> {
+    let mut sum = 0i64;
+    for (&left, &right) in left.iter().zip(right) {
+        let product = i64::from(left) * i64::from(right);
+        sum = sum.checked_add(product).ok_or_else(|| {
+            DodamError::UnsupportedSql("SUM integer expression overflow".to_string())
+        })?;
+    }
+    Ok((sum, left.len() as u64))
+}
+
+fn sum_product_non_null_i32_i64(left: &[i32], right: &[i64]) -> Result<(i64, u64)> {
+    let mut sum = 0i64;
+    let mut count = 0u64;
+    for (&left, &right) in left.iter().zip(right) {
+        let Some(product) = i64::from(left).checked_mul(right) else {
+            continue;
+        };
+        sum = sum.checked_add(product).ok_or_else(|| {
+            DodamError::UnsupportedSql("SUM integer expression overflow".to_string())
+        })?;
+        count += 1;
+    }
+    Ok((sum, count))
+}
+
+fn sum_product_non_null_i64_i32(left: &[i64], right: &[i32]) -> Result<(i64, u64)> {
+    let mut sum = 0i64;
+    let mut count = 0u64;
+    for (&left, &right) in left.iter().zip(right) {
+        let Some(product) = left.checked_mul(i64::from(right)) else {
+            continue;
+        };
+        sum = sum.checked_add(product).ok_or_else(|| {
+            DodamError::UnsupportedSql("SUM integer expression overflow".to_string())
+        })?;
+        count += 1;
+    }
+    Ok((sum, count))
+}
+
+fn sum_product_non_null_i64_i64(left: &[i64], right: &[i64]) -> Result<(i64, u64)> {
+    let mut sum = 0i64;
+    let mut count = 0u64;
+    for (&left, &right) in left.iter().zip(right) {
+        let Some(product) = left.checked_mul(right) else {
+            continue;
+        };
+        sum = sum.checked_add(product).ok_or_else(|| {
+            DodamError::UnsupportedSql("SUM integer expression overflow".to_string())
+        })?;
+        count += 1;
+    }
+    Ok((sum, count))
 }
 
 #[allow(clippy::too_many_arguments)]

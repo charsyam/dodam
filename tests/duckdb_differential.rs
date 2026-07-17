@@ -2486,6 +2486,19 @@ async fn duckdb_differential_generic_performance_shapes() {
 
     assert_same_as_duckdb(
         &format!(
+            "SELECT key, count(*) FILTER (WHERE id < 2) AS sparse_rows, sum(value) FILTER (WHERE payload LIKE 'payload-9%') AS sparse_payload_sum, avg(value) FILTER (WHERE value >= 0) AS dense_avg FROM '{}' GROUP BY key ORDER BY key NULLS FIRST",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT key, count(*) FILTER (WHERE id < 2) AS sparse_rows, sum(value) FILTER (WHERE payload LIKE 'payload-9%') AS sparse_payload_sum, avg(value) FILTER (WHERE value >= 0) AS dense_avg FROM read_parquet('{}') GROUP BY key ORDER BY key NULLS FIRST",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
             "SELECT id, key, payload FROM '{}' WHERE key IS NOT NULL AND (id, key) IN (SELECT id, key FROM '{}' WHERE key >= 1 AND key IS NOT NULL) ORDER BY id",
             facts_path.display(),
             facts_path.display()
