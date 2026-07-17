@@ -41,13 +41,14 @@ use crate::vector::{DictionaryStringValues, RawColumnView, SelectionRuns, Select
 
 mod selected_i64_decoder;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrimitiveRowGroupMinMax {
     pub row_group: usize,
     pub rows: usize,
     pub null_count: Option<u64>,
     pub min: i128,
     pub max: i128,
+    pub data_type: DataType,
 }
 
 pub(crate) struct DirectI32I64DecimalI32SelectedBatch<'a> {
@@ -12569,6 +12570,7 @@ pub fn read_parquet_primitive_column_min_max_by_row_group(
             null_count: statistics.null_count_opt(),
             min,
             max,
+            data_type: column_type.clone(),
         });
     }
     Ok(Some(ranges))

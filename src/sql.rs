@@ -42831,13 +42831,22 @@ fn metadata_literal_to_i128_for_ranges(
     literal: &LiteralValue,
     ranges: &[PrimitiveRowGroupMinMax],
 ) -> Result<Option<i128>> {
-    if ranges.is_empty() {
+    let Some(first) = ranges.first() else {
         return Ok(None);
-    }
-    match literal_as_i64_for_type(literal) {
-        Ok(value) => Ok(value.map(i128::from)),
-        Err(DodamError::InvalidCast(_)) => Ok(None),
-        Err(error) => Err(error),
+    };
+    match &first.data_type {
+        DataType::Decimal128(precision, scale) => {
+            literal_as_decimal128_for_type(literal, *precision, *scale)
+        }
+        DataType::Date32 => literal_as_date32_for_type(literal).map(|value| value.map(i128::from)),
+        DataType::Int32 | DataType::Int64 | DataType::UInt32 => {
+            match literal_as_i64_for_type(literal) {
+                Ok(value) => Ok(value.map(i128::from)),
+                Err(DodamError::InvalidCast(_)) => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+        _ => Ok(None),
     }
 }
 
