@@ -694,7 +694,7 @@ fn parts_supplier_relationship_bad_supplier_path(selection: &SqlExpr) -> Result<
                 let SetExpr::Select(select) = subquery.body.as_ref() else {
                     continue;
                 };
-                for table in q04_subquery_tables(select)? {
+                for table in parse_select_table_refs(select)? {
                     if table_ref_alias_or_name(&table).eq_ignore_ascii_case("supplier") {
                         return Ok(Some(table.path));
                     }
@@ -704,7 +704,7 @@ fn parts_supplier_relationship_bad_supplier_path(selection: &SqlExpr) -> Result<
                 let SetExpr::Select(select) = subquery.body.as_ref() else {
                     continue;
                 };
-                for table in q04_subquery_tables(select)? {
+                for table in parse_select_table_refs(select)? {
                     if table_ref_alias_or_name(&table).eq_ignore_ascii_case("supplier") {
                         return Ok(Some(table.path));
                     }
