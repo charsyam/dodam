@@ -79,6 +79,7 @@ Review follow-up:
       - Renamed remaining Q02/Q14/Q15/Q16 profile labels to rule-shape names (`minimum-cost-supplier`, `promo-revenue-ratio`, `top-supplier-revenue`, `parts-supplier-relationship`) so external instrumentation no longer exposes those as query-number fast paths.
       - Added low-memory SQL differential coverage for `JOIN + GROUP BY + SUM` under `SqlExecutionOptions { join_memory_limit_bytes: Some(1) }`, extending the existing low-memory join correctness guard beyond plain join output.
       - Split public SQL output/options/sink types from `sql.rs` into `src/sql/types.rs`, shrinking the top-level SQL module and making the execution API boundary explicit.
+      - Continued lowering the TPC-H-derived rule module naming: the minimum-cost supplier rule no longer uses Q02-prefixed helper/type names internally, and repeated comma-join table alias matching was replaced with a small `named_comma_join_tables(...)` resolver reused by multiple rule-shape implementations. External Q14/Q15/Q16 helper calls remain until those implementations are moved out of `sql.rs`; SF=0.01 Q02/Q14/Q15/Q16 subset stayed fast (`0.276x` median-sum), and the focused generic set stayed ahead (`0.909x`).
 
 - TPC-H exact-shape fast paths are not a valid proxy for generic OLAP performance.
   - SF=1 review data showed Q1 exact `~33ms` but small GROUP BY changes falling to `~565-675ms`, while DuckDB stayed around `~40-47ms`.

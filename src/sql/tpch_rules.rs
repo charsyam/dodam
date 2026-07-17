@@ -1,6 +1,6 @@
 use super::*;
 
-fn q02_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
+fn minimum_cost_supplier_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
     if !matches!(parse_limit(query), Ok(Some(_))) || !matches!(parse_offset(query), Ok(0)) {
         return false;
     }
@@ -56,7 +56,7 @@ pub(super) async fn try_execute_minimum_cost_supplier_sql(
     let Some(selection) = select.selection.as_ref() else {
         return Ok(None);
     };
-    if !q02_shape(select, query, selection) {
+    if !minimum_cost_supplier_shape(select, query, selection) {
         return Ok(None);
     }
     if query.with.is_some()
@@ -70,38 +70,36 @@ pub(super) async fn try_execute_minimum_cost_supplier_sql(
         return Ok(None);
     }
     let limit = parse_limit(query)?.unwrap_or(usize::MAX);
-    let Some(tables) = parse_comma_join_table_refs(select)? else {
+    let Some(mut tables) = named_comma_join_tables(
+        select,
+        &["part", "supplier", "partsupp", "nation", "region"],
+    )?
+    else {
         return Ok(None);
     };
-    let mut part = None;
-    let mut supplier = None;
-    let mut partsupp = None;
-    let mut nation = None;
-    let mut region = None;
-    for table in tables {
-        match table_ref_alias_or_name(&table)
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "part" => part = Some(table),
-            "supplier" => supplier = Some(table),
-            "partsupp" => partsupp = Some(table),
-            "nation" => nation = Some(table),
-            "region" => region = Some(table),
-            _ => {}
-        }
-    }
-    let (Some(part), Some(supplier), Some(partsupp), Some(nation), Some(region)) =
-        (part, supplier, partsupp, nation, region)
-    else {
+    let Some(part) = tables.remove("part") else {
+        return Ok(None);
+    };
+    let Some(supplier) = tables.remove("supplier") else {
+        return Ok(None);
+    };
+    let Some(partsupp) = tables.remove("partsupp") else {
+        return Ok(None);
+    };
+    let Some(nation) = tables.remove("nation") else {
+        return Ok(None);
+    };
+    let Some(region) = tables.remove("region") else {
         return Ok(None);
     };
     let mut conjuncts = Vec::new();
     collect_sql_and_conjuncts(selection, &mut conjuncts);
-    let Some(part_size) = q02_numeric_i64_equality_literal(&conjuncts, "p_size")? else {
+    let Some(part_size) = minimum_cost_supplier_numeric_i64_equality_literal(&conjuncts, "p_size")?
+    else {
         return Ok(None);
     };
-    let Some(part_type_suffix) = q02_like_suffix_literal(&conjuncts, "p_type")? else {
+    let Some(part_type_suffix) = minimum_cost_supplier_like_suffix_literal(&conjuncts, "p_type")?
+    else {
         return Ok(None);
     };
     let Some(region_name) = string_equality_literal(&conjuncts, "r_name")? else {
@@ -112,21 +110,31 @@ pub(super) async fn try_execute_minimum_cost_supplier_sql(
     let region_keys = q05_region_keys(engine, region.path, batch_size, &region_name).await?;
     let nation_names = q05_nation_names(engine, nation.path, batch_size, &region_keys).await?;
     if nation_names.is_empty() {
-        return Ok(Some(q02_output(Vec::new())?));
+        return Ok(Some(minimum_cost_supplier_output(Vec::new())?));
     }
-    let suppliers = q02_supplier_rows(engine, supplier.path, batch_size, &nation_names).await?;
+    let suppliers =
+        minimum_cost_supplier_supplier_rows(engine, supplier.path, batch_size, &nation_names)
+            .await?;
     if suppliers.is_empty() {
-        return Ok(Some(q02_output(Vec::new())?));
+        return Ok(Some(minimum_cost_supplier_output(Vec::new())?));
     }
-    let parts =
-        q02_matching_parts(engine, part.path, batch_size, part_size, &part_type_suffix).await?;
+    let parts = minimum_cost_supplier_matching_parts(
+        engine,
+        part.path,
+        batch_size,
+        part_size,
+        &part_type_suffix,
+    )
+    .await?;
     if parts.is_empty() {
-        return Ok(Some(q02_output(Vec::new())?));
+        return Ok(Some(minimum_cost_supplier_output(Vec::new())?));
     }
     tpch_profile_elapsed("minimum-cost-supplier dimensions", stage);
 
     let stage = tpch_profile_start();
-    let mut rows = q02_min_cost_rows(engine, partsupp.path, batch_size, &parts, &suppliers).await?;
+    let mut rows =
+        minimum_cost_supplier_min_cost_rows(engine, partsupp.path, batch_size, &parts, &suppliers)
+            .await?;
     tpch_profile_elapsed("minimum-cost-supplier partsupp min cost", stage);
     rows.sort_by(|left, right| {
         right
@@ -138,10 +146,13 @@ pub(super) async fn try_execute_minimum_cost_supplier_sql(
             .then_with(|| left.p_partkey.cmp(&right.p_partkey))
     });
     rows.truncate(limit);
-    Ok(Some(q02_output(rows)?))
+    Ok(Some(minimum_cost_supplier_output(rows)?))
 }
 
-fn q02_numeric_i64_equality_literal(conjuncts: &[SqlExpr], column: &str) -> Result<Option<i64>> {
+fn minimum_cost_supplier_numeric_i64_equality_literal(
+    conjuncts: &[SqlExpr],
+    column: &str,
+) -> Result<Option<i64>> {
     for conjunct in conjuncts {
         let SqlExpr::BinaryOp { left, op, right } = conjunct else {
             continue;
@@ -162,7 +173,27 @@ fn q02_numeric_i64_equality_literal(conjuncts: &[SqlExpr], column: &str) -> Resu
     Ok(None)
 }
 
-fn q02_like_suffix_literal(conjuncts: &[SqlExpr], column: &str) -> Result<Option<String>> {
+fn named_comma_join_tables(
+    select: &Select,
+    names: &[&str],
+) -> Result<Option<HashMap<String, SqlTableRef>>> {
+    let Some(tables) = parse_comma_join_table_refs(select)? else {
+        return Ok(None);
+    };
+    let mut output = HashMap::with_capacity(names.len());
+    for table in tables {
+        let alias = table_ref_alias_or_name(&table).to_ascii_lowercase();
+        if names.iter().any(|name| alias == *name) {
+            output.insert(alias, table);
+        }
+    }
+    Ok(Some(output))
+}
+
+fn minimum_cost_supplier_like_suffix_literal(
+    conjuncts: &[SqlExpr],
+    column: &str,
+) -> Result<Option<String>> {
     for conjunct in conjuncts {
         let SqlExpr::Like {
             expr,
@@ -190,7 +221,7 @@ fn q02_like_suffix_literal(conjuncts: &[SqlExpr], column: &str) -> Result<Option
 }
 
 #[derive(Clone)]
-struct Q02Supplier {
+struct MinimumCostSupplierSupplier {
     acctbal: f64,
     s_name: String,
     n_name: String,
@@ -200,18 +231,18 @@ struct Q02Supplier {
 }
 
 #[derive(Clone)]
-struct Q02Part {
+struct MinimumCostSupplierPart {
     mfgr: String,
 }
 
 #[derive(Clone)]
-struct Q02Candidate {
+struct MinimumCostSupplierCandidate {
     partkey: i64,
     suppkey: i64,
     supplycost: f64,
 }
 
-struct Q02Row {
+struct MinimumCostSupplierRow {
     acctbal: f64,
     s_name: String,
     n_name: String,
@@ -222,12 +253,12 @@ struct Q02Row {
     s_comment: String,
 }
 
-async fn q02_supplier_rows(
+async fn minimum_cost_supplier_supplier_rows(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
     nation_names: &HashMap<i64, String>,
-) -> Result<HashMap<i64, Q02Supplier>> {
+) -> Result<HashMap<i64, MinimumCostSupplierSupplier>> {
     let nation_keys = AdaptiveI64Set::from_hash(nation_names.keys().copied().collect());
     let mut stream = engine
         .scan_parquet_batches(
@@ -284,7 +315,7 @@ async fn q02_supplier_rows(
             };
             suppliers.insert(
                 suppkey,
-                Q02Supplier {
+                MinimumCostSupplierSupplier {
                     acctbal: acctbals.value(row),
                     s_name: names.value(row).to_string(),
                     n_name: n_name.clone(),
@@ -298,13 +329,13 @@ async fn q02_supplier_rows(
     Ok(suppliers)
 }
 
-async fn q02_matching_parts(
+async fn minimum_cost_supplier_matching_parts(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
     part_size: i64,
     type_suffix: &str,
-) -> Result<HashMap<i64, Q02Part>> {
+) -> Result<HashMap<i64, MinimumCostSupplierPart>> {
     let mut stream = engine
         .scan_parquet_batches(
             path,
@@ -339,7 +370,7 @@ async fn q02_matching_parts(
             if size == part_size && types.value(row).ends_with(type_suffix) {
                 parts.insert(
                     partkey,
-                    Q02Part {
+                    MinimumCostSupplierPart {
                         mfgr: mfgrs.value(row).to_string(),
                     },
                 );
@@ -349,13 +380,13 @@ async fn q02_matching_parts(
     Ok(parts)
 }
 
-async fn q02_min_cost_rows(
+async fn minimum_cost_supplier_min_cost_rows(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-    parts: &HashMap<i64, Q02Part>,
-    suppliers: &HashMap<i64, Q02Supplier>,
-) -> Result<Vec<Q02Row>> {
+    parts: &HashMap<i64, MinimumCostSupplierPart>,
+    suppliers: &HashMap<i64, MinimumCostSupplierSupplier>,
+) -> Result<Vec<MinimumCostSupplierRow>> {
     let part_keys = AdaptiveI64Set::from_hash(parts.keys().copied().collect());
     let supplier_keys = AdaptiveI64Set::from_hash(suppliers.keys().copied().collect());
     let mut stream = engine
@@ -372,7 +403,7 @@ async fn q02_min_cost_rows(
         )
         .await?;
     let mut min_costs = HashMap::<i64, f64>::new();
-    let mut candidates = Vec::<Q02Candidate>::new();
+    let mut candidates = Vec::<MinimumCostSupplierCandidate>::new();
     while let Some(batch) = stream.next() {
         let batch = batch?;
         let partkeys = batch_column(&batch, "ps_partkey")?;
@@ -405,7 +436,7 @@ async fn q02_min_cost_rows(
                     }
                 })
                 .or_insert(supplycost);
-            candidates.push(Q02Candidate {
+            candidates.push(MinimumCostSupplierCandidate {
                 partkey,
                 suppkey,
                 supplycost,
@@ -426,7 +457,7 @@ async fn q02_min_cost_rows(
         ) else {
             continue;
         };
-        rows.push(Q02Row {
+        rows.push(MinimumCostSupplierRow {
             acctbal: supplier.acctbal,
             s_name: supplier.s_name.clone(),
             n_name: supplier.n_name.clone(),
@@ -440,7 +471,7 @@ async fn q02_min_cost_rows(
     Ok(rows)
 }
 
-fn q02_output(rows: Vec<Q02Row>) -> Result<QueryOutput> {
+fn minimum_cost_supplier_output(rows: Vec<MinimumCostSupplierRow>) -> Result<QueryOutput> {
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
             Field::new("s_acctbal", DataType::Float64, false),
@@ -485,7 +516,7 @@ fn q02_output(rows: Vec<Q02Row>) -> Result<QueryOutput> {
     })
 }
 
-fn q16_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
+fn parts_supplier_relationship_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
     let projection = select
         .projection
         .iter()
@@ -534,7 +565,7 @@ pub(super) async fn try_execute_parts_supplier_relationship_sql(
     let Some(selection) = select.selection.as_ref() else {
         return Ok(None);
     };
-    if !q16_shape(select, query, selection) {
+    if !parts_supplier_relationship_shape(select, query, selection) {
         return Ok(None);
     }
     if !matches!(parse_limit(query), Ok(None)) {
@@ -561,7 +592,7 @@ pub(super) async fn try_execute_parts_supplier_relationship_sql(
     let (Some(partsupp), Some(part)) = (partsupp, part) else {
         return Ok(None);
     };
-    let Some(supplier_path) = q16_bad_supplier_path(selection)? else {
+    let Some(supplier_path) = parts_supplier_relationship_bad_supplier_path(selection)? else {
         return Ok(None);
     };
     let mut conjuncts = Vec::new();
@@ -613,7 +644,7 @@ pub(super) async fn try_execute_parts_supplier_relationship_sql(
     Ok(Some(q16_output(rows)?))
 }
 
-fn q16_bad_supplier_path(selection: &SqlExpr) -> Result<Option<PathBuf>> {
+fn parts_supplier_relationship_bad_supplier_path(selection: &SqlExpr) -> Result<Option<PathBuf>> {
     let mut stack = vec![selection];
     while let Some(expr) = stack.pop() {
         match expr {
@@ -652,7 +683,7 @@ fn q16_bad_supplier_path(selection: &SqlExpr) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-fn q14_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
+fn promo_revenue_ratio_shape(select: &Select, query: &Query, selection: &SqlExpr) -> bool {
     if !matches!(parse_limit(query), Ok(None)) {
         return false;
     }
@@ -689,28 +720,18 @@ pub(super) async fn try_execute_promo_revenue_ratio_sql(
     let Some(selection) = select.selection.as_ref() else {
         return Ok(None);
     };
-    if !q14_shape(select, query, selection) {
+    if !promo_revenue_ratio_shape(select, query, selection) {
         return Ok(None);
     }
     reject_query_features(query)?;
     reject_select_features(select)?;
-    let Some(tables) = parse_comma_join_table_refs(select)? else {
+    let Some(mut tables) = named_comma_join_tables(select, &["lineitem", "part"])? else {
         return Ok(None);
     };
-    if tables.len() != 2 {
+    let Some(lineitem) = tables.remove("lineitem") else {
         return Ok(None);
-    }
-    let mut lineitem = None;
-    let mut part = None;
-    for table in tables {
-        let alias = table_ref_alias_or_name(&table);
-        if alias.eq_ignore_ascii_case("lineitem") {
-            lineitem = Some(table);
-        } else if alias.eq_ignore_ascii_case("part") {
-            part = Some(table);
-        }
-    }
-    let (Some(lineitem), Some(part)) = (lineitem, part) else {
+    };
+    let Some(part) = tables.remove("part") else {
         return Ok(None);
     };
     let mut conjuncts = Vec::new();
@@ -741,7 +762,7 @@ pub(super) async fn try_execute_promo_revenue_ratio_sql(
     Ok(Some(q17_output("promo_revenue".to_string(), value)?))
 }
 
-fn q15_shape(query: &Query) -> bool {
+fn top_supplier_revenue_shape(query: &Query) -> bool {
     let Some(with) = query.with.as_ref() else {
         return false;
     };
@@ -819,7 +840,7 @@ pub(super) async fn try_execute_top_supplier_revenue_sql(
     let [Statement::Query(query)] = statements.as_slice() else {
         return Ok(None);
     };
-    if !q15_shape(query) {
+    if !top_supplier_revenue_shape(query) {
         return Ok(None);
     }
     let Some(with) = query.with.as_ref() else {
@@ -858,19 +879,10 @@ pub(super) async fn try_execute_top_supplier_revenue_sql(
         return Ok(None);
     };
 
-    let Some(tables) = parse_comma_join_table_refs(outer_select)? else {
+    let Some(mut tables) = named_comma_join_tables(outer_select, &["supplier"])? else {
         return Ok(None);
     };
-    if tables.len() != 2 {
-        return Ok(None);
-    }
-    let mut supplier = None;
-    for table in tables {
-        if table_ref_alias_or_name(&table).eq_ignore_ascii_case("supplier") {
-            supplier = Some(table);
-        }
-    }
-    let Some(supplier) = supplier else {
+    let Some(supplier) = tables.remove("supplier") else {
         return Ok(None);
     };
 
