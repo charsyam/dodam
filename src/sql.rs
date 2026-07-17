@@ -38591,7 +38591,7 @@ fn comma_join_hash_output_projection(
 }
 
 fn zero_column_join_output_enabled() -> bool {
-    std::env::var("DODAM_ZERO_COLUMN_JOIN_OUTPUT")
+    !std::env::var("DODAM_DISABLE_ZERO_COLUMN_JOIN_OUTPUT")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 

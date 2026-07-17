@@ -383,6 +383,11 @@ fn native_filtered_update_i32_group_direct_predicates_columnar_batch(
     if max_key > native_filtered_eager_dense_max_key() {
         return Ok(false);
     }
+    if native_filtered_update_i32_group_count_sum_avg_dense_batch(
+        values, predicates, inputs, specs, dense, max_key,
+    )? {
+        return Ok(true);
+    }
     if native_filtered_fused_vector_sink_enabled()
         && native_filtered_update_i32_group_direct_predicates_fused_vector_sink(
             values, predicates, inputs, specs, dense, max_key,
@@ -426,6 +431,113 @@ fn native_filtered_update_i32_group_direct_predicates_columnar_batch(
         }
     }
     Ok(true)
+}
+
+fn native_filtered_update_i32_group_count_sum_avg_dense_batch(
+    keys: &Int32Array,
+    predicates: &[NativeFilteredDirectPredicate],
+    inputs: &[NativeFilteredBatchInput],
+    specs: &[NativeFilteredAggregateSpec],
+    dense: &mut Vec<Option<Vec<NativeFilteredAggregateState>>>,
+    max_key: usize,
+) -> Result<bool> {
+    if !native_filtered_count_sum_avg_dense_sink_enabled() {
+        return Ok(false);
+    }
+    if predicates.len() != 3 || inputs.len() != 3 || specs.len() != 3 || keys.null_count() != 0 {
+        return Ok(false);
+    }
+    if !matches!(
+        specs[0].expr,
+        AggregateExpr::CountStar | AggregateExpr::Count(_)
+    ) || !matches!(specs[1].expr, AggregateExpr::Sum(_))
+        || !matches!(specs[2].expr, AggregateExpr::Avg(_))
+    {
+        return Ok(false);
+    }
+    let count_input = &inputs[0];
+    let sum_input = &inputs[1];
+    let avg_input = &inputs[2];
+    if !matches!(
+        count_input,
+        NativeFilteredBatchInput::AlwaysSome
+            | NativeFilteredBatchInput::NonNull
+            | NativeFilteredBatchInput::I64Array(_)
+            | NativeFilteredBatchInput::I32Array(_)
+    ) || !matches!(
+        sum_input,
+        NativeFilteredBatchInput::I64Array(_) | NativeFilteredBatchInput::I32Array(_)
+    ) || !matches!(
+        avg_input,
+        NativeFilteredBatchInput::I64Array(_) | NativeFilteredBatchInput::I32Array(_)
+    ) {
+        return Ok(false);
+    }
+
+    let groups = max_key + 1;
+    let mut present = vec![false; groups];
+    let mut count_values = vec![0_u64; groups];
+    let mut sum_values = vec![0_i64; groups];
+    let mut sum_counts = vec![0_u64; groups];
+    let mut avg_values = vec![0_i64; groups];
+    let mut avg_counts = vec![0_u64; groups];
+
+    for row in 0..keys.len() {
+        let key = keys.value(row) as usize;
+        present[key] = true;
+        if predicates[0].selected(row) && native_filtered_input_present_infallible(count_input, row)
+        {
+            count_values[key] += 1;
+        }
+        if predicates[1].selected(row)
+            && let Some(value) = native_filtered_input_i64_infallible(sum_input, row)
+        {
+            sum_values[key] += value;
+            sum_counts[key] += 1;
+        }
+        if predicates[2].selected(row)
+            && let Some(value) = native_filtered_input_i64_infallible(avg_input, row)
+        {
+            avg_values[key] += value;
+            avg_counts[key] += 1;
+        }
+    }
+
+    if dense.len() <= max_key {
+        dense.resize_with(max_key + 1, || None);
+    }
+    for key in 0..groups {
+        if !present[key] {
+            continue;
+        }
+        let states = dense[key].get_or_insert_with(|| native_filtered_initial_states(specs));
+        match &mut states[0] {
+            NativeFilteredAggregateState::Count(count) => {
+                *count = count.saturating_add(count_values[key]);
+            }
+            _ => return Ok(false),
+        }
+        match &mut states[1] {
+            NativeFilteredAggregateState::SumI64 { sum, count } => {
+                *sum = sum.saturating_add(sum_values[key]);
+                *count = count.saturating_add(sum_counts[key]);
+            }
+            _ => return Ok(false),
+        }
+        match &mut states[2] {
+            NativeFilteredAggregateState::AvgI64 { sum, count } => {
+                *sum = sum.saturating_add(avg_values[key]);
+                *count = count.saturating_add(avg_counts[key]);
+            }
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+fn native_filtered_count_sum_avg_dense_sink_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_NATIVE_FILTERED_COUNT_SUM_AVG_DENSE_SINK")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 fn native_filtered_update_i32_group_direct_predicates_fused_vector_sink(
@@ -1010,6 +1122,30 @@ fn native_filtered_update_i32_dense_row_masks(
         }
     }
     Ok(())
+}
+
+fn native_filtered_input_present_infallible(input: &NativeFilteredBatchInput, row: usize) -> bool {
+    match input {
+        NativeFilteredBatchInput::AlwaysSome | NativeFilteredBatchInput::NonNull => true,
+        NativeFilteredBatchInput::I64Array(values) => values.is_valid(row),
+        NativeFilteredBatchInput::I32Array(values) => values.is_valid(row),
+        NativeFilteredBatchInput::Other(_) => false,
+    }
+}
+
+fn native_filtered_input_i64_infallible(
+    input: &NativeFilteredBatchInput,
+    row: usize,
+) -> Option<i64> {
+    match input {
+        NativeFilteredBatchInput::I64Array(values) if values.is_valid(row) => {
+            Some(values.value(row))
+        }
+        NativeFilteredBatchInput::I32Array(values) if values.is_valid(row) => {
+            Some(i64::from(values.value(row)))
+        }
+        _ => None,
+    }
 }
 
 fn native_filtered_update_i64_dense_row_masks(
