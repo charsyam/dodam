@@ -804,27 +804,15 @@ async fn duckdb_differential_join_low_memory_limit() {
         facts_path.display(),
         dim_path.display()
     );
-    let output = execute_sql_with_options(
-        &DodamEngine::default(),
+    assert_same_as_duckdb_with_options(
         &dodam_sql,
-        BATCH_SIZE,
+        &duckdb_sql,
+        tempdir.path(),
         SqlExecutionOptions {
             join_memory_limit_bytes: Some(1),
         },
     )
-    .await
-    .expect("execute low-memory Dodam join");
-    let dodam_rows = match output {
-        QueryOutput::Scan { batches } | QueryOutput::Aggregate { batches, .. } => {
-            canonical_rows(&batches)
-        }
-        QueryOutput::Explain { .. } => panic!("unexpected EXPLAIN output"),
-    };
-    let duckdb_rows = run_duckdb(&duckdb_sql, tempdir.path());
-    assert_eq!(
-        dodam_rows, duckdb_rows,
-        "\nDodam SQL:\n{dodam_sql}\n\nDuckDB SQL:\n{duckdb_sql}"
-    );
+    .await;
 
     let dodam_sql = format!(
         "SELECT d.name, count(*), sum(f.value) FROM '{}' f JOIN '{}' d ON f.key = d.key GROUP BY d.name ORDER BY d.name",
@@ -836,27 +824,77 @@ async fn duckdb_differential_join_low_memory_limit() {
         facts_path.display(),
         dim_path.display()
     );
-    let output = execute_sql_with_options(
-        &DodamEngine::default(),
+    assert_same_as_duckdb_with_options(
         &dodam_sql,
-        BATCH_SIZE,
+        &duckdb_sql,
+        tempdir.path(),
         SqlExecutionOptions {
             join_memory_limit_bytes: Some(1),
         },
     )
-    .await
-    .expect("execute low-memory Dodam join aggregate");
-    let dodam_rows = match output {
-        QueryOutput::Scan { batches } | QueryOutput::Aggregate { batches, .. } => {
-            canonical_rows(&batches)
-        }
-        QueryOutput::Explain { .. } => panic!("unexpected EXPLAIN output"),
-    };
-    let duckdb_rows = run_duckdb(&duckdb_sql, tempdir.path());
-    assert_eq!(
-        dodam_rows, duckdb_rows,
-        "\nDodam SQL:\n{dodam_sql}\n\nDuckDB SQL:\n{duckdb_sql}"
+    .await;
+
+    let dodam_sql = format!(
+        "SELECT f.id, d.name FROM '{}' f JOIN '{}' d ON f.key = d.key ORDER BY f.value DESC, f.id LIMIT 3",
+        facts_path.display(),
+        dim_path.display()
     );
+    let duckdb_sql = format!(
+        "SELECT f.id, d.name FROM read_parquet('{}') f JOIN read_parquet('{}') d ON f.key = d.key ORDER BY f.value DESC, f.id LIMIT 3",
+        facts_path.display(),
+        dim_path.display()
+    );
+    assert_same_as_duckdb_with_options(
+        &dodam_sql,
+        &duckdb_sql,
+        tempdir.path(),
+        SqlExecutionOptions {
+            join_memory_limit_bytes: Some(1),
+        },
+    )
+    .await;
+
+    let dodam_sql = format!(
+        "SELECT f.id, d.name FROM (SELECT id, key, value FROM '{}' WHERE value >= 20) f JOIN '{}' d ON f.key = d.key ORDER BY f.id",
+        facts_path.display(),
+        dim_path.display()
+    );
+    let duckdb_sql = format!(
+        "SELECT f.id, d.name FROM (SELECT id, key, value FROM read_parquet('{}') WHERE value >= 20) f JOIN read_parquet('{}') d ON f.key = d.key ORDER BY f.id",
+        facts_path.display(),
+        dim_path.display()
+    );
+    assert_same_as_duckdb_with_options(
+        &dodam_sql,
+        &duckdb_sql,
+        tempdir.path(),
+        SqlExecutionOptions {
+            join_memory_limit_bytes: Some(1),
+        },
+    )
+    .await;
+
+    let dodam_sql = format!(
+        "SELECT d.name AS key_name, d2.name AS id_name, count(*) FROM '{}' f JOIN '{}' d ON f.key = d.key JOIN '{}' d2 ON f.id = d2.key GROUP BY d.name, d2.name ORDER BY key_name, id_name",
+        facts_path.display(),
+        dim_path.display(),
+        dim_path.display()
+    );
+    let duckdb_sql = format!(
+        "SELECT d.name AS key_name, d2.name AS id_name, count(*) FROM read_parquet('{}') f JOIN read_parquet('{}') d ON f.key = d.key JOIN read_parquet('{}') d2 ON f.id = d2.key GROUP BY d.name, d2.name ORDER BY key_name, id_name",
+        facts_path.display(),
+        dim_path.display(),
+        dim_path.display()
+    );
+    assert_same_as_duckdb_with_options(
+        &dodam_sql,
+        &duckdb_sql,
+        tempdir.path(),
+        SqlExecutionOptions {
+            join_memory_limit_bytes: Some(1),
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -3655,6 +3693,28 @@ async fn dodam_copy_csv_header_and_escaping() {
 
 async fn assert_same_as_duckdb(dodam_sql: &str, duckdb_sql: &str, tempdir: &Path) {
     assert_same_as_duckdb_case("", dodam_sql, duckdb_sql, tempdir).await;
+}
+
+async fn assert_same_as_duckdb_with_options(
+    dodam_sql: &str,
+    duckdb_sql: &str,
+    tempdir: &Path,
+    options: SqlExecutionOptions,
+) {
+    let output = execute_sql_with_options(&DodamEngine::default(), dodam_sql, BATCH_SIZE, options)
+        .await
+        .expect("execute Dodam SQL with options");
+    let dodam_rows = match output {
+        QueryOutput::Scan { batches } | QueryOutput::Aggregate { batches, .. } => {
+            canonical_rows(&batches)
+        }
+        QueryOutput::Explain { .. } => panic!("unexpected EXPLAIN output"),
+    };
+    let duckdb_rows = run_duckdb(duckdb_sql, tempdir);
+    assert_eq!(
+        dodam_rows, duckdb_rows,
+        "\nDodam SQL:\n{dodam_sql}\n\nDuckDB SQL:\n{duckdb_sql}"
+    );
 }
 
 async fn assert_same_as_duckdb_case(

@@ -18688,6 +18688,11 @@ fn q15_revenue_by_supplier_view_into(
     revenues: &mut HashMap<i64, f64>,
 ) -> Result<()> {
     if view.num_columns() == 4 {
+        if update_i64_grouped_discounted_revenue_by_date_view(
+            view, 0, 1, 2, 3, start_days, end_days, revenues,
+        )? {
+            return Ok(());
+        }
         let (Some(suppkeys), Some(shipdates), Some(extendedprices), Some(discounts)) = (
             view.i64_vector(0),
             view.date32_vector(1),
@@ -18704,47 +18709,6 @@ fn q15_revenue_by_supplier_view_into(
                 revenues,
             );
         };
-        if let (Some(suppkey_values), Some(shipdate_values)) = (
-            suppkeys.values_if_null_free(),
-            shipdates.values_if_null_free(),
-        ) && extendedprices.null_count() == 0
-            && discounts.null_count() == 0
-        {
-            let discount_scale = discounts.scale();
-            let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
-            if let (Some(extendedprice_values), Some(discount_values)) =
-                (extendedprices.raw_i64_values(), discounts.raw_i64_values())
-            {
-                for row in 0..view.num_rows() {
-                    let shipdate = shipdate_values[row];
-                    if shipdate >= start_days && shipdate < end_days {
-                        *revenues.entry(suppkey_values[row]).or_insert(0.0) +=
-                            decimal_discounted_revenue_raw_i64(
-                                extendedprice_values[row],
-                                discount_values[row],
-                                discount_scale,
-                                revenue_scale,
-                            );
-                    }
-                }
-                return Ok(());
-            }
-            let extendedprice_values = extendedprices.raw_values();
-            let discount_values = discounts.raw_values();
-            for row in 0..view.num_rows() {
-                let shipdate = shipdate_values[row];
-                if shipdate >= start_days && shipdate < end_days {
-                    *revenues.entry(suppkey_values[row]).or_insert(0.0) +=
-                        decimal_discounted_revenue_raw(
-                            extendedprice_values[row],
-                            discount_values[row],
-                            discount_scale,
-                            revenue_scale,
-                        );
-                }
-            }
-            return Ok(());
-        }
         for row in 0..view.num_rows() {
             if suppkeys.is_null(row)
                 || shipdates.is_null(row)
@@ -18766,6 +18730,68 @@ fn q15_revenue_by_supplier_view_into(
         return Ok(());
     };
     q15_revenue_by_supplier_batch_into(batch.clone(), start_days, end_days, revenues)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_i64_grouped_discounted_revenue_by_date_view(
+    view: BatchView<'_>,
+    key_index: usize,
+    date_index: usize,
+    extendedprice_index: usize,
+    discount_index: usize,
+    start_days: i32,
+    end_days: i32,
+    revenues: &mut HashMap<i64, f64>,
+) -> Result<bool> {
+    let (Some(keys), Some(dates), Some(extendedprices), Some(discounts)) = (
+        view.i64_vector(key_index),
+        view.date32_vector(date_index),
+        view.decimal128_vector(extendedprice_index),
+        view.decimal128_vector(discount_index),
+    ) else {
+        return Ok(false);
+    };
+    let (Some(key_values), Some(date_values)) =
+        (keys.values_if_null_free(), dates.values_if_null_free())
+    else {
+        return Ok(false);
+    };
+    if extendedprices.null_count() != 0 || discounts.null_count() != 0 {
+        return Ok(false);
+    }
+    let discount_scale = discounts.scale();
+    let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
+    if let (Some(extendedprice_values), Some(discount_values)) =
+        (extendedprices.raw_i64_values(), discounts.raw_i64_values())
+    {
+        for row in 0..view.num_rows() {
+            let date = date_values[row];
+            if date >= start_days && date < end_days {
+                *revenues.entry(key_values[row]).or_insert(0.0) +=
+                    decimal_discounted_revenue_raw_i64(
+                        extendedprice_values[row],
+                        discount_values[row],
+                        discount_scale,
+                        revenue_scale,
+                    );
+            }
+        }
+        return Ok(true);
+    }
+    let extendedprice_values = extendedprices.raw_values();
+    let discount_values = discounts.raw_values();
+    for row in 0..view.num_rows() {
+        let date = date_values[row];
+        if date >= start_days && date < end_days {
+            *revenues.entry(key_values[row]).or_insert(0.0) += decimal_discounted_revenue_raw(
+                extendedprice_values[row],
+                discount_values[row],
+                discount_scale,
+                revenue_scale,
+            );
+        }
+    }
+    Ok(true)
 }
 
 struct Q15Row {

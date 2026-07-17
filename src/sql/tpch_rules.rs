@@ -613,11 +613,11 @@ pub(super) async fn try_execute_parts_supplier_relationship_sql(
 
     let stage = tpch_profile_start();
     let bad_suppliers =
-        q16_bad_suppliers(engine, supplier_path, batch_size, &comment_parts).await?;
+        supplier_comment_exclusion_keys(engine, supplier_path, batch_size, &comment_parts).await?;
     tpch_profile_elapsed("parts-supplier-relationship bad suppliers", stage);
 
     let stage = tpch_profile_start();
-    let part_groups = q16_part_groups(
+    let part_groups = parts_supplier_relationship_part_groups(
         engine,
         part.path,
         batch_size,
@@ -628,11 +628,11 @@ pub(super) async fn try_execute_parts_supplier_relationship_sql(
     .await?;
     tpch_profile_elapsed("parts-supplier-relationship part groups", stage);
     if part_groups.groups.is_empty() {
-        return Ok(Some(q16_output(Vec::new())?));
+        return Ok(Some(parts_supplier_relationship_output(Vec::new())?));
     }
 
     let stage = tpch_profile_start();
-    let rows = q16_supplier_counts(
+    let rows = parts_supplier_relationship_supplier_counts(
         engine,
         partsupp.path,
         batch_size,
@@ -641,7 +641,49 @@ pub(super) async fn try_execute_parts_supplier_relationship_sql(
     )
     .await?;
     tpch_profile_elapsed("parts-supplier-relationship supplier counts", stage);
-    Ok(Some(q16_output(rows)?))
+    Ok(Some(parts_supplier_relationship_output(rows)?))
+}
+
+async fn supplier_comment_exclusion_keys(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    comment_parts: &[String],
+) -> Result<Q16BadSuppliers> {
+    q16_bad_suppliers(engine, path, batch_size, comment_parts).await
+}
+
+async fn parts_supplier_relationship_part_groups(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    excluded_brand: &str,
+    excluded_type_prefix: &str,
+    sizes: &AdaptiveI64Set,
+) -> Result<Q16PartGroups> {
+    q16_part_groups(
+        engine,
+        path,
+        batch_size,
+        excluded_brand,
+        excluded_type_prefix,
+        sizes,
+    )
+    .await
+}
+
+async fn parts_supplier_relationship_supplier_counts(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    part_groups: Q16PartGroups,
+    bad_suppliers: Q16BadSuppliers,
+) -> Result<Vec<Q16Row>> {
+    q16_supplier_counts(engine, path, batch_size, part_groups, bad_suppliers).await
+}
+
+fn parts_supplier_relationship_output(rows: Vec<Q16Row>) -> Result<QueryOutput> {
+    q16_output(rows)
 }
 
 fn parts_supplier_relationship_bad_supplier_path(selection: &SqlExpr) -> Result<Option<PathBuf>> {
@@ -741,14 +783,14 @@ pub(super) async fn try_execute_promo_revenue_ratio_sql(
     };
 
     let stage = tpch_profile_start();
-    let promo_parts = q14_promo_parts(engine, part.path, batch_size).await?;
+    let promo_parts = promo_part_lookup(engine, part.path, batch_size).await?;
     tpch_profile_elapsed("promo-revenue-ratio promo parts", stage);
     if promo_parts.is_empty() {
         return Ok(Some(q17_output("promo_revenue".to_string(), None)?));
     }
 
     let stage = tpch_profile_start();
-    let (promo, total) = q14_promo_revenue(
+    let (promo, total) = promo_discounted_revenue(
         engine,
         lineitem.path,
         batch_size,
@@ -760,6 +802,25 @@ pub(super) async fn try_execute_promo_revenue_ratio_sql(
     tpch_profile_elapsed("promo-revenue-ratio promo revenue", stage);
     let value = (total != 0.0).then_some(100.0 * promo / total);
     Ok(Some(q17_output("promo_revenue".to_string(), value)?))
+}
+
+async fn promo_part_lookup(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+) -> Result<DenseI64BoolLookup> {
+    q14_promo_parts(engine, path, batch_size).await
+}
+
+async fn promo_discounted_revenue(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    start_days: i32,
+    end_days: i32,
+    promo_parts: DenseI64BoolLookup,
+) -> Result<(f64, f64)> {
+    q14_promo_revenue(engine, path, batch_size, start_days, end_days, promo_parts).await
 }
 
 fn top_supplier_revenue_shape(query: &Query) -> bool {
@@ -887,8 +948,14 @@ pub(super) async fn try_execute_top_supplier_revenue_sql(
     };
 
     let stage = tpch_profile_start();
-    let revenues =
-        q15_revenue_by_supplier(engine, lineitem.path, batch_size, start_days, end_days).await?;
+    let revenues = supplier_discounted_revenue_by_date(
+        engine,
+        lineitem.path,
+        batch_size,
+        start_days,
+        end_days,
+    )
+    .await?;
     tpch_profile_elapsed("top-supplier-revenue revenue by supplier", stage);
     let Some(max_revenue) = revenues
         .values()
@@ -896,7 +963,7 @@ pub(super) async fn try_execute_top_supplier_revenue_sql(
         .filter(|value| value.is_finite())
         .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
     else {
-        return Ok(Some(q15_output(Vec::new())?));
+        return Ok(Some(top_supplier_revenue_output(Vec::new())?));
     };
     let top_suppliers = revenues
         .into_iter()
@@ -904,7 +971,30 @@ pub(super) async fn try_execute_top_supplier_revenue_sql(
         .collect::<HashMap<_, _>>();
 
     let stage = tpch_profile_start();
-    let rows = q15_supplier_rows(engine, supplier.path, batch_size, &top_suppliers).await?;
+    let rows = top_supplier_rows(engine, supplier.path, batch_size, &top_suppliers).await?;
     tpch_profile_elapsed("top-supplier-revenue supplier rows", stage);
-    Ok(Some(q15_output(rows)?))
+    Ok(Some(top_supplier_revenue_output(rows)?))
+}
+
+async fn supplier_discounted_revenue_by_date(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    start_days: i32,
+    end_days: i32,
+) -> Result<HashMap<i64, f64>> {
+    q15_revenue_by_supplier(engine, path, batch_size, start_days, end_days).await
+}
+
+async fn top_supplier_rows(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    top_suppliers: &HashMap<i64, f64>,
+) -> Result<Vec<Q15Row>> {
+    q15_supplier_rows(engine, path, batch_size, top_suppliers).await
+}
+
+fn top_supplier_revenue_output(rows: Vec<Q15Row>) -> Result<QueryOutput> {
+    q15_output(rows)
 }
