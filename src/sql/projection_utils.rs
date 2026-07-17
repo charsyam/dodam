@@ -1,5 +1,11 @@
 use super::*;
 
+pub(super) fn add_column_once(columns: &mut Vec<String>, column: String) {
+    if !columns.iter().any(|existing| existing == &column) {
+        columns.push(column);
+    }
+}
+
 pub(super) fn projection_expressions_are_plain_columns(
     expressions: &[ProjectionExpression],
 ) -> bool {

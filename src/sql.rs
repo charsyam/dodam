@@ -131,7 +131,7 @@ use projection_types::{
     GroupExpressionBinding, ParsedProjection, ProjectionExpression, ScalarSqlExpression,
 };
 use projection_utils::{
-    add_projection_columns, projection_expressions_are_plain_columns,
+    add_column_once, add_projection_columns, projection_expressions_are_plain_columns,
     projection_requires_expression_path,
 };
 use query_features::{
@@ -47417,12 +47417,6 @@ fn group_by_all_projection_expressions(select: &Select) -> Result<Vec<SqlExpr>> 
         expressions.push(expr);
     }
     Ok(expressions)
-}
-
-fn add_column_once(columns: &mut Vec<String>, column: String) {
-    if !columns.iter().any(|existing| existing == &column) {
-        columns.push(column);
-    }
 }
 
 fn projection_ordinal_targets(
