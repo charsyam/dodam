@@ -113,6 +113,65 @@ pub(super) fn parse_select_table_refs(select: &Select) -> Result<Vec<SqlTableRef
         .collect::<Result<Vec<_>>>()
 }
 
+pub(super) fn select_inner_column_prefixes(select: &Select) -> Result<Vec<String>> {
+    let mut prefixes = Vec::new();
+    for table in &select.from {
+        add_table_factor_prefix(&table.relation, &mut prefixes)?;
+        for join in &table.joins {
+            match &join.join_operator {
+                JoinOperator::CrossJoin(JoinConstraint::None) => {
+                    add_table_factor_prefix(&join.relation, &mut prefixes)?;
+                }
+                _ => return Ok(Vec::new()),
+            }
+        }
+    }
+    Ok(prefixes)
+}
+
+fn add_table_factor_prefix(relation: &TableFactor, prefixes: &mut Vec<String>) -> Result<()> {
+    let table_ref = parse_table_factor(relation)?;
+    let alias = table_ref_alias_or_name(&table_ref);
+    if let Some(prefix) = tpch_alias_prefix(&alias) {
+        add_column_once(prefixes, prefix.to_string());
+    } else if let Some(initial) = alias.chars().next() {
+        add_column_once(prefixes, initial.to_string());
+    }
+    Ok(())
+}
+
+pub(super) fn parse_derived_from(select: &Select) -> Result<Option<(&Query, String)>> {
+    let [table] = select.from.as_slice() else {
+        return Ok(None);
+    };
+    if !table.joins.is_empty() {
+        return Ok(None);
+    }
+    let TableFactor::Derived {
+        lateral,
+        subquery,
+        alias,
+        sample,
+    } = &table.relation
+    else {
+        return Ok(None);
+    };
+    if *lateral || sample.is_some() {
+        return Err(DodamError::UnsupportedSql(
+            "LATERAL and TABLESAMPLE derived tables are not supported".to_string(),
+        ));
+    }
+    let alias = alias.as_ref().ok_or_else(|| {
+        DodamError::UnsupportedSql("derived tables must have an alias".to_string())
+    })?;
+    if !alias.columns.is_empty() || alias.at.is_some() {
+        return Err(DodamError::UnsupportedSql(
+            "derived table column aliases and AT aliases are not supported".to_string(),
+        ));
+    }
+    Ok(Some((subquery.as_ref(), alias.name.value.clone())))
+}
+
 pub(super) fn parse_table_factor(relation: &TableFactor) -> Result<SqlTableRef> {
     let TableFactor::Table {
         name,

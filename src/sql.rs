@@ -107,6 +107,7 @@ mod projection_types;
 mod projection_utils;
 mod query_features;
 mod query_modifiers;
+mod query_routing;
 mod rule_registry;
 mod scalar_output;
 mod semijoin;
@@ -172,10 +173,15 @@ use query_modifiers::{
     alias_target, parse_limit, parse_offset, parse_order_by, resolve_alias,
     resolve_order_by_ordinal, scan_limit_with_offset,
 };
+use query_routing::{
+    plan_direct_join_sink_request_relaxed, sql_select_has_explicit_join,
+    sql_uses_materialized_subquery, sql_uses_multi_comma_join, sql_uses_set_operation,
+};
 use rule_registry::{sql_rule_shape_mismatch_error, try_execute_registered_sql_rules};
 use scalar_output::{
-    coalesce_options, format_date32_days, format_decimal128_value, format_f64_for_sql_varchar,
-    format_timestamp_millis, rename_output_batches,
+    coalesce_options, drop_prefixed_columns, format_date32_days, format_decimal128_value,
+    format_f64_for_sql_varchar, format_timestamp_millis, rename_output_batches,
+    strip_batch_field_prefix,
 };
 use semijoin::{
     apply_correlated_subquery_filter_batches, evaluate_correlated_subquery_filter_mask,
@@ -186,9 +192,9 @@ use semijoin::{
     try_execute_in_subquery_sql, unqualified_semijoin_column,
 };
 use table_refs::{
-    SqlTableRef, parse_comma_join_table_refs, parse_from,
+    SqlTableRef, parse_comma_join_table_refs, parse_derived_from, parse_from,
     parse_multi_input_join_table_refs_and_conjuncts, parse_select_table_refs, parse_table_factor,
-    table_ref_alias_or_name,
+    select_inner_column_prefixes, table_ref_alias_or_name,
 };
 pub use types::{
     QueryOutput, SqlExecutionOptions, SqlResultSink, SqlSinkExecutionOptions,
@@ -39082,103 +39088,6 @@ async fn scan_table_for_comma_join(
     collect_batches(stream)
 }
 
-fn strip_batch_field_prefix(batches: Vec<RecordBatch>, prefix: &str) -> Result<Vec<RecordBatch>> {
-    batches
-        .into_iter()
-        .map(|batch| {
-            let fields = batch
-                .schema()
-                .fields()
-                .iter()
-                .map(|field| {
-                    let name = field
-                        .name()
-                        .as_str()
-                        .strip_prefix(prefix)
-                        .unwrap_or(field.name().as_str())
-                        .to_string();
-                    Arc::new(Field::new(
-                        name,
-                        field.data_type().clone(),
-                        field.is_nullable(),
-                    ))
-                })
-                .collect::<Vec<_>>();
-            Ok(RecordBatch::try_new(
-                Arc::new(Schema::new(fields)),
-                batch.columns().to_vec(),
-            )?)
-        })
-        .collect()
-}
-
-fn parse_derived_from(select: &Select) -> Result<Option<(&Query, String)>> {
-    let [table] = select.from.as_slice() else {
-        return Ok(None);
-    };
-    if !table.joins.is_empty() {
-        return Ok(None);
-    }
-    let TableFactor::Derived {
-        lateral,
-        subquery,
-        alias,
-        sample,
-    } = &table.relation
-    else {
-        return Ok(None);
-    };
-    if *lateral || sample.is_some() {
-        return Err(DodamError::UnsupportedSql(
-            "LATERAL and TABLESAMPLE derived tables are not supported".to_string(),
-        ));
-    }
-    let alias = alias.as_ref().ok_or_else(|| {
-        DodamError::UnsupportedSql("derived tables must have an alias".to_string())
-    })?;
-    if !alias.columns.is_empty() || alias.at.is_some() {
-        return Err(DodamError::UnsupportedSql(
-            "derived table column aliases and AT aliases are not supported".to_string(),
-        ));
-    }
-    Ok(Some((subquery.as_ref(), alias.name.value.clone())))
-}
-
-fn sql_uses_materialized_subquery(sql: &str) -> Result<bool> {
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Ok(false);
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Ok(false);
-    };
-    Ok(parse_derived_from(select)?.is_some()
-        || select.selection.as_ref().is_some_and(|expr| {
-            top_level_exists_subquery(Some(expr)).is_some()
-                || expr_contains_materializable_subquery(expr)
-        })
-        || select
-            .having
-            .as_ref()
-            .is_some_and(expr_contains_materializable_subquery))
-}
-
-fn sql_uses_multi_comma_join(sql: &str) -> Result<bool> {
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Ok(false);
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Ok(false);
-    };
-    Ok(parse_multi_input_join_table_refs_and_conjuncts(select)?
-        .is_some_and(|(tables, _)| tables.len() > 2))
-}
-
 pub async fn try_execute_sql_streaming(
     engine: &DodamEngine,
     sql: &str,
@@ -39253,19 +39162,6 @@ pub async fn execute_sql_to_result_sink(
     sink.write_output(output)?;
     profile.write_output = Some(write_started.elapsed());
     Ok(profile)
-}
-
-fn plan_direct_join_sink_request_relaxed(
-    sql: &str,
-    batch_size: usize,
-) -> Result<Option<JoinParquetRequest>> {
-    match plan_direct_join_sink_request(sql, batch_size) {
-        Ok(request) => Ok(request),
-        Err(DodamError::UnsupportedSql(message)) if sql_rule_shape_mismatch_error(&message) => {
-            Ok(None)
-        }
-        Err(error) => Err(error),
-    }
 }
 
 async fn try_execute_set_operation_sql_to_sink(
@@ -41984,29 +41880,6 @@ fn plan_direct_join_sink_request(
     direct_join_sink_request(query, batch_size)
 }
 
-fn sql_select_has_explicit_join(sql: &str) -> Result<bool> {
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Ok(false);
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Ok(false);
-    };
-    Ok(select.from.iter().any(|table| !table.joins.is_empty()))
-}
-
-fn sql_uses_set_operation(sql: &str) -> Result<bool> {
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Ok(false);
-    };
-    Ok(query_contains_set_operation(query.body.as_ref()))
-}
-
 fn direct_join_sink_request(
     query: SqlQuery,
     batch_size: usize,
@@ -42843,56 +42716,11 @@ fn aggregate_column_parts(column: &str) -> Option<(&str, &str)> {
     Some((function, argument))
 }
 
-fn select_inner_column_prefixes(select: &Select) -> Result<Vec<String>> {
-    let mut prefixes = Vec::new();
-    for table in &select.from {
-        add_table_factor_prefix(&table.relation, &mut prefixes)?;
-        for join in &table.joins {
-            match &join.join_operator {
-                JoinOperator::CrossJoin(JoinConstraint::None) => {
-                    add_table_factor_prefix(&join.relation, &mut prefixes)?;
-                }
-                _ => return Ok(Vec::new()),
-            }
-        }
-    }
-    Ok(prefixes)
-}
-
-fn add_table_factor_prefix(relation: &TableFactor, prefixes: &mut Vec<String>) -> Result<()> {
-    let table_ref = parse_table_factor(relation)?;
-    let alias = table_ref_alias_or_name(&table_ref);
-    if let Some(prefix) = tpch_alias_prefix(&alias) {
-        add_column_once(prefixes, prefix.to_string());
-    } else if let Some(initial) = alias.chars().next() {
-        add_column_once(prefixes, initial.to_string());
-    }
-    Ok(())
-}
-
 fn column_has_any_prefix(column: &str, prefixes: &[String]) -> bool {
     let unqualified = unqualified_semijoin_column(column);
     prefixes
         .iter()
         .any(|prefix| unqualified.starts_with(&format!("{prefix}_")))
-}
-
-fn drop_prefixed_columns(batches: Vec<RecordBatch>, prefix: &str) -> Result<Vec<RecordBatch>> {
-    let mut output = Vec::new();
-    for batch in batches {
-        let keep = batch
-            .schema()
-            .fields()
-            .iter()
-            .filter_map(|field| (!field.name().starts_with(prefix)).then_some(field.name().clone()))
-            .collect::<Vec<_>>();
-        if keep.is_empty() {
-            continue;
-        }
-        let mut projected = apply_output_projection(vec![batch], &Projection::Columns(keep))?;
-        output.append(&mut projected);
-    }
-    Ok(output)
 }
 
 fn common_or_comma_join_equality_keys(

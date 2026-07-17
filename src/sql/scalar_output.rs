@@ -88,3 +88,57 @@ pub(super) fn rename_output_batches(
         })
         .collect()
 }
+
+pub(super) fn strip_batch_field_prefix(
+    batches: Vec<RecordBatch>,
+    prefix: &str,
+) -> Result<Vec<RecordBatch>> {
+    batches
+        .into_iter()
+        .map(|batch| {
+            let fields = batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| {
+                    let name = field
+                        .name()
+                        .as_str()
+                        .strip_prefix(prefix)
+                        .unwrap_or(field.name().as_str())
+                        .to_string();
+                    Arc::new(Field::new(
+                        name,
+                        field.data_type().clone(),
+                        field.is_nullable(),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            Ok(RecordBatch::try_new(
+                Arc::new(Schema::new(fields)),
+                batch.columns().to_vec(),
+            )?)
+        })
+        .collect()
+}
+
+pub(super) fn drop_prefixed_columns(
+    batches: Vec<RecordBatch>,
+    prefix: &str,
+) -> Result<Vec<RecordBatch>> {
+    let mut output = Vec::new();
+    for batch in batches {
+        let keep = batch
+            .schema()
+            .fields()
+            .iter()
+            .filter_map(|field| (!field.name().starts_with(prefix)).then_some(field.name().clone()))
+            .collect::<Vec<_>>();
+        if keep.is_empty() {
+            continue;
+        }
+        let mut projected = apply_output_projection(vec![batch], &Projection::Columns(keep))?;
+        output.append(&mut projected);
+    }
+    Ok(output)
+}
