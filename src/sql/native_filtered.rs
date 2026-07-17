@@ -592,6 +592,10 @@ impl NativeFilteredColumnarAggState {
         input: &NativeFilteredBatchInput,
         keys: &Int32Array,
     ) {
+        if matches!(predicate, NativeFilteredDirectPredicate::AlwaysTrue) {
+            self.update_with_i32_keys_all(input, keys);
+            return;
+        }
         match self {
             Self::Count(counts) => match input {
                 NativeFilteredBatchInput::AlwaysSome | NativeFilteredBatchInput::NonNull => {
@@ -633,6 +637,82 @@ impl NativeFilteredColumnarAggState {
                             let key = keys.value(row) as usize;
                             sums[key] += i64::from(values.value(row));
                             counts[key] += 1;
+                        }
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+
+    fn update_with_i32_keys_all(&mut self, input: &NativeFilteredBatchInput, keys: &Int32Array) {
+        match self {
+            Self::Count(counts) => match input {
+                NativeFilteredBatchInput::AlwaysSome | NativeFilteredBatchInput::NonNull => {
+                    for row in 0..keys.len() {
+                        counts[keys.value(row) as usize] += 1;
+                    }
+                }
+                NativeFilteredBatchInput::I64Array(values) => {
+                    if values.null_count() == 0 {
+                        for row in 0..keys.len() {
+                            counts[keys.value(row) as usize] += 1;
+                        }
+                    } else {
+                        for row in 0..keys.len() {
+                            if values.is_valid(row) {
+                                counts[keys.value(row) as usize] += 1;
+                            }
+                        }
+                    }
+                }
+                NativeFilteredBatchInput::I32Array(values) => {
+                    if values.null_count() == 0 {
+                        for row in 0..keys.len() {
+                            counts[keys.value(row) as usize] += 1;
+                        }
+                    } else {
+                        for row in 0..keys.len() {
+                            if values.is_valid(row) {
+                                counts[keys.value(row) as usize] += 1;
+                            }
+                        }
+                    }
+                }
+                NativeFilteredBatchInput::Other(_) => {}
+            },
+            Self::SumI64 { sums, counts } | Self::AvgI64 { sums, counts } => match input {
+                NativeFilteredBatchInput::I64Array(values) => {
+                    if values.null_count() == 0 {
+                        for row in 0..keys.len() {
+                            let key = keys.value(row) as usize;
+                            sums[key] += values.value(row);
+                            counts[key] += 1;
+                        }
+                    } else {
+                        for row in 0..keys.len() {
+                            if values.is_valid(row) {
+                                let key = keys.value(row) as usize;
+                                sums[key] += values.value(row);
+                                counts[key] += 1;
+                            }
+                        }
+                    }
+                }
+                NativeFilteredBatchInput::I32Array(values) => {
+                    if values.null_count() == 0 {
+                        for row in 0..keys.len() {
+                            let key = keys.value(row) as usize;
+                            sums[key] += i64::from(values.value(row));
+                            counts[key] += 1;
+                        }
+                    } else {
+                        for row in 0..keys.len() {
+                            if values.is_valid(row) {
+                                let key = keys.value(row) as usize;
+                                sums[key] += i64::from(values.value(row));
+                                counts[key] += 1;
+                            }
                         }
                     }
                 }
@@ -749,6 +829,11 @@ fn native_filtered_direct_predicate_row_masks(
     for (index, predicate) in predicates.iter().enumerate() {
         let bit = 1u8 << index;
         match predicate {
+            NativeFilteredDirectPredicate::AlwaysTrue => {
+                for mask in &mut masks {
+                    *mask |= bit;
+                }
+            }
             NativeFilteredDirectPredicate::Precomputed(selected) => {
                 if selected.len() < rows {
                     return None;
@@ -1248,6 +1333,7 @@ impl NativeFilteredBatchMask {
 }
 
 enum NativeFilteredDirectPredicate {
+    AlwaysTrue,
     Precomputed(Vec<bool>),
     IsNotNull(ArrayRef),
     I32Compare {
@@ -1275,6 +1361,7 @@ enum NativeFilteredDirectPredicate {
 impl NativeFilteredDirectPredicate {
     fn selected(&self, row: usize) -> bool {
         match self {
+            Self::AlwaysTrue => true,
             Self::Precomputed(selected) => selected.get(row).copied().unwrap_or(false),
             Self::IsNotNull(values) => values.is_valid(row),
             Self::I32Compare {
@@ -1313,6 +1400,7 @@ impl NativeFilteredDirectPredicate {
 
     fn append_selected_rows(&self, rows: usize, selected_rows: &mut Vec<usize>) {
         match self {
+            Self::AlwaysTrue => selected_rows.extend(0..rows),
             Self::Precomputed(selected) => {
                 for row in 0..rows.min(selected.len()) {
                     if selected[row] {
@@ -1450,9 +1538,12 @@ fn native_filtered_direct_predicate(
         SqlExpr::IsNotNull(expr) => {
             let column = sql_column_name(expr, None)?;
             let index = output_batch_column_index(batch, &column)?;
-            Ok(Some(NativeFilteredDirectPredicate::IsNotNull(
-                batch.column(index).clone(),
-            )))
+            let values = batch.column(index);
+            Ok(Some(if values.null_count() == 0 {
+                NativeFilteredDirectPredicate::AlwaysTrue
+            } else {
+                NativeFilteredDirectPredicate::IsNotNull(values.clone())
+            }))
         }
         SqlExpr::BinaryOp { left, op, right }
             if matches!(
