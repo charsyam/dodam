@@ -6,6 +6,9 @@ struct DecimalProductSumSpec {
     left_column: String,
     right_column: String,
     third_column: Option<String>,
+    left_index: usize,
+    right_index: usize,
+    third_index: Option<usize>,
     left_kind: ProductColumnKind,
     right_kind: ProductColumnKind,
     third_kind: Option<ProductColumnKind>,
@@ -123,6 +126,9 @@ struct DecimalProductSumState {
 
 #[derive(Clone, Copy)]
 struct ProductPayloadPlan {
+    left_index: usize,
+    right_index: usize,
+    third_index: Option<usize>,
     left_kind: ProductColumnKind,
     right_kind: ProductColumnKind,
     third_kind: Option<ProductColumnKind>,
@@ -226,12 +232,23 @@ async fn try_collect_filtered_product_sum_late_materialized(
     if predicate_columns.is_empty() {
         return Ok(None);
     }
-    let mut payload_columns = vec![spec.left_column.clone(), spec.right_column.clone()];
+    let mut payload_columns = Vec::new();
+    add_column_once(&mut payload_columns, spec.left_column.clone());
+    add_column_once(&mut payload_columns, spec.right_column.clone());
     if let Some(column) = &spec.third_column {
         add_column_once(&mut payload_columns, column.clone());
     }
+    let payload_index = |column: &str| {
+        payload_columns
+            .iter()
+            .position(|candidate| candidate == column)
+            .expect("product payload column is projected")
+    };
     let sum_expr = spec.sum_expr.clone();
     let product_plan = ProductPayloadPlan {
+        left_index: payload_index(&spec.left_column),
+        right_index: payload_index(&spec.right_column),
+        third_index: spec.third_column.as_deref().map(payload_index),
         left_kind: spec.left_kind,
         right_kind: spec.right_kind,
         third_kind: spec.third_kind,
@@ -332,12 +349,6 @@ impl DecimalProductSumSpec {
         let right_column = right.column.as_str();
         let third = rest.first();
         let third_column = third.map(|term| term.column.as_str());
-        if left_column == right_column
-            || third_column.is_some_and(|column| column == left_column || column == right_column)
-        {
-            log_product_sum_rule_miss("duplicate-product-columns");
-            return Ok(None);
-        }
         let Some(left_kind) = product_column_kind(engine, path, left_column)? else {
             log_product_sum_rule_miss("left-product-type-unsupported");
             return Ok(None);
@@ -346,10 +357,15 @@ impl DecimalProductSumSpec {
             log_product_sum_rule_miss("right-product-type-unsupported");
             return Ok(None);
         };
-        let third_kind = third_column
-            .map(|column| product_column_kind(engine, path, column))
-            .transpose()?
-            .flatten();
+        let third_kind = if let Some(column) = third_column {
+            let Some(kind) = product_column_kind(engine, path, column)? else {
+                log_product_sum_rule_miss("third-product-type-unsupported");
+                return Ok(None);
+            };
+            Some(kind)
+        } else {
+            None
+        };
         let decimal_product = matches!(
             (left_kind, right_kind, third_kind),
             (
@@ -387,6 +403,9 @@ impl DecimalProductSumSpec {
         if let Some(column) = third_column {
             add_column_once(&mut projection, column.to_string());
         }
+        let left_index = product_projection_index(&projection, left_column);
+        let right_index = product_projection_index(&projection, right_column);
+        let third_index = third_column.map(|column| product_projection_index(&projection, column));
         for column in filter.referenced_columns() {
             add_column_once(&mut projection, column);
         }
@@ -410,6 +429,9 @@ impl DecimalProductSumSpec {
             left_column: left_column.to_string(),
             right_column: right_column.to_string(),
             third_column: third_column.map(str::to_string),
+            left_index,
+            right_index,
+            third_index,
             left_kind,
             right_kind,
             third_kind,
@@ -448,6 +470,13 @@ impl DecimalProductSumSpec {
     fn product_factor_count(&self) -> usize {
         2 + usize::from(self.third_kind.is_some())
     }
+}
+
+fn product_projection_index(projection: &[String], column: &str) -> usize {
+    projection
+        .iter()
+        .position(|candidate| candidate == column)
+        .expect("product column is projected")
 }
 
 fn product_column_kind(
@@ -713,14 +742,20 @@ fn consume_product_sum_vectors(
     };
     match (spec.left_kind, spec.right_kind) {
         (ProductColumnKind::Int64, ProductColumnKind::Int64) => {
-            let (Some(left), Some(right)) = (view.i64_vector(0), view.i64_vector(1)) else {
+            let (Some(left), Some(right)) = (
+                view.i64_vector(spec.left_index),
+                view.i64_vector(spec.right_index),
+            ) else {
                 return Ok(false);
             };
             consume_i64_i64_product_sum_vectors(view, &predicates, left, right, state);
             Ok(true)
         }
         (ProductColumnKind::Int32, ProductColumnKind::Int32) => {
-            let (Some(left), Some(right)) = (view.i32_vector(0), view.i32_vector(1)) else {
+            let (Some(left), Some(right)) = (
+                view.i32_vector(spec.left_index),
+                view.i32_vector(spec.right_index),
+            ) else {
                 return Ok(false);
             };
             consume_i32_i32_product_sum_vectors(view, &predicates, left, right, state);
@@ -730,8 +765,10 @@ fn consume_product_sum_vectors(
             ProductColumnKind::DecimalI64 { scale: left_scale },
             ProductColumnKind::DecimalI64 { scale: right_scale },
         ) => {
-            let (Some(left), Some(right)) = (view.decimal128_vector(0), view.decimal128_vector(1))
-            else {
+            let (Some(left), Some(right)) = (
+                view.decimal128_vector(spec.left_index),
+                view.decimal128_vector(spec.right_index),
+            ) else {
                 return Ok(false);
             };
             if left.scale_i64() != Some(left_scale) || right.scale_i64() != Some(right_scale) {
@@ -740,7 +777,10 @@ fn consume_product_sum_vectors(
             let third = match spec.third_kind {
                 None => None,
                 Some(kind @ ProductColumnKind::DecimalI64 { scale }) => {
-                    let Some(values) = view.decimal128_vector(2) else {
+                    let Some(values) = spec
+                        .third_index
+                        .and_then(|index| view.decimal128_vector(index))
+                    else {
                         return Ok(false);
                     };
                     if values.scale_i64() != Some(scale) {
@@ -780,8 +820,10 @@ fn consume_product_payload_view(
             ProductColumnKind::DecimalI64 { scale: left_scale },
             ProductColumnKind::DecimalI64 { scale: right_scale },
         ) => {
-            let (Some(left), Some(right)) = (view.decimal128_vector(0), view.decimal128_vector(1))
-            else {
+            let (Some(left), Some(right)) = (
+                view.decimal128_vector(plan.left_index),
+                view.decimal128_vector(plan.right_index),
+            ) else {
                 return Ok(());
             };
             if left.scale_i64() != Some(left_scale) || right.scale_i64() != Some(right_scale) {
@@ -790,7 +832,10 @@ fn consume_product_payload_view(
             let third = match plan.third_kind {
                 None => None,
                 Some(ProductColumnKind::DecimalI64 { scale }) => {
-                    let Some(values) = view.decimal128_vector(2) else {
+                    let Some(values) = plan
+                        .third_index
+                        .and_then(|index| view.decimal128_vector(index))
+                    else {
                         return Ok(());
                     };
                     if values.scale_i64() != Some(scale) {
@@ -840,7 +885,10 @@ fn consume_product_payload_view(
             }
         }
         (ProductColumnKind::Int64, ProductColumnKind::Int64) => {
-            let (Some(left), Some(right)) = (view.i64_vector(0), view.i64_vector(1)) else {
+            let (Some(left), Some(right)) = (
+                view.i64_vector(plan.left_index),
+                view.i64_vector(plan.right_index),
+            ) else {
                 return Ok(());
             };
             for row in 0..view.num_rows() {
@@ -852,7 +900,10 @@ fn consume_product_payload_view(
             }
         }
         (ProductColumnKind::Int32, ProductColumnKind::Int32) => {
-            let (Some(left), Some(right)) = (view.i32_vector(0), view.i32_vector(1)) else {
+            let (Some(left), Some(right)) = (
+                view.i32_vector(plan.left_index),
+                view.i32_vector(plan.right_index),
+            ) else {
                 return Ok(());
             };
             for row in 0..view.num_rows() {
@@ -1319,10 +1370,10 @@ fn consume_product_row(
     row: usize,
     state: &mut DecimalProductSumState,
 ) -> Result<()> {
-    let Some(left) = product_value(view, 0, spec.left_kind, row)? else {
+    let Some(left) = product_value(view, spec.left_index, spec.left_kind, row)? else {
         return Ok(());
     };
-    let Some(right) = product_value(view, 1, spec.right_kind, row)? else {
+    let Some(right) = product_value(view, spec.right_index, spec.right_kind, row)? else {
         return Ok(());
     };
     match (left, right) {
@@ -1339,8 +1390,12 @@ fn consume_product_row(
             let mut product = (left as f64) * (right as f64);
             let mut scale = (left_scale as f64) * (right_scale as f64);
             if let Some(third_kind) = spec.third_kind {
-                let Some(ProductValue::Scaled(third, third_scale)) =
-                    product_value(view, 2, third_kind, row)?
+                let Some(ProductValue::Scaled(third, third_scale)) = product_value(
+                    view,
+                    spec.third_index.expect("third product column index"),
+                    third_kind,
+                    row,
+                )?
                 else {
                     return Ok(());
                 };

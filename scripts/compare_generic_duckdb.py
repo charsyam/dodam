@@ -259,6 +259,16 @@ def generic_queries(data_dir: Path) -> list[GenericQuery]:
             f"SELECT sum(amount * (1 - rate) * (1 + tax)) FROM read_parquet('{product}') WHERE event_date < '2024-01-20' AND amount >= '10.00' AND amount < '20.00'",
         ),
         GenericQuery(
+            "standard_duplicate_product_sum",
+            f"SELECT sum(amount * amount) FROM '{product}' WHERE event_date < '2024-01-20' AND amount >= '10.00' AND amount < '20.00'",
+            f"SELECT sum(amount * amount) FROM read_parquet('{product}') WHERE event_date < '2024-01-20' AND amount >= '10.00' AND amount < '20.00'",
+        ),
+        GenericQuery(
+            "standard_duplicate_three_factor_product_sum",
+            f"SELECT sum(amount * (1 - rate) * amount) FROM '{product}' WHERE event_date < '2024-01-20' AND amount >= '10.00' AND amount < '20.00'",
+            f"SELECT sum(amount * (1 - rate) * amount) FROM read_parquet('{product}') WHERE event_date < '2024-01-20' AND amount >= '10.00' AND amount < '20.00'",
+        ),
+        GenericQuery(
             "standard_filter_product_sum",
             f"SELECT sum(amount * (1 - rate)) FILTER (WHERE event_date < '2024-01-20') FROM '{product}' WHERE amount >= '10.00' AND amount < '20.00'",
             f"SELECT sum(amount * (1 - rate)) FILTER (WHERE event_date < '2024-01-20') FROM read_parquet('{product}') WHERE amount >= '10.00' AND amount < '20.00'",
