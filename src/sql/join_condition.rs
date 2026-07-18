@@ -516,3 +516,51 @@ pub(super) fn strip_column_prefix(column: &str, prefix: &str) -> String {
         .unwrap_or(column)
         .to_string()
 }
+
+pub(super) fn common_or_comma_join_equality_keys(
+    expr: &SqlExpr,
+    left_alias: &str,
+    right_alias: &str,
+    table_aliases: &[&str],
+) -> Result<Vec<(String, String)>> {
+    match expr {
+        SqlExpr::Nested(expr) => {
+            common_or_comma_join_equality_keys(expr, left_alias, right_alias, table_aliases)
+        }
+        SqlExpr::BinaryOp {
+            left,
+            op: BinaryOperator::Or,
+            right,
+        } => {
+            let left_keys =
+                common_or_comma_join_equality_keys(left, left_alias, right_alias, table_aliases)?;
+            let right_keys =
+                common_or_comma_join_equality_keys(right, left_alias, right_alias, table_aliases)?;
+            Ok(left_keys
+                .into_iter()
+                .filter(|key| right_keys.iter().any(|right_key| right_key == key))
+                .collect())
+        }
+        expr => branch_comma_join_equality_keys(expr, left_alias, right_alias, table_aliases),
+    }
+}
+
+fn branch_comma_join_equality_keys(
+    expr: &SqlExpr,
+    left_alias: &str,
+    right_alias: &str,
+    table_aliases: &[&str],
+) -> Result<Vec<(String, String)>> {
+    let mut conjuncts = Vec::new();
+    collect_sql_and_conjuncts(expr, &mut conjuncts);
+    let mut keys = Vec::new();
+    for conjunct in conjuncts {
+        if let Some(key) =
+            comma_join_equality_keys(&conjunct, left_alias, right_alias, table_aliases)?
+            && !keys.iter().any(|existing| existing == &key)
+        {
+            keys.push(key);
+        }
+    }
+    Ok(keys)
+}

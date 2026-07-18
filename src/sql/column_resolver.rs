@@ -310,3 +310,16 @@ fn is_tpch_column_prefix(prefix: &str) -> bool {
         "c" | "o" | "l" | "p" | "ps" | "s" | "n" | "r"
     )
 }
+
+pub(super) fn resolve_batch_column(
+    batch: &RecordBatch,
+    column: &str,
+) -> Result<Option<BoundColumn>> {
+    ColumnResolver::batch(batch).resolve_batch_bound(column)
+}
+
+pub(super) fn aggregate_column_parts(column: &str) -> Option<(&str, &str)> {
+    let (function, rest) = column.split_once('(')?;
+    let argument = rest.strip_suffix(')')?;
+    Some((function, argument))
+}

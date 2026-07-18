@@ -148,8 +148,8 @@ use batch_streams::{
     collect_verified_monotonic_order_limit_batches,
 };
 use column_resolver::{
-    BoundColumn, ColumnResolver, infer_tpch_table_alias, join_column_name, object_name_to_string,
-    sql_column_name,
+    BoundColumn, ColumnResolver, aggregate_column_parts, infer_tpch_table_alias, join_column_name,
+    object_name_to_string, resolve_batch_column, sql_column_name,
 };
 use comma_join::*;
 use direct_join_sink::plan_direct_join_sink_request;
@@ -173,8 +173,9 @@ use join_condition::{
     collect_filter_columns, collect_sql_and_conjuncts, collect_sql_or_disjuncts,
     combine_expr_filters, combine_filter_options, combine_sql_and_conjuncts,
     combine_sql_and_disjuncts, comma_join_base_edge, comma_join_equality_keys,
-    comma_join_keys_for_next, join_column_owner, joined_comma_join_key, maybe_join_column_name,
-    parse_join_condition, strip_column_prefix, unqualified_join_column,
+    comma_join_keys_for_next, common_or_comma_join_equality_keys, join_column_owner,
+    joined_comma_join_key, maybe_join_column_name, parse_join_condition, strip_column_prefix,
+    unqualified_join_column,
 };
 use join_filter_parser::{join_expr_to_filter_expr, parse_join_filter, parse_join_filter_plan};
 use join_lookup_fusion::{
@@ -36892,69 +36893,11 @@ fn join_memory_limit_bytes(options: SqlExecutionOptions) -> u64 {
         .unwrap_or_else(default_join_memory_limit_bytes)
 }
 
-fn resolve_batch_column(batch: &RecordBatch, column: &str) -> Result<Option<BoundColumn>> {
-    ColumnResolver::batch(batch).resolve_batch_bound(column)
-}
-
-fn aggregate_column_parts(column: &str) -> Option<(&str, &str)> {
-    let (function, rest) = column.split_once('(')?;
-    let argument = rest.strip_suffix(')')?;
-    Some((function, argument))
-}
-
 fn column_has_any_prefix(column: &str, prefixes: &[String]) -> bool {
     let unqualified = unqualified_semijoin_column(column);
     prefixes
         .iter()
         .any(|prefix| unqualified.starts_with(&format!("{prefix}_")))
-}
-
-fn common_or_comma_join_equality_keys(
-    expr: &SqlExpr,
-    left_alias: &str,
-    right_alias: &str,
-    table_aliases: &[&str],
-) -> Result<Vec<(String, String)>> {
-    match expr {
-        SqlExpr::Nested(expr) => {
-            common_or_comma_join_equality_keys(expr, left_alias, right_alias, table_aliases)
-        }
-        SqlExpr::BinaryOp {
-            left,
-            op: BinaryOperator::Or,
-            right,
-        } => {
-            let left_keys =
-                common_or_comma_join_equality_keys(left, left_alias, right_alias, table_aliases)?;
-            let right_keys =
-                common_or_comma_join_equality_keys(right, left_alias, right_alias, table_aliases)?;
-            Ok(left_keys
-                .into_iter()
-                .filter(|key| right_keys.iter().any(|right_key| right_key == key))
-                .collect())
-        }
-        expr => branch_comma_join_equality_keys(expr, left_alias, right_alias, table_aliases),
-    }
-}
-
-fn branch_comma_join_equality_keys(
-    expr: &SqlExpr,
-    left_alias: &str,
-    right_alias: &str,
-    table_aliases: &[&str],
-) -> Result<Vec<(String, String)>> {
-    let mut conjuncts = Vec::new();
-    collect_sql_and_conjuncts(expr, &mut conjuncts);
-    let mut keys = Vec::new();
-    for conjunct in conjuncts {
-        if let Some(key) =
-            comma_join_equality_keys(&conjunct, left_alias, right_alias, table_aliases)?
-            && !keys.iter().any(|existing| existing == &key)
-        {
-            keys.push(key);
-        }
-    }
-    Ok(keys)
 }
 
 #[cfg(test)]
