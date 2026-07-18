@@ -657,6 +657,7 @@ pub(super) fn sql_rule_shape_mismatch_error(message: &str) -> bool {
         || message.contains("expected exactly one JOIN")
         || message.contains("only direct table scans are supported")
         || message.contains("expected column identifier")
+        || message.contains("WITH/FETCH/locks/settings/format/pipe clauses are not supported")
         || message.contains("unsupported WHERE expression")
 }
 
