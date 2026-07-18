@@ -10160,44 +10160,126 @@ async fn try_execute_with_cte_sql(
     if let Some(output) = try_execute_single_cte_select(&cte_alias, &cte_batches, select, query)? {
         return Ok(Some(output));
     }
-    if select.from.len() != 2 || select.from.iter().any(|table| !table.joins.is_empty()) {
-        return Err(DodamError::UnsupportedSql(
-            "WITH currently supports two-table comma joins".to_string(),
-        ));
-    }
-
-    let mut relations = Vec::new();
-    for table in &select.from {
-        relations.push(
-            materialize_cte_join_relation(
-                engine,
-                &table.relation,
+    let (relations, left_keys, right_keys, residual, right_filter, join_type) = if select.from.len()
+        == 2
+        && select.from.iter().all(|table| table.joins.is_empty())
+    {
+        let mut relations = Vec::new();
+        for table in &select.from {
+            relations.push(
+                materialize_cte_join_relation(
+                    engine,
+                    &table.relation,
+                    &cte_alias,
+                    &cte_batches,
+                    batch_size,
+                    options,
+                )
+                .await?,
+            );
+        }
+        let [left, right] = relations.as_slice() else {
+            return Ok(None);
+        };
+        let aliases = vec![left.alias.clone(), right.alias.clone()];
+        let alias_refs = aliases.iter().map(String::as_str).collect::<Vec<_>>();
+        let selection = select.selection.as_ref().ok_or_else(|| {
+            DodamError::UnsupportedSql(
+                "comma join requires an equality predicate in WHERE".to_string(),
+            )
+        })?;
+        let mut rewritten_selection = selection.clone();
+        rewrite_cte_scalar_subqueries_to_literals(
+            &mut rewritten_selection,
+            &cte_alias,
+            &cte_batches,
+        )?;
+        let (left_keys, right_keys, residual) = split_comma_join_selection(
+            Some(&rewritten_selection),
+            &left.alias,
+            &right.alias,
+            &alias_refs,
+        )?;
+        (
+            relations,
+            left_keys,
+            right_keys,
+            residual,
+            None,
+            JoinType::Inner,
+        )
+    } else if let [table] = select.from.as_slice()
+        && let [join] = table.joins.as_slice()
+    {
+        let left = materialize_cte_join_relation(
+            engine,
+            &table.relation,
+            &cte_alias,
+            &cte_batches,
+            batch_size,
+            options,
+        )
+        .await?;
+        let right = materialize_cte_join_relation(
+            engine,
+            &join.relation,
+            &cte_alias,
+            &cte_batches,
+            batch_size,
+            options,
+        )
+        .await?;
+        let mut rewritten_join = join.clone();
+        if let JoinOperator::Join(JoinConstraint::On(expr))
+        | JoinOperator::Inner(JoinConstraint::On(expr))
+        | JoinOperator::Left(JoinConstraint::On(expr))
+        | JoinOperator::LeftOuter(JoinConstraint::On(expr))
+        | JoinOperator::Right(JoinConstraint::On(expr))
+        | JoinOperator::RightOuter(JoinConstraint::On(expr))
+        | JoinOperator::FullOuter(JoinConstraint::On(expr))
+        | JoinOperator::Semi(JoinConstraint::On(expr))
+        | JoinOperator::LeftSemi(JoinConstraint::On(expr)) = &mut rewritten_join.join_operator
+        {
+            rewrite_cte_scalar_subqueries_to_literals(expr, &cte_alias, &cte_batches)?;
+        }
+        let (join_type, left_keys, right_keys, right_filter) =
+            parse_join_condition(&rewritten_join, &left.alias, &right.alias)?;
+        let residual = if let Some(selection) = select.selection.as_ref() {
+            let mut rewritten_selection = selection.clone();
+            rewrite_cte_scalar_subqueries_to_literals(
+                &mut rewritten_selection,
                 &cte_alias,
                 &cte_batches,
-                batch_size,
-                options,
-            )
-            .await?,
-        );
-    }
+            )?;
+            Some(rewritten_selection)
+        } else {
+            None
+        };
+        (
+            vec![left, right],
+            left_keys,
+            right_keys,
+            residual,
+            right_filter,
+            join_type,
+        )
+    } else {
+        return Err(DodamError::UnsupportedSql(
+            "WITH currently supports two-table comma joins and single explicit JOINs".to_string(),
+        ));
+    };
     let [left, right] = relations.as_slice() else {
         return Ok(None);
     };
     let aliases = vec![left.alias.clone(), right.alias.clone()];
     let alias_refs = aliases.iter().map(String::as_str).collect::<Vec<_>>();
-    let selection = select.selection.as_ref().ok_or_else(|| {
-        DodamError::UnsupportedSql("comma join requires an equality predicate in WHERE".to_string())
-    })?;
-    let mut rewritten_selection = selection.clone();
-    rewrite_cte_scalar_subqueries_to_literals(&mut rewritten_selection, &cte_alias, &cte_batches)?;
-    let (left_keys, right_keys, residual) = split_comma_join_selection(
-        Some(&rewritten_selection),
-        &left.alias,
-        &right.alias,
-        &alias_refs,
-    )?;
-    let group_by = parse_join_group_by(select, &alias_refs)?;
-    let projection = parse_join_projection(select, &alias_refs, &group_by)?;
+    let output_aliases = if join_type == JoinType::Semi {
+        vec![left.alias.as_str()]
+    } else {
+        alias_refs.clone()
+    };
+    let group_by = parse_join_group_by(select, &output_aliases)?;
+    let projection = parse_join_projection(select, &output_aliases, &group_by)?;
     let distinct = parse_distinct(select)?;
     validate_distinct(
         distinct,
@@ -10205,8 +10287,12 @@ async fn try_execute_with_cte_sql(
         &projection.aggregates,
         None,
     )?;
-    let (filter, expression_filter) =
-        parse_join_filter_plan(residual.as_ref(), &projection.aliases, &alias_refs, false)?;
+    let (filter, expression_filter) = parse_join_filter_plan(
+        residual.as_ref(),
+        &projection.aliases,
+        &output_aliases,
+        false,
+    )?;
     let rewritten_having = if let Some(expr) = select.having.as_ref() {
         Some(
             Box::pin(rewrite_uncorrelated_scalar_subqueries_to_literals(
@@ -10221,31 +10307,34 @@ async fn try_execute_with_cte_sql(
     };
     let having = rewritten_having
         .as_ref()
-        .map(|expr| parse_join_filter(expr, &projection.aliases, &alias_refs, true))
+        .map(|expr| parse_join_filter(expr, &projection.aliases, &output_aliases, true))
         .transpose()?;
     let order_by = parse_join_order_by(
         query,
         &projection.aliases,
         &projection.ordinal_targets,
-        &alias_refs,
+        &output_aliases,
     )?;
     let limit = parse_limit(query)?;
 
     let stream = Box::new(HashJoinExec::new(
         Box::new(MemoryExec::new(left.batches.clone())),
-        Box::new(MemoryExec::new(right.batches.clone())),
+        Box::new(MemoryExec::new(apply_output_filter(
+            right.batches.clone(),
+            right_filter.as_ref(),
+        )?)),
         left_keys,
         right_keys,
         left.alias.clone(),
         right.alias.clone(),
         JoinBuildSide::Right,
-        JoinType::Inner,
+        join_type,
         Projection::All,
     ))
     .execute()?;
     let mut batches = apply_output_filter(collect_batches(stream)?, filter.as_ref())?;
     if let Some(expression_filter) = expression_filter.as_ref() {
-        batches = apply_output_join_expression_filter(batches, expression_filter, &alias_refs)?;
+        batches = apply_output_join_expression_filter(batches, expression_filter, &output_aliases)?;
     }
     if !projection.aggregates.is_empty() {
         batches = append_aggregate_expression_columns(batches, &projection.aggregate_expressions)?;

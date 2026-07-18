@@ -1034,3 +1034,69 @@ fn sql_rule_profile_enabled() -> bool {
         )
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn specific_vector_rules_rank_before_generic_with_cte_fallback() {
+        let context = SqlRuleContext::from_sql(
+            r#"
+WITH revenue AS (
+    SELECT
+        l_suppkey AS supplier_no,
+        sum(l_extendedprice * (1 - l_discount)) AS total_revenue
+    FROM lineitem
+    WHERE l_shipdate >= DATE '1996-01-01'
+      AND l_shipdate < DATE '1996-01-01' + INTERVAL '3' MONTH
+    GROUP BY l_suppkey
+)
+SELECT
+    s_suppkey,
+    s_name,
+    s_address,
+    s_phone,
+    total_revenue
+FROM supplier, revenue
+WHERE s_suppkey = supplier_no
+  AND total_revenue = (SELECT max(total_revenue) FROM revenue)
+ORDER BY s_suppkey
+"#,
+        )
+        .expect("parse Q15-shaped SQL context");
+
+        assert!(SqlRule::WithCte.is_candidate(&context));
+        assert!(SqlRule::TopSupplierRevenue.is_candidate(&context));
+
+        let with_cte_cost = SqlRule::WithCte.estimated_cost(&context, None);
+        let vector_cost = SqlRule::TopSupplierRevenue.estimated_cost(&context, None);
+
+        assert!(
+            vector_cost < with_cte_cost,
+            "top-supplier vector rule must be tried before generic WITH CTE fallback: vector={vector_cost}, cte={with_cte_cost}"
+        );
+    }
+
+    #[test]
+    fn generic_expression_rules_rank_after_shape_specific_rules() {
+        let context = SqlRuleContext::from_sql(
+            r#"
+SELECT
+    sum(l_extendedprice * l_discount) AS revenue
+FROM lineitem
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+"#,
+        )
+        .expect("parse expression aggregate SQL context");
+
+        let projection_cost = SqlRule::ProjectionExpression.estimated_cost(&context, None);
+        let pricing_cost = SqlRule::PricingSummary.estimated_cost(&context, None);
+
+        assert!(
+            pricing_cost < projection_cost,
+            "shape-specific vector aggregate candidates should not be hidden by generic expression fallback: vector={pricing_cost}, projection={projection_cost}"
+        );
+    }
+}

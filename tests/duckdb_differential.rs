@@ -895,6 +895,26 @@ async fn duckdb_differential_join_low_memory_limit() {
         },
     )
     .await;
+
+    let dodam_sql = format!(
+        "WITH filtered AS (SELECT id, key, value FROM '{}' WHERE value >= 20) SELECT filtered.id, d.name FROM filtered JOIN '{}' d ON filtered.key = d.key ORDER BY filtered.id, d.name",
+        facts_path.display(),
+        dim_path.display()
+    );
+    let duckdb_sql = format!(
+        "WITH filtered AS (SELECT id, key, value FROM read_parquet('{}') WHERE value >= 20) SELECT filtered.id, d.name FROM filtered JOIN read_parquet('{}') d ON filtered.key = d.key ORDER BY filtered.id, d.name",
+        facts_path.display(),
+        dim_path.display()
+    );
+    assert_same_as_duckdb_with_options(
+        &dodam_sql,
+        &duckdb_sql,
+        tempdir.path(),
+        SqlExecutionOptions {
+            join_memory_limit_bytes: Some(1),
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
