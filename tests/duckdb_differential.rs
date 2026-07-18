@@ -931,6 +931,48 @@ async fn duckdb_differential_join_low_memory_limit() {
 }
 
 #[tokio::test]
+async fn duckdb_differential_decimal_sum_join_syntax_equivalence() {
+    let Some(_duckdb) = DuckDbGuard::new() else {
+        return;
+    };
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let lineitem_path = tempdir.path().join("decimal-lineitem.parquet");
+    let orders_path = tempdir.path().join("status-orders.parquet");
+    write_decimal_lineitem_parquet(&lineitem_path);
+    write_status_orders_parquet(&orders_path);
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT o.o_orderstatus, sum(l.l_extendedprice) FROM '{}' AS l JOIN '{}' AS o ON l.l_orderkey = o.o_orderkey GROUP BY o.o_orderstatus ORDER BY o.o_orderstatus",
+            lineitem_path.display(),
+            orders_path.display()
+        ),
+        &format!(
+            "SELECT o.o_orderstatus, sum(l.l_extendedprice) FROM read_parquet('{}') AS l JOIN read_parquet('{}') AS o ON l.l_orderkey = o.o_orderkey GROUP BY o.o_orderstatus ORDER BY o.o_orderstatus",
+            lineitem_path.display(),
+            orders_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT o_orderstatus, sum(l_extendedprice) FROM '{}' AS lineitem, '{}' AS orders WHERE l_orderkey = o_orderkey GROUP BY o_orderstatus ORDER BY o_orderstatus",
+            lineitem_path.display(),
+            orders_path.display()
+        ),
+        &format!(
+            "SELECT o_orderstatus, sum(l_extendedprice) FROM read_parquet('{}') AS lineitem, read_parquet('{}') AS orders WHERE l_orderkey = o_orderkey GROUP BY o_orderstatus ORDER BY o_orderstatus",
+            lineitem_path.display(),
+            orders_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn duckdb_differential_multi_key_and_string_join() {
     let Some(_duckdb) = DuckDbGuard::new() else {
         return;
@@ -4349,6 +4391,33 @@ fn write_dim_parquet(path: &Path) {
     let keys = Int32Array::from_iter_values([1, 2, 2, 4]);
     let names = StringArray::from_iter_values(["one", "two-a", "two-b", "four"]);
     write_parquet(path, schema, vec![Arc::new(keys), Arc::new(names)]);
+}
+
+fn write_decimal_lineitem_parquet(path: &Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("l_orderkey", DataType::Int64, false),
+        Field::new("l_extendedprice", DataType::Decimal128(15, 2), true),
+    ]));
+    let orderkeys = Int64Array::from_iter_values([1, 1, 2, 3]);
+    let prices = Decimal128Array::from(vec![
+        Some(100000000000),
+        Some(200000000001),
+        Some(123456789012),
+        None,
+    ])
+    .with_precision_and_scale(15, 2)
+    .expect("decimal precision");
+    write_parquet(path, schema, vec![Arc::new(orderkeys), Arc::new(prices)]);
+}
+
+fn write_status_orders_parquet(path: &Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("o_orderkey", DataType::Int64, false),
+        Field::new("o_orderstatus", DataType::Utf8, false),
+    ]));
+    let orderkeys = Int64Array::from_iter_values([1, 2, 4]);
+    let statuses = StringArray::from_iter_values(["F", "O", "P"]);
+    write_parquet(path, schema, vec![Arc::new(orderkeys), Arc::new(statuses)]);
 }
 
 fn write_duplicate_pairs_parquet(path: &Path) {
