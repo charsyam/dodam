@@ -103,6 +103,7 @@ mod literal_values;
 mod literals;
 mod metadata_predicate;
 mod native_filtered;
+mod output_utils;
 mod profiling;
 mod projection_types;
 mod projection_utils;
@@ -161,6 +162,7 @@ use native_filtered::{
     NativeFilteredAggregateSpec, collect_native_filtered_aggregates,
     legacy_case_filtered_aggregate_specs, native_filtered_input_kind,
 };
+use output_utils::{apply_output_distinct, limit_batches};
 use profiling::{
     generic_profile_elapsed, generic_profile_start, semijoin_profile_enabled, sql_elapsed_nanos,
     sql_nanos_to_millis, tpch_profile_elapsed, tpch_profile_enabled, tpch_profile_start,
@@ -47276,13 +47278,6 @@ fn group_value_is_null(value: &GroupValue) -> bool {
     }
 }
 
-fn apply_output_distinct(batches: Vec<RecordBatch>, distinct: bool) -> Result<Vec<RecordBatch>> {
-    if !distinct {
-        return Ok(batches);
-    }
-    collect_batches(Box::new(DistinctExec::new(Box::new(MemoryExec::new(batches)))).execute()?)
-}
-
 fn apply_output_expression_projection_order_limit(
     mut batches: Vec<RecordBatch>,
     expressions: &[ProjectionExpression],
@@ -47756,38 +47751,6 @@ fn primitive_partial_sort_enabled() -> bool {
     std::env::var("DODAM_ENABLE_PRIMITIVE_PARTIAL_SORT")
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
-}
-
-fn limit_batches(
-    batches: Vec<RecordBatch>,
-    limit: Option<usize>,
-    offset: usize,
-) -> Vec<RecordBatch> {
-    let mut to_skip = offset;
-    let mut remaining = limit.unwrap_or(usize::MAX);
-    let mut limited = Vec::new();
-    for batch in batches {
-        if to_skip >= batch.num_rows() {
-            to_skip -= batch.num_rows();
-            continue;
-        }
-        let batch = if to_skip > 0 {
-            let sliced = batch.slice(to_skip, batch.num_rows() - to_skip);
-            to_skip = 0;
-            sliced
-        } else {
-            batch
-        };
-        if remaining == 0 {
-            break;
-        }
-        let rows = remaining.min(batch.num_rows());
-        remaining -= rows;
-        if rows > 0 {
-            limited.push(batch.slice(0, rows));
-        }
-    }
-    limited
 }
 
 fn apply_output_filter(
