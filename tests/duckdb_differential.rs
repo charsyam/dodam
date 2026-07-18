@@ -473,6 +473,19 @@ async fn duckdb_differential_aggregate_matrix() {
         tempdir.path(),
     )
     .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT key, count(*) FILTER (WHERE true) AS all_rows, sum(value) FILTER (WHERE false) AS no_sum, avg(value) FILTER (WHERE true) AS avg_value FROM '{}' GROUP BY key ORDER BY key NULLS FIRST",
+            facts_path.display()
+        ),
+        &format!(
+            "SELECT key, count(*) FILTER (WHERE true) AS all_rows, sum(value) FILTER (WHERE false) AS no_sum, avg(value) FILTER (WHERE true) AS avg_value FROM read_parquet('{}') GROUP BY key ORDER BY key NULLS FIRST",
+            facts_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
 }
 
 #[tokio::test]
