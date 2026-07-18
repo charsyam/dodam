@@ -77,7 +77,7 @@ pub(super) async fn try_execute_derived_left_join_count_distribution_sql(
         return Ok(None);
     }
 
-    let dense_counts = collect_dense_right_counts(engine, join, count_column, batch_size).await?;
+    let dense_counts = collect_dense_right_counts(engine, join, &count_column, batch_size).await?;
     if dense_counts.is_empty() {
         return Ok(None);
     }

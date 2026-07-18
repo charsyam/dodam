@@ -314,6 +314,7 @@ use query_modifiers::{
     alias_target, parse_limit, parse_offset, parse_order_by, resolve_alias,
     resolve_order_by_ordinal, scan_limit_with_offset,
 };
+pub use query_parser::parse_sql;
 use query_parser::{parse_query, split_comma_join_selection, split_subquery_residual};
 use query_routing::{
     plan_direct_join_sink_request_relaxed, sql_select_has_explicit_join,
@@ -400,24 +401,6 @@ use with_cte::try_execute_with_cte_sql;
 const DEFAULT_MAX_DENSE_I64_KEY: usize = 20_000_000;
 const DEFAULT_Q09_ORDER_YEAR_DENSE_BYTES: usize = 384 * 1024 * 1024;
 const MAX_SQL_EXTERNAL_JOIN_PARTITIONS: usize = 1024;
-
-pub fn parse_sql(input: &str) -> Result<SqlQuery> {
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, input)
-        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
-    let [statement] = statements.as_slice() else {
-        return Err(DodamError::UnsupportedSql(
-            "expected exactly one statement".to_string(),
-        ));
-    };
-
-    let Statement::Query(query) = statement else {
-        return Err(DodamError::UnsupportedSql(
-            "only SELECT queries are supported".to_string(),
-        ));
-    };
-    parse_query(query)
-}
 
 pub async fn execute_sql(
     engine: &DodamEngine,

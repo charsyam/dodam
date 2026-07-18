@@ -1,5 +1,23 @@
 use super::*;
 
+pub fn parse_sql(input: &str) -> Result<SqlQuery> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, input)
+        .map_err(|error| DodamError::UnsupportedSql(error.to_string()))?;
+    let [statement] = statements.as_slice() else {
+        return Err(DodamError::UnsupportedSql(
+            "expected exactly one statement".to_string(),
+        ));
+    };
+
+    let Statement::Query(query) = statement else {
+        return Err(DodamError::UnsupportedSql(
+            "only SELECT queries are supported".to_string(),
+        ));
+    };
+    parse_query(query)
+}
+
 pub(super) fn parse_query(query: &Query) -> Result<SqlQuery> {
     reject_query_features(query)?;
     let SetExpr::Select(select) = query.body.as_ref() else {
