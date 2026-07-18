@@ -6545,3 +6545,200 @@ fn selection_is_column_is_not_null(
     };
     Ok(sql_column_name(expr, table_alias)? == column)
 }
+
+pub(super) async fn try_apply_correlated_min_equality_filter(
+    engine: &DodamEngine,
+    batches: Vec<RecordBatch>,
+    residual: &SqlExpr,
+    batch_size: usize,
+) -> Result<Option<Vec<RecordBatch>>> {
+    if batches.is_empty() {
+        return Ok(Some(batches));
+    }
+    let Some(plan) = correlated_min_equality_plan(&batches[0], residual)? else {
+        return Ok(None);
+    };
+    let aggregate_output = Box::pin(execute_sql(engine, &plan.aggregate_sql, batch_size)).await?;
+    let aggregate_batches = query_output_batches(aggregate_output)?;
+    if aggregate_batches.is_empty() || aggregate_batches.iter().all(|batch| batch.num_rows() == 0) {
+        return Ok(Some(Vec::new()));
+    }
+    let Some(inner_key) = resolve_batch_column(&aggregate_batches[0], &plan.inner_key)? else {
+        return Ok(None);
+    };
+    let Some(aggregate_column) =
+        resolve_batch_column(&aggregate_batches[0], &plan.aggregate_column)?
+    else {
+        return Ok(None);
+    };
+
+    let stream = Box::new(HashJoinExec::new(
+        Box::new(MemoryExec::new(batches)),
+        Box::new(MemoryExec::new(aggregate_batches)),
+        vec![plan.outer_key.physical_name.clone()],
+        vec![inner_key.physical_name],
+        "__dodam_outer".to_string(),
+        "__dodam_corr".to_string(),
+        JoinBuildSide::Right,
+        JoinType::Inner,
+        Projection::All,
+    ))
+    .execute()?;
+    let joined = collect_batches(stream)?;
+    let joined = strip_batch_field_prefix(joined, "__dodam_outer.")?;
+    let min_column = format!("__dodam_corr.{}", aggregate_column.physical_name);
+    let filtered = apply_output_filter(
+        joined,
+        Some(&FilterExpr::new(Expr::ColumnComparison {
+            left: plan.outer_value.physical_name,
+            op: ComparisonOp::Eq,
+            right: min_column,
+        })),
+    )?;
+    Ok(Some(drop_prefixed_columns(filtered, "__dodam_corr.")?))
+}
+
+struct CorrelatedMinEqualityPlan {
+    outer_value: BoundColumn,
+    outer_key: BoundColumn,
+    inner_key: String,
+    aggregate_column: String,
+    aggregate_sql: String,
+}
+
+fn correlated_min_equality_plan(
+    outer_batch: &RecordBatch,
+    residual: &SqlExpr,
+) -> Result<Option<CorrelatedMinEqualityPlan>> {
+    let SqlExpr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = residual
+    else {
+        return Ok(None);
+    };
+    let (outer_value_expr, subquery) = match (left.as_ref(), right.as_ref()) {
+        (outer, SqlExpr::Subquery(subquery)) => (outer, subquery),
+        (SqlExpr::Subquery(subquery), outer) => (outer, subquery),
+        _ => return Ok(None),
+    };
+    let outer_value = sql_column_name(outer_value_expr, None)?;
+    let Some(outer_value) = resolve_batch_column(outer_batch, &outer_value)? else {
+        return Ok(None);
+    };
+
+    let SetExpr::Select(select) = subquery.body.as_ref() else {
+        return Ok(None);
+    };
+    if select.distinct.is_some()
+        || select.having.is_some()
+        || !matches!(select.group_by, GroupByExpr::Expressions(ref exprs, _) if exprs.is_empty())
+        || !select.sort_by.is_empty()
+        || !select.lateral_views.is_empty()
+        || !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+    {
+        return Ok(None);
+    }
+    let [SelectItem::UnnamedExpr(SqlExpr::Function(function))] = select.projection.as_slice()
+    else {
+        return Ok(None);
+    };
+    let aggregate = parse_aggregate(function, None)?;
+    let AggregateExpr::Min(min_input_column) = aggregate else {
+        return Ok(None);
+    };
+    let Some(selection) = select.selection.as_ref() else {
+        return Ok(None);
+    };
+    let inner_prefixes = select_inner_column_prefixes(select)?;
+    let mut conjuncts = Vec::new();
+    collect_sql_and_conjuncts(selection, &mut conjuncts);
+    let Some((correlation_index, inner_key, outer_key)) =
+        correlated_inner_outer_key(outer_batch, &conjuncts, &inner_prefixes)?
+    else {
+        return Ok(None);
+    };
+    let Some(outer_key) = resolve_batch_column(outer_batch, &outer_key)? else {
+        return Ok(None);
+    };
+    let remaining = conjuncts
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, conjunct)| (index != correlation_index).then_some(conjunct))
+        .collect::<Vec<_>>();
+    let where_sql = combine_sql_and_conjuncts(remaining)
+        .map(|expr| format!(" WHERE {expr}"))
+        .unwrap_or_default();
+    let from_sql = select
+        .from
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if from_sql.is_empty() {
+        return Ok(None);
+    }
+    let aggregate_column = format!("min({min_input_column})");
+    let aggregate_sql = format!(
+        "SELECT {inner_key}, min({min_input_column}) FROM {from_sql}{where_sql} GROUP BY {inner_key}"
+    );
+    Ok(Some(CorrelatedMinEqualityPlan {
+        outer_value,
+        outer_key,
+        inner_key,
+        aggregate_column,
+        aggregate_sql,
+    }))
+}
+
+fn correlated_inner_outer_key(
+    outer_batch: &RecordBatch,
+    conjuncts: &[SqlExpr],
+    inner_prefixes: &[String],
+) -> Result<Option<(usize, String, String)>> {
+    for (index, conjunct) in conjuncts.iter().enumerate() {
+        let SqlExpr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } = conjunct
+        else {
+            continue;
+        };
+        let Some(left_column) = semijoin_column_name(left)? else {
+            continue;
+        };
+        let Some(right_column) = semijoin_column_name(right)? else {
+            continue;
+        };
+        let left_inner = column_has_any_prefix(&left_column, inner_prefixes);
+        let right_inner = column_has_any_prefix(&right_column, inner_prefixes);
+        if left_inner != right_inner {
+            let (inner, outer) = if left_inner {
+                (left_column, right_column)
+            } else {
+                (right_column, left_column)
+            };
+            if resolve_batch_column(outer_batch, &outer)?.is_some() {
+                return Ok(Some((index, inner, outer)));
+            }
+            continue;
+        }
+        let left_in_outer = resolve_batch_column(outer_batch, &left_column)?.is_some();
+        let right_in_outer = resolve_batch_column(outer_batch, &right_column)?.is_some();
+        match (left_in_outer, right_in_outer) {
+            (true, true) if left_inner && !right_inner => {
+                return Ok(Some((index, left_column, right_column)));
+            }
+            (true, true) if right_inner && !left_inner => {
+                return Ok(Some((index, right_column, left_column)));
+            }
+            (true, false) => return Ok(Some((index, right_column, left_column))),
+            (false, true) => return Ok(Some((index, left_column, right_column))),
+            _ => {}
+        }
+    }
+    Ok(None)
+}
