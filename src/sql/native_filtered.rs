@@ -1487,7 +1487,7 @@ fn native_filtered_initial_states(
         .iter()
         .map(|spec| match spec.expr {
             AggregateExpr::Count(_) => NativeFilteredAggregateState::Count(0),
-            AggregateExpr::Sum(_) if native_filtered_product_f64_shape(&spec.input).is_some() => {
+            AggregateExpr::Sum(_) if product_expression_shape(&spec.input).is_some() => {
                 NativeFilteredAggregateState::SumF64 { sum: 0.0, count: 0 }
             }
             AggregateExpr::Sum(_) => NativeFilteredAggregateState::SumI64 { sum: 0, count: 0 },
@@ -2158,15 +2158,8 @@ struct NativeFilteredProductF64Input {
 #[derive(Clone)]
 struct NativeFilteredProductF64Term {
     values: Decimal128Array,
-    transform: NativeFilteredProductTransform,
+    transform: ProductTermTransform,
     scale: f64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NativeFilteredProductTransform {
-    Identity,
-    OneMinus,
-    OnePlus,
 }
 
 impl NativeFilteredProductF64Input {
@@ -2206,11 +2199,7 @@ impl NativeFilteredProductF64Term {
     #[inline]
     fn transformed_raw(&self, row: usize) -> f64 {
         let raw = self.values.value(row) as f64;
-        match self.transform {
-            NativeFilteredProductTransform::Identity => raw,
-            NativeFilteredProductTransform::OneMinus => self.scale - raw,
-            NativeFilteredProductTransform::OnePlus => self.scale + raw,
-        }
+        self.transform.apply_raw_f64(raw, self.scale)
     }
 }
 
@@ -2319,12 +2308,13 @@ fn native_filtered_product_f64_input(
     batch: &RecordBatch,
     expr: &ScalarSqlExpression,
 ) -> Result<Option<NativeFilteredProductF64Input>> {
-    let Some(shape) = native_filtered_product_f64_shape(expr) else {
+    let Some(shape) = product_expression_shape(expr) else {
         return Ok(None);
     };
-    let mut terms = Vec::with_capacity(shape.len());
+    let mut terms = Vec::with_capacity(shape.terms.len());
     let mut scale = 1.0;
-    for (column, transform) in shape {
+    for term in shape.terms {
+        let column = term.column;
         let index = output_batch_column_index(batch, &column)?;
         let array = batch.column(index);
         let Some(decimal) = decimal_input(array)? else {
@@ -2333,7 +2323,7 @@ fn native_filtered_product_f64_input(
         scale *= decimal.scale;
         terms.push(NativeFilteredProductF64Term {
             values: decimal.values.clone(),
-            transform,
+            transform: term.transform,
             scale: decimal.scale,
         });
     }
@@ -2341,59 +2331,6 @@ fn native_filtered_product_f64_input(
         terms,
         inv_scale: scale.recip(),
     }))
-}
-
-fn native_filtered_product_f64_shape(
-    expr: &ScalarSqlExpression,
-) -> Option<Vec<(String, NativeFilteredProductTransform)>> {
-    let mut terms = Vec::new();
-    native_filtered_collect_product_terms(expr, &mut terms)?;
-    (2..=3).contains(&terms.len()).then_some(terms)
-}
-
-fn native_filtered_collect_product_terms(
-    expr: &ScalarSqlExpression,
-    terms: &mut Vec<(String, NativeFilteredProductTransform)>,
-) -> Option<()> {
-    if let ScalarSqlExpression::Binary { left, op, right } = expr
-        && *op == BinaryOperator::Multiply
-    {
-        native_filtered_collect_product_terms(left, terms)?;
-        native_filtered_collect_product_terms(right, terms)?;
-        return Some(());
-    }
-    terms.push(native_filtered_product_term(expr)?);
-    Some(())
-}
-
-fn native_filtered_product_term(
-    expr: &ScalarSqlExpression,
-) -> Option<(String, NativeFilteredProductTransform)> {
-    if let ScalarSqlExpression::Column(column) = expr {
-        return Some((column.clone(), NativeFilteredProductTransform::Identity));
-    }
-    let ScalarSqlExpression::Binary { left, op, right } = expr else {
-        return None;
-    };
-    if !native_filtered_scalar_literal_is_one(left) {
-        return None;
-    }
-    let ScalarSqlExpression::Column(column) = right.as_ref() else {
-        return None;
-    };
-    match op {
-        BinaryOperator::Minus => Some((column.clone(), NativeFilteredProductTransform::OneMinus)),
-        BinaryOperator::Plus => Some((column.clone(), NativeFilteredProductTransform::OnePlus)),
-        _ => None,
-    }
-}
-
-fn native_filtered_scalar_literal_is_one(expr: &ScalarSqlExpression) -> bool {
-    match expr {
-        ScalarSqlExpression::Literal(LiteralValue::Int64(1)) => true,
-        ScalarSqlExpression::Literal(LiteralValue::Float64(value)) => *value == 1.0,
-        _ => false,
-    }
 }
 
 fn native_filtered_update_state(

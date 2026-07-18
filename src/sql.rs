@@ -142,6 +142,7 @@ mod prefix_supplier_threshold;
 mod pricing_summary;
 mod primitive_buffers;
 mod primitive_selection;
+mod product_expression;
 mod profiling;
 mod profit_by_nation_year;
 mod projection_expression;
@@ -288,6 +289,7 @@ use primitive_selection::{
     primitive_topk_filter_positions_into, primitive_topk_filter_positions_with_min_key_into,
     primitive_topk_sequence_base, reserve_selected_positions, row_at_time_fallback_enabled,
 };
+use product_expression::*;
 use profiling::{
     generic_profile_elapsed, generic_profile_start, semijoin_profile_enabled, sql_elapsed_nanos,
     sql_nanos_to_millis, tpch_profile_elapsed, tpch_profile_enabled, tpch_profile_start,

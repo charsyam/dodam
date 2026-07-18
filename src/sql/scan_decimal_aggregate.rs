@@ -23,23 +23,6 @@ enum ProductColumnKind {
     DecimalI64 { scale: i64 },
 }
 
-#[derive(Clone, Copy)]
-enum ProductTermTransform {
-    Identity,
-    OneMinus,
-    OnePlus,
-}
-
-impl ProductTermTransform {
-    fn apply_raw_i64(self, raw: i64, scale: i64) -> i64 {
-        match self {
-            Self::Identity => raw,
-            Self::OneMinus => scale - raw,
-            Self::OnePlus => scale + raw,
-        }
-    }
-}
-
 #[derive(Clone)]
 enum PrimitivePredicate {
     Date32 {
@@ -337,13 +320,18 @@ impl DecimalProductSumSpec {
             log_product_sum_rule_miss("expression-output-mismatch");
             return Ok(None);
         }
-        let Some(product) = decimal_product_columns(&expression.expr) else {
+        let Some(product) = product_expression_shape(&expression.expr) else {
             log_product_sum_rule_miss("expression-not-column-product");
             return Ok(None);
         };
-        let left_column = product.left_column.as_str();
-        let right_column = product.right_column.as_str();
-        let third_column = product.third_column.as_deref();
+        let [left, right, rest @ ..] = product.terms.as_slice() else {
+            log_product_sum_rule_miss("expression-not-column-product");
+            return Ok(None);
+        };
+        let left_column = left.column.as_str();
+        let right_column = right.column.as_str();
+        let third = rest.first();
+        let third_column = third.map(|term| term.column.as_str());
         if left_column == right_column
             || third_column.is_some_and(|column| column == left_column || column == right_column)
         {
@@ -425,9 +413,9 @@ impl DecimalProductSumSpec {
             left_kind,
             right_kind,
             third_kind,
-            left_transform: product.left_transform,
-            right_transform: product.right_transform,
-            third_transform: product.third_transform,
+            left_transform: left.transform,
+            right_transform: right.transform,
+            third_transform: third.map(|term| term.transform),
             projection,
             predicates,
         }))
@@ -459,77 +447,6 @@ impl DecimalProductSumSpec {
 
     fn product_factor_count(&self) -> usize {
         2 + usize::from(self.third_kind.is_some())
-    }
-}
-
-struct DecimalProductShape {
-    left_column: String,
-    right_column: String,
-    third_column: Option<String>,
-    left_transform: ProductTermTransform,
-    right_transform: ProductTermTransform,
-    third_transform: Option<ProductTermTransform>,
-}
-
-fn decimal_product_columns(expr: &ScalarSqlExpression) -> Option<DecimalProductShape> {
-    let mut terms = Vec::new();
-    collect_product_terms(expr, &mut terms)?;
-    if terms.len() < 2 || terms.len() > 3 {
-        return None;
-    }
-    let left = terms.remove(0);
-    let right = terms.remove(0);
-    let third = (!terms.is_empty()).then(|| terms.remove(0));
-    Some(DecimalProductShape {
-        left_column: left.0,
-        right_column: right.0,
-        third_column: third.as_ref().map(|term| term.0.clone()),
-        left_transform: left.1,
-        right_transform: right.1,
-        third_transform: third.map(|term| term.1),
-    })
-}
-
-fn collect_product_terms(
-    expr: &ScalarSqlExpression,
-    terms: &mut Vec<(String, ProductTermTransform)>,
-) -> Option<()> {
-    if let ScalarSqlExpression::Binary { left, op, right } = expr
-        && *op == BinaryOperator::Multiply
-    {
-        collect_product_terms(left, terms)?;
-        collect_product_terms(right, terms)?;
-        return Some(());
-    }
-    terms.push(product_term(expr)?);
-    Some(())
-}
-
-fn product_term(expr: &ScalarSqlExpression) -> Option<(String, ProductTermTransform)> {
-    if let ScalarSqlExpression::Column(column) = expr {
-        return Some((column.clone(), ProductTermTransform::Identity));
-    }
-    let ScalarSqlExpression::Binary { left, op, right } = expr else {
-        return None;
-    };
-    if !scalar_literal_is_one_local(left) {
-        return None;
-    }
-    let ScalarSqlExpression::Column(column) = right.as_ref() else {
-        return None;
-    };
-    match op {
-        BinaryOperator::Minus => Some((column.clone(), ProductTermTransform::OneMinus)),
-        BinaryOperator::Plus => Some((column.clone(), ProductTermTransform::OnePlus)),
-        _ => None,
-    }
-}
-
-fn scalar_literal_is_one_local(expr: &ScalarSqlExpression) -> bool {
-    match expr {
-        ScalarSqlExpression::Literal(LiteralValue::Int64(1)) => true,
-        ScalarSqlExpression::Literal(LiteralValue::Float64(value)) => *value == 1.0,
-        _ => false,
     }
 }
 
