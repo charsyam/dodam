@@ -74,7 +74,10 @@ pub(super) async fn try_execute_discounted_revenue_or_predicate_sql(
     let part_masks = q19_matching_part_masks(engine, part.path, batch_size, rules.as_ref()).await?;
     tpch_profile_elapsed("Q19 part masks", stage);
     if part_masks.is_empty() {
-        return Ok(Some(q17_output("revenue".to_string(), None)?));
+        return Ok(Some(single_f64_aggregate_output(
+            "revenue".to_string(),
+            None,
+        )?));
     }
     let stage = tpch_profile_start();
     let (revenue, count) = q19_lineitem_revenue(
@@ -87,7 +90,10 @@ pub(super) async fn try_execute_discounted_revenue_or_predicate_sql(
     .await?;
     tpch_profile_elapsed("Q19 lineitem revenue", stage);
     let value = (count > 0).then_some(revenue);
-    Ok(Some(q17_output("revenue".to_string(), value)?))
+    Ok(Some(single_f64_aggregate_output(
+        "revenue".to_string(),
+        value,
+    )?))
 }
 
 #[derive(Clone)]

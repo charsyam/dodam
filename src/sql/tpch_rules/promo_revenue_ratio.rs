@@ -61,7 +61,10 @@ pub(in crate::sql) async fn try_execute_promo_revenue_ratio_sql(
     let promo_parts = promo_part_lookup(engine, part.path, batch_size).await?;
     tpch_profile_elapsed("promo-revenue-ratio promo parts", stage);
     if promo_parts.is_empty() {
-        return Ok(Some(q17_output("promo_revenue".to_string(), None)?));
+        return Ok(Some(single_f64_aggregate_output(
+            "promo_revenue".to_string(),
+            None,
+        )?));
     }
 
     let stage = tpch_profile_start();
@@ -76,7 +79,10 @@ pub(in crate::sql) async fn try_execute_promo_revenue_ratio_sql(
     .await?;
     tpch_profile_elapsed("promo-revenue-ratio promo revenue", stage);
     let value = (total != 0.0).then_some(100.0 * promo / total);
-    Ok(Some(q17_output("promo_revenue".to_string(), value)?))
+    Ok(Some(single_f64_aggregate_output(
+        "promo_revenue".to_string(),
+        value,
+    )?))
 }
 
 async fn promo_part_lookup(
