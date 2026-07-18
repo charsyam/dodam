@@ -52,18 +52,18 @@ pub(super) async fn try_execute_prefix_part_supplier_threshold_sql(
     };
 
     let stage = tpch_profile_start();
-    let forest_parts = q20_forest_part_keys(engine, part_path, batch_size).await?;
-    tpch_profile_elapsed("Q20 forest part keys", stage);
+    let forest_parts = prefix_part_keys(engine, part_path, batch_size).await?;
+    tpch_profile_elapsed("PrefixSupplierThreshold forest part keys", stage);
     if forest_parts.is_empty() {
-        return Ok(Some(q20_output(Vec::new())?));
+        return Ok(Some(prefix_supplier_threshold_output(Vec::new())?));
     }
     let forest_parts = AdaptiveI64Set::from_hash(forest_parts);
     let stage = tpch_profile_start();
     let lineitem_sums =
-        q20_lineitem_quantity_sums(engine, lineitem_path, batch_size, &forest_parts).await?;
-    tpch_profile_elapsed("Q20 lineitem quantity sums", stage);
+        lineitem_quantity_sums_for_parts(engine, lineitem_path, batch_size, &forest_parts).await?;
+    tpch_profile_elapsed("PrefixSupplierThreshold lineitem quantity sums", stage);
     let stage = tpch_profile_start();
-    let eligible_suppliers = q20_eligible_supplier_keys(
+    let eligible_suppliers = eligible_supplier_keys_by_threshold(
         engine,
         partsupp_path,
         batch_size,
@@ -71,15 +71,15 @@ pub(super) async fn try_execute_prefix_part_supplier_threshold_sql(
         &lineitem_sums,
     )
     .await?;
-    tpch_profile_elapsed("Q20 eligible suppliers", stage);
+    tpch_profile_elapsed("PrefixSupplierThreshold eligible suppliers", stage);
     if eligible_suppliers.is_empty() {
-        return Ok(Some(q20_output(Vec::new())?));
+        return Ok(Some(prefix_supplier_threshold_output(Vec::new())?));
     }
     let stage = tpch_profile_start();
-    let nation_keys = q21_nation_keys(engine, nation.path, batch_size, "CANADA").await?;
-    tpch_profile_elapsed("Q20 nation keys", stage);
+    let nation_keys = nation_keys_by_name(engine, nation.path, batch_size, "CANADA").await?;
+    tpch_profile_elapsed("PrefixSupplierThreshold nation keys", stage);
     let stage = tpch_profile_start();
-    let mut rows = q20_supplier_rows(
+    let mut rows = supplier_rows_by_nation_and_eligibility(
         engine,
         supplier.path,
         batch_size,
@@ -87,11 +87,11 @@ pub(super) async fn try_execute_prefix_part_supplier_threshold_sql(
         &eligible_suppliers,
     )
     .await?;
-    tpch_profile_elapsed("Q20 supplier rows", stage);
+    tpch_profile_elapsed("PrefixSupplierThreshold supplier rows", stage);
     let stage = tpch_profile_start();
     rows.sort_by(|left, right| left.s_name.cmp(&right.s_name));
-    tpch_profile_elapsed("Q20 final sort", stage);
-    Ok(Some(q20_output(rows)?))
+    tpch_profile_elapsed("PrefixSupplierThreshold final sort", stage);
+    Ok(Some(prefix_supplier_threshold_output(rows)?))
 }
 
 pub(super) fn prefix_part_supplier_threshold_shape(select: &Select, selection: &SqlExpr) -> bool {
@@ -104,7 +104,7 @@ pub(super) fn prefix_part_supplier_threshold_shape(select: &Select, selection: &
         && text.contains("n_name = 'canada'")
 }
 
-pub(super) async fn q20_forest_part_keys(
+pub(super) async fn prefix_part_keys(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
@@ -135,7 +135,7 @@ pub(super) async fn q20_forest_part_keys(
     Ok(keys)
 }
 
-pub(super) async fn q20_lineitem_quantity_sums(
+pub(super) async fn lineitem_quantity_sums_for_parts(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
@@ -158,16 +158,16 @@ pub(super) async fn q20_lineitem_quantity_sums(
             HashMap::<(i64, i64), f64>::new,
             HashMap::<(i64, i64), f64>::new,
             move |view, sums| {
-                q20_lineitem_quantity_sums_view_into(view, &forest_parts, sums)?;
+                lineitem_quantity_sums_view_into(view, &forest_parts, sums)?;
                 Ok(Some(()))
             },
             merge_f64_groups,
-            "Q20 lineitem quantity aggregate",
+            "PrefixSupplierThreshold lineitem quantity aggregate",
         )
         .await
 }
 
-pub(super) fn q20_lineitem_quantity_sums_view_into(
+pub(super) fn lineitem_quantity_sums_view_into(
     view: BatchView<'_>,
     forest_parts: &AdaptiveI64Set,
     sums: &mut HashMap<(i64, i64), f64>,
@@ -179,7 +179,7 @@ pub(super) fn q20_lineitem_quantity_sums_view_into(
             view.decimal128_vector(2),
             view.date32_vector(3),
         )
-        && let Some(batch_sums) = q20_lineitem_quantity_sums_vector_typed(
+        && let Some(batch_sums) = lineitem_quantity_sums_vector_typed(
             partkeys,
             suppkeys,
             quantities,
@@ -195,12 +195,12 @@ pub(super) fn q20_lineitem_quantity_sums_view_into(
     };
     merge_f64_groups(
         sums,
-        q20_lineitem_quantity_sums_batch(batch.clone(), forest_parts)?,
+        lineitem_quantity_sums_batch(batch.clone(), forest_parts)?,
     );
     Ok(())
 }
 
-pub(super) fn q20_lineitem_quantity_sums_batch(
+pub(super) fn lineitem_quantity_sums_batch(
     batch: RecordBatch,
     forest_parts: &AdaptiveI64Set,
 ) -> Result<HashMap<(i64, i64), f64>> {
@@ -209,7 +209,7 @@ pub(super) fn q20_lineitem_quantity_sums_batch(
     let quantities = batch_column(&batch, "l_quantity")?;
     let shipdates = batch_column(&batch, "l_shipdate")?;
     if let Some(sums) =
-        q20_lineitem_quantity_sums_typed(partkeys, suppkeys, quantities, shipdates, forest_parts)?
+        lineitem_quantity_sums_typed(partkeys, suppkeys, quantities, shipdates, forest_parts)?
     {
         return Ok(sums);
     }
@@ -235,7 +235,7 @@ pub(super) fn q20_lineitem_quantity_sums_batch(
     Ok(sums)
 }
 
-pub(super) fn q20_lineitem_quantity_sums_typed(
+pub(super) fn lineitem_quantity_sums_typed(
     partkeys: &ArrayRef,
     suppkeys: &ArrayRef,
     quantities: &ArrayRef,
@@ -288,7 +288,7 @@ pub(super) fn q20_lineitem_quantity_sums_typed(
     Ok(Some(sums))
 }
 
-pub(super) fn q20_lineitem_quantity_sums_vector_typed(
+pub(super) fn lineitem_quantity_sums_vector_typed(
     partkeys: I64VectorView<'_>,
     suppkeys: I64VectorView<'_>,
     quantities: Decimal128VectorView<'_>,
@@ -337,7 +337,7 @@ pub(super) fn q20_lineitem_quantity_sums_vector_typed(
     Some(sums)
 }
 
-pub(super) async fn q20_eligible_supplier_keys(
+pub(super) async fn eligible_supplier_keys_by_threshold(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
@@ -363,13 +363,9 @@ pub(super) async fn q20_eligible_supplier_keys(
         let partkeys = batch_column(&batch, "ps_partkey")?;
         let suppkeys = batch_column(&batch, "ps_suppkey")?;
         let availqty = batch_column(&batch, "ps_availqty")?;
-        if let Some(batch_suppliers) = q20_eligible_supplier_keys_typed(
-            partkeys,
-            suppkeys,
-            availqty,
-            forest_parts,
-            lineitem_sums,
-        ) {
+        if let Some(batch_suppliers) =
+            eligible_supplier_keys_typed(partkeys, suppkeys, availqty, forest_parts, lineitem_sums)
+        {
             suppliers.extend(batch_suppliers);
             continue;
         }
@@ -395,7 +391,7 @@ pub(super) async fn q20_eligible_supplier_keys(
     Ok(suppliers)
 }
 
-pub(super) fn q20_eligible_supplier_keys_typed(
+pub(super) fn eligible_supplier_keys_typed(
     partkeys: &ArrayRef,
     suppkeys: &ArrayRef,
     availqtys: &ArrayRef,
@@ -445,18 +441,18 @@ pub(super) fn q20_eligible_supplier_keys_typed(
     Some(suppliers)
 }
 
-pub(super) struct Q20Row {
+pub(super) struct PrefixSupplierThresholdRow {
     s_name: String,
     s_address: String,
 }
 
-pub(super) async fn q20_supplier_rows(
+pub(super) async fn supplier_rows_by_nation_and_eligibility(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
     nation_keys: &HashSet<i64>,
     eligible_suppliers: &HashSet<i64>,
-) -> Result<Vec<Q20Row>> {
+) -> Result<Vec<PrefixSupplierThresholdRow>> {
     let mut stream = engine
         .scan_parquet_batches(
             path,
@@ -490,7 +486,7 @@ pub(super) async fn q20_supplier_rows(
                 && names.is_valid(row)
                 && addresses.is_valid(row)
             {
-                rows.push(Q20Row {
+                rows.push(PrefixSupplierThresholdRow {
                     s_name: names.value(row).to_string(),
                     s_address: addresses.value(row).to_string(),
                 });
@@ -500,7 +496,9 @@ pub(super) async fn q20_supplier_rows(
     Ok(rows)
 }
 
-pub(super) fn q20_output(rows: Vec<Q20Row>) -> Result<QueryOutput> {
+pub(super) fn prefix_supplier_threshold_output(
+    rows: Vec<PrefixSupplierThresholdRow>,
+) -> Result<QueryOutput> {
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
             Field::new("s_name", DataType::Utf8, false),

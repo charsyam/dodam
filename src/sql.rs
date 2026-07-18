@@ -11720,7 +11720,7 @@ async fn try_execute_important_stock_value_sql(
     };
 
     let stage = tpch_profile_start();
-    let nation_keys = q21_nation_keys(engine, nation.path, batch_size, &nation_name).await?;
+    let nation_keys = nation_keys_by_name(engine, nation.path, batch_size, &nation_name).await?;
     tpch_profile_elapsed("Q11 nation keys", stage);
     if nation_keys.is_empty() {
         return Ok(Some(q11_output(Vec::new())?));

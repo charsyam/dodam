@@ -50,23 +50,24 @@ pub(super) async fn try_execute_supplier_wait_count_antijoin_sql(
         return Ok(None);
     };
     let stage = tpch_profile_start();
-    let nation_keys = q21_nation_keys(engine, nation.path, batch_size, "SAUDI ARABIA").await?;
-    tpch_profile_elapsed("Q21 nation keys", stage);
+    let nation_keys = nation_keys_by_name(engine, nation.path, batch_size, "SAUDI ARABIA").await?;
+    tpch_profile_elapsed("SupplierWait nation keys", stage);
     let stage = tpch_profile_start();
-    let suppliers = q21_supplier_names(engine, supplier.path, batch_size, &nation_keys).await?;
-    tpch_profile_elapsed("Q21 supplier names", stage);
+    let suppliers =
+        supplier_names_by_nation_keys(engine, supplier.path, batch_size, &nation_keys).await?;
+    tpch_profile_elapsed("SupplierWait supplier names", stage);
     if suppliers.is_empty() {
-        return Ok(Some(q21_output(Vec::new())?));
+        return Ok(Some(supplier_wait_output(Vec::new())?));
     }
     let stage = tpch_profile_start();
-    let final_orders = q21_final_order_keys(engine, orders.path, batch_size).await?;
-    tpch_profile_elapsed("Q21 final order keys", stage);
+    let final_orders = final_order_keys_by_status(engine, orders.path, batch_size).await?;
+    tpch_profile_elapsed("SupplierWait final order keys", stage);
     if final_orders.is_empty() {
-        return Ok(Some(q21_output(Vec::new())?));
+        return Ok(Some(supplier_wait_output(Vec::new())?));
     }
     let stage = tpch_profile_start();
-    let counts = if q21_ordered_lineitem_enabled()
-        && let Some(counts) = q21_lineitem_supplier_counts_ordered(
+    let counts = if supplier_wait_ordered_lineitem_enabled()
+        && let Some(counts) = lineitem_supplier_wait_counts_ordered(
             engine,
             lineitem.path.clone(),
             batch_size,
@@ -75,15 +76,15 @@ pub(super) async fn try_execute_supplier_wait_count_antijoin_sql(
         )
         .await?
     {
-        tpch_profile_elapsed("Q21 ordered lineitem counts", stage);
+        tpch_profile_elapsed("SupplierWait ordered lineitem counts", stage);
         counts
     } else {
         let order_states =
-            q21_lineitem_order_states(engine, lineitem.path, batch_size, final_orders).await?;
-        tpch_profile_elapsed("Q21 lineitem order states", stage);
+            lineitem_order_states(engine, lineitem.path, batch_size, final_orders).await?;
+        tpch_profile_elapsed("SupplierWait lineitem order states", stage);
         let mut counts = HashMap::<i64, u64>::with_capacity(suppliers.len());
         for state in order_states.into_values() {
-            q21_count_qualifying_order(&mut counts, &suppliers, &state);
+            count_qualifying_supplier_wait_order(&mut counts, &suppliers, &state);
         }
         counts
     };
@@ -91,7 +92,7 @@ pub(super) async fn try_execute_supplier_wait_count_antijoin_sql(
     let mut rows = counts
         .into_iter()
         .filter_map(|(suppkey, count)| {
-            suppliers.get(&suppkey).map(|name| Q21Row {
+            suppliers.get(&suppkey).map(|name| SupplierWaitRow {
                 s_name: name.clone(),
                 count,
             })
@@ -104,12 +105,12 @@ pub(super) async fn try_execute_supplier_wait_count_antijoin_sql(
             .then_with(|| left.s_name.cmp(&right.s_name))
     });
     rows.truncate(100);
-    tpch_profile_elapsed("Q21 final rows", stage);
-    Ok(Some(q21_output(rows)?))
+    tpch_profile_elapsed("SupplierWait final rows", stage);
+    Ok(Some(supplier_wait_output(rows)?))
 }
 
-pub(super) fn q21_ordered_lineitem_enabled() -> bool {
-    std::env::var_os("DODAM_Q21_DISABLE_ORDERED_LINEITEM").is_none()
+pub(super) fn supplier_wait_ordered_lineitem_enabled() -> bool {
+    std::env::var_os("DODAM_SupplierWait_DISABLE_ORDERED_LINEITEM").is_none()
 }
 
 pub(super) fn supplier_wait_count_antijoin_shape(
@@ -127,7 +128,7 @@ pub(super) fn supplier_wait_count_antijoin_shape(
         && text.contains("n_name = 'saudi arabia'")
 }
 
-pub(super) async fn q21_nation_keys(
+pub(super) async fn nation_keys_by_name(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
@@ -159,7 +160,7 @@ pub(super) async fn q21_nation_keys(
     Ok(keys)
 }
 
-pub(super) async fn q21_supplier_names(
+pub(super) async fn supplier_names_by_nation_keys(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
@@ -199,13 +200,13 @@ pub(super) async fn q21_supplier_names(
     Ok(suppliers)
 }
 
-pub(super) async fn q21_final_order_keys(
+pub(super) async fn final_order_keys_by_status(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-) -> Result<Q21FinalOrders> {
-    if q21_atomic_final_orders_enabled()
-        && let Some(keys) = q21_final_order_keys_atomic(engine, path.clone(), batch_size).await?
+) -> Result<FinalOrderKeys> {
+    if atomic_final_orders_enabled()
+        && let Some(keys) = final_order_keys_atomic(engine, path.clone(), batch_size).await?
     {
         return Ok(keys);
     }
@@ -218,26 +219,26 @@ pub(super) async fn q21_final_order_keys(
             None,
         )
         .await?;
-    let mut keys = Q21FinalOrders::new_dense();
+    let mut keys = FinalOrderKeys::new_dense();
     while let Some(batch) = stream.next() {
         let batch = batch?;
-        q21_final_orders_batch_into(&batch, &mut keys)?;
+        final_orders_batch_into(&batch, &mut keys)?;
     }
     Ok(keys)
 }
 
-pub(super) type Q21FinalOrders = AdaptiveI64Set;
+pub(super) type FinalOrderKeys = AdaptiveI64Set;
 
-pub(super) fn q21_atomic_final_orders_enabled() -> bool {
-    !std::env::var("DODAM_Q21_DISABLE_ATOMIC_FINAL_ORDERS")
+pub(super) fn atomic_final_orders_enabled() -> bool {
+    !std::env::var("DODAM_SupplierWait_DISABLE_ATOMIC_FINAL_ORDERS")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
-pub(super) async fn q21_final_order_keys_atomic(
+pub(super) async fn final_order_keys_atomic(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-) -> Result<Option<Q21FinalOrders>> {
+) -> Result<Option<FinalOrderKeys>> {
     let Some(max_key) = engine
         .parquet_i64_column_max(path.clone(), "o_orderkey")
         .await?
@@ -253,12 +254,12 @@ pub(super) async fn q21_final_order_keys_atomic(
             Projection::Columns(vec!["o_orderkey".to_string(), "o_orderstatus".to_string()]),
             vec!["o_orderstatus".to_string()],
             Vec::new(),
-            q21_atomic_final_order_row_group_chunk(),
+            atomic_final_order_row_group_chunk(),
             || (),
             {
                 let markers = markers.clone();
                 move |view, _state| {
-                    q21_final_orders_atomic_view_into(view, &markers)?;
+                    final_orders_atomic_view_into(view, &markers)?;
                     Ok(Some(()))
                 }
             },
@@ -269,20 +270,22 @@ pub(super) async fn q21_final_order_keys_atomic(
         return Ok(None);
     };
     let markers = Arc::try_unwrap(markers).map_err(|_| {
-        DodamError::UnsupportedSql("Q21 atomic final-order marker still shared".to_string())
+        DodamError::UnsupportedSql(
+            "SupplierWait atomic final-order marker still shared".to_string(),
+        )
     })?;
     Ok(Some(markers.into_adaptive_i64_set()))
 }
 
-pub(super) fn q21_atomic_final_order_row_group_chunk() -> usize {
-    std::env::var("DODAM_Q21_ATOMIC_FINAL_ORDER_ROW_GROUP_CHUNK")
+pub(super) fn atomic_final_order_row_group_chunk() -> usize {
+    std::env::var("DODAM_SupplierWait_ATOMIC_FINAL_ORDER_ROW_GROUP_CHUNK")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(8)
 }
 
-pub(super) fn q21_final_orders_atomic_view_into(
+pub(super) fn final_orders_atomic_view_into(
     view: BatchView<'_>,
     markers: &DenseAtomicU8,
 ) -> Result<()> {
@@ -290,21 +293,21 @@ pub(super) fn q21_final_orders_atomic_view_into(
         && let Some(orderkeys) = view.i64_vector(0)
     {
         if let Some(statuses) = view.dictionary_i32_view(1) {
-            return q21_final_orders_atomic_dictionary_view_into(orderkeys, statuses, markers);
+            return final_orders_atomic_dictionary_view_into(orderkeys, statuses, markers);
         }
         if let Some(statuses) = view.utf8(1) {
-            return q21_final_orders_atomic_utf8_view_into(orderkeys, statuses, markers);
+            return final_orders_atomic_utf8_view_into(orderkeys, statuses, markers);
         }
     }
     let Some(batch) = view.try_record_batch() else {
         return Err(DodamError::UnsupportedSql(
-            "Q21 final-order raw vector columns have unsupported types".to_string(),
+            "SupplierWait final-order raw vector columns have unsupported types".to_string(),
         ));
     };
-    q21_final_orders_atomic_batch_into(batch, markers)
+    final_orders_atomic_batch_into(batch, markers)
 }
 
-pub(super) fn q21_final_orders_atomic_dictionary_view_into(
+pub(super) fn final_orders_atomic_dictionary_view_into(
     orderkeys: I64VectorView<'_>,
     statuses: DictionaryI32View<'_>,
     markers: &DenseAtomicU8,
@@ -313,7 +316,7 @@ pub(super) fn q21_final_orders_atomic_dictionary_view_into(
     Ok(())
 }
 
-pub(super) fn q21_final_orders_atomic_utf8_view_into(
+pub(super) fn final_orders_atomic_utf8_view_into(
     orderkeys: I64VectorView<'_>,
     statuses: &StringArray,
     markers: &DenseAtomicU8,
@@ -322,7 +325,7 @@ pub(super) fn q21_final_orders_atomic_utf8_view_into(
     Ok(())
 }
 
-pub(super) fn q21_final_orders_atomic_batch_into(
+pub(super) fn final_orders_atomic_batch_into(
     batch: &RecordBatch,
     markers: &DenseAtomicU8,
 ) -> Result<()> {
@@ -364,9 +367,9 @@ pub(super) fn q21_final_orders_atomic_batch_into(
     Ok(())
 }
 
-pub(super) fn q21_final_orders_batch_into(
+pub(super) fn final_orders_batch_into(
     batch: &RecordBatch,
-    keys: &mut Q21FinalOrders,
+    keys: &mut FinalOrderKeys,
 ) -> Result<()> {
     let orderkeys = batch_column(batch, "o_orderkey")?;
     let statuses = batch_string_column(batch, "o_orderstatus")?;
@@ -401,14 +404,14 @@ pub(super) fn q21_final_orders_batch_into(
 }
 
 #[derive(Clone, Copy, Default)]
-pub(super) struct Q21OrderState {
+pub(super) struct SupplierWaitOrderState {
     first_supplier: i64,
     late_supplier: i64,
     late_row_count: u32,
     flags: u8,
 }
 
-impl Q21OrderState {
+impl SupplierWaitOrderState {
     const HAS_SUPPLIER: u8 = 1 << 0;
     const HAS_MULTIPLE_SUPPLIERS: u8 = 1 << 1;
     const HAS_LATE_SUPPLIER: u8 = 1 << 2;
@@ -455,7 +458,7 @@ impl Q21OrderState {
         self.has_late_supplier() && !self.has_multiple_late_suppliers()
     }
 
-    fn merge(&mut self, other: Q21OrderState) {
+    fn merge(&mut self, other: SupplierWaitOrderState) {
         if other.has_supplier() {
             self.add_supplier(other.first_supplier);
             if other.has_multiple_suppliers() {
@@ -485,26 +488,28 @@ impl Q21OrderState {
     }
 }
 
-pub(super) type Q21OrderStateMap = FastHashMap<i64, Q21OrderState>;
+pub(super) type SupplierWaitOrderStateMap = FastHashMap<i64, SupplierWaitOrderState>;
 
-pub(super) fn q21_order_state_map() -> Q21OrderStateMap {
+pub(super) fn supplier_wait_order_state_map() -> SupplierWaitOrderStateMap {
     fast_hash_map()
 }
 
-pub(super) fn q21_order_state_map_with_capacity(capacity: usize) -> Q21OrderStateMap {
+pub(super) fn supplier_wait_order_state_map_with_capacity(
+    capacity: usize,
+) -> SupplierWaitOrderStateMap {
     fast_hash_map_with_capacity(capacity)
 }
 
-pub(super) async fn q21_lineitem_order_states(
+pub(super) async fn lineitem_order_states(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-    final_orders: Q21FinalOrders,
-) -> Result<Q21OrderStateMap> {
-    if q21_dense_order_state_enabled()
-        && let Some(dense_index) = q21_dense_final_order_index(&final_orders)
+    final_orders: FinalOrderKeys,
+) -> Result<SupplierWaitOrderStateMap> {
+    if dense_order_state_enabled()
+        && let Some(dense_index) = dense_final_order_index(&final_orders)
         && let Some(states) =
-            q21_lineitem_order_states_dense(engine, path.clone(), batch_size, dense_index).await?
+            lineitem_order_states_dense(engine, path.clone(), batch_size, dense_index).await?
     {
         return Ok(states);
     }
@@ -516,18 +521,18 @@ pub(super) async fn q21_lineitem_order_states(
     ]);
     let output_capacity = final_orders.len();
     let final_orders = Arc::new(final_orders);
-    if q21_row_group_map_enabled()
+    if supplier_wait_row_group_map_enabled()
         && let Some(partials) = engine
             .parquet_row_group_map_view(
                 path.clone(),
                 batch_size,
                 projection.clone(),
-                q21_row_group_map_chunk(),
-                q21_order_state_map,
+                supplier_wait_row_group_map_chunk(),
+                supplier_wait_order_state_map,
                 {
                     let final_orders = final_orders.clone();
                     move |view, states| {
-                        q21_lineitem_order_states_projected_view_into(view, &final_orders, states)?;
+                        lineitem_order_states_projected_view_into(view, &final_orders, states)?;
                         Ok(Some(()))
                     }
                 },
@@ -535,66 +540,66 @@ pub(super) async fn q21_lineitem_order_states(
             )
             .await?
     {
-        let mut output = q21_order_state_map_with_capacity(output_capacity);
+        let mut output = supplier_wait_order_state_map_with_capacity(output_capacity);
         for partial in partials {
-            q21_merge_order_states(&mut output, partial);
+            merge_order_states(&mut output, partial);
         }
         return Ok(output);
     }
     let mut stream = engine
         .scan_parquet_batches(path, batch_size, None, projection, None)
         .await?;
-    q21_parallel_batch_order_states(
+    parallel_batch_order_states(
         &mut stream,
-        q21_lineitem_order_state_chunk_size(),
+        lineitem_order_state_chunk_size(),
         output_capacity,
         move |batches| {
-            let mut states = q21_order_state_map();
+            let mut states = supplier_wait_order_state_map();
             for batch in batches {
-                q21_lineitem_order_states_projected_batch_into(batch, &final_orders, &mut states)?;
+                lineitem_order_states_projected_batch_into(batch, &final_orders, &mut states)?;
             }
             Ok(states)
         },
     )
 }
 
-pub(super) fn q21_row_group_map_enabled() -> bool {
-    std::env::var_os("DODAM_Q21_DISABLE_ROW_GROUP_MAP").is_none()
+pub(super) fn supplier_wait_row_group_map_enabled() -> bool {
+    std::env::var_os("DODAM_SupplierWait_DISABLE_ROW_GROUP_MAP").is_none()
 }
 
-pub(super) fn q21_row_group_map_chunk() -> usize {
-    std::env::var("DODAM_Q21_ROW_GROUP_MAP_CHUNK")
+pub(super) fn supplier_wait_row_group_map_chunk() -> usize {
+    std::env::var("DODAM_SupplierWait_ROW_GROUP_MAP_CHUNK")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(2)
 }
 
-pub(super) fn q21_dense_order_state_enabled() -> bool {
-    std::env::var("DODAM_Q21_ENABLE_DENSE_ORDER_STATE")
+pub(super) fn dense_order_state_enabled() -> bool {
+    std::env::var("DODAM_SupplierWait_ENABLE_DENSE_ORDER_STATE")
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
 }
 
-pub(super) fn q21_dense_order_state_max_orders() -> usize {
-    std::env::var("DODAM_Q21_DENSE_STATE_MAX_ORDERS")
+pub(super) fn dense_order_state_max_orders() -> usize {
+    std::env::var("DODAM_SupplierWait_DENSE_STATE_MAX_ORDERS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(2_000_000)
 }
 
-pub(super) struct Q21DenseFinalOrderIndex {
+pub(super) struct DenseFinalOrderIndex {
     index_by_orderkey: Vec<i32>,
     orderkeys: Vec<i64>,
 }
 
-pub(super) fn q21_dense_final_order_index(
-    final_orders: &Q21FinalOrders,
-) -> Option<Arc<Q21DenseFinalOrderIndex>> {
+pub(super) fn dense_final_order_index(
+    final_orders: &FinalOrderKeys,
+) -> Option<Arc<DenseFinalOrderIndex>> {
     let contains = final_orders.dense_contains_slice()?;
     let selected = final_orders.len();
-    if selected > q21_dense_order_state_max_orders() {
+    if selected > dense_order_state_max_orders() {
         return None;
     }
     let mut index_by_orderkey = vec![-1_i32; contains.len()];
@@ -607,18 +612,18 @@ pub(super) fn q21_dense_final_order_index(
         index_by_orderkey[orderkey] = index;
         orderkeys.push(orderkey as i64);
     }
-    Some(Arc::new(Q21DenseFinalOrderIndex {
+    Some(Arc::new(DenseFinalOrderIndex {
         index_by_orderkey,
         orderkeys,
     }))
 }
 
-pub(super) async fn q21_lineitem_order_states_dense(
+pub(super) async fn lineitem_order_states_dense(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-    dense_index: Arc<Q21DenseFinalOrderIndex>,
-) -> Result<Option<Q21OrderStateMap>> {
+    dense_index: Arc<DenseFinalOrderIndex>,
+) -> Result<Option<SupplierWaitOrderStateMap>> {
     let mut stream = engine
         .scan_parquet_batches(
             path,
@@ -633,18 +638,14 @@ pub(super) async fn q21_lineitem_order_states_dense(
             None,
         )
         .await?;
-    q21_parallel_dense_order_states(
-        &mut stream,
-        q21_lineitem_order_state_chunk_size(),
-        dense_index,
-    )
+    parallel_dense_order_states(&mut stream, lineitem_order_state_chunk_size(), dense_index)
 }
 
-pub(super) fn q21_parallel_dense_order_states(
+pub(super) fn parallel_dense_order_states(
     stream: &mut SendableBatchStream,
     chunk_size: usize,
-    dense_index: Arc<Q21DenseFinalOrderIndex>,
-) -> Result<Option<Q21OrderStateMap>> {
+    dense_index: Arc<DenseFinalOrderIndex>,
+) -> Result<Option<SupplierWaitOrderStateMap>> {
     let profile = tpch_profile_enabled();
     let started = profile.then(Instant::now);
     let (sender, receiver) = mpsc::channel();
@@ -662,7 +663,7 @@ pub(super) fn q21_parallel_dense_order_states(
         let task_chunk = std::mem::replace(&mut chunk, Vec::with_capacity(chunk_size));
         pending_chunks += 1;
         rayon::spawn(move || {
-            let _ = sender.send(q21_dense_order_states_chunk(task_chunk, dense_index));
+            let _ = sender.send(dense_order_states_chunk(task_chunk, dense_index));
         });
     }
     if !chunk.is_empty() {
@@ -670,7 +671,7 @@ pub(super) fn q21_parallel_dense_order_states(
         let dense_index = dense_index.clone();
         pending_chunks += 1;
         rayon::spawn(move || {
-            let _ = sender.send(q21_dense_order_states_chunk(chunk, dense_index));
+            let _ = sender.send(dense_order_states_chunk(chunk, dense_index));
         });
     }
     let stream_ms = stream_started
@@ -678,11 +679,11 @@ pub(super) fn q21_parallel_dense_order_states(
         .unwrap_or_default();
     drop(sender);
     let merge_started = profile.then(Instant::now);
-    let mut output = Q21DenseOrderStates::new(dense_index.orderkeys.len());
+    let mut output = DenseOrderStates::new(dense_index.orderkeys.len());
     for _ in 0..pending_chunks {
-        let partial = receiver
-            .recv()
-            .map_err(|_| DodamError::UnsupportedSql("Q21 dense worker stopped".to_string()))??;
+        let partial = receiver.recv().map_err(|_| {
+            DodamError::UnsupportedSql("SupplierWait dense worker stopped".to_string())
+        })??;
         output.merge(partial);
     }
     let states = output.into_map(&dense_index.orderkeys);
@@ -691,7 +692,7 @@ pub(super) fn q21_parallel_dense_order_states(
             .map(|started| started.elapsed().as_secs_f64() * 1000.0)
             .unwrap_or_default();
         eprintln!(
-            "[dodam:tpch-profile] Q21 dense lineitem order states: total={:.3} ms stream_read={:.3} ms worker_wait_merge={:.3} ms chunks={pending_chunks}",
+            "[dodam:tpch-profile] SupplierWait dense lineitem order states: total={:.3} ms stream_read={:.3} ms worker_wait_merge={:.3} ms chunks={pending_chunks}",
             started.elapsed().as_secs_f64() * 1000.0,
             stream_ms,
             merge_ms
@@ -700,28 +701,28 @@ pub(super) fn q21_parallel_dense_order_states(
     Ok(Some(states))
 }
 
-pub(super) fn q21_dense_order_states_chunk(
+pub(super) fn dense_order_states_chunk(
     batches: Vec<RecordBatch>,
-    dense_index: Arc<Q21DenseFinalOrderIndex>,
-) -> Result<Q21DenseOrderStates> {
-    let mut states = Q21DenseOrderStates::new(dense_index.orderkeys.len());
+    dense_index: Arc<DenseFinalOrderIndex>,
+) -> Result<DenseOrderStates> {
+    let mut states = DenseOrderStates::new(dense_index.orderkeys.len());
     for batch in batches {
-        if !q21_dense_order_states_batch_into(&batch, &dense_index, &mut states)? {
+        if !dense_order_states_batch_into(&batch, &dense_index, &mut states)? {
             return Err(DodamError::UnsupportedSql(
-                "Q21 dense order-state path requires typed lineitem columns".to_string(),
+                "SupplierWait dense order-state path requires typed lineitem columns".to_string(),
             ));
         }
     }
     Ok(states)
 }
 
-pub(super) struct Q21DenseOrderStates {
+pub(super) struct DenseOrderStates {
     positions: Vec<i32>,
-    states: Vec<Q21OrderState>,
+    states: Vec<SupplierWaitOrderState>,
     touched: Vec<usize>,
 }
 
-impl Q21DenseOrderStates {
+impl DenseOrderStates {
     fn new(len: usize) -> Self {
         Self {
             positions: vec![-1; len],
@@ -730,12 +731,13 @@ impl Q21DenseOrderStates {
         }
     }
 
-    fn state_mut(&mut self, index: usize) -> &mut Q21OrderState {
+    fn state_mut(&mut self, index: usize) -> &mut SupplierWaitOrderState {
         let position = self.positions[index];
         let position = if position < 0 {
             let position = self.states.len();
-            self.positions[index] = i32::try_from(position).expect("Q21 state index overflow");
-            self.states.push(Q21OrderState::default());
+            self.positions[index] =
+                i32::try_from(position).expect("SupplierWait state index overflow");
+            self.states.push(SupplierWaitOrderState::default());
             self.touched.push(index);
             position
         } else {
@@ -752,8 +754,8 @@ impl Q21DenseOrderStates {
         }
     }
 
-    fn into_map(self, orderkeys: &[i64]) -> Q21OrderStateMap {
-        let mut output = q21_order_state_map_with_capacity(self.touched.len());
+    fn into_map(self, orderkeys: &[i64]) -> SupplierWaitOrderStateMap {
+        let mut output = supplier_wait_order_state_map_with_capacity(self.touched.len());
         for index in self.touched {
             let position = self.positions[index];
             debug_assert!(position >= 0);
@@ -763,10 +765,10 @@ impl Q21DenseOrderStates {
     }
 }
 
-pub(super) fn q21_dense_order_states_batch_into(
+pub(super) fn dense_order_states_batch_into(
     batch: &RecordBatch,
-    dense_index: &Q21DenseFinalOrderIndex,
-    states: &mut Q21DenseOrderStates,
+    dense_index: &DenseFinalOrderIndex,
+    states: &mut DenseOrderStates,
 ) -> Result<bool> {
     let orderkeys = batch_column(batch, "l_orderkey")?;
     let suppkeys = batch_column(batch, "l_suppkey")?;
@@ -790,7 +792,7 @@ pub(super) fn q21_dense_order_states_batch_into(
         let receipts = receipt.values().as_ref();
         let commits = commit.values().as_ref();
         for row in 0..orderkeys.len() {
-            let Some(index) = q21_dense_order_index(dense_index, orderkeys[row]) else {
+            let Some(index) = dense_order_index(dense_index, orderkeys[row]) else {
                 continue;
             };
             let state = states.state_mut(index);
@@ -806,7 +808,7 @@ pub(super) fn q21_dense_order_states_batch_into(
         if orderkeys.is_null(row) || suppkeys.is_null(row) {
             continue;
         }
-        let Some(index) = q21_dense_order_index(dense_index, orderkeys.value(row)) else {
+        let Some(index) = dense_order_index(dense_index, orderkeys.value(row)) else {
             continue;
         };
         let state = states.state_mut(index);
@@ -822,8 +824,8 @@ pub(super) fn q21_dense_order_states_batch_into(
     Ok(true)
 }
 
-pub(super) fn q21_dense_order_index(
-    dense_index: &Q21DenseFinalOrderIndex,
+pub(super) fn dense_order_index(
+    dense_index: &DenseFinalOrderIndex,
     orderkey: i64,
 ) -> Option<usize> {
     let index = usize::try_from(orderkey).ok()?;
@@ -831,14 +833,14 @@ pub(super) fn q21_dense_order_index(
     usize::try_from(compact).ok()
 }
 
-pub(super) fn q21_parallel_batch_order_states<Map>(
+pub(super) fn parallel_batch_order_states<Map>(
     stream: &mut SendableBatchStream,
     chunk_size: usize,
     output_capacity: usize,
     map: Map,
-) -> Result<Q21OrderStateMap>
+) -> Result<SupplierWaitOrderStateMap>
 where
-    Map: Fn(Vec<RecordBatch>) -> Result<Q21OrderStateMap> + Send + Sync + Clone + 'static,
+    Map: Fn(Vec<RecordBatch>) -> Result<SupplierWaitOrderStateMap> + Send + Sync + Clone + 'static,
 {
     let profile = tpch_profile_enabled();
     let started = profile.then(Instant::now);
@@ -875,20 +877,18 @@ where
     let merge_started = profile.then(Instant::now);
     let mut partials = Vec::with_capacity(pending_chunks);
     for _ in 0..pending_chunks {
-        partials.push(
-            receiver
-                .recv()
-                .map_err(|_| DodamError::UnsupportedSql("Q21 worker stopped".to_string()))??,
-        );
+        partials.push(receiver.recv().map_err(|_| {
+            DodamError::UnsupportedSql("SupplierWait worker stopped".to_string())
+        })??);
     }
-    let output = if q21_parallel_merge_enabled() {
+    let output = if supplier_wait_parallel_merge_enabled() {
         partials
             .into_par_iter()
-            .reduce(q21_order_state_map, q21_merge_order_states_owned)
+            .reduce(supplier_wait_order_state_map, merge_order_states_owned)
     } else {
-        let mut output = q21_order_state_map_with_capacity(output_capacity);
+        let mut output = supplier_wait_order_state_map_with_capacity(output_capacity);
         for partial in partials {
-            q21_merge_order_states(&mut output, partial);
+            merge_order_states(&mut output, partial);
         }
         output
     };
@@ -897,7 +897,7 @@ where
             .map(|started| started.elapsed().as_secs_f64() * 1000.0)
             .unwrap_or_default();
         eprintln!(
-            "[dodam:tpch-profile] Q21 lineitem order states: total={:.3} ms stream_read={:.3} ms worker_wait_merge={:.3} ms chunks={pending_chunks}",
+            "[dodam:tpch-profile] SupplierWait lineitem order states: total={:.3} ms stream_read={:.3} ms worker_wait_merge={:.3} ms chunks={pending_chunks}",
             started.elapsed().as_secs_f64() * 1000.0,
             stream_ms,
             merge_ms
@@ -906,37 +906,31 @@ where
     Ok(output)
 }
 
-pub(super) fn q21_parallel_merge_enabled() -> bool {
-    std::env::var("DODAM_Q21_ENABLE_PARALLEL_MERGE")
+pub(super) fn supplier_wait_parallel_merge_enabled() -> bool {
+    std::env::var("DODAM_SupplierWait_ENABLE_PARALLEL_MERGE")
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
 }
 
-pub(super) fn q21_lineitem_order_state_chunk_size() -> usize {
-    std::env::var("DODAM_Q21_CHUNK_SIZE")
+pub(super) fn lineitem_order_state_chunk_size() -> usize {
+    std::env::var("DODAM_SupplierWait_CHUNK_SIZE")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(48)
 }
 
-pub(super) fn q21_lineitem_order_states_batch_into(
+pub(super) fn lineitem_order_states_batch_into(
     batch: RecordBatch,
-    final_orders: &Q21FinalOrders,
-    states: &mut Q21OrderStateMap,
+    final_orders: &FinalOrderKeys,
+    states: &mut SupplierWaitOrderStateMap,
 ) -> Result<()> {
     let orderkeys = batch_column(&batch, "l_orderkey")?;
     let suppkeys = batch_column(&batch, "l_suppkey")?;
     let receipt = batch_column(&batch, "l_receiptdate")?;
     let commit = batch_column(&batch, "l_commitdate")?;
-    if q21_lineitem_order_states_typed_into(
-        orderkeys,
-        suppkeys,
-        receipt,
-        commit,
-        final_orders,
-        states,
-    ) {
+    if lineitem_order_states_typed_into(orderkeys, suppkeys, receipt, commit, final_orders, states)
+    {
         return Ok(());
     }
     let dense_final_orders = final_orders.dense_contains_slice();
@@ -947,7 +941,7 @@ pub(super) fn q21_lineitem_order_states_batch_into(
         ) else {
             continue;
         };
-        if !q21_final_order_contains(final_orders, dense_final_orders, orderkey) {
+        if !final_order_contains(final_orders, dense_final_orders, orderkey) {
             continue;
         }
         let state = states.entry(orderkey).or_default();
@@ -964,13 +958,13 @@ pub(super) fn q21_lineitem_order_states_batch_into(
     Ok(())
 }
 
-pub(super) fn q21_lineitem_order_states_projected_batch_into(
+pub(super) fn lineitem_order_states_projected_batch_into(
     batch: RecordBatch,
-    final_orders: &Q21FinalOrders,
-    states: &mut Q21OrderStateMap,
+    final_orders: &FinalOrderKeys,
+    states: &mut SupplierWaitOrderStateMap,
 ) -> Result<()> {
     if batch.num_columns() == 4
-        && q21_lineitem_order_states_typed_into(
+        && lineitem_order_states_typed_into(
             batch.column(0),
             batch.column(1),
             batch.column(2),
@@ -981,13 +975,13 @@ pub(super) fn q21_lineitem_order_states_projected_batch_into(
     {
         return Ok(());
     }
-    q21_lineitem_order_states_batch_into(batch, final_orders, states)
+    lineitem_order_states_batch_into(batch, final_orders, states)
 }
 
-pub(super) fn q21_lineitem_order_states_projected_view_into(
+pub(super) fn lineitem_order_states_projected_view_into(
     view: BatchView<'_>,
-    final_orders: &Q21FinalOrders,
-    states: &mut Q21OrderStateMap,
+    final_orders: &FinalOrderKeys,
+    states: &mut SupplierWaitOrderStateMap,
 ) -> Result<()> {
     if view.num_columns() == 4
         && let (Some(orderkeys), Some(suppkeys), Some(receipt), Some(commit)) = (
@@ -997,7 +991,7 @@ pub(super) fn q21_lineitem_order_states_projected_view_into(
             view.date32_vector(3),
         )
     {
-        q21_lineitem_order_states_vector_typed_into(
+        lineitem_order_states_vector_typed_into(
             orderkeys,
             suppkeys,
             receipt,
@@ -1010,16 +1004,16 @@ pub(super) fn q21_lineitem_order_states_projected_view_into(
     let Some(batch) = view.try_record_batch() else {
         return Ok(());
     };
-    q21_lineitem_order_states_batch_into(batch.clone(), final_orders, states)
+    lineitem_order_states_batch_into(batch.clone(), final_orders, states)
 }
 
-pub(super) fn q21_lineitem_order_states_typed_into(
+pub(super) fn lineitem_order_states_typed_into(
     orderkeys: &ArrayRef,
     suppkeys: &ArrayRef,
     receipt: &ArrayRef,
     commit: &ArrayRef,
-    final_orders: &Q21FinalOrders,
-    states: &mut Q21OrderStateMap,
+    final_orders: &FinalOrderKeys,
+    states: &mut SupplierWaitOrderStateMap,
 ) -> bool {
     let (Some(orderkeys), Some(suppkeys), Some(receipt), Some(commit)) = (
         orderkeys.as_any().downcast_ref::<Int64Array>(),
@@ -1041,19 +1035,19 @@ pub(super) fn q21_lineitem_order_states_typed_into(
         let commits = commit.values().as_ref();
         let mut current_orderkey = None::<i64>;
         let mut current_order_selected = false;
-        let mut current_state = Q21OrderState::default();
+        let mut current_state = SupplierWaitOrderState::default();
         for row in 0..orderkeys.len() {
             let orderkey = orderkeys[row];
             if current_orderkey.is_some_and(|current| current != orderkey) {
                 if current_order_selected {
-                    q21_flush_run_state(states, current_orderkey, &mut current_state);
+                    flush_run_state(states, current_orderkey, &mut current_state);
                 }
                 current_order_selected =
-                    q21_final_order_contains(final_orders, dense_final_orders, orderkey);
+                    final_order_contains(final_orders, dense_final_orders, orderkey);
                 current_orderkey = Some(orderkey);
             } else if current_orderkey.is_none() {
                 current_order_selected =
-                    q21_final_order_contains(final_orders, dense_final_orders, orderkey);
+                    final_order_contains(final_orders, dense_final_orders, orderkey);
                 current_orderkey = Some(orderkey);
             }
             if !current_order_selected {
@@ -1066,13 +1060,13 @@ pub(super) fn q21_lineitem_order_states_typed_into(
             }
         }
         if current_order_selected {
-            q21_flush_run_state(states, current_orderkey, &mut current_state);
+            flush_run_state(states, current_orderkey, &mut current_state);
         }
         return true;
     }
     let mut current_orderkey = None::<i64>;
     let mut current_order_selected = false;
-    let mut current_state = Q21OrderState::default();
+    let mut current_state = SupplierWaitOrderState::default();
     for row in 0..orderkeys.len() {
         if orderkeys.is_null(row) || suppkeys.is_null(row) {
             continue;
@@ -1080,14 +1074,14 @@ pub(super) fn q21_lineitem_order_states_typed_into(
         let orderkey = orderkeys.value(row);
         if current_orderkey.is_some_and(|current| current != orderkey) {
             if current_order_selected {
-                q21_flush_run_state(states, current_orderkey, &mut current_state);
+                flush_run_state(states, current_orderkey, &mut current_state);
             }
             current_order_selected =
-                q21_final_order_contains(final_orders, dense_final_orders, orderkey);
+                final_order_contains(final_orders, dense_final_orders, orderkey);
             current_orderkey = Some(orderkey);
         } else if current_orderkey.is_none() {
             current_order_selected =
-                q21_final_order_contains(final_orders, dense_final_orders, orderkey);
+                final_order_contains(final_orders, dense_final_orders, orderkey);
             current_orderkey = Some(orderkey);
         }
         if !current_order_selected {
@@ -1103,18 +1097,18 @@ pub(super) fn q21_lineitem_order_states_typed_into(
         }
     }
     if current_order_selected {
-        q21_flush_run_state(states, current_orderkey, &mut current_state);
+        flush_run_state(states, current_orderkey, &mut current_state);
     }
     true
 }
 
-pub(super) fn q21_lineitem_order_states_vector_typed_into(
+pub(super) fn lineitem_order_states_vector_typed_into(
     orderkeys: I64VectorView<'_>,
     suppkeys: I64VectorView<'_>,
     receipt: Date32VectorView<'_>,
     commit: Date32VectorView<'_>,
-    final_orders: &Q21FinalOrders,
-    states: &mut Q21OrderStateMap,
+    final_orders: &FinalOrderKeys,
+    states: &mut SupplierWaitOrderStateMap,
 ) {
     let dense_final_orders = final_orders.dense_contains_slice();
     if let (Some(orderkey_values), Some(suppkey_values), Some(receipts), Some(commits)) = (
@@ -1125,19 +1119,19 @@ pub(super) fn q21_lineitem_order_states_vector_typed_into(
     ) {
         let mut current_orderkey = None::<i64>;
         let mut current_order_selected = false;
-        let mut current_state = Q21OrderState::default();
+        let mut current_state = SupplierWaitOrderState::default();
         for row in 0..orderkey_values.len() {
             let orderkey = orderkey_values[row];
             if current_orderkey.is_some_and(|current| current != orderkey) {
                 if current_order_selected {
-                    q21_flush_run_state(states, current_orderkey, &mut current_state);
+                    flush_run_state(states, current_orderkey, &mut current_state);
                 }
                 current_order_selected =
-                    q21_final_order_contains(final_orders, dense_final_orders, orderkey);
+                    final_order_contains(final_orders, dense_final_orders, orderkey);
                 current_orderkey = Some(orderkey);
             } else if current_orderkey.is_none() {
                 current_order_selected =
-                    q21_final_order_contains(final_orders, dense_final_orders, orderkey);
+                    final_order_contains(final_orders, dense_final_orders, orderkey);
                 current_orderkey = Some(orderkey);
             }
             if !current_order_selected {
@@ -1150,13 +1144,13 @@ pub(super) fn q21_lineitem_order_states_vector_typed_into(
             }
         }
         if current_order_selected {
-            q21_flush_run_state(states, current_orderkey, &mut current_state);
+            flush_run_state(states, current_orderkey, &mut current_state);
         }
         return;
     }
     let mut current_orderkey = None::<i64>;
     let mut current_order_selected = false;
-    let mut current_state = Q21OrderState::default();
+    let mut current_state = SupplierWaitOrderState::default();
     for row in 0..orderkeys.len() {
         if orderkeys.is_null(row) || suppkeys.is_null(row) {
             continue;
@@ -1164,14 +1158,14 @@ pub(super) fn q21_lineitem_order_states_vector_typed_into(
         let orderkey = orderkeys.value(row);
         if current_orderkey.is_some_and(|current| current != orderkey) {
             if current_order_selected {
-                q21_flush_run_state(states, current_orderkey, &mut current_state);
+                flush_run_state(states, current_orderkey, &mut current_state);
             }
             current_order_selected =
-                q21_final_order_contains(final_orders, dense_final_orders, orderkey);
+                final_order_contains(final_orders, dense_final_orders, orderkey);
             current_orderkey = Some(orderkey);
         } else if current_orderkey.is_none() {
             current_order_selected =
-                q21_final_order_contains(final_orders, dense_final_orders, orderkey);
+                final_order_contains(final_orders, dense_final_orders, orderkey);
             current_orderkey = Some(orderkey);
         }
         if !current_order_selected {
@@ -1187,12 +1181,12 @@ pub(super) fn q21_lineitem_order_states_vector_typed_into(
         }
     }
     if current_order_selected {
-        q21_flush_run_state(states, current_orderkey, &mut current_state);
+        flush_run_state(states, current_orderkey, &mut current_state);
     }
 }
 
-pub(super) fn q21_final_order_contains(
-    final_orders: &Q21FinalOrders,
+pub(super) fn final_order_contains(
+    final_orders: &FinalOrderKeys,
     dense_final_orders: Option<&[bool]>,
     orderkey: i64,
 ) -> bool {
@@ -1206,11 +1200,11 @@ pub(super) fn q21_final_order_contains(
     final_orders.contains(orderkey)
 }
 
-pub(super) async fn q21_lineitem_supplier_counts_ordered(
+pub(super) async fn lineitem_supplier_wait_counts_ordered(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-    final_orders: &Q21FinalOrders,
+    final_orders: &FinalOrderKeys,
     suppliers: &HashMap<i64, String>,
 ) -> Result<Option<HashMap<i64, u64>>> {
     let projection = Projection::Columns(vec![
@@ -1226,13 +1220,13 @@ pub(super) async fn q21_lineitem_supplier_counts_ordered(
             path,
             batch_size,
             projection,
-            q21_row_group_map_chunk(),
-            Q21OrderedLineitemChunkState::default,
+            supplier_wait_row_group_map_chunk(),
+            OrderedLineitemChunkState::default,
             {
                 let final_orders = final_orders.clone();
                 let suppliers = suppliers.clone();
                 move |view, state| {
-                    q21_ordered_lineitem_chunk_view(view, &final_orders, suppliers.as_ref(), state)
+                    ordered_lineitem_chunk_view(view, &final_orders, suppliers.as_ref(), state)
                 }
             },
             |state| Ok(Some(state)),
@@ -1241,34 +1235,34 @@ pub(super) async fn q21_lineitem_supplier_counts_ordered(
     else {
         return Ok(None);
     };
-    Ok(Some(q21_merge_ordered_lineitem_chunks(
+    Ok(Some(merge_ordered_lineitem_chunks(
         chunks,
         suppliers.as_ref(),
     )))
 }
 
 #[derive(Default)]
-pub(super) struct Q21OrderedLineitemChunkState {
+pub(super) struct OrderedLineitemChunkState {
     counts: HashMap<i64, u64>,
     current_orderkey: Option<i64>,
     current_selected: bool,
-    current_state: Q21OrderState,
-    first: Option<OrderedRowGroupBoundary<i64, Q21SelectedOrderState>>,
-    last: Option<OrderedRowGroupBoundary<i64, Q21SelectedOrderState>>,
+    current_state: SupplierWaitOrderState,
+    first: Option<OrderedRowGroupBoundary<i64, SelectedOrderState>>,
+    last: Option<OrderedRowGroupBoundary<i64, SelectedOrderState>>,
     order_count: usize,
 }
 
 #[derive(Clone, Copy, Default)]
-pub(super) struct Q21SelectedOrderState {
+pub(super) struct SelectedOrderState {
     selected: bool,
-    state: Q21OrderState,
+    state: SupplierWaitOrderState,
 }
 
-pub(super) fn q21_ordered_lineitem_chunk_view(
+pub(super) fn ordered_lineitem_chunk_view(
     view: BatchView<'_>,
-    final_orders: &Q21FinalOrders,
+    final_orders: &FinalOrderKeys,
     suppliers: &HashMap<i64, String>,
-    state: &mut Q21OrderedLineitemChunkState,
+    state: &mut OrderedLineitemChunkState,
 ) -> Result<Option<()>> {
     if view.num_columns() == 4
         && let (Some(orderkeys), Some(suppkeys), Some(receipt), Some(commit)) = (
@@ -1278,7 +1272,7 @@ pub(super) fn q21_ordered_lineitem_chunk_view(
             view.date32_vector(3),
         )
     {
-        return q21_ordered_lineitem_chunk_vector_typed(
+        return ordered_lineitem_chunk_vector_typed(
             orderkeys,
             suppkeys,
             receipt,
@@ -1291,14 +1285,14 @@ pub(super) fn q21_ordered_lineitem_chunk_view(
     let Some(batch) = view.try_record_batch() else {
         return Ok(None);
     };
-    q21_ordered_lineitem_chunk_batch(batch, final_orders, suppliers, state)
+    ordered_lineitem_chunk_batch(batch, final_orders, suppliers, state)
 }
 
-pub(super) fn q21_ordered_lineitem_chunk_batch(
+pub(super) fn ordered_lineitem_chunk_batch(
     batch: &RecordBatch,
-    final_orders: &Q21FinalOrders,
+    final_orders: &FinalOrderKeys,
     suppliers: &HashMap<i64, String>,
-    state: &mut Q21OrderedLineitemChunkState,
+    state: &mut OrderedLineitemChunkState,
 ) -> Result<Option<()>> {
     if batch.num_columns() == 4
         && let (Some(orderkeys), Some(suppkeys), Some(receipt), Some(commit)) = (
@@ -1308,7 +1302,7 @@ pub(super) fn q21_ordered_lineitem_chunk_batch(
             batch.column(3).as_any().downcast_ref::<Date32Array>(),
         )
     {
-        return q21_ordered_lineitem_chunk_typed_batch(
+        return ordered_lineitem_chunk_typed_batch(
             orderkeys,
             suppkeys,
             receipt,
@@ -1321,14 +1315,14 @@ pub(super) fn q21_ordered_lineitem_chunk_batch(
     Ok(None)
 }
 
-pub(super) fn q21_ordered_lineitem_chunk_typed_batch(
+pub(super) fn ordered_lineitem_chunk_typed_batch(
     orderkeys: &Int64Array,
     suppkeys: &Int64Array,
     receipt: &Date32Array,
     commit: &Date32Array,
-    final_orders: &Q21FinalOrders,
+    final_orders: &FinalOrderKeys,
     suppliers: &HashMap<i64, String>,
-    chunk: &mut Q21OrderedLineitemChunkState,
+    chunk: &mut OrderedLineitemChunkState,
 ) -> Result<Option<()>> {
     let dense_final_orders = final_orders.dense_contains_slice();
     for row in 0..orderkeys.len() {
@@ -1341,17 +1335,17 @@ pub(super) fn q21_ordered_lineitem_chunk_typed_batch(
                 return Ok(None);
             }
             if orderkey != current {
-                q21_ordered_chunk_finish_current(chunk, suppliers);
+                ordered_chunk_finish_current(chunk, suppliers);
                 chunk.current_orderkey = Some(orderkey);
                 chunk.current_selected =
-                    q21_final_order_contains(final_orders, dense_final_orders, orderkey);
-                chunk.current_state = Q21OrderState::default();
+                    final_order_contains(final_orders, dense_final_orders, orderkey);
+                chunk.current_state = SupplierWaitOrderState::default();
                 chunk.order_count += 1;
             }
         } else {
             chunk.current_orderkey = Some(orderkey);
             chunk.current_selected =
-                q21_final_order_contains(final_orders, dense_final_orders, orderkey);
+                final_order_contains(final_orders, dense_final_orders, orderkey);
             chunk.order_count = 1;
         }
         if !chunk.current_selected {
@@ -1366,14 +1360,14 @@ pub(super) fn q21_ordered_lineitem_chunk_typed_batch(
     Ok(Some(()))
 }
 
-pub(super) fn q21_ordered_lineitem_chunk_vector_typed(
+pub(super) fn ordered_lineitem_chunk_vector_typed(
     orderkeys: I64VectorView<'_>,
     suppkeys: I64VectorView<'_>,
     receipt: Date32VectorView<'_>,
     commit: Date32VectorView<'_>,
-    final_orders: &Q21FinalOrders,
+    final_orders: &FinalOrderKeys,
     suppliers: &HashMap<i64, String>,
-    chunk: &mut Q21OrderedLineitemChunkState,
+    chunk: &mut OrderedLineitemChunkState,
 ) -> Result<Option<()>> {
     let dense_final_orders = final_orders.dense_contains_slice();
     if let (Some(orderkey_values), Some(suppkey_values), Some(receipts), Some(commits)) = (
@@ -1389,17 +1383,17 @@ pub(super) fn q21_ordered_lineitem_chunk_vector_typed(
                     return Ok(None);
                 }
                 if orderkey != current {
-                    q21_ordered_chunk_finish_current(chunk, suppliers);
+                    ordered_chunk_finish_current(chunk, suppliers);
                     chunk.current_orderkey = Some(orderkey);
                     chunk.current_selected =
-                        q21_final_order_contains(final_orders, dense_final_orders, orderkey);
-                    chunk.current_state = Q21OrderState::default();
+                        final_order_contains(final_orders, dense_final_orders, orderkey);
+                    chunk.current_state = SupplierWaitOrderState::default();
                     chunk.order_count += 1;
                 }
             } else {
                 chunk.current_orderkey = Some(orderkey);
                 chunk.current_selected =
-                    q21_final_order_contains(final_orders, dense_final_orders, orderkey);
+                    final_order_contains(final_orders, dense_final_orders, orderkey);
                 chunk.order_count = 1;
             }
             if !chunk.current_selected {
@@ -1423,17 +1417,17 @@ pub(super) fn q21_ordered_lineitem_chunk_vector_typed(
                 return Ok(None);
             }
             if orderkey != current {
-                q21_ordered_chunk_finish_current(chunk, suppliers);
+                ordered_chunk_finish_current(chunk, suppliers);
                 chunk.current_orderkey = Some(orderkey);
                 chunk.current_selected =
-                    q21_final_order_contains(final_orders, dense_final_orders, orderkey);
-                chunk.current_state = Q21OrderState::default();
+                    final_order_contains(final_orders, dense_final_orders, orderkey);
+                chunk.current_state = SupplierWaitOrderState::default();
                 chunk.order_count += 1;
             }
         } else {
             chunk.current_orderkey = Some(orderkey);
             chunk.current_selected =
-                q21_final_order_contains(final_orders, dense_final_orders, orderkey);
+                final_order_contains(final_orders, dense_final_orders, orderkey);
             chunk.order_count = 1;
         }
         if !chunk.current_selected {
@@ -1448,8 +1442,8 @@ pub(super) fn q21_ordered_lineitem_chunk_vector_typed(
     Ok(Some(()))
 }
 
-pub(super) fn q21_ordered_chunk_finish_current(
-    chunk: &mut Q21OrderedLineitemChunkState,
+pub(super) fn ordered_chunk_finish_current(
+    chunk: &mut OrderedLineitemChunkState,
     suppliers: &HashMap<i64, String>,
 ) {
     let Some(orderkey) = chunk.current_orderkey else {
@@ -1457,7 +1451,7 @@ pub(super) fn q21_ordered_chunk_finish_current(
     };
     let boundary = OrderedRowGroupBoundary {
         key: orderkey,
-        state: Q21SelectedOrderState {
+        state: SelectedOrderState {
             selected: chunk.current_selected,
             state: chunk.current_state,
         },
@@ -1465,12 +1459,12 @@ pub(super) fn q21_ordered_chunk_finish_current(
     if chunk.order_count == 1 {
         chunk.first = Some(boundary);
     } else if boundary.state.selected {
-        q21_count_qualifying_order(&mut chunk.counts, suppliers, &boundary.state.state);
+        count_qualifying_supplier_wait_order(&mut chunk.counts, suppliers, &boundary.state.state);
     }
 }
 
-pub(super) fn q21_merge_ordered_lineitem_chunks(
-    mut chunks: Vec<Q21OrderedLineitemChunkState>,
+pub(super) fn merge_ordered_lineitem_chunks(
+    mut chunks: Vec<OrderedLineitemChunkState>,
     suppliers: &HashMap<i64, String>,
 ) -> HashMap<i64, u64> {
     let mut ordered_chunks = Vec::with_capacity(chunks.len());
@@ -1478,7 +1472,7 @@ pub(super) fn q21_merge_ordered_lineitem_chunks(
         if let Some(orderkey) = chunk.current_orderkey {
             let boundary = OrderedRowGroupBoundary {
                 key: orderkey,
-                state: Q21SelectedOrderState {
+                state: SelectedOrderState {
                     selected: chunk.current_selected,
                     state: chunk.current_state,
                 },
@@ -1510,17 +1504,17 @@ pub(super) fn q21_merge_ordered_lineitem_chunks(
         },
         |counts, boundary| {
             if boundary.state.selected {
-                q21_count_qualifying_order(counts, suppliers, &boundary.state.state);
+                count_qualifying_supplier_wait_order(counts, suppliers, &boundary.state.state);
             }
         },
     );
     counts
 }
 
-pub(super) fn q21_count_qualifying_order(
+pub(super) fn count_qualifying_supplier_wait_order(
     counts: &mut HashMap<i64, u64>,
     suppliers: &HashMap<i64, String>,
-    state: &Q21OrderState,
+    state: &SupplierWaitOrderState,
 ) {
     if !state.has_multiple_suppliers() || !state.has_single_late_supplier() {
         return;
@@ -1532,10 +1526,10 @@ pub(super) fn q21_count_qualifying_order(
     *counts.entry(suppkey).or_insert(0) += u64::from(state.late_row_count);
 }
 
-pub(super) fn q21_flush_run_state(
-    states: &mut Q21OrderStateMap,
+pub(super) fn flush_run_state(
+    states: &mut SupplierWaitOrderStateMap,
     orderkey: Option<i64>,
-    state: &mut Q21OrderState,
+    state: &mut SupplierWaitOrderState,
 ) {
     let Some(orderkey) = orderkey else {
         return;
@@ -1546,32 +1540,32 @@ pub(super) fn q21_flush_run_state(
         .merge(std::mem::take(state));
 }
 
-pub(super) fn q21_merge_order_states(
-    states: &mut Q21OrderStateMap,
-    batch_states: Q21OrderStateMap,
+pub(super) fn merge_order_states(
+    states: &mut SupplierWaitOrderStateMap,
+    batch_states: SupplierWaitOrderStateMap,
 ) {
     for (orderkey, batch_state) in batch_states {
         states.entry(orderkey).or_default().merge(batch_state);
     }
 }
 
-pub(super) fn q21_merge_order_states_owned(
-    mut left: Q21OrderStateMap,
-    mut right: Q21OrderStateMap,
-) -> Q21OrderStateMap {
+pub(super) fn merge_order_states_owned(
+    mut left: SupplierWaitOrderStateMap,
+    mut right: SupplierWaitOrderStateMap,
+) -> SupplierWaitOrderStateMap {
     if left.len() < right.len() {
         std::mem::swap(&mut left, &mut right);
     }
-    q21_merge_order_states(&mut left, right);
+    merge_order_states(&mut left, right);
     left
 }
 
-pub(super) struct Q21Row {
+pub(super) struct SupplierWaitRow {
     s_name: String,
     count: u64,
 }
 
-pub(super) fn q21_output(rows: Vec<Q21Row>) -> Result<QueryOutput> {
+pub(super) fn supplier_wait_output(rows: Vec<SupplierWaitRow>) -> Result<QueryOutput> {
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
             Field::new("s_name", DataType::Utf8, false),
