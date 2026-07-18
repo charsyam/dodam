@@ -59,6 +59,14 @@ pub(crate) struct DirectI32I64DecimalI32SelectedBatch<'a> {
     pub(crate) predicate_applied: bool,
 }
 
+pub(crate) struct DirectI64DateDecimalDecimalSelectedBatch<'a> {
+    pub(crate) keys: &'a [i64],
+    pub(crate) dates: &'a [i32],
+    pub(crate) left_decimals: &'a [i64],
+    pub(crate) right_decimals: &'a [i64],
+    pub(crate) predicate_applied: bool,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct SelectedI64ChunkRange {
     pub(crate) selected_offset: usize,
@@ -7885,6 +7893,35 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn scan_parquet_i64_date_decimal_decimal_selected_typed_with_store<F>(
+    path: &Path,
+    batch_size: usize,
+    row_groups: &[usize],
+    columns: [&str; 4],
+    date_min: Option<i32>,
+    date_max: Option<i32>,
+    file_cache: Arc<ParquetFileCache>,
+    store: &dyn ObjectStore,
+    consume: F,
+) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
+where
+    F: for<'a> FnMut(DirectI64DateDecimalDecimalSelectedBatch<'a>) -> Result<()>,
+{
+    if file_cache.enabled() {
+        let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
+        let reader = SerializedFileReader::new(reader)?;
+        return scan_parquet_i64_date_decimal_decimal_selected_reader(
+            reader, batch_size, row_groups, columns, date_min, date_max, consume,
+        );
+    }
+    let file = store.open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    scan_parquet_i64_date_decimal_decimal_selected_reader(
+        reader, batch_size, row_groups, columns, date_min, date_max, consume,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 pub(crate) fn scan_parquet_i32_i32_dictionary_i64_decimal_selected_with_store<F>(
     path: &Path,
@@ -9075,6 +9112,304 @@ where
                 sums: &selected_sums,
                 decimals: decimal_view,
                 dates: date_view,
+                predicate_applied: use_selected_payload,
+            })?;
+            metrics.add_consume_nanos(elapsed_nanos(consume_started));
+        }
+    }
+    Ok(Some(metrics))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_parquet_i64_date_decimal_decimal_selected_reader<R, F>(
+    reader: SerializedFileReader<R>,
+    batch_size: usize,
+    row_groups: &[usize],
+    columns: [&str; 4],
+    date_min: Option<i32>,
+    date_max: Option<i32>,
+    mut consume: F,
+) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
+where
+    R: ChunkReader + 'static,
+    F: for<'a> FnMut(DirectI64DateDecimalDecimalSelectedBatch<'a>) -> Result<()>,
+{
+    let trace = std::env::var("DODAM_DIRECT_SELECTION_TRACE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
+    let Some(column_indices) = parquet_column_indices_by_name(&reader, &columns) else {
+        if trace {
+            eprintln!(
+                "[dodam:direct-selected] i64-date-decimal-decimal reject: missing columns {columns:?}"
+            );
+        }
+        return Ok(None);
+    };
+    let [
+        key_column,
+        date_column,
+        left_decimal_column,
+        right_decimal_column,
+    ] = <[usize; 4]>::try_from(column_indices).map_err(|_| {
+        DodamError::UnsupportedSql(
+            "direct selected discounted revenue column shape mismatch".to_string(),
+        )
+    })?;
+    let schema = reader.metadata().file_metadata().schema_descr();
+    let key_required = schema.column(key_column).max_def_level() == 0;
+    let date_required = schema.column(date_column).max_def_level() == 0;
+    let left_required = schema.column(left_decimal_column).max_def_level() == 0;
+    let right_required = schema.column(right_decimal_column).max_def_level() == 0;
+    let mut metrics = DirectPrimitiveColumnScanMetrics {
+        row_groups: row_groups.len(),
+        column_read_nanos: vec![0; 4],
+        ..DirectPrimitiveColumnScanMetrics::default()
+    };
+    for &row_group_index in row_groups {
+        let row_group = reader.get_row_group(row_group_index)?;
+        let mut key_reader = match row_group.get_column_reader(key_column)? {
+            ColumnReader::Int64ColumnReader(reader) => reader,
+            _ => {
+                if trace {
+                    eprintln!(
+                        "[dodam:direct-selected] i64-date-decimal-decimal reject: key is not INT64"
+                    );
+                }
+                return Ok(None);
+            }
+        };
+        let mut date_reader = match row_group.get_column_reader(date_column)? {
+            ColumnReader::Int32ColumnReader(reader) => reader,
+            _ => {
+                if trace {
+                    eprintln!(
+                        "[dodam:direct-selected] i64-date-decimal-decimal reject: date is not INT32"
+                    );
+                }
+                return Ok(None);
+            }
+        };
+        let mut left_reader = match row_group.get_column_reader(left_decimal_column)? {
+            ColumnReader::Int64ColumnReader(reader) => reader,
+            _ => {
+                if trace {
+                    eprintln!(
+                        "[dodam:direct-selected] i64-date-decimal-decimal reject: left decimal is not INT64"
+                    );
+                }
+                return Ok(None);
+            }
+        };
+        let mut right_reader = match row_group.get_column_reader(right_decimal_column)? {
+            ColumnReader::Int64ColumnReader(reader) => reader,
+            _ => {
+                if trace {
+                    eprintln!(
+                        "[dodam:direct-selected] i64-date-decimal-decimal reject: right decimal is not INT64"
+                    );
+                }
+                return Ok(None);
+            }
+        };
+        let mut date_values = Vec::<i32>::with_capacity(batch_size);
+        let mut key_def_levels = Vec::<i16>::with_capacity(batch_size);
+        let mut date_def_levels = Vec::<i16>::with_capacity(batch_size);
+        let mut left_def_levels = Vec::<i16>::with_capacity(batch_size);
+        let mut right_def_levels = Vec::<i16>::with_capacity(batch_size);
+        let mut selected_keys = Vec::<i64>::with_capacity(batch_size);
+        let mut selected_dates = Vec::<i32>::with_capacity(batch_size);
+        let mut selected_left = Vec::<i64>::with_capacity(batch_size);
+        let mut selected_right = Vec::<i64>::with_capacity(batch_size);
+        let mut selected_runs = Vec::<(usize, usize)>::new();
+        loop {
+            date_values.clear();
+            key_def_levels.clear();
+            date_def_levels.clear();
+            left_def_levels.clear();
+            right_def_levels.clear();
+            selected_keys.clear();
+            selected_dates.clear();
+            selected_left.clear();
+            selected_right.clear();
+            selected_runs.clear();
+            let read_started = Instant::now();
+            let date_started = Instant::now();
+            let (records, value_count, level_count) = date_reader.read_records(
+                batch_size,
+                (!date_required).then_some(&mut date_def_levels),
+                None,
+                &mut date_values,
+            )?;
+            metrics.add_column_read_nanos(1, elapsed_nanos(date_started));
+            if records == 0 {
+                metrics.add_read_nanos(elapsed_nanos(read_started));
+                break;
+            }
+            if value_count != records
+                || !direct_def_levels_match(level_count, records, date_required)
+                || !direct_all_present(date_required, &date_def_levels)
+            {
+                if trace {
+                    eprintln!(
+                        "[dodam:direct-selected] i64-date-decimal-decimal reject: date levels records={records} values={value_count} levels={level_count} required={date_required}"
+                    );
+                }
+                metrics.add_read_nanos(elapsed_nanos(read_started));
+                return Ok(None);
+            }
+            build_date_selected_runs(
+                &date_values,
+                date_min,
+                date_max,
+                &mut selected_runs,
+                &mut selected_dates,
+            );
+            metrics.selected_rows = metrics.selected_rows.saturating_add(selected_dates.len());
+            metrics.selected_runs = metrics.selected_runs.saturating_add(selected_runs.len());
+            let use_selected_payload =
+                direct_selection_payload_gate(records, selected_dates.len(), selected_runs.len());
+            let key_started = Instant::now();
+            if use_selected_payload {
+                if !read_i64_selected_runs(
+                    &mut key_reader,
+                    records,
+                    &selected_runs,
+                    key_required,
+                    &mut key_def_levels,
+                    &mut selected_keys,
+                    &mut metrics,
+                )? {
+                    if trace {
+                        eprintln!(
+                            "[dodam:direct-selected] i64-date-decimal-decimal reject: selected key read failed"
+                        );
+                    }
+                    metrics.add_read_nanos(elapsed_nanos(read_started));
+                    return Ok(None);
+                }
+            } else {
+                let (key_records, key_value_count, key_level_count) = key_reader.read_records(
+                    records,
+                    (!key_required).then_some(&mut key_def_levels),
+                    None,
+                    &mut selected_keys,
+                )?;
+                if key_records != records
+                    || key_value_count != records
+                    || !direct_def_levels_match(key_level_count, records, key_required)
+                    || !direct_all_present(key_required, &key_def_levels)
+                {
+                    if trace {
+                        eprintln!(
+                            "[dodam:direct-selected] i64-date-decimal-decimal reject: key levels records={key_records}/{records} values={key_value_count} levels={key_level_count} required={key_required}"
+                        );
+                    }
+                    metrics.add_read_nanos(elapsed_nanos(read_started));
+                    return Ok(None);
+                }
+            }
+            metrics.add_column_read_nanos(0, elapsed_nanos(key_started));
+            let left_started = Instant::now();
+            if use_selected_payload {
+                if !read_i64_selected_runs(
+                    &mut left_reader,
+                    records,
+                    &selected_runs,
+                    left_required,
+                    &mut left_def_levels,
+                    &mut selected_left,
+                    &mut metrics,
+                )? {
+                    if trace {
+                        eprintln!(
+                            "[dodam:direct-selected] i64-date-decimal-decimal reject: selected left decimal read failed"
+                        );
+                    }
+                    metrics.add_read_nanos(elapsed_nanos(read_started));
+                    return Ok(None);
+                }
+            } else {
+                let (left_records, left_value_count, left_level_count) = left_reader.read_records(
+                    records,
+                    (!left_required).then_some(&mut left_def_levels),
+                    None,
+                    &mut selected_left,
+                )?;
+                if left_records != records
+                    || left_value_count != records
+                    || !direct_def_levels_match(left_level_count, records, left_required)
+                    || !direct_all_present(left_required, &left_def_levels)
+                {
+                    if trace {
+                        eprintln!(
+                            "[dodam:direct-selected] i64-date-decimal-decimal reject: left levels records={left_records}/{records} values={left_value_count} levels={left_level_count} required={left_required}"
+                        );
+                    }
+                    metrics.add_read_nanos(elapsed_nanos(read_started));
+                    return Ok(None);
+                }
+            }
+            metrics.add_column_read_nanos(2, elapsed_nanos(left_started));
+            let right_started = Instant::now();
+            if use_selected_payload {
+                if !read_i64_selected_runs(
+                    &mut right_reader,
+                    records,
+                    &selected_runs,
+                    right_required,
+                    &mut right_def_levels,
+                    &mut selected_right,
+                    &mut metrics,
+                )? {
+                    if trace {
+                        eprintln!(
+                            "[dodam:direct-selected] i64-date-decimal-decimal reject: selected right decimal read failed"
+                        );
+                    }
+                    metrics.add_read_nanos(elapsed_nanos(read_started));
+                    return Ok(None);
+                }
+                metrics.selected_payload_batches += 1;
+            } else {
+                let (right_records, right_value_count, right_level_count) = right_reader
+                    .read_records(
+                        records,
+                        (!right_required).then_some(&mut right_def_levels),
+                        None,
+                        &mut selected_right,
+                    )?;
+                if right_records != records
+                    || right_value_count != records
+                    || !direct_def_levels_match(right_level_count, records, right_required)
+                    || !direct_all_present(right_required, &right_def_levels)
+                {
+                    if trace {
+                        eprintln!(
+                            "[dodam:direct-selected] i64-date-decimal-decimal reject: right levels records={right_records}/{records} values={right_value_count} levels={right_level_count} required={right_required}"
+                        );
+                    }
+                    metrics.add_read_nanos(elapsed_nanos(read_started));
+                    return Ok(None);
+                }
+                metrics.full_payload_batches += 1;
+            }
+            metrics.add_column_read_nanos(3, elapsed_nanos(right_started));
+            metrics.add_read_nanos(elapsed_nanos(read_started));
+            metrics.batches += 1;
+            metrics.rows = metrics.rows.saturating_add(records);
+            if selected_keys.is_empty() {
+                continue;
+            }
+            let consume_started = Instant::now();
+            let date_view = if use_selected_payload {
+                selected_dates.as_slice()
+            } else {
+                date_values.as_slice()
+            };
+            consume(DirectI64DateDecimalDecimalSelectedBatch {
+                keys: &selected_keys,
+                dates: date_view,
+                left_decimals: &selected_left,
+                right_decimals: &selected_right,
                 predicate_applied: use_selected_payload,
             })?;
             metrics.add_consume_nanos(elapsed_nanos(consume_started));
@@ -11091,6 +11426,36 @@ fn build_selected_runs(
     }
 }
 
+fn build_date_selected_runs(
+    dates: &[i32],
+    date_min: Option<i32>,
+    date_max: Option<i32>,
+    runs: &mut Vec<(usize, usize)>,
+    selected_dates: &mut Vec<i32>,
+) {
+    let mut run_start = None;
+    let mut run_len = 0usize;
+    for (row, date) in dates.iter().copied().enumerate() {
+        let selected =
+            date_min.is_none_or(|min| date >= min) && date_max.is_none_or(|max| date <= max);
+        if selected {
+            selected_dates.push(date);
+            if run_start.is_none() {
+                run_start = Some(row);
+                run_len = 1;
+            } else {
+                run_len += 1;
+            }
+        } else if let Some(start) = run_start.take() {
+            runs.push((start, run_len));
+            run_len = 0;
+        }
+    }
+    if let Some(start) = run_start {
+        runs.push((start, run_len));
+    }
+}
+
 fn read_i32_selected_runs(
     reader: &mut ColumnReaderImpl<Int32Type>,
     records: usize,
@@ -12172,7 +12537,7 @@ fn log_direct_selection_gate(
 
 fn direct_def_levels_match(level_count: usize, record_count: usize, required: bool) -> bool {
     if required {
-        level_count == 0
+        level_count == 0 || level_count == record_count
     } else {
         level_count == record_count
     }

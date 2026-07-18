@@ -44,11 +44,12 @@ use crate::plan::{
 };
 use crate::storage::{
     DirectByteArrayPayloadReader, DirectColumnScanMetrics, DirectI32I32DictionaryI64SelectedBatch,
-    DirectI32I64DecimalI32SelectedBatch, DirectI64I32I32ScanMetrics, DirectOrderedPrimitiveBatch,
-    DirectPrimitiveColumnScanMetrics, DirectPrimitiveColumnSpec, DirectPrimitiveColumnType,
-    DirectSelectedPrimitivePageBatch, I64BloomPredicate, LocalFileSystemObjectStore, ObjectStore,
-    ParquetBatchReader, ParquetFileCache, ParquetFileCacheStats, ParquetMetadataCache,
-    PrimitiveRowGroupMinMax, parquet_column_monotonic_by_scan, parquet_row_group_count_with_store,
+    DirectI32I64DecimalI32SelectedBatch, DirectI64DateDecimalDecimalSelectedBatch,
+    DirectI64I32I32ScanMetrics, DirectOrderedPrimitiveBatch, DirectPrimitiveColumnScanMetrics,
+    DirectPrimitiveColumnSpec, DirectPrimitiveColumnType, DirectSelectedPrimitivePageBatch,
+    I64BloomPredicate, LocalFileSystemObjectStore, ObjectStore, ParquetBatchReader,
+    ParquetFileCache, ParquetFileCacheStats, ParquetMetadataCache, PrimitiveRowGroupMinMax,
+    parquet_column_monotonic_by_scan, parquet_row_group_count_with_store,
     parquet_row_groups_monotonic_by_column, parquet_total_row_count_with_store,
     plan_parquet_scan_tasks, read_parquet_file_statistics, read_parquet_i64_column_constant,
     read_parquet_i64_column_max, read_parquet_i128_column_min_max,
@@ -65,6 +66,7 @@ use crate::storage::{
     scan_parquet_i32_selected_by_byte_array_prefix_with_store,
     scan_parquet_i64_byte_array_payload_columns_with_store,
     scan_parquet_i64_byte_array_selected_by_i32x3_dictionary_with_store,
+    scan_parquet_i64_date_decimal_decimal_selected_typed_with_store,
     scan_parquet_i64_dictionary_i32x3_columns_with_store,
     scan_parquet_i64_dictionary_i32x3_dict_columns_with_store,
     scan_parquet_i64_dictionary_i32x3_page_columns_with_store,
@@ -1688,6 +1690,88 @@ impl DodamEngine {
                         decimal_max,
                         filter.date_min,
                         filter.date_max,
+                        engine.file_cache.clone(),
+                        engine.object_store.as_ref(),
+                        |batch| consume(&mut state, batch),
+                    );
+                    let _ =
+                        sender.send(result.map(|metrics| metrics.map(|metrics| (state, metrics))));
+                });
+            }
+        });
+        drop(sender);
+        for received in receiver {
+            let Some((partial, metrics)) = received? else {
+                return Ok(None);
+            };
+            merge(&mut state, partial)?;
+            scan_metrics.merge_from(metrics);
+        }
+        let profile_columns = columns
+            .iter()
+            .map(|name| OwnedDirectPrimitiveColumnSpec {
+                name: (*name).to_string(),
+                column_type: DirectPrimitiveColumnType::I64,
+            })
+            .collect::<Vec<_>>();
+        log_direct_primitive_fold_profile(path, &profile_columns, &scan_metrics);
+        Ok(Some((state, scan_metrics)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn scan_parquet_i64_date_decimal_decimal_selected_typed_fold<
+        S,
+        Init,
+        Consume,
+        Merge,
+    >(
+        &self,
+        path: impl AsRef<Path>,
+        batch_size: usize,
+        row_groups: &[usize],
+        columns: [&str; 4],
+        date_min: Option<i32>,
+        date_max: Option<i32>,
+        init: Init,
+        consume: Consume,
+        merge: Merge,
+    ) -> Result<Option<(S, DirectPrimitiveColumnScanMetrics)>>
+    where
+        S: Send,
+        Init: Fn() -> S + Sync,
+        Consume:
+            for<'a> Fn(&mut S, DirectI64DateDecimalDecimalSelectedBatch<'a>) -> Result<()> + Sync,
+        Merge: Fn(&mut S, S) -> Result<()> + Sync,
+    {
+        let path = path.as_ref();
+        let mut state = init();
+        let mut scan_metrics = DirectPrimitiveColumnScanMetrics::default();
+        if row_groups.is_empty() {
+            return Ok(Some((state, scan_metrics)));
+        }
+        let workers = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4)
+            .min(row_groups.len());
+        let (sender, receiver) = mpsc::channel();
+        let row_group_partitions = partition_row_groups_balanced(row_groups, workers);
+        std::thread::scope(|scope| {
+            for row_group_partition in row_group_partitions {
+                let sender = sender.clone();
+                let engine = self.clone();
+                let path = path.to_path_buf();
+                let row_groups = row_group_partition;
+                let init = &init;
+                let consume = &consume;
+                scope.spawn(move || {
+                    let mut state = init();
+                    let result = scan_parquet_i64_date_decimal_decimal_selected_typed_with_store(
+                        &path,
+                        batch_size,
+                        &row_groups,
+                        columns,
+                        date_min,
+                        date_max,
                         engine.file_cache.clone(),
                         engine.object_store.as_ref(),
                         |batch| consume(&mut state, batch),
@@ -7388,7 +7472,7 @@ fn direct_primitive_profile_enabled() -> bool {
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
-fn direct_selection_fold_enabled() -> bool {
+pub(crate) fn direct_selection_fold_enabled() -> bool {
     if std::env::var("DODAM_DISABLE_DIRECT_SELECTION_FOLD")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
     {

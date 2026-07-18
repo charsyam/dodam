@@ -62,6 +62,8 @@ impl SqlRuleKind {
 
     fn fallback_penalty(self) -> u32 {
         match self {
+            Self::Cte => 50_000,
+            Self::GenericExpression => 40_000,
             _ => 0,
         }
     }

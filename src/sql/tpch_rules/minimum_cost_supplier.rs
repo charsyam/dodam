@@ -278,8 +278,32 @@ async fn minimum_cost_supplier_matching_parts(
         let mfgrs = batch_string_column(&batch, "p_mfgr")?;
         let sizes = batch_column(&batch, "p_size")?;
         let types = batch_string_column(&batch, "p_type")?;
+        if let Some(partkeys) = partkeys.as_any().downcast_ref::<Int64Array>()
+            && let Some(sizes) = sizes.as_any().downcast_ref::<Int32Array>()
+        {
+            for row in 0..batch.num_rows() {
+                if partkeys.is_null(row) || sizes.is_null(row) || types.is_null(row) {
+                    continue;
+                }
+                if i64::from(sizes.value(row)) != part_size
+                    || !types.value(row).ends_with(type_suffix)
+                {
+                    continue;
+                }
+                if mfgrs.is_null(row) {
+                    continue;
+                }
+                parts.insert(
+                    partkeys.value(row),
+                    MinimumCostSupplierPart {
+                        mfgr: mfgrs.value(row).to_string(),
+                    },
+                );
+            }
+            continue;
+        }
         for row in 0..batch.num_rows() {
-            if mfgrs.is_null(row) || types.is_null(row) {
+            if types.is_null(row) {
                 continue;
             }
             let (Some(partkey), Some(size)) = (
@@ -289,6 +313,9 @@ async fn minimum_cost_supplier_matching_parts(
                 continue;
             };
             if size == part_size && types.value(row).ends_with(type_suffix) {
+                if mfgrs.is_null(row) {
+                    continue;
+                }
                 parts.insert(
                     partkey,
                     MinimumCostSupplierPart {
@@ -323,7 +350,7 @@ async fn minimum_cost_supplier_min_cost_rows(
             None,
         )
         .await?;
-    let mut candidates_by_part = HashMap::<i64, (f64, Vec<i64>)>::new();
+    let mut candidates_by_part = HashMap::<i64, (i128, Vec<i64>)>::new();
     while let Some(batch) = stream.next() {
         let batch = batch?;
         let partkeys = batch_column(&batch, "ps_partkey")?;
@@ -334,6 +361,39 @@ async fn minimum_cost_supplier_min_cost_rows(
                 "ps_supplycost must be Decimal128".to_string(),
             ));
         };
+        if let (Some(partkeys), Some(suppkeys), Some(raw_supplycosts)) = (
+            partkeys.as_any().downcast_ref::<Int64Array>(),
+            suppkeys.as_any().downcast_ref::<Int64Array>(),
+            Some(supplycosts.raw_values()),
+        ) {
+            for row in 0..batch.num_rows() {
+                if partkeys.is_null(row) || suppkeys.is_null(row) || supplycosts.is_null(row) {
+                    continue;
+                }
+                let partkey = partkeys.value(row);
+                let suppkey = suppkeys.value(row);
+                if !part_keys.contains(partkey) || !supplier_keys.contains(suppkey) {
+                    continue;
+                }
+                let supplycost = raw_supplycosts[row];
+                match candidates_by_part.entry(partkey) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert((supplycost, vec![suppkey]));
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        let (min_cost, suppkeys) = entry.get_mut();
+                        if supplycost < *min_cost {
+                            *min_cost = supplycost;
+                            suppkeys.clear();
+                            suppkeys.push(suppkey);
+                        } else if supplycost == *min_cost {
+                            suppkeys.push(suppkey);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         for row in 0..batch.num_rows() {
             if supplycosts.is_null(row) {
                 continue;
@@ -347,7 +407,7 @@ async fn minimum_cost_supplier_min_cost_rows(
             if !part_keys.contains(partkey) || !supplier_keys.contains(suppkey) {
                 continue;
             }
-            let supplycost = supplycosts.value(row);
+            let supplycost = supplycosts.raw_values()[row];
             match candidates_by_part.entry(partkey) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert((supplycost, vec![suppkey]));

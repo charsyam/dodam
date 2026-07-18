@@ -56,7 +56,7 @@ use crate::engine::{
     DirectPrimitiveBatchLocation, DodamEngine, JoinAlgorithm, JoinParquetRequest,
     LateMaterializationPolicy, LateMaterializedMetrics, LateSelectionBuilder,
     OrderedRowGroupBoundary, OrderedRowGroupChunk, RowGroupBatchScanProfile,
-    merge_ordered_row_group_chunks,
+    direct_selection_fold_enabled, merge_ordered_row_group_chunks,
 };
 use crate::error::{DodamError, Result};
 use crate::execution::JoinType;
@@ -7088,6 +7088,11 @@ async fn q15_revenue_by_supplier(
     start_days: i32,
     end_days: i32,
 ) -> Result<HashMap<i64, f64>> {
+    if let Some(revenues) =
+        q15_revenue_by_supplier_direct(engine, &path, batch_size, start_days, end_days)?
+    {
+        return Ok(revenues);
+    }
     let projection = Projection::Columns(vec![
         "l_suppkey".to_string(),
         "l_shipdate".to_string(),
@@ -7112,6 +7117,127 @@ async fn q15_revenue_by_supplier(
             "Q15 revenue aggregate",
         )
         .await
+}
+
+fn q15_revenue_by_supplier_direct(
+    engine: &DodamEngine,
+    path: &Path,
+    batch_size: usize,
+    start_days: i32,
+    end_days: i32,
+) -> Result<Option<HashMap<i64, f64>>> {
+    if !direct_discounted_revenue_selected_fold_enabled() {
+        return Ok(None);
+    }
+    let trace = std::env::var("DODAM_DIRECT_SELECTION_TRACE")
+        .or_else(|_| std::env::var("DODAM_TPCH_PROFILE"))
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
+    if trace {
+        eprintln!("[dodam:direct-selected] Q15 candidate");
+    }
+    if !direct_selection_fold_enabled() {
+        if trace {
+            eprintln!("[dodam:direct-selected] Q15 reject: direct selection fold disabled");
+        }
+        return Ok(None);
+    }
+    let Some((_price_precision, price_scale)) =
+        engine.parquet_decimal128_type(path, "l_extendedprice")?
+    else {
+        if trace {
+            eprintln!("[dodam:direct-selected] Q15 reject: l_extendedprice is not Decimal128");
+        }
+        return Ok(None);
+    };
+    let Some((_discount_precision, discount_decimal_scale)) =
+        engine.parquet_decimal128_type(path, "l_discount")?
+    else {
+        if trace {
+            eprintln!("[dodam:direct-selected] Q15 reject: l_discount is not Decimal128");
+        }
+        return Ok(None);
+    };
+    let date_max = end_days.checked_sub(1).ok_or_else(|| {
+        DodamError::UnsupportedSql("invalid empty Q15 date range for direct fold".to_string())
+    })?;
+    let row_groups = (0..engine.parquet_row_group_count(path)?).collect::<Vec<_>>();
+    let discount_scale = decimal_scale_factor(discount_decimal_scale);
+    let revenue_scale =
+        1.0 / (decimal_scale_factor(price_scale) * decimal_scale_factor(discount_decimal_scale));
+    let Some((revenues, _metrics)) = engine
+        .scan_parquet_i64_date_decimal_decimal_selected_typed_fold(
+            path,
+            batch_size,
+            &row_groups,
+            ["l_suppkey", "l_shipdate", "l_extendedprice", "l_discount"],
+            Some(start_days),
+            Some(date_max),
+            HashMap::<i64, f64>::new,
+            move |revenues, batch| {
+                q15_revenue_by_supplier_direct_batch_into(
+                    batch,
+                    start_days,
+                    end_days,
+                    discount_scale,
+                    revenue_scale,
+                    revenues,
+                )
+            },
+            |revenues, partial| {
+                merge_f64_groups(revenues, partial);
+                Ok(())
+            },
+        )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(revenues))
+}
+
+fn direct_discounted_revenue_selected_fold_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_DIRECT_DISCOUNTED_REVENUE_SELECTED_FOLD")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn q15_revenue_by_supplier_direct_batch_into(
+    batch: crate::storage::DirectI64DateDecimalDecimalSelectedBatch<'_>,
+    start_days: i32,
+    end_days: i32,
+    discount_scale: f64,
+    revenue_scale: f64,
+    revenues: &mut HashMap<i64, f64>,
+) -> Result<()> {
+    if batch.keys.len() != batch.left_decimals.len()
+        || batch.keys.len() != batch.right_decimals.len()
+        || batch.keys.len() != batch.dates.len()
+    {
+        return Err(DodamError::UnsupportedSql(
+            "direct discounted revenue batch length mismatch".to_string(),
+        ));
+    }
+    if batch.predicate_applied {
+        for row in 0..batch.keys.len() {
+            *revenues.entry(batch.keys[row]).or_insert(0.0) += decimal_discounted_revenue_raw_i64(
+                batch.left_decimals[row],
+                batch.right_decimals[row],
+                discount_scale,
+                revenue_scale,
+            );
+        }
+        return Ok(());
+    }
+    for row in 0..batch.keys.len() {
+        let date = batch.dates[row];
+        if date >= start_days && date < end_days {
+            *revenues.entry(batch.keys[row]).or_insert(0.0) += decimal_discounted_revenue_raw_i64(
+                batch.left_decimals[row],
+                batch.right_decimals[row],
+                discount_scale,
+                revenue_scale,
+            );
+        }
+    }
+    Ok(())
 }
 
 fn q15_revenue_by_supplier_batch_into<S: BuildHasher>(
