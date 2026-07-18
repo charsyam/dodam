@@ -107,8 +107,9 @@ pub(super) async fn try_execute_minimum_cost_supplier_sql(
     };
 
     let stage = tpch_profile_start();
-    let region_keys = q05_region_keys(engine, region.path, batch_size, &region_name).await?;
-    let nation_names = q05_nation_names(engine, nation.path, batch_size, &region_keys).await?;
+    let region_keys = region_keys_by_name(engine, region.path, batch_size, &region_name).await?;
+    let nation_names =
+        nation_names_by_region_keys(engine, nation.path, batch_size, &region_keys).await?;
     if nation_names.is_empty() {
         return Ok(Some(minimum_cost_supplier_output(Vec::new())?));
     }
