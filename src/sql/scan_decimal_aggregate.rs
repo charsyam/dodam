@@ -171,6 +171,7 @@ pub(super) async fn try_collect_filtered_decimal_product_sum_scan_fold(
     {
         return Ok(Some(metrics));
     }
+    let batch_size = product_vector_scan_batch_size(batch_size);
     let started = Instant::now();
     let state = engine
         .parquet_scan_accumulate_chunks_view(
@@ -321,6 +322,15 @@ async fn try_collect_filtered_product_sum_late_materialized(
 fn should_try_filtered_product_sum_late_materialized(spec: &DecimalProductSumSpec) -> bool {
     spec.product_factor_count() <= 2
         || std::env::var_os("DODAM_ENABLE_THREE_FACTOR_PRODUCT_SUM_LATE").is_some()
+}
+
+pub(super) fn product_vector_scan_batch_size(batch_size: usize) -> usize {
+    let max_rows = std::env::var("DODAM_PRODUCT_VECTOR_BATCH_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(8192);
+    batch_size.min(max_rows).max(1)
 }
 
 impl DecimalProductSumSpec {

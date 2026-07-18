@@ -350,7 +350,9 @@ use scalar_parser::{
     parse_struct_field_access, rewrite_join_scalar_predicate, scalar_expression_columns,
     scalar_expression_references_aggregate, sql_column_expr,
 };
-use scan_decimal_aggregate::try_collect_filtered_decimal_product_sum_scan_fold;
+use scan_decimal_aggregate::{
+    product_vector_scan_batch_size, try_collect_filtered_decimal_product_sum_scan_fold,
+};
 use scan_order_limit::{
     prefer_post_scan_primitive_desc_topk, try_execute_monotonic_row_group_order_limit_scan,
 };

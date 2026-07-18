@@ -100,6 +100,11 @@ pub(super) async fn execute_single_table_aggregate_query(
                 &query.path,
                 &query.filtered_aggregates,
             )?;
+            let batch_size = if filtered_aggregates_have_product_sum(&filtered_aggregates) {
+                product_vector_scan_batch_size(batch_size)
+            } else {
+                batch_size
+            };
             let stream = engine
                 .scan_parquet_batches(
                     query.path,
@@ -151,4 +156,11 @@ pub(super) async fn execute_single_table_aggregate_query(
         batches = rename_output_batches(batches, &query.aliases)?;
     }
     Ok(QueryOutput::Aggregate { metrics, batches })
+}
+
+fn filtered_aggregates_have_product_sum(specs: &[NativeFilteredAggregateSpec]) -> bool {
+    specs.iter().any(|spec| {
+        matches!(spec.expr, AggregateExpr::Sum(_))
+            && product_expression_shape(&spec.input).is_some()
+    })
 }
