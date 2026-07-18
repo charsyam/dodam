@@ -1,5 +1,251 @@
 use super::*;
 
+pub(super) fn predicate_requires_expression_path(expr: &SqlExpr) -> bool {
+    match expr {
+        SqlExpr::BinaryOp { left, op, right }
+            if matches!(op, BinaryOperator::And | BinaryOperator::Or) =>
+        {
+            predicate_requires_expression_path(left) || predicate_requires_expression_path(right)
+        }
+        SqlExpr::UnaryOp { op, expr } if *op == UnaryOperator::Not => {
+            predicate_requires_expression_path(expr)
+        }
+        SqlExpr::Nested(expr) => predicate_requires_expression_path(expr),
+        SqlExpr::BinaryOp { left, right, .. } => {
+            scalar_predicate_side_requires_expression(left)
+                || scalar_predicate_side_requires_expression(right)
+        }
+        SqlExpr::IsNull(expr) | SqlExpr::IsNotNull(expr) => {
+            scalar_predicate_side_requires_expression(expr)
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            scalar_predicate_side_requires_expression(expr)
+                || list.iter().any(scalar_predicate_side_requires_expression)
+        }
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            scalar_predicate_side_requires_expression(expr)
+                || scalar_predicate_side_requires_expression(low)
+                || scalar_predicate_side_requires_expression(high)
+        }
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            scalar_predicate_side_requires_expression(expr)
+                || scalar_predicate_side_requires_expression(pattern)
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn scalar_predicate_side_requires_expression(expr: &SqlExpr) -> bool {
+    match expr {
+        SqlExpr::Identifier(_) => false,
+        SqlExpr::CompoundIdentifier(parts) => parts.len() > 1,
+        SqlExpr::Function(_)
+        | SqlExpr::Substring { .. }
+        | SqlExpr::Cast { .. }
+        | SqlExpr::Case { .. }
+        | SqlExpr::CompoundFieldAccess { .. } => true,
+        _ => sql_literal_value(expr).is_err(),
+    }
+}
+
+pub(super) fn predicate_expression_columns(
+    expr: &SqlExpr,
+    table_alias: Option<&str>,
+) -> Result<Vec<String>> {
+    let mut columns = Vec::new();
+    collect_predicate_expression_columns(expr, table_alias, &mut columns)?;
+    Ok(columns)
+}
+
+pub(super) fn collect_predicate_expression_columns(
+    expr: &SqlExpr,
+    table_alias: Option<&str>,
+    columns: &mut Vec<String>,
+) -> Result<()> {
+    match expr {
+        SqlExpr::BinaryOp { left, right, .. } => {
+            collect_predicate_expression_columns(left, table_alias, columns)?;
+            collect_predicate_expression_columns(right, table_alias, columns)?;
+        }
+        SqlExpr::UnaryOp { expr, .. }
+        | SqlExpr::Nested(expr)
+        | SqlExpr::IsNull(expr)
+        | SqlExpr::IsNotNull(expr) => {
+            collect_predicate_expression_columns(expr, table_alias, columns)?;
+        }
+        SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
+            if let Some((column, _)) = parse_struct_field_access(expr, table_alias)? {
+                add_column_once(columns, column);
+            } else {
+                add_column_once(columns, sql_column_name(expr, table_alias)?);
+            }
+        }
+        SqlExpr::CompoundFieldAccess { .. } => {
+            for column in
+                scalar_expression_columns(&parse_scalar_sql_expression(expr, table_alias)?)
+            {
+                add_column_once(columns, column);
+            }
+        }
+        SqlExpr::Function(function) => {
+            if let Some(expression) = parse_scalar_function_projection(function, None, table_alias)?
+            {
+                for column in scalar_expression_columns(&expression.expr) {
+                    add_column_once(columns, column);
+                }
+            }
+        }
+        SqlExpr::Substring { .. } => {
+            for column in
+                scalar_expression_columns(&parse_scalar_sql_expression(expr, table_alias)?)
+            {
+                add_column_once(columns, column);
+            }
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            collect_predicate_expression_columns(expr, table_alias, columns)?;
+            for item in list {
+                collect_predicate_expression_columns(item, table_alias, columns)?;
+            }
+        }
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            collect_predicate_expression_columns(expr, table_alias, columns)?;
+            collect_predicate_expression_columns(pattern, table_alias, columns)?;
+        }
+        SqlExpr::Exists { subquery, .. }
+        | SqlExpr::InSubquery { subquery, .. }
+        | SqlExpr::Subquery(subquery) => {
+            collect_subquery_outer_columns(subquery, table_alias, columns)?;
+        }
+        SqlExpr::Cast { expr, .. } => {
+            collect_predicate_expression_columns(expr, table_alias, columns)?;
+        }
+        SqlExpr::Value(_) => {}
+        _ => {}
+    }
+    Ok(())
+}
+
+fn collect_subquery_outer_columns(
+    query: &Query,
+    table_alias: Option<&str>,
+    columns: &mut Vec<String>,
+) -> Result<()> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(());
+    };
+    if let Some(selection) = select.selection.as_ref() {
+        collect_outer_column_candidates(selection, table_alias, columns)?;
+    }
+    Ok(())
+}
+
+fn collect_outer_column_candidates(
+    expr: &SqlExpr,
+    table_alias: Option<&str>,
+    columns: &mut Vec<String>,
+) -> Result<()> {
+    match expr {
+        SqlExpr::BinaryOp { left, right, .. } => {
+            collect_outer_column_candidates(left, table_alias, columns)?;
+            collect_outer_column_candidates(right, table_alias, columns)?;
+        }
+        SqlExpr::UnaryOp { expr, .. }
+        | SqlExpr::Nested(expr)
+        | SqlExpr::IsNull(expr)
+        | SqlExpr::IsNotNull(expr)
+        | SqlExpr::Cast { expr, .. } => {
+            collect_outer_column_candidates(expr, table_alias, columns)?;
+        }
+        SqlExpr::Identifier(ident) => {
+            if unqualified_column_matches_table_alias(&ident.value, table_alias) {
+                add_column_once(columns, ident.value.clone());
+            }
+        }
+        SqlExpr::CompoundIdentifier(parts) => {
+            if let [qualifier, column] = parts.as_slice()
+                && table_alias.is_some_and(|alias| qualifier.value.eq_ignore_ascii_case(alias))
+            {
+                add_column_once(columns, column.value.clone());
+            }
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            collect_outer_column_candidates(expr, table_alias, columns)?;
+            for item in list {
+                collect_outer_column_candidates(item, table_alias, columns)?;
+            }
+        }
+        SqlExpr::Exists { subquery, .. }
+        | SqlExpr::InSubquery { subquery, .. }
+        | SqlExpr::Subquery(subquery) => {
+            collect_subquery_outer_columns(subquery, table_alias, columns)?;
+        }
+        SqlExpr::Function(function) => {
+            for arg in function_arg_exprs(function) {
+                collect_outer_column_candidates(arg, table_alias, columns)?;
+            }
+        }
+        SqlExpr::Value(_) => {}
+        _ => {}
+    }
+    Ok(())
+}
+
+pub(super) fn unqualified_column_matches_table_alias(
+    column: &str,
+    table_alias: Option<&str>,
+) -> bool {
+    let Some(table_alias) = table_alias else {
+        return false;
+    };
+    let Some((prefix, _)) = column.split_once('_') else {
+        return false;
+    };
+    infer_tpch_table_alias(prefix, &[table_alias]).is_some_and(|alias| alias == table_alias)
+}
+
+pub(super) fn function_arg_exprs(function: &sqlparser::ast::Function) -> Vec<&SqlExpr> {
+    let FunctionArguments::List(args) = &function.args else {
+        return Vec::new();
+    };
+    args.args
+        .iter()
+        .filter_map(|arg| match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Some(expr),
+            _ => None,
+        })
+        .collect()
+}
+
+pub(super) fn expr_contains_scalar_subquery(expr: &SqlExpr) -> bool {
+    match expr {
+        SqlExpr::Subquery(_) => true,
+        SqlExpr::BinaryOp { left, right, .. } => {
+            expr_contains_scalar_subquery(left) || expr_contains_scalar_subquery(right)
+        }
+        SqlExpr::Nested(expr) | SqlExpr::UnaryOp { expr, .. } => {
+            expr_contains_scalar_subquery(expr)
+        }
+        SqlExpr::IsNull(expr) | SqlExpr::IsNotNull(expr) => expr_contains_scalar_subquery(expr),
+        SqlExpr::InList { expr, list, .. } => {
+            expr_contains_scalar_subquery(expr) || list.iter().any(expr_contains_scalar_subquery)
+        }
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            expr_contains_scalar_subquery(expr)
+                || expr_contains_scalar_subquery(low)
+                || expr_contains_scalar_subquery(high)
+        }
+        SqlExpr::Like { expr, pattern, .. } | SqlExpr::ILike { expr, pattern, .. } => {
+            expr_contains_scalar_subquery(expr) || expr_contains_scalar_subquery(pattern)
+        }
+        _ => false,
+    }
+}
+
 pub(super) async fn split_subquery_and_expression_filters(
     engine: &DodamEngine,
     selection: &SqlExpr,
