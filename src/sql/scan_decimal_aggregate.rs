@@ -159,14 +159,15 @@ pub(super) async fn try_collect_filtered_decimal_product_sum_scan_fold(
         log_product_sum_rule_miss("spec-mismatch");
         return Ok(None);
     };
-    if let Some(metrics) = try_collect_filtered_product_sum_late_materialized(
-        engine,
-        path.clone(),
-        batch_size,
-        filter,
-        &spec,
-    )
-    .await?
+    if should_try_filtered_product_sum_late_materialized(&spec)
+        && let Some(metrics) = try_collect_filtered_product_sum_late_materialized(
+            engine,
+            path.clone(),
+            batch_size,
+            filter,
+            &spec,
+        )
+        .await?
     {
         return Ok(Some(metrics));
     }
@@ -315,6 +316,11 @@ async fn try_collect_filtered_product_sum_late_materialized(
         aggregate_nanos: started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
         ..AggregateMetrics::default()
     }))
+}
+
+fn should_try_filtered_product_sum_late_materialized(spec: &DecimalProductSumSpec) -> bool {
+    spec.product_factor_count() <= 2
+        || std::env::var_os("DODAM_ENABLE_THREE_FACTOR_PRODUCT_SUM_LATE").is_some()
 }
 
 impl DecimalProductSumSpec {
