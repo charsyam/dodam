@@ -285,7 +285,7 @@ use semijoin::{
     try_apply_correlated_min_equality_filter, try_execute_correlated_exists_semijoin_sql,
     try_execute_correlated_exists_subquery_sql, try_execute_correlated_in_pair_semijoin_sql,
     try_execute_correlated_subquery_filter_sql, try_execute_exists_subquery_sql,
-    try_execute_in_subquery_sql, unqualified_semijoin_column,
+    try_execute_in_subquery_sql,
 };
 use set_operations::{
     align_union_all_batch_schema, append_disjoint_literal_values, append_union_all_batches,
@@ -34337,13 +34337,6 @@ fn join_memory_limit_bytes(options: SqlExecutionOptions) -> u64 {
         .join_memory_limit_bytes
         .filter(|value| *value > 0)
         .unwrap_or_else(default_join_memory_limit_bytes)
-}
-
-fn column_has_any_prefix(column: &str, prefixes: &[String]) -> bool {
-    let unqualified = unqualified_semijoin_column(column);
-    prefixes
-        .iter()
-        .any(|prefix| unqualified.starts_with(&format!("{prefix}_")))
 }
 
 #[cfg(test)]

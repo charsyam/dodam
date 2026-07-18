@@ -6742,3 +6742,10 @@ fn correlated_inner_outer_key(
     }
     Ok(None)
 }
+
+fn column_has_any_prefix(column: &str, prefixes: &[String]) -> bool {
+    let unqualified = unqualified_semijoin_column(column);
+    prefixes
+        .iter()
+        .any(|prefix| unqualified.starts_with(&format!("{prefix}_")))
+}
