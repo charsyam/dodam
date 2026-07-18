@@ -2152,7 +2152,7 @@ fn array_value_as_i64(array: &dyn Array, row: usize) -> Result<Option<i64>> {
     scalar_value_as_i64(&evaluated_array(array)?, row)
 }
 
-fn scalar_value_as_f64(value: &EvaluatedScalar, row: usize) -> Result<Option<f64>> {
+pub(super) fn scalar_value_as_f64(value: &EvaluatedScalar, row: usize) -> Result<Option<f64>> {
     match value {
         EvaluatedScalar::Array(array) => {
             scalar_value_as_f64(&evaluated_array(array.as_ref())?, row)

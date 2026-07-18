@@ -333,7 +333,8 @@ use scalar_eval::{
     boolean_and, boolean_not, boolean_or, decimal_scale_i128, evaluate_scalar_expression,
     evaluate_scalar_predicate, evaluated_array, evaluated_column, literal_as_date32_for_type,
     literal_as_decimal128_for_type, literal_as_i64_for_type, reverse_binary_operator,
-    scalar_as_f64, scalar_value_as_i64, scalar_value_at, validate_decimal_precision,
+    scalar_as_f64, scalar_value_as_f64, scalar_value_as_i64, scalar_value_at,
+    validate_decimal_precision,
 };
 use scalar_output::{
     coalesce_options, drop_prefixed_columns, format_date32_days, format_decimal128_value,

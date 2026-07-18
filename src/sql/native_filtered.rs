@@ -18,6 +18,7 @@ pub(super) enum NativeFilteredInputKind {
 enum NativeFilteredAggregateState {
     Count(u64),
     SumI64 { sum: i64, count: u64 },
+    SumF64 { sum: f64, count: u64 },
     AvgI64 { sum: i64, count: u64 },
     MinI64(Option<i64>),
     MaxI64(Option<i64>),
@@ -683,6 +684,7 @@ fn native_filtered_update_i64_group_direct_predicates(
 enum NativeFilteredColumnarAggState {
     Count(Vec<u64>),
     SumI64 { sums: Vec<i64>, counts: Vec<u64> },
+    SumF64 { sums: Vec<f64>, counts: Vec<u64> },
     AvgI64 { sums: Vec<i64>, counts: Vec<u64> },
 }
 
@@ -707,6 +709,12 @@ impl NativeFilteredColumnarAggState {
                 sums: vec![0; groups],
                 counts: vec![0; groups],
             }),
+            (AggregateExpr::Sum(_), NativeFilteredBatchInput::ProductF64(_)) => {
+                Some(Self::SumF64 {
+                    sums: vec![0.0; groups],
+                    counts: vec![0; groups],
+                })
+            }
             (
                 AggregateExpr::Avg(_),
                 NativeFilteredBatchInput::I64Array(_) | NativeFilteredBatchInput::I32Array(_),
@@ -745,7 +753,7 @@ impl NativeFilteredColumnarAggState {
                         }
                     }
                 }
-                NativeFilteredBatchInput::Other(_) => {}
+                NativeFilteredBatchInput::ProductF64(_) | NativeFilteredBatchInput::Other(_) => {}
             },
             Self::SumI64 { sums, counts } | Self::AvgI64 { sums, counts } => match input {
                 NativeFilteredBatchInput::I64Array(values) => {
@@ -768,6 +776,17 @@ impl NativeFilteredColumnarAggState {
                 }
                 _ => {}
             },
+            Self::SumF64 { sums, counts } => {
+                if let NativeFilteredBatchInput::ProductF64(values) = input {
+                    for row in selected_rows.iter().copied() {
+                        if let Some(value) = values.value(row) {
+                            let key = keys.value(row) as usize;
+                            sums[key] += value;
+                            counts[key] += 1;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -787,7 +806,7 @@ impl NativeFilteredColumnarAggState {
                         counts[key] += 1;
                     }
                 }
-                NativeFilteredBatchInput::Other(_) => {}
+                NativeFilteredBatchInput::ProductF64(_) | NativeFilteredBatchInput::Other(_) => {}
             },
             Self::SumI64 { sums, counts } | Self::AvgI64 { sums, counts } => match input {
                 NativeFilteredBatchInput::I64Array(values) => {
@@ -804,6 +823,14 @@ impl NativeFilteredColumnarAggState {
                 }
                 _ => {}
             },
+            Self::SumF64 { sums, counts } => {
+                if let NativeFilteredBatchInput::ProductF64(values) = input
+                    && let Some(value) = values.value(row)
+                {
+                    sums[key] += value;
+                    counts[key] += 1;
+                }
+            }
         }
     }
 
@@ -840,7 +867,7 @@ impl NativeFilteredColumnarAggState {
                         }
                     }
                 }
-                NativeFilteredBatchInput::Other(_) => {}
+                NativeFilteredBatchInput::ProductF64(_) | NativeFilteredBatchInput::Other(_) => {}
             },
             Self::SumI64 { sums, counts } | Self::AvgI64 { sums, counts } => match input {
                 NativeFilteredBatchInput::I64Array(values) => {
@@ -863,6 +890,19 @@ impl NativeFilteredColumnarAggState {
                 }
                 _ => {}
             },
+            Self::SumF64 { sums, counts } => {
+                if let NativeFilteredBatchInput::ProductF64(values) = input {
+                    for row in 0..keys.len() {
+                        if predicate.selected(row)
+                            && let Some(value) = values.value(row)
+                        {
+                            let key = keys.value(row) as usize;
+                            sums[key] += value;
+                            counts[key] += 1;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -900,7 +940,7 @@ impl NativeFilteredColumnarAggState {
                         }
                     }
                 }
-                NativeFilteredBatchInput::Other(_) => {}
+                NativeFilteredBatchInput::ProductF64(_) | NativeFilteredBatchInput::Other(_) => {}
             },
             Self::SumI64 { sums, counts } | Self::AvgI64 { sums, counts } => match input {
                 NativeFilteredBatchInput::I64Array(values) => {
@@ -939,6 +979,17 @@ impl NativeFilteredColumnarAggState {
                 }
                 _ => {}
             },
+            Self::SumF64 { sums, counts } => {
+                if let NativeFilteredBatchInput::ProductF64(values) = input {
+                    for row in 0..keys.len() {
+                        if let Some(value) = values.value(row) {
+                            let key = keys.value(row) as usize;
+                            sums[key] += value;
+                            counts[key] += 1;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -956,6 +1007,13 @@ impl NativeFilteredColumnarAggState {
                 NativeFilteredAggregateState::AvgI64 { sum, count },
             ) => {
                 *sum = sum.saturating_add(sums[key]);
+                *count = count.saturating_add(counts[key]);
+            }
+            (
+                Self::SumF64 { sums, counts },
+                NativeFilteredAggregateState::SumF64 { sum, count },
+            ) => {
+                *sum += sums[key];
                 *count = count.saturating_add(counts[key]);
             }
             _ => {}
@@ -1145,7 +1203,7 @@ fn native_filtered_input_present_infallible(input: &NativeFilteredBatchInput, ro
         NativeFilteredBatchInput::AlwaysSome | NativeFilteredBatchInput::NonNull => true,
         NativeFilteredBatchInput::I64Array(values) => values.is_valid(row),
         NativeFilteredBatchInput::I32Array(values) => values.is_valid(row),
-        NativeFilteredBatchInput::Other(_) => false,
+        NativeFilteredBatchInput::ProductF64(_) | NativeFilteredBatchInput::Other(_) => false,
     }
 }
 
@@ -1429,6 +1487,9 @@ fn native_filtered_initial_states(
         .iter()
         .map(|spec| match spec.expr {
             AggregateExpr::Count(_) => NativeFilteredAggregateState::Count(0),
+            AggregateExpr::Sum(_) if native_filtered_product_f64_shape(&spec.input).is_some() => {
+                NativeFilteredAggregateState::SumF64 { sum: 0.0, count: 0 }
+            }
             AggregateExpr::Sum(_) => NativeFilteredAggregateState::SumI64 { sum: 0, count: 0 },
             AggregateExpr::Avg(_) => NativeFilteredAggregateState::AvgI64 { sum: 0, count: 0 },
             AggregateExpr::Min(_) => NativeFilteredAggregateState::MinI64(None),
@@ -1534,6 +1595,20 @@ fn native_filtered_update_global_state_typed(
                             *sum = sum.saturating_add(i64::from(values.value(row)));
                             *count += 1;
                         }
+                    }
+                }
+                Ok(())
+            }
+            _ => native_filtered_update_global_state_typed_fallback(state, spec, mask, input),
+        },
+        NativeFilteredAggregateState::SumF64 { sum, count } => match input {
+            NativeFilteredBatchInput::ProductF64(values) if values.is_null_free() => {
+                for row in 0..mask.mask.len() {
+                    if mask.selected(row)
+                        && let Some(value) = values.value(row)
+                    {
+                        *sum += value;
+                        *count += 1;
                     }
                 }
                 Ok(())
@@ -2070,7 +2145,73 @@ enum NativeFilteredBatchInput {
     NonNull,
     I64Array(Int64Array),
     I32Array(Int32Array),
+    ProductF64(NativeFilteredProductF64Input),
     Other(EvaluatedScalar),
+}
+
+#[derive(Clone)]
+struct NativeFilteredProductF64Input {
+    terms: Vec<NativeFilteredProductF64Term>,
+    inv_scale: f64,
+}
+
+#[derive(Clone)]
+struct NativeFilteredProductF64Term {
+    values: Decimal128Array,
+    transform: NativeFilteredProductTransform,
+    scale: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeFilteredProductTransform {
+    Identity,
+    OneMinus,
+    OnePlus,
+}
+
+impl NativeFilteredProductF64Input {
+    #[inline]
+    fn value(&self, row: usize) -> Option<f64> {
+        match self.terms.as_slice() {
+            [left, right] => {
+                if left.values.is_null(row) || right.values.is_null(row) {
+                    return None;
+                }
+                Some(left.transformed_raw(row) * right.transformed_raw(row) * self.inv_scale)
+            }
+            [left, right, third] => {
+                if left.values.is_null(row)
+                    || right.values.is_null(row)
+                    || third.values.is_null(row)
+                {
+                    return None;
+                }
+                Some(
+                    left.transformed_raw(row)
+                        * right.transformed_raw(row)
+                        * third.transformed_raw(row)
+                        * self.inv_scale,
+                )
+            }
+            _ => None,
+        }
+    }
+
+    fn is_null_free(&self) -> bool {
+        self.terms.iter().all(|term| term.values.null_count() == 0)
+    }
+}
+
+impl NativeFilteredProductF64Term {
+    #[inline]
+    fn transformed_raw(&self, row: usize) -> f64 {
+        let raw = self.values.value(row) as f64;
+        match self.transform {
+            NativeFilteredProductTransform::Identity => raw,
+            NativeFilteredProductTransform::OneMinus => self.scale - raw,
+            NativeFilteredProductTransform::OnePlus => self.scale + raw,
+        }
+    }
 }
 
 fn native_filtered_batch_inputs(
@@ -2134,6 +2275,11 @@ fn native_filtered_batch_input(
     if spec.input_kind == NativeFilteredInputKind::AlwaysSome {
         return Ok(NativeFilteredBatchInput::AlwaysSome);
     }
+    if matches!(spec.expr, AggregateExpr::Sum(_))
+        && let Some(input) = native_filtered_product_f64_input(batch, &spec.input)?
+    {
+        return Ok(NativeFilteredBatchInput::ProductF64(input));
+    }
     let value = evaluate_scalar_expression(batch, &spec.input)?;
     match (&spec.expr, &value) {
         (AggregateExpr::Count(_), EvaluatedScalar::Array(array)) if array.null_count() == 0 => {
@@ -2169,6 +2315,87 @@ fn native_filtered_batch_input(
     }
 }
 
+fn native_filtered_product_f64_input(
+    batch: &RecordBatch,
+    expr: &ScalarSqlExpression,
+) -> Result<Option<NativeFilteredProductF64Input>> {
+    let Some(shape) = native_filtered_product_f64_shape(expr) else {
+        return Ok(None);
+    };
+    let mut terms = Vec::with_capacity(shape.len());
+    let mut scale = 1.0;
+    for (column, transform) in shape {
+        let index = output_batch_column_index(batch, &column)?;
+        let array = batch.column(index);
+        let Some(decimal) = decimal_input(array)? else {
+            return Ok(None);
+        };
+        scale *= decimal.scale;
+        terms.push(NativeFilteredProductF64Term {
+            values: decimal.values.clone(),
+            transform,
+            scale: decimal.scale,
+        });
+    }
+    Ok(Some(NativeFilteredProductF64Input {
+        terms,
+        inv_scale: scale.recip(),
+    }))
+}
+
+fn native_filtered_product_f64_shape(
+    expr: &ScalarSqlExpression,
+) -> Option<Vec<(String, NativeFilteredProductTransform)>> {
+    let mut terms = Vec::new();
+    native_filtered_collect_product_terms(expr, &mut terms)?;
+    (2..=3).contains(&terms.len()).then_some(terms)
+}
+
+fn native_filtered_collect_product_terms(
+    expr: &ScalarSqlExpression,
+    terms: &mut Vec<(String, NativeFilteredProductTransform)>,
+) -> Option<()> {
+    if let ScalarSqlExpression::Binary { left, op, right } = expr
+        && *op == BinaryOperator::Multiply
+    {
+        native_filtered_collect_product_terms(left, terms)?;
+        native_filtered_collect_product_terms(right, terms)?;
+        return Some(());
+    }
+    terms.push(native_filtered_product_term(expr)?);
+    Some(())
+}
+
+fn native_filtered_product_term(
+    expr: &ScalarSqlExpression,
+) -> Option<(String, NativeFilteredProductTransform)> {
+    if let ScalarSqlExpression::Column(column) = expr {
+        return Some((column.clone(), NativeFilteredProductTransform::Identity));
+    }
+    let ScalarSqlExpression::Binary { left, op, right } = expr else {
+        return None;
+    };
+    if !native_filtered_scalar_literal_is_one(left) {
+        return None;
+    }
+    let ScalarSqlExpression::Column(column) = right.as_ref() else {
+        return None;
+    };
+    match op {
+        BinaryOperator::Minus => Some((column.clone(), NativeFilteredProductTransform::OneMinus)),
+        BinaryOperator::Plus => Some((column.clone(), NativeFilteredProductTransform::OnePlus)),
+        _ => None,
+    }
+}
+
+fn native_filtered_scalar_literal_is_one(expr: &ScalarSqlExpression) -> bool {
+    match expr {
+        ScalarSqlExpression::Literal(LiteralValue::Int64(1)) => true,
+        ScalarSqlExpression::Literal(LiteralValue::Float64(value)) => *value == 1.0,
+        _ => false,
+    }
+}
+
 fn native_filtered_update_state(
     state: &mut NativeFilteredAggregateState,
     spec: &NativeFilteredAggregateSpec,
@@ -2184,6 +2411,12 @@ fn native_filtered_update_state(
         NativeFilteredAggregateState::SumI64 { sum, count }
         | NativeFilteredAggregateState::AvgI64 { sum, count } => {
             if let Some(value) = native_filtered_input_i64(input, row)? {
+                *sum += value;
+                *count += 1;
+            }
+        }
+        NativeFilteredAggregateState::SumF64 { sum, count } => {
+            if let Some(value) = native_filtered_input_f64(input, row)? {
                 *sum += value;
                 *count += 1;
             }
@@ -2227,6 +2460,9 @@ fn native_filtered_update_state_fast(
                 }
                 Ok(())
             }
+            NativeFilteredBatchInput::ProductF64(_) => {
+                native_filtered_update_state(state, spec, input, row)
+            }
             NativeFilteredBatchInput::Other(_) => {
                 native_filtered_update_state(state, spec, input, row)
             }
@@ -2247,8 +2483,18 @@ fn native_filtered_update_state_fast(
                 }
                 Ok(())
             }
+            NativeFilteredBatchInput::ProductF64(_) => {
+                native_filtered_update_state(state, spec, input, row)
+            }
             _ => native_filtered_update_state(state, spec, input, row),
         },
+        NativeFilteredAggregateState::SumF64 { sum, count } => {
+            if let Some(value) = native_filtered_input_f64(input, row)? {
+                *sum += value;
+                *count += 1;
+            }
+            Ok(())
+        }
         NativeFilteredAggregateState::MinI64(_) | NativeFilteredAggregateState::MaxI64(_) => {
             native_filtered_update_state(state, spec, input, row)
         }
@@ -2293,6 +2539,15 @@ fn native_filtered_update_state_infallible(
                 }
                 true
             }
+            NativeFilteredBatchInput::ProductF64(values) => {
+                if !values.is_null_free() {
+                    return false;
+                }
+                if values.value(row).is_some() {
+                    *count += 1;
+                }
+                true
+            }
             NativeFilteredBatchInput::Other(_) => false,
         },
         NativeFilteredAggregateState::SumI64 { sum, count }
@@ -2313,6 +2568,19 @@ fn native_filtered_update_state_infallible(
             }
             _ => false,
         },
+        NativeFilteredAggregateState::SumF64 { sum, count } => match input {
+            NativeFilteredBatchInput::ProductF64(values) => {
+                if !values.is_null_free() {
+                    return false;
+                }
+                if let Some(value) = values.value(row) {
+                    *sum += value;
+                    *count += 1;
+                }
+                true
+            }
+            _ => false,
+        },
         NativeFilteredAggregateState::MinI64(_) | NativeFilteredAggregateState::MaxI64(_) => false,
     }
 }
@@ -2322,6 +2590,7 @@ fn native_filtered_input_is_some(input: &NativeFilteredBatchInput, row: usize) -
         NativeFilteredBatchInput::AlwaysSome | NativeFilteredBatchInput::NonNull => true,
         NativeFilteredBatchInput::I64Array(values) => !values.is_null(row),
         NativeFilteredBatchInput::I32Array(values) => !values.is_null(row),
+        NativeFilteredBatchInput::ProductF64(values) => values.value(row).is_some(),
         NativeFilteredBatchInput::Other(value) => scalar_value_at(value, row)?.is_some(),
     })
 }
@@ -2343,7 +2612,24 @@ fn native_filtered_input_i64(input: &NativeFilteredBatchInput, row: usize) -> Re
                 Ok(Some(i64::from(values.value(row))))
             }
         }
+        NativeFilteredBatchInput::ProductF64(_) => Err(DodamError::UnsupportedSql(
+            "filtered product input is not an integer".to_string(),
+        )),
         NativeFilteredBatchInput::Other(value) => scalar_value_as_i64(value, row),
+    }
+}
+
+fn native_filtered_input_f64(input: &NativeFilteredBatchInput, row: usize) -> Result<Option<f64>> {
+    match input {
+        NativeFilteredBatchInput::ProductF64(values) => Ok(values.value(row)),
+        NativeFilteredBatchInput::I64Array(values) => {
+            Ok(values.is_valid(row).then(|| values.value(row) as f64))
+        }
+        NativeFilteredBatchInput::I32Array(values) => {
+            Ok(values.is_valid(row).then(|| f64::from(values.value(row))))
+        }
+        NativeFilteredBatchInput::Other(value) => scalar_value_as_f64(value, row),
+        NativeFilteredBatchInput::AlwaysSome | NativeFilteredBatchInput::NonNull => Ok(None),
     }
 }
 
@@ -2360,6 +2646,9 @@ fn native_filtered_finish_states(
                 NativeFilteredAggregateState::Count(count) => AggregateValue::Count(count),
                 NativeFilteredAggregateState::SumI64 { sum, count } => {
                     AggregateValue::Int64((count > 0).then_some(sum))
+                }
+                NativeFilteredAggregateState::SumF64 { sum, count } => {
+                    AggregateValue::Float64((count > 0).then_some(sum))
                 }
                 NativeFilteredAggregateState::AvgI64 { sum, count } => {
                     AggregateValue::Float64((count > 0).then_some(sum as f64 / count as f64))

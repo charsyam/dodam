@@ -110,7 +110,7 @@ def main() -> int:
 def ensure_fixture(duckdb: str, data_dir: Path, timeout: float, scale: int) -> None:
     facts = data_dir / "facts.parquet"
     facts_scrambled = data_dir / "facts_scrambled.parquet"
-    product = data_dir / "product_v2.parquet"
+    product = data_dir / "product_v3.parquet"
     dim = data_dir / "dim.parquet"
     nested = data_dir / "nested.parquet"
     if (
@@ -152,6 +152,7 @@ COPY (
 COPY (
   SELECT
     i::INTEGER AS id,
+    (i % 10)::INTEGER AS bucket,
     CAST((i % 10000) / 100.0 AS DECIMAL(18,2)) AS amount,
     CAST((i % 100) / 100.0 AS DECIMAL(18,2)) AS rate,
     CAST((i % 8) / 100.0 AS DECIMAL(18,2)) AS tax,
@@ -188,7 +189,7 @@ COPY (
 def generic_queries(data_dir: Path) -> list[GenericQuery]:
     facts = data_dir / "facts.parquet"
     facts_scrambled = data_dir / "facts_scrambled.parquet"
-    product = data_dir / "product_v2.parquet"
+    product = data_dir / "product_v3.parquet"
     dim = data_dir / "dim.parquet"
     nested = data_dir / "nested.parquet"
     return [
@@ -256,6 +257,21 @@ def generic_queries(data_dir: Path) -> list[GenericQuery]:
             "standard_three_factor_product_sum",
             f"SELECT sum(amount * (1 - rate) * (1 + tax)) FROM '{product}' WHERE event_date < '2024-01-20' AND amount >= '10.00' AND amount < '20.00'",
             f"SELECT sum(amount * (1 - rate) * (1 + tax)) FROM read_parquet('{product}') WHERE event_date < '2024-01-20' AND amount >= '10.00' AND amount < '20.00'",
+        ),
+        GenericQuery(
+            "standard_filter_product_sum",
+            f"SELECT sum(amount * (1 - rate)) FILTER (WHERE event_date < '2024-01-20') FROM '{product}' WHERE amount >= '10.00' AND amount < '20.00'",
+            f"SELECT sum(amount * (1 - rate)) FILTER (WHERE event_date < '2024-01-20') FROM read_parquet('{product}') WHERE amount >= '10.00' AND amount < '20.00'",
+        ),
+        GenericQuery(
+            "standard_filter_three_factor_product_sum",
+            f"SELECT sum(amount * (1 - rate) * (1 + tax)) FILTER (WHERE event_date < '2024-01-20') FROM '{product}' WHERE amount >= '10.00' AND amount < '20.00'",
+            f"SELECT sum(amount * (1 - rate) * (1 + tax)) FILTER (WHERE event_date < '2024-01-20') FROM read_parquet('{product}') WHERE amount >= '10.00' AND amount < '20.00'",
+        ),
+        GenericQuery(
+            "standard_grouped_filter_product_sum",
+            f"SELECT bucket, sum(amount * (1 - rate)) FILTER (WHERE event_date < '2024-01-20') FROM '{product}' WHERE amount >= '10.00' AND amount < '20.00' GROUP BY bucket ORDER BY bucket",
+            f"SELECT bucket, sum(amount * (1 - rate)) FILTER (WHERE event_date < '2024-01-20') FROM read_parquet('{product}') WHERE amount >= '10.00' AND amount < '20.00' GROUP BY bucket ORDER BY bucket",
         ),
         GenericQuery(
             "review_high_cardinality_group",
