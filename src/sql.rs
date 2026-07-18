@@ -128,6 +128,7 @@ mod join_projection_plan;
 mod late_materialization;
 mod literal_values;
 mod literals;
+mod memory_policy;
 mod metadata_predicate;
 mod nation_market_share;
 mod native_filtered;
@@ -247,6 +248,7 @@ use literals::{
     parse_timestamp_millis_value, parse_usize_literal, parse_ymd, sql_comparison_op,
     sql_like_escape, sql_like_pattern, sql_literal_value,
 };
+use memory_policy::{default_join_memory_limit_bytes, join_memory_limit_bytes};
 use metadata_predicate::simplify_filtered_aggregates_with_parquet_stats;
 use nation_market_share::*;
 use native_filtered::{
@@ -447,21 +449,6 @@ pub async fn execute_sql_with_options(
     }
 
     execute_single_table_scan_query(engine, query, batch_size).await
-}
-
-fn default_join_memory_limit_bytes() -> u64 {
-    std::env::var("DODAM_JOIN_MEMORY_LIMIT_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(128 * 1024 * 1024)
-}
-
-fn join_memory_limit_bytes(options: SqlExecutionOptions) -> u64 {
-    options
-        .join_memory_limit_bytes
-        .filter(|value| *value > 0)
-        .unwrap_or_else(default_join_memory_limit_bytes)
 }
 
 #[cfg(test)]
