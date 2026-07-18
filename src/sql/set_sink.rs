@@ -206,11 +206,11 @@ fn try_write_same_source_union_all_primitive_to_sink(
         values,
         negated,
         ..
-    } = shared.filter.expr()
+    } = shared.filter.expr().clone()
     else {
         return Ok(false);
     };
-    if *negated {
+    if negated {
         return Ok(false);
     }
     let mut scan_projection = shared.projection.clone();
@@ -233,7 +233,7 @@ fn try_write_same_source_union_all_primitive_to_sink(
     }
     let Some(filter_index) = scan_columns
         .iter()
-        .position(|column| column == filter_column)
+        .position(|column| column == &filter_column)
     else {
         return Ok(false);
     };
@@ -241,13 +241,13 @@ fn try_write_same_source_union_all_primitive_to_sink(
         DirectPrimitiveColumnType::I32 => PrimitiveFilterValues::I32(
             values
                 .iter()
-                .map(|value| value.as_i32(filter_column))
+                .map(|value| value.as_i32(&filter_column))
                 .collect::<Result<Vec<_>>>()?,
         ),
         DirectPrimitiveColumnType::I64 => PrimitiveFilterValues::I64(
             values
                 .iter()
-                .map(|value| value.as_i64(filter_column))
+                .map(|value| value.as_i64(&filter_column))
                 .collect::<Result<Vec<_>>>()?,
         ),
         DirectPrimitiveColumnType::Date32
@@ -898,11 +898,11 @@ fn try_write_same_source_union_all_ordered_desc_primitive_to_sink(
         values,
         negated,
         ..
-    } = shared.filter.expr()
+    } = shared.filter.expr().clone()
     else {
         return Ok(false);
     };
-    if *negated || !columns.iter().any(|column| column == sort_column) {
+    if negated || !columns.iter().any(|column| column == sort_column) {
         return Ok(false);
     }
     let Some(column_types) = engine.parquet_direct_primitive_column_types(&shared.path, columns)?
@@ -917,20 +917,20 @@ fn try_write_same_source_union_all_ordered_desc_primitive_to_sink(
     }) {
         return Ok(false);
     }
-    let Some(filter_index) = columns.iter().position(|column| column == filter_column) else {
+    let Some(filter_index) = columns.iter().position(|column| column == &filter_column) else {
         return Ok(false);
     };
     let filter_values = match column_types[filter_index] {
         DirectPrimitiveColumnType::I32 => PrimitiveFilterValues::I32(
             values
                 .iter()
-                .map(|value| value.as_i32(filter_column))
+                .map(|value| value.as_i32(&filter_column))
                 .collect::<Result<Vec<_>>>()?,
         ),
         DirectPrimitiveColumnType::I64 => PrimitiveFilterValues::I64(
             values
                 .iter()
-                .map(|value| value.as_i64(filter_column))
+                .map(|value| value.as_i64(&filter_column))
                 .collect::<Result<Vec<_>>>()?,
         ),
         DirectPrimitiveColumnType::Date32
