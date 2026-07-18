@@ -472,3 +472,218 @@ async fn rewrite_materializable_subqueries_to_literals(
         expr => Ok(Some(expr)),
     }
 }
+pub(super) async fn parse_filter_with_subqueries(
+    engine: &DodamEngine,
+    expr: &SqlExpr,
+    aliases: &[(String, String)],
+    table_alias: Option<&str>,
+    allow_aggregates: bool,
+    batch_size: usize,
+) -> Result<Option<Expr>> {
+    match expr {
+        SqlExpr::Exists { subquery, negated } => {
+            let exists = query_output_batches(
+                Box::pin(execute_sql(engine, &subquery.to_string(), batch_size)).await?,
+            )?
+            .iter()
+            .any(|batch| batch.num_rows() > 0);
+            Ok(Some(Expr::Boolean(Some(if *negated {
+                !exists
+            } else {
+                exists
+            }))))
+        }
+        SqlExpr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            let output = Box::pin(execute_sql(engine, &subquery.to_string(), batch_size)).await?;
+            let values = literal_values_from_single_column_batches(query_output_batches(output)?)?;
+            if let Ok(value) = sql_literal_value(expr) {
+                return Ok(Some(Expr::Boolean(evaluate_literal_in_values(
+                    &value, &values, *negated,
+                ))));
+            }
+            Ok(Some(Expr::InList {
+                column: sql_filter_column(expr, aliases, table_alias, allow_aggregates)?,
+                has_null: subquery_values_contain_null(&values),
+                values: non_null_subquery_values(values),
+                negated: *negated,
+            }))
+        }
+        SqlExpr::InList {
+            expr: in_expr,
+            list,
+            negated,
+        } => {
+            if predicate_requires_expression_path(expr) {
+                return Ok(None);
+            }
+            if let Ok(value) = sql_literal_value(in_expr) {
+                return Ok(Some(Expr::Boolean(evaluate_literal_in_list(
+                    &value, list, *negated,
+                )?)));
+            }
+            Ok(Some(sql_expr_to_filter_expr(
+                expr,
+                aliases,
+                table_alias,
+                allow_aggregates,
+            )?))
+        }
+        SqlExpr::UnaryOp { op, expr } if *op == UnaryOperator::Not => {
+            let Some(expr) = Box::pin(parse_filter_with_subqueries(
+                engine,
+                expr,
+                aliases,
+                table_alias,
+                allow_aggregates,
+                batch_size,
+            ))
+            .await?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(Expr::Not(Box::new(expr))))
+        }
+        SqlExpr::IsNull(inner) | SqlExpr::IsNotNull(inner) => {
+            if let Ok(value) = sql_literal_value(inner) {
+                let is_null = matches!(value, LiteralValue::Null);
+                let is_not_null = matches!(expr, SqlExpr::IsNotNull(_));
+                return Ok(Some(Expr::Boolean(Some(if is_not_null {
+                    !is_null
+                } else {
+                    is_null
+                }))));
+            }
+            Ok(Some(sql_expr_to_filter_expr(
+                expr,
+                aliases,
+                table_alias,
+                allow_aggregates,
+            )?))
+        }
+        SqlExpr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
+            let left = Box::pin(parse_filter_with_subqueries(
+                engine,
+                left,
+                aliases,
+                table_alias,
+                allow_aggregates,
+                batch_size,
+            ))
+            .await?;
+            let right = Box::pin(parse_filter_with_subqueries(
+                engine,
+                right,
+                aliases,
+                table_alias,
+                allow_aggregates,
+                batch_size,
+            ))
+            .await?;
+            Ok(Some(match (left, right) {
+                (Some(left), Some(right)) => Expr::And(Box::new(left), Box::new(right)),
+                (Some(expr), None) | (None, Some(expr)) => expr,
+                (None, None) => return Ok(None),
+            }))
+        }
+        SqlExpr::BinaryOp { left, op, right } if *op == BinaryOperator::Or => {
+            let left = Box::pin(parse_filter_with_subqueries(
+                engine,
+                left,
+                aliases,
+                table_alias,
+                allow_aggregates,
+                batch_size,
+            ))
+            .await?;
+            let right = Box::pin(parse_filter_with_subqueries(
+                engine,
+                right,
+                aliases,
+                table_alias,
+                allow_aggregates,
+                batch_size,
+            ))
+            .await?;
+            Ok(Some(match (left, right) {
+                (Some(left), Some(right)) => Expr::Or(Box::new(left), Box::new(right)),
+                (Some(expr), None) | (None, Some(expr)) => expr,
+                (None, None) => return Ok(None),
+            }))
+        }
+        SqlExpr::BinaryOp { left, op, right }
+            if matches!(
+                op,
+                BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+            ) && matches!(right.as_ref(), SqlExpr::Subquery(_)) =>
+        {
+            let SqlExpr::Subquery(subquery) = right.as_ref() else {
+                unreachable!("validated scalar subquery")
+            };
+            let output = Box::pin(execute_sql(engine, &subquery.to_string(), batch_size)).await?;
+            let value = scalar_literal_value_from_batches(query_output_batches(output)?)?;
+            if let Ok(left) = sql_literal_value(left) {
+                return Ok(Some(Expr::Boolean(compare_literal_values(
+                    &left, op, &value,
+                )?)));
+            }
+            Ok(Some(Expr::Comparison(ComparisonExpr {
+                column: sql_filter_column(left, aliases, table_alias, allow_aggregates)?,
+                op: sql_comparison_op(op),
+                value,
+            })))
+        }
+        SqlExpr::BinaryOp { left, op, right }
+            if matches!(
+                op,
+                BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+            ) =>
+        {
+            if predicate_requires_expression_path(expr) {
+                return Ok(None);
+            }
+            if let (Ok(left), Ok(right)) = (sql_literal_value(left), sql_literal_value(right)) {
+                return Ok(Some(Expr::Boolean(compare_literal_values(
+                    &left, op, &right,
+                )?)));
+            }
+            Ok(Some(sql_expr_to_filter_expr(
+                expr,
+                aliases,
+                table_alias,
+                allow_aggregates,
+            )?))
+        }
+        SqlExpr::Nested(expr) => {
+            Box::pin(parse_filter_with_subqueries(
+                engine,
+                expr,
+                aliases,
+                table_alias,
+                allow_aggregates,
+                batch_size,
+            ))
+            .await
+        }
+        _ if predicate_requires_expression_path(expr) => Ok(None),
+        _ => Ok(Some(sql_expr_to_filter_expr(
+            expr,
+            aliases,
+            table_alias,
+            allow_aggregates,
+        )?)),
+    }
+}
