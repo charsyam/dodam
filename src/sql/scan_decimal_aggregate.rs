@@ -3,6 +3,8 @@ use super::*;
 #[derive(Clone)]
 struct DecimalProductSumSpec {
     sum_expr: AggregateExpr,
+    left_column: String,
+    right_column: String,
     left_kind: ProductColumnKind,
     right_kind: ProductColumnKind,
     projection: Vec<String>,
@@ -51,9 +53,15 @@ enum PrimitivePredicateVector<'a> {
 impl PrimitivePredicateVectors<'_> {
     #[inline]
     fn matches(&self, row: usize) -> bool {
-        self.predicates
-            .iter()
-            .all(|predicate| predicate.matches(row))
+        match self.predicates.as_slice() {
+            [] => true,
+            [first] => first.matches(row),
+            [first, second] => first.matches(row) && second.matches(row),
+            [first, second, third] => {
+                first.matches(row) && second.matches(row) && third.matches(row)
+            }
+            predicates => predicates.iter().all(|predicate| predicate.matches(row)),
+        }
     }
 }
 
@@ -92,16 +100,30 @@ pub(super) async fn try_collect_filtered_decimal_product_sum_scan_fold(
     expressions: &[ProjectionExpression],
 ) -> Result<Option<AggregateMetrics>> {
     let Some(filter) = filter.as_ref() else {
+        log_product_sum_rule_miss("missing-filter");
         return Ok(None);
     };
     if !path.exists() {
+        log_product_sum_rule_miss("path-missing");
         return Ok(None);
     }
     let Some(spec) =
         DecimalProductSumSpec::try_new(engine, &path, filter, aggregates, expressions)?
     else {
+        log_product_sum_rule_miss("spec-mismatch");
         return Ok(None);
     };
+    if let Some(metrics) = try_collect_filtered_product_sum_late_materialized(
+        engine,
+        path.clone(),
+        batch_size,
+        filter,
+        &spec,
+    )
+    .await?
+    {
+        return Ok(Some(metrics));
+    }
     let started = Instant::now();
     let state = engine
         .parquet_scan_accumulate_chunks_view(
@@ -143,6 +165,91 @@ pub(super) async fn try_collect_filtered_decimal_product_sum_scan_fold(
     }))
 }
 
+async fn try_collect_filtered_product_sum_late_materialized(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    filter: &FilterExpr,
+    spec: &DecimalProductSumSpec,
+) -> Result<Option<AggregateMetrics>> {
+    if !matches!(
+        (spec.left_kind, spec.right_kind),
+        (
+            ProductColumnKind::DecimalI64 { .. },
+            ProductColumnKind::DecimalI64 { .. }
+        )
+    ) {
+        return Ok(None);
+    }
+    let predicate_columns = filter.referenced_columns();
+    if predicate_columns.is_empty() {
+        return Ok(None);
+    }
+    let payload_columns = vec![spec.left_column.clone(), spec.right_column.clone()];
+    let sum_expr = spec.sum_expr.clone();
+    let left_kind = spec.left_kind;
+    let right_kind = spec.right_kind;
+    let started = Instant::now();
+    let Some(partials) = engine
+        .late_materialized_parquet_map_pruned_with_policy_view(
+            path,
+            batch_size,
+            Projection::Columns(predicate_columns.clone()),
+            Projection::Columns(payload_columns),
+            vec![filter.expr().clone()],
+            scan_aggregate_row_group_chunk(),
+            LateMaterializationPolicy::selective_with_selector_run_ratio(
+                filtered_product_sum_late_max_selected_ratio(),
+                filtered_product_sum_late_max_selector_run_ratio(),
+            )
+            .with_io_cost_gate(true),
+            move || DecimalProductSumState::default(),
+            {
+                let filter = filter.clone();
+                let predicate_columns = predicate_columns.clone();
+                move |view, selection, _state: &mut DecimalProductSumState| {
+                    if push_projected_view_filter_selection(
+                        view,
+                        &predicate_columns,
+                        &filter,
+                        selection,
+                    )? {
+                        return Ok(Some(()));
+                    }
+                    Ok(None)
+                }
+            },
+            move |view, state: &mut DecimalProductSumState| {
+                consume_product_payload_view(view, left_kind, right_kind, state)?;
+                Ok(Some(()))
+            },
+            |state, _metrics| Ok(Some(state)),
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let mut state = DecimalProductSumState::default();
+    for partial in partials {
+        state.sum += partial.output.sum;
+        state.int_sum += partial.output.int_sum;
+        state.count += partial.output.count;
+        state.rows += partial.metrics.total_rows;
+        state.batches += partial.output.batches;
+    }
+    Ok(Some(AggregateMetrics {
+        fragments: 1,
+        batches: state.batches,
+        rows: state.rows,
+        values: vec![AggregateResult {
+            expr: sum_expr,
+            value: spec.aggregate_value(&state)?,
+        }],
+        aggregate_nanos: started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        ..AggregateMetrics::default()
+    }))
+}
+
 impl DecimalProductSumSpec {
     fn try_new(
         engine: &DodamEngine,
@@ -152,21 +259,27 @@ impl DecimalProductSumSpec {
         expressions: &[ProjectionExpression],
     ) -> Result<Option<Self>> {
         let [AggregateExpr::Sum(sum_column)] = aggregates else {
+            log_product_sum_rule_miss("aggregate-not-single-sum");
             return Ok(None);
         };
         let [expression] = expressions else {
+            log_product_sum_rule_miss("expression-not-single");
             return Ok(None);
         };
         if expression.output_name != *sum_column {
+            log_product_sum_rule_miss("expression-output-mismatch");
             return Ok(None);
         }
         let Some((left_column, right_column)) = decimal_product_columns(&expression.expr) else {
+            log_product_sum_rule_miss("expression-not-column-product");
             return Ok(None);
         };
         let Some(left_kind) = product_column_kind(engine, path, left_column)? else {
+            log_product_sum_rule_miss("left-product-type-unsupported");
             return Ok(None);
         };
         let Some(right_kind) = product_column_kind(engine, path, right_column)? else {
+            log_product_sum_rule_miss("right-product-type-unsupported");
             return Ok(None);
         };
         if matches!(
@@ -183,6 +296,7 @@ impl DecimalProductSumSpec {
             )
         ) {
         } else {
+            log_product_sum_rule_miss("mixed-product-types");
             return Ok(None);
         }
         if matches!(
@@ -193,6 +307,7 @@ impl DecimalProductSumSpec {
             )
         ) && std::env::var_os("DODAM_ENABLE_INTEGER_PRODUCT_SUM_SCAN_FOLD").is_none()
         {
+            log_product_sum_rule_miss("integer-product-default-disabled");
             return Ok(None);
         }
         let mut projection = Vec::new();
@@ -208,14 +323,18 @@ impl DecimalProductSumSpec {
             {
                 predicates.push(predicate);
             } else {
+                log_product_sum_rule_miss("predicate-unsupported");
                 return Ok(None);
             }
         }
         if predicates.is_empty() {
+            log_product_sum_rule_miss("no-primitive-predicates");
             return Ok(None);
         }
         Ok(Some(Self {
             sum_expr: aggregates[0].clone(),
+            left_column: left_column.to_string(),
+            right_column: right_column.to_string(),
             left_kind,
             right_kind,
             projection,
@@ -270,6 +389,13 @@ fn product_column_kind(
     column: &str,
 ) -> Result<Option<ProductColumnKind>> {
     let column = column.to_string();
+    if let Some((precision, scale)) = engine.parquet_decimal128_type(path, &column)? {
+        if precision <= 18 {
+            return Ok(Some(ProductColumnKind::DecimalI64 {
+                scale: decimal_scale_i64_local(scale)?,
+            }));
+        }
+    }
     if let Some(types) =
         engine.parquet_direct_primitive_column_types(path, std::slice::from_ref(&column))?
     {
@@ -557,6 +683,69 @@ fn consume_product_sum_vectors(
         }
         _ => Ok(false),
     }
+}
+
+fn consume_product_payload_view(
+    view: BatchView<'_>,
+    left_kind: ProductColumnKind,
+    right_kind: ProductColumnKind,
+    state: &mut DecimalProductSumState,
+) -> Result<()> {
+    state.batches += 1;
+    match (left_kind, right_kind) {
+        (
+            ProductColumnKind::DecimalI64 { scale: left_scale },
+            ProductColumnKind::DecimalI64 { scale: right_scale },
+        ) => {
+            let (Some(left), Some(right)) = (view.decimal128_vector(0), view.decimal128_vector(1))
+            else {
+                return Ok(());
+            };
+            if left.scale_i64() != Some(left_scale) || right.scale_i64() != Some(right_scale) {
+                return Ok(());
+            }
+            let scale = (left_scale as f64) * (right_scale as f64);
+            for row in 0..view.num_rows() {
+                if left.is_null(row) || right.is_null(row) {
+                    continue;
+                }
+                let Some(left) = left.raw_i64_value(row) else {
+                    continue;
+                };
+                let Some(right) = right.raw_i64_value(row) else {
+                    continue;
+                };
+                state.sum += (left as f64) * (right as f64) / scale;
+                state.count += 1;
+            }
+        }
+        (ProductColumnKind::Int64, ProductColumnKind::Int64) => {
+            let (Some(left), Some(right)) = (view.i64_vector(0), view.i64_vector(1)) else {
+                return Ok(());
+            };
+            for row in 0..view.num_rows() {
+                if left.is_null(row) || right.is_null(row) {
+                    continue;
+                }
+                state.int_sum += i128::from(left.value(row)) * i128::from(right.value(row));
+                state.count += 1;
+            }
+        }
+        (ProductColumnKind::Int32, ProductColumnKind::Int32) => {
+            let (Some(left), Some(right)) = (view.i32_vector(0), view.i32_vector(1)) else {
+                return Ok(());
+            };
+            for row in 0..view.num_rows() {
+                if left.is_null(row) || right.is_null(row) {
+                    continue;
+                }
+                state.int_sum += i128::from(left.value(row)) * i128::from(right.value(row));
+                state.count += 1;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn bind_predicate_vectors<'a>(
@@ -898,4 +1087,30 @@ fn decimal_scale_i64_local(scale: i8) -> Result<i64> {
     10_i64
         .checked_pow(scale)
         .ok_or_else(|| DodamError::UnsupportedSql("decimal scale overflow".to_string()))
+}
+
+fn filtered_product_sum_late_max_selected_ratio() -> f64 {
+    std::env::var("DODAM_FILTERED_PRODUCT_SUM_LATE_MAX_SELECTED_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.20)
+        .clamp(0.0, 1.0)
+}
+
+fn filtered_product_sum_late_max_selector_run_ratio() -> f64 {
+    std::env::var("DODAM_FILTERED_PRODUCT_SUM_LATE_MAX_SELECTOR_RUN_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.50)
+        .clamp(0.0, 1.0)
+}
+
+fn log_product_sum_rule_miss(reason: &str) {
+    if std::env::var("DODAM_PRODUCT_SUM_PROFILE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        eprintln!("[dodam:product-sum-profile] miss reason={reason}");
+    }
 }

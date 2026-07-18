@@ -1241,7 +1241,7 @@ fn evaluate_filter_mask_for_projected_view(
     evaluate_expr_mask_for_projected_view(view, columns, filter.expr())
 }
 
-fn push_projected_view_filter_selection(
+pub(super) fn push_projected_view_filter_selection(
     view: BatchView<'_>,
     columns: &[String],
     filter: &FilterExpr,
