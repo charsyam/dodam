@@ -160,7 +160,329 @@ async fn supplier_discounted_revenue_by_date(
     start_days: i32,
     end_days: i32,
 ) -> Result<HashMap<i64, f64>> {
-    q15_revenue_by_supplier(engine, path, batch_size, start_days, end_days).await
+    if let Some(revenues) =
+        supplier_discounted_revenue_direct(engine, &path, batch_size, start_days, end_days)?
+    {
+        return Ok(revenues);
+    }
+    let projection = Projection::Columns(vec![
+        "l_suppkey".to_string(),
+        "l_shipdate".to_string(),
+        "l_extendedprice".to_string(),
+        "l_discount".to_string(),
+    ]);
+    engine
+        .parquet_scan_accumulate_chunks_view(
+            path,
+            batch_size,
+            projection,
+            scan_aggregate_row_group_chunk(),
+            8,
+            scan_aggregate_fusion_enabled(),
+            HashMap::<i64, f64>::new,
+            HashMap::<i64, f64>::new,
+            move |view, revenues| {
+                supplier_discounted_revenue_view_into(view, start_days, end_days, revenues)?;
+                Ok(Some(()))
+            },
+            merge_f64_groups,
+            "top-supplier revenue aggregate",
+        )
+        .await
+}
+
+fn supplier_discounted_revenue_direct(
+    engine: &DodamEngine,
+    path: &Path,
+    batch_size: usize,
+    start_days: i32,
+    end_days: i32,
+) -> Result<Option<HashMap<i64, f64>>> {
+    if !direct_discounted_revenue_selected_fold_enabled() {
+        return Ok(None);
+    }
+    let trace = std::env::var("DODAM_DIRECT_SELECTION_TRACE")
+        .or_else(|_| std::env::var("DODAM_TPCH_PROFILE"))
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
+    if trace {
+        eprintln!("[dodam:direct-selected] top-supplier revenue candidate");
+    }
+    if !direct_selection_fold_enabled() {
+        if trace {
+            eprintln!(
+                "[dodam:direct-selected] top-supplier revenue reject: direct selection fold disabled"
+            );
+        }
+        return Ok(None);
+    }
+    let Some((_price_precision, price_scale)) =
+        engine.parquet_decimal128_type(path, "l_extendedprice")?
+    else {
+        if trace {
+            eprintln!(
+                "[dodam:direct-selected] top-supplier revenue reject: l_extendedprice is not Decimal128"
+            );
+        }
+        return Ok(None);
+    };
+    let Some((_discount_precision, discount_decimal_scale)) =
+        engine.parquet_decimal128_type(path, "l_discount")?
+    else {
+        if trace {
+            eprintln!(
+                "[dodam:direct-selected] top-supplier revenue reject: l_discount is not Decimal128"
+            );
+        }
+        return Ok(None);
+    };
+    let date_max = end_days.checked_sub(1).ok_or_else(|| {
+        DodamError::UnsupportedSql(
+            "invalid empty top-supplier revenue date range for direct fold".to_string(),
+        )
+    })?;
+    let row_groups = (0..engine.parquet_row_group_count(path)?).collect::<Vec<_>>();
+    let discount_scale = decimal_scale_factor(discount_decimal_scale);
+    let revenue_scale =
+        1.0 / (decimal_scale_factor(price_scale) * decimal_scale_factor(discount_decimal_scale));
+    let Some((revenues, _metrics)) = engine
+        .scan_parquet_i64_date_decimal_decimal_selected_typed_fold(
+            path,
+            batch_size,
+            &row_groups,
+            ["l_suppkey", "l_shipdate", "l_extendedprice", "l_discount"],
+            Some(start_days),
+            Some(date_max),
+            HashMap::<i64, f64>::new,
+            move |revenues, batch| {
+                supplier_discounted_revenue_direct_batch_into(
+                    batch,
+                    start_days,
+                    end_days,
+                    discount_scale,
+                    revenue_scale,
+                    revenues,
+                )
+            },
+            |revenues, partial| {
+                merge_f64_groups(revenues, partial);
+                Ok(())
+            },
+        )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(revenues))
+}
+
+fn direct_discounted_revenue_selected_fold_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_DIRECT_DISCOUNTED_REVENUE_SELECTED_FOLD")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn supplier_discounted_revenue_direct_batch_into(
+    batch: crate::storage::DirectI64DateDecimalDecimalSelectedBatch<'_>,
+    start_days: i32,
+    end_days: i32,
+    discount_scale: f64,
+    revenue_scale: f64,
+    revenues: &mut HashMap<i64, f64>,
+) -> Result<()> {
+    if batch.keys.len() != batch.left_decimals.len()
+        || batch.keys.len() != batch.right_decimals.len()
+        || batch.keys.len() != batch.dates.len()
+    {
+        return Err(DodamError::UnsupportedSql(
+            "direct discounted revenue batch length mismatch".to_string(),
+        ));
+    }
+    if batch.predicate_applied {
+        for row in 0..batch.keys.len() {
+            *revenues.entry(batch.keys[row]).or_insert(0.0) += decimal_discounted_revenue_raw_i64(
+                batch.left_decimals[row],
+                batch.right_decimals[row],
+                discount_scale,
+                revenue_scale,
+            );
+        }
+        return Ok(());
+    }
+    for row in 0..batch.keys.len() {
+        let date = batch.dates[row];
+        if date >= start_days && date < end_days {
+            *revenues.entry(batch.keys[row]).or_insert(0.0) += decimal_discounted_revenue_raw_i64(
+                batch.left_decimals[row],
+                batch.right_decimals[row],
+                discount_scale,
+                revenue_scale,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn supplier_discounted_revenue_batch_into<S: BuildHasher>(
+    batch: RecordBatch,
+    start_days: i32,
+    end_days: i32,
+    revenues: &mut HashMap<i64, f64, S>,
+) -> Result<()> {
+    let suppkeys = batch_column(&batch, "l_suppkey")?;
+    let shipdates = batch_column(&batch, "l_shipdate")?;
+    let extendedprices = batch_column(&batch, "l_extendedprice")?;
+    let discounts = batch_column(&batch, "l_discount")?;
+    if let (Some(suppkeys), Some(shipdates), Some(extendedprices), Some(discounts)) = (
+        suppkeys.as_any().downcast_ref::<Int64Array>(),
+        shipdates.as_any().downcast_ref::<Date32Array>(),
+        decimal_input(extendedprices)?,
+        decimal_input(discounts)?,
+    ) {
+        for row in 0..batch.num_rows() {
+            if suppkeys.is_null(row)
+                || shipdates.is_null(row)
+                || extendedprices.is_null(row)
+                || discounts.is_null(row)
+            {
+                continue;
+            }
+            let shipdate = shipdates.value(row);
+            if shipdate < start_days || shipdate >= end_days {
+                continue;
+            }
+            *revenues.entry(suppkeys.value(row)).or_insert(0.0) +=
+                extendedprices.value(row) * (1.0 - discounts.value(row));
+        }
+        return Ok(());
+    }
+    for row in 0..batch.num_rows() {
+        let Some(shipdate) = date32_value(shipdates, row)? else {
+            continue;
+        };
+        if shipdate < start_days || shipdate >= end_days {
+            continue;
+        }
+        let (Some(suppkey), Some(extendedprice), Some(discount)) = (
+            numeric_i64_value(suppkeys, row)?,
+            numeric_f64_value(extendedprices, row)?,
+            numeric_f64_value(discounts, row)?,
+        ) else {
+            continue;
+        };
+        *revenues.entry(suppkey).or_insert(0.0) += extendedprice * (1.0 - discount);
+    }
+    Ok(())
+}
+
+fn supplier_discounted_revenue_view_into(
+    view: BatchView<'_>,
+    start_days: i32,
+    end_days: i32,
+    revenues: &mut HashMap<i64, f64>,
+) -> Result<()> {
+    if view.num_columns() == 4 {
+        if update_i64_grouped_discounted_revenue_by_date_view(
+            view, 0, 1, 2, 3, start_days, end_days, revenues,
+        )? {
+            return Ok(());
+        }
+        let (Some(suppkeys), Some(shipdates), Some(extendedprices), Some(discounts)) = (
+            view.i64_vector(0),
+            view.date32_vector(1),
+            view.decimal128_vector(2),
+            view.decimal128_vector(3),
+        ) else {
+            let Some(batch) = view.try_record_batch() else {
+                return Ok(());
+            };
+            return supplier_discounted_revenue_batch_into(
+                batch.clone(),
+                start_days,
+                end_days,
+                revenues,
+            );
+        };
+        for row in 0..view.num_rows() {
+            if suppkeys.is_null(row)
+                || shipdates.is_null(row)
+                || extendedprices.is_null(row)
+                || discounts.is_null(row)
+            {
+                continue;
+            }
+            let shipdate = shipdates.value(row);
+            if shipdate < start_days || shipdate >= end_days {
+                continue;
+            }
+            *revenues.entry(suppkeys.value(row)).or_insert(0.0) +=
+                extendedprices.value(row) * (1.0 - discounts.value(row));
+        }
+        return Ok(());
+    }
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(());
+    };
+    supplier_discounted_revenue_batch_into(batch.clone(), start_days, end_days, revenues)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_i64_grouped_discounted_revenue_by_date_view<S: BuildHasher>(
+    view: BatchView<'_>,
+    key_index: usize,
+    date_index: usize,
+    extendedprice_index: usize,
+    discount_index: usize,
+    start_days: i32,
+    end_days: i32,
+    revenues: &mut HashMap<i64, f64, S>,
+) -> Result<bool> {
+    let (Some(keys), Some(dates), Some(extendedprices), Some(discounts)) = (
+        view.i64_vector(key_index),
+        view.date32_vector(date_index),
+        view.decimal128_vector(extendedprice_index),
+        view.decimal128_vector(discount_index),
+    ) else {
+        return Ok(false);
+    };
+    let (Some(key_values), Some(date_values)) =
+        (keys.values_if_null_free(), dates.values_if_null_free())
+    else {
+        return Ok(false);
+    };
+    if extendedprices.null_count() != 0 || discounts.null_count() != 0 {
+        return Ok(false);
+    }
+    let discount_scale = discounts.scale();
+    let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
+    if let (Some(extendedprice_values), Some(discount_values)) =
+        (extendedprices.raw_i64_values(), discounts.raw_i64_values())
+    {
+        for row in 0..view.num_rows() {
+            let date = date_values[row];
+            if date >= start_days && date < end_days {
+                *revenues.entry(key_values[row]).or_insert(0.0) +=
+                    decimal_discounted_revenue_raw_i64(
+                        extendedprice_values[row],
+                        discount_values[row],
+                        discount_scale,
+                        revenue_scale,
+                    );
+            }
+        }
+        return Ok(true);
+    }
+    let extendedprice_values = extendedprices.raw_values();
+    let discount_values = discounts.raw_values();
+    for row in 0..view.num_rows() {
+        let date = date_values[row];
+        if date >= start_days && date < end_days {
+            *revenues.entry(key_values[row]).or_insert(0.0) += decimal_discounted_revenue_raw(
+                extendedprice_values[row],
+                discount_values[row],
+                discount_scale,
+                revenue_scale,
+            );
+        }
+    }
+    Ok(true)
 }
 
 async fn top_supplier_rows(
@@ -168,10 +490,128 @@ async fn top_supplier_rows(
     path: PathBuf,
     batch_size: usize,
     top_suppliers: &HashMap<i64, f64>,
-) -> Result<Vec<Q15Row>> {
-    q15_supplier_rows(engine, path, batch_size, top_suppliers).await
+) -> Result<Vec<TopSupplierRevenueRow>> {
+    let mut stream = engine
+        .scan_parquet_batches(
+            path,
+            batch_size,
+            None,
+            Projection::Columns(vec![
+                "s_suppkey".to_string(),
+                "s_name".to_string(),
+                "s_address".to_string(),
+                "s_phone".to_string(),
+            ]),
+            None,
+        )
+        .await?;
+    let mut rows = Vec::new();
+    while let Some(batch) = stream.next() {
+        let batch = batch?;
+        top_supplier_rows_view_into(BatchView::new(&batch), top_suppliers, &mut rows)?;
+    }
+    rows.sort_by_key(|row| row.suppkey);
+    Ok(rows)
 }
 
-fn top_supplier_revenue_output(rows: Vec<Q15Row>) -> Result<QueryOutput> {
-    q15_output(rows)
+fn top_supplier_revenue_output(rows: Vec<TopSupplierRevenueRow>) -> Result<QueryOutput> {
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("s_suppkey", DataType::Int64, false),
+            Field::new("s_name", DataType::Utf8, false),
+            Field::new("s_address", DataType::Utf8, false),
+            Field::new("s_phone", DataType::Utf8, false),
+            Field::new("total_revenue", DataType::Float64, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from_iter_values(
+                rows.iter().map(|row| row.suppkey),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.name.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.address.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.phone.as_str()),
+            )),
+            Arc::new(Float64Array::from_iter_values(
+                rows.iter().map(|row| row.total_revenue),
+            )),
+        ],
+    )?;
+    Ok(QueryOutput::Aggregate {
+        metrics: AggregateMetrics::default(),
+        batches: vec![batch],
+    })
+}
+
+struct TopSupplierRevenueRow {
+    suppkey: i64,
+    name: String,
+    address: String,
+    phone: String,
+    total_revenue: f64,
+}
+
+fn top_supplier_rows_view_into(
+    view: BatchView<'_>,
+    top_suppliers: &HashMap<i64, f64>,
+    rows: &mut Vec<TopSupplierRevenueRow>,
+) -> Result<()> {
+    if view.num_columns() == 4
+        && let (Some(suppkeys), Some(names), Some(addresses), Some(phones)) =
+            (view.i64(0), view.utf8(1), view.utf8(2), view.utf8(3))
+    {
+        for row in 0..view.num_rows() {
+            if suppkeys.is_null(row)
+                || names.is_null(row)
+                || addresses.is_null(row)
+                || phones.is_null(row)
+            {
+                continue;
+            }
+            let suppkey = suppkeys.value(row);
+            let Some(total_revenue) = top_suppliers.get(&suppkey).copied() else {
+                continue;
+            };
+            rows.push(TopSupplierRevenueRow {
+                suppkey,
+                name: names.value(row).to_string(),
+                address: addresses.value(row).to_string(),
+                phone: phones.value(row).to_string(),
+                total_revenue,
+            });
+        }
+        return Ok(());
+    }
+    let Some(batch) = view.try_record_batch() else {
+        return Err(DodamError::UnsupportedSql(
+            "top-supplier raw vector columns have unsupported types".to_string(),
+        ));
+    };
+    let suppkeys = batch_column(batch, "s_suppkey")?;
+    let names = batch_string_column(batch, "s_name")?;
+    let addresses = batch_string_column(batch, "s_address")?;
+    let phones = batch_string_column(batch, "s_phone")?;
+    for row in 0..batch.num_rows() {
+        if names.is_null(row) || addresses.is_null(row) || phones.is_null(row) {
+            continue;
+        }
+        let Some(suppkey) = numeric_i64_value(suppkeys, row)? else {
+            continue;
+        };
+        let Some(total_revenue) = top_suppliers.get(&suppkey).copied() else {
+            continue;
+        };
+        rows.push(TopSupplierRevenueRow {
+            suppkey,
+            name: names.value(row).to_string(),
+            address: addresses.value(row).to_string(),
+            phone: phones.value(row).to_string(),
+            total_revenue,
+        });
+    }
+    Ok(())
 }
