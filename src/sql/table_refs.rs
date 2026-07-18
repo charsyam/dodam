@@ -66,6 +66,23 @@ pub(super) fn parse_comma_join_table_refs(select: &Select) -> Result<Option<Vec<
     Ok(Some(tables))
 }
 
+pub(super) fn named_comma_join_tables(
+    select: &Select,
+    names: &[&str],
+) -> Result<Option<HashMap<String, SqlTableRef>>> {
+    let Some(tables) = parse_comma_join_table_refs(select)? else {
+        return Ok(None);
+    };
+    let mut output = HashMap::with_capacity(names.len());
+    for table in tables {
+        let alias = table_ref_alias_or_name(&table).to_ascii_lowercase();
+        if names.iter().any(|name| alias == *name) {
+            output.insert(alias, table);
+        }
+    }
+    Ok(Some(output))
+}
+
 pub(super) fn parse_multi_input_join_table_refs_and_conjuncts(
     select: &Select,
 ) -> Result<Option<(Vec<SqlTableRef>, Vec<SqlExpr>)>> {

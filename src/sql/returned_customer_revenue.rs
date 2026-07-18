@@ -102,6 +102,18 @@ pub(super) async fn try_execute_returned_customer_revenue_sql(
     if revenues.is_empty() {
         return Ok(Some(returned_customer_revenue_output(Vec::new())?));
     }
+    if let Some(rows) = returned_customer_topk_rows_with_late_payload(
+        engine,
+        customer.path.clone(),
+        batch_size,
+        &nation_names,
+        &revenues,
+        20,
+    )
+    .await?
+    {
+        return Ok(Some(returned_customer_revenue_output(rows)?));
+    }
     let customer_key_filter = revenues.keys().copied().collect::<HashSet<_>>();
     let customer_keys = AdaptiveI64Set::from_hash(customer_key_filter.clone());
     let customers = returned_customer_rows(
@@ -112,6 +124,56 @@ pub(super) async fn try_execute_returned_customer_revenue_sql(
         &customer_key_filter,
     )
     .await?;
+    let rows = returned_customer_rows_from_payload(revenues, &customers, &nation_names, 20);
+    Ok(Some(returned_customer_revenue_output(rows)?))
+}
+
+async fn returned_customer_topk_rows_with_late_payload<S: BuildHasher>(
+    engine: &DodamEngine,
+    customer_path: PathBuf,
+    batch_size: usize,
+    nation_names: &HashMap<i64, String>,
+    revenues: &HashMap<i64, f64, S>,
+    limit: usize,
+) -> Result<Option<Vec<ReturnedCustomerRevenueRow>>> {
+    let candidate_count = revenues.len().min(limit.saturating_mul(8).max(limit));
+    if candidate_count == revenues.len() {
+        return Ok(None);
+    }
+    let mut candidates = revenues
+        .iter()
+        .map(|(&custkey, &revenue)| (custkey, revenue))
+        .collect::<Vec<_>>();
+    candidates.select_nth_unstable_by(candidate_count, |left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    candidates.truncate(candidate_count);
+    let candidate_revenues = candidates.iter().copied().collect::<HashMap<i64, f64>>();
+    let customer_key_filter = candidate_revenues.keys().copied().collect::<HashSet<_>>();
+    let customer_keys = AdaptiveI64Set::from_hash(customer_key_filter.clone());
+    let customers = returned_customer_rows(
+        engine,
+        customer_path,
+        batch_size,
+        &customer_keys,
+        &customer_key_filter,
+    )
+    .await?;
+    let rows =
+        returned_customer_rows_from_payload(candidate_revenues, &customers, nation_names, limit);
+    Ok((rows.len() == limit).then_some(rows))
+}
+
+fn returned_customer_rows_from_payload<S: BuildHasher>(
+    revenues: HashMap<i64, f64, S>,
+    customers: &HashMap<i64, ReturnedCustomer>,
+    nation_names: &HashMap<i64, String>,
+    limit: usize,
+) -> Vec<ReturnedCustomerRevenueRow> {
     let mut rows = revenues
         .into_iter()
         .filter_map(|(c_custkey, revenue)| {
@@ -136,8 +198,8 @@ pub(super) async fn try_execute_returned_customer_revenue_sql(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| left.c_custkey.cmp(&right.c_custkey))
     });
-    rows.truncate(20);
-    Ok(Some(returned_customer_revenue_output(rows)?))
+    rows.truncate(limit);
+    rows
 }
 
 pub(super) fn date_range_bounds(conjuncts: &[SqlExpr], column: &str) -> Result<Option<(i32, i32)>> {

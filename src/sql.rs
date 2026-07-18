@@ -148,6 +148,7 @@ mod rule_registry;
 mod scalar_eval;
 mod scalar_output;
 mod scalar_parser;
+mod scan_decimal_aggregate;
 mod semijoin;
 mod semijoin_exists;
 mod semijoin_tuple;
@@ -310,6 +311,7 @@ use scalar_parser::{
     parse_struct_field_access, rewrite_join_scalar_predicate, scalar_expression_columns,
     scalar_expression_references_aggregate, sql_column_expr,
 };
+use scan_decimal_aggregate::try_collect_filtered_decimal_product_sum_scan_fold;
 use semijoin::{
     apply_correlated_subquery_filter_batches, evaluate_correlated_subquery_filter_mask,
     rewrite_uncorrelated_scalar_subqueries_to_literals, semijoin_key_at,
@@ -339,9 +341,9 @@ use shipping_priority_revenue::*;
 use supplier_stock_threshold::*;
 use supplier_wait_antijoin::*;
 use table_refs::{
-    SqlTableRef, parse_comma_join_table_refs, parse_derived_from, parse_from,
-    parse_multi_input_join_table_refs_and_conjuncts, parse_select_table_refs, parse_table_factor,
-    select_inner_column_prefixes, table_ref_alias_or_name,
+    SqlTableRef, named_comma_join_tables, parse_comma_join_table_refs, parse_derived_from,
+    parse_from, parse_multi_input_join_table_refs_and_conjuncts, parse_select_table_refs,
+    parse_table_factor, select_inner_column_prefixes, table_ref_alias_or_name,
 };
 pub use types::{
     QueryOutput, SqlExecutionOptions, SqlResultSink, SqlSinkExecutionOptions,
@@ -624,23 +626,35 @@ pub async fn execute_sql_with_options(
         {
             metrics
         } else if !query.aggregate_expressions.is_empty() || !query.filtered_aggregates.is_empty() {
-            if let Some(metrics) = try_collect_expression_aggregate_fused_dictionary_selected(
+            if let Some(metrics) = try_collect_filtered_decimal_product_sum_scan_fold(
                 engine,
                 query.path.clone(),
                 batch_size,
                 query.filter.clone(),
-                &group_by,
                 &aggregates,
                 &query.aggregate_expressions,
-                query.order_by.is_some(),
-                expression_aggregate_output_limit(
-                    &group_by,
-                    query.order_by.as_ref(),
-                    query.limit,
-                    query.offset,
-                ),
             )
             .await?
+            {
+                metrics
+            } else if let Some(metrics) =
+                try_collect_expression_aggregate_fused_dictionary_selected(
+                    engine,
+                    query.path.clone(),
+                    batch_size,
+                    query.filter.clone(),
+                    &group_by,
+                    &aggregates,
+                    &query.aggregate_expressions,
+                    query.order_by.is_some(),
+                    expression_aggregate_output_limit(
+                        &group_by,
+                        query.order_by.as_ref(),
+                        query.limit,
+                        query.offset,
+                    ),
+                )
+                .await?
             {
                 metrics
             } else if let Some(metrics) = try_collect_expression_aggregate_late_materialized(
@@ -6764,6 +6778,27 @@ fn string_inequality_literal(conjuncts: &[SqlExpr], column: &str) -> Result<Opti
     Ok(None)
 }
 
+fn numeric_i64_equality_literal(conjuncts: &[SqlExpr], column: &str) -> Result<Option<i64>> {
+    for conjunct in conjuncts {
+        let SqlExpr::BinaryOp { left, op, right } = conjunct else {
+            continue;
+        };
+        if *op != BinaryOperator::Eq {
+            continue;
+        }
+        if sql_expr_column_matches(left, column) {
+            if let LiteralValue::Int64(value) = sql_literal_value(right)? {
+                return Ok(Some(value));
+            }
+        } else if sql_expr_column_matches(right, column)
+            && let LiteralValue::Int64(value) = sql_literal_value(left)?
+        {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
 fn not_like_prefix_literal(conjuncts: &[SqlExpr], column: &str) -> Result<Option<String>> {
     for conjunct in conjuncts {
         let SqlExpr::Like {
@@ -6782,6 +6817,33 @@ fn not_like_prefix_literal(conjuncts: &[SqlExpr], column: &str) -> Result<Option
             continue;
         };
         if let Some(value) = pattern.strip_suffix('%')
+            && !value.contains('%')
+            && !value.contains('_')
+        {
+            return Ok(Some(value.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+fn like_suffix_literal(conjuncts: &[SqlExpr], column: &str) -> Result<Option<String>> {
+    for conjunct in conjuncts {
+        let SqlExpr::Like {
+            expr,
+            pattern,
+            negated,
+            ..
+        } = conjunct
+        else {
+            continue;
+        };
+        if *negated || !sql_expr_column_matches(expr, column) {
+            continue;
+        }
+        let LiteralValue::Utf8(pattern) = sql_literal_value(pattern)? else {
+            continue;
+        };
+        if let Some(value) = pattern.strip_prefix('%')
             && !value.contains('%')
             && !value.contains('_')
         {
@@ -7026,16 +7088,17 @@ async fn q15_revenue_by_supplier(
     start_days: i32,
     end_days: i32,
 ) -> Result<HashMap<i64, f64>> {
+    let projection = Projection::Columns(vec![
+        "l_suppkey".to_string(),
+        "l_shipdate".to_string(),
+        "l_extendedprice".to_string(),
+        "l_discount".to_string(),
+    ]);
     engine
         .parquet_scan_accumulate_chunks_view(
             path,
             batch_size,
-            Projection::Columns(vec![
-                "l_suppkey".to_string(),
-                "l_shipdate".to_string(),
-                "l_extendedprice".to_string(),
-                "l_discount".to_string(),
-            ]),
+            projection,
             scan_aggregate_row_group_chunk(),
             8,
             scan_aggregate_fusion_enabled(),
@@ -7051,11 +7114,11 @@ async fn q15_revenue_by_supplier(
         .await
 }
 
-fn q15_revenue_by_supplier_batch_into(
+fn q15_revenue_by_supplier_batch_into<S: BuildHasher>(
     batch: RecordBatch,
     start_days: i32,
     end_days: i32,
-    revenues: &mut HashMap<i64, f64>,
+    revenues: &mut HashMap<i64, f64, S>,
 ) -> Result<()> {
     let suppkeys = batch_column(&batch, "l_suppkey")?;
     let shipdates = batch_column(&batch, "l_shipdate")?;
@@ -7155,7 +7218,7 @@ fn q15_revenue_by_supplier_view_into(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn update_i64_grouped_discounted_revenue_by_date_view(
+fn update_i64_grouped_discounted_revenue_by_date_view<S: BuildHasher>(
     view: BatchView<'_>,
     key_index: usize,
     date_index: usize,
@@ -7163,7 +7226,7 @@ fn update_i64_grouped_discounted_revenue_by_date_view(
     discount_index: usize,
     start_days: i32,
     end_days: i32,
-    revenues: &mut HashMap<i64, f64>,
+    revenues: &mut HashMap<i64, f64, S>,
 ) -> Result<bool> {
     let (Some(keys), Some(dates), Some(extendedprices), Some(discounts)) = (
         view.i64_vector(key_index),
