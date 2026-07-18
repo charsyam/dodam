@@ -5,10 +5,13 @@ struct DecimalProductSumSpec {
     sum_expr: AggregateExpr,
     left_column: String,
     right_column: String,
+    third_column: Option<String>,
     left_kind: ProductColumnKind,
     right_kind: ProductColumnKind,
+    third_kind: Option<ProductColumnKind>,
     left_transform: ProductTermTransform,
     right_transform: ProductTermTransform,
+    third_transform: Option<ProductTermTransform>,
     projection: Vec<String>,
     predicates: Vec<PrimitivePredicate>,
 }
@@ -82,6 +85,31 @@ impl PrimitivePredicateVectors<'_> {
             predicates => predicates.iter().all(|predicate| predicate.matches(row)),
         }
     }
+
+    fn sparse_selection(&self, rows: usize) -> PredicateSelection {
+        if rows == 0 {
+            return PredicateSelection::Empty;
+        }
+        let mut selected = Vec::new();
+        for row in 0..rows {
+            if self.matches(row) {
+                selected.push(row);
+            }
+        }
+        if selected.is_empty() {
+            PredicateSelection::Empty
+        } else if selected.len().saturating_mul(4) <= rows.saturating_mul(3) {
+            PredicateSelection::Sparse(selected)
+        } else {
+            PredicateSelection::Dense
+        }
+    }
+}
+
+enum PredicateSelection {
+    Empty,
+    Sparse(Vec<usize>),
+    Dense,
 }
 
 impl PrimitivePredicateVector<'_> {
@@ -114,8 +142,10 @@ struct DecimalProductSumState {
 struct ProductPayloadPlan {
     left_kind: ProductColumnKind,
     right_kind: ProductColumnKind,
+    third_kind: Option<ProductColumnKind>,
     left_transform: ProductTermTransform,
     right_transform: ProductTermTransform,
+    third_transform: Option<ProductTermTransform>,
 }
 
 pub(super) async fn try_collect_filtered_decimal_product_sum_scan_fold(
@@ -200,10 +230,11 @@ async fn try_collect_filtered_product_sum_late_materialized(
     spec: &DecimalProductSumSpec,
 ) -> Result<Option<AggregateMetrics>> {
     if !matches!(
-        (spec.left_kind, spec.right_kind),
+        (spec.left_kind, spec.right_kind, spec.third_kind),
         (
             ProductColumnKind::DecimalI64 { .. },
-            ProductColumnKind::DecimalI64 { .. }
+            ProductColumnKind::DecimalI64 { .. },
+            None | Some(ProductColumnKind::DecimalI64 { .. })
         )
     ) {
         return Ok(None);
@@ -212,13 +243,18 @@ async fn try_collect_filtered_product_sum_late_materialized(
     if predicate_columns.is_empty() {
         return Ok(None);
     }
-    let payload_columns = vec![spec.left_column.clone(), spec.right_column.clone()];
+    let mut payload_columns = vec![spec.left_column.clone(), spec.right_column.clone()];
+    if let Some(column) = &spec.third_column {
+        add_column_once(&mut payload_columns, column.clone());
+    }
     let sum_expr = spec.sum_expr.clone();
     let product_plan = ProductPayloadPlan {
         left_kind: spec.left_kind,
         right_kind: spec.right_kind,
+        third_kind: spec.third_kind,
         left_transform: spec.left_transform,
         right_transform: spec.right_transform,
+        third_transform: spec.third_transform,
     };
     let started = Instant::now();
     let Some(partials) = engine
@@ -230,8 +266,8 @@ async fn try_collect_filtered_product_sum_late_materialized(
             vec![filter.expr().clone()],
             scan_aggregate_row_group_chunk(),
             LateMaterializationPolicy::selective_with_selector_run_ratio(
-                filtered_product_sum_late_max_selected_ratio(),
-                filtered_product_sum_late_max_selector_run_ratio(),
+                filtered_product_sum_late_max_selected_ratio(spec.product_factor_count()),
+                filtered_product_sum_late_max_selector_run_ratio(spec.product_factor_count()),
             )
             .with_io_cost_gate(true),
             move || DecimalProductSumState::default(),
@@ -307,6 +343,13 @@ impl DecimalProductSumSpec {
         };
         let left_column = product.left_column.as_str();
         let right_column = product.right_column.as_str();
+        let third_column = product.third_column.as_deref();
+        if left_column == right_column
+            || third_column.is_some_and(|column| column == left_column || column == right_column)
+        {
+            log_product_sum_rule_miss("duplicate-product-columns");
+            return Ok(None);
+        }
         let Some(left_kind) = product_column_kind(engine, path, left_column)? else {
             log_product_sum_rule_miss("left-product-type-unsupported");
             return Ok(None);
@@ -315,20 +358,27 @@ impl DecimalProductSumSpec {
             log_product_sum_rule_miss("right-product-type-unsupported");
             return Ok(None);
         };
-        if matches!(
-            (left_kind, right_kind),
+        let third_kind = third_column
+            .map(|column| product_column_kind(engine, path, column))
+            .transpose()?
+            .flatten();
+        let decimal_product = matches!(
+            (left_kind, right_kind, third_kind),
             (
                 ProductColumnKind::DecimalI64 { .. },
-                ProductColumnKind::DecimalI64 { .. }
+                ProductColumnKind::DecimalI64 { .. },
+                None | Some(ProductColumnKind::DecimalI64 { .. })
             )
-        ) || matches!(
-            (left_kind, right_kind),
-            (
-                ProductColumnKind::Int32 | ProductColumnKind::Int64,
-                ProductColumnKind::Int32 | ProductColumnKind::Int64
-            )
-        ) {
-        } else {
+        );
+        let integer_product = third_kind.is_none()
+            && matches!(
+                (left_kind, right_kind),
+                (
+                    ProductColumnKind::Int32 | ProductColumnKind::Int64,
+                    ProductColumnKind::Int32 | ProductColumnKind::Int64
+                )
+            );
+        if !decimal_product && !integer_product {
             log_product_sum_rule_miss("mixed-product-types");
             return Ok(None);
         }
@@ -346,6 +396,9 @@ impl DecimalProductSumSpec {
         let mut projection = Vec::new();
         add_column_once(&mut projection, left_column.to_string());
         add_column_once(&mut projection, right_column.to_string());
+        if let Some(column) = third_column {
+            add_column_once(&mut projection, column.to_string());
+        }
         for column in filter.referenced_columns() {
             add_column_once(&mut projection, column);
         }
@@ -368,10 +421,13 @@ impl DecimalProductSumSpec {
             sum_expr: aggregates[0].clone(),
             left_column: left_column.to_string(),
             right_column: right_column.to_string(),
+            third_column: third_column.map(str::to_string),
             left_kind,
             right_kind,
+            third_kind,
             left_transform: product.left_transform,
             right_transform: product.right_transform,
+            third_transform: product.third_transform,
             projection,
             predicates,
         }))
@@ -383,7 +439,7 @@ impl DecimalProductSumSpec {
                 (
                     ProductColumnKind::Int32 | ProductColumnKind::Int64,
                     ProductColumnKind::Int32 | ProductColumnKind::Int64,
-                ) => AggregateValue::Int64(None),
+                ) if self.third_kind.is_none() => AggregateValue::Int64(None),
                 _ => AggregateValue::Float64(None),
             });
         }
@@ -391,7 +447,7 @@ impl DecimalProductSumSpec {
             (
                 ProductColumnKind::Int32 | ProductColumnKind::Int64,
                 ProductColumnKind::Int32 | ProductColumnKind::Int64,
-            ) => {
+            ) if self.third_kind.is_none() => {
                 let value = i64::try_from(state.int_sum).map_err(|_| {
                     DodamError::UnsupportedSql("SUM integer expression overflow".to_string())
                 })?;
@@ -400,30 +456,53 @@ impl DecimalProductSumSpec {
             _ => Ok(AggregateValue::Float64(Some(state.sum))),
         }
     }
+
+    fn product_factor_count(&self) -> usize {
+        2 + usize::from(self.third_kind.is_some())
+    }
 }
 
 struct DecimalProductShape {
     left_column: String,
     right_column: String,
+    third_column: Option<String>,
     left_transform: ProductTermTransform,
     right_transform: ProductTermTransform,
+    third_transform: Option<ProductTermTransform>,
 }
 
 fn decimal_product_columns(expr: &ScalarSqlExpression) -> Option<DecimalProductShape> {
-    let ScalarSqlExpression::Binary { left, op, right } = expr else {
-        return None;
-    };
-    if *op != BinaryOperator::Multiply {
+    let mut terms = Vec::new();
+    collect_product_terms(expr, &mut terms)?;
+    if terms.len() < 2 || terms.len() > 3 {
         return None;
     }
-    let left = product_term(left)?;
-    let right = product_term(right)?;
+    let left = terms.remove(0);
+    let right = terms.remove(0);
+    let third = (!terms.is_empty()).then(|| terms.remove(0));
     Some(DecimalProductShape {
         left_column: left.0,
         right_column: right.0,
+        third_column: third.as_ref().map(|term| term.0.clone()),
         left_transform: left.1,
         right_transform: right.1,
+        third_transform: third.map(|term| term.1),
     })
+}
+
+fn collect_product_terms(
+    expr: &ScalarSqlExpression,
+    terms: &mut Vec<(String, ProductTermTransform)>,
+) -> Option<()> {
+    if let ScalarSqlExpression::Binary { left, op, right } = expr
+        && *op == BinaryOperator::Multiply
+    {
+        collect_product_terms(left, terms)?;
+        collect_product_terms(right, terms)?;
+        return Some(());
+    }
+    terms.push(product_term(expr)?);
+    Some(())
 }
 
 fn product_term(expr: &ScalarSqlExpression) -> Option<(String, ProductTermTransform)> {
@@ -741,15 +820,30 @@ fn consume_product_sum_vectors(
             if left.scale_i64() != Some(left_scale) || right.scale_i64() != Some(right_scale) {
                 return Ok(false);
             }
+            let third = match spec.third_kind {
+                None => None,
+                Some(kind @ ProductColumnKind::DecimalI64 { scale }) => {
+                    let Some(values) = view.decimal128_vector(2) else {
+                        return Ok(false);
+                    };
+                    if values.scale_i64() != Some(scale) {
+                        return Ok(false);
+                    }
+                    Some((kind, values))
+                }
+                Some(_) => return Ok(false),
+            };
             consume_decimal_i64_product_sum_vectors(
                 view,
                 &predicates,
                 left,
                 right,
+                third,
                 left_scale,
                 right_scale,
                 spec.left_transform,
                 spec.right_transform,
+                spec.third_transform,
                 state,
             );
             Ok(true)
@@ -776,9 +870,36 @@ fn consume_product_payload_view(
             if left.scale_i64() != Some(left_scale) || right.scale_i64() != Some(right_scale) {
                 return Ok(());
             }
-            let scale = (left_scale as f64) * (right_scale as f64);
+            let third = match plan.third_kind {
+                None => None,
+                Some(ProductColumnKind::DecimalI64 { scale }) => {
+                    let Some(values) = view.decimal128_vector(2) else {
+                        return Ok(());
+                    };
+                    if values.scale_i64() != Some(scale) {
+                        return Ok(());
+                    }
+                    Some((
+                        values,
+                        scale,
+                        plan.third_transform
+                            .unwrap_or(ProductTermTransform::Identity),
+                    ))
+                }
+                _ => return Ok(()),
+            };
+            let mut scale = (left_scale as f64) * (right_scale as f64);
+            if let Some((_, third_scale, _)) = third {
+                scale *= third_scale as f64;
+            }
+            let inv_scale = scale.recip();
             for row in 0..view.num_rows() {
                 if left.is_null(row) || right.is_null(row) {
+                    continue;
+                }
+                if let Some((values, _, _)) = third
+                    && values.is_null(row)
+                {
                     continue;
                 }
                 let Some(left) = left.raw_i64_value(row) else {
@@ -789,7 +910,15 @@ fn consume_product_payload_view(
                 };
                 let left = plan.left_transform.apply_raw_i64(left, left_scale);
                 let right = plan.right_transform.apply_raw_i64(right, right_scale);
-                state.sum += (left as f64) * (right as f64) / scale;
+                let mut product = (left as f64) * (right as f64);
+                if let Some((values, third_scale, transform)) = third {
+                    let Some(third) = values.raw_i64_value(row) else {
+                        continue;
+                    };
+                    let third = transform.apply_raw_i64(third, third_scale);
+                    product *= third as f64;
+                }
+                state.sum += product * inv_scale;
                 state.count += 1;
             }
         }
@@ -916,42 +1045,354 @@ fn consume_decimal_i64_product_sum_vectors(
     predicates: &PrimitivePredicateVectors<'_>,
     left: Decimal128VectorView<'_>,
     right: Decimal128VectorView<'_>,
+    third: Option<(ProductColumnKind, Decimal128VectorView<'_>)>,
     left_scale: i64,
     right_scale: i64,
     left_transform: ProductTermTransform,
     right_transform: ProductTermTransform,
+    third_transform: Option<ProductTermTransform>,
     state: &mut DecimalProductSumState,
 ) {
     state.rows += view.num_rows();
     state.batches += 1;
+    let third = match third {
+        None => None,
+        Some((ProductColumnKind::DecimalI64 { scale }, values)) => {
+            if values.scale_i64() != Some(scale) {
+                return;
+            }
+            Some((
+                values,
+                scale,
+                third_transform.unwrap_or(ProductTermTransform::Identity),
+            ))
+        }
+        _ => return,
+    };
+    let selection = predicates.sparse_selection(view.num_rows());
+    if matches!(selection, PredicateSelection::Empty) {
+        return;
+    }
     if left.null_count() == 0 && right.null_count() == 0 {
         if let (Some(left), Some(right)) = (left.raw_i64_values(), right.raw_i64_values()) {
-            let scale = (left_scale as f64) * (right_scale as f64);
-            for row in 0..view.num_rows() {
-                if predicates.matches(row) {
-                    let left = left_transform.apply_raw_i64(left[row], left_scale);
-                    let right = right_transform.apply_raw_i64(right[row], right_scale);
-                    state.sum += (left as f64) * (right as f64) / scale;
-                    state.count += 1;
+            let mut scale = (left_scale as f64) * (right_scale as f64);
+            if let Some((_, third_scale, _)) = third {
+                scale *= third_scale as f64;
+            }
+            let inv_scale = scale.recip();
+            if let Some((values, third_scale, transform)) = third
+                && values.null_count() == 0
+                && let Some(third_values) = values.raw_i64_values()
+            {
+                match selection {
+                    PredicateSelection::Empty => unreachable!("empty selection returned above"),
+                    PredicateSelection::Sparse(rows) => {
+                        for row in rows {
+                            let left = left_transform.apply_raw_i64(left[row], left_scale);
+                            let right = right_transform.apply_raw_i64(right[row], right_scale);
+                            let third = transform.apply_raw_i64(third_values[row], third_scale);
+                            state.sum +=
+                                (left as f64) * (right as f64) * (third as f64) * inv_scale;
+                            state.count += 1;
+                        }
+                    }
+                    PredicateSelection::Dense => {
+                        for row in 0..view.num_rows() {
+                            if predicates.matches(row) {
+                                let left = left_transform.apply_raw_i64(left[row], left_scale);
+                                let right = right_transform.apply_raw_i64(right[row], right_scale);
+                                let third = transform.apply_raw_i64(third_values[row], third_scale);
+                                state.sum +=
+                                    (left as f64) * (right as f64) * (third as f64) * inv_scale;
+                                state.count += 1;
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+            if let Some((values, third_scale, transform)) = third
+                && values.null_count() == 0
+                && let Some((third_bytes, third_len)) = values.raw_i64_bytes()
+                && third_len == view.num_rows()
+            {
+                match selection {
+                    PredicateSelection::Empty => unreachable!("empty selection returned above"),
+                    PredicateSelection::Sparse(rows) => {
+                        for row in rows {
+                            let left = left_transform.apply_raw_i64(left[row], left_scale);
+                            let right = right_transform.apply_raw_i64(right[row], right_scale);
+                            let third = transform.apply_raw_i64(
+                                read_i64_le_unaligned(third_bytes, row),
+                                third_scale,
+                            );
+                            state.sum +=
+                                (left as f64) * (right as f64) * (third as f64) * inv_scale;
+                            state.count += 1;
+                        }
+                    }
+                    PredicateSelection::Dense => {
+                        for row in 0..view.num_rows() {
+                            if predicates.matches(row) {
+                                let left = left_transform.apply_raw_i64(left[row], left_scale);
+                                let right = right_transform.apply_raw_i64(right[row], right_scale);
+                                let third = transform.apply_raw_i64(
+                                    read_i64_le_unaligned(third_bytes, row),
+                                    third_scale,
+                                );
+                                state.sum +=
+                                    (left as f64) * (right as f64) * (third as f64) * inv_scale;
+                                state.count += 1;
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+            match selection {
+                PredicateSelection::Empty => unreachable!("empty selection returned above"),
+                PredicateSelection::Sparse(rows) => {
+                    for row in rows {
+                        let left = left_transform.apply_raw_i64(left[row], left_scale);
+                        let right = right_transform.apply_raw_i64(right[row], right_scale);
+                        let mut product = (left as f64) * (right as f64);
+                        if let Some((values, third_scale, transform)) = third {
+                            if values.is_null(row) {
+                                continue;
+                            }
+                            let Some(third) = values.raw_i64_value(row) else {
+                                continue;
+                            };
+                            product *= transform.apply_raw_i64(third, third_scale) as f64;
+                        }
+                        state.sum += product * inv_scale;
+                        state.count += 1;
+                    }
+                }
+                PredicateSelection::Dense => {
+                    for row in 0..view.num_rows() {
+                        if !predicates.matches(row) {
+                            continue;
+                        }
+                        let left = left_transform.apply_raw_i64(left[row], left_scale);
+                        let right = right_transform.apply_raw_i64(right[row], right_scale);
+                        let mut product = (left as f64) * (right as f64);
+                        if let Some((values, third_scale, transform)) = third {
+                            if values.is_null(row) {
+                                continue;
+                            }
+                            let Some(third) = values.raw_i64_value(row) else {
+                                continue;
+                            };
+                            product *= transform.apply_raw_i64(third, third_scale) as f64;
+                        }
+                        state.sum += product * inv_scale;
+                        state.count += 1;
+                    }
+                }
+            }
+            return;
+        }
+        if let (Some((left, left_len)), Some((right, right_len))) =
+            (left.raw_i64_bytes(), right.raw_i64_bytes())
+            && left_len == view.num_rows()
+            && right_len == view.num_rows()
+        {
+            let mut scale = (left_scale as f64) * (right_scale as f64);
+            if let Some((_, third_scale, _)) = third {
+                scale *= third_scale as f64;
+            }
+            let inv_scale = scale.recip();
+            if let Some((values, third_scale, transform)) = third
+                && values.null_count() == 0
+                && let Some(third_values) = values.raw_i64_values()
+            {
+                match selection {
+                    PredicateSelection::Empty => unreachable!("empty selection returned above"),
+                    PredicateSelection::Sparse(rows) => {
+                        for row in rows {
+                            let left = left_transform
+                                .apply_raw_i64(read_i64_le_unaligned(left, row), left_scale);
+                            let right = right_transform
+                                .apply_raw_i64(read_i64_le_unaligned(right, row), right_scale);
+                            let third = transform.apply_raw_i64(third_values[row], third_scale);
+                            state.sum +=
+                                (left as f64) * (right as f64) * (third as f64) * inv_scale;
+                            state.count += 1;
+                        }
+                    }
+                    PredicateSelection::Dense => {
+                        for row in 0..view.num_rows() {
+                            if predicates.matches(row) {
+                                let left = left_transform
+                                    .apply_raw_i64(read_i64_le_unaligned(left, row), left_scale);
+                                let right = right_transform
+                                    .apply_raw_i64(read_i64_le_unaligned(right, row), right_scale);
+                                let third = transform.apply_raw_i64(third_values[row], third_scale);
+                                state.sum +=
+                                    (left as f64) * (right as f64) * (third as f64) * inv_scale;
+                                state.count += 1;
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+            if let Some((values, third_scale, transform)) = third
+                && values.null_count() == 0
+                && let Some((third_bytes, third_len)) = values.raw_i64_bytes()
+                && third_len == view.num_rows()
+            {
+                match selection {
+                    PredicateSelection::Empty => unreachable!("empty selection returned above"),
+                    PredicateSelection::Sparse(rows) => {
+                        for row in rows {
+                            let left = left_transform
+                                .apply_raw_i64(read_i64_le_unaligned(left, row), left_scale);
+                            let right = right_transform
+                                .apply_raw_i64(read_i64_le_unaligned(right, row), right_scale);
+                            let third = transform.apply_raw_i64(
+                                read_i64_le_unaligned(third_bytes, row),
+                                third_scale,
+                            );
+                            state.sum +=
+                                (left as f64) * (right as f64) * (third as f64) * inv_scale;
+                            state.count += 1;
+                        }
+                    }
+                    PredicateSelection::Dense => {
+                        for row in 0..view.num_rows() {
+                            if predicates.matches(row) {
+                                let left = left_transform
+                                    .apply_raw_i64(read_i64_le_unaligned(left, row), left_scale);
+                                let right = right_transform
+                                    .apply_raw_i64(read_i64_le_unaligned(right, row), right_scale);
+                                let third = transform.apply_raw_i64(
+                                    read_i64_le_unaligned(third_bytes, row),
+                                    third_scale,
+                                );
+                                state.sum +=
+                                    (left as f64) * (right as f64) * (third as f64) * inv_scale;
+                                state.count += 1;
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+            match selection {
+                PredicateSelection::Empty => unreachable!("empty selection returned above"),
+                PredicateSelection::Sparse(rows) => {
+                    for row in rows {
+                        let left = left_transform
+                            .apply_raw_i64(read_i64_le_unaligned(left, row), left_scale);
+                        let right = right_transform
+                            .apply_raw_i64(read_i64_le_unaligned(right, row), right_scale);
+                        let mut product = (left as f64) * (right as f64);
+                        if let Some((values, third_scale, transform)) = third {
+                            if values.is_null(row) {
+                                continue;
+                            }
+                            let Some(third) = values.raw_i64_value(row) else {
+                                continue;
+                            };
+                            product *= transform.apply_raw_i64(third, third_scale) as f64;
+                        }
+                        state.sum += product * inv_scale;
+                        state.count += 1;
+                    }
+                }
+                PredicateSelection::Dense => {
+                    for row in 0..view.num_rows() {
+                        if !predicates.matches(row) {
+                            continue;
+                        }
+                        let left = left_transform
+                            .apply_raw_i64(read_i64_le_unaligned(left, row), left_scale);
+                        let right = right_transform
+                            .apply_raw_i64(read_i64_le_unaligned(right, row), right_scale);
+                        let mut product = (left as f64) * (right as f64);
+                        if let Some((values, third_scale, transform)) = third {
+                            if values.is_null(row) {
+                                continue;
+                            }
+                            let Some(third) = values.raw_i64_value(row) else {
+                                continue;
+                            };
+                            product *= transform.apply_raw_i64(third, third_scale) as f64;
+                        }
+                        state.sum += product * inv_scale;
+                        state.count += 1;
+                    }
                 }
             }
             return;
         }
     }
-    for row in 0..view.num_rows() {
-        if left.is_null(row) || right.is_null(row) || !predicates.matches(row) {
-            continue;
+    match selection {
+        PredicateSelection::Empty => unreachable!("empty selection returned above"),
+        PredicateSelection::Sparse(rows) => {
+            for row in rows {
+                if left.is_null(row) || right.is_null(row) {
+                    continue;
+                }
+                let Some(left) = left.raw_i64_value(row) else {
+                    continue;
+                };
+                let Some(right) = right.raw_i64_value(row) else {
+                    continue;
+                };
+                if let Some((values, _, _)) = third
+                    && values.is_null(row)
+                {
+                    continue;
+                }
+                let left = left_transform.apply_raw_i64(left, left_scale);
+                let right = right_transform.apply_raw_i64(right, right_scale);
+                let mut scale = (left_scale as f64) * (right_scale as f64);
+                let mut product = (left as f64) * (right as f64);
+                if let Some((values, third_scale, transform)) = third {
+                    let Some(third) = values.raw_i64_value(row) else {
+                        continue;
+                    };
+                    scale *= third_scale as f64;
+                    product *= transform.apply_raw_i64(third, third_scale) as f64;
+                }
+                state.sum += product / scale;
+                state.count += 1;
+            }
         }
-        let Some(left) = left.raw_i64_value(row) else {
-            continue;
-        };
-        let Some(right) = right.raw_i64_value(row) else {
-            continue;
-        };
-        let left = left_transform.apply_raw_i64(left, left_scale);
-        let right = right_transform.apply_raw_i64(right, right_scale);
-        state.sum += (left as f64) * (right as f64) / ((left_scale as f64) * (right_scale as f64));
-        state.count += 1;
+        PredicateSelection::Dense => {
+            for row in 0..view.num_rows() {
+                if left.is_null(row) || right.is_null(row) || !predicates.matches(row) {
+                    continue;
+                }
+                let Some(left) = left.raw_i64_value(row) else {
+                    continue;
+                };
+                let Some(right) = right.raw_i64_value(row) else {
+                    continue;
+                };
+                if let Some((values, _, _)) = third
+                    && values.is_null(row)
+                {
+                    continue;
+                }
+                let left = left_transform.apply_raw_i64(left, left_scale);
+                let right = right_transform.apply_raw_i64(right, right_scale);
+                let mut scale = (left_scale as f64) * (right_scale as f64);
+                let mut product = (left as f64) * (right as f64);
+                if let Some((values, third_scale, transform)) = third {
+                    let Some(third) = values.raw_i64_value(row) else {
+                        continue;
+                    };
+                    scale *= third_scale as f64;
+                    product *= transform.apply_raw_i64(third, third_scale) as f64;
+                }
+                state.sum += product / scale;
+                state.count += 1;
+            }
+        }
     }
 }
 
@@ -968,7 +1409,9 @@ fn consume_product_row(
         return Ok(());
     };
     match (left, right) {
-        (ProductValue::Integer(left), ProductValue::Integer(right)) => {
+        (ProductValue::Integer(left), ProductValue::Integer(right))
+            if spec.third_kind.is_none() =>
+        {
             state.int_sum += left * right;
         }
         (ProductValue::Scaled(left, left_scale), ProductValue::Scaled(right, right_scale)) => {
@@ -976,8 +1419,22 @@ fn consume_product_row(
             let right = spec
                 .right_transform
                 .apply_raw_i64(right as i64, right_scale);
-            state.sum +=
-                (left as f64) * (right as f64) / ((left_scale as f64) * (right_scale as f64));
+            let mut product = (left as f64) * (right as f64);
+            let mut scale = (left_scale as f64) * (right_scale as f64);
+            if let Some(third_kind) = spec.third_kind {
+                let Some(ProductValue::Scaled(third, third_scale)) =
+                    product_value(view, 2, third_kind, row)?
+                else {
+                    return Ok(());
+                };
+                let third = spec
+                    .third_transform
+                    .unwrap_or(ProductTermTransform::Identity)
+                    .apply_raw_i64(third as i64, third_scale);
+                product *= third as f64;
+                scale *= third_scale as f64;
+            }
+            state.sum += product / scale;
         }
         _ => return Ok(()),
     }
@@ -1056,7 +1513,9 @@ fn predicates_match_row(
                 if values.is_null(row) || values.scale_i64() != Some(*scale) {
                     return Ok(false);
                 }
-                let value = values.raw_values()[row] as i64;
+                let Some(value) = values.raw_i64_value(row) else {
+                    return Ok(false);
+                };
                 if !i64_in_bounds(value, *min, *max) {
                     return Ok(false);
                 }
@@ -1177,21 +1636,31 @@ fn decimal_scale_i64_local(scale: i8) -> Result<i64> {
         .ok_or_else(|| DodamError::UnsupportedSql("decimal scale overflow".to_string()))
 }
 
-fn filtered_product_sum_late_max_selected_ratio() -> f64 {
+fn filtered_product_sum_late_max_selected_ratio(product_factor_count: usize) -> f64 {
+    let default = if product_factor_count >= 3 {
+        0.12
+    } else {
+        0.20
+    };
     std::env::var("DODAM_FILTERED_PRODUCT_SUM_LATE_MAX_SELECTED_RATIO")
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite())
-        .unwrap_or(0.20)
+        .unwrap_or(default)
         .clamp(0.0, 1.0)
 }
 
-fn filtered_product_sum_late_max_selector_run_ratio() -> f64 {
+fn filtered_product_sum_late_max_selector_run_ratio(product_factor_count: usize) -> f64 {
+    let default = if product_factor_count >= 3 {
+        0.35
+    } else {
+        0.50
+    };
     std::env::var("DODAM_FILTERED_PRODUCT_SUM_LATE_MAX_SELECTOR_RUN_RATIO")
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite())
-        .unwrap_or(0.50)
+        .unwrap_or(default)
         .clamp(0.0, 1.0)
 }
 

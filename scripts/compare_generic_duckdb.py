@@ -110,7 +110,7 @@ def main() -> int:
 def ensure_fixture(duckdb: str, data_dir: Path, timeout: float, scale: int) -> None:
     facts = data_dir / "facts.parquet"
     facts_scrambled = data_dir / "facts_scrambled.parquet"
-    product = data_dir / "product.parquet"
+    product = data_dir / "product_v2.parquet"
     dim = data_dir / "dim.parquet"
     nested = data_dir / "nested.parquet"
     if (
@@ -154,6 +154,7 @@ COPY (
     i::INTEGER AS id,
     CAST((i % 10000) / 100.0 AS DECIMAL(18,2)) AS amount,
     CAST((i % 100) / 100.0 AS DECIMAL(18,2)) AS rate,
+    CAST((i % 8) / 100.0 AS DECIMAL(18,2)) AS tax,
     DATE '2024-01-01' + ((i % 31)::INTEGER) AS event_date
   FROM range(0, {facts_rows}) AS t(i)
 ) TO '{product}' (FORMAT PARQUET, COMPRESSION ZSTD);
@@ -187,7 +188,7 @@ COPY (
 def generic_queries(data_dir: Path) -> list[GenericQuery]:
     facts = data_dir / "facts.parquet"
     facts_scrambled = data_dir / "facts_scrambled.parquet"
-    product = data_dir / "product.parquet"
+    product = data_dir / "product_v2.parquet"
     dim = data_dir / "dim.parquet"
     nested = data_dir / "nested.parquet"
     return [
@@ -250,6 +251,11 @@ def generic_queries(data_dir: Path) -> list[GenericQuery]:
             "standard_discounted_product_sum",
             f"SELECT sum(amount * (1 - rate)) FROM '{product}' WHERE event_date < '2024-01-20' AND amount >= '10.00' AND amount < '20.00'",
             f"SELECT sum(amount * (1 - rate)) FROM read_parquet('{product}') WHERE event_date < '2024-01-20' AND amount >= '10.00' AND amount < '20.00'",
+        ),
+        GenericQuery(
+            "standard_three_factor_product_sum",
+            f"SELECT sum(amount * (1 - rate) * (1 + tax)) FROM '{product}' WHERE event_date < '2024-01-20' AND amount >= '10.00' AND amount < '20.00'",
+            f"SELECT sum(amount * (1 - rate) * (1 + tax)) FROM read_parquet('{product}') WHERE event_date < '2024-01-20' AND amount >= '10.00' AND amount < '20.00'",
         ),
         GenericQuery(
             "review_high_cardinality_group",

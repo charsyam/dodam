@@ -1858,6 +1858,19 @@ async fn duckdb_differential_tpch_q6_canonical_shape() {
         tempdir.path(),
     )
     .await;
+
+    assert_single_numeric_same_as_duckdb(
+        &format!(
+            "SELECT sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS revenue FROM '{}' WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1994-01-01' + INTERVAL '1' YEAR AND l_quantity < 24",
+            lineitem_path.display()
+        ),
+        &format!(
+            "SELECT sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS revenue FROM read_parquet('{}') WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1994-01-01' + INTERVAL '1' YEAR AND l_quantity < 24",
+            lineitem_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -3764,6 +3777,22 @@ async fn assert_same_as_duckdb_case(
     );
 }
 
+async fn assert_single_numeric_same_as_duckdb(dodam_sql: &str, duckdb_sql: &str, tempdir: &Path) {
+    let dodam_rows = run_dodam(dodam_sql).await;
+    let duckdb_rows = run_duckdb(duckdb_sql, tempdir);
+    assert_eq!(dodam_rows.len(), 1, "Dodam SQL:\n{dodam_sql}");
+    assert_eq!(duckdb_rows.len(), 1, "DuckDB SQL:\n{duckdb_sql}");
+    let dodam = dodam_rows[0].parse::<f64>().expect("Dodam numeric result");
+    let duckdb = duckdb_rows[0]
+        .parse::<f64>()
+        .expect("DuckDB numeric result");
+    let tolerance = 1e-9_f64.max(duckdb.abs() * 1e-12);
+    assert!(
+        (dodam - duckdb).abs() <= tolerance,
+        "\nDodam SQL:\n{dodam_sql}\n\nDuckDB SQL:\n{duckdb_sql}\nDodam={dodam} DuckDB={duckdb} tolerance={tolerance}"
+    );
+}
+
 async fn assert_same_as_duckdb_unordered_case(
     case_name: &str,
     dodam_sql: &str,
@@ -4688,6 +4717,7 @@ fn write_tpch_q6_lineitem_parquet(path: &Path) {
         Field::new("l_quantity", DataType::Int64, false),
         Field::new("l_extendedprice", DataType::Float64, false),
         Field::new("l_discount", DataType::Float64, false),
+        Field::new("l_tax", DataType::Float64, false),
         Field::new("l_shipdate", DataType::Date32, false),
     ]));
     let quantities = Int64Array::from_iter_values([10, 20, 15, 30, 5, 22, 40, 12]);
@@ -4696,6 +4726,7 @@ fn write_tpch_q6_lineitem_parquet(path: &Path) {
     ]);
     let discounts =
         Float64Array::from_iter_values([0.05, 0.07, 0.06, 0.03, 0.08, 0.06, 0.04, 0.06]);
+    let taxes = Float64Array::from_iter_values([0.02, 0.03, 0.01, 0.04, 0.02, 0.00, 0.05, 0.07]);
     let shipdates = Date32Array::from_iter_values([
         date_days(1994, 1, 15),
         date_days(1994, 6, 30),
@@ -4713,6 +4744,7 @@ fn write_tpch_q6_lineitem_parquet(path: &Path) {
             Arc::new(quantities),
             Arc::new(extendedprices),
             Arc::new(discounts),
+            Arc::new(taxes),
             Arc::new(shipdates),
         ],
     );
