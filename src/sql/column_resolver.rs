@@ -323,3 +323,38 @@ pub(super) fn aggregate_column_parts(column: &str) -> Option<(&str, &str)> {
     let argument = rest.strip_suffix(')')?;
     Some((function, argument))
 }
+
+pub(super) fn batch_column_index(batch: &RecordBatch, column: &str) -> Result<usize> {
+    if let Some(index) = batch
+        .schema()
+        .fields()
+        .iter()
+        .position(|field| same_join_column(field.name(), column))
+    {
+        return Ok(index);
+    }
+    Err(DodamError::UnknownColumn(column.to_string()))
+}
+
+pub(super) fn projected_column_index(projection: &[String], column: &str) -> Option<usize> {
+    projection
+        .iter()
+        .position(|projected| same_join_column(projected, column))
+}
+
+pub(super) fn batch_projected_column_index(
+    batch: &RecordBatch,
+    index_hint: Option<usize>,
+    column: &str,
+) -> Result<usize> {
+    if let Some(index) = index_hint
+        && batch
+            .schema()
+            .fields()
+            .get(index)
+            .is_some_and(|field| same_join_column(field.name(), column))
+    {
+        return Ok(index);
+    }
+    batch_column_index(batch, column)
+}
