@@ -389,8 +389,9 @@ use table_refs::{
     parse_from, parse_multi_input_join_table_refs_and_conjuncts, parse_select_table_refs,
     parse_table_factor, select_inner_column_prefixes, table_ref_alias_or_name,
 };
+use types::SqlJoin;
 pub use types::{
-    QueryOutput, SqlExecutionOptions, SqlResultSink, SqlSinkExecutionOptions,
+    QueryOutput, SqlExecutionOptions, SqlQuery, SqlResultSink, SqlSinkExecutionOptions,
     SqlSinkExecutionProfile,
 };
 use window::try_execute_window_sql;
@@ -399,44 +400,6 @@ use with_cte::try_execute_with_cte_sql;
 const DEFAULT_MAX_DENSE_I64_KEY: usize = 20_000_000;
 const DEFAULT_Q09_ORDER_YEAR_DENSE_BYTES: usize = 384 * 1024 * 1024;
 const MAX_SQL_EXTERNAL_JOIN_PARTITIONS: usize = 1024;
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct SqlQuery {
-    path: PathBuf,
-    join: Option<SqlJoin>,
-    projection: Projection,
-    filter: Option<FilterExpr>,
-    expression_filter: Option<SqlExpr>,
-    having: Option<FilterExpr>,
-    order_by: Option<SortKey>,
-    limit: Option<usize>,
-    offset: usize,
-    distinct: bool,
-    aggregates: Vec<AggregateExpr>,
-    filtered_aggregates: Vec<NativeFilteredAggregateSpec>,
-    aggregate_expressions: Vec<ProjectionExpression>,
-    expressions: Vec<ProjectionExpression>,
-    group_by: Vec<String>,
-    aliases: Vec<(String, String)>,
-    qualified_wildcards: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct SqlJoin {
-    right: SqlTableRef,
-    left_alias: String,
-    right_alias: String,
-    left_keys: Vec<String>,
-    right_keys: Vec<String>,
-    right_filter: Option<FilterExpr>,
-    join_type: JoinType,
-}
-
-impl SqlQuery {
-    pub fn is_aggregate(&self) -> bool {
-        !self.aggregates.is_empty()
-    }
-}
 
 pub fn parse_sql(input: &str) -> Result<SqlQuery> {
     let dialect = GenericDialect {};
