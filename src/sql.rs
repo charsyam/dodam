@@ -120,6 +120,7 @@ mod native_filtered;
 mod output_order;
 mod output_utils;
 mod primitive_buffers;
+mod primitive_selection;
 mod profiling;
 mod projection_parser;
 mod projection_types;
@@ -213,6 +214,12 @@ use primitive_buffers::{
     primitive_topk_key, push_direct_selected_page_value, push_null_free_primitive_row,
     push_null_free_primitive_value, push_primitive_batch_value, push_primitive_output_slot,
 };
+use primitive_selection::{
+    ordered_sink_profile_enabled, primitive_ordered_selected_batch,
+    primitive_topk_filter_i32_positions, primitive_topk_filter_i64_positions,
+    primitive_topk_filter_positions_into, primitive_topk_filter_positions_with_min_key_into,
+    primitive_topk_sequence_base, reserve_selected_positions, row_at_time_fallback_enabled,
+};
 use profiling::{
     generic_profile_elapsed, generic_profile_start, semijoin_profile_enabled, sql_elapsed_nanos,
     sql_nanos_to_millis, tpch_profile_elapsed, tpch_profile_enabled, tpch_profile_start,
@@ -278,12 +285,8 @@ use set_operations::{
     union_quantifier_is_distinct, validate_union_all_batches,
 };
 use set_sink::{
-    append_same_source_union_all_filter_batches, ordered_sink_profile_enabled,
-    primitive_topk_filter_i32_positions, primitive_topk_filter_i64_positions,
-    primitive_topk_filter_positions_into, primitive_topk_filter_positions_with_min_key_into,
-    primitive_topk_sequence_base, reserve_selected_positions, row_at_time_fallback_enabled,
-    same_source_union_primitive_chunk_size, try_execute_set_operation_sql_to_sink,
-    write_same_source_primitive_batch_to_sink,
+    append_same_source_union_all_filter_batches, same_source_union_primitive_chunk_size,
+    try_execute_set_operation_sql_to_sink, write_same_source_primitive_batch_to_sink,
 };
 use table_refs::{
     SqlTableRef, parse_comma_join_table_refs, parse_derived_from, parse_from,
