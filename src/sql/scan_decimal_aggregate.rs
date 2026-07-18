@@ -7,6 +7,8 @@ struct DecimalProductSumSpec {
     right_column: String,
     left_kind: ProductColumnKind,
     right_kind: ProductColumnKind,
+    left_transform: ProductTermTransform,
+    right_transform: ProductTermTransform,
     projection: Vec<String>,
     predicates: Vec<PrimitivePredicate>,
 }
@@ -16,6 +18,23 @@ enum ProductColumnKind {
     Int32,
     Int64,
     DecimalI64 { scale: i64 },
+}
+
+#[derive(Clone, Copy)]
+enum ProductTermTransform {
+    Identity,
+    OneMinus,
+    OnePlus,
+}
+
+impl ProductTermTransform {
+    fn apply_raw_i64(self, raw: i64, scale: i64) -> i64 {
+        match self {
+            Self::Identity => raw,
+            Self::OneMinus => scale - raw,
+            Self::OnePlus => scale + raw,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -89,6 +108,14 @@ struct DecimalProductSumState {
     count: u64,
     rows: usize,
     batches: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ProductPayloadPlan {
+    left_kind: ProductColumnKind,
+    right_kind: ProductColumnKind,
+    left_transform: ProductTermTransform,
+    right_transform: ProductTermTransform,
 }
 
 pub(super) async fn try_collect_filtered_decimal_product_sum_scan_fold(
@@ -187,8 +214,12 @@ async fn try_collect_filtered_product_sum_late_materialized(
     }
     let payload_columns = vec![spec.left_column.clone(), spec.right_column.clone()];
     let sum_expr = spec.sum_expr.clone();
-    let left_kind = spec.left_kind;
-    let right_kind = spec.right_kind;
+    let product_plan = ProductPayloadPlan {
+        left_kind: spec.left_kind,
+        right_kind: spec.right_kind,
+        left_transform: spec.left_transform,
+        right_transform: spec.right_transform,
+    };
     let started = Instant::now();
     let Some(partials) = engine
         .late_materialized_parquet_map_pruned_with_policy_view(
@@ -220,7 +251,7 @@ async fn try_collect_filtered_product_sum_late_materialized(
                 }
             },
             move |view, state: &mut DecimalProductSumState| {
-                consume_product_payload_view(view, left_kind, right_kind, state)?;
+                consume_product_payload_view(view, product_plan, state)?;
                 Ok(Some(()))
             },
             |state, _metrics| Ok(Some(state)),
@@ -270,10 +301,12 @@ impl DecimalProductSumSpec {
             log_product_sum_rule_miss("expression-output-mismatch");
             return Ok(None);
         }
-        let Some((left_column, right_column)) = decimal_product_columns(&expression.expr) else {
+        let Some(product) = decimal_product_columns(&expression.expr) else {
             log_product_sum_rule_miss("expression-not-column-product");
             return Ok(None);
         };
+        let left_column = product.left_column.as_str();
+        let right_column = product.right_column.as_str();
         let Some(left_kind) = product_column_kind(engine, path, left_column)? else {
             log_product_sum_rule_miss("left-product-type-unsupported");
             return Ok(None);
@@ -337,6 +370,8 @@ impl DecimalProductSumSpec {
             right_column: right_column.to_string(),
             left_kind,
             right_kind,
+            left_transform: product.left_transform,
+            right_transform: product.right_transform,
             projection,
             predicates,
         }))
@@ -367,20 +402,56 @@ impl DecimalProductSumSpec {
     }
 }
 
-fn decimal_product_columns(expr: &ScalarSqlExpression) -> Option<(&str, &str)> {
+struct DecimalProductShape {
+    left_column: String,
+    right_column: String,
+    left_transform: ProductTermTransform,
+    right_transform: ProductTermTransform,
+}
+
+fn decimal_product_columns(expr: &ScalarSqlExpression) -> Option<DecimalProductShape> {
     let ScalarSqlExpression::Binary { left, op, right } = expr else {
         return None;
     };
     if *op != BinaryOperator::Multiply {
         return None;
     }
-    let ScalarSqlExpression::Column(left) = left.as_ref() else {
+    let left = product_term(left)?;
+    let right = product_term(right)?;
+    Some(DecimalProductShape {
+        left_column: left.0,
+        right_column: right.0,
+        left_transform: left.1,
+        right_transform: right.1,
+    })
+}
+
+fn product_term(expr: &ScalarSqlExpression) -> Option<(String, ProductTermTransform)> {
+    if let ScalarSqlExpression::Column(column) = expr {
+        return Some((column.clone(), ProductTermTransform::Identity));
+    }
+    let ScalarSqlExpression::Binary { left, op, right } = expr else {
         return None;
     };
-    let ScalarSqlExpression::Column(right) = right.as_ref() else {
+    if !scalar_literal_is_one_local(left) {
+        return None;
+    }
+    let ScalarSqlExpression::Column(column) = right.as_ref() else {
         return None;
     };
-    Some((left.as_str(), right.as_str()))
+    match op {
+        BinaryOperator::Minus => Some((column.clone(), ProductTermTransform::OneMinus)),
+        BinaryOperator::Plus => Some((column.clone(), ProductTermTransform::OnePlus)),
+        _ => None,
+    }
+}
+
+fn scalar_literal_is_one_local(expr: &ScalarSqlExpression) -> bool {
+    match expr {
+        ScalarSqlExpression::Literal(LiteralValue::Int64(1)) => true,
+        ScalarSqlExpression::Literal(LiteralValue::Float64(value)) => *value == 1.0,
+        _ => false,
+    }
 }
 
 fn product_column_kind(
@@ -677,6 +748,8 @@ fn consume_product_sum_vectors(
                 right,
                 left_scale,
                 right_scale,
+                spec.left_transform,
+                spec.right_transform,
                 state,
             );
             Ok(true)
@@ -687,12 +760,11 @@ fn consume_product_sum_vectors(
 
 fn consume_product_payload_view(
     view: BatchView<'_>,
-    left_kind: ProductColumnKind,
-    right_kind: ProductColumnKind,
+    plan: ProductPayloadPlan,
     state: &mut DecimalProductSumState,
 ) -> Result<()> {
     state.batches += 1;
-    match (left_kind, right_kind) {
+    match (plan.left_kind, plan.right_kind) {
         (
             ProductColumnKind::DecimalI64 { scale: left_scale },
             ProductColumnKind::DecimalI64 { scale: right_scale },
@@ -715,6 +787,8 @@ fn consume_product_payload_view(
                 let Some(right) = right.raw_i64_value(row) else {
                     continue;
                 };
+                let left = plan.left_transform.apply_raw_i64(left, left_scale);
+                let right = plan.right_transform.apply_raw_i64(right, right_scale);
                 state.sum += (left as f64) * (right as f64) / scale;
                 state.count += 1;
             }
@@ -844,6 +918,8 @@ fn consume_decimal_i64_product_sum_vectors(
     right: Decimal128VectorView<'_>,
     left_scale: i64,
     right_scale: i64,
+    left_transform: ProductTermTransform,
+    right_transform: ProductTermTransform,
     state: &mut DecimalProductSumState,
 ) {
     state.rows += view.num_rows();
@@ -853,7 +929,9 @@ fn consume_decimal_i64_product_sum_vectors(
             let scale = (left_scale as f64) * (right_scale as f64);
             for row in 0..view.num_rows() {
                 if predicates.matches(row) {
-                    state.sum += (left[row] as f64) * (right[row] as f64) / scale;
+                    let left = left_transform.apply_raw_i64(left[row], left_scale);
+                    let right = right_transform.apply_raw_i64(right[row], right_scale);
+                    state.sum += (left as f64) * (right as f64) / scale;
                     state.count += 1;
                 }
             }
@@ -864,9 +942,15 @@ fn consume_decimal_i64_product_sum_vectors(
         if left.is_null(row) || right.is_null(row) || !predicates.matches(row) {
             continue;
         }
-        let left = left.value(row);
-        let right = right.value(row);
-        state.sum += left * right;
+        let Some(left) = left.raw_i64_value(row) else {
+            continue;
+        };
+        let Some(right) = right.raw_i64_value(row) else {
+            continue;
+        };
+        let left = left_transform.apply_raw_i64(left, left_scale);
+        let right = right_transform.apply_raw_i64(right, right_scale);
+        state.sum += (left as f64) * (right as f64) / ((left_scale as f64) * (right_scale as f64));
         state.count += 1;
     }
 }
@@ -888,6 +972,10 @@ fn consume_product_row(
             state.int_sum += left * right;
         }
         (ProductValue::Scaled(left, left_scale), ProductValue::Scaled(right, right_scale)) => {
+            let left = spec.left_transform.apply_raw_i64(left as i64, left_scale);
+            let right = spec
+                .right_transform
+                .apply_raw_i64(right as i64, right_scale);
             state.sum +=
                 (left as f64) * (right as f64) / ((left_scale as f64) * (right_scale as f64));
         }

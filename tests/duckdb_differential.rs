@@ -1845,6 +1845,19 @@ async fn duckdb_differential_tpch_q6_canonical_shape() {
         tempdir.path(),
     )
     .await;
+
+    assert_same_as_duckdb(
+        &format!(
+            "SELECT sum(l_extendedprice * (1 - l_discount)) AS revenue FROM '{}' WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1994-01-01' + INTERVAL '1' YEAR AND l_quantity < 24",
+            lineitem_path.display()
+        ),
+        &format!(
+            "SELECT sum(l_extendedprice * (1 - l_discount)) AS revenue FROM read_parquet('{}') WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1994-01-01' + INTERVAL '1' YEAR AND l_quantity < 24",
+            lineitem_path.display()
+        ),
+        tempdir.path(),
+    )
+    .await;
 }
 
 #[tokio::test]
