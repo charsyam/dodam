@@ -165,6 +165,7 @@ mod set_sink;
 mod shipping_order_priority;
 mod shipping_priority_counts;
 mod shipping_priority_revenue;
+mod sql_sink;
 mod subquery_rewrite;
 mod supplier_stock_threshold;
 mod supplier_wait_antijoin;
@@ -364,6 +365,9 @@ use set_sink::{
 use shipping_order_priority::*;
 use shipping_priority_counts::*;
 use shipping_priority_revenue::*;
+pub use sql_sink::{
+    execute_sql_to_result_sink, try_execute_sql_streaming, try_execute_sql_to_sink,
+};
 use subquery_rewrite::{
     parse_filter_with_subqueries, try_execute_correlated_join_subquery_filter_sql,
     try_execute_materialized_join_subquery_sql,
@@ -1016,82 +1020,6 @@ fn prefer_post_scan_primitive_desc_topk(
         }) == PrimitiveOrderLimitStrategy::PostScanTopK,
     )
 }
-pub async fn try_execute_sql_streaming(
-    engine: &DodamEngine,
-    sql: &str,
-    batch_size: usize,
-) -> Result<Option<SendableBatchStream>> {
-    if explain_sql(engine, sql, batch_size).await?.is_some() {
-        return Ok(None);
-    }
-    let Some(request) = plan_direct_join_sink_request_relaxed(sql, batch_size)? else {
-        return Ok(None);
-    };
-    engine.join_parquet_batches(request).await.map(Some)
-}
-
-pub async fn try_execute_sql_to_sink(
-    engine: &DodamEngine,
-    sql: &str,
-    batch_size: usize,
-    sink: &mut dyn RecordBatchSink,
-) -> Result<Option<ScanPlanMetrics>> {
-    if explain_sql(engine, sql, batch_size).await?.is_some() {
-        return Ok(None);
-    }
-    if let Some(metrics) =
-        try_execute_set_operation_sql_to_sink(engine, sql, batch_size, sink).await?
-    {
-        return Ok(Some(metrics));
-    }
-    let Some(request) = plan_direct_join_sink_request_relaxed(sql, batch_size)? else {
-        return Ok(None);
-    };
-    let plan = engine.plan_parquet_join(request).await?;
-    engine.write_join_plan_to_sink(plan, sink).map(Some)
-}
-
-pub async fn execute_sql_to_result_sink(
-    engine: &DodamEngine,
-    sql: &str,
-    batch_size: usize,
-    sink: &mut dyn SqlResultSink,
-    options: SqlSinkExecutionOptions,
-) -> Result<SqlSinkExecutionProfile> {
-    let mut profile = SqlSinkExecutionProfile::default();
-    if options.allow_direct_or_streaming && explain_sql(engine, sql, batch_size).await?.is_none() {
-        let direct_started = Instant::now();
-        if let Some(metrics) =
-            try_execute_set_operation_sql_to_sink(engine, sql, batch_size, sink.record_batch_sink())
-                .await?
-        {
-            profile.direct_sink = Some(direct_started.elapsed());
-            profile.scan_plan_metrics = Some(metrics);
-            return Ok(profile);
-        }
-        if let Some(request) = plan_direct_join_sink_request_relaxed(sql, batch_size)? {
-            let plan = engine.plan_parquet_join(request).await?;
-            let metrics = engine.write_join_plan_to_sink(plan, sink.record_batch_sink())?;
-            profile.direct_sink = Some(direct_started.elapsed());
-            profile.scan_plan_metrics = Some(metrics);
-            return Ok(profile);
-        }
-        profile.direct_sink = Some(direct_started.elapsed());
-        profile.streaming = Some(Duration::ZERO);
-    } else {
-        profile.direct_sink = Some(Duration::ZERO);
-        profile.streaming = Some(Duration::ZERO);
-    }
-
-    let execute_started = Instant::now();
-    let output = execute_sql(engine, sql, batch_size).await?;
-    profile.execute = Some(execute_started.elapsed());
-    let write_started = Instant::now();
-    sink.write_output(output)?;
-    profile.write_output = Some(write_started.elapsed());
-    Ok(profile)
-}
-
 fn default_join_memory_limit_bytes() -> u64 {
     std::env::var("DODAM_JOIN_MEMORY_LIMIT_BYTES")
         .ok()
