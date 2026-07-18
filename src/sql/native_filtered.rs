@@ -2124,8 +2124,14 @@ fn native_filtered_batch_masks_impl(
             index
         } else {
             let index = unique.len();
+            let mask =
+                if let Some(value) = native_filtered_constant_boolean_condition(&spec.condition) {
+                    BooleanArray::from(vec![value; batch.num_rows()])
+                } else {
+                    evaluate_scalar_predicate(batch, &spec.condition, None)?
+                };
             unique.push(NativeFilteredBatchMask::new_with_sparse(
-                evaluate_scalar_predicate(batch, &spec.condition, None)?,
+                mask,
                 build_sparse_rows,
             ));
             cache.insert(key, index);
@@ -2137,6 +2143,16 @@ fn native_filtered_batch_masks_impl(
         .into_iter()
         .map(|index| unique[index].clone())
         .collect())
+}
+
+fn native_filtered_constant_boolean_condition(condition: &SqlExpr) -> Option<bool> {
+    match condition {
+        SqlExpr::Value(value) => match &value.value {
+            Value::Boolean(value) => Some(*value),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 #[derive(Clone)]
