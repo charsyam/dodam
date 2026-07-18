@@ -6955,6 +6955,14 @@ impl DodamEngine {
             self.object_store.clone(),
         )
         .try_execute_metrics()
+        .or_else(|error| match &error {
+            DodamError::UnsupportedSql(message)
+                if message.starts_with("unsupported DirectPrimitiveFoldExec ") =>
+            {
+                Ok(None)
+            }
+            _ => Err(error),
+        })
     }
 
     pub(crate) fn parquet_decimal128_type(
