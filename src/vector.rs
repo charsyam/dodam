@@ -413,6 +413,15 @@ impl<'a> Decimal128VectorView<'a> {
         }
     }
 
+    pub(crate) fn raw_i64_value(&self, row: usize) -> Option<i64> {
+        match self {
+            Self::Arrow { values, .. } => Some(values.values().as_ref()[row] as i64),
+            Self::Raw { values, .. } => Some(values[row] as i64),
+            Self::RawI64 { values, .. } => Some(values[row]),
+            Self::RawI64Bytes { data, .. } => Some(read_i64_le_unaligned(data, row)),
+        }
+    }
+
     pub(crate) fn len(&self) -> usize {
         match self {
             Self::Arrow { values, .. } => values.len(),

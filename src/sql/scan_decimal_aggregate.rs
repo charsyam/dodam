@@ -3,10 +3,17 @@ use super::*;
 #[derive(Clone)]
 struct DecimalProductSumSpec {
     sum_expr: AggregateExpr,
-    left_column: String,
-    right_column: String,
+    left_kind: ProductColumnKind,
+    right_kind: ProductColumnKind,
     projection: Vec<String>,
     predicates: Vec<PrimitivePredicate>,
+}
+
+#[derive(Clone, Copy)]
+enum ProductColumnKind {
+    Int32,
+    Int64,
+    DecimalI64 { scale: i64 },
 }
 
 #[derive(Clone)]
@@ -24,9 +31,53 @@ enum PrimitivePredicate {
     },
 }
 
+struct PrimitivePredicateVectors<'a> {
+    predicates: Vec<PrimitivePredicateVector<'a>>,
+}
+
+enum PrimitivePredicateVector<'a> {
+    Date32 {
+        values: Date32VectorView<'a>,
+        min: Option<i32>,
+        max: Option<i32>,
+    },
+    Decimal128 {
+        values: Decimal128VectorView<'a>,
+        min: Option<i64>,
+        max: Option<i64>,
+    },
+}
+
+impl PrimitivePredicateVectors<'_> {
+    #[inline]
+    fn matches(&self, row: usize) -> bool {
+        self.predicates
+            .iter()
+            .all(|predicate| predicate.matches(row))
+    }
+}
+
+impl PrimitivePredicateVector<'_> {
+    #[inline]
+    fn matches(&self, row: usize) -> bool {
+        match self {
+            Self::Date32 { values, min, max } => {
+                !values.is_null(row) && i32_in_bounds(values.value(row), *min, *max)
+            }
+            Self::Decimal128 { values, min, max } => {
+                !values.is_null(row)
+                    && values
+                        .raw_i64_value(row)
+                        .is_some_and(|value| i64_in_bounds(value, *min, *max))
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct DecimalProductSumState {
     sum: f64,
+    int_sum: i128,
     count: u64,
     rows: usize,
     batches: usize,
@@ -71,6 +122,7 @@ pub(super) async fn try_collect_filtered_decimal_product_sum_scan_fold(
             },
             |state, partial| {
                 state.sum += partial.sum;
+                state.int_sum += partial.int_sum;
                 state.count += partial.count;
                 state.rows += partial.rows;
                 state.batches += partial.batches;
@@ -83,8 +135,8 @@ pub(super) async fn try_collect_filtered_decimal_product_sum_scan_fold(
         batches: state.batches,
         rows: state.rows,
         values: vec![AggregateResult {
-            expr: spec.sum_expr,
-            value: AggregateValue::Float64((state.count > 0).then_some(state.sum)),
+            expr: spec.sum_expr.clone(),
+            value: spec.aggregate_value(&state)?,
         }],
         aggregate_nanos: started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
         ..AggregateMetrics::default()
@@ -111,13 +163,36 @@ impl DecimalProductSumSpec {
         let Some((left_column, right_column)) = decimal_product_columns(&expression.expr) else {
             return Ok(None);
         };
-        let Some((left_precision, _)) = engine.parquet_decimal128_type(path, left_column)? else {
+        let Some(left_kind) = product_column_kind(engine, path, left_column)? else {
             return Ok(None);
         };
-        let Some((right_precision, _)) = engine.parquet_decimal128_type(path, right_column)? else {
+        let Some(right_kind) = product_column_kind(engine, path, right_column)? else {
             return Ok(None);
         };
-        if left_precision > 18 || right_precision > 18 {
+        if matches!(
+            (left_kind, right_kind),
+            (
+                ProductColumnKind::DecimalI64 { .. },
+                ProductColumnKind::DecimalI64 { .. }
+            )
+        ) || matches!(
+            (left_kind, right_kind),
+            (
+                ProductColumnKind::Int32 | ProductColumnKind::Int64,
+                ProductColumnKind::Int32 | ProductColumnKind::Int64
+            )
+        ) {
+        } else {
+            return Ok(None);
+        }
+        if matches!(
+            (left_kind, right_kind),
+            (
+                ProductColumnKind::Int32 | ProductColumnKind::Int64,
+                ProductColumnKind::Int32 | ProductColumnKind::Int64
+            )
+        ) && std::env::var_os("DODAM_ENABLE_INTEGER_PRODUCT_SUM_SCAN_FOLD").is_none()
+        {
             return Ok(None);
         }
         let mut projection = Vec::new();
@@ -141,11 +216,35 @@ impl DecimalProductSumSpec {
         }
         Ok(Some(Self {
             sum_expr: aggregates[0].clone(),
-            left_column: left_column.to_string(),
-            right_column: right_column.to_string(),
+            left_kind,
+            right_kind,
             projection,
             predicates,
         }))
+    }
+
+    fn aggregate_value(&self, state: &DecimalProductSumState) -> Result<AggregateValue> {
+        if state.count == 0 {
+            return Ok(match (self.left_kind, self.right_kind) {
+                (
+                    ProductColumnKind::Int32 | ProductColumnKind::Int64,
+                    ProductColumnKind::Int32 | ProductColumnKind::Int64,
+                ) => AggregateValue::Int64(None),
+                _ => AggregateValue::Float64(None),
+            });
+        }
+        match (self.left_kind, self.right_kind) {
+            (
+                ProductColumnKind::Int32 | ProductColumnKind::Int64,
+                ProductColumnKind::Int32 | ProductColumnKind::Int64,
+            ) => {
+                let value = i64::try_from(state.int_sum).map_err(|_| {
+                    DodamError::UnsupportedSql("SUM integer expression overflow".to_string())
+                })?;
+                Ok(AggregateValue::Int64(Some(value)))
+            }
+            _ => Ok(AggregateValue::Float64(Some(state.sum))),
+        }
     }
 }
 
@@ -163,6 +262,36 @@ fn decimal_product_columns(expr: &ScalarSqlExpression) -> Option<(&str, &str)> {
         return None;
     };
     Some((left.as_str(), right.as_str()))
+}
+
+fn product_column_kind(
+    engine: &DodamEngine,
+    path: &Path,
+    column: &str,
+) -> Result<Option<ProductColumnKind>> {
+    let column = column.to_string();
+    if let Some(types) =
+        engine.parquet_direct_primitive_column_types(path, std::slice::from_ref(&column))?
+    {
+        if let [column_type] = types.as_slice() {
+            return Ok(match column_type {
+                DirectPrimitiveColumnType::I32 => Some(ProductColumnKind::Int32),
+                DirectPrimitiveColumnType::I64 => Some(ProductColumnKind::Int64),
+                DirectPrimitiveColumnType::Decimal128Int64 { precision, scale }
+                | DirectPrimitiveColumnType::Decimal128Int64Raw { precision, scale } => {
+                    if *precision <= 18 {
+                        Some(ProductColumnKind::DecimalI64 {
+                            scale: decimal_scale_i64_local(*scale)?,
+                        })
+                    } else {
+                        None
+                    }
+                }
+                DirectPrimitiveColumnType::Date32 => None,
+            });
+        }
+    }
+    Ok(None)
 }
 
 fn primitive_predicate_for_column(
@@ -347,59 +476,18 @@ fn consume_decimal_product_sum_view(
         };
         return consume_decimal_product_sum_batch(batch, spec, state);
     }
-    let (Some(left), Some(right)) = (view.decimal128_vector(0), view.decimal128_vector(1)) else {
-        let Some(batch) = view.try_record_batch() else {
-            return Err(DodamError::UnsupportedSql(
-                "filtered decimal product sum requires decimal inputs".to_string(),
-            ));
-        };
-        return consume_decimal_product_sum_batch(batch, spec, state);
-    };
-    let Some(left_scale) = left.scale_i64() else {
-        return consume_decimal_product_sum_batch_required(view, spec, state);
-    };
-    let Some(right_scale) = right.scale_i64() else {
-        return consume_decimal_product_sum_batch_required(view, spec, state);
-    };
-    if left.precision() > 18 || right.precision() > 18 {
-        return consume_decimal_product_sum_batch_required(view, spec, state);
-    }
-    let left_values = left.raw_values();
-    let right_values = right.raw_values();
-    let revenue_scale = 1.0 / ((left_scale as f64) * (right_scale as f64));
-    state.rows += view.num_rows();
-    state.batches += 1;
-    if left.null_count() == 0 && right.null_count() == 0 && predicates_are_null_free(view, spec) {
-        for row in 0..view.num_rows() {
-            if predicates_match_row(view, spec, row)? {
-                state.sum +=
-                    (left_values[row] as i64 * right_values[row] as i64) as f64 * revenue_scale;
-                state.count += 1;
-            }
-        }
+    if consume_product_sum_vectors(view, spec, state)? {
         return Ok(());
     }
+    state.rows += view.num_rows();
+    state.batches += 1;
     for row in 0..view.num_rows() {
-        if left.is_null(row) || right.is_null(row) || !predicates_match_row(view, spec, row)? {
+        if !predicates_match_row(view, spec, row)? {
             continue;
         }
-        state.sum += (left_values[row] as i64 * right_values[row] as i64) as f64 * revenue_scale;
-        state.count += 1;
+        consume_product_row(view, spec, row, state)?;
     }
     Ok(())
-}
-
-fn consume_decimal_product_sum_batch_required(
-    view: BatchView<'_>,
-    spec: &DecimalProductSumSpec,
-    state: &mut DecimalProductSumState,
-) -> Result<()> {
-    let Some(batch) = view.try_record_batch() else {
-        return Err(DodamError::UnsupportedSql(
-            "filtered decimal product sum fallback requires RecordBatch".to_string(),
-        ));
-    };
-    consume_decimal_product_sum_batch(batch, spec, state)
 }
 
 fn consume_decimal_product_sum_batch(
@@ -407,53 +495,261 @@ fn consume_decimal_product_sum_batch(
     spec: &DecimalProductSumSpec,
     state: &mut DecimalProductSumState,
 ) -> Result<()> {
-    let left = batch_column(batch, &spec.left_column)?;
-    let right = batch_column(batch, &spec.right_column)?;
-    let Some(left) = decimal_input(left)? else {
-        return Err(DodamError::UnsupportedSql(
-            "filtered decimal product sum left input must be Decimal128".to_string(),
-        ));
-    };
-    let Some(right) = decimal_input(right)? else {
-        return Err(DodamError::UnsupportedSql(
-            "filtered decimal product sum right input must be Decimal128".to_string(),
-        ));
-    };
-    let Some(left_scale) = left.scale_i64() else {
-        return Err(DodamError::UnsupportedSql(
-            "filtered decimal product sum left scale is too large".to_string(),
-        ));
-    };
-    let Some(right_scale) = right.scale_i64() else {
-        return Err(DodamError::UnsupportedSql(
-            "filtered decimal product sum right scale is too large".to_string(),
-        ));
-    };
-    let revenue_scale = 1.0 / ((left_scale as f64) * (right_scale as f64));
-    let left_values = left.raw_values();
-    let right_values = right.raw_values();
+    let view = BatchView::new(batch);
+    if consume_product_sum_vectors(view, spec, state)? {
+        return Ok(());
+    }
     state.rows += batch.num_rows();
     state.batches += 1;
     for row in 0..batch.num_rows() {
-        if left.is_null(row) || right.is_null(row) || !batch_predicates_match_row(batch, spec, row)?
-        {
+        if !batch_predicates_match_row(batch, spec, row)? {
             continue;
         }
-        state.sum += (left_values[row] as i64 * right_values[row] as i64) as f64 * revenue_scale;
-        state.count += 1;
+        consume_product_row(view, spec, row, state)?;
     }
     Ok(())
 }
 
-fn predicates_are_null_free(view: BatchView<'_>, spec: &DecimalProductSumSpec) -> bool {
-    spec.predicates.iter().all(|predicate| match predicate {
-        PrimitivePredicate::Date32 { index, .. } => view
-            .date32_vector(*index)
-            .is_some_and(|values| values.values_if_null_free().is_some()),
-        PrimitivePredicate::Decimal128 { index, .. } => view
-            .decimal128_vector(*index)
-            .is_some_and(|values| values.null_count() == 0),
-    })
+fn consume_product_sum_vectors(
+    view: BatchView<'_>,
+    spec: &DecimalProductSumSpec,
+    state: &mut DecimalProductSumState,
+) -> Result<bool> {
+    let Some(predicates) = bind_predicate_vectors(view, spec) else {
+        return Ok(false);
+    };
+    match (spec.left_kind, spec.right_kind) {
+        (ProductColumnKind::Int64, ProductColumnKind::Int64) => {
+            let (Some(left), Some(right)) = (view.i64_vector(0), view.i64_vector(1)) else {
+                return Ok(false);
+            };
+            consume_i64_i64_product_sum_vectors(view, &predicates, left, right, state);
+            Ok(true)
+        }
+        (ProductColumnKind::Int32, ProductColumnKind::Int32) => {
+            let (Some(left), Some(right)) = (view.i32_vector(0), view.i32_vector(1)) else {
+                return Ok(false);
+            };
+            consume_i32_i32_product_sum_vectors(view, &predicates, left, right, state);
+            Ok(true)
+        }
+        (
+            ProductColumnKind::DecimalI64 { scale: left_scale },
+            ProductColumnKind::DecimalI64 { scale: right_scale },
+        ) => {
+            let (Some(left), Some(right)) = (view.decimal128_vector(0), view.decimal128_vector(1))
+            else {
+                return Ok(false);
+            };
+            if left.scale_i64() != Some(left_scale) || right.scale_i64() != Some(right_scale) {
+                return Ok(false);
+            }
+            consume_decimal_i64_product_sum_vectors(
+                view,
+                &predicates,
+                left,
+                right,
+                left_scale,
+                right_scale,
+                state,
+            );
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn bind_predicate_vectors<'a>(
+    view: BatchView<'a>,
+    spec: &DecimalProductSumSpec,
+) -> Option<PrimitivePredicateVectors<'a>> {
+    let mut predicates = Vec::with_capacity(spec.predicates.len());
+    for predicate in &spec.predicates {
+        match predicate {
+            PrimitivePredicate::Date32 { index, min, max } => {
+                predicates.push(PrimitivePredicateVector::Date32 {
+                    values: view.date32_vector(*index)?,
+                    min: *min,
+                    max: *max,
+                });
+            }
+            PrimitivePredicate::Decimal128 {
+                index,
+                scale,
+                min,
+                max,
+            } => {
+                let values = view.decimal128_vector(*index)?;
+                if values.scale_i64() != Some(*scale) {
+                    return None;
+                }
+                predicates.push(PrimitivePredicateVector::Decimal128 {
+                    values,
+                    min: *min,
+                    max: *max,
+                });
+            }
+        }
+    }
+    Some(PrimitivePredicateVectors { predicates })
+}
+
+fn consume_i64_i64_product_sum_vectors(
+    view: BatchView<'_>,
+    predicates: &PrimitivePredicateVectors<'_>,
+    left: I64VectorView<'_>,
+    right: I64VectorView<'_>,
+    state: &mut DecimalProductSumState,
+) {
+    state.rows += view.num_rows();
+    state.batches += 1;
+    if let (Some(left), Some(right)) = (left.values_if_null_free(), right.values_if_null_free()) {
+        for row in 0..view.num_rows() {
+            if predicates.matches(row) {
+                state.int_sum += i128::from(left[row]) * i128::from(right[row]);
+                state.count += 1;
+            }
+        }
+        return;
+    }
+    for row in 0..view.num_rows() {
+        if left.is_null(row) || right.is_null(row) || !predicates.matches(row) {
+            continue;
+        }
+        state.int_sum += i128::from(left.value(row)) * i128::from(right.value(row));
+        state.count += 1;
+    }
+}
+
+fn consume_i32_i32_product_sum_vectors(
+    view: BatchView<'_>,
+    predicates: &PrimitivePredicateVectors<'_>,
+    left: I32VectorView<'_>,
+    right: I32VectorView<'_>,
+    state: &mut DecimalProductSumState,
+) {
+    state.rows += view.num_rows();
+    state.batches += 1;
+    if let (Some(left), Some(right)) = (left.values_if_null_free(), right.values_if_null_free()) {
+        for row in 0..view.num_rows() {
+            if predicates.matches(row) {
+                state.int_sum += i128::from(left[row]) * i128::from(right[row]);
+                state.count += 1;
+            }
+        }
+        return;
+    }
+    for row in 0..view.num_rows() {
+        if left.is_null(row) || right.is_null(row) || !predicates.matches(row) {
+            continue;
+        }
+        state.int_sum += i128::from(left.value(row)) * i128::from(right.value(row));
+        state.count += 1;
+    }
+}
+
+fn consume_decimal_i64_product_sum_vectors(
+    view: BatchView<'_>,
+    predicates: &PrimitivePredicateVectors<'_>,
+    left: Decimal128VectorView<'_>,
+    right: Decimal128VectorView<'_>,
+    left_scale: i64,
+    right_scale: i64,
+    state: &mut DecimalProductSumState,
+) {
+    state.rows += view.num_rows();
+    state.batches += 1;
+    if left.null_count() == 0 && right.null_count() == 0 {
+        if let (Some(left), Some(right)) = (left.raw_i64_values(), right.raw_i64_values()) {
+            let scale = (left_scale as f64) * (right_scale as f64);
+            for row in 0..view.num_rows() {
+                if predicates.matches(row) {
+                    state.sum += (left[row] as f64) * (right[row] as f64) / scale;
+                    state.count += 1;
+                }
+            }
+            return;
+        }
+    }
+    for row in 0..view.num_rows() {
+        if left.is_null(row) || right.is_null(row) || !predicates.matches(row) {
+            continue;
+        }
+        let left = left.value(row);
+        let right = right.value(row);
+        state.sum += left * right;
+        state.count += 1;
+    }
+}
+
+fn consume_product_row(
+    view: BatchView<'_>,
+    spec: &DecimalProductSumSpec,
+    row: usize,
+    state: &mut DecimalProductSumState,
+) -> Result<()> {
+    let Some(left) = product_value(view, 0, spec.left_kind, row)? else {
+        return Ok(());
+    };
+    let Some(right) = product_value(view, 1, spec.right_kind, row)? else {
+        return Ok(());
+    };
+    match (left, right) {
+        (ProductValue::Integer(left), ProductValue::Integer(right)) => {
+            state.int_sum += left * right;
+        }
+        (ProductValue::Scaled(left, left_scale), ProductValue::Scaled(right, right_scale)) => {
+            state.sum +=
+                (left as f64) * (right as f64) / ((left_scale as f64) * (right_scale as f64));
+        }
+        _ => return Ok(()),
+    }
+    state.count += 1;
+    Ok(())
+}
+
+enum ProductValue {
+    Integer(i128),
+    Scaled(i128, i64),
+}
+
+fn product_value(
+    view: BatchView<'_>,
+    index: usize,
+    kind: ProductColumnKind,
+    row: usize,
+) -> Result<Option<ProductValue>> {
+    match kind {
+        ProductColumnKind::Int32 => {
+            let Some(values) = view.i32_vector(index) else {
+                return Ok(None);
+            };
+            Ok(
+                (!values.is_null(row))
+                    .then(|| ProductValue::Integer(i128::from(values.value(row)))),
+            )
+        }
+        ProductColumnKind::Int64 => {
+            let Some(values) = view.i64_vector(index) else {
+                return Ok(None);
+            };
+            Ok(
+                (!values.is_null(row))
+                    .then(|| ProductValue::Integer(i128::from(values.value(row)))),
+            )
+        }
+        ProductColumnKind::DecimalI64 { scale } => {
+            let Some(values) = view.decimal128_vector(index) else {
+                return Ok(None);
+            };
+            if values.scale_i64() != Some(scale) || values.is_null(row) {
+                return Ok(None);
+            }
+            Ok(values
+                .raw_i64_value(row)
+                .map(|value| ProductValue::Scaled(i128::from(value), scale)))
+        }
+    }
 }
 
 fn predicates_match_row(
