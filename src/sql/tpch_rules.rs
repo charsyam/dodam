@@ -649,8 +649,8 @@ async fn supplier_comment_exclusion_keys(
     path: PathBuf,
     batch_size: usize,
     comment_parts: &[String],
-) -> Result<Q16BadSuppliers> {
-    q16_bad_suppliers(engine, path, batch_size, comment_parts).await
+) -> Result<ExcludedSuppliers> {
+    excluded_suppliers_by_comment_like(engine, path, batch_size, comment_parts).await
 }
 
 async fn parts_supplier_relationship_part_groups(
@@ -660,8 +660,8 @@ async fn parts_supplier_relationship_part_groups(
     excluded_brand: &str,
     excluded_type_prefix: &str,
     sizes: &AdaptiveI64Set,
-) -> Result<Q16PartGroups> {
-    q16_part_groups(
+) -> Result<PartGroups> {
+    part_groups_by_attributes(
         engine,
         path,
         batch_size,
@@ -676,14 +676,15 @@ async fn parts_supplier_relationship_supplier_counts(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-    part_groups: Q16PartGroups,
-    bad_suppliers: Q16BadSuppliers,
-) -> Result<Vec<Q16Row>> {
-    q16_supplier_counts(engine, path, batch_size, part_groups, bad_suppliers).await
+    part_groups: PartGroups,
+    bad_suppliers: ExcludedSuppliers,
+) -> Result<Vec<PartSupplierGroupRow>> {
+    distinct_supplier_counts_by_part_group(engine, path, batch_size, part_groups, bad_suppliers)
+        .await
 }
 
-fn parts_supplier_relationship_output(rows: Vec<Q16Row>) -> Result<QueryOutput> {
-    q16_output(rows)
+fn parts_supplier_relationship_output(rows: Vec<PartSupplierGroupRow>) -> Result<QueryOutput> {
+    part_supplier_group_output(rows)
 }
 
 fn parts_supplier_relationship_bad_supplier_path(selection: &SqlExpr) -> Result<Option<PathBuf>> {
