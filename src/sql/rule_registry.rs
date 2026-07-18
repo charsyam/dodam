@@ -1039,6 +1039,25 @@ fn sql_rule_profile_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn registered_rules_have_unique_names_and_stable_ranks() {
+        let mut names = HashSet::new();
+        for (rank, rule) in sql_rule_registry().iter().copied().enumerate() {
+            assert!(
+                names.insert(rule.name()),
+                "duplicate SQL rule name: {}",
+                rule.name()
+            );
+            assert_eq!(
+                rule.cost_rank(),
+                rank as u16,
+                "cost rank should match registry order for {}",
+                rule.name()
+            );
+        }
+    }
 
     #[test]
     fn specific_vector_rules_rank_before_generic_with_cte_fallback() {

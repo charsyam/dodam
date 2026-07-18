@@ -103,7 +103,9 @@ def main() -> int:
 
     print_report(report)
     if args.json_out:
-        Path(args.json_out).write_text(json.dumps(report, indent=2) + "\n")
+        json_out = Path(args.json_out)
+        json_out.parent.mkdir(parents=True, exist_ok=True)
+        json_out.write_text(json.dumps(report, indent=2) + "\n")
     return 0
 
 

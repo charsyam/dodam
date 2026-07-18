@@ -628,13 +628,9 @@ mod tests {
             panic!("expected query");
         };
 
-        let mut operands = Vec::new();
-        assert!(
-            collect_union_all_operand_queries(query.body.as_ref(), &mut operands)
-                .expect("operands should parse")
-        );
-        let plan =
-            same_source_disjoint_union_all_plan(&operands).expect("shared scan should be planned");
+        let plan = plan_same_source_union_all_scan(query.body.as_ref())
+            .expect("shared scan planner should parse")
+            .expect("shared scan should be planned");
 
         assert_eq!(plan.path, PathBuf::from("/tmp/facts.parquet"));
         assert_eq!(
@@ -662,13 +658,9 @@ mod tests {
             panic!("expected query");
         };
 
-        let mut operands = Vec::new();
-        assert!(
-            collect_union_all_operand_queries(query.body.as_ref(), &mut operands)
-                .expect("operands should parse")
-        );
-        let plan =
-            same_source_disjoint_union_all_plan(&operands).expect("shared scan should be planned");
+        let plan = plan_same_source_union_all_scan(query.body.as_ref())
+            .expect("shared scan planner should parse")
+            .expect("shared scan should be planned");
 
         let Expr::InList { values, .. } = plan.filter.expr() else {
             panic!("expected in-list filter");
@@ -690,13 +682,16 @@ mod tests {
             panic!("expected query");
         };
 
-        let mut operands = Vec::new();
         assert!(
-            collect_union_all_operand_queries(query.body.as_ref(), &mut operands)
-                .expect("operands should parse")
+            plan_same_source_union_all_scan(query.body.as_ref())
+                .expect("shared scan planner should parse")
+                .is_none()
         );
-        assert!(same_source_disjoint_union_all_plan(&operands).is_none());
-        assert!(same_source_union_all_filter_scan_plan(&operands).is_some());
+        assert!(
+            plan_same_source_union_all_filter_scan(query.body.as_ref())
+                .expect("filter scan planner should parse")
+                .is_some()
+        );
     }
 
     #[test]

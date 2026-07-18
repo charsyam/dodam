@@ -384,9 +384,11 @@ fn native_filtered_update_i32_group_direct_predicates_columnar_batch(
     if max_key > native_filtered_eager_dense_max_key() {
         return Ok(false);
     }
-    if native_filtered_update_i32_group_count_sum_avg_dense_batch(
-        values, predicates, inputs, specs, dense, max_key,
-    )? {
+    if native_filtered_count_sum_avg_dense_sink_enabled(predicates)
+        && native_filtered_update_i32_group_count_sum_avg_dense_batch(
+            values, predicates, inputs, specs, dense, max_key,
+        )?
+    {
         return Ok(true);
     }
     if native_filtered_fused_vector_sink_enabled()
@@ -458,9 +460,6 @@ fn native_filtered_update_i32_group_count_sum_avg_dense_batch(
     dense: &mut Vec<Option<Vec<NativeFilteredAggregateState>>>,
     max_key: usize,
 ) -> Result<bool> {
-    if !native_filtered_count_sum_avg_dense_sink_enabled() {
-        return Ok(false);
-    }
     if predicates.len() != 3 || inputs.len() != 3 || specs.len() != 3 || keys.null_count() != 0 {
         return Ok(false);
     }
@@ -552,9 +551,28 @@ fn native_filtered_update_i32_group_count_sum_avg_dense_batch(
     Ok(true)
 }
 
-fn native_filtered_count_sum_avg_dense_sink_enabled() -> bool {
-    std::env::var("DODAM_ENABLE_NATIVE_FILTERED_COUNT_SUM_AVG_DENSE_SINK")
+fn native_filtered_count_sum_avg_dense_sink_enabled(
+    predicates: &[NativeFilteredDirectPredicate],
+) -> bool {
+    if std::env::var("DODAM_DISABLE_NATIVE_FILTERED_COUNT_SUM_AVG_DENSE_SINK")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return false;
+    }
+    if std::env::var("DODAM_ENABLE_NATIVE_FILTERED_COUNT_SUM_AVG_DENSE_SINK")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return true;
+    }
+    native_filtered_count_sum_avg_dense_sink_auto_candidate(predicates)
+}
+
+fn native_filtered_count_sum_avg_dense_sink_auto_candidate(
+    predicates: &[NativeFilteredDirectPredicate],
+) -> bool {
+    !predicates
+        .iter()
+        .any(NativeFilteredDirectPredicate::prefers_selected_rows)
 }
 
 fn native_filtered_update_i32_group_direct_predicates_fused_vector_sink(
@@ -2641,5 +2659,34 @@ fn scalar_value_type_name(value: &ScalarValue) -> &'static str {
         ScalarValue::Boolean(_) => "BOOLEAN",
         ScalarValue::Date32(_) => "DATE",
         ScalarValue::TimestampMillisecond(_) => "TIMESTAMP",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn count_sum_avg_dense_sink_auto_gate_rejects_selected_row_predicates() {
+        assert!(native_filtered_count_sum_avg_dense_sink_auto_candidate(&[
+            NativeFilteredDirectPredicate::AlwaysTrue,
+            NativeFilteredDirectPredicate::I64Compare {
+                values: Int64Array::from(vec![1_i64, 2, 3]),
+                op: BinaryOperator::GtEq,
+                literal: 0,
+            },
+        ]));
+
+        assert!(!native_filtered_count_sum_avg_dense_sink_auto_candidate(&[
+            NativeFilteredDirectPredicate::AlwaysTrue,
+            NativeFilteredDirectPredicate::Utf8PrefixLike {
+                values: StringArray::from(vec!["label-1", "other"]),
+                prefix: "label-".to_string(),
+                negated: false,
+            },
+        ]));
+        assert!(!native_filtered_count_sum_avg_dense_sink_auto_candidate(&[
+            NativeFilteredDirectPredicate::Precomputed(vec![true, false]),
+        ]));
     }
 }
