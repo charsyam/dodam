@@ -395,6 +395,22 @@ fn native_filtered_update_i32_group_direct_predicates_columnar_batch(
     {
         return Ok(true);
     }
+    if let Some(row_masks) = native_filtered_direct_predicate_row_masks(predicates, values.len()) {
+        if dense.len() <= max_key {
+            dense.resize_with(max_key + 1, || None);
+        }
+        let mut present = vec![false; max_key + 1];
+        for row in 0..values.len() {
+            present[values.value(row) as usize] = true;
+        }
+        for (key, present) in present.into_iter().enumerate() {
+            if present && dense[key].is_none() {
+                dense[key] = Some(native_filtered_initial_states(specs));
+            }
+        }
+        native_filtered_update_i32_dense_row_masks(values, &row_masks, inputs, specs, dense)?;
+        return Ok(true);
+    }
     let Some(mut columnar) = native_filtered_columnar_agg_states(specs, inputs, max_key + 1) else {
         return Ok(false);
     };
