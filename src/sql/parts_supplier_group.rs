@@ -125,55 +125,47 @@ pub(super) async fn part_groups_by_attributes(
         "p_type".to_string(),
         "p_size".to_string(),
     ]);
-    if part_dictionary_strings_enabled() {
-        let excluded_brand_owned = Arc::new(excluded_brand.to_string());
-        let excluded_type_prefix_owned = Arc::new(excluded_type_prefix.to_string());
-        let sizes = Arc::new(sizes.clone());
-        if let Some(partials) = engine
-            .parquet_row_group_map_dictionary_columns_pruned_view(
-                path.clone(),
-                batch_size,
-                projection.clone(),
-                vec!["p_brand".to_string(), "p_type".to_string()],
-                Vec::new(),
-                part_group_chunk_size(),
-                PartGroupPartial::default,
-                {
-                    let excluded_brand = excluded_brand_owned.clone();
-                    let excluded_type_prefix = excluded_type_prefix_owned.clone();
-                    let sizes = sizes.clone();
-                    move |view, partial| {
-                        part_groups_partial_view(
-                            view,
-                            &excluded_brand,
-                            &excluded_type_prefix,
-                            &sizes,
-                            partial,
-                        )?;
-                        Ok(Some(()))
-                    }
-                },
-                |partial| Ok(Some(partial)),
-            )
-            .await?
-        {
-            return merge_part_group_partials(partials);
-        }
+    let excluded_brand_owned = Arc::new(excluded_brand.to_string());
+    let excluded_type_prefix_owned = Arc::new(excluded_type_prefix.to_string());
+    let sizes_for_scan = Arc::new(sizes.clone());
+    if let Some(partials) = engine
+        .parquet_row_group_map_dictionary_columns_pruned_view(
+            path.clone(),
+            batch_size,
+            projection.clone(),
+            vec!["p_brand".to_string(), "p_type".to_string()],
+            Vec::new(),
+            part_group_chunk_size(),
+            PartGroupPartial::default,
+            {
+                let excluded_brand = excluded_brand_owned.clone();
+                let excluded_type_prefix = excluded_type_prefix_owned.clone();
+                let sizes = sizes_for_scan.clone();
+                move |view, partial| {
+                    part_groups_partial_view(
+                        view,
+                        &excluded_brand,
+                        &excluded_type_prefix,
+                        &sizes,
+                        partial,
+                    )?;
+                    Ok(Some(()))
+                }
+            },
+            |partial| Ok(Some(partial)),
+        )
+        .await?
+    {
+        return merge_part_group_partials(partials);
     }
-    let mut stream = if part_dictionary_strings_enabled() {
-        engine
-            .scan_parquet_batches_dictionary_columns(
-                path,
-                batch_size,
-                projection,
-                vec!["p_brand".to_string(), "p_type".to_string()],
-            )
-            .await?
-    } else {
-        engine
-            .scan_parquet_batches(path, batch_size, None, projection, None)
-            .await?
-    };
+    let mut stream = engine
+        .scan_parquet_batches_dictionary_columns(
+            path,
+            batch_size,
+            projection,
+            vec!["p_brand".to_string(), "p_type".to_string()],
+        )
+        .await?;
     let mut brand_ids = fast_hash_map::<String, usize>();
     let mut type_ids = fast_hash_map::<String, usize>();
     let mut brands_by_id = Vec::<String>::new();
@@ -406,16 +398,8 @@ pub(super) fn part_groups_vector_batch(
     Ok(true)
 }
 
-pub(super) fn part_dictionary_strings_enabled() -> bool {
-    std::env::var_os("DODAM_Q16_DISABLE_PART_DICTIONARY_STRINGS").is_none()
-}
-
 pub(super) fn part_group_chunk_size() -> usize {
-    std::env::var("DODAM_Q16_PART_GROUP_CHUNK_SIZE")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(2)
+    rule_chunk_size(2)
 }
 
 pub(super) struct PartGroupPartialRow {
@@ -1037,43 +1021,6 @@ pub(super) async fn distinct_supplier_counts_by_part_group(
             merge_supplier_counts_packed(&mut packed, partial);
         }
         packed.counts_by_first(groups.len())
-    } else if let Some(layout) = supplier_bitset_layout(groups.len(), bad_suppliers.max_suppkey) {
-        let Some(partials) = engine
-            .parquet_row_group_map_view(
-                path.clone(),
-                batch_size,
-                projection.clone(),
-                supplier_count_chunk_size(),
-                {
-                    let layout = layout.clone();
-                    move || GroupSupplierBitset::new(layout.clone())
-                },
-                {
-                    let part_to_group = part_to_group.clone();
-                    let bad_supplier_keys = bad_supplier_keys.clone();
-                    move |view, distinct_suppliers| {
-                        supplier_counts_bitset_view(
-                            view,
-                            &part_to_group,
-                            &bad_supplier_keys,
-                            distinct_suppliers,
-                        )?;
-                        Ok(Some(()))
-                    }
-                },
-                |distinct_suppliers| Ok(Some(distinct_suppliers)),
-            )
-            .await?
-        else {
-            return Err(DodamError::UnsupportedSql(
-                "part supplier group partsupp row-group map is unavailable".to_string(),
-            ));
-        };
-        let mut partial = GroupSupplierBitset::new(layout);
-        for batch_partial in partials {
-            merge_supplier_bitsets(&mut partial, batch_partial);
-        }
-        partial.counts()
     } else {
         let Some(partials) = engine
             .parquet_row_group_map_view(
@@ -1139,197 +1086,12 @@ pub(super) async fn distinct_supplier_counts_by_part_group(
     Ok(rows)
 }
 
-#[allow(dead_code)]
-pub(super) async fn supplier_counts_stream(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-    groups: Vec<PartGroupKey>,
-    part_to_group: Arc<AdaptiveI64Map<usize>>,
-    bad_supplier_keys: Arc<AdaptiveI64Set>,
-    max_suppkey: Option<i64>,
-) -> Result<Vec<PartSupplierGroupRow>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec!["ps_partkey".to_string(), "ps_suppkey".to_string()]),
-            None,
-        )
-        .await?;
-    let supplier_counts = if packed_distinct_enabled(groups.len(), max_suppkey) {
-        let packed = parallel_batch_fold_view_chunks(
-            &mut stream,
-            supplier_count_chunk_size(),
-            PackedU32PairDistinct::new,
-            move |view, distinct_suppliers| {
-                supplier_counts_packed_view(
-                    view,
-                    &part_to_group,
-                    &bad_supplier_keys,
-                    distinct_suppliers,
-                )?;
-                Ok(Some(()))
-            },
-            Ok,
-            PackedU32PairDistinct::new(),
-            merge_supplier_counts_packed,
-            "part supplier group partsupp supplier counts",
-        )?;
-        packed.counts_by_first(groups.len())
-    } else if let Some(layout) = supplier_bitset_layout(groups.len(), max_suppkey) {
-        let layout_for_scan = Arc::new(layout.clone());
-        let partial = parallel_batch_fold_view_chunks(
-            &mut stream,
-            supplier_count_chunk_size(),
-            {
-                let layout_for_scan = layout_for_scan.clone();
-                move || GroupSupplierBitset::new((*layout_for_scan).clone())
-            },
-            move |view, distinct_suppliers| {
-                supplier_counts_bitset_view(
-                    view,
-                    &part_to_group,
-                    &bad_supplier_keys,
-                    distinct_suppliers,
-                )?;
-                Ok(Some(()))
-            },
-            Ok,
-            GroupSupplierBitset::new(layout),
-            merge_supplier_bitsets,
-            "part supplier group partsupp supplier counts",
-        )?;
-        partial.counts()
-    } else {
-        let distinct_suppliers = parallel_batch_fold(
-            &mut stream,
-            move |batch| supplier_counts_batch(batch, &part_to_group, &bad_supplier_keys),
-            FastHashSet::<(usize, i64)>::default(),
-            merge_supplier_counts,
-            "part supplier group partsupp supplier counts",
-        )?;
-        let mut supplier_counts = vec![0_u64; groups.len()];
-        for (group_id, _) in distinct_suppliers {
-            if let Some(count) = supplier_counts.get_mut(group_id) {
-                *count += 1;
-            }
-        }
-        supplier_counts
-    };
-    let mut rows = supplier_counts
-        .into_iter()
-        .enumerate()
-        .filter_map(|(group_id, supplier_count)| {
-            if supplier_count == 0 {
-                return None;
-            }
-            let group = groups.get(group_id)?;
-            Some(PartSupplierGroupRow {
-                brand: group.brand.clone(),
-                type_name: group.type_name.clone(),
-                size: group.size,
-                supplier_count,
-            })
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| {
-        right
-            .supplier_count
-            .cmp(&left.supplier_count)
-            .then_with(|| left.brand.cmp(&right.brand))
-            .then_with(|| left.type_name.cmp(&right.type_name))
-            .then_with(|| left.size.cmp(&right.size))
-    });
-    Ok(rows)
-}
-
-#[derive(Clone)]
-pub(super) struct SupplierBitsetLayout {
-    group_count: usize,
-    words_per_group: usize,
-}
-
-pub(super) struct GroupSupplierBitset {
-    layout: SupplierBitsetLayout,
-    words: Vec<u64>,
-}
-
-impl GroupSupplierBitset {
-    fn new(layout: SupplierBitsetLayout) -> Self {
-        let words = vec![0; layout.group_count.saturating_mul(layout.words_per_group)];
-        Self { layout, words }
-    }
-
-    fn insert(&mut self, group_id: usize, suppkey: i64) {
-        if suppkey < 0 || group_id >= self.layout.group_count {
-            return;
-        }
-        let suppkey = suppkey as usize;
-        let word = suppkey / 64;
-        if word >= self.layout.words_per_group {
-            return;
-        }
-        let index = group_id * self.layout.words_per_group + word;
-        self.words[index] |= 1_u64 << (suppkey & 63);
-    }
-
-    fn merge(&mut self, other: GroupSupplierBitset) {
-        for (left, right) in self.words.iter_mut().zip(other.words) {
-            *left |= right;
-        }
-    }
-
-    fn counts(&self) -> Vec<u64> {
-        self.words
-            .chunks(self.layout.words_per_group)
-            .map(|words| words.iter().map(|word| u64::from(word.count_ones())).sum())
-            .collect()
-    }
-}
-
-pub(super) fn supplier_bitset_layout(
-    group_count: usize,
-    max_suppkey: Option<i64>,
-) -> Option<SupplierBitsetLayout> {
-    if std::env::var_os("DODAM_Q16_ENABLE_SUPPLIER_BITSET").is_none() {
-        return None;
-    }
-    let max_suppkey = max_suppkey?;
-    if max_suppkey < 0 || group_count == 0 {
-        return None;
-    }
-    let words_per_group = (usize::try_from(max_suppkey).ok()? + 64) / 64;
-    let bytes = group_count.checked_mul(words_per_group)?.checked_mul(8)?;
-    if bytes > supplier_bitset_max_bytes() {
-        return None;
-    }
-    Some(SupplierBitsetLayout {
-        group_count,
-        words_per_group,
-    })
-}
-
-pub(super) fn supplier_bitset_max_bytes() -> usize {
-    std::env::var("DODAM_Q16_SUPPLIER_BITSET_MAX_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(32 * 1024 * 1024)
-}
-
 pub(super) fn supplier_count_chunk_size() -> usize {
-    std::env::var("DODAM_Q16_SUPPLIER_COUNT_CHUNK_SIZE")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(4)
+    rule_chunk_size(4)
 }
 
 pub(super) fn packed_distinct_enabled(group_count: usize, max_suppkey: Option<i64>) -> bool {
-    std::env::var_os("DODAM_Q16_DISABLE_PACKED_DISTINCT").is_none()
-        && group_count <= u32::MAX as usize
+    group_count <= u32::MAX as usize
         && max_suppkey.is_some_and(|key| key >= 0 && key <= u32::MAX as i64)
 }
 
@@ -1490,103 +1252,6 @@ pub(super) fn merge_supplier_counts_packed(
     groups.append(&mut batch_groups);
 }
 
-pub(super) fn supplier_counts_bitset_batch(
-    batch: RecordBatch,
-    part_to_group: &AdaptiveI64Map<usize>,
-    bad_suppliers: &AdaptiveI64Set,
-    distinct_suppliers: &mut GroupSupplierBitset,
-) -> Result<()> {
-    let partkeys = batch_column(&batch, "ps_partkey")?;
-    let suppkeys = batch_column(&batch, "ps_suppkey")?;
-    if let Some(keys) = SupplierKeyView::try_new(partkeys, suppkeys)
-        && supplier_counts_bitset_typed(keys, part_to_group, bad_suppliers, distinct_suppliers)
-    {
-        return Ok(());
-    }
-    for row in 0..batch.num_rows() {
-        let (Some(partkey), Some(suppkey)) = (
-            numeric_i64_value(partkeys, row)?,
-            numeric_i64_value(suppkeys, row)?,
-        ) else {
-            continue;
-        };
-        if bad_suppliers.contains(suppkey) {
-            continue;
-        }
-        let Some(group_id) = part_to_group.get(partkey) else {
-            continue;
-        };
-        distinct_suppliers.insert(group_id, suppkey);
-    }
-    Ok(())
-}
-
-pub(super) fn supplier_counts_bitset_view(
-    view: BatchView<'_>,
-    part_to_group: &AdaptiveI64Map<usize>,
-    bad_suppliers: &AdaptiveI64Set,
-    distinct_suppliers: &mut GroupSupplierBitset,
-) -> Result<()> {
-    if view.num_columns() == 2
-        && let Some(keys) = SupplierKeyView::try_new_view(view)
-        && supplier_counts_bitset_typed(keys, part_to_group, bad_suppliers, distinct_suppliers)
-    {
-        return Ok(());
-    }
-    let Some(batch) = view.try_record_batch() else {
-        return Err(DodamError::UnsupportedSql(
-            "part supplier group bitset supplier-count raw vector columns have unsupported types"
-                .to_string(),
-        ));
-    };
-    supplier_counts_bitset_batch(
-        batch.clone(),
-        part_to_group,
-        bad_suppliers,
-        distinct_suppliers,
-    )
-}
-
-pub(super) fn supplier_counts_bitset_typed(
-    keys: SupplierKeyView<'_>,
-    part_to_group: &AdaptiveI64Map<usize>,
-    bad_suppliers: &AdaptiveI64Set,
-    distinct_suppliers: &mut GroupSupplierBitset,
-) -> bool {
-    let partkeys = keys.partkeys;
-    let suppkeys = keys.suppkeys;
-    if let (Some(partkey_values), Some(suppkey_values)) = (
-        partkeys.values_if_null_free(),
-        suppkeys.values_if_null_free(),
-    ) {
-        for row in 0..partkey_values.len() {
-            let suppkey = suppkey_values[row];
-            if bad_suppliers.contains(suppkey) {
-                continue;
-            }
-            let Some(group_id) = part_to_group.get(partkey_values[row]) else {
-                continue;
-            };
-            distinct_suppliers.insert(group_id, suppkey);
-        }
-        return true;
-    }
-    for row in 0..partkeys.len() {
-        if partkeys.is_null(row) || suppkeys.is_null(row) {
-            continue;
-        }
-        let suppkey = suppkeys.value(row);
-        if bad_suppliers.contains(suppkey) {
-            continue;
-        }
-        let Some(group_id) = part_to_group.get(partkeys.value(row)) else {
-            continue;
-        };
-        distinct_suppliers.insert(group_id, suppkey);
-    }
-    true
-}
-
 pub(super) fn supplier_counts_batch(
     batch: RecordBatch,
     part_to_group: &AdaptiveI64Map<usize>,
@@ -1667,13 +1332,6 @@ pub(super) fn merge_supplier_counts(
     batch_groups: FastHashSet<(usize, i64)>,
 ) {
     groups.extend(batch_groups);
-}
-
-pub(super) fn merge_supplier_bitsets(
-    groups: &mut GroupSupplierBitset,
-    batch_groups: GroupSupplierBitset,
-) {
-    groups.merge(batch_groups);
 }
 
 pub(super) fn part_supplier_group_output(rows: Vec<PartSupplierGroupRow>) -> Result<QueryOutput> {

@@ -166,49 +166,16 @@ async fn q07_supplier_nations(
     batch_size: usize,
     target_nations: &HashMap<i64, String>,
 ) -> Result<FastHashMap<i64, i64>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec!["s_suppkey".to_string(), "s_nationkey".to_string()]),
-            None,
-        )
-        .await?;
-    let mut suppliers = fast_hash_map::<i64, i64>();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let suppkeys = batch_column(&batch, "s_suppkey")?;
-        let nationkeys = batch_column(&batch, "s_nationkey")?;
-        if let (Some(suppkeys), Some(nationkeys)) = (
-            suppkeys.as_any().downcast_ref::<Int64Array>(),
-            nationkeys.as_any().downcast_ref::<Int64Array>(),
-        ) && suppkeys.null_count() == 0
-            && nationkeys.null_count() == 0
-        {
-            let suppkey_values = suppkeys.values().as_ref();
-            let nationkey_values = nationkeys.values().as_ref();
-            for row in 0..suppkey_values.len() {
-                let nationkey = nationkey_values[row];
-                if target_nations.contains_key(&nationkey) {
-                    suppliers.insert(suppkey_values[row], nationkey);
-                }
-            }
-            continue;
-        }
-        for row in 0..batch.num_rows() {
-            let (Some(suppkey), Some(nationkey)) = (
-                numeric_i64_value(suppkeys, row)?,
-                numeric_i64_value(nationkeys, row)?,
-            ) else {
-                continue;
-            };
-            if target_nations.contains_key(&nationkey) {
-                suppliers.insert(suppkey, nationkey);
-            }
-        }
-    }
-    Ok(suppliers)
+    let nation_keys = AdaptiveI64Set::from_hash(target_nations.keys().copied().collect());
+    collect_i64_by_i64_set_hash_map(
+        engine,
+        path,
+        batch_size,
+        "s_suppkey",
+        "s_nationkey",
+        &nation_keys,
+    )
+    .await
 }
 
 pub(super) async fn q07_customer_nations(
@@ -217,49 +184,16 @@ pub(super) async fn q07_customer_nations(
     batch_size: usize,
     target_nations: &HashMap<i64, String>,
 ) -> Result<FastHashMap<i64, i64>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec!["c_custkey".to_string(), "c_nationkey".to_string()]),
-            None,
-        )
-        .await?;
-    let mut customers = fast_hash_map::<i64, i64>();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let custkeys = batch_column(&batch, "c_custkey")?;
-        let nationkeys = batch_column(&batch, "c_nationkey")?;
-        if let (Some(custkeys), Some(nationkeys)) = (
-            custkeys.as_any().downcast_ref::<Int64Array>(),
-            nationkeys.as_any().downcast_ref::<Int64Array>(),
-        ) && custkeys.null_count() == 0
-            && nationkeys.null_count() == 0
-        {
-            let custkey_values = custkeys.values().as_ref();
-            let nationkey_values = nationkeys.values().as_ref();
-            for row in 0..custkey_values.len() {
-                let nationkey = nationkey_values[row];
-                if target_nations.contains_key(&nationkey) {
-                    customers.insert(custkey_values[row], nationkey);
-                }
-            }
-            continue;
-        }
-        for row in 0..batch.num_rows() {
-            let (Some(custkey), Some(nationkey)) = (
-                numeric_i64_value(custkeys, row)?,
-                numeric_i64_value(nationkeys, row)?,
-            ) else {
-                continue;
-            };
-            if target_nations.contains_key(&nationkey) {
-                customers.insert(custkey, nationkey);
-            }
-        }
-    }
-    Ok(customers)
+    let nation_keys = AdaptiveI64Set::from_hash(target_nations.keys().copied().collect());
+    collect_i64_by_i64_set_hash_map(
+        engine,
+        path,
+        batch_size,
+        "c_custkey",
+        "c_nationkey",
+        &nation_keys,
+    )
+    .await
 }
 
 async fn q07_order_customers(
@@ -278,119 +212,30 @@ async fn q07_order_customers(
         )
         .await?;
     let customer_nations = Arc::new(AdaptiveI64Map::from_hash(customer_nations.clone()));
-    parallel_batch_fold_view_chunks(
+    let orders = parallel_batch_collect_pairs_view_chunks(
         &mut stream,
         4,
-        || fast_hash_map::<i64, i64>(),
         move |view, orders| {
-            merge_maps(orders, q07_order_customers_view(view, &customer_nations)?);
+            orders.extend(q07_order_customers_view(view, &customer_nations)?);
             Ok(Some(()))
         },
-        Ok,
-        fast_hash_map::<i64, i64>(),
-        merge_maps,
         "Q07 order customer nations",
-    )
-}
-
-fn q07_order_customers_batch(
-    batch: RecordBatch,
-    customer_nations: &AdaptiveI64Map<i64>,
-) -> Result<FastHashMap<i64, i64>> {
-    let orderkeys = batch_column(&batch, "o_orderkey")?;
-    let custkeys = batch_column(&batch, "o_custkey")?;
-    if let Some(orders) = q07_order_customers_batch_typed(orderkeys, custkeys, customer_nations) {
-        return Ok(orders);
-    }
-    let mut orders = fast_hash_map::<i64, i64>();
-    for row in 0..batch.num_rows() {
-        let (Some(orderkey), Some(custkey)) = (
-            numeric_i64_value(orderkeys, row)?,
-            numeric_i64_value(custkeys, row)?,
-        ) else {
-            continue;
-        };
-        if let Some(nationkey) = customer_nations.get(custkey) {
-            orders.insert(orderkey, nationkey);
-        }
-    }
-    Ok(orders)
+    )?;
+    Ok(fast_hash_map_from_pairs_profiled(
+        orders,
+        "bilateral order customer nations build",
+    ))
 }
 
 fn q07_order_customers_view(
     view: BatchView<'_>,
     customer_nations: &AdaptiveI64Map<i64>,
-) -> Result<FastHashMap<i64, i64>> {
-    if view.num_columns() == 2
-        && let (Some(orderkeys), Some(custkeys)) = (view.i64_vector(0), view.i64_vector(1))
-        && let Some(orders) =
-            q07_order_customers_vector_typed(orderkeys, custkeys, customer_nations)
-    {
-        return Ok(orders);
-    }
-    let Some(batch) = view.try_record_batch() else {
-        return Ok(fast_hash_map());
-    };
-    q07_order_customers_batch(batch.clone(), customer_nations)
-}
-
-fn q07_order_customers_batch_typed(
-    orderkeys: &ArrayRef,
-    custkeys: &ArrayRef,
-    customer_nations: &AdaptiveI64Map<i64>,
-) -> Option<FastHashMap<i64, i64>> {
-    let (Some(orderkeys), Some(custkeys)) = (
-        orderkeys.as_any().downcast_ref::<Int64Array>(),
-        custkeys.as_any().downcast_ref::<Int64Array>(),
-    ) else {
-        return None;
-    };
-    let mut orders = fast_hash_map::<i64, i64>();
-    if orderkeys.null_count() == 0 && custkeys.null_count() == 0 {
-        for row in 0..orderkeys.len() {
-            if let Some(nationkey) = customer_nations.get(custkeys.value(row)) {
-                orders.insert(orderkeys.value(row), nationkey);
-            }
-        }
-        return Some(orders);
-    }
-    for row in 0..orderkeys.len() {
-        if orderkeys.is_null(row) || custkeys.is_null(row) {
-            continue;
-        }
-        if let Some(nationkey) = customer_nations.get(custkeys.value(row)) {
-            orders.insert(orderkeys.value(row), nationkey);
-        }
-    }
-    Some(orders)
-}
-
-fn q07_order_customers_vector_typed(
-    orderkeys: I64VectorView<'_>,
-    custkeys: I64VectorView<'_>,
-    customer_nations: &AdaptiveI64Map<i64>,
-) -> Option<FastHashMap<i64, i64>> {
-    let mut orders = fast_hash_map::<i64, i64>();
-    if let (Some(orderkey_values), Some(custkey_values)) = (
-        orderkeys.values_if_null_free(),
-        custkeys.values_if_null_free(),
-    ) {
-        for row in 0..orderkey_values.len() {
-            if let Some(nationkey) = customer_nations.get(custkey_values[row]) {
-                orders.insert(orderkey_values[row], nationkey);
-            }
-        }
-        return Some(orders);
-    }
-    for row in 0..orderkeys.len() {
-        if orderkeys.is_null(row) || custkeys.is_null(row) {
-            continue;
-        }
-        if let Some(nationkey) = customer_nations.get(custkeys.value(row)) {
-            orders.insert(orderkeys.value(row), nationkey);
-        }
-    }
-    Some(orders)
+) -> Result<Vec<(i64, i64)>> {
+    collect_i64_i64_pairs_view(
+        view,
+        "Q07 order customer raw vector columns have unsupported types",
+        |_, custkey| Ok(customer_nations.get(custkey)),
+    )
 }
 
 struct Q07Row {
@@ -436,21 +281,20 @@ async fn q07_volume_rows(
     }));
     let supplier_nations = Arc::new(AdaptiveI64Map::from_hash(supplier_nations.clone()));
     let order_customer_nations = Arc::new(order_customer_nations.clone());
-    let groups = if q07_late_materialized_enabled()
-        && let Some(groups) = q07_volume_rows_late_materialized(
-            engine,
-            path.clone(),
-            batch_size,
-            supplier_nations.clone(),
-            order_customer_nations.clone(),
-            start_days,
-            end_days,
-            pruning_predicates.clone(),
-        )
-        .await?
+    let groups = if let Some(groups) = q07_volume_rows_late_materialized(
+        engine,
+        path.clone(),
+        batch_size,
+        supplier_nations.clone(),
+        order_customer_nations.clone(),
+        start_days,
+        end_days,
+        pruning_predicates.clone(),
+    )
+    .await?
     {
         groups
-    } else if q07_row_group_map_enabled() {
+    } else {
         let supplier_nations_for_scan = supplier_nations.clone();
         let order_customer_nations_for_scan = order_customer_nations.clone();
         if let Some(partials) = engine
@@ -497,19 +341,6 @@ async fn q07_volume_rows(
             )
             .await?
         }
-    } else {
-        q07_volume_rows_stream(
-            engine,
-            path,
-            batch_size,
-            projection,
-            pruning_predicates,
-            supplier_nations,
-            order_customer_nations,
-            start_days,
-            end_days,
-        )
-        .await?
     };
     let mut rows = groups
         .into_iter()
@@ -601,37 +432,16 @@ async fn q07_volume_rows_late_materialized(
     Ok(Some(groups))
 }
 
-fn q07_late_materialized_enabled() -> bool {
-    if std::env::var("DODAM_Q07_DISABLE_LATE_MATERIALIZE")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-    {
-        return false;
-    }
-    true
-}
-
 fn q07_late_materialized_row_group_chunk() -> usize {
-    std::env::var("DODAM_Q07_LATE_ROW_GROUP_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(2)
+    late_materialization_row_group_chunk(2)
 }
 
 fn q07_late_materialized_max_selected_ratio() -> f64 {
-    std::env::var("DODAM_Q07_LATE_MAX_SELECTED_RATIO")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.10)
+    late_materialization_max_selected_ratio(0.10)
 }
 
 fn q07_late_materialized_max_selector_run_ratio() -> f64 {
-    std::env::var("DODAM_Q07_LATE_MAX_SELECTOR_RUN_RATIO")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.60)
+    late_materialization_max_selector_run_ratio(0.60)
 }
 
 #[derive(Clone, Copy)]
@@ -831,34 +641,18 @@ fn q07_late_consume_payload_batch(
     if let (Some(extendedprices), Some(discounts)) =
         (decimal_input(extendedprices)?, decimal_input(discounts)?)
     {
-        if extendedprices.null_count() == 0 && discounts.null_count() == 0 {
-            let extendedprice_values = extendedprices.raw_values();
-            let discount_values = discounts.raw_values();
-            let (discount_scale, revenue_scale) =
-                decimal_discounted_revenue_scales(extendedprices, discounts);
-            for row in 0..extendedprice_values.len() {
-                let Some(selected) = state.selected_rows.get(state.payload_offset).copied() else {
-                    return Err(DodamError::UnsupportedSql(
-                        "Q07 payload row overflow".to_string(),
-                    ));
-                };
-                state.payload_offset += 1;
-                *state
-                    .groups
-                    .entry((
-                        selected.supp_nation_key,
-                        selected.cust_nation_key,
-                        state.year_cache.year(selected.shipdate)?,
-                    ))
-                    .or_insert(0.0) += decimal_discounted_revenue_raw(
-                    extendedprice_values[row],
-                    discount_values[row],
-                    discount_scale,
-                    revenue_scale,
-                );
-            }
-            return Ok(Some(()));
-        }
+        let extendedprices = Decimal128VectorView::Arrow {
+            values: extendedprices.values,
+            precision: extendedprices.precision,
+            scale: extendedprices.scale,
+        };
+        let discounts = Decimal128VectorView::Arrow {
+            values: discounts.values,
+            precision: discounts.precision,
+            scale: discounts.scale,
+        };
+        q07_late_consume_payload_vector(extendedprices, discounts, batch.num_rows(), state)?;
+        return Ok(Some(()));
     }
     for row in 0..batch.num_rows() {
         let Some(selected) = state.selected_rows.get(state.payload_offset).copied() else {
@@ -893,7 +687,7 @@ fn q07_late_consume_payload_view(
         && let (Some(extendedprices), Some(discounts)) =
             (view.decimal128_vector(0), view.decimal128_vector(1))
     {
-        q07_late_consume_payload_vector(extendedprices, discounts, state)?;
+        q07_late_consume_payload_vector(extendedprices, discounts, view.num_rows(), state)?;
         return Ok(Some(()));
     }
     let Some(batch) = view.try_record_batch() else {
@@ -905,71 +699,37 @@ fn q07_late_consume_payload_view(
 fn q07_late_consume_payload_vector(
     extendedprices: Decimal128VectorView<'_>,
     discounts: Decimal128VectorView<'_>,
+    row_count: usize,
     state: &mut Q07LateState,
 ) -> Result<()> {
-    if extendedprices.null_count() == 0 && discounts.null_count() == 0 {
-        let extendedprice_values = extendedprices.raw_values();
-        let discount_values = discounts.raw_values();
-        let discount_scale = discounts.scale();
-        let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
-        for row in 0..extendedprice_values.len() {
+    consume_discounted_revenue_decimal128_vectors(
+        extendedprices,
+        discounts,
+        row_count,
+        |_, revenue| {
             let Some(selected) = state.selected_rows.get(state.payload_offset).copied() else {
                 return Err(DodamError::UnsupportedSql(
                     "Q07 payload row overflow".to_string(),
                 ));
             };
             state.payload_offset += 1;
-            *state
-                .groups
-                .entry((
-                    selected.supp_nation_key,
-                    selected.cust_nation_key,
-                    state.year_cache.year(selected.shipdate)?,
-                ))
-                .or_insert(0.0) += decimal_discounted_revenue_raw(
-                extendedprice_values[row],
-                discount_values[row],
-                discount_scale,
-                revenue_scale,
-            );
-        }
-        return Ok(());
-    }
-    for row in 0..extendedprices.raw_values().len() {
-        let Some(selected) = state.selected_rows.get(state.payload_offset).copied() else {
-            return Err(DodamError::UnsupportedSql(
-                "Q07 payload row overflow".to_string(),
-            ));
-        };
-        state.payload_offset += 1;
-        if extendedprices.is_null(row) || discounts.is_null(row) {
-            continue;
-        }
-        *state
-            .groups
-            .entry((
-                selected.supp_nation_key,
-                selected.cust_nation_key,
-                state.year_cache.year(selected.shipdate)?,
-            ))
-            .or_insert(0.0) += extendedprices.value(row) * (1.0 - discounts.value(row));
-    }
-    Ok(())
+            if let Some(revenue) = revenue {
+                *state
+                    .groups
+                    .entry((
+                        selected.supp_nation_key,
+                        selected.cust_nation_key,
+                        state.year_cache.year(selected.shipdate)?,
+                    ))
+                    .or_insert(0.0) += revenue;
+            }
+            Ok(())
+        },
+    )
 }
 
 fn q07_log_late_materialized_profile(metrics: LateMaterializedMetrics, row_group_chunk: usize) {
-    if !tpch_profile_enabled() {
-        return;
-    }
-    let ratio = if metrics.total_rows == 0 {
-        0.0
-    } else {
-        metrics.selected_rows as f64 / metrics.total_rows as f64
-    };
-    eprintln!(
-        "[dodam:tpch-profile] Q07 lineitem: late_materialized rows={} selected={} ratio={:.6} selector_runs={} row_group_chunk={}",
-        metrics.total_rows, metrics.selected_rows, ratio, metrics.selector_runs, row_group_chunk
-    );
+    tpch_profile_late_materialized("Q07 lineitem", metrics, row_group_chunk);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1017,16 +777,8 @@ async fn q07_volume_rows_stream(
     )
 }
 
-fn q07_row_group_map_enabled() -> bool {
-    std::env::var_os("DODAM_Q07_DISABLE_ROW_GROUP_MAP").is_none()
-}
-
 fn q07_row_group_map_chunk() -> usize {
-    std::env::var("DODAM_Q07_ROW_GROUP_MAP_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(2)
+    generic_row_group_map_chunk_size(2)
 }
 
 fn q07_volume_batch(
@@ -1087,38 +839,6 @@ fn q07_volume_batch(
             .or_insert(0.0) += extendedprice * (1.0 - discount);
     }
     Ok(groups)
-}
-
-#[allow(dead_code)]
-fn q07_volume_projected_batch(
-    batch: RecordBatch,
-    supplier_nations: &AdaptiveI64Map<i64>,
-    order_customer_nations: &FastHashMap<i64, i64>,
-    start_days: i32,
-    end_days: i32,
-) -> Result<FastHashMap<(i64, i64, i32), f64>> {
-    if batch.num_columns() == 5
-        && let Some(groups) = q07_volume_batch_typed(
-            batch.column(0),
-            batch.column(1),
-            batch.column(2),
-            batch.column(3),
-            batch.column(4),
-            supplier_nations,
-            order_customer_nations,
-            start_days,
-            end_days,
-        )?
-    {
-        return Ok(groups);
-    }
-    q07_volume_batch(
-        batch,
-        supplier_nations,
-        order_customer_nations,
-        start_days,
-        end_days,
-    )
 }
 
 fn q07_volume_projected_view(
@@ -1187,74 +907,90 @@ fn q07_volume_vector(
         orderkeys.values_if_null_free(),
         suppkeys.values_if_null_free(),
         shipdates.values_if_null_free(),
-    ) && extendedprices.null_count() == 0
-        && discounts.null_count() == 0
-    {
-        let extendedprice_values = extendedprices.raw_values();
-        let discount_values = discounts.raw_values();
-        let discount_scale = discounts.scale();
-        let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
+    ) {
         if let Some((supplier_nation_values, supplier_nation_present)) =
             supplier_nations.dense_slices()
         {
-            for row in 0..orderkey_values.len() {
-                let shipdate = shipdate_values[row];
-                if shipdate < start_days || shipdate > end_days {
-                    continue;
-                }
-                let Ok(suppkey) = usize::try_from(suppkey_values[row]) else {
-                    continue;
-                };
-                if !supplier_nation_present
-                    .get(suppkey)
-                    .copied()
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
-                let Some(cust_nation_key) =
-                    order_customer_nations.get(&orderkey_values[row]).copied()
-                else {
-                    continue;
-                };
-                let supp_nation_key = supplier_nation_values[suppkey];
-                if supp_nation_key == cust_nation_key {
-                    continue;
-                }
-                *groups
-                    .entry((supp_nation_key, cust_nation_key, year_cache.year(shipdate)?))
-                    .or_insert(0.0) += decimal_discounted_revenue_raw(
-                    extendedprice_values[row],
-                    discount_values[row],
-                    discount_scale,
-                    revenue_scale,
-                );
-            }
+            let group_key = std::cell::Cell::new(None::<(i64, i64, i32)>);
+            consume_filtered_discounted_revenue_decimal128_vectors(
+                extendedprices,
+                discounts,
+                orderkey_values.len(),
+                |row| {
+                    group_key.set(None);
+                    let shipdate = shipdate_values[row];
+                    if shipdate < start_days || shipdate > end_days {
+                        return Ok(false);
+                    }
+                    let Ok(suppkey) = usize::try_from(suppkey_values[row]) else {
+                        return Ok(false);
+                    };
+                    if !supplier_nation_present
+                        .get(suppkey)
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        return Ok(false);
+                    }
+                    let Some(cust_nation_key) =
+                        order_customer_nations.get(&orderkey_values[row]).copied()
+                    else {
+                        return Ok(false);
+                    };
+                    let supp_nation_key = supplier_nation_values[suppkey];
+                    if supp_nation_key == cust_nation_key {
+                        return Ok(false);
+                    }
+                    group_key.set(Some((
+                        supp_nation_key,
+                        cust_nation_key,
+                        year_cache.year(shipdate)?,
+                    )));
+                    Ok(true)
+                },
+                |_, revenue| {
+                    if let Some(key) = group_key.get() {
+                        *groups.entry(key).or_insert(0.0) += revenue;
+                    }
+                    Ok(())
+                },
+            )?;
             return Ok(groups);
         }
-        for row in 0..orderkey_values.len() {
-            let shipdate = shipdate_values[row];
-            if shipdate < start_days || shipdate > end_days {
-                continue;
-            }
-            let (Some(supp_nation_key), Some(cust_nation_key)) = (
-                supplier_nations.get(suppkey_values[row]),
-                order_customer_nations.get(&orderkey_values[row]).copied(),
-            ) else {
-                continue;
-            };
-            if supp_nation_key == cust_nation_key {
-                continue;
-            }
-            *groups
-                .entry((supp_nation_key, cust_nation_key, year_cache.year(shipdate)?))
-                .or_insert(0.0) += decimal_discounted_revenue_raw(
-                extendedprice_values[row],
-                discount_values[row],
-                discount_scale,
-                revenue_scale,
-            );
-        }
+        let group_key = std::cell::Cell::new(None::<(i64, i64, i32)>);
+        consume_filtered_discounted_revenue_decimal128_vectors(
+            extendedprices,
+            discounts,
+            orderkey_values.len(),
+            |row| {
+                group_key.set(None);
+                let shipdate = shipdate_values[row];
+                if shipdate < start_days || shipdate > end_days {
+                    return Ok(false);
+                }
+                let (Some(supp_nation_key), Some(cust_nation_key)) = (
+                    supplier_nations.get(suppkey_values[row]),
+                    order_customer_nations.get(&orderkey_values[row]).copied(),
+                ) else {
+                    return Ok(false);
+                };
+                if supp_nation_key == cust_nation_key {
+                    return Ok(false);
+                }
+                group_key.set(Some((
+                    supp_nation_key,
+                    cust_nation_key,
+                    year_cache.year(shipdate)?,
+                )));
+                Ok(true)
+            },
+            |_, revenue| {
+                if let Some(key) = group_key.get() {
+                    *groups.entry(key).or_insert(0.0) += revenue;
+                }
+                Ok(())
+            },
+        )?;
         return Ok(groups);
     }
     for row in 0..orderkeys.len() {
@@ -1306,73 +1042,28 @@ fn q07_volume_batch_typed(
     ) else {
         return Ok(None);
     };
-    let mut groups = fast_hash_map::<(i64, i64, i32), f64>();
-    let mut year_cache = Date32YearCache::default();
-    if orderkeys.null_count() == 0
-        && suppkeys.null_count() == 0
-        && shipdates.null_count() == 0
-        && extendedprices.null_count() == 0
-        && discounts.null_count() == 0
-    {
-        let orderkey_values = orderkeys.values().as_ref();
-        let suppkey_values = suppkeys.values().as_ref();
-        let shipdate_values = shipdates.values().as_ref();
-        let extendedprice_values = extendedprices.raw_values();
-        let discount_values = discounts.raw_values();
-        let (discount_scale, revenue_scale) =
-            decimal_discounted_revenue_scales(extendedprices, discounts);
-        for row in 0..orderkeys.len() {
-            let shipdate = shipdate_values[row];
-            if shipdate < start_days || shipdate > end_days {
-                continue;
-            }
-            let (Some(supp_nation_key), Some(cust_nation_key)) = (
-                supplier_nations.get(suppkey_values[row]),
-                order_customer_nations.get(&orderkey_values[row]).copied(),
-            ) else {
-                continue;
-            };
-            if supp_nation_key == cust_nation_key {
-                continue;
-            }
-            *groups
-                .entry((supp_nation_key, cust_nation_key, year_cache.year(shipdate)?))
-                .or_insert(0.0) += decimal_discounted_revenue_raw(
-                extendedprice_values[row],
-                discount_values[row],
-                discount_scale,
-                revenue_scale,
-            );
-        }
-        return Ok(Some(groups));
-    }
-    for row in 0..orderkeys.len() {
-        if orderkeys.is_null(row)
-            || suppkeys.is_null(row)
-            || shipdates.is_null(row)
-            || extendedprices.is_null(row)
-            || discounts.is_null(row)
-        {
-            continue;
-        }
-        let shipdate = shipdates.value(row);
-        if shipdate < start_days || shipdate > end_days {
-            continue;
-        }
-        let (Some(supp_nation_key), Some(cust_nation_key)) = (
-            supplier_nations.get(suppkeys.value(row)),
-            order_customer_nations.get(&orderkeys.value(row)).copied(),
-        ) else {
-            continue;
-        };
-        if supp_nation_key == cust_nation_key {
-            continue;
-        }
-        *groups
-            .entry((supp_nation_key, cust_nation_key, year_cache.year(shipdate)?))
-            .or_insert(0.0) += extendedprices.value(row) * (1.0 - discounts.value(row));
-    }
-    Ok(Some(groups))
+    let extendedprices = Decimal128VectorView::Arrow {
+        values: extendedprices.values,
+        precision: extendedprices.precision,
+        scale: extendedprices.scale,
+    };
+    let discounts = Decimal128VectorView::Arrow {
+        values: discounts.values,
+        precision: discounts.precision,
+        scale: discounts.scale,
+    };
+    q07_volume_vector(
+        I64VectorView::Arrow(orderkeys),
+        I64VectorView::Arrow(suppkeys),
+        Date32VectorView::Arrow(shipdates),
+        extendedprices,
+        discounts,
+        supplier_nations,
+        order_customer_nations,
+        start_days,
+        end_days,
+    )
+    .map(Some)
 }
 
 fn q07_output(rows: Vec<Q07Row>) -> Result<QueryOutput> {

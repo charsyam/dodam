@@ -515,8 +515,7 @@ fn product_column_kind(
             return Ok(match column_type {
                 DirectPrimitiveColumnType::I32 => Some(ProductColumnKind::Int32),
                 DirectPrimitiveColumnType::I64 => Some(ProductColumnKind::Int64),
-                DirectPrimitiveColumnType::Decimal128Int64 { precision, scale }
-                | DirectPrimitiveColumnType::Decimal128Int64Raw { precision, scale } => {
+                DirectPrimitiveColumnType::Decimal128Int64Raw { precision, scale } => {
                     if *precision <= 18 {
                         Some(ProductColumnKind::DecimalI64 {
                             scale: decimal_scale_i64_local(*scale)?,

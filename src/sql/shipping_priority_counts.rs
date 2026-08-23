@@ -167,10 +167,7 @@ pub(super) fn pending_shipping_order_map_new() -> PendingShippingOrderMap {
 }
 
 pub(super) fn pending_shipping_order_map_initial_capacity() -> usize {
-    std::env::var("DODAM_Q12_PENDING_MAP_INITIAL_CAPACITY")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(4096)
+    4096
 }
 
 #[inline(always)]
@@ -180,63 +177,6 @@ pub(super) fn pending_order_increment(
     mode_index: usize,
 ) {
     pending.entry(orderkey).or_default().counts[mode_index] += 1;
-}
-
-pub(super) struct PendingOrderRunAccumulator<'a> {
-    pending: &'a mut PendingShippingOrderMap,
-    current_key: Option<i64>,
-    counts: [u64; 2],
-    combine_runs: bool,
-}
-
-impl<'a> PendingOrderRunAccumulator<'a> {
-    fn new(pending: &'a mut PendingShippingOrderMap) -> Self {
-        Self {
-            pending,
-            current_key: None,
-            counts: [0, 0],
-            combine_runs: pending_order_run_accumulator_enabled(),
-        }
-    }
-
-    #[inline(always)]
-    fn increment(&mut self, orderkey: i64, mode_index: usize) {
-        if !self.combine_runs {
-            pending_order_increment(self.pending, orderkey, mode_index);
-            return;
-        }
-        if self.current_key == Some(orderkey) {
-            self.counts[mode_index] += 1;
-            return;
-        }
-        self.flush();
-        self.current_key = Some(orderkey);
-        self.counts = [0, 0];
-        self.counts[mode_index] = 1;
-    }
-
-    #[inline(always)]
-    fn flush(&mut self) {
-        if !self.combine_runs {
-            return;
-        }
-        let Some(orderkey) = self.current_key.take() else {
-            return;
-        };
-        let counts = self.counts;
-        if counts[0] != 0 || counts[1] != 0 {
-            pending_order_add(self.pending, orderkey, PendingShippingOrder { counts });
-        }
-    }
-
-    fn finish(mut self) {
-        self.flush();
-    }
-}
-
-pub(super) fn pending_order_run_accumulator_enabled() -> bool {
-    std::env::var("DODAM_Q12_ENABLE_PENDING_RUN_ACCUMULATOR")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 #[inline(always)]
@@ -308,19 +248,6 @@ pub(super) async fn filtered_lineitem_counts(
     start_days: i32,
     end_days: i32,
 ) -> Result<PendingShippingOrderMap> {
-    if shipping_late_materialized_enabled()
-        && let Some(pending) = filtered_lineitem_counts_late_materialized(
-            engine,
-            path.clone(),
-            batch_size,
-            shipmodes,
-            start_days,
-            end_days,
-        )
-        .await?
-    {
-        return Ok(pending);
-    }
     let projection = Projection::Columns(vec![
         "l_orderkey".to_string(),
         "l_shipmode".to_string(),
@@ -329,74 +256,16 @@ pub(super) async fn filtered_lineitem_counts(
         "l_shipdate".to_string(),
     ]);
     let shipmodes = Arc::new(shipmodes.to_vec());
-    if lineitem_row_filter_enabled() {
-        return filtered_lineitem_counts_row_filtered(
-            engine, path, batch_size, projection, shipmodes, start_days, end_days,
-        )
-        .await;
-    }
-    if direct_lineitem_selected_payload_enabled()
-        && let Some(pending) = filtered_lineitem_counts_direct_selected_payload(
-            engine,
-            path.clone(),
-            shipmodes.clone(),
-            start_days,
-            end_days,
-        )
-        .await?
-    {
-        return Ok(pending);
-    }
-    if direct_lineitem_raw_enabled()
-        && let Some(pending) = filtered_lineitem_counts_direct_raw(
-            engine,
-            path.clone(),
-            batch_size,
-            shipmodes.clone(),
-            start_days,
-            end_days,
-        )
-        .await?
-    {
-        return Ok(pending);
-    }
-    if direct_lineitem_dict_raw_enabled()
-        && let Some(pending) = filtered_lineitem_counts_direct_dict_raw(
-            engine,
-            path.clone(),
-            batch_size,
-            shipmodes.clone(),
-            start_days,
-            end_days,
-        )
-        .await?
-    {
-        return Ok(pending);
-    }
-    if direct_lineitem_page_raw_enabled()
-        && let Some(pending) = filtered_lineitem_counts_direct_page_raw(
-            engine,
-            path.clone(),
-            batch_size,
-            shipmodes.clone(),
-            start_days,
-            end_days,
-        )
-        .await?
-    {
-        return Ok(pending);
-    }
-    if shipping_row_group_map_enabled()
-        && let Some(partials) = filtered_lineitem_counts_row_group_map(
-            engine,
-            path.clone(),
-            batch_size,
-            projection.clone(),
-            shipmodes.clone(),
-            start_days,
-            end_days,
-        )
-        .await?
+    if let Some(partials) = filtered_lineitem_counts_row_group_map(
+        engine,
+        path.clone(),
+        batch_size,
+        projection.clone(),
+        shipmodes.clone(),
+        start_days,
+        end_days,
+    )
+    .await?
     {
         let mut pending = pending_shipping_order_map_new();
         for partial in partials {
@@ -410,274 +279,6 @@ pub(super) async fn filtered_lineitem_counts(
     .await
 }
 
-pub(super) async fn filtered_lineitem_counts_direct_selected_payload(
-    engine: &DodamEngine,
-    path: PathBuf,
-    shipmodes: Arc<Vec<String>>,
-    start_days: i32,
-    end_days: i32,
-) -> Result<Option<PendingShippingOrderMap>> {
-    engine
-        .scan_parquet_i64_byte_array_selected_by_i32x3_dictionary_fold(
-            path,
-            [
-                "l_orderkey",
-                "l_shipmode",
-                "l_commitdate",
-                "l_receiptdate",
-                "l_shipdate",
-            ],
-            receiptdate_pruning_predicates(start_days, end_days),
-            shipping_row_group_map_chunk(),
-            pending_shipping_order_map_new,
-            move |commitdate, receiptdate, shipdate| {
-                lineitem_dates_match(commitdate, receiptdate, shipdate, start_days, end_days)
-            },
-            {
-                let shipmodes = shipmodes.clone();
-                move |pending, orderkeys, mode_ids, dictionary| {
-                    filtered_lineitem_counts_selected_payload_into(
-                        orderkeys, mode_ids, dictionary, &shipmodes, pending,
-                    );
-                    Ok(())
-                }
-            },
-            Ok,
-            |pending, partial| {
-                merge_pending_shipping_orders(pending, partial);
-                Ok(())
-            },
-        )
-        .await
-}
-
-pub(super) async fn filtered_lineitem_counts_direct_dict_raw(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-    shipmodes: Arc<Vec<String>>,
-    start_days: i32,
-    end_days: i32,
-) -> Result<Option<PendingShippingOrderMap>> {
-    engine
-        .scan_parquet_i64_dictionary_i32x3_dict_fold(
-            path,
-            batch_size,
-            [
-                "l_orderkey",
-                "l_shipmode",
-                "l_commitdate",
-                "l_receiptdate",
-                "l_shipdate",
-            ],
-            receiptdate_pruning_predicates(start_days, end_days),
-            shipping_row_group_map_chunk(),
-            pending_shipping_order_map_new,
-            {
-                let shipmodes = shipmodes.clone();
-                move |pending,
-                      key_ids,
-                      key_dictionary,
-                      mode_ids,
-                      mode_dictionary,
-                      commitdate_ids,
-                      commitdate_dictionary,
-                      receiptdate_ids,
-                      receiptdate_dictionary,
-                      shipdate_ids,
-                      shipdate_dictionary| {
-                    filtered_lineitem_counts_direct_dict_raw_into(
-                        key_ids,
-                        key_dictionary,
-                        mode_ids,
-                        mode_dictionary,
-                        commitdate_ids,
-                        commitdate_dictionary,
-                        receiptdate_ids,
-                        receiptdate_dictionary,
-                        shipdate_ids,
-                        shipdate_dictionary,
-                        &shipmodes,
-                        start_days,
-                        end_days,
-                        pending,
-                    );
-                    Ok(())
-                }
-            },
-            Ok,
-            |pending, partial| {
-                merge_pending_shipping_orders(pending, partial);
-                Ok(())
-            },
-        )
-        .await
-}
-
-pub(super) async fn filtered_lineitem_counts_direct_page_raw(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-    shipmodes: Arc<Vec<String>>,
-    start_days: i32,
-    end_days: i32,
-) -> Result<Option<PendingShippingOrderMap>> {
-    engine
-        .scan_parquet_i64_dictionary_i32x3_page_fold(
-            path,
-            batch_size,
-            [
-                "l_orderkey",
-                "l_shipmode",
-                "l_commitdate",
-                "l_receiptdate",
-                "l_shipdate",
-            ],
-            receiptdate_pruning_predicates(start_days, end_days),
-            shipping_row_group_map_chunk(),
-            pending_shipping_order_map_new,
-            {
-                let shipmodes = shipmodes.clone();
-                move |pending,
-                      orderkey_bytes,
-                      mode_ids,
-                      dictionary,
-                      commitdate_bytes,
-                      receiptdate_bytes,
-                      shipdate_bytes,
-                      records| {
-                    filtered_lineitem_counts_direct_page_raw_into(
-                        orderkey_bytes,
-                        mode_ids,
-                        dictionary,
-                        commitdate_bytes,
-                        receiptdate_bytes,
-                        shipdate_bytes,
-                        records,
-                        &shipmodes,
-                        start_days,
-                        end_days,
-                        pending,
-                    );
-                    Ok(())
-                }
-            },
-            Ok,
-            |pending, partial| {
-                merge_pending_shipping_orders(pending, partial);
-                Ok(())
-            },
-        )
-        .await
-}
-
-pub(super) async fn filtered_lineitem_counts_direct_raw(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-    shipmodes: Arc<Vec<String>>,
-    start_days: i32,
-    end_days: i32,
-) -> Result<Option<PendingShippingOrderMap>> {
-    engine
-        .scan_parquet_i64_dictionary_i32x3_fold(
-            path,
-            batch_size,
-            [
-                "l_orderkey",
-                "l_shipmode",
-                "l_commitdate",
-                "l_receiptdate",
-                "l_shipdate",
-            ],
-            receiptdate_pruning_predicates(start_days, end_days),
-            shipping_row_group_map_chunk(),
-            pending_shipping_order_map_new,
-            {
-                let shipmodes = shipmodes.clone();
-                move |pending,
-                      orderkeys,
-                      mode_ids,
-                      dictionary,
-                      commitdates,
-                      receiptdates,
-                      shipdates| {
-                    filtered_lineitem_counts_direct_raw_into(
-                        orderkeys,
-                        mode_ids,
-                        dictionary,
-                        commitdates,
-                        receiptdates,
-                        shipdates,
-                        &shipmodes,
-                        start_days,
-                        end_days,
-                        pending,
-                    );
-                    Ok(())
-                }
-            },
-            Ok,
-            |pending, partial| {
-                merge_pending_shipping_orders(pending, partial);
-                Ok(())
-            },
-        )
-        .await
-}
-
-pub(super) async fn filtered_lineitem_counts_row_filtered(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-    projection: Projection,
-    shipmodes: Arc<Vec<String>>,
-    start_days: i32,
-    end_days: i32,
-) -> Result<PendingShippingOrderMap> {
-    let mut stream = engine
-        .scan_parquet_batches_row_filtered(
-            path,
-            batch_size,
-            projection,
-            receiptdate_pruning_predicates(start_days, end_days),
-        )
-        .await?;
-    parallel_batch_fold_view_chunks(
-        &mut stream,
-        shipping_lineitem_chunk_size(),
-        pending_shipping_order_map_new,
-        move |view, pending| {
-            if filtered_lineitem_counts_projected_view_into(
-                view, &shipmodes, start_days, end_days, pending,
-            )? {
-                Ok(Some(()))
-            } else {
-                let Some(batch) = view.try_record_batch() else {
-                    return Err(DodamError::UnsupportedSql(
-                        "shipping priority counts row-filter lineitem raw vector columns have unsupported types"
-                            .to_string(),
-                    ));
-                };
-                merge_pending_shipping_orders(
-                    pending,
-                    filtered_lineitem_counts_projected_batch(
-                        batch.clone(),
-                        &shipmodes,
-                        start_days,
-                        end_days,
-                    )?,
-                );
-                Ok(Some(()))
-            }
-        },
-        Ok,
-        pending_shipping_order_map_new(),
-        merge_pending_shipping_orders,
-        "shipping priority counts lineitem row-filter aggregate",
-    )
-}
-
 pub(super) async fn filtered_lineitem_counts_row_group_map(
     engine: &DodamEngine,
     path: PathBuf,
@@ -689,15 +290,12 @@ pub(super) async fn filtered_lineitem_counts_row_group_map(
 ) -> Result<Option<Vec<PendingShippingOrderMap>>> {
     let build_state = pending_shipping_order_map_new;
     let finish = |pending| Ok(Some(pending));
-    let dictionary_columns = lineitem_dictionary_shipmode_enabled()
-        .then(|| vec!["l_shipmode".to_string()])
-        .unwrap_or_default();
     engine
         .parquet_row_group_map_scan_view(
             path,
             batch_size,
             projection,
-            dictionary_columns,
+            vec!["l_shipmode".to_string()],
             receiptdate_pruning_predicates(start_days, end_days),
             shipping_row_group_map_chunk(),
             build_state,
@@ -733,77 +331,8 @@ pub(super) async fn filtered_lineitem_counts_row_group_map(
         .await
 }
 
-pub(super) async fn filtered_lineitem_counts_late_materialized(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-    shipmodes: &[String],
-    start_days: i32,
-    end_days: i32,
-) -> Result<Option<PendingShippingOrderMap>> {
-    let predicate_projection = Projection::Columns(vec![
-        "l_shipmode".to_string(),
-        "l_commitdate".to_string(),
-        "l_receiptdate".to_string(),
-        "l_shipdate".to_string(),
-    ]);
-    let payload_projection = Projection::Columns(vec!["l_orderkey".to_string()]);
-    let shipmodes = Arc::new(shipmodes.to_vec());
-    let Some(chunks) = engine
-        .late_materialized_parquet_map_pruned_with_policy_view(
-            path,
-            batch_size,
-            predicate_projection,
-            payload_projection,
-            Vec::new(),
-            shipping_late_materialized_row_group_chunk(),
-            LateMaterializationPolicy::selective_with_selector_run_ratio(
-                shipping_late_materialized_max_selected_ratio(),
-                shipping_late_materialized_max_selector_run_ratio(),
-            )
-            .with_selector_runs_per_selected(shipping_late_materialized_max_runs_per_selected()),
-            {
-                let shipmodes = shipmodes.clone();
-                move || ShippingLateState {
-                    shipmodes: shipmodes.clone(),
-                    start_days,
-                    end_days,
-                    selected_modes: Vec::new(),
-                    selected_offset: 0,
-                    pending: pending_shipping_order_map_new(),
-                }
-            },
-            late_build_shipping_selection_view,
-            late_consume_orderkey_payload_view,
-            |state, _metrics| {
-                if state.selected_offset != state.selected_modes.len() {
-                    return Err(DodamError::UnsupportedSql(
-                        "shipping priority counts row selection payload mismatch".to_string(),
-                    ));
-                }
-                Ok(Some(state.pending))
-            },
-        )
-        .await?
-    else {
-        return Ok(None);
-    };
-    let mut pending = pending_shipping_order_map_new();
-    let mut metrics = LateMaterializedMetrics::default();
-    for chunk in chunks {
-        merge_pending_shipping_orders(&mut pending, chunk.output);
-        metrics.add(chunk.metrics);
-    }
-    log_shipping_late_materialized_profile(metrics, shipping_late_materialized_row_group_chunk());
-    Ok(Some(pending))
-}
-
 pub(super) fn shipping_lineitem_chunk_size() -> usize {
-    std::env::var("DODAM_Q12_LINEITEM_CHUNK_SIZE")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(8)
+    8
 }
 
 pub(super) async fn filtered_lineitem_counts_stream(
@@ -852,80 +381,8 @@ pub(super) async fn filtered_lineitem_counts_stream(
     )
 }
 
-pub(super) fn shipping_row_group_map_enabled() -> bool {
-    std::env::var_os("DODAM_Q12_DISABLE_ROW_GROUP_MAP").is_none()
-}
-
-pub(super) fn lineitem_dictionary_shipmode_enabled() -> bool {
-    std::env::var_os("DODAM_Q12_DISABLE_LINEITEM_DICTIONARY_SHIPMODE").is_none()
-}
-
-pub(super) fn lineitem_row_filter_enabled() -> bool {
-    std::env::var_os("DODAM_Q12_ENABLE_LINEITEM_ROW_FILTER").is_some()
-}
-
-pub(super) fn direct_lineitem_raw_enabled() -> bool {
-    std::env::var("DODAM_Q12_ENABLE_DIRECT_LINEITEM_RAW")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-}
-
-pub(super) fn direct_lineitem_selected_payload_enabled() -> bool {
-    std::env::var("DODAM_Q12_ENABLE_DIRECT_LINEITEM_SELECTED_PAYLOAD")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-}
-
-pub(super) fn direct_lineitem_dict_raw_enabled() -> bool {
-    std::env::var("DODAM_Q12_ENABLE_DIRECT_LINEITEM_DICT_RAW")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-}
-
-pub(super) fn direct_lineitem_page_raw_enabled() -> bool {
-    std::env::var("DODAM_Q12_ENABLE_DIRECT_LINEITEM_PAGE_RAW")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-}
-
 pub(super) fn shipping_row_group_map_chunk() -> usize {
-    std::env::var("DODAM_Q12_ROW_GROUP_MAP_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(4)
-}
-
-pub(super) fn shipping_late_materialized_enabled() -> bool {
-    std::env::var_os("DODAM_Q12_ENABLE_LATE_MATERIALIZE").is_some()
-}
-
-pub(super) fn shipping_late_materialized_row_group_chunk() -> usize {
-    std::env::var("DODAM_Q12_LATE_ROW_GROUP_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(2)
-}
-
-pub(super) fn shipping_late_materialized_max_selected_ratio() -> f64 {
-    std::env::var("DODAM_Q12_LATE_MAX_SELECTED_RATIO")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.20)
-}
-
-pub(super) fn shipping_late_materialized_max_selector_run_ratio() -> f64 {
-    std::env::var("DODAM_Q12_LATE_MAX_SELECTOR_RUN_RATIO")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.50)
-}
-
-pub(super) fn shipping_late_materialized_max_runs_per_selected() -> f64 {
-    std::env::var("DODAM_Q12_LATE_MAX_RUNS_PER_SELECTED")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(1.25)
+    generic_row_group_map_chunk_size(4)
 }
 
 pub(super) fn receiptdate_pruning_predicates(start_days: i32, end_days: i32) -> Vec<Expr> {
@@ -977,19 +434,17 @@ pub(super) fn filtered_lineitem_counts_batch_into(
     let commitdates = batch_column(&batch, "l_commitdate")?;
     let receiptdates = batch_column(&batch, "l_receiptdate")?;
     let shipdates = batch_column(&batch, "l_shipdate")?;
-    if shipping_typed_loop_enabled()
-        && filtered_lineitem_counts_batch_typed_into(
-            orderkeys,
-            modes,
-            commitdates,
-            receiptdates,
-            shipdates,
-            shipmodes,
-            start_days,
-            end_days,
-            pending,
-        )
-    {
+    if filtered_lineitem_counts_batch_typed_into(
+        orderkeys,
+        modes,
+        commitdates,
+        receiptdates,
+        shipdates,
+        shipmodes,
+        start_days,
+        end_days,
+        pending,
+    ) {
         return Ok(());
     }
     for row in 0..batch.num_rows() {
@@ -1089,7 +544,7 @@ pub(super) fn filtered_lineitem_counts_projected_view_into(
     end_days: i32,
     pending: &mut PendingShippingOrderMap,
 ) -> Result<bool> {
-    if view.num_columns() != 5 || !shipping_typed_loop_enabled() {
+    if view.num_columns() != 5 {
         return Ok(false);
     }
     if view.num_columns() == 5
@@ -1108,287 +563,6 @@ pub(super) fn filtered_lineitem_counts_projected_view_into(
         return Ok(true);
     }
     Ok(false)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn filtered_lineitem_counts_direct_raw_into(
-    orderkeys: &[i64],
-    mode_ids: &[i32],
-    dictionary: &[bytes::Bytes],
-    commitdates: &[i32],
-    receiptdates: &[i32],
-    shipdates: &[i32],
-    shipmodes: &[String],
-    start_days: i32,
-    end_days: i32,
-    pending: &mut PendingShippingOrderMap,
-) {
-    let Some(mode_flags) = dictionary_bytes_match_flags(dictionary, shipmodes) else {
-        return;
-    };
-    let mut accumulator = PendingOrderRunAccumulator::new(pending);
-    for row in 0..orderkeys.len() {
-        let commitdate = commitdates[row];
-        let receiptdate = receiptdates[row];
-        if !lineitem_dates_match(
-            commitdate,
-            receiptdate,
-            shipdates[row],
-            start_days,
-            end_days,
-        ) {
-            continue;
-        }
-        let mode_id = mode_ids[row];
-        if mode_id < 0 {
-            continue;
-        }
-        let Some(mode_index) = mode_flags
-            .get(mode_id as usize)
-            .and_then(|mode_index| *mode_index)
-        else {
-            continue;
-        };
-        accumulator.increment(orderkeys[row], mode_index);
-    }
-    accumulator.finish();
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn filtered_lineitem_counts_direct_page_raw_into(
-    orderkey_bytes: &[u8],
-    mode_ids: &[i32],
-    dictionary: &[bytes::Bytes],
-    commitdate_bytes: &[u8],
-    receiptdate_bytes: &[u8],
-    shipdate_bytes: &[u8],
-    records: usize,
-    shipmodes: &[String],
-    start_days: i32,
-    end_days: i32,
-    pending: &mut PendingShippingOrderMap,
-) {
-    let Some(mode_flags) = dictionary_bytes_match_flags(dictionary, shipmodes) else {
-        return;
-    };
-    if orderkey_bytes.len() < records.saturating_mul(std::mem::size_of::<i64>())
-        || commitdate_bytes.len() < records.saturating_mul(std::mem::size_of::<i32>())
-        || receiptdate_bytes.len() < records.saturating_mul(std::mem::size_of::<i32>())
-        || shipdate_bytes.len() < records.saturating_mul(std::mem::size_of::<i32>())
-        || mode_ids.len() < records
-    {
-        return;
-    }
-    let mut accumulator = PendingOrderRunAccumulator::new(pending);
-    let mut row = 0usize;
-    while row + 8 <= records {
-        for offset in 0..8 {
-            let row = row + offset;
-            let commitdate = read_i32_le_unaligned(commitdate_bytes, row);
-            let receiptdate = read_i32_le_unaligned(receiptdate_bytes, row);
-            if !lineitem_dates_match(
-                commitdate,
-                receiptdate,
-                read_i32_le_unaligned(shipdate_bytes, row),
-                start_days,
-                end_days,
-            ) {
-                continue;
-            }
-            let mode_id = mode_ids[row];
-            if mode_id < 0 {
-                continue;
-            }
-            let Some(mode_index) = mode_flags
-                .get(mode_id as usize)
-                .and_then(|mode_index| *mode_index)
-            else {
-                continue;
-            };
-            accumulator.increment(read_i64_le_unaligned(orderkey_bytes, row), mode_index);
-        }
-        row += 8;
-    }
-    while row < records {
-        let commitdate = read_i32_le_unaligned(commitdate_bytes, row);
-        let receiptdate = read_i32_le_unaligned(receiptdate_bytes, row);
-        if lineitem_dates_match(
-            commitdate,
-            receiptdate,
-            read_i32_le_unaligned(shipdate_bytes, row),
-            start_days,
-            end_days,
-        ) {
-            let mode_id = mode_ids[row];
-            if mode_id >= 0
-                && let Some(mode_index) = mode_flags
-                    .get(mode_id as usize)
-                    .and_then(|mode_index| *mode_index)
-            {
-                accumulator.increment(read_i64_le_unaligned(orderkey_bytes, row), mode_index);
-            }
-        }
-        row += 1;
-    }
-    accumulator.finish();
-}
-
-pub(super) fn filtered_lineitem_counts_selected_payload_into(
-    orderkeys: &[i64],
-    mode_ids: &[i32],
-    dictionary: &[bytes::Bytes],
-    shipmodes: &[String],
-    pending: &mut PendingShippingOrderMap,
-) {
-    let Some(mode_flags) = dictionary_bytes_match_flags(dictionary, shipmodes) else {
-        return;
-    };
-    let rows = orderkeys.len().min(mode_ids.len());
-    let mut accumulator = PendingOrderRunAccumulator::new(pending);
-    let mut row = 0usize;
-    while row + 8 <= rows {
-        for offset in 0..8 {
-            let row = row + offset;
-            let Some(mode_index) = mode_dictionary_match_index(mode_ids[row], &mode_flags) else {
-                continue;
-            };
-            accumulator.increment(orderkeys[row], mode_index);
-        }
-        row += 8;
-    }
-    while row < rows {
-        if let Some(mode_index) = mode_dictionary_match_index(mode_ids[row], &mode_flags) {
-            accumulator.increment(orderkeys[row], mode_index);
-        }
-        row += 1;
-    }
-    accumulator.finish();
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn filtered_lineitem_counts_direct_dict_raw_into(
-    key_ids: &[i32],
-    key_dictionary: &[i64],
-    mode_ids: &[i32],
-    mode_dictionary: &[bytes::Bytes],
-    commitdate_ids: &[i32],
-    commitdate_dictionary: &[i32],
-    receiptdate_ids: &[i32],
-    receiptdate_dictionary: &[i32],
-    shipdate_ids: &[i32],
-    shipdate_dictionary: &[i32],
-    shipmodes: &[String],
-    start_days: i32,
-    end_days: i32,
-    pending: &mut PendingShippingOrderMap,
-) {
-    let Some(mode_flags) = dictionary_bytes_match_flags(mode_dictionary, shipmodes) else {
-        return;
-    };
-    let records = key_ids
-        .len()
-        .min(mode_ids.len())
-        .min(commitdate_ids.len())
-        .min(receiptdate_ids.len())
-        .min(shipdate_ids.len());
-    let mut accumulator = PendingOrderRunAccumulator::new(pending);
-    let mut row = 0usize;
-    while row + 8 <= records {
-        for offset in 0..8 {
-            let row = row + offset;
-            let Some(commitdate) = i32_dictionary_value(commitdate_ids[row], commitdate_dictionary)
-            else {
-                continue;
-            };
-            let Some(receiptdate) =
-                i32_dictionary_value(receiptdate_ids[row], receiptdate_dictionary)
-            else {
-                continue;
-            };
-            let Some(shipdate) = i32_dictionary_value(shipdate_ids[row], shipdate_dictionary)
-            else {
-                continue;
-            };
-            if !lineitem_dates_match(commitdate, receiptdate, shipdate, start_days, end_days) {
-                continue;
-            }
-            let Some(mode_index) = mode_dictionary_match_index(mode_ids[row], &mode_flags) else {
-                continue;
-            };
-            let Some(orderkey) = i64_dictionary_value(key_ids[row], key_dictionary) else {
-                continue;
-            };
-            accumulator.increment(orderkey, mode_index);
-        }
-        row += 8;
-    }
-    while row < records {
-        let Some(commitdate) = i32_dictionary_value(commitdate_ids[row], commitdate_dictionary)
-        else {
-            row += 1;
-            continue;
-        };
-        let Some(receiptdate) = i32_dictionary_value(receiptdate_ids[row], receiptdate_dictionary)
-        else {
-            row += 1;
-            continue;
-        };
-        let Some(shipdate) = i32_dictionary_value(shipdate_ids[row], shipdate_dictionary) else {
-            row += 1;
-            continue;
-        };
-        if lineitem_dates_match(commitdate, receiptdate, shipdate, start_days, end_days)
-            && let Some(mode_index) = mode_dictionary_match_index(mode_ids[row], &mode_flags)
-            && let Some(orderkey) = i64_dictionary_value(key_ids[row], key_dictionary)
-        {
-            accumulator.increment(orderkey, mode_index);
-        }
-        row += 1;
-    }
-    accumulator.finish();
-}
-
-#[inline(always)]
-pub(super) fn i32_dictionary_value(id: i32, dictionary: &[i32]) -> Option<i32> {
-    let id = usize::try_from(id).ok()?;
-    dictionary.get(id).copied()
-}
-
-#[inline(always)]
-pub(super) fn i64_dictionary_value(id: i32, dictionary: &[i64]) -> Option<i64> {
-    let id = usize::try_from(id).ok()?;
-    dictionary.get(id).copied()
-}
-
-#[inline(always)]
-pub(super) fn mode_dictionary_match_index(id: i32, flags: &[Option<usize>]) -> Option<usize> {
-    let id = usize::try_from(id).ok()?;
-    flags.get(id).and_then(|mode_index| *mode_index)
-}
-
-pub(super) fn dictionary_bytes_match_flags(
-    dictionary: &[bytes::Bytes],
-    shipmodes: &[String],
-) -> Option<Vec<Option<usize>>> {
-    let [left_mode, right_mode] = shipmodes else {
-        return None;
-    };
-    let left_mode = left_mode.as_bytes();
-    let right_mode = right_mode.as_bytes();
-    Some(
-        dictionary
-            .iter()
-            .map(|value| {
-                if value.as_ref() == left_mode {
-                    Some(0)
-                } else if value.as_ref() == right_mode {
-                    Some(1)
-                } else {
-                    None
-                }
-            })
-            .collect(),
-    )
 }
 
 pub(super) struct LineitemStringView<'a> {
@@ -1456,36 +630,6 @@ pub(super) fn filtered_lineitem_counts_batch_dictionary_typed_into(
             view.shipdates.values_if_null_free(),
         )
     {
-        let mut accumulator = PendingOrderRunAccumulator::new(pending);
-        if lineitem_selection_vector_enabled() {
-            let mut selected = SelectionVector::with_capacity(orderkey_values.len().min(4096));
-            for row in 0..orderkey_values.len() {
-                let commitdate = commitdate_values[row];
-                let receiptdate = receiptdate_values[row];
-                if lineitem_dates_match(
-                    commitdate,
-                    receiptdate,
-                    shipdate_values[row],
-                    start_days,
-                    end_days,
-                ) {
-                    selected.push(row);
-                }
-            }
-            if should_use_lineitem_selection_vector(selected.len(), orderkey_values.len()) {
-                for &row in selected.as_slice() {
-                    let row = row as usize;
-                    let Some(mode_index) =
-                        dictionary_i32_view_match_index(mode_keys, &mode_flags, row)
-                    else {
-                        continue;
-                    };
-                    accumulator.increment(orderkey_values[row], mode_index);
-                }
-                accumulator.finish();
-                return true;
-            }
-        }
         for row in 0..orderkey_values.len() {
             let commitdate = commitdate_values[row];
             let receiptdate = receiptdate_values[row];
@@ -1502,12 +646,10 @@ pub(super) fn filtered_lineitem_counts_batch_dictionary_typed_into(
             else {
                 continue;
             };
-            accumulator.increment(orderkey_values[row], mode_index);
+            pending_order_increment(pending, orderkey_values[row], mode_index);
         }
-        accumulator.finish();
         return true;
     }
-    let mut accumulator = PendingOrderRunAccumulator::new(pending);
     for row in 0..view.orderkeys.len() {
         if view.orderkeys.is_null(row)
             || view.modes.is_null(row)
@@ -1531,9 +673,8 @@ pub(super) fn filtered_lineitem_counts_batch_dictionary_typed_into(
         let Some(mode_index) = dictionary_i32_view_match_index(mode_keys, &mode_flags, row) else {
             continue;
         };
-        accumulator.increment(view.orderkeys.value(row), mode_index);
+        pending_order_increment(pending, view.orderkeys.value(row), mode_index);
     }
-    accumulator.finish();
     true
 }
 
@@ -1596,39 +737,6 @@ pub(super) fn filtered_lineitem_counts_string_view_into(
             view.shipdates.values_if_null_free(),
         )
     {
-        let mut accumulator = PendingOrderRunAccumulator::new(pending);
-        if lineitem_selection_vector_enabled() {
-            let mut selected = SelectionVector::with_capacity(orderkey_values.len().min(4096));
-            for row in 0..orderkey_values.len() {
-                let commitdate = commitdate_values[row];
-                let receiptdate = receiptdate_values[row];
-                if lineitem_dates_match(
-                    commitdate,
-                    receiptdate,
-                    shipdate_values[row],
-                    start_days,
-                    end_days,
-                ) {
-                    selected.push(row);
-                }
-            }
-            if should_use_lineitem_selection_vector(selected.len(), orderkey_values.len()) {
-                for &row in selected.as_slice() {
-                    let row = row as usize;
-                    let mode = view.modes.value_bytes(row);
-                    let mode_index = if mode == left_mode {
-                        0
-                    } else if mode == right_mode {
-                        1
-                    } else {
-                        continue;
-                    };
-                    accumulator.increment(orderkey_values[row], mode_index);
-                }
-                accumulator.finish();
-                return true;
-            }
-        }
         for row in 0..orderkey_values.len() {
             let commitdate = commitdate_values[row];
             let receiptdate = receiptdate_values[row];
@@ -1649,12 +757,10 @@ pub(super) fn filtered_lineitem_counts_string_view_into(
             } else {
                 continue;
             };
-            accumulator.increment(orderkey_values[row], mode_index);
+            pending_order_increment(pending, orderkey_values[row], mode_index);
         }
-        accumulator.finish();
         return true;
     }
-    let mut accumulator = PendingOrderRunAccumulator::new(pending);
     for row in 0..view.orderkeys.len() {
         if view.orderkeys.is_null(row)
             || view.modes.is_null(row)
@@ -1683,33 +789,9 @@ pub(super) fn filtered_lineitem_counts_string_view_into(
         } else {
             continue;
         };
-        accumulator.increment(view.orderkeys.value(row), mode_index);
+        pending_order_increment(pending, view.orderkeys.value(row), mode_index);
     }
-    accumulator.finish();
     true
-}
-
-pub(super) fn lineitem_selection_vector_enabled() -> bool {
-    std::env::var("DODAM_Q12_ENABLE_LINEITEM_SELECTION_VECTOR")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-}
-
-pub(super) fn lineitem_selection_vector_max_ratio() -> f64 {
-    std::env::var("DODAM_Q12_LINEITEM_SELECTION_VECTOR_MAX_RATIO")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.50)
-}
-
-pub(super) fn should_use_lineitem_selection_vector(
-    selected_rows: usize,
-    total_rows: usize,
-) -> bool {
-    if selected_rows == 0 || total_rows == 0 {
-        return selected_rows == 0;
-    }
-    (selected_rows as f64 / total_rows as f64) <= lineitem_selection_vector_max_ratio()
 }
 
 pub(super) fn shipmode_index(shipmodes: &[String], mode: &str) -> Option<usize> {
@@ -1718,236 +800,6 @@ pub(super) fn shipmode_index(shipmodes: &[String], mode: &str) -> Option<usize> 
         [_, right] if mode == right => Some(1),
         _ => None,
     }
-}
-
-pub(super) fn shipping_typed_loop_enabled() -> bool {
-    std::env::var_os("DODAM_Q12_DISABLE_TYPED_LOOP").is_none()
-}
-
-pub(super) struct ShippingLateState {
-    shipmodes: Arc<Vec<String>>,
-    start_days: i32,
-    end_days: i32,
-    selected_modes: Vec<u8>,
-    selected_offset: usize,
-    pending: PendingShippingOrderMap,
-}
-
-pub(super) fn late_build_shipping_selection_batch(
-    batch: RecordBatch,
-    selection: &mut LateSelectionBuilder,
-    state: &mut ShippingLateState,
-) -> Result<Option<()>> {
-    let modes = batch_string_column(&batch, "l_shipmode")?;
-    let Some(commitdates) = batch_column(&batch, "l_commitdate")?
-        .as_any()
-        .downcast_ref::<Date32Array>()
-    else {
-        return Ok(None);
-    };
-    let Some(receiptdates) = batch_column(&batch, "l_receiptdate")?
-        .as_any()
-        .downcast_ref::<Date32Array>()
-    else {
-        return Ok(None);
-    };
-    let Some(shipdates) = batch_column(&batch, "l_shipdate")?
-        .as_any()
-        .downcast_ref::<Date32Array>()
-    else {
-        return Ok(None);
-    };
-    let [left_mode, right_mode] = state.shipmodes.as_slice() else {
-        return Ok(None);
-    };
-    if modes.null_count() != 0
-        || commitdates.null_count() != 0
-        || receiptdates.null_count() != 0
-        || shipdates.null_count() != 0
-    {
-        return Ok(None);
-    }
-    let left_mode = left_mode.as_bytes();
-    let right_mode = right_mode.as_bytes();
-    let mode_offsets = modes.value_offsets();
-    let mode_data = modes.value_data();
-    let commitdate_values = commitdates.values().as_ref();
-    let receiptdate_values = receiptdates.values().as_ref();
-    let shipdate_values = shipdates.values().as_ref();
-    for row in 0..batch.num_rows() {
-        let commitdate = commitdate_values[row];
-        let receiptdate = receiptdate_values[row];
-        if !lineitem_dates_match(
-            commitdate,
-            receiptdate,
-            shipdate_values[row],
-            state.start_days,
-            state.end_days,
-        ) {
-            selection.push(false);
-            continue;
-        }
-        let mode = bytes_string_parts(mode_offsets, mode_data, row);
-        let mode_index = if mode == left_mode {
-            0
-        } else if mode == right_mode {
-            1
-        } else {
-            selection.push(false);
-            continue;
-        };
-        state.selected_modes.push(mode_index);
-        selection.push(true);
-    }
-    Ok(Some(()))
-}
-
-pub(super) fn late_build_shipping_selection_view(
-    view: BatchView<'_>,
-    selection: &mut LateSelectionBuilder,
-    state: &mut ShippingLateState,
-) -> Result<Option<()>> {
-    if view.num_columns() == 4 {
-        let Some(modes) = view.utf8_vector(0) else {
-            let Some(batch) = view.try_record_batch() else {
-                return Ok(None);
-            };
-            return late_build_shipping_selection_batch(batch.clone(), selection, state);
-        };
-        let (Some(commitdates), Some(receiptdates), Some(shipdates)) =
-            (view.date32(1), view.date32(2), view.date32(3))
-        else {
-            let Some(batch) = view.try_record_batch() else {
-                return Ok(None);
-            };
-            return late_build_shipping_selection_batch(batch.clone(), selection, state);
-        };
-        let [left_mode, right_mode] = state.shipmodes.as_slice() else {
-            return Ok(None);
-        };
-        if modes.null_count() != 0
-            || commitdates.null_count() != 0
-            || receiptdates.null_count() != 0
-            || shipdates.null_count() != 0
-        {
-            return Ok(None);
-        }
-        let left_mode = left_mode.as_bytes();
-        let right_mode = right_mode.as_bytes();
-        let commitdate_values = commitdates.values().as_ref();
-        let receiptdate_values = receiptdates.values().as_ref();
-        let shipdate_values = shipdates.values().as_ref();
-        for row in 0..view.num_rows() {
-            let commitdate = commitdate_values[row];
-            let receiptdate = receiptdate_values[row];
-            if !lineitem_dates_match(
-                commitdate,
-                receiptdate,
-                shipdate_values[row],
-                state.start_days,
-                state.end_days,
-            ) {
-                selection.push(false);
-                continue;
-            }
-            let mode = modes.value_bytes(row);
-            let mode_index = if mode == left_mode {
-                0
-            } else if mode == right_mode {
-                1
-            } else {
-                selection.push(false);
-                continue;
-            };
-            state.selected_modes.push(mode_index);
-            selection.push(true);
-        }
-        return Ok(Some(()));
-    }
-    let Some(batch) = view.try_record_batch() else {
-        return Ok(None);
-    };
-    late_build_shipping_selection_batch(batch.clone(), selection, state)
-}
-
-pub(super) fn late_consume_orderkey_payload_batch(
-    batch: RecordBatch,
-    state: &mut ShippingLateState,
-) -> Result<Option<()>> {
-    let Some(orderkeys) = batch_column(&batch, "l_orderkey")?
-        .as_any()
-        .downcast_ref::<Int64Array>()
-    else {
-        return Ok(None);
-    };
-    if orderkeys.null_count() != 0 {
-        return Ok(None);
-    }
-    for &orderkey in orderkeys.values() {
-        let mode_index = *state
-            .selected_modes
-            .get(state.selected_offset)
-            .ok_or_else(|| {
-                DodamError::UnsupportedSql(
-                    "shipping priority counts row selection payload mismatch".to_string(),
-                )
-            })? as usize;
-        pending_order_increment(&mut state.pending, orderkey, mode_index);
-        state.selected_offset += 1;
-    }
-    Ok(Some(()))
-}
-
-pub(super) fn late_consume_orderkey_payload_view(
-    view: BatchView<'_>,
-    state: &mut ShippingLateState,
-) -> Result<Option<()>> {
-    if view.num_columns() == 1 {
-        let Some(orderkeys) = view.i64_vector(0) else {
-            let Some(batch) = view.try_record_batch() else {
-                return Ok(None);
-            };
-            return late_consume_orderkey_payload_batch(batch.clone(), state);
-        };
-        let Some(orderkey_values) = orderkeys.values_if_null_free() else {
-            return Ok(None);
-        };
-        for &orderkey in orderkey_values {
-            let mode_index = *state
-                .selected_modes
-                .get(state.selected_offset)
-                .ok_or_else(|| {
-                    DodamError::UnsupportedSql(
-                        "shipping priority counts row selection payload mismatch".to_string(),
-                    )
-                })? as usize;
-            pending_order_increment(&mut state.pending, orderkey, mode_index);
-            state.selected_offset += 1;
-        }
-        return Ok(Some(()));
-    }
-    let Some(batch) = view.try_record_batch() else {
-        return Ok(None);
-    };
-    late_consume_orderkey_payload_batch(batch.clone(), state)
-}
-
-pub(super) fn log_shipping_late_materialized_profile(
-    metrics: LateMaterializedMetrics,
-    row_group_chunk: usize,
-) {
-    if !tpch_profile_enabled() {
-        return;
-    }
-    let ratio = if metrics.total_rows == 0 {
-        0.0
-    } else {
-        metrics.selected_rows as f64 / metrics.total_rows as f64
-    };
-    eprintln!(
-        "[dodam:tpch-profile] shipping priority counts lineitem: late_materialized rows={} selected={} ratio={:.6} selector_runs={} row_group_chunk={}",
-        metrics.total_rows, metrics.selected_rows, ratio, metrics.selector_runs, row_group_chunk
-    );
 }
 
 pub(super) fn merge_pending_shipping_orders(

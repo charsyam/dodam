@@ -251,7 +251,6 @@ fn try_write_same_source_union_all_primitive_to_sink(
                 .collect::<Result<Vec<_>>>()?,
         ),
         DirectPrimitiveColumnType::Date32
-        | DirectPrimitiveColumnType::Decimal128Int64 { .. }
         | DirectPrimitiveColumnType::Decimal128Int64Raw { .. } => return Ok(false),
     };
     let row_group_count = engine.parquet_row_group_count(&shared.path)?;
@@ -934,7 +933,6 @@ fn try_write_same_source_union_all_ordered_desc_primitive_to_sink(
                 .collect::<Result<Vec<_>>>()?,
         ),
         DirectPrimitiveColumnType::Date32
-        | DirectPrimitiveColumnType::Decimal128Int64 { .. }
         | DirectPrimitiveColumnType::Decimal128Int64Raw { .. } => return Ok(false),
     };
     let specs = columns

@@ -34,7 +34,8 @@ pub(super) async fn try_execute_derived_prefix_avg_anti_join_aggregate_sql(
     };
     let (avg, customer_candidates) =
         customer_candidates_and_average(engine, customer.path.clone(), batch_size).await?;
-    let order_customers = order_customer_keys(engine, orders_path, batch_size).await?;
+    let order_customers =
+        collect_i64_adaptive_set(engine, orders_path, batch_size, "o_custkey").await?;
     let mut groups = customer_groups_from_candidates(avg, &order_customers, customer_candidates);
     groups.sort_by(|left, right| left.cntrycode.cmp(&right.cntrycode));
     Ok(Some(prefix_avg_antijoin_output(groups)?))
@@ -154,51 +155,6 @@ fn customer_candidates_and_average_typed(
         }
     }
     Ok(Some((sum, count)))
-}
-
-async fn order_customer_keys(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-) -> Result<AdaptiveI64Set> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec!["o_custkey".to_string()]),
-            None,
-        )
-        .await?;
-    let mut keys = AdaptiveI64Set::new_dense();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let custkeys = batch_column(&batch, "o_custkey")?;
-        if order_customer_keys_batch_into(custkeys, &mut keys)? {
-            continue;
-        }
-        for row in 0..batch.num_rows() {
-            if let Some(key) = numeric_i64_value(custkeys, row)? {
-                keys.insert(key);
-            }
-        }
-    }
-    Ok(keys)
-}
-
-fn order_customer_keys_batch_into(custkeys: &ArrayRef, keys: &mut AdaptiveI64Set) -> Result<bool> {
-    let Some(custkeys) = custkeys.as_any().downcast_ref::<Int64Array>() else {
-        return Ok(false);
-    };
-    if custkeys.null_count() == 0 {
-        return Ok(keys.try_insert_dense_values(custkeys.values().as_ref()));
-    }
-    for row in 0..custkeys.len() {
-        if custkeys.is_valid(row) {
-            keys.insert(custkeys.value(row));
-        }
-    }
-    Ok(true)
 }
 
 struct PrefixAvgAntiJoinGroup {

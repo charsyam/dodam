@@ -160,8 +160,27 @@ async fn supplier_discounted_revenue_by_date(
     start_days: i32,
     end_days: i32,
 ) -> Result<HashMap<i64, f64>> {
-    if let Some(revenues) =
-        supplier_discounted_revenue_direct(engine, &path, batch_size, start_days, end_days)?
+    if let Some(revenues) = try_direct_i64_grouped_discounted_revenue_by_date(
+        engine,
+        &path,
+        batch_size,
+        "l_suppkey",
+        "l_shipdate",
+        "l_extendedprice",
+        "l_discount",
+        start_days,
+        end_days,
+    )? {
+        return Ok(revenues);
+    }
+    if let Some(revenues) = supplier_discounted_revenue_by_date_late(
+        engine,
+        path.clone(),
+        batch_size,
+        start_days,
+        end_days,
+    )
+    .await?
     {
         return Ok(revenues);
     }
@@ -191,133 +210,185 @@ async fn supplier_discounted_revenue_by_date(
         .await
 }
 
-fn supplier_discounted_revenue_direct(
+async fn supplier_discounted_revenue_by_date_late(
     engine: &DodamEngine,
-    path: &Path,
+    path: PathBuf,
     batch_size: usize,
     start_days: i32,
     end_days: i32,
 ) -> Result<Option<HashMap<i64, f64>>> {
-    if !direct_discounted_revenue_selected_fold_enabled() {
-        return Ok(None);
-    }
-    let trace = std::env::var("DODAM_DIRECT_SELECTION_TRACE")
-        .or_else(|_| std::env::var("DODAM_TPCH_PROFILE"))
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
-    if trace {
-        eprintln!("[dodam:direct-selected] top-supplier revenue candidate");
-    }
-    if !direct_selection_fold_enabled() {
-        if trace {
-            eprintln!(
-                "[dodam:direct-selected] top-supplier revenue reject: direct selection fold disabled"
-            );
-        }
-        return Ok(None);
-    }
-    let Some((_price_precision, price_scale)) =
-        engine.parquet_decimal128_type(path, "l_extendedprice")?
-    else {
-        if trace {
-            eprintln!(
-                "[dodam:direct-selected] top-supplier revenue reject: l_extendedprice is not Decimal128"
-            );
-        }
-        return Ok(None);
-    };
-    let Some((_discount_precision, discount_decimal_scale)) =
-        engine.parquet_decimal128_type(path, "l_discount")?
-    else {
-        if trace {
-            eprintln!(
-                "[dodam:direct-selected] top-supplier revenue reject: l_discount is not Decimal128"
-            );
-        }
-        return Ok(None);
-    };
-    let date_max = end_days.checked_sub(1).ok_or_else(|| {
-        DodamError::UnsupportedSql(
-            "invalid empty top-supplier revenue date range for direct fold".to_string(),
-        )
-    })?;
-    let row_groups = (0..engine.parquet_row_group_count(path)?).collect::<Vec<_>>();
-    let discount_scale = decimal_scale_factor(discount_decimal_scale);
-    let revenue_scale =
-        1.0 / (decimal_scale_factor(price_scale) * decimal_scale_factor(discount_decimal_scale));
-    let Some((revenues, _metrics)) = engine
-        .scan_parquet_i64_date_decimal_decimal_selected_typed_fold(
+    let predicate_projection = Projection::Columns(vec!["l_shipdate".to_string()]);
+    let payload_projection = Projection::Columns(vec![
+        "l_suppkey".to_string(),
+        "l_extendedprice".to_string(),
+        "l_discount".to_string(),
+    ]);
+    let policy = generic_late_materialization_policy_for_projection(
+        &predicate_projection,
+        &payload_projection,
+        0.20,
+        Some(0.50),
+    )
+    .with_selector_runs_per_selected(0.20);
+    let Some(chunks) = engine
+        .late_materialized_parquet_map_pruned_with_policy_view(
             path,
             batch_size,
-            &row_groups,
-            ["l_suppkey", "l_shipdate", "l_extendedprice", "l_discount"],
-            Some(start_days),
-            Some(date_max),
-            HashMap::<i64, f64>::new,
-            move |revenues, batch| {
-                supplier_discounted_revenue_direct_batch_into(
-                    batch,
-                    start_days,
-                    end_days,
-                    discount_scale,
-                    revenue_scale,
-                    revenues,
-                )
+            predicate_projection,
+            payload_projection,
+            Vec::new(),
+            top_supplier_revenue_late_row_group_chunk(),
+            policy,
+            move || TopSupplierRevenueLateState {
+                start_days,
+                end_days,
+                revenues: HashMap::<i64, f64>::new(),
             },
-            |revenues, partial| {
-                merge_f64_groups(revenues, partial);
-                Ok(())
-            },
-        )?
+            top_supplier_revenue_late_build_date_selection_view,
+            top_supplier_revenue_late_consume_payload_view,
+            |state, metrics| Ok(Some((state.revenues, metrics))),
+        )
+        .await?
     else {
         return Ok(None);
     };
+    let mut revenues = HashMap::<i64, f64>::new();
+    let mut metrics = LateMaterializedMetrics::default();
+    for chunk in chunks {
+        let (chunk_revenues, chunk_metrics) = chunk.output;
+        metrics.add(chunk_metrics);
+        merge_f64_groups(&mut revenues, chunk_revenues);
+    }
+    tpch_profile_late_materialized(
+        "top-supplier revenue aggregate",
+        metrics,
+        top_supplier_revenue_late_row_group_chunk(),
+    );
     Ok(Some(revenues))
 }
 
-fn direct_discounted_revenue_selected_fold_enabled() -> bool {
-    std::env::var("DODAM_ENABLE_DIRECT_DISCOUNTED_REVENUE_SELECTED_FOLD")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+fn top_supplier_revenue_late_row_group_chunk() -> usize {
+    late_materialization_row_group_chunk(2)
 }
 
-fn supplier_discounted_revenue_direct_batch_into(
-    batch: crate::storage::DirectI64DateDecimalDecimalSelectedBatch<'_>,
+struct TopSupplierRevenueLateState {
     start_days: i32,
     end_days: i32,
-    discount_scale: f64,
-    revenue_scale: f64,
-    revenues: &mut HashMap<i64, f64>,
-) -> Result<()> {
-    if batch.keys.len() != batch.left_decimals.len()
-        || batch.keys.len() != batch.right_decimals.len()
-        || batch.keys.len() != batch.dates.len()
+    revenues: HashMap<i64, f64>,
+}
+
+fn top_supplier_revenue_late_build_date_selection_view(
+    view: BatchView<'_>,
+    selection: &mut LateSelectionBuilder,
+    state: &mut TopSupplierRevenueLateState,
+) -> Result<Option<()>> {
+    if view.num_columns() == 1
+        && let Some(shipdates) = view.date32_vector(0)
     {
-        return Err(DodamError::UnsupportedSql(
-            "direct discounted revenue batch length mismatch".to_string(),
-        ));
-    }
-    if batch.predicate_applied {
-        for row in 0..batch.keys.len() {
-            *revenues.entry(batch.keys[row]).or_insert(0.0) += decimal_discounted_revenue_raw_i64(
-                batch.left_decimals[row],
-                batch.right_decimals[row],
-                discount_scale,
-                revenue_scale,
+        if let Some(shipdate_values) = shipdates.values_if_null_free() {
+            for &shipdate in shipdate_values {
+                selection.push(shipdate >= state.start_days && shipdate < state.end_days);
+            }
+            return Ok(Some(()));
+        }
+        for row in 0..shipdates.len() {
+            selection.push(
+                !shipdates.is_null(row)
+                    && shipdates.value(row) >= state.start_days
+                    && shipdates.value(row) < state.end_days,
             );
         }
-        return Ok(());
+        return Ok(Some(()));
     }
-    for row in 0..batch.keys.len() {
-        let date = batch.dates[row];
-        if date >= start_days && date < end_days {
-            *revenues.entry(batch.keys[row]).or_insert(0.0) += decimal_discounted_revenue_raw_i64(
-                batch.left_decimals[row],
-                batch.right_decimals[row],
-                discount_scale,
-                revenue_scale,
-            );
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    top_supplier_revenue_late_build_date_selection_batch(batch.clone(), selection, state)
+}
+
+fn top_supplier_revenue_late_build_date_selection_batch(
+    batch: RecordBatch,
+    selection: &mut LateSelectionBuilder,
+    state: &mut TopSupplierRevenueLateState,
+) -> Result<Option<()>> {
+    let shipdates = batch_column(&batch, "l_shipdate")?;
+    let Some(shipdates) = shipdates.as_any().downcast_ref::<Date32Array>() else {
+        return Ok(None);
+    };
+    if shipdates.null_count() == 0 {
+        for &shipdate in shipdates.values() {
+            selection.push(shipdate >= state.start_days && shipdate < state.end_days);
         }
+        return Ok(Some(()));
     }
-    Ok(())
+    for row in 0..shipdates.len() {
+        selection.push(
+            shipdates.is_valid(row)
+                && shipdates.value(row) >= state.start_days
+                && shipdates.value(row) < state.end_days,
+        );
+    }
+    Ok(Some(()))
+}
+
+fn top_supplier_revenue_late_consume_payload_view(
+    view: BatchView<'_>,
+    state: &mut TopSupplierRevenueLateState,
+) -> Result<Option<()>> {
+    if view.num_columns() == 3
+        && let (Some(suppkeys), Some(extendedprices), Some(discounts)) = (
+            view.i64_vector(0),
+            view.decimal128_vector(1),
+            view.decimal128_vector(2),
+        )
+    {
+        let Some(suppkey_values) = suppkeys.values_if_null_free() else {
+            let Some(batch) = view.try_record_batch() else {
+                return Ok(None);
+            };
+            return top_supplier_revenue_late_consume_payload_batch(batch.clone(), state);
+        };
+        consume_discounted_revenue_decimal128_vectors(
+            extendedprices,
+            discounts,
+            view.num_rows(),
+            |row, revenue| {
+                if let Some(revenue) = revenue {
+                    *state.revenues.entry(suppkey_values[row]).or_insert(0.0) += revenue;
+                }
+                Ok(())
+            },
+        )?;
+        return Ok(Some(()));
+    }
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    top_supplier_revenue_late_consume_payload_batch(batch.clone(), state)
+}
+
+fn top_supplier_revenue_late_consume_payload_batch(
+    batch: RecordBatch,
+    state: &mut TopSupplierRevenueLateState,
+) -> Result<Option<()>> {
+    let suppkeys = batch_column(&batch, "l_suppkey")?;
+    let extendedprices = batch_column(&batch, "l_extendedprice")?;
+    let discounts = batch_column(&batch, "l_discount")?;
+    let (Some(suppkeys), Some(extendedprices), Some(discounts)) = (
+        suppkeys.as_any().downcast_ref::<Int64Array>(),
+        decimal_input(extendedprices)?,
+        decimal_input(discounts)?,
+    ) else {
+        return Ok(None);
+    };
+    for row in 0..batch.num_rows() {
+        if suppkeys.is_null(row) || extendedprices.is_null(row) || discounts.is_null(row) {
+            continue;
+        }
+        *state.revenues.entry(suppkeys.value(row)).or_insert(0.0) +=
+            extendedprices.value(row) * (1.0 - discounts.value(row));
+    }
+    Ok(Some(()))
 }
 
 fn supplier_discounted_revenue_batch_into<S: BuildHasher>(
@@ -423,93 +494,43 @@ fn supplier_discounted_revenue_view_into(
     supplier_discounted_revenue_batch_into(batch.clone(), start_days, end_days, revenues)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn update_i64_grouped_discounted_revenue_by_date_view<S: BuildHasher>(
-    view: BatchView<'_>,
-    key_index: usize,
-    date_index: usize,
-    extendedprice_index: usize,
-    discount_index: usize,
-    start_days: i32,
-    end_days: i32,
-    revenues: &mut HashMap<i64, f64, S>,
-) -> Result<bool> {
-    let (Some(keys), Some(dates), Some(extendedprices), Some(discounts)) = (
-        view.i64_vector(key_index),
-        view.date32_vector(date_index),
-        view.decimal128_vector(extendedprice_index),
-        view.decimal128_vector(discount_index),
-    ) else {
-        return Ok(false);
-    };
-    let (Some(key_values), Some(date_values)) =
-        (keys.values_if_null_free(), dates.values_if_null_free())
-    else {
-        return Ok(false);
-    };
-    if extendedprices.null_count() != 0 || discounts.null_count() != 0 {
-        return Ok(false);
-    }
-    let discount_scale = discounts.scale();
-    let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
-    if let (Some(extendedprice_values), Some(discount_values)) =
-        (extendedprices.raw_i64_values(), discounts.raw_i64_values())
-    {
-        for row in 0..view.num_rows() {
-            let date = date_values[row];
-            if date >= start_days && date < end_days {
-                *revenues.entry(key_values[row]).or_insert(0.0) +=
-                    decimal_discounted_revenue_raw_i64(
-                        extendedprice_values[row],
-                        discount_values[row],
-                        discount_scale,
-                        revenue_scale,
-                    );
-            }
-        }
-        return Ok(true);
-    }
-    let extendedprice_values = extendedprices.raw_values();
-    let discount_values = discounts.raw_values();
-    for row in 0..view.num_rows() {
-        let date = date_values[row];
-        if date >= start_days && date < end_days {
-            *revenues.entry(key_values[row]).or_insert(0.0) += decimal_discounted_revenue_raw(
-                extendedprice_values[row],
-                discount_values[row],
-                discount_scale,
-                revenue_scale,
-            );
-        }
-    }
-    Ok(true)
-}
-
 async fn top_supplier_rows(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
     top_suppliers: &HashMap<i64, f64>,
 ) -> Result<Vec<TopSupplierRevenueRow>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec![
-                "s_suppkey".to_string(),
-                "s_name".to_string(),
-                "s_address".to_string(),
-                "s_phone".to_string(),
-            ]),
-            None,
-        )
-        .await?;
-    let mut rows = Vec::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        top_supplier_rows_view_into(BatchView::new(&batch), top_suppliers, &mut rows)?;
-    }
+    let pruning_predicates = top_suppliers
+        .keys()
+        .copied()
+        .min()
+        .zip(top_suppliers.keys().copied().max())
+        .and_then(|(min_key, max_key)| {
+            selective_i64_range_from_parts(min_key, max_key, top_suppliers.len())
+        })
+        .map(|(min_key, max_key)| i64_range_pruning_predicates("s_suppkey", min_key, max_key))
+        .unwrap_or_default();
+    let mut rows = collect_i64_three_utf8_mapped_rows_pruned(
+        engine,
+        path,
+        batch_size,
+        "s_suppkey",
+        "s_name",
+        "s_address",
+        "s_phone",
+        pruning_predicates,
+        |suppkey, name, address, phone| {
+            let total_revenue = top_suppliers.get(&suppkey).copied()?;
+            Some(TopSupplierRevenueRow {
+                suppkey,
+                name: name.to_string(),
+                address: address.to_string(),
+                phone: phone.to_string(),
+                total_revenue,
+            })
+        },
+    )
+    .await?;
     rows.sort_by_key(|row| row.suppkey);
     Ok(rows)
 }
@@ -553,65 +574,4 @@ struct TopSupplierRevenueRow {
     address: String,
     phone: String,
     total_revenue: f64,
-}
-
-fn top_supplier_rows_view_into(
-    view: BatchView<'_>,
-    top_suppliers: &HashMap<i64, f64>,
-    rows: &mut Vec<TopSupplierRevenueRow>,
-) -> Result<()> {
-    if view.num_columns() == 4
-        && let (Some(suppkeys), Some(names), Some(addresses), Some(phones)) =
-            (view.i64(0), view.utf8(1), view.utf8(2), view.utf8(3))
-    {
-        for row in 0..view.num_rows() {
-            if suppkeys.is_null(row)
-                || names.is_null(row)
-                || addresses.is_null(row)
-                || phones.is_null(row)
-            {
-                continue;
-            }
-            let suppkey = suppkeys.value(row);
-            let Some(total_revenue) = top_suppliers.get(&suppkey).copied() else {
-                continue;
-            };
-            rows.push(TopSupplierRevenueRow {
-                suppkey,
-                name: names.value(row).to_string(),
-                address: addresses.value(row).to_string(),
-                phone: phones.value(row).to_string(),
-                total_revenue,
-            });
-        }
-        return Ok(());
-    }
-    let Some(batch) = view.try_record_batch() else {
-        return Err(DodamError::UnsupportedSql(
-            "top-supplier raw vector columns have unsupported types".to_string(),
-        ));
-    };
-    let suppkeys = batch_column(batch, "s_suppkey")?;
-    let names = batch_string_column(batch, "s_name")?;
-    let addresses = batch_string_column(batch, "s_address")?;
-    let phones = batch_string_column(batch, "s_phone")?;
-    for row in 0..batch.num_rows() {
-        if names.is_null(row) || addresses.is_null(row) || phones.is_null(row) {
-            continue;
-        }
-        let Some(suppkey) = numeric_i64_value(suppkeys, row)? else {
-            continue;
-        };
-        let Some(total_revenue) = top_suppliers.get(&suppkey).copied() else {
-            continue;
-        };
-        rows.push(TopSupplierRevenueRow {
-            suppkey,
-            name: names.value(row).to_string(),
-            address: addresses.value(row).to_string(),
-            phone: phones.value(row).to_string(),
-            total_revenue,
-        });
-    }
-    Ok(())
 }

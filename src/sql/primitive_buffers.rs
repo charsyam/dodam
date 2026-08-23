@@ -381,8 +381,7 @@ pub(super) fn primitive_output_data_type(
         DirectPrimitiveColumnType::I32 => Ok(DataType::Int32),
         DirectPrimitiveColumnType::I64 => Ok(DataType::Int64),
         DirectPrimitiveColumnType::Date32 => Ok(DataType::Date32),
-        DirectPrimitiveColumnType::Decimal128Int64 { precision, scale }
-        | DirectPrimitiveColumnType::Decimal128Int64Raw { precision, scale } => {
+        DirectPrimitiveColumnType::Decimal128Int64Raw { precision, scale } => {
             Ok(DataType::Decimal128(*precision, *scale))
         }
     }
@@ -412,7 +411,6 @@ pub(super) fn primitive_empty_batch(
                     PrimitiveColumnValues::I32(Vec::new())
                 }
                 DirectPrimitiveColumnType::I64
-                | DirectPrimitiveColumnType::Decimal128Int64 { .. }
                 | DirectPrimitiveColumnType::Decimal128Int64Raw { .. } => {
                     PrimitiveColumnValues::I64(Vec::new())
                 }

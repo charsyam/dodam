@@ -35,6 +35,7 @@ enum SqlRule {
     CorrelatedExistsSubquery,
     ExistsSubquery,
     InSubquery,
+    ExpressionAggregate,
     ProjectionExpression,
 }
 
@@ -46,6 +47,26 @@ enum SqlRuleKind {
     SubqueryRewrite,
     Cte,
     GenericExpression,
+    ExpressionAggregate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlRuleInventoryEntry {
+    pub name: &'static str,
+    pub kind: &'static str,
+    pub cost_rank: u16,
+    pub required_features: &'static [&'static str],
+    pub required_columns: &'static [&'static str],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlRuleCandidateEntry {
+    pub name: &'static str,
+    pub kind: &'static str,
+    pub cost_rank: u16,
+    pub estimated_cost: u32,
+    pub required_features: &'static [&'static str],
+    pub required_columns: &'static [&'static str],
 }
 
 impl SqlRuleKind {
@@ -57,13 +78,14 @@ impl SqlRuleKind {
             Self::SubqueryRewrite => "subquery-rewrite",
             Self::Cte => "cte",
             Self::GenericExpression => "generic-expression",
+            Self::ExpressionAggregate => "expression-aggregate",
         }
     }
 
     fn fallback_penalty(self) -> u32 {
         match self {
             Self::Cte => 50_000,
-            Self::GenericExpression => 40_000,
+            Self::GenericExpression | Self::ExpressionAggregate => 40_000,
             _ => 0,
         }
     }
@@ -105,6 +127,7 @@ impl SqlRule {
             Self::CorrelatedExistsSubquery => "correlated-exists-subquery",
             Self::ExistsSubquery => "exists-subquery",
             Self::InSubquery => "in-subquery",
+            Self::ExpressionAggregate => "expression-aggregate",
             Self::ProjectionExpression => "projection-expression",
         }
     }
@@ -151,6 +174,7 @@ impl SqlRule {
             | Self::CorrelatedExistsSubquery
             | Self::ExistsSubquery
             | Self::InSubquery => SqlRuleKind::SubqueryRewrite,
+            Self::ExpressionAggregate => SqlRuleKind::ExpressionAggregate,
             Self::ProjectionExpression => SqlRuleKind::GenericExpression,
         }
     }
@@ -190,6 +214,7 @@ impl SqlRule {
             | Self::CorrelatedExistsSubquery
             | Self::ExistsSubquery
             | Self::InSubquery => &["subquery"],
+            Self::ExpressionAggregate => &["aggregate-expression"],
             Self::ProjectionExpression => &["projection-expression"],
         }
     }
@@ -338,6 +363,9 @@ impl SqlRule {
                 "l_discount",
                 "l_shipdate",
             ],
+            Self::DerivedLeftJoinCountDistribution => {
+                &["c_custkey", "o_custkey", "o_orderkey", "o_comment"]
+            }
             Self::JoinWithCorrelatedAvgThreshold => &[
                 "p_partkey",
                 "p_brand",
@@ -345,6 +373,16 @@ impl SqlRule {
                 "l_partkey",
                 "l_quantity",
                 "l_extendedprice",
+            ],
+            Self::JoinWithGroupedSumSemijoin => &[
+                "c_custkey",
+                "c_name",
+                "o_custkey",
+                "o_orderkey",
+                "o_orderdate",
+                "o_totalprice",
+                "l_orderkey",
+                "l_quantity",
             ],
             Self::ShippingModePriorityCounts => &[
                 "l_orderkey",
@@ -364,7 +402,17 @@ impl SqlRule {
                 "l_receiptdate",
                 "l_commitdate",
             ],
+            Self::DerivedPrefixAvgAntiJoinAggregate => {
+                &["c_custkey", "c_phone", "c_acctbal", "o_custkey"]
+            }
             Self::PrefixPartSupplierThreshold => &[
+                "s_suppkey",
+                "s_name",
+                "s_address",
+                "s_nationkey",
+                "n_nationkey",
+                "n_name",
+                "p_partkey",
                 "p_name",
                 "ps_partkey",
                 "ps_suppkey",
@@ -489,6 +537,18 @@ impl SqlRule {
             }
             Self::ExistsSubquery => try_execute_exists_subquery_sql(engine, sql, batch_size).await,
             Self::InSubquery => try_execute_in_subquery_sql(engine, sql, batch_size).await,
+            Self::ExpressionAggregate => {
+                let query = parse_sql(sql)?;
+                if query.join.is_some() || !query.is_aggregate() {
+                    return Ok(None);
+                }
+                if query.aggregate_expressions.is_empty() && query.filtered_aggregates.is_empty() {
+                    return Ok(None);
+                }
+                execute_single_table_aggregate_query(engine, query, batch_size)
+                    .await
+                    .map(Some)
+            }
             Self::ProjectionExpression => {
                 try_execute_projection_expression_sql(engine, sql, batch_size).await
             }
@@ -533,6 +593,7 @@ impl SqlRule {
             Self::ProjectionExpression => {
                 context.has_projection_expression || context.has_predicate_expression
             }
+            Self::ExpressionAggregate => context.has_aggregate_expression,
         }
     }
 }
@@ -572,8 +633,42 @@ fn sql_rule_registry() -> &'static [SqlRule] {
         SqlRule::CorrelatedExistsSubquery,
         SqlRule::ExistsSubquery,
         SqlRule::InSubquery,
+        SqlRule::ExpressionAggregate,
         SqlRule::ProjectionExpression,
     ]
+}
+
+pub fn sql_rule_inventory() -> Vec<SqlRuleInventoryEntry> {
+    sql_rule_registry()
+        .iter()
+        .copied()
+        .map(|rule| SqlRuleInventoryEntry {
+            name: rule.name(),
+            kind: rule.kind().name(),
+            cost_rank: rule.cost_rank(),
+            required_features: rule.required_features(),
+            required_columns: rule.required_columns(),
+        })
+        .collect()
+}
+
+pub fn sql_rule_candidates_for_sql(sql: &str) -> Result<Vec<SqlRuleCandidateEntry>> {
+    let context = SqlRuleContext::from_sql(sql)?;
+    let mut candidates = sql_rule_registry()
+        .iter()
+        .copied()
+        .filter(|rule| rule.is_candidate(&context))
+        .map(|rule| SqlRuleCandidateEntry {
+            name: rule.name(),
+            kind: rule.kind().name(),
+            cost_rank: rule.cost_rank(),
+            estimated_cost: rule.estimated_cost(&context, None),
+            required_features: rule.required_features(),
+            required_columns: rule.required_columns(),
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|candidate| (candidate.estimated_cost, candidate.cost_rank));
+    Ok(candidates)
 }
 
 #[derive(Clone, Copy)]
@@ -581,6 +676,7 @@ struct SqlRuleCandidate {
     rule: SqlRule,
     estimated_cost: u32,
     estimated_scan_bytes: Option<u64>,
+    estimated_scan_source: &'static str,
 }
 
 pub(super) async fn try_execute_registered_sql_rules(
@@ -597,11 +693,16 @@ pub(super) async fn try_execute_registered_sql_rules(
         .collect::<Vec<_>>();
     let mut candidates = Vec::with_capacity(rules.len());
     for rule in rules {
-        let estimated_scan_bytes = estimate_sql_rule_scan_bytes(engine, &context, rule).await;
+        let estimated_scan = estimate_sql_rule_scan_bytes(engine, &context, rule).await;
+        let estimated_scan_bytes = estimated_scan.as_ref().map(|estimate| estimate.bytes);
         candidates.push(SqlRuleCandidate {
             rule,
             estimated_cost: rule.estimated_cost(&context, estimated_scan_bytes),
             estimated_scan_bytes,
+            estimated_scan_source: estimated_scan
+                .as_ref()
+                .map(|estimate| estimate.source)
+                .unwrap_or("none"),
         });
     }
     candidates.sort_by_key(|candidate| (candidate.estimated_cost, candidate.rule.cost_rank()));
@@ -633,7 +734,7 @@ pub(super) async fn try_execute_registered_sql_rules(
         if let Some(output) = output {
             if sql_rule_profile_enabled() {
                 eprintln!(
-                    "[dodam:sql-rule] selected={} kind={} cost_rank={} estimated_cost={} estimated_scan_bytes={} required_features={} required_columns={}",
+                    "[dodam:sql-rule] selected={} kind={} cost_rank={} estimated_cost={} estimated_scan_bytes={} scan_source={} required_features={} required_columns={}",
                     rule.name(),
                     rule.kind().name(),
                     rule.cost_rank(),
@@ -642,6 +743,7 @@ pub(super) async fn try_execute_registered_sql_rules(
                         .estimated_scan_bytes
                         .map(|bytes| bytes.to_string())
                         .unwrap_or_else(|| "unknown".to_string()),
+                    candidate.estimated_scan_source,
                     rule.required_features().join(","),
                     rule.required_columns().join(",")
                 );
@@ -669,6 +771,7 @@ struct SqlRuleContext {
     has_projection_expression: bool,
     has_predicate_expression: bool,
     has_aggregate: bool,
+    has_aggregate_expression: bool,
     has_group_by: bool,
     has_order_by: bool,
     has_limit: bool,
@@ -676,6 +779,7 @@ struct SqlRuleContext {
     from_table_count: usize,
     lower_sql: String,
     table_paths: Vec<PathBuf>,
+    referenced_columns: Vec<String>,
 }
 
 impl SqlRuleContext {
@@ -695,7 +799,7 @@ impl SqlRuleContext {
             context.from_table_count = select.from.len();
             context.has_join = select.from.iter().any(|table| !table.joins.is_empty());
             context.has_derived_from = select.from.iter().any(table_with_derived_relation);
-            context.has_projection_expression = select_has_projection_expression(select);
+            context.has_projection_expression = select_has_projection_expression(select)?;
             context.has_predicate_expression = select
                 .selection
                 .as_ref()
@@ -705,6 +809,13 @@ impl SqlRuleContext {
                 matches!(&select.group_by, GroupByExpr::Expressions(exprs, _) if !exprs.is_empty());
             for table in &select.from {
                 collect_table_paths(table, &mut context.table_paths);
+            }
+        }
+        if let Ok(parsed_query) = parse_query(query) {
+            context.has_aggregate_expression = !parsed_query.aggregate_expressions.is_empty()
+                || !parsed_query.filtered_aggregates.is_empty();
+            if let Projection::Columns(columns) = parsed_query.projection {
+                context.referenced_columns = columns;
             }
         }
         context.has_order_by = query.order_by.is_some();
@@ -733,6 +844,7 @@ impl SqlRuleContext {
                 || lower_sql.contains("avg(")
                 || lower_sql.contains("min(")
                 || lower_sql.contains("max("),
+            has_aggregate_expression: false,
             has_group_by: lower_sql.contains(" group by "),
             has_order_by: lower_sql.contains(" order by "),
             has_limit: lower_sql.contains(" limit "),
@@ -740,6 +852,7 @@ impl SqlRuleContext {
             from_table_count: 0,
             lower_sql,
             table_paths: Vec::new(),
+            referenced_columns: Vec::new(),
         }
     }
 
@@ -764,6 +877,7 @@ impl SqlRuleContext {
             "derived-from" => self.has_derived_from,
             "multi-input" => self.from_table_count > 1 || self.has_join,
             "subquery" => self.has_subquery,
+            "aggregate-expression" => self.has_aggregate_expression,
             "projection-expression" => {
                 self.has_projection_expression || self.has_predicate_expression
             }
@@ -798,6 +912,9 @@ impl SqlRuleContext {
         if self.has_aggregate {
             features.push("aggregate");
         }
+        if self.has_aggregate_expression {
+            features.push("aggregate-expression");
+        }
         if self.has_group_by {
             features.push("group-by");
         }
@@ -815,19 +932,30 @@ impl SqlRuleContext {
     }
 }
 
-fn select_has_projection_expression(select: &Select) -> bool {
-    select.projection.iter().any(|item| match item {
+fn select_has_projection_expression(select: &Select) -> Result<bool> {
+    if select.from.len() == 1
+        && select
+            .from
+            .first()
+            .is_some_and(|table| table.joins.is_empty())
+        && let Ok(path) = parse_from(select)
+        && let Ok(group_by) = parse_group_by(select, path.alias.as_deref())
+        && let Ok(projection) = parse_projection(select, &group_by, path.alias.as_deref())
+    {
+        return Ok(projection_requires_expression_path(&projection.expressions));
+    }
+    Ok(select.projection.iter().any(|item| match item {
         SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+            if matches!(expr, SqlExpr::CompoundIdentifier(_)) {
+                return !sql_expr_is_aggregate(expr);
+            }
             !matches!(
                 expr,
-                SqlExpr::Identifier(_)
-                    | SqlExpr::CompoundIdentifier(_)
-                    | SqlExpr::Wildcard(_)
-                    | SqlExpr::QualifiedWildcard(_, _)
+                SqlExpr::Identifier(_) | SqlExpr::Wildcard(_) | SqlExpr::QualifiedWildcard(_, _)
             ) && !sql_expr_is_aggregate(expr)
         }
         _ => false,
-    })
+    }))
 }
 
 fn select_has_aggregate(select: &Select) -> bool {
@@ -875,23 +1003,47 @@ fn sql_expr_is_aggregate(expr: &SqlExpr) -> bool {
     }
 }
 
+struct SqlRuleScanEstimate {
+    bytes: u64,
+    source: &'static str,
+}
+
 async fn estimate_sql_rule_scan_bytes(
     engine: &DodamEngine,
     context: &SqlRuleContext,
     rule: SqlRule,
-) -> Option<u64> {
-    let required_columns = rule.required_columns();
-    if required_columns.is_empty() || context.table_paths.is_empty() {
+) -> Option<SqlRuleScanEstimate> {
+    let context_referenced_columns;
+    let (required_columns, scan_source) = if matches!(rule, SqlRule::ExpressionAggregate) {
+        context_referenced_columns = context
+            .referenced_columns
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        (
+            context_referenced_columns.as_slice(),
+            "expression-projection",
+        )
+    } else {
+        (rule.required_columns(), "required-columns")
+    };
+    if context.table_paths.is_empty() {
         return None;
     }
     let mut total = 0_u64;
     let mut matched = false;
+    let mut source = scan_source;
     for path in &context.table_paths {
-        let columns = required_columns_for_table(path, required_columns);
-        if columns.is_empty() {
-            continue;
-        }
-        let projection = Projection::Columns(columns);
+        let projection = if required_columns.is_empty() {
+            source = "all-columns-fallback";
+            Projection::All
+        } else {
+            let columns = required_columns_for_table(path, required_columns);
+            if columns.is_empty() {
+                continue;
+            }
+            Projection::Columns(columns)
+        };
         if let Ok(bytes) = engine
             .estimate_parquet_projection_compressed_bytes(path.clone(), &projection)
             .await
@@ -900,7 +1052,10 @@ async fn estimate_sql_rule_scan_bytes(
             matched = true;
         }
     }
-    matched.then_some(total)
+    matched.then_some(SqlRuleScanEstimate {
+        bytes: total,
+        source,
+    })
 }
 
 fn required_columns_for_table(path: &Path, required_columns: &[&str]) -> Vec<String> {
@@ -1060,6 +1215,39 @@ mod tests {
     }
 
     #[test]
+    fn public_rule_inventory_matches_registry() {
+        let inventory = sql_rule_inventory();
+        assert_eq!(inventory.len(), sql_rule_registry().len());
+        for (rank, entry) in inventory.iter().enumerate() {
+            assert_eq!(entry.cost_rank, rank as u16);
+            assert!(!entry.name.is_empty());
+            assert!(!entry.kind.is_empty());
+        }
+    }
+
+    #[test]
+    fn candidate_matrix_orders_by_estimated_cost_then_rank() {
+        let candidates = sql_rule_candidates_for_sql(
+            r#"
+SELECT f.bucket, count(*)
+FROM facts f
+JOIN dim d ON f.key = d.key
+WHERE f.value > 10
+GROUP BY f.bucket
+"#,
+        )
+        .expect("candidate matrix");
+        assert!(!candidates.is_empty());
+        for pair in candidates.windows(2) {
+            assert!(
+                (pair[0].estimated_cost, pair[0].cost_rank)
+                    <= (pair[1].estimated_cost, pair[1].cost_rank),
+                "candidate matrix should be sorted by execution priority: {candidates:?}"
+            );
+        }
+    }
+
+    #[test]
     fn specific_vector_rules_rank_before_generic_with_cte_fallback() {
         let context = SqlRuleContext::from_sql(
             r#"
@@ -1118,5 +1306,43 @@ WHERE l_shipdate >= DATE '1994-01-01'
             pricing_cost < projection_cost,
             "shape-specific vector aggregate candidates should not be hidden by generic expression fallback: vector={pricing_cost}, projection={projection_cost}"
         );
+    }
+
+    #[test]
+    fn aggregate_expression_is_registered_generic_rule_candidate() {
+        let candidates = sql_rule_candidates_for_sql(
+            r#"
+SELECT
+    sum(l_extendedprice * l_discount) AS revenue
+FROM lineitem
+WHERE l_shipdate >= DATE '1994-01-01'
+  AND l_shipdate < DATE '1995-01-01'
+  AND l_quantity < 24
+"#,
+        )
+        .expect("parse expression aggregate SQL context");
+
+        let expression_aggregate = candidates
+            .iter()
+            .find(|candidate| candidate.name == "expression-aggregate")
+            .expect("expression aggregate candidate");
+        assert_eq!(expression_aggregate.kind, "expression-aggregate");
+        assert!(
+            expression_aggregate
+                .required_features
+                .contains(&"aggregate-expression"),
+            "{expression_aggregate:?}"
+        );
+    }
+
+    #[test]
+    fn struct_field_projection_is_generic_expression_candidate() {
+        let context = SqlRuleContext::from_sql(
+            "SELECT id, attrs.rank AS rank FROM '/tmp/nested.parquet' ORDER BY id",
+        )
+        .expect("parse struct field projection SQL context");
+
+        assert!(context.has_projection_expression);
+        assert!(SqlRule::ProjectionExpression.is_candidate(&context));
     }
 }

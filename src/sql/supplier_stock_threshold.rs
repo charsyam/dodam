@@ -113,46 +113,15 @@ async fn supplier_keys_for_nations(
     batch_size: usize,
     nation_keys: &HashSet<i64>,
 ) -> Result<AdaptiveI64Set> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec!["s_suppkey".to_string(), "s_nationkey".to_string()]),
-            None,
-        )
-        .await?;
-    let mut suppliers = AdaptiveI64Set::new_dense();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let suppkeys = batch_column(&batch, "s_suppkey")?;
-        let nationkeys = batch_column(&batch, "s_nationkey")?;
-        if let (Some(suppkeys), Some(nationkeys)) = (
-            suppkeys.as_any().downcast_ref::<Int64Array>(),
-            nationkeys.as_any().downcast_ref::<Int64Array>(),
-        ) {
-            if suppkeys.null_count() == 0 && nationkeys.null_count() == 0 {
-                for (&suppkey, &nationkey) in suppkeys.values().iter().zip(nationkeys.values()) {
-                    if nation_keys.contains(&nationkey) {
-                        suppliers.insert(suppkey);
-                    }
-                }
-                continue;
-            }
-        }
-        for row in 0..batch.num_rows() {
-            let (Some(suppkey), Some(nationkey)) = (
-                numeric_i64_value(suppkeys, row)?,
-                numeric_i64_value(nationkeys, row)?,
-            ) else {
-                continue;
-            };
-            if nation_keys.contains(&nationkey) {
-                suppliers.insert(suppkey);
-            }
-        }
-    }
-    Ok(suppliers)
+    collect_i64_by_i64_set_adaptive_set(
+        engine,
+        path,
+        batch_size,
+        "s_suppkey",
+        "s_nationkey",
+        nation_keys,
+    )
+    .await
 }
 
 async fn stock_value_rows_for_suppliers(
@@ -161,13 +130,10 @@ async fn stock_value_rows_for_suppliers(
     batch_size: usize,
     supplier_keys: &AdaptiveI64Set,
 ) -> Result<Vec<SupplierStockValueRow>> {
-    if stock_value_late_materialized_enabled() {
-        if let Some(rows) =
-            stock_value_rows_for_suppliers_late(engine, path.clone(), batch_size, supplier_keys)
-                .await?
-        {
-            return Ok(rows);
-        }
+    if let Some(rows) =
+        stock_value_rows_for_suppliers_late(engine, path.clone(), batch_size, supplier_keys).await?
+    {
+        return Ok(rows);
     }
     let mut stream = engine
         .scan_parquet_batches(
@@ -340,49 +306,26 @@ fn stock_value_rows_from_dense_values(
     rows
 }
 
-fn stock_value_late_materialized_enabled() -> bool {
-    std::env::var_os("DODAM_Q11_DISABLE_LATE_MATERIALIZE").is_none()
-}
-
 fn stock_value_late_materialized_row_group_chunk() -> usize {
-    std::env::var("DODAM_Q11_LATE_ROW_GROUP_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(1)
+    late_materialization_row_group_chunk(1)
 }
 
 fn stock_value_late_materialized_max_selected_ratio() -> f64 {
-    std::env::var("DODAM_Q11_LATE_MAX_SELECTED_RATIO")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.10)
+    late_materialization_max_selected_ratio(0.10)
 }
 
 fn stock_value_late_materialized_max_selector_run_ratio() -> f64 {
-    std::env::var("DODAM_Q11_LATE_MAX_SELECTOR_RUN_RATIO")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.20)
+    late_materialization_max_selector_run_ratio(0.20)
 }
 
 fn stock_value_log_late_materialized_profile(
     metrics: LateMaterializedMetrics,
     row_group_chunk: usize,
 ) {
-    if !tpch_profile_enabled() {
-        return;
-    }
-    let ratio = if metrics.total_rows == 0 {
-        0.0
-    } else {
-        metrics.selected_rows as f64 / metrics.total_rows as f64
-    };
-    eprintln!(
-        "[dodam:tpch-profile] supplier-stock-threshold partsupp: late_materialized rows={} selected={} ratio={:.6} selector_runs={} row_group_chunk={}",
-        metrics.total_rows, metrics.selected_rows, ratio, metrics.selector_runs, row_group_chunk
+    tpch_profile_late_materialized(
+        "supplier-stock-threshold partsupp",
+        metrics,
+        row_group_chunk,
     );
 }
 

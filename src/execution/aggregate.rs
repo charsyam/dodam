@@ -4697,7 +4697,6 @@ impl<'a> CoalesceUtf8ViewInput<'a> {
             DictionaryI32View::Arrow(dictionary) if dictionary.null_count() == 0 => {
                 Some(dictionary.keys().values().as_ref())
             }
-            DictionaryI32View::Raw { keys, .. } => Some(keys),
             DictionaryI32View::Arrow(_) => None,
         }
     }

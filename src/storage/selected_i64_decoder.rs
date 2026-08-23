@@ -5,8 +5,9 @@ use parquet::column::page::Page;
 use crate::error::{DodamError, Result};
 
 use super::{
-    DirectPrimitiveColumnScanMetrics, advance_run_cursor, decode_rle_i16_values,
-    num_required_bits_i16, parse_v1_rle_level_data, runs_overlap_from,
+    DirectPrimitiveColumnScanMetrics, advance_run_cursor, count_present_def_levels,
+    decode_dictionary_indices_selected_nullable_ranges, decode_dictionary_indices_selected_ranges,
+    decode_rle_i16_values, num_required_bits_i16, parse_v1_rle_level_data, runs_overlap_from,
 };
 
 pub(super) fn read_plain_i64_selected_runs(
@@ -29,9 +30,21 @@ pub(super) fn read_plain_i64_selected_runs(
     let mut run_cursor = 0usize;
     let mut def_levels = Vec::<i16>::new();
     let mut present_prefix = Vec::<usize>::new();
+    let mut dictionary = None::<Vec<i64>>;
+    let mut dictionary_ids = Vec::<i32>::new();
     while let Some(page) = page_reader.get_next_page()? {
         match page {
-            Page::DictionaryPage { .. } => return Ok(None),
+            Page::DictionaryPage {
+                buf,
+                num_values,
+                encoding,
+                ..
+            } => {
+                if encoding != Encoding::PLAIN || dictionary.is_some() {
+                    return Ok(None);
+                }
+                dictionary = Some(decode_plain_i64_dictionary(buf, num_values as usize)?);
+            }
             Page::DataPage {
                 buf,
                 num_values,
@@ -39,7 +52,10 @@ pub(super) fn read_plain_i64_selected_runs(
                 def_level_encoding,
                 ..
             } => {
-                if encoding != Encoding::PLAIN {
+                if !matches!(
+                    encoding,
+                    Encoding::PLAIN | Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
+                ) {
                     return Ok(None);
                 }
                 let page_rows = num_values as usize;
@@ -63,28 +79,60 @@ pub(super) fn read_plain_i64_selected_runs(
                         page_rows,
                         &mut def_levels,
                     )?;
-                    copy_selected_i64_nullable_page(
-                        &buf,
-                        value_start,
-                        page_row_start,
-                        page_rows,
-                        runs,
-                        &def_levels,
-                        column_desc.max_def_level(),
-                        &mut present_prefix,
-                        output,
-                        metrics,
-                    )?;
+                    if encoding == Encoding::PLAIN {
+                        copy_selected_i64_nullable_page(
+                            &buf,
+                            value_start,
+                            page_row_start,
+                            page_rows,
+                            runs,
+                            &def_levels,
+                            column_desc.max_def_level(),
+                            &mut present_prefix,
+                            output,
+                            metrics,
+                        )?;
+                    } else {
+                        let values =
+                            count_present_def_levels(&def_levels, column_desc.max_def_level());
+                        append_dictionary_selected_i64_page(
+                            buf.slice(value_start..),
+                            values,
+                            dictionary.as_deref(),
+                            page_row_start,
+                            page_rows,
+                            runs,
+                            Some((&def_levels, column_desc.max_def_level())),
+                            &mut dictionary_ids,
+                            output,
+                            metrics,
+                        )?;
+                    }
                 } else {
-                    copy_selected_i64_required_page(
-                        &buf,
-                        value_start,
-                        page_row_start,
-                        page_rows,
-                        runs,
-                        output,
-                        metrics,
-                    )?;
+                    if encoding == Encoding::PLAIN {
+                        copy_selected_i64_required_page(
+                            &buf,
+                            value_start,
+                            page_row_start,
+                            page_rows,
+                            runs,
+                            output,
+                            metrics,
+                        )?;
+                    } else {
+                        append_dictionary_selected_i64_page(
+                            buf.slice(value_start..),
+                            page_rows,
+                            dictionary.as_deref(),
+                            page_row_start,
+                            page_rows,
+                            runs,
+                            None,
+                            &mut dictionary_ids,
+                            output,
+                            metrics,
+                        )?;
+                    }
                 }
                 page_row_start = page_row_end;
             }
@@ -97,7 +145,10 @@ pub(super) fn read_plain_i64_selected_runs(
                 rep_levels_byte_len,
                 ..
             } => {
-                if encoding != Encoding::PLAIN {
+                if !matches!(
+                    encoding,
+                    Encoding::PLAIN | Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
+                ) {
                     return Ok(None);
                 }
                 let page_rows = num_values as usize;
@@ -113,15 +164,30 @@ pub(super) fn read_plain_i64_selected_runs(
                 }
                 if column_desc.max_def_level() > 0 {
                     if num_nulls == 0 {
-                        copy_selected_i64_required_page(
-                            &buf,
-                            value_start,
-                            page_row_start,
-                            page_rows,
-                            runs,
-                            output,
-                            metrics,
-                        )?;
+                        if encoding == Encoding::PLAIN {
+                            copy_selected_i64_required_page(
+                                &buf,
+                                value_start,
+                                page_row_start,
+                                page_rows,
+                                runs,
+                                output,
+                                metrics,
+                            )?;
+                        } else {
+                            append_dictionary_selected_i64_page(
+                                buf.slice(value_start..),
+                                page_rows,
+                                dictionary.as_deref(),
+                                page_row_start,
+                                page_rows,
+                                runs,
+                                None,
+                                &mut dictionary_ids,
+                                output,
+                                metrics,
+                            )?;
+                        }
                     } else {
                         let def_start = rep_levels_byte_len as usize;
                         let def_end = def_start + def_levels_byte_len as usize;
@@ -135,29 +201,61 @@ pub(super) fn read_plain_i64_selected_runs(
                             page_rows,
                             &mut def_levels,
                         )?;
-                        copy_selected_i64_nullable_page(
+                        if encoding == Encoding::PLAIN {
+                            copy_selected_i64_nullable_page(
+                                &buf,
+                                value_start,
+                                page_row_start,
+                                page_rows,
+                                runs,
+                                &def_levels,
+                                column_desc.max_def_level(),
+                                &mut present_prefix,
+                                output,
+                                metrics,
+                            )?;
+                        } else {
+                            let values =
+                                count_present_def_levels(&def_levels, column_desc.max_def_level());
+                            append_dictionary_selected_i64_page(
+                                buf.slice(value_start..),
+                                values,
+                                dictionary.as_deref(),
+                                page_row_start,
+                                page_rows,
+                                runs,
+                                Some((&def_levels, column_desc.max_def_level())),
+                                &mut dictionary_ids,
+                                output,
+                                metrics,
+                            )?;
+                        }
+                    }
+                } else {
+                    if encoding == Encoding::PLAIN {
+                        copy_selected_i64_required_page(
                             &buf,
                             value_start,
                             page_row_start,
                             page_rows,
                             runs,
-                            &def_levels,
-                            column_desc.max_def_level(),
-                            &mut present_prefix,
+                            output,
+                            metrics,
+                        )?;
+                    } else {
+                        append_dictionary_selected_i64_page(
+                            buf.slice(value_start..),
+                            page_rows,
+                            dictionary.as_deref(),
+                            page_row_start,
+                            page_rows,
+                            runs,
+                            None,
+                            &mut dictionary_ids,
                             output,
                             metrics,
                         )?;
                     }
-                } else {
-                    copy_selected_i64_required_page(
-                        &buf,
-                        value_start,
-                        page_row_start,
-                        page_rows,
-                        runs,
-                        output,
-                        metrics,
-                    )?;
                 }
                 page_row_start = page_row_end;
             }
@@ -167,6 +265,80 @@ pub(super) fn read_plain_i64_selected_runs(
         return Ok(None);
     }
     Ok(Some(()))
+}
+
+fn decode_plain_i64_dictionary(buf: Bytes, num_values: usize) -> Result<Vec<i64>> {
+    let bytes = num_values.saturating_mul(std::mem::size_of::<i64>());
+    if bytes > buf.len() {
+        return Ok(Vec::new());
+    }
+    let mut values = Vec::with_capacity(num_values);
+    for chunk in buf[..bytes].chunks_exact(8) {
+        values.push(i64::from_le_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ]));
+    }
+    Ok(values)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_dictionary_selected_i64_page(
+    data: Bytes,
+    values: usize,
+    dictionary: Option<&[i64]>,
+    page_row_start: usize,
+    page_rows: usize,
+    runs: &[(usize, usize)],
+    nullable: Option<(&[i16], i16)>,
+    ids: &mut Vec<i32>,
+    output: &mut Vec<i64>,
+    metrics: &mut DirectPrimitiveColumnScanMetrics,
+) -> Result<()> {
+    let Some(dictionary) = dictionary else {
+        return Err(DodamError::UnsupportedSql(
+            "dictionary selected i64 page missing dictionary".to_string(),
+        ));
+    };
+    ids.clear();
+    if let Some((def_levels, max_def_level)) = nullable {
+        decode_dictionary_indices_selected_nullable_ranges(
+            data,
+            values,
+            dictionary.len(),
+            runs,
+            page_row_start,
+            page_rows,
+            def_levels,
+            max_def_level,
+            ids,
+        )?;
+    } else {
+        decode_dictionary_indices_selected_ranges(
+            data,
+            values,
+            dictionary.len(),
+            runs,
+            page_row_start,
+            page_rows,
+            ids,
+        )?;
+    }
+    metrics.add_selected_read(ids.len());
+    output.reserve(ids.len());
+    for id in ids.iter().copied() {
+        let Ok(index) = usize::try_from(id) else {
+            return Err(DodamError::UnsupportedSql(
+                "selected nullable dictionary i64 contains null".to_string(),
+            ));
+        };
+        let Some(value) = dictionary.get(index) else {
+            return Err(DodamError::UnsupportedSql(
+                "selected dictionary i64 id out of range".to_string(),
+            ));
+        };
+        output.push(*value);
+    }
+    Ok(())
 }
 
 pub(super) fn read_plain_i64_selected_runs_sink<F>(

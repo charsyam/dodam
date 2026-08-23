@@ -215,37 +215,16 @@ async fn customer_nations_in_region(
     batch_size: usize,
     nation_names: &HashMap<i64, String>,
 ) -> Result<FastHashMap<i64, i64>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec!["c_custkey".to_string(), "c_nationkey".to_string()]),
-            None,
-        )
-        .await?;
     let nation_keys = AdaptiveI64Set::from_hash(nation_names.keys().copied().collect());
-    let mut customers = fast_hash_map::<i64, i64>();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let custkeys = batch_column(&batch, "c_custkey")?;
-        let nationkeys = batch_column(&batch, "c_nationkey")?;
-        if key_nation_map_batch_typed(custkeys, nationkeys, &nation_keys, &mut customers) {
-            continue;
-        }
-        for row in 0..batch.num_rows() {
-            let (Some(custkey), Some(nationkey)) = (
-                numeric_i64_value(custkeys, row)?,
-                numeric_i64_value(nationkeys, row)?,
-            ) else {
-                continue;
-            };
-            if nation_keys.contains(nationkey) {
-                customers.insert(custkey, nationkey);
-            }
-        }
-    }
-    Ok(customers)
+    collect_i64_by_i64_set_hash_map(
+        engine,
+        path,
+        batch_size,
+        "c_custkey",
+        "c_nationkey",
+        &nation_keys,
+    )
+    .await
 }
 
 async fn supplier_nations_in_region(
@@ -254,86 +233,16 @@ async fn supplier_nations_in_region(
     batch_size: usize,
     nation_names: &HashMap<i64, String>,
 ) -> Result<FastHashMap<i64, i64>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec!["s_suppkey".to_string(), "s_nationkey".to_string()]),
-            None,
-        )
-        .await?;
     let nation_keys = AdaptiveI64Set::from_hash(nation_names.keys().copied().collect());
-    let mut suppliers = fast_hash_map::<i64, i64>();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let suppkeys = batch_column(&batch, "s_suppkey")?;
-        let nationkeys = batch_column(&batch, "s_nationkey")?;
-        if key_nation_map_batch_typed(suppkeys, nationkeys, &nation_keys, &mut suppliers) {
-            continue;
-        }
-        for row in 0..batch.num_rows() {
-            let (Some(suppkey), Some(nationkey)) = (
-                numeric_i64_value(suppkeys, row)?,
-                numeric_i64_value(nationkeys, row)?,
-            ) else {
-                continue;
-            };
-            if nation_keys.contains(nationkey) {
-                suppliers.insert(suppkey, nationkey);
-            }
-        }
-    }
-    Ok(suppliers)
-}
-
-fn key_nation_map_batch_typed(
-    keys: &ArrayRef,
-    nationkeys: &ArrayRef,
-    nation_filter: &AdaptiveI64Set,
-    output: &mut FastHashMap<i64, i64>,
-) -> bool {
-    let (Some(keys), Some(nationkeys)) = (
-        keys.as_any().downcast_ref::<Int64Array>(),
-        nationkeys.as_any().downcast_ref::<Int64Array>(),
-    ) else {
-        return false;
-    };
-    if keys.null_count() == 0 && nationkeys.null_count() == 0 {
-        let key_values = keys.values().as_ref();
-        let nation_values = nationkeys.values().as_ref();
-        if let Some(nation_contains) = nation_filter.dense_contains_slice() {
-            for row in 0..key_values.len() {
-                let nationkey = nation_values[row];
-                if usize::try_from(nationkey)
-                    .ok()
-                    .and_then(|index| nation_contains.get(index))
-                    .copied()
-                    .unwrap_or(false)
-                {
-                    output.insert(key_values[row], nationkey);
-                }
-            }
-            return true;
-        }
-        for row in 0..key_values.len() {
-            let nationkey = nation_values[row];
-            if nation_filter.contains(nationkey) {
-                output.insert(key_values[row], nationkey);
-            }
-        }
-        return true;
-    }
-    for row in 0..keys.len() {
-        if keys.is_null(row) || nationkeys.is_null(row) {
-            continue;
-        }
-        let nationkey = nationkeys.value(row);
-        if nation_filter.contains(nationkey) {
-            output.insert(keys.value(row), nationkey);
-        }
-    }
-    true
+    collect_i64_by_i64_set_hash_map(
+        engine,
+        path,
+        batch_size,
+        "s_suppkey",
+        "s_nationkey",
+        &nation_keys,
+    )
+    .await
 }
 
 async fn order_customer_nations(
@@ -358,62 +267,24 @@ async fn order_customer_nations(
         )
         .await?;
     let customer_nations = Arc::new(AdaptiveI64Map::from_hash(customer_nations.clone()));
-    parallel_batch_fold_view_chunks(
+    let orders = parallel_batch_collect_pairs_view_chunks(
         &mut stream,
         4,
-        || fast_hash_map::<i64, i64>(),
         move |view, orders| {
-            merge_maps(
-                orders,
-                order_customer_nations_view(view, &customer_nations, start_days, end_days)?,
-            );
+            orders.extend(order_customer_nations_view(
+                view,
+                &customer_nations,
+                start_days,
+                end_days,
+            )?);
             Ok(Some(()))
         },
-        Ok,
-        fast_hash_map::<i64, i64>(),
-        merge_maps,
         "regional order customer nations",
-    )
-}
-
-fn order_customer_nations_batch(
-    batch: RecordBatch,
-    customer_nations: &AdaptiveI64Map<i64>,
-    start_days: i32,
-    end_days: i32,
-) -> Result<FastHashMap<i64, i64>> {
-    let orderkeys = batch_column(&batch, "o_orderkey")?;
-    let custkeys = batch_column(&batch, "o_custkey")?;
-    let orderdates = batch_column(&batch, "o_orderdate")?;
-    if let Some(orders) = order_customer_nations_batch_typed(
-        orderkeys,
-        custkeys,
-        orderdates,
-        customer_nations,
-        start_days,
-        end_days,
-    ) {
-        return Ok(orders);
-    }
-    let mut orders = fast_hash_map::<i64, i64>();
-    for row in 0..batch.num_rows() {
-        let Some(orderdate) = date32_value(orderdates, row)? else {
-            continue;
-        };
-        if orderdate < start_days || orderdate >= end_days {
-            continue;
-        }
-        let (Some(orderkey), Some(custkey)) = (
-            numeric_i64_value(orderkeys, row)?,
-            numeric_i64_value(custkeys, row)?,
-        ) else {
-            continue;
-        };
-        if let Some(nationkey) = customer_nations.get(custkey) {
-            orders.insert(orderkey, nationkey);
-        }
-    }
-    Ok(orders)
+    )?;
+    Ok(fast_hash_map_from_pairs_profiled(
+        orders,
+        "regional order customer nations build",
+    ))
 }
 
 fn order_customer_nations_view(
@@ -421,127 +292,18 @@ fn order_customer_nations_view(
     customer_nations: &AdaptiveI64Map<i64>,
     start_days: i32,
     end_days: i32,
-) -> Result<FastHashMap<i64, i64>> {
-    if view.num_columns() == 3
-        && let (Some(orderkeys), Some(custkeys), Some(orderdates)) = (
-            view.i64_vector(0),
-            view.i64_vector(1),
-            view.date32_vector(2),
-        )
-    {
-        return Ok(order_customer_nations_vectors(
-            orderkeys,
-            custkeys,
-            orderdates,
-            customer_nations,
-            start_days,
-            end_days,
-        ));
-    }
-    let Some(batch) = view.try_record_batch() else {
-        return Err(DodamError::UnsupportedSql(
-            "regional order customer nation raw vector columns have unsupported types".to_string(),
-        ));
-    };
-    order_customer_nations_batch(batch.clone(), customer_nations, start_days, end_days)
-}
-
-fn order_customer_nations_vectors(
-    orderkeys: I64VectorView<'_>,
-    custkeys: I64VectorView<'_>,
-    orderdates: Date32VectorView<'_>,
-    customer_nations: &AdaptiveI64Map<i64>,
-    start_days: i32,
-    end_days: i32,
-) -> FastHashMap<i64, i64> {
-    let mut orders = fast_hash_map::<i64, i64>();
-    if let (Some(orderkey_values), Some(custkey_values), Some(orderdate_values)) = (
-        orderkeys.values_if_null_free(),
-        custkeys.values_if_null_free(),
-        orderdates.values_if_null_free(),
-    ) {
-        if let Some((nation_values, nation_present)) = customer_nations.dense_slices() {
-            for row in 0..orderkey_values.len() {
-                let orderdate = orderdate_values[row];
-                if orderdate < start_days || orderdate >= end_days {
-                    continue;
-                }
-                let Ok(custkey) = usize::try_from(custkey_values[row]) else {
-                    continue;
-                };
-                if nation_present.get(custkey).copied().unwrap_or(false) {
-                    orders.insert(orderkey_values[row], nation_values[custkey]);
-                }
-            }
-            return orders;
-        }
-        for row in 0..orderkey_values.len() {
-            let orderdate = orderdate_values[row];
+) -> Result<Vec<(i64, i64)>> {
+    let dense_nations = customer_nations.dense_word_slices();
+    collect_i64_i64_date32_pairs_view(
+        view,
+        "regional order customer nation raw vector columns have unsupported types",
+        |_, custkey, orderdate| {
             if orderdate < start_days || orderdate >= end_days {
-                continue;
+                return Ok(None);
             }
-            if let Some(nationkey) = customer_nations.get(custkey_values[row]) {
-                orders.insert(orderkey_values[row], nationkey);
-            }
-        }
-        return orders;
-    }
-    for row in 0..orderkeys.len() {
-        if orderkeys.is_null(row) || custkeys.is_null(row) || orderdates.is_null(row) {
-            continue;
-        }
-        let orderdate = orderdates.value(row);
-        if orderdate < start_days || orderdate >= end_days {
-            continue;
-        }
-        if let Some(nationkey) = customer_nations.get(custkeys.value(row)) {
-            orders.insert(orderkeys.value(row), nationkey);
-        }
-    }
-    orders
-}
-
-fn order_customer_nations_batch_typed(
-    orderkeys: &ArrayRef,
-    custkeys: &ArrayRef,
-    orderdates: &ArrayRef,
-    customer_nations: &AdaptiveI64Map<i64>,
-    start_days: i32,
-    end_days: i32,
-) -> Option<FastHashMap<i64, i64>> {
-    let (Some(orderkeys), Some(custkeys), Some(orderdates)) = (
-        orderkeys.as_any().downcast_ref::<Int64Array>(),
-        custkeys.as_any().downcast_ref::<Int64Array>(),
-        orderdates.as_any().downcast_ref::<Date32Array>(),
-    ) else {
-        return None;
-    };
-    let mut orders = fast_hash_map::<i64, i64>();
-    if orderkeys.null_count() == 0 && custkeys.null_count() == 0 && orderdates.null_count() == 0 {
-        for row in 0..orderkeys.len() {
-            let orderdate = orderdates.value(row);
-            if orderdate < start_days || orderdate >= end_days {
-                continue;
-            }
-            if let Some(nationkey) = customer_nations.get(custkeys.value(row)) {
-                orders.insert(orderkeys.value(row), nationkey);
-            }
-        }
-        return Some(orders);
-    }
-    for row in 0..orderkeys.len() {
-        if orderkeys.is_null(row) || custkeys.is_null(row) || orderdates.is_null(row) {
-            continue;
-        }
-        let orderdate = orderdates.value(row);
-        if orderdate < start_days || orderdate >= end_days {
-            continue;
-        }
-        if let Some(nationkey) = customer_nations.get(custkeys.value(row)) {
-            orders.insert(orderkeys.value(row), nationkey);
-        }
-    }
-    Some(orders)
+            Ok(customer_nations.get_cached_words(dense_nations, custkey))
+        },
+    )
 }
 
 struct RegionalSupplierRevenueRow {
@@ -563,16 +325,28 @@ async fn revenue_by_nation(
         "l_extendedprice".to_string(),
         "l_discount".to_string(),
     ]);
-    let pruning_predicates = if let Some((min_key, max_key)) =
-        selective_i64_key_range(order_customer_nations.keys().copied())
-    {
+    let pruning_predicates = if let (Some(min_key), Some(max_key)) = (
+        order_customer_nations.keys().copied().min(),
+        order_customer_nations.keys().copied().max(),
+    ) {
         i64_range_pruning_predicates("l_orderkey", min_key, max_key)
     } else {
         Vec::new()
     };
     let order_customer_nations = Arc::new(order_customer_nations.clone());
     let supplier_nations = Arc::new(AdaptiveI64Map::from_hash(supplier_nations.clone()));
-    let groups = if regional_revenue_row_group_map_enabled() {
+    let groups = if let Some(groups) = revenue_by_nation_late_materialized(
+        engine,
+        path.clone(),
+        batch_size,
+        pruning_predicates.clone(),
+        order_customer_nations.clone(),
+        supplier_nations.clone(),
+    )
+    .await?
+    {
+        groups
+    } else {
         let order_customer_nations_for_scan = order_customer_nations.clone();
         let supplier_nations_for_scan = supplier_nations.clone();
         if let Some(partials) = engine
@@ -615,17 +389,6 @@ async fn revenue_by_nation(
             )
             .await?
         }
-    } else {
-        revenue_by_nation_stream(
-            engine,
-            path,
-            batch_size,
-            projection,
-            pruning_predicates,
-            order_customer_nations,
-            supplier_nations,
-        )
-        .await?
     };
     let mut rows = groups
         .into_iter()
@@ -647,6 +410,342 @@ async fn revenue_by_nation(
     Ok(rows)
 }
 
+async fn revenue_by_nation_late_materialized(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    pruning_predicates: Vec<Expr>,
+    order_customer_nations: Arc<FastHashMap<i64, i64>>,
+    supplier_nations: Arc<AdaptiveI64Map<i64>>,
+) -> Result<Option<FastHashMap<i64, f64>>> {
+    let predicate_projection =
+        Projection::Columns(vec!["l_orderkey".to_string(), "l_suppkey".to_string()]);
+    let payload_projection = Projection::Columns(vec![
+        "l_extendedprice".to_string(),
+        "l_discount".to_string(),
+    ]);
+    let policy = generic_late_materialization_policy_for_projection(
+        &predicate_projection,
+        &payload_projection,
+        0.35,
+        Some(0.60),
+    );
+    let Some(chunks) = engine
+        .late_materialized_parquet_map_pruned_with_policy_view(
+            path,
+            batch_size,
+            predicate_projection,
+            payload_projection,
+            pruning_predicates,
+            regional_revenue_late_materialized_row_group_chunk(),
+            policy,
+            {
+                let order_customer_nations = order_customer_nations.clone();
+                let supplier_nations = supplier_nations.clone();
+                move || RegionalRevenueLateState {
+                    order_customer_nations: order_customer_nations.clone(),
+                    supplier_nations: supplier_nations.clone(),
+                    selected_nations: Vec::new(),
+                    selected_offsets: Vec::new(),
+                    payload_offset: 0,
+                    groups: fast_hash_map(),
+                }
+            },
+            regional_revenue_late_build_selection_view,
+            regional_revenue_late_consume_payload_view,
+            |state, metrics| {
+                if state.payload_offset != state.selected_nations.len() {
+                    return Err(DodamError::UnsupportedSql(
+                        "regional revenue late payload row mismatch".to_string(),
+                    ));
+                }
+                Ok(Some((state.groups, metrics)))
+            },
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let mut groups = fast_hash_map::<i64, f64>();
+    let mut metrics = LateMaterializedMetrics::default();
+    for chunk in chunks {
+        let (chunk_groups, chunk_metrics) = chunk.output;
+        metrics.add(chunk_metrics);
+        merge_f64_groups(&mut groups, chunk_groups);
+    }
+    regional_revenue_log_late_materialized_profile(
+        metrics,
+        regional_revenue_late_materialized_row_group_chunk(),
+    );
+    Ok(Some(groups))
+}
+
+fn regional_revenue_late_materialized_row_group_chunk() -> usize {
+    late_materialization_row_group_chunk(16)
+}
+
+struct RegionalRevenueLateState {
+    order_customer_nations: Arc<FastHashMap<i64, i64>>,
+    supplier_nations: Arc<AdaptiveI64Map<i64>>,
+    selected_nations: Vec<Option<i64>>,
+    selected_offsets: Vec<u32>,
+    payload_offset: usize,
+    groups: FastHashMap<i64, f64>,
+}
+
+fn regional_revenue_late_build_selection_view(
+    view: BatchView<'_>,
+    selection: &mut LateSelectionBuilder,
+    state: &mut RegionalRevenueLateState,
+) -> Result<Option<()>> {
+    if view.num_columns() == 2
+        && let (Some(orderkeys), Some(suppkeys)) = (view.i64_vector(0), view.i64_vector(1))
+    {
+        if let (Some(orderkey_values), Some(suppkey_values)) = (
+            orderkeys.values_if_null_free(),
+            suppkeys.values_if_null_free(),
+        ) {
+            regional_revenue_push_late_selection_slices(
+                selection,
+                orderkey_values,
+                suppkey_values,
+                state,
+            );
+            return Ok(Some(()));
+        }
+        for row in 0..orderkeys.len() {
+            let selected = if orderkeys.is_null(row) || suppkeys.is_null(row) {
+                None
+            } else {
+                regional_revenue_late_selected_nation(
+                    orderkeys.value(row),
+                    suppkeys.value(row),
+                    state,
+                )
+            };
+            if let Some(nation) = selected {
+                selection.push(true);
+                state.selected_nations.push(Some(nation));
+            } else {
+                selection.push(false);
+            }
+        }
+        return Ok(Some(()));
+    }
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    regional_revenue_late_build_selection_batch(batch.clone(), selection, state)
+}
+
+fn regional_revenue_late_build_selection_batch(
+    batch: RecordBatch,
+    selection: &mut LateSelectionBuilder,
+    state: &mut RegionalRevenueLateState,
+) -> Result<Option<()>> {
+    let orderkeys = batch_column(&batch, "l_orderkey")?;
+    let suppkeys = batch_column(&batch, "l_suppkey")?;
+    if let (Some(orderkeys), Some(suppkeys)) = (
+        orderkeys.as_any().downcast_ref::<Int64Array>(),
+        suppkeys.as_any().downcast_ref::<Int64Array>(),
+    ) && orderkeys.null_count() == 0
+        && suppkeys.null_count() == 0
+    {
+        let orderkey_values = orderkeys.values().as_ref();
+        let suppkey_values = suppkeys.values().as_ref();
+        regional_revenue_push_late_selection_slices(
+            selection,
+            orderkey_values,
+            suppkey_values,
+            state,
+        );
+        return Ok(Some(()));
+    }
+    for row in 0..batch.num_rows() {
+        let selected = match (
+            numeric_i64_value(orderkeys, row)?,
+            numeric_i64_value(suppkeys, row)?,
+        ) {
+            (Some(orderkey), Some(suppkey)) => {
+                regional_revenue_late_selected_nation(orderkey, suppkey, state)
+            }
+            _ => None,
+        };
+        if let Some(nation) = selected {
+            selection.push(true);
+            state.selected_nations.push(Some(nation));
+        } else {
+            selection.push(false);
+        }
+    }
+    Ok(Some(()))
+}
+
+fn regional_revenue_late_selected_nation(
+    orderkey: i64,
+    suppkey: i64,
+    state: &RegionalRevenueLateState,
+) -> Option<i64> {
+    let supplier_nation = state.supplier_nations.get(suppkey)?;
+    let nation = *state.order_customer_nations.get(&orderkey)?;
+    (nation == supplier_nation).then_some(nation)
+}
+
+fn regional_revenue_late_selected_nation_cached(
+    orderkey: i64,
+    suppkey: i64,
+    state: &RegionalRevenueLateState,
+    supplier_words: Option<(&[i64], &[u64])>,
+) -> Option<i64> {
+    let supplier_nation = state
+        .supplier_nations
+        .get_cached_words(supplier_words, suppkey)?;
+    let nation = *state.order_customer_nations.get(&orderkey)?;
+    (nation == supplier_nation).then_some(nation)
+}
+
+fn regional_revenue_push_late_selection_slices(
+    selection: &mut LateSelectionBuilder,
+    orderkeys: &[i64],
+    suppkeys: &[i64],
+    state: &mut RegionalRevenueLateState,
+) {
+    state.selected_offsets.clear();
+    state.selected_offsets.reserve(orderkeys.len().min(1024));
+    let supplier_words = state.supplier_nations.dense_word_slices();
+    let max_gap = late_materialization_coalesce_max_gap(8);
+    for row in 0..orderkeys.len() {
+        if regional_revenue_late_selected_nation_cached(
+            orderkeys[row],
+            suppkeys[row],
+            state,
+            supplier_words,
+        )
+        .is_some()
+        {
+            state.selected_offsets.push(row as u32);
+        }
+    }
+    let order_customer_nations = state.order_customer_nations.clone();
+    let supplier_nations = state.supplier_nations.clone();
+    selection.push_selected_u32_offsets_coalesced(
+        orderkeys.len(),
+        &state.selected_offsets,
+        max_gap,
+        |row| {
+            let nation = row.and_then(|row| {
+                let supplier_nation = supplier_nations.get(suppkeys[row])?;
+                let nation = *order_customer_nations.get(&orderkeys[row])?;
+                (nation == supplier_nation).then_some(nation)
+            });
+            state.selected_nations.push(nation);
+        },
+    );
+}
+
+fn regional_revenue_late_consume_payload_view(
+    view: BatchView<'_>,
+    state: &mut RegionalRevenueLateState,
+) -> Result<Option<()>> {
+    if view.num_columns() == 2
+        && let (Some(extendedprices), Some(discounts)) =
+            (view.decimal128_vector(0), view.decimal128_vector(1))
+    {
+        regional_revenue_late_consume_payload_vector(
+            extendedprices,
+            discounts,
+            view.num_rows(),
+            state,
+        )?;
+        return Ok(Some(()));
+    }
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    regional_revenue_late_consume_payload_batch(batch.clone(), state)
+}
+
+fn regional_revenue_late_consume_payload_batch(
+    batch: RecordBatch,
+    state: &mut RegionalRevenueLateState,
+) -> Result<Option<()>> {
+    let extendedprices = batch_column(&batch, "l_extendedprice")?;
+    let discounts = batch_column(&batch, "l_discount")?;
+    if let (Some(extendedprices), Some(discounts)) =
+        (decimal_input(extendedprices)?, decimal_input(discounts)?)
+    {
+        regional_revenue_late_consume_payload_vector(
+            Decimal128VectorView::Arrow {
+                values: extendedprices.values,
+                precision: extendedprices.precision,
+                scale: extendedprices.scale,
+            },
+            Decimal128VectorView::Arrow {
+                values: discounts.values,
+                precision: discounts.precision,
+                scale: discounts.scale,
+            },
+            batch.num_rows(),
+            state,
+        )?;
+        return Ok(Some(()));
+    }
+    for row in 0..batch.num_rows() {
+        let Some(nation) = state.selected_nations.get(state.payload_offset).copied() else {
+            return Err(DodamError::UnsupportedSql(
+                "regional revenue late payload row overflow".to_string(),
+            ));
+        };
+        state.payload_offset += 1;
+        let Some(nation) = nation else {
+            continue;
+        };
+        let (Some(extendedprice), Some(discount)) = (
+            numeric_f64_value(extendedprices, row)?,
+            numeric_f64_value(discounts, row)?,
+        ) else {
+            continue;
+        };
+        *state.groups.entry(nation).or_insert(0.0) += extendedprice * (1.0 - discount);
+    }
+    Ok(Some(()))
+}
+
+fn regional_revenue_late_consume_payload_vector(
+    extendedprices: Decimal128VectorView<'_>,
+    discounts: Decimal128VectorView<'_>,
+    row_count: usize,
+    state: &mut RegionalRevenueLateState,
+) -> Result<()> {
+    consume_discounted_revenue_decimal128_vectors(
+        extendedprices,
+        discounts,
+        row_count,
+        |_, revenue| {
+            let Some(nation) = state.selected_nations.get(state.payload_offset).copied() else {
+                return Err(DodamError::UnsupportedSql(
+                    "regional revenue late payload row overflow".to_string(),
+                ));
+            };
+            state.payload_offset += 1;
+            let Some(nation) = nation else {
+                return Ok(());
+            };
+            if let Some(revenue) = revenue {
+                *state.groups.entry(nation).or_insert(0.0) += revenue;
+            }
+            Ok(())
+        },
+    )
+}
+
+fn regional_revenue_log_late_materialized_profile(
+    metrics: LateMaterializedMetrics,
+    row_group_chunk: usize,
+) {
+    tpch_profile_late_materialized("regional revenue", metrics, row_group_chunk);
+}
+
 async fn revenue_by_nation_stream(
     engine: &DodamEngine,
     path: PathBuf,
@@ -656,7 +755,7 @@ async fn revenue_by_nation_stream(
     order_customer_nations: Arc<FastHashMap<i64, i64>>,
     supplier_nations: Arc<AdaptiveI64Map<i64>>,
 ) -> Result<FastHashMap<i64, f64>> {
-    let mut stream = if pruning_predicates.is_empty() {
+    let stream = if pruning_predicates.is_empty() {
         engine
             .scan_parquet_batches(path, batch_size, None, projection, None)
             .await?
@@ -665,6 +764,20 @@ async fn revenue_by_nation_stream(
             .scan_parquet_batches_pruned(path, batch_size, projection, pruning_predicates)
             .await?
     };
+    revenue_by_nation_stream_from_batches(
+        stream,
+        order_customer_nations,
+        supplier_nations,
+        "regional revenue aggregate",
+    )
+}
+
+fn revenue_by_nation_stream_from_batches(
+    mut stream: SendableBatchStream,
+    order_customer_nations: Arc<FastHashMap<i64, i64>>,
+    supplier_nations: Arc<AdaptiveI64Map<i64>>,
+    label: &str,
+) -> Result<FastHashMap<i64, f64>> {
     parallel_batch_fold_view_chunks(
         &mut stream,
         join_aggregate_chunk_size(),
@@ -679,20 +792,12 @@ async fn revenue_by_nation_stream(
         Ok,
         fast_hash_map::<i64, f64>(),
         merge_f64_groups,
-        "regional revenue aggregate",
+        label,
     )
 }
 
-fn regional_revenue_row_group_map_enabled() -> bool {
-    std::env::var_os("DODAM_Q05_DISABLE_ROW_GROUP_MAP").is_none()
-}
-
 fn regional_revenue_row_group_map_chunk() -> usize {
-    std::env::var("DODAM_Q05_ROW_GROUP_MAP_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(2)
+    generic_row_group_map_chunk_size(2)
 }
 
 fn revenue_by_nation_batch(
@@ -722,10 +827,10 @@ fn revenue_by_nation_batch(
         ) else {
             continue;
         };
-        let (Some(customer_nation), Some(supplier_nation)) = (
-            order_customer_nations.get(&orderkey).copied(),
-            supplier_nations.get(suppkey),
-        ) else {
+        let Some(supplier_nation) = supplier_nations.get(suppkey) else {
+            continue;
+        };
+        let Some(customer_nation) = order_customer_nations.get(&orderkey).copied() else {
             continue;
         };
         if customer_nation != supplier_nation {
@@ -742,27 +847,6 @@ fn revenue_by_nation_batch(
     Ok(groups)
 }
 
-#[allow(dead_code)]
-fn revenue_by_nation_projected_batch(
-    batch: RecordBatch,
-    order_customer_nations: &FastHashMap<i64, i64>,
-    supplier_nations: &AdaptiveI64Map<i64>,
-) -> Result<FastHashMap<i64, f64>> {
-    if batch.num_columns() == 4
-        && let Some(groups) = revenue_by_nation_typed(
-            batch.column(0),
-            batch.column(1),
-            batch.column(2),
-            batch.column(3),
-            order_customer_nations,
-            supplier_nations,
-        )?
-    {
-        return Ok(groups);
-    }
-    revenue_by_nation_batch(batch, order_customer_nations, supplier_nations)
-}
-
 fn revenue_by_nation_projected_view(
     view: BatchView<'_>,
     order_customer_nations: &FastHashMap<i64, i64>,
@@ -776,14 +860,14 @@ fn revenue_by_nation_projected_view(
             view.decimal128_vector(3),
         )
     {
-        return Ok(revenue_by_nation_vector(
+        return revenue_by_nation_vector(
             orderkeys,
             suppkeys,
             extendedprices,
             discounts,
             order_customer_nations,
             supplier_nations,
-        ));
+        );
     }
     let Some(batch) = view.try_record_batch() else {
         return Err(DodamError::UnsupportedSql(
@@ -800,87 +884,112 @@ fn revenue_by_nation_vector(
     discounts: Decimal128VectorView<'_>,
     order_customer_nations: &FastHashMap<i64, i64>,
     supplier_nations: &AdaptiveI64Map<i64>,
-) -> FastHashMap<i64, f64> {
+) -> Result<FastHashMap<i64, f64>> {
     let mut groups = fast_hash_map::<i64, f64>();
+    revenue_by_nation_vector_into(
+        orderkeys,
+        suppkeys,
+        extendedprices,
+        discounts,
+        order_customer_nations,
+        supplier_nations,
+        &mut groups,
+    )?;
+    Ok(groups)
+}
+
+fn revenue_by_nation_vector_into(
+    orderkeys: I64VectorView<'_>,
+    suppkeys: I64VectorView<'_>,
+    extendedprices: Decimal128VectorView<'_>,
+    discounts: Decimal128VectorView<'_>,
+    order_customer_nations: &FastHashMap<i64, i64>,
+    supplier_nations: &AdaptiveI64Map<i64>,
+    groups: &mut FastHashMap<i64, f64>,
+) -> Result<()> {
     if let (Some(orderkey_values), Some(suppkey_values)) = (
         orderkeys.values_if_null_free(),
         suppkeys.values_if_null_free(),
-    ) && extendedprices.null_count() == 0
-        && discounts.null_count() == 0
-    {
-        let extendedprice_values = extendedprices.raw_values();
-        let discount_values = discounts.raw_values();
-        let discount_scale = discounts.scale();
-        let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
+    ) {
         if let Some((supplier_nation_values, supplier_nation_present)) =
             supplier_nations.dense_slices()
         {
-            for row in 0..orderkey_values.len() {
-                let orderkey = orderkey_values[row];
-                let Some(customer_nation) = order_customer_nations.get(&orderkey).copied() else {
-                    continue;
+            consume_filtered_discounted_revenue_decimal128_vectors_with_payload(
+                extendedprices,
+                discounts,
+                orderkey_values.len(),
+                |row| {
+                    let Ok(suppkey) = usize::try_from(suppkey_values[row]) else {
+                        return Ok(None);
+                    };
+                    if supplier_nation_present
+                        .get(suppkey)
+                        .copied()
+                        .unwrap_or(false)
+                        && let Some(nation) =
+                            order_customer_nations.get(&orderkey_values[row]).copied()
+                        && supplier_nation_values[suppkey] == nation
+                    {
+                        return Ok(Some(nation));
+                    }
+                    Ok(None)
+                },
+                |_, nation, revenue| {
+                    *groups.entry(nation).or_insert(0.0) += revenue;
+                    Ok(())
+                },
+            )?;
+            return Ok(());
+        }
+        consume_filtered_discounted_revenue_decimal128_vectors_with_payload(
+            extendedprices,
+            discounts,
+            orderkey_values.len(),
+            |row| {
+                let Some(supplier_nation) = supplier_nations.get(suppkey_values[row]) else {
+                    return Ok(None);
                 };
-                let Ok(suppkey) = usize::try_from(suppkey_values[row]) else {
-                    continue;
+                let Some(nation) = order_customer_nations.get(&orderkey_values[row]).copied()
+                else {
+                    return Ok(None);
                 };
-                if supplier_nation_present
-                    .get(suppkey)
-                    .copied()
-                    .unwrap_or(false)
-                    && supplier_nation_values[suppkey] == customer_nation
-                {
-                    *groups.entry(customer_nation).or_insert(0.0) += decimal_discounted_revenue_raw(
-                        extendedprice_values[row],
-                        discount_values[row],
-                        discount_scale,
-                        revenue_scale,
-                    );
+                if nation == supplier_nation {
+                    return Ok(Some(nation));
                 }
+                Ok(None)
+            },
+            |_, nation, revenue| {
+                *groups.entry(nation).or_insert(0.0) += revenue;
+                Ok(())
+            },
+        )?;
+        return Ok(());
+    }
+    consume_filtered_discounted_revenue_decimal128_vectors_with_payload(
+        extendedprices,
+        discounts,
+        orderkeys.len(),
+        |row| {
+            if orderkeys.is_null(row) || suppkeys.is_null(row) {
+                return Ok(None);
             }
-            return groups;
-        }
-        for row in 0..orderkey_values.len() {
-            let orderkey = orderkey_values[row];
-            let suppkey = suppkey_values[row];
-            let (Some(customer_nation), Some(supplier_nation)) = (
-                order_customer_nations.get(&orderkey).copied(),
-                supplier_nations.get(suppkey),
-            ) else {
-                continue;
+            let Some(supplier_nation) = supplier_nations.get(suppkeys.value(row)) else {
+                return Ok(None);
             };
-            if customer_nation == supplier_nation {
-                *groups.entry(customer_nation).or_insert(0.0) += decimal_discounted_revenue_raw(
-                    extendedprice_values[row],
-                    discount_values[row],
-                    discount_scale,
-                    revenue_scale,
-                );
+            let Some(nation) = order_customer_nations.get(&orderkeys.value(row)).copied() else {
+                return Ok(None);
+            };
+            if nation == supplier_nation {
+                return Ok(Some(nation));
             }
-        }
-        return groups;
-    }
-    for row in 0..orderkeys.len() {
-        if orderkeys.is_null(row)
-            || suppkeys.is_null(row)
-            || extendedprices.is_null(row)
-            || discounts.is_null(row)
-        {
-            continue;
-        }
-        let orderkey = orderkeys.value(row);
-        let suppkey = suppkeys.value(row);
-        let (Some(customer_nation), Some(supplier_nation)) = (
-            order_customer_nations.get(&orderkey).copied(),
-            supplier_nations.get(suppkey),
-        ) else {
-            continue;
-        };
-        if customer_nation == supplier_nation {
-            *groups.entry(customer_nation).or_insert(0.0) +=
-                extendedprices.value(row) * (1.0 - discounts.value(row));
-        }
-    }
-    groups
+            Ok(None)
+        },
+        |_, nation, revenue| {
+            *groups.entry(nation).or_insert(0.0) += revenue;
+            Ok(())
+        },
+    )?;
+    Ok(())
 }
 
 fn revenue_by_nation_typed(
@@ -899,60 +1008,25 @@ fn revenue_by_nation_typed(
     ) else {
         return Ok(None);
     };
-    let mut groups = fast_hash_map::<i64, f64>();
-    if orderkeys.null_count() == 0
-        && suppkeys.null_count() == 0
-        && extendedprices.null_count() == 0
-        && discounts.null_count() == 0
-    {
-        let orderkey_values = orderkeys.values().as_ref();
-        let suppkey_values = suppkeys.values().as_ref();
-        let extendedprice_values = extendedprices.raw_values();
-        let discount_values = discounts.raw_values();
-        let (discount_scale, revenue_scale) =
-            decimal_discounted_revenue_scales(extendedprices, discounts);
-        for row in 0..orderkeys.len() {
-            let orderkey = orderkey_values[row];
-            let suppkey = suppkey_values[row];
-            let (Some(customer_nation), Some(supplier_nation)) = (
-                order_customer_nations.get(&orderkey).copied(),
-                supplier_nations.get(suppkey),
-            ) else {
-                continue;
-            };
-            if customer_nation == supplier_nation {
-                *groups.entry(customer_nation).or_insert(0.0) += decimal_discounted_revenue_raw(
-                    extendedprice_values[row],
-                    discount_values[row],
-                    discount_scale,
-                    revenue_scale,
-                );
-            }
-        }
-        return Ok(Some(groups));
-    }
-    for row in 0..orderkeys.len() {
-        if orderkeys.is_null(row)
-            || suppkeys.is_null(row)
-            || extendedprices.is_null(row)
-            || discounts.is_null(row)
-        {
-            continue;
-        }
-        let orderkey = orderkeys.value(row);
-        let suppkey = suppkeys.value(row);
-        let (Some(customer_nation), Some(supplier_nation)) = (
-            order_customer_nations.get(&orderkey).copied(),
-            supplier_nations.get(suppkey),
-        ) else {
-            continue;
-        };
-        if customer_nation == supplier_nation {
-            *groups.entry(customer_nation).or_insert(0.0) +=
-                extendedprices.value(row) * (1.0 - discounts.value(row));
-        }
-    }
-    Ok(Some(groups))
+    let extendedprices = Decimal128VectorView::Arrow {
+        values: extendedprices.values,
+        precision: extendedprices.precision,
+        scale: extendedprices.scale,
+    };
+    let discounts = Decimal128VectorView::Arrow {
+        values: discounts.values,
+        precision: discounts.precision,
+        scale: discounts.scale,
+    };
+    revenue_by_nation_vector(
+        I64VectorView::Arrow(orderkeys),
+        I64VectorView::Arrow(suppkeys),
+        extendedprices,
+        discounts,
+        order_customer_nations,
+        supplier_nations,
+    )
+    .map(Some)
 }
 
 fn regional_supplier_revenue_output(rows: Vec<RegionalSupplierRevenueRow>) -> Result<QueryOutput> {

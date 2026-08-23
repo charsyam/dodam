@@ -3,14 +3,14 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, BooleanBufferBuilder, BooleanBuilder, Date32Array, Date64Array,
-    Decimal128Array, DictionaryArray, Float64Array, Int32Array, Int64Array, ListArray, StringArray,
-    StructArray, TimestampMillisecondArray, UInt32Array, UInt64Array, make_array,
+    Array, ArrayRef, BooleanArray, BooleanBufferBuilder, Date32Array, Date64Array, Decimal128Array,
+    DictionaryArray, Float64Array, Int32Array, Int64Array, ListArray, StringArray, StructArray,
+    TimestampMillisecondArray, UInt32Array, UInt64Array, make_array,
 };
 use arrow::buffer::NullBuffer;
 use arrow::compute::filter_record_batch;
@@ -24,7 +24,6 @@ use arrow_select::concat::concat_batches;
 use arrow_select::take::take_record_batch;
 use memchr::memmem::Finder;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use rayon::prelude::*;
 use sqlparser::ast::{
     AccessExpr, BinaryOperator, CeilFloorKind, DateTimeField, Distinct, DuplicateTreatment,
     Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint,
@@ -39,24 +38,25 @@ use crate::cost::{
     DecimalRangeSelectivityInput, ExpressionAggregateLateChunkCostInput,
     FusedSelectedAggregateCostInput, OrderedPrimitiveChunkCostInput, OrderedPrimitiveSinkCostInput,
     PipelineMemoryCostInput, PipelineMemoryStrategy, PrimitiveOrderLimitCostInput,
-    PrimitiveOrderLimitStrategy, ProjectionSelectivityCostInput, SelectedPayloadDecision,
-    SelectedPayloadSpreadCostInput, SqlRuleCostInput, StreamingLeftDeepJoinCostInput,
-    WorkerCostInput, choose_expression_aggregate_late_row_group_chunk,
-    choose_fused_selected_aggregate, choose_late_materialization_projection_selected_ratio,
+    PrimitiveOrderLimitStrategy, ProjectionSelectivityCostInput, RowGroupMapChunkCostInput,
+    SelectedPayloadDecision, SelectedPayloadSpreadCostInput, SqlRuleCostInput,
+    StreamingLeftDeepJoinCostInput, WorkerCostInput,
+    choose_expression_aggregate_late_row_group_chunk, choose_fused_selected_aggregate,
+    choose_late_materialization_projection_selected_ratio,
     choose_ordered_primitive_row_group_chunk, choose_ordered_primitive_sink,
     choose_parallel_workers, choose_pipeline_memory_strategy,
-    choose_primitive_order_limit_strategy, choose_selected_payload_by_spread,
-    choose_streaming_left_deep_join, estimate_sql_rule_cost,
+    choose_primitive_order_limit_strategy, choose_row_group_map_chunk,
+    choose_selected_payload_by_spread, choose_streaming_left_deep_join, estimate_sql_rule_cost,
 };
 use crate::dense::{
     AdaptiveI64Map, AdaptiveI64Set, DenseAtomicU8, DenseI64BoolLookup, DenseI64F64Sum,
-    DenseI64I32Map, PackedU32PairDistinct, SortedI64Lookup, adaptive_dense_index,
+    DenseI64I32Map, DenseI64RankMap, PackedU32PairDistinct, adaptive_dense_index,
 };
 use crate::engine::{
     DirectPrimitiveBatchLocation, DodamEngine, JoinAlgorithm, JoinParquetRequest,
     LateMaterializationPolicy, LateMaterializedMetrics, LateSelectionBuilder,
     OrderedRowGroupBoundary, OrderedRowGroupChunk, RowGroupBatchScanProfile,
-    direct_selection_fold_enabled, merge_ordered_row_group_chunks,
+    merge_ordered_row_group_chunks,
 };
 use crate::error::{DodamError, Result};
 use crate::execution::JoinType;
@@ -69,9 +69,8 @@ use crate::execution::{
     RecordBatchSink, ScanPlanMetrics, SendableBatchStream, SortExpr, SortKey, StripPrefixExec,
     aggregate_metrics_to_batches, collect_aggregates, collect_grouped_aggregates,
     collect_grouped_aggregates_with_key_exprs, decimal_discounted_revenue_raw,
-    decimal_discounted_revenue_raw_i64, decimal_discounted_revenue_scales, decimal_input,
-    evaluate_filter_mask, evaluate_projected_view_filter_mask, filter_batch, scan_projection,
-    try_for_each_i64_i64_date32,
+    decimal_discounted_revenue_raw_i64, decimal_input, evaluate_filter_mask,
+    evaluate_projected_view_filter_mask, filter_batch, scan_projection,
 };
 use crate::hash::{FastHashMap, FastHashSet, fast_hash_map, fast_hash_map_with_capacity};
 use crate::optimizer::{
@@ -81,16 +80,16 @@ use crate::optimizer::{
     plan_join_inputs,
 };
 use crate::storage::{
-    DirectColumnScanMetrics, DirectI64I32I32ScanMetrics, DirectOrderedPrimitiveBatch,
-    DirectOrderedPrimitiveColumnValues, DirectPrimitiveColumnScanMetrics,
-    DirectPrimitiveColumnSpec, DirectPrimitiveColumnType, DirectSelectedPrimitiveColumnPageView,
-    DirectSelectedPrimitivePageBatch, PrimitiveRowGroupMinMax, read_i32_le_unchecked,
+    DirectOrderedPrimitiveBatch, DirectOrderedPrimitiveColumnValues,
+    DirectPrimitiveColumnScanMetrics, DirectPrimitiveColumnSpec, DirectPrimitiveColumnType,
+    DirectSelectedPrimitiveColumnPageView, DirectSelectedPrimitivePageBatch,
+    PrimitiveRowGroupMinMax, read_i32_le_unchecked,
 };
 use crate::vector::{
     BatchConsumer, BatchView, Date32VectorView, Decimal128VectorView, DictionaryI32View,
-    DictionaryStringValues, I32VectorView, I64VectorView, SelectionVector, Utf8VectorView,
-    consume_record_batch, dictionary_i32_view_match_flags, dictionary_i32_view_match_index,
-    read_i32_le_unaligned, read_i64_le_unaligned, store_i64_keys_matching_dictionary_target,
+    DictionaryStringValues, I32VectorView, I64VectorView, Utf8VectorView, consume_record_batch,
+    dictionary_i32_view_match_flags, dictionary_i32_view_match_index, read_i32_le_unaligned,
+    read_i64_le_unaligned, store_i64_keys_matching_dictionary_target,
     store_i64_keys_matching_utf8_target,
 };
 
@@ -292,7 +291,8 @@ use primitive_selection::{
 use product_expression::*;
 use profiling::{
     generic_profile_elapsed, generic_profile_start, semijoin_profile_enabled, sql_elapsed_nanos,
-    sql_nanos_to_millis, tpch_profile_elapsed, tpch_profile_enabled, tpch_profile_start,
+    sql_nanos_to_millis, tpch_profile_elapsed, tpch_profile_enabled,
+    tpch_profile_late_materialized, tpch_profile_start,
 };
 use profit_by_nation_year::*;
 use projection_expression::{
@@ -328,15 +328,17 @@ use query_routing::{
 use regional_supplier_revenue::*;
 use returned_customer_revenue::*;
 use rule_helpers::*;
+pub use rule_registry::{
+    SqlRuleCandidateEntry, SqlRuleInventoryEntry, sql_rule_candidates_for_sql, sql_rule_inventory,
+};
 use rule_registry::{sql_rule_shape_mismatch_error, try_execute_registered_sql_rules};
 use scalar_eval::{
     EvaluatedScalar, ScalarValue, apply_output_expression_filter,
     apply_output_expression_projection, apply_output_filter, apply_output_join_expression_filter,
-    boolean_and, boolean_not, boolean_or, decimal_scale_i128, evaluate_scalar_expression,
-    evaluate_scalar_predicate, evaluated_array, evaluated_column, literal_as_date32_for_type,
-    literal_as_decimal128_for_type, literal_as_i64_for_type, reverse_binary_operator,
-    scalar_as_f64, scalar_value_as_f64, scalar_value_as_i64, scalar_value_at,
-    validate_decimal_precision,
+    decimal_scale_i128, evaluate_scalar_expression, evaluate_scalar_predicate, evaluated_array,
+    evaluated_column, literal_as_date32_for_type, literal_as_decimal128_for_type,
+    literal_as_i64_for_type, reverse_binary_operator, scalar_as_f64, scalar_value_as_f64,
+    scalar_value_as_i64, scalar_value_at, validate_decimal_precision,
 };
 use scalar_output::{
     coalesce_options, drop_prefixed_columns, format_date32_days, format_decimal128_value,
@@ -407,7 +409,7 @@ use window::try_execute_window_sql;
 use with_cte::try_execute_with_cte_sql;
 
 const DEFAULT_MAX_DENSE_I64_KEY: usize = 20_000_000;
-const DEFAULT_Q09_ORDER_YEAR_DENSE_BYTES: usize = 384 * 1024 * 1024;
+const DEFAULT_ORDER_YEAR_DENSE_BYTES: usize = 3 * 1024 * 1024 * 1024;
 const MAX_SQL_EXTERNAL_JOIN_PARTITIONS: usize = 1024;
 
 pub async fn execute_sql(

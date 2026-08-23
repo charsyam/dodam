@@ -1,4 +1,131 @@
 use super::*;
+use std::sync::atomic::AtomicU32;
+
+const DEFAULT_DENSE_COUNT_MEMORY_BYTES: usize = 256 * 1024 * 1024;
+const DEFAULT_DENSE_COUNT_MAX_AMPLIFICATION: f64 = 8.0;
+
+#[derive(Clone, Copy)]
+struct DenseCountPlan {
+    min_key: i64,
+    capacity: usize,
+}
+
+impl DenseCountPlan {
+    fn from_ranges(
+        ranges: &[PrimitiveRowGroupMinMax],
+        max_bytes: usize,
+        max_amplification: f64,
+    ) -> Option<Self> {
+        let min_key = ranges.iter().map(|range| range.min).min()?;
+        let max_key = ranges.iter().map(|range| range.max).max()?;
+        let rows = ranges
+            .iter()
+            .try_fold(0_u128, |rows, range| rows.checked_add(range.rows as u128))?;
+        let capacity = max_key.checked_sub(min_key)?.checked_add(1)?;
+        let capacity = usize::try_from(capacity).ok()?;
+        let live_bytes = capacity
+            .checked_mul(std::mem::size_of::<u32>())?
+            .checked_mul(2)?;
+        if capacity == 0
+            || live_bytes > max_bytes
+            || !max_amplification.is_finite()
+            || max_amplification < 1.0
+            || capacity as f64 > rows as f64 * max_amplification
+        {
+            return None;
+        }
+        Some(Self {
+            min_key: i64::try_from(min_key).ok()?,
+            capacity,
+        })
+    }
+
+    #[inline]
+    fn index(self, key: i64) -> Option<usize> {
+        let index = i128::from(key).checked_sub(i128::from(self.min_key))?;
+        let index = usize::try_from(index).ok()?;
+        (index < self.capacity).then_some(index)
+    }
+}
+
+struct DenseCounts {
+    plan: DenseCountPlan,
+    values: Vec<u32>,
+}
+
+impl DenseCounts {
+    fn new(plan: DenseCountPlan) -> Self {
+        Self {
+            plan,
+            values: vec![0; plan.capacity],
+        }
+    }
+
+    #[inline]
+    fn increment(&mut self, key: i64) -> Result<()> {
+        let Some(index) = self.plan.index(key) else {
+            return Err(DodamError::UnsupportedSql(
+                "dense count key exceeds metadata range".to_string(),
+            ));
+        };
+        self.values[index] = self.values[index]
+            .checked_add(1)
+            .ok_or_else(|| DodamError::InvalidFilter("dense count overflow".to_string()))?;
+        Ok(())
+    }
+
+    #[inline]
+    fn get(&self, key: i64) -> u32 {
+        self.plan
+            .index(key)
+            .and_then(|index| self.values.get(index))
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+struct DenseAtomicCounts {
+    plan: DenseCountPlan,
+    values: Box<[AtomicU32]>,
+}
+
+impl DenseAtomicCounts {
+    fn new(plan: DenseCountPlan) -> Self {
+        Self {
+            plan,
+            values: (0..plan.capacity)
+                .map(|_| AtomicU32::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
+    }
+
+    #[inline]
+    fn increment(&self, key: i64) -> Result<()> {
+        let Some(index) = self.plan.index(key) else {
+            return Err(DodamError::UnsupportedSql(
+                "dense count key exceeds metadata range".to_string(),
+            ));
+        };
+        self.values[index]
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| DodamError::InvalidFilter("dense count overflow".to_string()))?;
+        Ok(())
+    }
+
+    fn snapshot(&self) -> DenseCounts {
+        DenseCounts {
+            plan: self.plan,
+            values: self
+                .values
+                .iter()
+                .map(|value| value.load(Ordering::Relaxed))
+                .collect(),
+        }
+    }
+}
 
 pub(super) async fn try_execute_derived_left_join_count_distribution_sql(
     engine: &DodamEngine,
@@ -77,10 +204,11 @@ pub(super) async fn try_execute_derived_left_join_count_distribution_sql(
         return Ok(None);
     }
 
-    let dense_counts = collect_dense_right_counts(engine, join, &count_column, batch_size).await?;
-    if dense_counts.is_empty() {
+    let Some(dense_counts) =
+        collect_dense_right_counts(engine, join, &count_column, batch_size).await?
+    else {
         return Ok(None);
-    }
+    };
     let groups =
         collect_left_count_distribution(engine, &inner.path, join, &dense_counts, batch_size)
             .await?;
@@ -106,13 +234,31 @@ pub(super) async fn try_execute_derived_left_join_count_distribution_sql(
     Ok(Some(QueryOutput::Aggregate { metrics, batches }))
 }
 
-pub(super) async fn collect_dense_right_counts(
+async fn collect_dense_right_counts(
     engine: &DodamEngine,
     join: &SqlJoin,
     count_column: &str,
     batch_size: usize,
-) -> Result<Vec<u32>> {
+) -> Result<Option<DenseCounts>> {
     let count_column = strip_column_prefix(count_column, &join.right_alias);
+    let key_column = strip_column_prefix(&join.right_keys[0], &join.right_alias);
+    let Some(ranges) =
+        engine.parquet_primitive_column_min_max_by_row_group(&join.right.path, &key_column)?
+    else {
+        return Ok(None);
+    };
+    let max_bytes = std::env::var("DODAM_DENSE_COUNT_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_DENSE_COUNT_MEMORY_BYTES);
+    let Some(plan) = DenseCountPlan::from_ranges(
+        &ranges,
+        max_bytes,
+        dense_max_amplification(DEFAULT_DENSE_COUNT_MAX_AMPLIFICATION),
+    ) else {
+        return Ok(None);
+    };
     let count_column_required = count_column != join.right_keys[0]
         && !parquet_column_is_non_nullable(&join.right.path, &count_column)?;
     let mut right_projection = vec![join.right_keys[0].clone()];
@@ -158,10 +304,11 @@ pub(super) async fn collect_dense_right_counts(
             Projection::Columns(right_projection_for_scan.clone()),
             join.right_keys[0].clone(),
             filter,
+            plan,
         )
         .await?
     {
-        return Ok(counts);
+        return Ok(Some(counts));
     }
     let mut right_stream = engine
         .scan_parquet_batches(
@@ -176,7 +323,7 @@ pub(super) async fn collect_dense_right_counts(
             },
         )
         .await?;
-    let mut dense_counts = Vec::<u32>::new();
+    let mut dense_counts = DenseCounts::new(plan);
     while let Some(batch) = right_stream.next() {
         let batch = batch?;
         let fast_like_strings = fast_like_filter
@@ -199,7 +346,7 @@ pub(super) async fn collect_dense_right_counts(
             .as_any()
             .downcast_ref::<Int64Array>()
         else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let values = count_index.map(|index| batch.column(index));
         let mask = eval_filter
@@ -229,17 +376,7 @@ pub(super) async fn collect_dense_right_counts(
                         ) {
                             continue;
                         }
-                        if key < 0 || key > 10_000_000 {
-                            return Ok(Vec::new());
-                        }
-                        let index = key as usize;
-                        if dense_counts.len() <= index {
-                            dense_counts.resize(index + 1, 0);
-                        }
-                        dense_counts[index] =
-                            dense_counts[index].checked_add(1).ok_or_else(|| {
-                                DodamError::InvalidFilter("dense count overflow".to_string())
-                            })?;
+                        dense_counts.increment(key)?;
                     }
                     continue;
                 }
@@ -253,16 +390,7 @@ pub(super) async fn collect_dense_right_counts(
                     ) {
                         continue;
                     }
-                    if key < 0 || key > 10_000_000 {
-                        return Ok(Vec::new());
-                    }
-                    let index = key as usize;
-                    if dense_counts.len() <= index {
-                        dense_counts.resize(index + 1, 0);
-                    }
-                    dense_counts[index] = dense_counts[index].checked_add(1).ok_or_else(|| {
-                        DodamError::InvalidFilter("dense count overflow".to_string())
-                    })?;
+                    dense_counts.increment(key)?;
                 }
                 continue;
             }
@@ -279,16 +407,7 @@ pub(super) async fn collect_dense_right_counts(
                     ) {
                         continue;
                     }
-                    if key < 0 || key > 10_000_000 {
-                        return Ok(Vec::new());
-                    }
-                    let index = key as usize;
-                    if dense_counts.len() <= index {
-                        dense_counts.resize(index + 1, 0);
-                    }
-                    dense_counts[index] = dense_counts[index].checked_add(1).ok_or_else(|| {
-                        DodamError::InvalidFilter("dense count overflow".to_string())
-                    })?;
+                    dense_counts.increment(key)?;
                 }
                 continue;
             }
@@ -302,16 +421,7 @@ pub(super) async fn collect_dense_right_counts(
                 ) {
                     continue;
                 }
-                if key < 0 || key > 10_000_000 {
-                    return Ok(Vec::new());
-                }
-                let index = key as usize;
-                if dense_counts.len() <= index {
-                    dense_counts.resize(index + 1, 0);
-                }
-                dense_counts[index] = dense_counts[index]
-                    .checked_add(1)
-                    .ok_or_else(|| DodamError::InvalidFilter("dense count overflow".to_string()))?;
+                dense_counts.increment(key)?;
             }
             continue;
         }
@@ -339,69 +449,57 @@ pub(super) async fn collect_dense_right_counts(
                 continue;
             }
             let key = keys.value(row);
-            if key < 0 || key > 10_000_000 {
-                return Ok(Vec::new());
-            }
-            let index = key as usize;
-            if dense_counts.len() <= index {
-                dense_counts.resize(index + 1, 0);
-            }
-            dense_counts[index] = dense_counts[index]
-                .checked_add(1)
-                .ok_or_else(|| DodamError::InvalidFilter("dense count overflow".to_string()))?;
+            dense_counts.increment(key)?;
         }
     }
-    Ok(dense_counts)
+    Ok(Some(dense_counts))
 }
 
-pub(super) async fn collect_dense_right_counts_fast_like_row_group_map(
+async fn collect_dense_right_counts_fast_like_row_group_map(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
     projection: Projection,
     key_column: String,
     filter: FastLikeSubstrings,
-) -> Result<Option<Vec<u32>>> {
+    plan: DenseCountPlan,
+) -> Result<Option<DenseCounts>> {
     let filter = Arc::new(filter);
-    let Some(partials) = engine
+    let counts = Arc::new(DenseAtomicCounts::new(plan));
+    let shared_counts = counts.clone();
+    let Some(_) = engine
         .parquet_row_group_map_view(
             path,
             batch_size,
             projection,
             dense_right_count_row_group_chunk(),
-            Vec::<u32>::new,
+            || (),
             {
                 let filter = filter.clone();
                 let key_column = key_column.clone();
-                move |view, counts| {
-                    collect_dense_right_counts_fast_like_view(view, &key_column, &filter, counts)
+                move |view, _state| {
+                    collect_dense_right_counts_fast_like_view(
+                        view,
+                        &key_column,
+                        &filter,
+                        &shared_counts,
+                    )
                 }
             },
-            |counts| Ok(Some(counts)),
+            |()| Ok(Some(())),
         )
         .await?
     else {
         return Ok(None);
     };
-    let mut counts = Vec::<u32>::new();
-    for partial in partials {
-        if counts.len() < partial.len() {
-            counts.resize(partial.len(), 0);
-        }
-        for (index, count) in partial.into_iter().enumerate() {
-            counts[index] = counts[index]
-                .checked_add(count)
-                .ok_or_else(|| DodamError::InvalidFilter("dense count overflow".to_string()))?;
-        }
-    }
-    Ok(Some(counts))
+    Ok(Some(counts.snapshot()))
 }
 
-pub(super) fn collect_dense_right_counts_fast_like_batch(
+fn collect_dense_right_counts_fast_like_batch(
     batch: RecordBatch,
     key_column: &str,
     filter: &FastLikeSubstrings,
-    counts: &mut Vec<u32>,
+    counts: &DenseAtomicCounts,
 ) -> Result<Option<()>> {
     let key_index = batch_column_index(&batch, key_column)?;
     let Some(keys) = batch
@@ -430,7 +528,7 @@ pub(super) fn collect_dense_right_counts_fast_like_batch(
                     second,
                     filter.negated,
                 ) {
-                    dense_count_increment(counts, key)?;
+                    counts.increment(key)?;
                 }
             }
             return Ok(Some(()));
@@ -443,7 +541,7 @@ pub(super) fn collect_dense_right_counts_fast_like_batch(
                 &finders,
                 filter.negated,
             ) {
-                dense_count_increment(counts, key)?;
+                counts.increment(key)?;
             }
         }
         return Ok(Some(()));
@@ -461,7 +559,7 @@ pub(super) fn collect_dense_right_counts_fast_like_batch(
                     filter.negated,
                 )
             {
-                dense_count_increment(counts, keys.value(row))?;
+                counts.increment(keys.value(row))?;
             }
         }
         return Ok(Some(()));
@@ -476,17 +574,17 @@ pub(super) fn collect_dense_right_counts_fast_like_batch(
                 filter.negated,
             )
         {
-            dense_count_increment(counts, keys.value(row))?;
+            counts.increment(keys.value(row))?;
         }
     }
     Ok(Some(()))
 }
 
-pub(super) fn collect_dense_right_counts_fast_like_view(
+fn collect_dense_right_counts_fast_like_view(
     view: BatchView<'_>,
     key_column: &str,
     filter: &FastLikeSubstrings,
-    counts: &mut Vec<u32>,
+    counts: &DenseAtomicCounts,
 ) -> Result<Option<()>> {
     let Some(batch) = view.try_record_batch() else {
         return Ok(None);
@@ -526,7 +624,7 @@ pub(super) fn collect_dense_right_counts_fast_like_view(
                     second,
                     filter.negated,
                 ) {
-                    dense_count_increment(counts, key)?;
+                    counts.increment(key)?;
                 }
             }
             return Ok(Some(()));
@@ -539,7 +637,7 @@ pub(super) fn collect_dense_right_counts_fast_like_view(
                 &finders,
                 filter.negated,
             ) {
-                dense_count_increment(counts, key)?;
+                counts.increment(key)?;
             }
         }
         return Ok(Some(()));
@@ -557,7 +655,7 @@ pub(super) fn collect_dense_right_counts_fast_like_view(
                     filter.negated,
                 )
             {
-                dense_count_increment(counts, keys.value(row))?;
+                counts.increment(keys.value(row))?;
             }
         }
         return Ok(Some(()));
@@ -572,26 +670,10 @@ pub(super) fn collect_dense_right_counts_fast_like_view(
                 filter.negated,
             )
         {
-            dense_count_increment(counts, keys.value(row))?;
+            counts.increment(keys.value(row))?;
         }
     }
     Ok(Some(()))
-}
-
-pub(super) fn dense_count_increment(counts: &mut Vec<u32>, key: i64) -> Result<()> {
-    if !(0..=10_000_000).contains(&key) {
-        return Err(DodamError::InvalidFilter(
-            "dense count key out of supported range".to_string(),
-        ));
-    }
-    let index = key as usize;
-    if counts.len() <= index {
-        counts.resize(index + 1, 0);
-    }
-    counts[index] = counts[index]
-        .checked_add(1)
-        .ok_or_else(|| DodamError::InvalidFilter("dense count overflow".to_string()))?;
-    Ok(())
 }
 
 pub(super) fn dense_right_count_row_group_map_enabled() -> bool {
@@ -774,11 +856,11 @@ pub(super) fn parquet_column_is_non_nullable(path: &PathBuf, column: &str) -> Re
         .is_some_and(|field| !field.is_nullable()))
 }
 
-pub(super) async fn collect_left_count_distribution(
+async fn collect_left_count_distribution(
     engine: &DodamEngine,
     left_path: &PathBuf,
     join: &SqlJoin,
-    dense_counts: &[u32],
+    dense_counts: &DenseCounts,
     batch_size: usize,
 ) -> Result<Vec<GroupAggregateResult>> {
     let mut left_stream = engine
@@ -805,11 +887,7 @@ pub(super) async fn collect_left_count_distribution(
         };
         if keys.null_count() == 0 {
             for key in keys.values().as_ref() {
-                let count = if *key >= 0 {
-                    dense_counts.get(*key as usize).copied().unwrap_or(0)
-                } else {
-                    0
-                };
+                let count = dense_counts.get(*key);
                 let index = count as usize;
                 if distribution.len() <= index {
                     distribution.resize(index + 1, 0);
@@ -820,12 +898,7 @@ pub(super) async fn collect_left_count_distribution(
         }
         for row in 0..batch.num_rows() {
             let count = if keys.is_valid(row) {
-                let key = keys.value(row);
-                if key >= 0 {
-                    dense_counts.get(key as usize).copied().unwrap_or(0)
-                } else {
-                    0
-                }
+                dense_counts.get(keys.value(row))
             } else {
                 0
             };
@@ -951,6 +1024,62 @@ pub(super) fn try_count_derived_aggregate_groups(
     batches = apply_output_order_limit(batches, order_by, limit, 0)?;
     batches = rename_output_batches(batches, &projection.aliases)?;
     Ok(Some(QueryOutput::Aggregate { metrics, batches }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn range(row_group: usize, rows: usize, min: i128, max: i128) -> PrimitiveRowGroupMinMax {
+        PrimitiveRowGroupMinMax {
+            row_group,
+            rows,
+            null_count: Some(0),
+            min,
+            max,
+            data_type: DataType::Int64,
+        }
+    }
+
+    #[test]
+    fn dense_count_plan_accepts_sf100_key_range_with_bounded_memory() {
+        let plan = DenseCountPlan::from_ranges(
+            &[
+                range(0, 75_000_000, 1, 7_500_000),
+                range(1, 75_000_000, 7_500_001, 14_999_999),
+            ],
+            DEFAULT_DENSE_COUNT_MEMORY_BYTES,
+            DEFAULT_DENSE_COUNT_MAX_AMPLIFICATION,
+        )
+        .expect("SF100 key range should fit the dense count budget");
+
+        assert_eq!(plan.min_key, 1);
+        assert_eq!(plan.capacity, 14_999_999);
+        assert_eq!(plan.index(1), Some(0));
+        assert_eq!(plan.index(14_999_999), Some(14_999_998));
+    }
+
+    #[test]
+    fn dense_count_plan_rejects_excess_memory_or_sparse_amplification() {
+        assert!(DenseCountPlan::from_ranges(&[range(0, 100, 0, 10_000)], 1024, 8.0).is_none());
+        assert!(DenseCountPlan::from_ranges(&[range(0, 10, 0, 100)], 1024 * 1024, 8.0).is_none());
+    }
+
+    #[test]
+    fn dense_atomic_counts_support_large_offset_keys() {
+        let plan = DenseCountPlan::from_ranges(&[range(0, 4, 15_000_000, 15_000_001)], 1024, 8.0)
+            .expect("narrow high-key range should use offset dense counts");
+        let counts = DenseAtomicCounts::new(plan);
+        counts.increment(15_000_000).expect("first increment");
+        counts.increment(15_000_000).expect("second increment");
+        counts.increment(15_000_001).expect("neighbor increment");
+
+        let counts = counts.snapshot();
+        assert_eq!(counts.get(14_999_999), 0);
+        assert_eq!(counts.get(15_000_000), 2);
+        assert_eq!(counts.get(15_000_001), 1);
+        assert_eq!(counts.get(15_000_002), 0);
+    }
 }
 
 pub(super) fn aggregate_value_to_group_value(value: &AggregateValue) -> Option<GroupValue> {

@@ -118,8 +118,15 @@ pub(super) async fn try_execute_profit_by_nation_year_sql(
         return Ok(None);
     };
 
-    let part_key_filter =
-        q09_matching_part_keys(engine, part.path, batch_size, &name_substring).await?;
+    let part_key_filter = collect_i64_utf8_contains_set(
+        engine,
+        part.path,
+        batch_size,
+        "p_partkey",
+        "p_name",
+        &name_substring,
+    )
+    .await?;
     if part_key_filter.is_empty() {
         return Ok(Some(q09_output(Vec::new())?));
     }
@@ -127,20 +134,44 @@ pub(super) async fn try_execute_profit_by_nation_year_sql(
     let supplier_nations = q09_supplier_nations(engine, supplier.path, batch_size).await?;
     let nation_names = nation_names_by_keys(engine, nation.path, batch_size).await?;
     let order_years = q09_order_years(engine, orders.path, batch_size).await?;
-    let supply_costs = q09_supply_costs(engine, partsupp.path, batch_size, &part_keys).await?;
+    let supply_costs = q09_supply_costs(
+        engine,
+        partsupp.path,
+        batch_size,
+        &part_keys,
+        &supplier_nations,
+    )
+    .await?;
+    q09_log_profit_build_layouts(&part_keys, &order_years, &supply_costs);
     let rows = q09_profit_rows(
         engine,
         lineitem.path,
         batch_size,
         &part_keys,
-        &part_key_filter,
-        &supplier_nations,
         &nation_names,
         order_years,
         supply_costs,
     )
     .await?;
     Ok(Some(q09_output(rows)?))
+}
+
+fn q09_log_profit_build_layouts(
+    part_keys: &AdaptiveI64Set,
+    order_years: &Q09OrderYears,
+    supply_costs: &Q09SupplyCosts,
+) {
+    if !tpch_profile_enabled() {
+        return;
+    }
+    eprintln!(
+        "[dodam:tpch-profile] Q09 profit build layouts: part_dense={} order_dense={} supply_layout={} part_keys={} supply_entries={}",
+        part_keys.dense_contains_slice().is_some(),
+        order_years.dense_slice().is_some(),
+        supply_costs.layout_name(),
+        part_keys.len(),
+        supply_costs.len(),
+    );
 }
 
 fn like_contains_literal(conjuncts: &[SqlExpr], column: &str) -> Result<Option<String>> {
@@ -172,77 +203,12 @@ fn like_contains_literal(conjuncts: &[SqlExpr], column: &str) -> Result<Option<S
     Ok(None)
 }
 
-async fn q09_matching_part_keys(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-    name_substring: &str,
-) -> Result<HashSet<i64>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec!["p_partkey".to_string(), "p_name".to_string()]),
-            None,
-        )
-        .await?;
-    let name_substring = name_substring.to_string();
-    parallel_batch_fold(
-        &mut stream,
-        move |batch| q09_matching_part_keys_batch(batch, &name_substring),
-        HashSet::<i64>::new(),
-        merge_sets,
-        "Q09 matching part keys",
-    )
-}
-
-fn q09_matching_part_keys_batch(batch: RecordBatch, name_substring: &str) -> Result<HashSet<i64>> {
-    let partkeys = batch_column(&batch, "p_partkey")?;
-    let names = batch_string_column(&batch, "p_name")?;
-    let finder = Finder::new(name_substring.as_bytes());
-    let mut keys = HashSet::new();
-    for row in 0..batch.num_rows() {
-        if names.is_valid(row)
-            && finder.find(names.value(row).as_bytes()).is_some()
-            && let Some(partkey) = numeric_i64_value(partkeys, row)?
-        {
-            keys.insert(partkey);
-        }
-    }
-    Ok(keys)
-}
-
 async fn q09_supplier_nations(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
 ) -> Result<AdaptiveI64Map<i64>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec!["s_suppkey".to_string(), "s_nationkey".to_string()]),
-            None,
-        )
-        .await?;
-    let mut suppliers = AdaptiveI64Map::<i64>::new_dense();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let suppkeys = batch_column(&batch, "s_suppkey")?;
-        let nationkeys = batch_column(&batch, "s_nationkey")?;
-        for row in 0..batch.num_rows() {
-            let (Some(suppkey), Some(nationkey)) = (
-                numeric_i64_value(suppkeys, row)?,
-                numeric_i64_value(nationkeys, row)?,
-            ) else {
-                continue;
-            };
-            suppliers.insert(suppkey, nationkey);
-        }
-    }
-    Ok(suppliers)
+    collect_i64_i64_adaptive_map(engine, path, batch_size, "s_suppkey", "s_nationkey").await
 }
 
 async fn q09_order_years(
@@ -250,9 +216,7 @@ async fn q09_order_years(
     path: PathBuf,
     batch_size: usize,
 ) -> Result<Q09OrderYears> {
-    if q09_order_year_row_group_map_enabled()
-        && let Some(years) = q09_order_years_row_group_map(engine, path.clone(), batch_size).await?
-    {
+    if let Some(years) = q09_order_years_row_group_map(engine, path.clone(), batch_size).await? {
         return Ok(years);
     }
     let mut stream = engine
@@ -328,7 +292,6 @@ async fn q09_order_years_row_group_map(
 }
 
 fn q09_order_years_from_partials(partials: Vec<Q09OrderYearPartial>) -> Q09OrderYears {
-    let mut years = Q09OrderYears::new(0);
     let mut min_key = i64::MAX;
     let mut max_key = i64::MIN;
     let mut fallback_required = false;
@@ -343,10 +306,28 @@ fn q09_order_years_from_partials(partials: Vec<Q09OrderYearPartial>) -> Q09Order
             partial.rows.len()
         })
         .sum::<usize>();
-    if fallback_required
-        || min_key > max_key
-        || !years.reserve_dense_range(min_key, max_key, q09_order_year_max_dense_entries())
-    {
+    if fallback_required || min_key > max_key {
+        let mut years = Q09OrderYears::new(0);
+        years.convert_to_fallback();
+        let fallback = years.fallback_mut().expect("converted q09 fallback");
+        for partial in partials {
+            for (orderkey, year) in partial.rows {
+                fallback.insert(orderkey, year);
+            }
+        }
+        return years;
+    }
+    let mut years = Q09OrderYears::new(0);
+    if !crate::dense::dense_i64_range_within_amplification(
+        min_key,
+        max_key,
+        row_count,
+        q09_order_year_dense_max_amplification(),
+    ) || !years.reserve_dense_range(
+        min_key,
+        max_key,
+        q09_order_year_max_dense_entries(Some(row_count)),
+    ) {
         years.convert_to_fallback();
         let fallback = years.fallback_mut().expect("converted q09 fallback");
         for partial in partials {
@@ -436,25 +417,26 @@ fn q09_order_years_partial_view_into(
     q09_order_years_partial_batch_into(batch.clone(), partial)
 }
 
-fn q09_order_year_row_group_map_enabled() -> bool {
-    std::env::var_os("DODAM_Q09_DISABLE_ORDER_YEAR_ROW_GROUP_MAP").is_none()
-}
-
 fn q09_order_year_row_group_map_chunk() -> usize {
-    std::env::var("DODAM_Q09_ORDER_YEAR_ROW_GROUP_MAP_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(8)
+    generic_row_group_map_chunk_size(8)
 }
 
-fn q09_order_year_max_dense_entries() -> usize {
-    std::env::var("DODAM_Q09_ORDER_YEAR_DENSE_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .map(|bytes| bytes / std::mem::size_of::<i32>())
-        .filter(|entries| *entries > 0)
-        .unwrap_or_else(|| DEFAULT_Q09_ORDER_YEAR_DENSE_BYTES / std::mem::size_of::<i32>())
+fn q09_order_year_max_dense_entries(row_count: Option<usize>) -> usize {
+    let byte_entries = q09_order_year_max_dense_byte_entries();
+    if let Some(row_count) = row_count {
+        let amplification_entries =
+            ((row_count as f64) * q09_order_year_dense_max_amplification()) as usize;
+        return byte_entries.min(amplification_entries.max(row_count));
+    }
+    byte_entries
+}
+
+fn q09_order_year_max_dense_byte_entries() -> usize {
+    dense_i32_max_entries(DEFAULT_ORDER_YEAR_DENSE_BYTES)
+}
+
+fn q09_order_year_dense_max_amplification() -> f64 {
+    dense_max_amplification(8.5)
 }
 
 fn q09_order_years_batch_into(
@@ -471,7 +453,7 @@ fn q09_order_years_batch_into(
         orderkeys.as_any().downcast_ref::<Int64Array>(),
         orderdates.as_any().downcast_ref::<Date32Array>(),
     ) {
-        let max_dense_entries = q09_order_year_max_dense_entries();
+        let max_dense_entries = q09_order_year_max_dense_entries(None);
         if orderkeys.null_count() == 0 && orderdates.null_count() == 0 {
             let orderkey_values = orderkeys.values().as_ref();
             let orderdate_values = orderdates.values().as_ref();
@@ -558,6 +540,7 @@ async fn q09_supply_costs(
     path: PathBuf,
     batch_size: usize,
     part_keys: &AdaptiveI64Set,
+    supplier_nations: &AdaptiveI64Map<i64>,
 ) -> Result<Q09SupplyCosts> {
     let mut stream = engine
         .scan_parquet_batches(
@@ -573,13 +556,15 @@ async fn q09_supply_costs(
         )
         .await?;
     let part_keys = Arc::new(part_keys.clone());
-    let costs = parallel_batch_fold(
+    let supplier_nations = Arc::new(supplier_nations.clone());
+    let mut costs = parallel_batch_fold(
         &mut stream,
-        move |batch| q09_supply_costs_batch(batch, &part_keys),
+        move |batch| q09_supply_costs_batch(batch, &part_keys, &supplier_nations),
         Q09SupplyCosts::new(),
         Q09SupplyCosts::merge,
         "Q09 supply costs",
     )?;
+    costs.compact_for_probe();
     q09_log_supply_cost_layout(&costs);
     Ok(costs)
 }
@@ -587,14 +572,18 @@ async fn q09_supply_costs(
 fn q09_supply_costs_batch(
     batch: RecordBatch,
     part_keys: &AdaptiveI64Set,
+    supplier_nations: &AdaptiveI64Map<i64>,
 ) -> Result<Q09SupplyCosts> {
     let partkeys = batch_column(&batch, "ps_partkey")?;
     let suppkeys = batch_column(&batch, "ps_suppkey")?;
     let supplycosts = batch_column(&batch, "ps_supplycost")?;
-    if let Some(costs) = q09_supply_costs_batch_typed(partkeys, suppkeys, supplycosts, part_keys)? {
+    if let Some(costs) =
+        q09_supply_costs_batch_typed(partkeys, suppkeys, supplycosts, part_keys, supplier_nations)?
+    {
         return Ok(costs);
     }
     let mut costs = Q09SupplyCosts::new();
+    let dense_supplier_nations = supplier_nations.dense_slices();
     for row in 0..batch.num_rows() {
         let (Some(partkey), Some(suppkey), Some(supplycost)) = (
             numeric_i64_value(partkeys, row)?,
@@ -603,8 +592,17 @@ fn q09_supply_costs_batch(
         ) else {
             continue;
         };
-        if part_keys.contains(partkey) {
-            costs.insert(partkey, suppkey, supplycost);
+        if part_keys.contains(partkey)
+            && let Some(nationkey) = supplier_nations.get_cached(dense_supplier_nations, suppkey)
+        {
+            costs.insert(
+                partkey,
+                suppkey,
+                Q09SupplyInfo {
+                    supplycost,
+                    nationkey,
+                },
+            );
         }
     }
     Ok(costs)
@@ -615,6 +613,7 @@ fn q09_supply_costs_batch_typed(
     suppkeys: &ArrayRef,
     supplycosts: &ArrayRef,
     part_keys: &AdaptiveI64Set,
+    supplier_nations: &AdaptiveI64Map<i64>,
 ) -> Result<Option<Q09SupplyCosts>> {
     let (Some(partkeys), Some(suppkeys), Some(supplycosts)) = (
         partkeys.as_any().downcast_ref::<Int64Array>(),
@@ -624,81 +623,68 @@ fn q09_supply_costs_batch_typed(
         return Ok(None);
     };
     let mut costs = Q09SupplyCosts::new();
+    let dense_part_keys = part_keys.dense_contains_slice();
+    let dense_supplier_nations = supplier_nations.dense_slices();
     for row in 0..partkeys.len() {
         if partkeys.is_null(row) || suppkeys.is_null(row) || supplycosts.is_null(row) {
             continue;
         }
         let partkey = partkeys.value(row);
-        if part_keys.contains(partkey) {
-            costs.insert(partkey, suppkeys.value(row), supplycosts.value(row));
+        if part_keys.contains_cached(dense_part_keys, partkey) {
+            let suppkey = suppkeys.value(row);
+            if let Some(nationkey) = supplier_nations.get_cached(dense_supplier_nations, suppkey) {
+                costs.insert(
+                    partkey,
+                    suppkey,
+                    Q09SupplyInfo {
+                        supplycost: supplycosts.value(row),
+                        nationkey,
+                    },
+                );
+            }
         }
     }
     Ok(Some(costs))
 }
 
+#[derive(Clone, Copy, Default)]
+struct Q09SupplyInfo {
+    supplycost: f64,
+    nationkey: i64,
+}
+
 enum Q09SupplyCosts {
-    PairHash(FastHashMap<(i64, i64), f64>),
-    PackedU64(FastHashMap<u64, f64>),
-    SmallFanout(FastHashMap<i64, Vec<(i64, f64)>>),
+    PairHash(FastHashMap<(i64, i64), Q09SupplyInfo>),
+    PackedU64(FastHashMap<u64, Q09SupplyInfo>),
 }
 
 impl Q09SupplyCosts {
     fn new() -> Self {
-        if std::env::var_os("DODAM_Q09_SUPPLYCOST_PAIR_HASH").is_some() {
-            Self::PairHash(fast_hash_map())
-        } else if std::env::var_os("DODAM_Q09_SUPPLYCOST_FANOUT").is_some() {
-            Self::SmallFanout(fast_hash_map())
-        } else {
-            Self::PackedU64(fast_hash_map())
-        }
+        Self::PackedU64(fast_hash_map())
     }
 
-    fn insert(&mut self, partkey: i64, suppkey: i64, supplycost: f64) {
+    fn insert(&mut self, partkey: i64, suppkey: i64, info: Q09SupplyInfo) {
         match self {
             Self::PairHash(costs) => {
-                costs.insert((partkey, suppkey), supplycost);
+                costs.insert((partkey, suppkey), info);
             }
             Self::PackedU64(costs) => {
                 let Some(key) = q09_pack_part_supp_key(partkey, suppkey) else {
                     self.convert_packed_to_pair_hash();
-                    self.insert(partkey, suppkey, supplycost);
+                    self.insert(partkey, suppkey, info);
                     return;
                 };
-                costs.insert(key, supplycost);
-            }
-            Self::SmallFanout(costs) => {
-                let should_convert = {
-                    let entries = costs.entry(partkey).or_default();
-                    if let Some((_, cost)) = entries.iter_mut().find(|(key, _)| *key == suppkey) {
-                        *cost = supplycost;
-                        return;
-                    }
-                    entries.len() >= q09_supplycost_max_fanout()
-                };
-                if should_convert {
-                    self.convert_small_fanout_to_packed();
-                    self.insert(partkey, suppkey, supplycost);
-                    return;
-                }
-                let entries = match self {
-                    Self::SmallFanout(costs) => costs.entry(partkey).or_default(),
-                    _ => unreachable!("Q09 supply cost layout converted"),
-                };
-                entries.push((suppkey, supplycost));
+                costs.insert(key, info);
             }
         }
     }
 
-    fn get(&self, partkey: i64, suppkey: i64) -> Option<f64> {
+    fn get(&self, partkey: i64, suppkey: i64) -> Option<Q09SupplyInfo> {
         match self {
             Self::PairHash(costs) => costs.get(&(partkey, suppkey)).copied(),
             Self::PackedU64(costs) => {
                 q09_pack_part_supp_key(partkey, suppkey).and_then(|key| costs.get(&key).copied())
             }
-            Self::SmallFanout(costs) => costs
-                .get(&partkey)?
-                .iter()
-                .find_map(|(key, cost)| (*key == suppkey).then_some(*cost)),
         }
     }
 
@@ -715,15 +701,10 @@ impl Q09SupplyCosts {
                     self.insert(partkey, suppkey, supplycost);
                 }
             }
-            Self::SmallFanout(batch) => {
-                for (partkey, entries) in batch {
-                    for (suppkey, supplycost) in entries {
-                        self.insert(partkey, suppkey, supplycost);
-                    }
-                }
-            }
         }
     }
+
+    fn compact_for_probe(&mut self) {}
 
     fn convert_packed_to_pair_hash(&mut self) {
         let Self::PackedU64(packed) = self else {
@@ -736,40 +717,10 @@ impl Q09SupplyCosts {
         *self = Self::PairHash(pair_hash);
     }
 
-    fn convert_small_fanout_to_packed(&mut self) {
-        let Self::SmallFanout(fanout) = self else {
-            return;
-        };
-        let mut packed = fast_hash_map();
-        let mut pair_hash = None::<FastHashMap<(i64, i64), f64>>;
-        for (partkey, entries) in std::mem::take(fanout) {
-            for (suppkey, supplycost) in entries {
-                if let Some(pair_hash) = pair_hash.as_mut() {
-                    pair_hash.insert((partkey, suppkey), supplycost);
-                } else if let Some(key) = q09_pack_part_supp_key(partkey, suppkey) {
-                    packed.insert(key, supplycost);
-                } else {
-                    let mut converted = fast_hash_map_with_capacity(packed.len() + 1);
-                    for (key, cost) in std::mem::take(&mut packed) {
-                        converted.insert(q09_unpack_part_supp_key(key), cost);
-                    }
-                    converted.insert((partkey, suppkey), supplycost);
-                    pair_hash = Some(converted);
-                }
-            }
-        }
-        *self = if let Some(pair_hash) = pair_hash {
-            Self::PairHash(pair_hash)
-        } else {
-            Self::PackedU64(packed)
-        };
-    }
-
     fn layout_name(&self) -> &'static str {
         match self {
             Self::PairHash(_) => "pair_hash",
             Self::PackedU64(_) => "packed_u64",
-            Self::SmallFanout(_) => "small_fanout",
         }
     }
 
@@ -777,7 +728,6 @@ impl Q09SupplyCosts {
         match self {
             Self::PairHash(costs) => costs.len(),
             Self::PackedU64(costs) => costs.len(),
-            Self::SmallFanout(costs) => costs.values().map(Vec::len).sum(),
         }
     }
 
@@ -793,24 +743,12 @@ impl Q09SupplyCosts {
                 .map(|key| q09_unpack_part_supp_key(*key).0)
                 .collect::<FastHashSet<_>>()
                 .len(),
-            Self::SmallFanout(costs) => costs.len(),
         }
     }
 
     fn max_fanout(&self) -> usize {
-        match self {
-            Self::SmallFanout(costs) => costs.values().map(Vec::len).max().unwrap_or(0),
-            Self::PairHash(_) | Self::PackedU64(_) => 0,
-        }
+        0
     }
-}
-
-fn q09_supplycost_max_fanout() -> usize {
-    std::env::var("DODAM_Q09_SUPPLYCOST_MAX_FANOUT")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(16)
 }
 
 fn q09_log_supply_cost_layout(costs: &Q09SupplyCosts) {
@@ -847,31 +785,13 @@ async fn q09_profit_rows(
     path: PathBuf,
     batch_size: usize,
     part_keys: &AdaptiveI64Set,
-    part_key_filter: &HashSet<i64>,
-    supplier_nations: &AdaptiveI64Map<i64>,
     nation_names: &HashMap<i64, String>,
     order_years: Q09OrderYears,
     supply_costs: Q09SupplyCosts,
 ) -> Result<Vec<Q09Row>> {
     let part_keys = Arc::new(part_keys.clone());
-    let supplier_nations = Arc::new(supplier_nations.clone());
     let order_years = Arc::new(order_years);
     let supply_costs = Arc::new(supply_costs);
-    if std::env::var_os("DODAM_Q09_ENABLE_LATE_MATERIALIZE").is_some()
-        && let Some(partial) = q09_late_materialized_profit_partial(
-            engine,
-            path.clone(),
-            batch_size,
-            part_keys.clone(),
-            supplier_nations.clone(),
-            order_years.clone(),
-            supply_costs.clone(),
-        )
-        .await?
-    {
-        q09_log_profit_profile(&partial.profile);
-        return q09_profit_rows_from_groups(partial.groups, nation_names);
-    }
     let projection = Projection::Columns(vec![
         "l_orderkey".to_string(),
         "l_partkey".to_string(),
@@ -880,73 +800,42 @@ async fn q09_profit_rows(
         "l_extendedprice".to_string(),
         "l_discount".to_string(),
     ]);
-    let use_partkey_row_filter = should_use_i64_set_row_filter_for_keys(
-        false,
-        "DODAM_Q09_DISABLE_LINEITEM_PARTKEY_ROW_FILTER",
-        Some("DODAM_Q09_ENABLE_LINEITEM_PARTKEY_ROW_FILTER"),
-        part_key_filter,
-        projection_column_count(&projection),
-    );
-    if q09_row_group_map_enabled() && !use_partkey_row_filter {
-        let part_keys_for_scan = part_keys.clone();
-        let supplier_nations_for_scan = supplier_nations.clone();
-        let order_years_for_scan = order_years.clone();
-        let supply_costs_for_scan = supply_costs.clone();
-        if let Some(partials) = engine
-            .parquet_row_group_map_view(
-                path.clone(),
-                batch_size,
-                projection.clone(),
-                q09_row_group_map_chunk(),
-                Q09ProfitPartial::default,
-                move |view, partial| {
-                    partial.merge(q09_profit_projected_view(
-                        view,
-                        &part_keys_for_scan,
-                        &supplier_nations_for_scan,
-                        &order_years_for_scan,
-                        &supply_costs_for_scan,
-                    )?);
-                    Ok(Some(()))
-                },
-                |partial| Ok(Some(partial)),
-            )
-            .await?
-        {
-            let mut partial = Q09ProfitPartial::default();
-            for batch in partials {
-                partial.merge(batch);
-            }
-            q09_log_profit_profile(&partial.profile);
-            return q09_profit_rows_from_groups(partial.groups, nation_names);
+    let part_keys_for_scan = part_keys.clone();
+    let order_years_for_scan = order_years.clone();
+    let supply_costs_for_scan = supply_costs.clone();
+    if let Some(partials) = engine
+        .parquet_row_group_map_view(
+            path.clone(),
+            batch_size,
+            projection.clone(),
+            q09_row_group_map_chunk(),
+            Q09ProfitPartial::default,
+            move |view, partial| {
+                partial.merge(q09_profit_projected_view(
+                    view,
+                    &part_keys_for_scan,
+                    &order_years_for_scan,
+                    &supply_costs_for_scan,
+                )?);
+                Ok(Some(()))
+            },
+            |partial| Ok(Some(partial)),
+        )
+        .await?
+    {
+        let mut partial = Q09ProfitPartial::default();
+        for batch in partials {
+            partial.merge(batch);
         }
+        q09_log_profit_profile(&partial.profile);
+        return q09_profit_rows_from_groups(partial.groups, nation_names);
     }
-    let mut stream = if use_partkey_row_filter {
-        engine
-            .scan_parquet_batches_i64_set_filtered(
-                path,
-                batch_size,
-                projection,
-                "l_partkey",
-                part_key_filter.clone(),
-            )
-            .await?
-    } else {
-        engine
-            .scan_parquet_batches(path, batch_size, None, projection, None)
-            .await?
-    };
+    let mut stream = engine
+        .scan_parquet_batches(path, batch_size, None, projection, None)
+        .await?;
     let partial = parallel_batch_fold(
         &mut stream,
-        move |batch| {
-            q09_profit_batch(
-                batch,
-                &part_keys,
-                &supplier_nations,
-                &order_years,
-                &supply_costs,
-            )
-        },
+        move |batch| q09_profit_batch(batch, &part_keys, &order_years, &supply_costs),
         Q09ProfitPartial::default(),
         Q09ProfitPartial::merge,
         "Q09 profit aggregate",
@@ -955,16 +844,8 @@ async fn q09_profit_rows(
     q09_profit_rows_from_groups(partial.groups, nation_names)
 }
 
-fn q09_row_group_map_enabled() -> bool {
-    std::env::var_os("DODAM_Q09_DISABLE_ROW_GROUP_MAP").is_none()
-}
-
 fn q09_row_group_map_chunk() -> usize {
-    std::env::var("DODAM_Q09_ROW_GROUP_MAP_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(2)
+    generic_row_group_map_chunk_size(4)
 }
 
 fn q09_profit_rows_from_groups(
@@ -989,477 +870,6 @@ fn q09_profit_rows_from_groups(
     Ok(rows)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn q09_late_materialized_profit_partial(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-    part_keys: Arc<AdaptiveI64Set>,
-    supplier_nations: Arc<AdaptiveI64Map<i64>>,
-    order_years: Arc<Q09OrderYears>,
-    supply_costs: Arc<Q09SupplyCosts>,
-) -> Result<Option<Q09ProfitPartial>> {
-    let predicate_projection = Projection::Columns(vec!["l_partkey".to_string()]);
-    let payload_projection = Projection::Columns(vec![
-        "l_orderkey".to_string(),
-        "l_suppkey".to_string(),
-        "l_quantity".to_string(),
-        "l_extendedprice".to_string(),
-        "l_discount".to_string(),
-    ]);
-    let Some(chunks) = engine
-        .late_materialized_parquet_map_pruned_with_policy_view(
-            path,
-            batch_size,
-            predicate_projection,
-            payload_projection,
-            Vec::new(),
-            q09_late_materialized_row_group_chunk(),
-            LateMaterializationPolicy::selective_with_selector_run_ratio(
-                q09_late_materialized_max_selected_ratio(),
-                q09_late_materialized_max_selector_run_ratio(),
-            ),
-            {
-                let part_keys = part_keys.clone();
-                let supplier_nations = supplier_nations.clone();
-                let order_years = order_years.clone();
-                let supply_costs = supply_costs.clone();
-                move || Q09LateProfitState {
-                    part_keys: part_keys.clone(),
-                    supplier_nations: supplier_nations.clone(),
-                    order_years: order_years.clone(),
-                    supply_costs: supply_costs.clone(),
-                    selected_partkeys: Vec::new(),
-                    partkey_offset: 0,
-                    partial: Q09ProfitPartial::default(),
-                }
-            },
-            q09_late_build_partkey_selection_view,
-            q09_late_consume_profit_payload_view,
-            |state, _metrics| {
-                if state.partkey_offset != state.selected_partkeys.len() {
-                    return Err(DodamError::UnsupportedSql(
-                        "Q09 row selection payload mismatch".to_string(),
-                    ));
-                }
-                Ok(Some(state.partial))
-            },
-        )
-        .await?
-    else {
-        return Ok(None);
-    };
-    let mut partial = Q09ProfitPartial::default();
-    let mut metrics = LateMaterializedMetrics::default();
-    for chunk in chunks {
-        partial.merge(chunk.output);
-        metrics.add(chunk.metrics);
-    }
-    q09_log_late_materialized_profile(metrics, q09_late_materialized_row_group_chunk());
-    Ok(Some(partial))
-}
-
-fn q09_late_materialized_row_group_chunk() -> usize {
-    std::env::var("DODAM_Q09_LATE_ROW_GROUP_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(2)
-}
-
-fn q09_late_materialized_max_selected_ratio() -> f64 {
-    std::env::var("DODAM_Q09_LATE_MAX_SELECTED_RATIO")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.20)
-}
-
-fn q09_late_materialized_max_selector_run_ratio() -> f64 {
-    std::env::var("DODAM_Q09_LATE_MAX_SELECTOR_RUN_RATIO")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.20)
-}
-
-fn q09_log_late_materialized_profile(metrics: LateMaterializedMetrics, row_group_chunk: usize) {
-    if !tpch_profile_enabled() {
-        return;
-    }
-    let ratio = if metrics.total_rows == 0 {
-        0.0
-    } else {
-        metrics.selected_rows as f64 / metrics.total_rows as f64
-    };
-    eprintln!(
-        "[dodam:tpch-profile] Q09 profit: late_materialized rows={} selected={} ratio={:.6} selector_runs={} row_group_chunk={}",
-        metrics.total_rows, metrics.selected_rows, ratio, metrics.selector_runs, row_group_chunk
-    );
-}
-
-struct Q09LateProfitState {
-    part_keys: Arc<AdaptiveI64Set>,
-    supplier_nations: Arc<AdaptiveI64Map<i64>>,
-    order_years: Arc<Q09OrderYears>,
-    supply_costs: Arc<Q09SupplyCosts>,
-    selected_partkeys: Vec<i64>,
-    partkey_offset: usize,
-    partial: Q09ProfitPartial,
-}
-
-fn q09_late_build_partkey_selection_batch(
-    batch: RecordBatch,
-    selection: &mut LateSelectionBuilder,
-    state: &mut Q09LateProfitState,
-) -> Result<Option<()>> {
-    let Some(metrics) = i64_set_late_build_selection_batch_into(
-        batch,
-        "l_partkey",
-        &state.part_keys,
-        &mut state.selected_partkeys,
-        selection,
-    )?
-    else {
-        return Ok(None);
-    };
-    state.partial.profile.rows += metrics.total_rows;
-    state.partial.profile.part_hits += metrics.selected_rows;
-    Ok(Some(()))
-}
-
-fn q09_late_build_partkey_selection_view(
-    view: BatchView<'_>,
-    selection: &mut LateSelectionBuilder,
-    state: &mut Q09LateProfitState,
-) -> Result<Option<()>> {
-    if view.num_columns() == 1 {
-        let Some(partkeys) = view.i64_vector(0) else {
-            return Ok(None);
-        };
-        let dense_part_keys = state.part_keys.dense_contains_slice();
-        state.partial.profile.rows += partkeys.len();
-        if let Some(partkey_values) = partkeys.values_if_null_free() {
-            for &partkey in partkey_values {
-                let selected = state.part_keys.contains_cached(dense_part_keys, partkey);
-                selection.push(selected);
-                if selected {
-                    state.selected_partkeys.push(partkey);
-                    state.partial.profile.part_hits += 1;
-                }
-            }
-            return Ok(Some(()));
-        }
-        for row in 0..partkeys.len() {
-            let selected = !partkeys.is_null(row)
-                && state
-                    .part_keys
-                    .contains_cached(dense_part_keys, partkeys.value(row));
-            selection.push(selected);
-            if selected {
-                state.selected_partkeys.push(partkeys.value(row));
-                state.partial.profile.part_hits += 1;
-            }
-        }
-        return Ok(Some(()));
-    }
-    let Some(batch) = view.try_record_batch() else {
-        return Ok(None);
-    };
-    q09_late_build_partkey_selection_batch(batch.clone(), selection, state)
-}
-
-fn q09_late_consume_profit_payload_batch(
-    batch: RecordBatch,
-    state: &mut Q09LateProfitState,
-) -> Result<Option<()>> {
-    let orderkeys = batch_column(&batch, "l_orderkey")?;
-    let suppkeys = batch_column(&batch, "l_suppkey")?;
-    let quantities = batch_column(&batch, "l_quantity")?;
-    let extendedprices = batch_column(&batch, "l_extendedprice")?;
-    let discounts = batch_column(&batch, "l_discount")?;
-    if let (
-        Some(orderkeys),
-        Some(suppkeys),
-        Some(quantities),
-        Some(extendedprices),
-        Some(discounts),
-    ) = (
-        orderkeys.as_any().downcast_ref::<Int64Array>(),
-        suppkeys.as_any().downcast_ref::<Int64Array>(),
-        decimal_input(quantities)?,
-        decimal_input(extendedprices)?,
-        decimal_input(discounts)?,
-    ) {
-        q09_late_consume_profit_decimal_batch(
-            orderkeys,
-            suppkeys,
-            quantities,
-            extendedprices,
-            discounts,
-            state,
-        )?;
-        return Ok(Some(()));
-    }
-    for row in 0..batch.num_rows() {
-        let Some(&partkey) = state.selected_partkeys.get(state.partkey_offset) else {
-            return Err(DodamError::UnsupportedSql(
-                "Q09 row selection payload overflow".to_string(),
-            ));
-        };
-        state.partkey_offset += 1;
-        let (Some(orderkey), Some(suppkey), Some(quantity), Some(extendedprice), Some(discount)) = (
-            numeric_i64_value(orderkeys, row)?,
-            numeric_i64_value(suppkeys, row)?,
-            numeric_f64_value(quantities, row)?,
-            numeric_f64_value(extendedprices, row)?,
-            numeric_f64_value(discounts, row)?,
-        ) else {
-            continue;
-        };
-        let Some(o_year) = q09_order_year_get(
-            &state.order_years,
-            state.order_years.dense_slice(),
-            orderkey,
-        ) else {
-            continue;
-        };
-        state.partial.profile.order_hits += 1;
-        let Some(nationkey) = state.supplier_nations.get(suppkey) else {
-            continue;
-        };
-        state.partial.profile.supplier_hits += 1;
-        let Some(supplycost) = state.supply_costs.get(partkey, suppkey) else {
-            continue;
-        };
-        state.partial.profile.supply_hits += 1;
-        let amount = extendedprice * (1.0 - discount) - supplycost * quantity;
-        state.partial.profile.amount_rows += 1;
-        state.partial.groups.add(nationkey, o_year, amount);
-    }
-    Ok(Some(()))
-}
-
-fn q09_late_consume_profit_payload_view(
-    view: BatchView<'_>,
-    state: &mut Q09LateProfitState,
-) -> Result<Option<()>> {
-    if view.num_columns() == 5
-        && let (
-            Some(orderkeys),
-            Some(suppkeys),
-            Some(quantities),
-            Some(extendedprices),
-            Some(discounts),
-        ) = (
-            view.i64_vector(0),
-            view.i64_vector(1),
-            view.decimal128_vector(2),
-            view.decimal128_vector(3),
-            view.decimal128_vector(4),
-        )
-    {
-        q09_late_consume_profit_decimal_view(
-            orderkeys,
-            suppkeys,
-            quantities,
-            extendedprices,
-            discounts,
-            state,
-        )?;
-        return Ok(Some(()));
-    }
-    let Some(batch) = view.try_record_batch() else {
-        return Ok(None);
-    };
-    q09_late_consume_profit_payload_batch(batch.clone(), state)
-}
-
-fn q09_late_consume_profit_decimal_batch(
-    orderkeys: &Int64Array,
-    suppkeys: &Int64Array,
-    quantities: DecimalInput<'_>,
-    extendedprices: DecimalInput<'_>,
-    discounts: DecimalInput<'_>,
-    state: &mut Q09LateProfitState,
-) -> Result<()> {
-    let dense_order_years = state.order_years.dense_slice();
-    let quantity_values = quantities.raw_values();
-    let extendedprice_values = extendedprices.raw_values();
-    let discount_values = discounts.raw_values();
-    let discount_scale = discounts.scale;
-    let revenue_scale = 1.0 / (extendedprices.scale * discount_scale);
-    let quantity_scale = 1.0 / quantities.scale;
-    if orderkeys.null_count() == 0
-        && suppkeys.null_count() == 0
-        && quantities.null_count() == 0
-        && extendedprices.null_count() == 0
-        && discounts.null_count() == 0
-    {
-        let orderkey_values = orderkeys.values().as_ref();
-        let suppkey_values = suppkeys.values().as_ref();
-        for row in 0..orderkeys.len() {
-            let Some(&partkey) = state.selected_partkeys.get(state.partkey_offset) else {
-                return Err(DodamError::UnsupportedSql(
-                    "Q09 row selection payload overflow".to_string(),
-                ));
-            };
-            state.partkey_offset += 1;
-            let orderkey = orderkey_values[row];
-            let suppkey = suppkey_values[row];
-            let Some(o_year) = q09_order_year_get(&state.order_years, dense_order_years, orderkey)
-            else {
-                continue;
-            };
-            state.partial.profile.order_hits += 1;
-            let Some(nationkey) = state.supplier_nations.get(suppkey) else {
-                continue;
-            };
-            state.partial.profile.supplier_hits += 1;
-            let Some(supplycost) = state.supply_costs.get(partkey, suppkey) else {
-                continue;
-            };
-            state.partial.profile.supply_hits += 1;
-            let amount = (extendedprice_values[row] as f64)
-                * (discount_scale - discount_values[row] as f64)
-                * revenue_scale
-                - supplycost * (quantity_values[row] as f64) * quantity_scale;
-            state.partial.profile.amount_rows += 1;
-            state.partial.groups.add(nationkey, o_year, amount);
-        }
-        return Ok(());
-    }
-    for row in 0..orderkeys.len() {
-        let Some(&partkey) = state.selected_partkeys.get(state.partkey_offset) else {
-            return Err(DodamError::UnsupportedSql(
-                "Q09 row selection payload overflow".to_string(),
-            ));
-        };
-        state.partkey_offset += 1;
-        if orderkeys.is_null(row)
-            || suppkeys.is_null(row)
-            || quantities.is_null(row)
-            || extendedprices.is_null(row)
-            || discounts.is_null(row)
-        {
-            continue;
-        }
-        let orderkey = orderkeys.value(row);
-        let suppkey = suppkeys.value(row);
-        let Some(o_year) = q09_order_year_get(&state.order_years, dense_order_years, orderkey)
-        else {
-            continue;
-        };
-        state.partial.profile.order_hits += 1;
-        let Some(nationkey) = state.supplier_nations.get(suppkey) else {
-            continue;
-        };
-        state.partial.profile.supplier_hits += 1;
-        let Some(supplycost) = state.supply_costs.get(partkey, suppkey) else {
-            continue;
-        };
-        state.partial.profile.supply_hits += 1;
-        let amount = (extendedprice_values[row] as f64)
-            * (discount_scale - discount_values[row] as f64)
-            * revenue_scale
-            - supplycost * (quantity_values[row] as f64) * quantity_scale;
-        state.partial.profile.amount_rows += 1;
-        state.partial.groups.add(nationkey, o_year, amount);
-    }
-    Ok(())
-}
-
-fn q09_late_consume_profit_decimal_view(
-    orderkeys: I64VectorView<'_>,
-    suppkeys: I64VectorView<'_>,
-    quantities: Decimal128VectorView<'_>,
-    extendedprices: Decimal128VectorView<'_>,
-    discounts: Decimal128VectorView<'_>,
-    state: &mut Q09LateProfitState,
-) -> Result<()> {
-    let dense_order_years = state.order_years.dense_slice();
-    let quantity_values = quantities.raw_values();
-    let extendedprice_values = extendedprices.raw_values();
-    let discount_values = discounts.raw_values();
-    let discount_scale = discounts.scale();
-    let revenue_scale = 1.0 / (extendedprices.scale() * discount_scale);
-    let quantity_scale = 1.0 / quantities.scale();
-    if let (Some(orderkey_values), Some(suppkey_values)) = (
-        orderkeys.values_if_null_free(),
-        suppkeys.values_if_null_free(),
-    ) && quantities.null_count() == 0
-        && extendedprices.null_count() == 0
-        && discounts.null_count() == 0
-    {
-        for row in 0..orderkey_values.len() {
-            let Some(&partkey) = state.selected_partkeys.get(state.partkey_offset) else {
-                return Err(DodamError::UnsupportedSql(
-                    "Q09 row selection payload overflow".to_string(),
-                ));
-            };
-            state.partkey_offset += 1;
-            let orderkey = orderkey_values[row];
-            let suppkey = suppkey_values[row];
-            let Some(o_year) = q09_order_year_get(&state.order_years, dense_order_years, orderkey)
-            else {
-                continue;
-            };
-            state.partial.profile.order_hits += 1;
-            let Some(nationkey) = state.supplier_nations.get(suppkey) else {
-                continue;
-            };
-            state.partial.profile.supplier_hits += 1;
-            let Some(supplycost) = state.supply_costs.get(partkey, suppkey) else {
-                continue;
-            };
-            state.partial.profile.supply_hits += 1;
-            let amount = (extendedprice_values[row] as f64)
-                * (discount_scale - discount_values[row] as f64)
-                * revenue_scale
-                - supplycost * (quantity_values[row] as f64) * quantity_scale;
-            state.partial.profile.amount_rows += 1;
-            state.partial.groups.add(nationkey, o_year, amount);
-        }
-        return Ok(());
-    }
-    for row in 0..orderkeys.len() {
-        let Some(&partkey) = state.selected_partkeys.get(state.partkey_offset) else {
-            return Err(DodamError::UnsupportedSql(
-                "Q09 row selection payload overflow".to_string(),
-            ));
-        };
-        state.partkey_offset += 1;
-        if orderkeys.is_null(row)
-            || suppkeys.is_null(row)
-            || quantities.is_null(row)
-            || extendedprices.is_null(row)
-            || discounts.is_null(row)
-        {
-            continue;
-        }
-        let orderkey = orderkeys.value(row);
-        let suppkey = suppkeys.value(row);
-        let Some(o_year) = q09_order_year_get(&state.order_years, dense_order_years, orderkey)
-        else {
-            continue;
-        };
-        state.partial.profile.order_hits += 1;
-        let Some(nationkey) = state.supplier_nations.get(suppkey) else {
-            continue;
-        };
-        state.partial.profile.supplier_hits += 1;
-        let Some(supplycost) = state.supply_costs.get(partkey, suppkey) else {
-            continue;
-        };
-        state.partial.profile.supply_hits += 1;
-        let amount = extendedprices.value(row) * (1.0 - discounts.value(row))
-            - supplycost * quantities.value(row);
-        state.partial.profile.amount_rows += 1;
-        state.partial.groups.add(nationkey, o_year, amount);
-    }
-    Ok(())
-}
-
 #[derive(Default)]
 struct Q09ProfitPartial {
     groups: Q09ProfitGroups,
@@ -1475,12 +885,23 @@ impl Q09ProfitPartial {
 
 #[derive(Default)]
 struct Q09ProfitGroups {
+    dense: Vec<f64>,
     packed: FastHashMap<u64, f64>,
     fallback: FastHashMap<(i64, i32), f64>,
 }
 
 impl Q09ProfitGroups {
     fn add(&mut self, nationkey: i64, year: i32, amount: f64) {
+        if let Some(slot) = q09_dense_profit_group_slot(nationkey, year) {
+            if self.dense.is_empty() {
+                self.dense.resize(
+                    Q09_DENSE_PROFIT_GROUP_NATIONS * Q09_DENSE_PROFIT_GROUP_YEARS,
+                    0.0,
+                );
+            }
+            self.dense[slot] += amount;
+            return;
+        }
         if let Some(key) = q09_pack_profit_group_key(nationkey, year) {
             *self.packed.entry(key).or_insert(0.0) += amount;
         } else {
@@ -1489,6 +910,17 @@ impl Q09ProfitGroups {
     }
 
     fn merge(&mut self, other: Self) {
+        if !other.dense.is_empty() {
+            if self.dense.is_empty() {
+                self.dense.resize(
+                    Q09_DENSE_PROFIT_GROUP_NATIONS * Q09_DENSE_PROFIT_GROUP_YEARS,
+                    0.0,
+                );
+            }
+            for (slot, amount) in other.dense.into_iter().enumerate() {
+                self.dense[slot] += amount;
+            }
+        }
         for (key, amount) in other.packed {
             *self.packed.entry(key).or_insert(0.0) += amount;
         }
@@ -1496,11 +928,41 @@ impl Q09ProfitGroups {
     }
 
     fn into_iter(self) -> impl Iterator<Item = ((i64, i32), f64)> {
-        self.packed
+        let dense = self
+            .dense
             .into_iter()
-            .map(|(key, amount)| (q09_unpack_profit_group_key(key), amount))
-            .chain(self.fallback)
+            .enumerate()
+            .filter(|(_, amount)| *amount != 0.0)
+            .map(|(slot, amount)| (q09_unpack_dense_profit_group_slot(slot), amount));
+        dense.chain(
+            self.packed
+                .into_iter()
+                .map(|(key, amount)| (q09_unpack_profit_group_key(key), amount))
+                .chain(self.fallback),
+        )
     }
+}
+
+const Q09_DENSE_PROFIT_GROUP_NATIONS: usize = 64;
+const Q09_DENSE_PROFIT_GROUP_YEAR_BASE: i32 = 1990;
+const Q09_DENSE_PROFIT_GROUP_YEARS: usize = 32;
+
+fn q09_dense_profit_group_slot(nationkey: i64, year: i32) -> Option<usize> {
+    let nation = usize::try_from(nationkey).ok()?;
+    if nation >= Q09_DENSE_PROFIT_GROUP_NATIONS {
+        return None;
+    }
+    let year = usize::try_from(year.checked_sub(Q09_DENSE_PROFIT_GROUP_YEAR_BASE)?).ok()?;
+    if year >= Q09_DENSE_PROFIT_GROUP_YEARS {
+        return None;
+    }
+    Some(nation * Q09_DENSE_PROFIT_GROUP_YEARS + year)
+}
+
+fn q09_unpack_dense_profit_group_slot(slot: usize) -> (i64, i32) {
+    let nation = slot / Q09_DENSE_PROFIT_GROUP_YEARS;
+    let year = Q09_DENSE_PROFIT_GROUP_YEAR_BASE + (slot % Q09_DENSE_PROFIT_GROUP_YEARS) as i32;
+    (nation as i64, year)
 }
 
 fn q09_pack_profit_group_key(nationkey: i64, year: i32) -> Option<u64> {
@@ -1525,6 +987,17 @@ struct Q09ProfitProfile {
     supplier_nanos: u64,
     supply_nanos: u64,
     amount_nanos: u64,
+    direct_i64_packed_dense_batches: usize,
+    direct_i64_selected_packed_dense_batches: usize,
+    direct_i64_fallback_batches: usize,
+    direct_i64_selected_fallback_batches: usize,
+    view_i64_packed_dense_batches: usize,
+    view_i64_fallback_batches: usize,
+    view_i128_packed_dense_batches: usize,
+    view_i128_fallback_batches: usize,
+    batch_i128_packed_dense_batches: usize,
+    batch_i128_fallback_batches: usize,
+    batch_null_fallback_batches: usize,
 }
 
 impl Q09ProfitProfile {
@@ -1540,6 +1013,39 @@ impl Q09ProfitProfile {
         self.supplier_nanos = self.supplier_nanos.saturating_add(other.supplier_nanos);
         self.supply_nanos = self.supply_nanos.saturating_add(other.supply_nanos);
         self.amount_nanos = self.amount_nanos.saturating_add(other.amount_nanos);
+        self.direct_i64_packed_dense_batches = self
+            .direct_i64_packed_dense_batches
+            .saturating_add(other.direct_i64_packed_dense_batches);
+        self.direct_i64_selected_packed_dense_batches = self
+            .direct_i64_selected_packed_dense_batches
+            .saturating_add(other.direct_i64_selected_packed_dense_batches);
+        self.direct_i64_fallback_batches = self
+            .direct_i64_fallback_batches
+            .saturating_add(other.direct_i64_fallback_batches);
+        self.direct_i64_selected_fallback_batches = self
+            .direct_i64_selected_fallback_batches
+            .saturating_add(other.direct_i64_selected_fallback_batches);
+        self.view_i64_packed_dense_batches = self
+            .view_i64_packed_dense_batches
+            .saturating_add(other.view_i64_packed_dense_batches);
+        self.view_i64_fallback_batches = self
+            .view_i64_fallback_batches
+            .saturating_add(other.view_i64_fallback_batches);
+        self.view_i128_packed_dense_batches = self
+            .view_i128_packed_dense_batches
+            .saturating_add(other.view_i128_packed_dense_batches);
+        self.view_i128_fallback_batches = self
+            .view_i128_fallback_batches
+            .saturating_add(other.view_i128_fallback_batches);
+        self.batch_i128_packed_dense_batches = self
+            .batch_i128_packed_dense_batches
+            .saturating_add(other.batch_i128_packed_dense_batches);
+        self.batch_i128_fallback_batches = self
+            .batch_i128_fallback_batches
+            .saturating_add(other.batch_i128_fallback_batches);
+        self.batch_null_fallback_batches = self
+            .batch_null_fallback_batches
+            .saturating_add(other.batch_null_fallback_batches);
     }
 }
 
@@ -1561,12 +1067,25 @@ fn q09_log_profit_profile(profile: &Q09ProfitProfile) {
         sql_nanos_to_millis(profile.supply_nanos),
         sql_nanos_to_millis(profile.amount_nanos),
     );
+    eprintln!(
+        "[dodam:tpch-profile] Q09 profit branches: direct_i64_packed_dense={} direct_i64_selected_packed_dense={} direct_i64_fallback={} direct_i64_selected_fallback={} view_i64_packed_dense={} view_i64_fallback={} view_i128_packed_dense={} view_i128_fallback={} batch_i128_packed_dense={} batch_i128_fallback={} batch_null_fallback={}",
+        profile.direct_i64_packed_dense_batches,
+        profile.direct_i64_selected_packed_dense_batches,
+        profile.direct_i64_fallback_batches,
+        profile.direct_i64_selected_fallback_batches,
+        profile.view_i64_packed_dense_batches,
+        profile.view_i64_fallback_batches,
+        profile.view_i128_packed_dense_batches,
+        profile.view_i128_fallback_batches,
+        profile.batch_i128_packed_dense_batches,
+        profile.batch_i128_fallback_batches,
+        profile.batch_null_fallback_batches,
+    );
 }
 
 fn q09_profit_batch(
     batch: RecordBatch,
     part_keys: &AdaptiveI64Set,
-    supplier_nations: &AdaptiveI64Map<i64>,
     order_years: &Q09OrderYears,
     supply_costs: &Q09SupplyCosts,
 ) -> Result<Q09ProfitPartial> {
@@ -1584,7 +1103,6 @@ fn q09_profit_batch(
         extendedprices,
         discounts,
         part_keys,
-        supplier_nations,
         order_years,
         supply_costs,
     )? {
@@ -1607,7 +1125,7 @@ fn q09_profit_batch(
             continue;
         };
         let started = collect_profile.then(Instant::now);
-        let part_hit = q09_part_key_contains(part_keys, dense_part_keys, partkey);
+        let part_hit = part_keys.contains_cached(dense_part_keys, partkey);
         if let Some(started) = started {
             profile.part_nanos = profile
                 .part_nanos
@@ -1633,19 +1151,6 @@ fn q09_profit_batch(
             profile.order_hits += 1;
         }
         let started = collect_profile.then(Instant::now);
-        let nationkey = supplier_nations.get(suppkey);
-        if let Some(started) = started {
-            profile.supplier_nanos = profile
-                .supplier_nanos
-                .saturating_add(sql_elapsed_nanos(started));
-        }
-        let Some(nationkey) = nationkey else {
-            continue;
-        };
-        if collect_profile {
-            profile.supplier_hits += 1;
-        }
-        let started = collect_profile.then(Instant::now);
         let supplycost = supply_costs.get(partkey, suppkey);
         if let Some(started) = started {
             profile.supply_nanos = profile
@@ -1655,6 +1160,10 @@ fn q09_profit_batch(
         let Some(supplycost) = supplycost else {
             continue;
         };
+        let nationkey = supplycost.nationkey;
+        if collect_profile {
+            profile.supplier_hits += 1;
+        }
         if collect_profile {
             profile.supply_hits += 1;
         }
@@ -1666,7 +1175,12 @@ fn q09_profit_batch(
             continue;
         };
         let started = collect_profile.then(Instant::now);
-        let amount = extendedprice * (1.0 - discount) - supplycost * quantity;
+        let amount = discounted_revenue_minus_product(
+            extendedprice,
+            discount,
+            supplycost.supplycost,
+            quantity,
+        );
         if let Some(started) = started {
             profile.amount_nanos = profile
                 .amount_nanos
@@ -1680,43 +1194,9 @@ fn q09_profit_batch(
     Ok(Q09ProfitPartial { groups, profile })
 }
 
-#[allow(dead_code)]
-fn q09_profit_projected_batch(
-    batch: RecordBatch,
-    part_keys: &AdaptiveI64Set,
-    supplier_nations: &AdaptiveI64Map<i64>,
-    order_years: &Q09OrderYears,
-    supply_costs: &Q09SupplyCosts,
-) -> Result<Q09ProfitPartial> {
-    if batch.num_columns() == 6
-        && let Some(groups) = q09_profit_decimal_batch(
-            batch.column(0),
-            batch.column(1),
-            batch.column(2),
-            batch.column(3),
-            batch.column(4),
-            batch.column(5),
-            part_keys,
-            supplier_nations,
-            order_years,
-            supply_costs,
-        )?
-    {
-        return Ok(groups);
-    }
-    q09_profit_batch(
-        batch,
-        part_keys,
-        supplier_nations,
-        order_years,
-        supply_costs,
-    )
-}
-
 fn q09_profit_projected_view(
     view: BatchView<'_>,
     part_keys: &AdaptiveI64Set,
-    supplier_nations: &AdaptiveI64Map<i64>,
     order_years: &Q09OrderYears,
     supply_costs: &Q09SupplyCosts,
 ) -> Result<Q09ProfitPartial> {
@@ -1744,7 +1224,6 @@ fn q09_profit_projected_view(
             extendedprices,
             discounts,
             part_keys,
-            supplier_nations,
             order_years,
             supply_costs,
         )
@@ -1754,21 +1233,7 @@ fn q09_profit_projected_view(
     let Some(batch) = view.try_record_batch() else {
         return Ok(Q09ProfitPartial::default());
     };
-    q09_profit_batch(
-        batch.clone(),
-        part_keys,
-        supplier_nations,
-        order_years,
-        supply_costs,
-    )
-}
-
-fn q09_part_key_contains(
-    part_keys: &AdaptiveI64Set,
-    dense_part_keys: Option<&[bool]>,
-    partkey: i64,
-) -> bool {
-    part_keys.contains_cached(dense_part_keys, partkey)
+    q09_profit_batch(batch.clone(), part_keys, order_years, supply_costs)
 }
 
 fn q09_order_year_get(
@@ -1783,15 +1248,6 @@ fn q09_order_year_get(
     order_years.get(orderkey)
 }
 
-fn q09_matched_index_enabled() -> bool {
-    if std::env::var("DODAM_Q09_ENABLE_MATCHED_INDEX")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-    {
-        return true;
-    }
-    false
-}
-
 fn q09_profit_decimal_batch(
     orderkeys: &ArrayRef,
     partkeys: &ArrayRef,
@@ -1800,7 +1256,6 @@ fn q09_profit_decimal_batch(
     extendedprices: &ArrayRef,
     discounts: &ArrayRef,
     part_keys: &AdaptiveI64Set,
-    supplier_nations: &AdaptiveI64Map<i64>,
     order_years: &Q09OrderYears,
     supply_costs: &Q09SupplyCosts,
 ) -> Result<Option<Q09ProfitPartial>> {
@@ -1827,6 +1282,7 @@ fn q09_profit_decimal_batch(
     let mut profile = Q09ProfitProfile::default();
     let collect_profile = tpch_profile_enabled();
     let dense_part_keys = part_keys.dense_contains_slice();
+    let dense_part_words = part_keys.dense_word_slice();
     let dense_order_years = order_years.dense_slice();
     let quantity_values = quantities.raw_values();
     let extendedprice_values = extendedprices.raw_values();
@@ -1844,10 +1300,10 @@ fn q09_profit_decimal_batch(
         let orderkey_values = orderkeys.values().as_ref();
         let partkey_values = partkeys.values().as_ref();
         let suppkey_values = suppkeys.values().as_ref();
-        if q09_matched_index_enabled()
-            && let Some(dense_part_keys) = dense_part_keys
+        if let (Some(dense_part_keys), Some(dense_order_years), Q09SupplyCosts::PackedU64(costs)) =
+            (dense_part_keys, dense_order_years, supply_costs)
         {
-            return Ok(Some(q09_profit_decimal_batch_matched_index(
+            let mut partial = q09_profit_decimal_packed_dense_loop_with_words(
                 orderkey_values,
                 partkey_values,
                 suppkey_values,
@@ -1858,12 +1314,18 @@ fn q09_profit_decimal_batch(
                 revenue_scale,
                 quantity_scale,
                 dense_part_keys,
-                supplier_nations,
-                order_years,
+                dense_part_words,
                 dense_order_years,
-                supply_costs,
+                costs,
                 collect_profile,
-            )));
+            );
+            if collect_profile {
+                partial.profile.batch_i128_packed_dense_batches = 1;
+            }
+            return Ok(Some(partial));
+        }
+        if collect_profile {
+            profile.batch_i128_fallback_batches = 1;
         }
         for row in 0..orderkeys.len() {
             if collect_profile {
@@ -1871,7 +1333,7 @@ fn q09_profit_decimal_batch(
             }
             let partkey = partkey_values[row];
             let started = collect_profile.then(Instant::now);
-            let part_hit = q09_part_key_contains(part_keys, dense_part_keys, partkey);
+            let part_hit = part_keys.contains_cached(dense_part_keys, partkey);
             if let Some(started) = started {
                 profile.part_nanos = profile
                     .part_nanos
@@ -1899,19 +1361,6 @@ fn q09_profit_decimal_batch(
                 profile.order_hits += 1;
             }
             let started = collect_profile.then(Instant::now);
-            let nationkey = supplier_nations.get(suppkey);
-            if let Some(started) = started {
-                profile.supplier_nanos = profile
-                    .supplier_nanos
-                    .saturating_add(sql_elapsed_nanos(started));
-            }
-            let Some(nationkey) = nationkey else {
-                continue;
-            };
-            if collect_profile {
-                profile.supplier_hits += 1;
-            }
-            let started = collect_profile.then(Instant::now);
             let supplycost = supply_costs.get(partkey, suppkey);
             if let Some(started) = started {
                 profile.supply_nanos = profile
@@ -1921,6 +1370,10 @@ fn q09_profit_decimal_batch(
             let Some(supplycost) = supplycost else {
                 continue;
             };
+            let nationkey = supplycost.nationkey;
+            if collect_profile {
+                profile.supplier_hits += 1;
+            }
             if collect_profile {
                 profile.supply_hits += 1;
             }
@@ -1928,7 +1381,7 @@ fn q09_profit_decimal_batch(
             let amount = (extendedprice_values[row] as f64)
                 * (discount_scale - discount_values[row] as f64)
                 * revenue_scale
-                - supplycost * (quantity_values[row] as f64) * quantity_scale;
+                - supplycost.supplycost * (quantity_values[row] as f64) * quantity_scale;
             if let Some(started) = started {
                 profile.amount_nanos = profile
                     .amount_nanos
@@ -1940,6 +1393,9 @@ fn q09_profit_decimal_batch(
             groups.add(nationkey, o_year, amount);
         }
         return Ok(Some(Q09ProfitPartial { groups, profile }));
+    }
+    if collect_profile {
+        profile.batch_null_fallback_batches = 1;
     }
     for row in 0..orderkeys.len() {
         if collect_profile {
@@ -1956,7 +1412,7 @@ fn q09_profit_decimal_batch(
         }
         let partkey = partkeys.value(row);
         let started = collect_profile.then(Instant::now);
-        let part_hit = q09_part_key_contains(part_keys, dense_part_keys, partkey);
+        let part_hit = part_keys.contains_cached(dense_part_keys, partkey);
         if let Some(started) = started {
             profile.part_nanos = profile
                 .part_nanos
@@ -1984,19 +1440,6 @@ fn q09_profit_decimal_batch(
             profile.order_hits += 1;
         }
         let started = collect_profile.then(Instant::now);
-        let nationkey = supplier_nations.get(suppkey);
-        if let Some(started) = started {
-            profile.supplier_nanos = profile
-                .supplier_nanos
-                .saturating_add(sql_elapsed_nanos(started));
-        }
-        let Some(nationkey) = nationkey else {
-            continue;
-        };
-        if collect_profile {
-            profile.supplier_hits += 1;
-        }
-        let started = collect_profile.then(Instant::now);
         let supplycost = supply_costs.get(partkey, suppkey);
         if let Some(started) = started {
             profile.supply_nanos = profile
@@ -2006,6 +1449,10 @@ fn q09_profit_decimal_batch(
         let Some(supplycost) = supplycost else {
             continue;
         };
+        let nationkey = supplycost.nationkey;
+        if collect_profile {
+            profile.supplier_hits += 1;
+        }
         if collect_profile {
             profile.supply_hits += 1;
         }
@@ -2013,7 +1460,7 @@ fn q09_profit_decimal_batch(
         let amount = (extendedprice_values[row] as f64)
             * (discount_scale - discount_values[row] as f64)
             * revenue_scale
-            - supplycost * (quantity_values[row] as f64) * quantity_scale;
+            - supplycost.supplycost * (quantity_values[row] as f64) * quantity_scale;
         if let Some(started) = started {
             profile.amount_nanos = profile
                 .amount_nanos
@@ -2036,7 +1483,6 @@ fn q09_profit_decimal_view(
     extendedprices: Decimal128VectorView<'_>,
     discounts: Decimal128VectorView<'_>,
     part_keys: &AdaptiveI64Set,
-    supplier_nations: &AdaptiveI64Map<i64>,
     order_years: &Q09OrderYears,
     supply_costs: &Q09SupplyCosts,
 ) -> Option<Q09ProfitPartial> {
@@ -2044,7 +1490,73 @@ fn q09_profit_decimal_view(
     let mut profile = Q09ProfitProfile::default();
     let collect_profile = tpch_profile_enabled();
     let dense_part_keys = part_keys.dense_contains_slice();
+    let dense_part_words = part_keys.dense_word_slice();
     let dense_order_years = order_years.dense_slice();
+    if let (
+        Some(orderkey_values),
+        Some(partkey_values),
+        Some(suppkey_values),
+        Some(quantity_values),
+        Some(extendedprice_values),
+        Some(discount_values),
+    ) = (
+        orderkeys.values_if_null_free(),
+        partkeys.values_if_null_free(),
+        suppkeys.values_if_null_free(),
+        quantities.raw_i64_values(),
+        extendedprices.raw_i64_values(),
+        discounts.raw_i64_values(),
+    ) && quantities.null_count() == 0
+        && extendedprices.null_count() == 0
+        && discounts.null_count() == 0
+    {
+        let discount_scale = discounts.scale();
+        let revenue_scale = 1.0 / (extendedprices.scale() * discount_scale);
+        let quantity_scale = 1.0 / quantities.scale();
+        if let (Some(dense_part_keys), Some(dense_order_years), Q09SupplyCosts::PackedU64(costs)) =
+            (dense_part_keys, dense_order_years, supply_costs)
+        {
+            let mut partial = q09_profit_decimal_i64_packed_dense_loop_with_words(
+                orderkey_values,
+                partkey_values,
+                suppkey_values,
+                quantity_values,
+                extendedprice_values,
+                discount_values,
+                discount_scale,
+                revenue_scale,
+                quantity_scale,
+                dense_part_keys,
+                dense_part_words,
+                dense_order_years,
+                costs,
+                collect_profile,
+            );
+            if collect_profile {
+                partial.profile.view_i64_packed_dense_batches = 1;
+            }
+            return Some(partial);
+        }
+        let mut partial = q09_profit_decimal_i64_view_loop(
+            orderkey_values,
+            partkey_values,
+            suppkey_values,
+            quantity_values,
+            extendedprice_values,
+            discount_values,
+            discount_scale,
+            revenue_scale,
+            quantity_scale,
+            part_keys,
+            order_years,
+            supply_costs,
+            collect_profile,
+        );
+        if collect_profile {
+            partial.profile.view_i64_fallback_batches = 1;
+        }
+        return Some(partial);
+    }
     let quantity_values = quantities.raw_values();
     let extendedprice_values = extendedprices.raw_values();
     let discount_values = discounts.raw_values();
@@ -2059,10 +1571,10 @@ fn q09_profit_decimal_view(
         && extendedprices.null_count() == 0
         && discounts.null_count() == 0
     {
-        if q09_matched_index_enabled()
-            && let Some(dense_part_keys) = dense_part_keys
+        if let (Some(dense_part_keys), Some(dense_order_years), Q09SupplyCosts::PackedU64(costs)) =
+            (dense_part_keys, dense_order_years, supply_costs)
         {
-            return Some(q09_profit_decimal_batch_matched_index(
+            let mut partial = q09_profit_decimal_packed_dense_loop_with_words(
                 orderkey_values,
                 partkey_values,
                 suppkey_values,
@@ -2073,12 +1585,18 @@ fn q09_profit_decimal_view(
                 revenue_scale,
                 quantity_scale,
                 dense_part_keys,
-                supplier_nations,
-                order_years,
+                dense_part_words,
                 dense_order_years,
-                supply_costs,
+                costs,
                 collect_profile,
-            ));
+            );
+            if collect_profile {
+                partial.profile.view_i128_packed_dense_batches = 1;
+            }
+            return Some(partial);
+        }
+        if collect_profile {
+            profile.view_i128_fallback_batches = 1;
         }
         for row in 0..orderkey_values.len() {
             if collect_profile {
@@ -2086,7 +1604,7 @@ fn q09_profit_decimal_view(
             }
             let partkey = partkey_values[row];
             let started = collect_profile.then(Instant::now);
-            let part_hit = q09_part_key_contains(part_keys, dense_part_keys, partkey);
+            let part_hit = part_keys.contains_cached(dense_part_keys, partkey);
             if let Some(started) = started {
                 profile.part_nanos = profile
                     .part_nanos
@@ -2114,19 +1632,6 @@ fn q09_profit_decimal_view(
                 profile.order_hits += 1;
             }
             let started = collect_profile.then(Instant::now);
-            let nationkey = supplier_nations.get(suppkey);
-            if let Some(started) = started {
-                profile.supplier_nanos = profile
-                    .supplier_nanos
-                    .saturating_add(sql_elapsed_nanos(started));
-            }
-            let Some(nationkey) = nationkey else {
-                continue;
-            };
-            if collect_profile {
-                profile.supplier_hits += 1;
-            }
-            let started = collect_profile.then(Instant::now);
             let supplycost = supply_costs.get(partkey, suppkey);
             if let Some(started) = started {
                 profile.supply_nanos = profile
@@ -2136,6 +1641,10 @@ fn q09_profit_decimal_view(
             let Some(supplycost) = supplycost else {
                 continue;
             };
+            let nationkey = supplycost.nationkey;
+            if collect_profile {
+                profile.supplier_hits += 1;
+            }
             if collect_profile {
                 profile.supply_hits += 1;
             }
@@ -2143,7 +1652,7 @@ fn q09_profit_decimal_view(
             let amount = (extendedprice_values[row] as f64)
                 * (discount_scale - discount_values[row] as f64)
                 * revenue_scale
-                - supplycost * (quantity_values[row] as f64) * quantity_scale;
+                - supplycost.supplycost * (quantity_values[row] as f64) * quantity_scale;
             if let Some(started) = started {
                 profile.amount_nanos = profile
                     .amount_nanos
@@ -2155,6 +1664,9 @@ fn q09_profit_decimal_view(
             groups.add(nationkey, o_year, amount);
         }
         return Some(Q09ProfitPartial { groups, profile });
+    }
+    if collect_profile {
+        profile.view_i128_fallback_batches = 1;
     }
     for row in 0..orderkeys.len() {
         if collect_profile {
@@ -2171,7 +1683,7 @@ fn q09_profit_decimal_view(
         }
         let partkey = partkeys.value(row);
         let started = collect_profile.then(Instant::now);
-        let part_hit = q09_part_key_contains(part_keys, dense_part_keys, partkey);
+        let part_hit = part_keys.contains_cached(dense_part_keys, partkey);
         if let Some(started) = started {
             profile.part_nanos = profile
                 .part_nanos
@@ -2199,19 +1711,6 @@ fn q09_profit_decimal_view(
             profile.order_hits += 1;
         }
         let started = collect_profile.then(Instant::now);
-        let nationkey = supplier_nations.get(suppkey);
-        if let Some(started) = started {
-            profile.supplier_nanos = profile
-                .supplier_nanos
-                .saturating_add(sql_elapsed_nanos(started));
-        }
-        let Some(nationkey) = nationkey else {
-            continue;
-        };
-        if collect_profile {
-            profile.supplier_hits += 1;
-        }
-        let started = collect_profile.then(Instant::now);
         let supplycost = supply_costs.get(partkey, suppkey);
         if let Some(started) = started {
             profile.supply_nanos = profile
@@ -2221,12 +1720,16 @@ fn q09_profit_decimal_view(
         let Some(supplycost) = supplycost else {
             continue;
         };
+        let nationkey = supplycost.nationkey;
+        if collect_profile {
+            profile.supplier_hits += 1;
+        }
         if collect_profile {
             profile.supply_hits += 1;
         }
         let started = collect_profile.then(Instant::now);
         let amount = extendedprices.value(row) * (1.0 - discounts.value(row))
-            - supplycost * quantities.value(row);
+            - supplycost.supplycost * quantities.value(row);
         if let Some(started) = started {
             profile.amount_nanos = profile
                 .amount_nanos
@@ -2240,8 +1743,8 @@ fn q09_profit_decimal_view(
     Some(Q09ProfitPartial { groups, profile })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn q09_profit_decimal_batch_matched_index(
+#[allow(clippy::too_many_arguments, dead_code)]
+fn q09_profit_decimal_packed_dense_loop(
     orderkey_values: &[i64],
     partkey_values: &[i64],
     suppkey_values: &[i64],
@@ -2252,10 +1755,43 @@ fn q09_profit_decimal_batch_matched_index(
     revenue_scale: f64,
     quantity_scale: f64,
     dense_part_keys: &[bool],
-    supplier_nations: &AdaptiveI64Map<i64>,
-    order_years: &Q09OrderYears,
-    dense_order_years: Option<(&[i32], i64, i32)>,
-    supply_costs: &Q09SupplyCosts,
+    dense_order_years: (&[i32], i64, i32),
+    supply_costs: &FastHashMap<u64, Q09SupplyInfo>,
+    collect_profile: bool,
+) -> Q09ProfitPartial {
+    q09_profit_decimal_packed_dense_loop_with_words(
+        orderkey_values,
+        partkey_values,
+        suppkey_values,
+        quantity_values,
+        extendedprice_values,
+        discount_values,
+        discount_scale,
+        revenue_scale,
+        quantity_scale,
+        dense_part_keys,
+        None,
+        dense_order_years,
+        supply_costs,
+        collect_profile,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q09_profit_decimal_packed_dense_loop_with_words(
+    orderkey_values: &[i64],
+    partkey_values: &[i64],
+    suppkey_values: &[i64],
+    quantity_values: &[i128],
+    extendedprice_values: &[i128],
+    discount_values: &[i128],
+    discount_scale: f64,
+    revenue_scale: f64,
+    quantity_scale: f64,
+    dense_part_keys: &[bool],
+    dense_part_words: Option<&[u64]>,
+    dense_order_years: (&[i32], i64, i32),
+    supply_costs: &FastHashMap<u64, Q09SupplyInfo>,
     collect_profile: bool,
 ) -> Q09ProfitPartial {
     let mut groups = Q09ProfitGroups::default();
@@ -2263,83 +1799,200 @@ fn q09_profit_decimal_batch_matched_index(
     if collect_profile {
         profile.rows = partkey_values.len();
     }
-    let started = collect_profile.then(Instant::now);
-    let mut matched_rows = Vec::new();
-    for (row, partkey) in partkey_values.iter().copied().enumerate() {
-        let Some(index) = usize::try_from(partkey).ok() else {
+    let (order_year_values, order_year_base, order_year_missing) = dense_order_years;
+    for row in 0..partkey_values.len() {
+        let partkey = partkey_values[row];
+        if let Some(words) = dense_part_words {
+            if !crate::dense::adaptive_i64_words_contains(words, partkey) {
+                continue;
+            }
+        } else {
+            let Some(part_index) = usize::try_from(partkey).ok() else {
+                continue;
+            };
+            if !dense_part_keys.get(part_index).copied().unwrap_or(false) {
+                continue;
+            }
+        }
+        if collect_profile {
+            profile.part_hits += 1;
+        }
+
+        let orderkey = orderkey_values[row];
+        let Some(order_index) = orderkey
+            .checked_sub(order_year_base)
+            .and_then(|index| usize::try_from(index).ok())
+        else {
             continue;
         };
-        if dense_part_keys.get(index).copied().unwrap_or(false) {
-            matched_rows.push(row);
+        let Some(&o_year) = order_year_values.get(order_index) else {
+            continue;
+        };
+        if o_year == order_year_missing {
+            continue;
         }
-    }
-    if let Some(started) = started {
-        profile.part_nanos = profile
-            .part_nanos
-            .saturating_add(sql_elapsed_nanos(started));
-    }
-    if collect_profile {
-        profile.part_hits = matched_rows.len();
-    }
+        if collect_profile {
+            profile.order_hits += 1;
+        }
 
-    for row in matched_rows {
-        let started = collect_profile.then(Instant::now);
-        let o_year = q09_order_year_get(order_years, dense_order_years, orderkey_values[row]);
-        if let Some(started) = started {
-            profile.order_nanos = profile
-                .order_nanos
-                .saturating_add(sql_elapsed_nanos(started));
+        let Some(supply_key) = q09_pack_part_supp_key(partkey, suppkey_values[row]) else {
+            continue;
+        };
+        let Some(supplycost) = supply_costs.get(&supply_key).copied() else {
+            continue;
+        };
+        if collect_profile {
+            profile.supplier_hits += 1;
+            profile.supply_hits += 1;
         }
-        let Some(o_year) = o_year else {
+
+        let amount = (extendedprice_values[row] as f64)
+            * (discount_scale - discount_values[row] as f64)
+            * revenue_scale
+            - supplycost.supplycost * (quantity_values[row] as f64) * quantity_scale;
+        groups.add(supplycost.nationkey, o_year, amount);
+        if collect_profile {
+            profile.amount_rows += 1;
+        }
+    }
+    Q09ProfitPartial { groups, profile }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q09_profit_decimal_i64_packed_dense_loop_with_words(
+    orderkey_values: &[i64],
+    partkey_values: &[i64],
+    suppkey_values: &[i64],
+    quantity_values: &[i64],
+    extendedprice_values: &[i64],
+    discount_values: &[i64],
+    discount_scale: f64,
+    revenue_scale: f64,
+    quantity_scale: f64,
+    dense_part_keys: &[bool],
+    dense_part_words: Option<&[u64]>,
+    dense_order_years: (&[i32], i64, i32),
+    supply_costs: &FastHashMap<u64, Q09SupplyInfo>,
+    collect_profile: bool,
+) -> Q09ProfitPartial {
+    let mut groups = Q09ProfitGroups::default();
+    let mut profile = Q09ProfitProfile::default();
+    if collect_profile {
+        profile.rows = partkey_values.len();
+    }
+    let (order_year_values, order_year_base, order_year_missing) = dense_order_years;
+    for row in 0..partkey_values.len() {
+        let partkey = partkey_values[row];
+        if let Some(words) = dense_part_words {
+            if !crate::dense::adaptive_i64_words_contains(words, partkey) {
+                continue;
+            }
+        } else {
+            let Some(part_index) = usize::try_from(partkey).ok() else {
+                continue;
+            };
+            if !dense_part_keys.get(part_index).copied().unwrap_or(false) {
+                continue;
+            }
+        }
+        if collect_profile {
+            profile.part_hits += 1;
+        }
+
+        let orderkey = orderkey_values[row];
+        let Some(order_index) = orderkey
+            .checked_sub(order_year_base)
+            .and_then(|index| usize::try_from(index).ok())
+        else {
+            continue;
+        };
+        let Some(&o_year) = order_year_values.get(order_index) else {
+            continue;
+        };
+        if o_year == order_year_missing {
+            continue;
+        }
+        if collect_profile {
+            profile.order_hits += 1;
+        }
+
+        let Some(supply_key) = q09_pack_part_supp_key(partkey, suppkey_values[row]) else {
+            continue;
+        };
+        let Some(supplycost) = supply_costs.get(&supply_key).copied() else {
+            continue;
+        };
+        if collect_profile {
+            profile.supplier_hits += 1;
+            profile.supply_hits += 1;
+        }
+
+        let amount = (extendedprice_values[row] as f64)
+            * (discount_scale - discount_values[row] as f64)
+            * revenue_scale
+            - supplycost.supplycost * (quantity_values[row] as f64) * quantity_scale;
+        groups.add(supplycost.nationkey, o_year, amount);
+        if collect_profile {
+            profile.amount_rows += 1;
+        }
+    }
+    Q09ProfitPartial { groups, profile }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn q09_profit_decimal_i64_view_loop(
+    orderkey_values: &[i64],
+    partkey_values: &[i64],
+    suppkey_values: &[i64],
+    quantity_values: &[i64],
+    extendedprice_values: &[i64],
+    discount_values: &[i64],
+    discount_scale: f64,
+    revenue_scale: f64,
+    quantity_scale: f64,
+    part_keys: &AdaptiveI64Set,
+    order_years: &Q09OrderYears,
+    supply_costs: &Q09SupplyCosts,
+    collect_profile: bool,
+) -> Q09ProfitPartial {
+    let mut groups = Q09ProfitGroups::default();
+    let mut profile = Q09ProfitProfile::default();
+    let dense_part_keys = part_keys.dense_contains_slice();
+    let dense_order_years = order_years.dense_slice();
+    if collect_profile {
+        profile.rows = partkey_values.len();
+    }
+    for row in 0..partkey_values.len() {
+        let partkey = partkey_values[row];
+        if !part_keys.contains_cached(dense_part_keys, partkey) {
+            continue;
+        }
+        if collect_profile {
+            profile.part_hits += 1;
+        }
+        let Some(o_year) = q09_order_year_get(order_years, dense_order_years, orderkey_values[row])
+        else {
             continue;
         };
         if collect_profile {
             profile.order_hits += 1;
         }
-        let suppkey = suppkey_values[row];
-        let started = collect_profile.then(Instant::now);
-        let nationkey = supplier_nations.get(suppkey);
-        if let Some(started) = started {
-            profile.supplier_nanos = profile
-                .supplier_nanos
-                .saturating_add(sql_elapsed_nanos(started));
-        }
-        let Some(nationkey) = nationkey else {
+        let Some(supplycost) = supply_costs.get(partkey, suppkey_values[row]) else {
             continue;
         };
         if collect_profile {
             profile.supplier_hits += 1;
-        }
-        let partkey = partkey_values[row];
-        let started = collect_profile.then(Instant::now);
-        let supplycost = supply_costs.get(partkey, suppkey);
-        if let Some(started) = started {
-            profile.supply_nanos = profile
-                .supply_nanos
-                .saturating_add(sql_elapsed_nanos(started));
-        }
-        let Some(supplycost) = supplycost else {
-            continue;
-        };
-        if collect_profile {
             profile.supply_hits += 1;
         }
-        let started = collect_profile.then(Instant::now);
         let amount = (extendedprice_values[row] as f64)
             * (discount_scale - discount_values[row] as f64)
             * revenue_scale
-            - supplycost * (quantity_values[row] as f64) * quantity_scale;
-        if let Some(started) = started {
-            profile.amount_nanos = profile
-                .amount_nanos
-                .saturating_add(sql_elapsed_nanos(started));
-        }
-        groups.add(nationkey, o_year, amount);
+            - supplycost.supplycost * (quantity_values[row] as f64) * quantity_scale;
+        groups.add(supplycost.nationkey, o_year, amount);
         if collect_profile {
             profile.amount_rows += 1;
         }
     }
-
     Q09ProfitPartial { groups, profile }
 }
 

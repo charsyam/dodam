@@ -1691,6 +1691,37 @@ async fn filters_join_with_correlated_scalar_aggregate_subquery_sql() {
 }
 
 #[tokio::test]
+async fn executes_q19_with_dictionary_selected_payload() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let lineitem_path = tempdir.path().join("lineitem.parquet");
+    let part_path = tempdir.path().join("part.parquet");
+    write_q19_dictionary_lineitem_parquet(&lineitem_path);
+    write_q19_dictionary_part_parquet(&part_path);
+
+    let sql = format!(
+        "SELECT sum(l_extendedprice * (1 - l_discount)) AS revenue
+         FROM '{}' AS lineitem, '{}' AS part
+         WHERE p_partkey = l_partkey
+           AND p_brand = 'Brand#12'
+           AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')
+           AND l_quantity >= 1 AND l_quantity <= 11
+           AND p_size BETWEEN 1 AND 5
+           AND l_shipmode IN ('AIR', 'AIR REG')
+           AND l_shipinstruct = 'DELIVER IN PERSON'",
+        lineitem_path.display(),
+        part_path.display()
+    );
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute Q19 dictionary selected payload sql");
+
+    let QueryOutput::Aggregate { batches, .. } = output else {
+        panic!("expected aggregate output");
+    };
+    assert_eq!(f64s_from_column(&batches, 0), vec![90.0]);
+}
+
+#[tokio::test]
 async fn executes_with_cte_join_and_scalar_subquery_sql() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let lineitem_path = tempdir.path().join("lineitem.parquet");
@@ -1722,6 +1753,42 @@ async fn executes_with_cte_join_and_scalar_subquery_sql() {
     assert_eq!(i64s_from_column(&batches, 0), vec![2]);
     assert_eq!(strings_from_column(&batches, 1), vec!["supplier-2"]);
     assert_eq!(f64s_from_column(&batches, 2), vec![200.0]);
+}
+
+#[tokio::test]
+async fn executes_top_supplier_revenue_with_direct_decimal_vectors() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let lineitem_path = tempdir.path().join("lineitem.parquet");
+    let supplier_path = tempdir.path().join("supplier.parquet");
+    write_q15_direct_decimal_lineitem_parquet(&lineitem_path);
+    write_q15_supplier_parquet(&supplier_path);
+
+    let sql = format!(
+        "WITH revenue AS (
+            SELECT l_suppkey AS supplier_no, sum(l_extendedprice * (1 - l_discount)) AS total_revenue
+            FROM '{}' AS lineitem
+            WHERE l_shipdate >= DATE '1996-01-01' AND l_shipdate < DATE '1996-01-01' + INTERVAL '3' MONTH
+            GROUP BY l_suppkey
+        )
+        SELECT s_suppkey, s_name, s_address, s_phone, total_revenue
+        FROM '{}' AS supplier, revenue
+        WHERE s_suppkey = supplier_no AND total_revenue = (SELECT max(total_revenue) FROM revenue)
+        ORDER BY s_suppkey",
+        lineitem_path.display(),
+        supplier_path.display()
+    );
+    let output = execute_sql(&DodamEngine::default(), &sql, 2)
+        .await
+        .expect("execute top-supplier direct decimal vector sql");
+
+    let QueryOutput::Aggregate { batches, .. } = output else {
+        panic!("expected aggregate output");
+    };
+    assert_eq!(i64s_from_column(&batches, 0), vec![2]);
+    assert_eq!(strings_from_column(&batches, 1), vec!["supplier-2"]);
+    assert_eq!(strings_from_column(&batches, 2), vec!["addr-2"]);
+    assert_eq!(strings_from_column(&batches, 3), vec!["phone-2"]);
+    assert_eq!(f64s_from_column(&batches, 4), vec![200.0]);
 }
 
 #[tokio::test]
@@ -3555,6 +3622,133 @@ fn write_q15_lineitem_parquet(path: &std::path::Path) {
     )
     .expect("record batch");
 
+    let file = File::create(path).expect("create parquet file");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+}
+
+fn write_q15_direct_decimal_lineitem_parquet(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("l_suppkey", DataType::Int64, false),
+        Field::new("l_shipdate", DataType::Date32, false),
+        Field::new("l_extendedprice", DataType::Decimal128(15, 2), false),
+        Field::new("l_discount", DataType::Decimal128(15, 2), false),
+    ]));
+    let mut suppkeys = vec![1, 1, 2, 3];
+    let mut shipdates = vec![
+        date_days(1996, 1, 10),
+        date_days(1996, 2, 20),
+        date_days(1996, 3, 1),
+        date_days(1996, 5, 1),
+    ];
+    let mut prices = vec![10_000, 5_000, 20_000, 100_000];
+    let mut discounts = vec![10, 0, 0, 0];
+    for _ in 0..20 {
+        suppkeys.push(3);
+        shipdates.push(date_days(1997, 1, 1));
+        prices.push(100_000);
+        discounts.push(0);
+    }
+    let suppkeys = Int64Array::from_iter_values(suppkeys);
+    let shipdates = Date32Array::from_iter_values(shipdates);
+    let prices = Decimal128Array::from_iter_values(prices)
+        .with_precision_and_scale(15, 2)
+        .expect("extendedprice decimal type");
+    let discounts = Decimal128Array::from_iter_values(discounts)
+        .with_precision_and_scale(15, 2)
+        .expect("discount decimal type");
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(suppkeys),
+            Arc::new(shipdates),
+            Arc::new(prices),
+            Arc::new(discounts),
+        ],
+    )
+    .expect("record batch");
+
+    let file = File::create(path).expect("create parquet file");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+}
+
+fn write_q19_dictionary_lineitem_parquet(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("l_partkey", DataType::Int64, false),
+        Field::new("l_quantity", DataType::Decimal128(15, 2), false),
+        Field::new("l_extendedprice", DataType::Decimal128(15, 2), false),
+        Field::new("l_discount", DataType::Decimal128(15, 2), false),
+        Field::new("l_shipmode", DataType::Utf8, false),
+        Field::new("l_shipinstruct", DataType::Utf8, false),
+    ]));
+    let mut partkeys = vec![1, 1];
+    partkeys.extend(2..20);
+    let mut quantities = vec![500, 1_500];
+    quantities.extend(std::iter::repeat_n(500, 18));
+    let mut prices = vec![10_000, 20_000];
+    prices.extend(std::iter::repeat_n(30_000, 18));
+    let mut discounts = vec![10, 0];
+    discounts.extend(std::iter::repeat_n(0, 18));
+    let mut shipmodes = vec!["AIR", "AIR"];
+    shipmodes.extend(std::iter::repeat_n("SHIP", 18));
+    let mut shipinstructs = vec!["DELIVER IN PERSON", "DELIVER IN PERSON"];
+    shipinstructs.extend(std::iter::repeat_n("TAKE BACK RETURN", 18));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from_iter_values(partkeys)),
+            Arc::new(
+                Decimal128Array::from_iter_values(quantities)
+                    .with_precision_and_scale(15, 2)
+                    .expect("quantity decimal type"),
+            ),
+            Arc::new(
+                Decimal128Array::from_iter_values(prices)
+                    .with_precision_and_scale(15, 2)
+                    .expect("extendedprice decimal type"),
+            ),
+            Arc::new(
+                Decimal128Array::from_iter_values(discounts)
+                    .with_precision_and_scale(15, 2)
+                    .expect("discount decimal type"),
+            ),
+            Arc::new(StringArray::from_iter_values(shipmodes)),
+            Arc::new(StringArray::from_iter_values(shipinstructs)),
+        ],
+    )
+    .expect("record batch");
+    let file = File::create(path).expect("create parquet file");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+}
+
+fn write_q19_dictionary_part_parquet(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("p_partkey", DataType::Int64, false),
+        Field::new("p_brand", DataType::Utf8, false),
+        Field::new("p_container", DataType::Utf8, false),
+        Field::new("p_size", DataType::Int32, false),
+    ]));
+    let partkeys = Int64Array::from_iter_values(1..20);
+    let mut brands = vec!["Brand#12"];
+    brands.extend(std::iter::repeat_n("Brand#99", 18));
+    let mut containers = vec!["SM BOX"];
+    containers.extend(std::iter::repeat_n("LG DRUM", 18));
+    let sizes = Int32Array::from_iter_values(std::iter::repeat_n(2, 19));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(partkeys),
+            Arc::new(StringArray::from_iter_values(brands)),
+            Arc::new(StringArray::from_iter_values(containers)),
+            Arc::new(sizes),
+        ],
+    )
+    .expect("record batch");
     let file = File::create(path).expect("create parquet file");
     let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
     writer.write(&batch).expect("write parquet batch");

@@ -1,6 +1,7 @@
 use dodam::engine::DodamEngine;
 use dodam::error::DodamError;
-use dodam::sql::execute_sql;
+use dodam::sql::{execute_sql, sql_rule_inventory};
+use std::path::Path;
 
 const BATCH_SIZE: usize = 4;
 
@@ -21,6 +22,111 @@ async fn tpch_query_support_inventory() {
         "TPC-H support inventory changed:\n{}",
         mismatches.join("\n")
     );
+}
+
+#[test]
+fn tpch_native_rule_inventory_is_registered() {
+    let rules = sql_rule_inventory();
+    let names = rules.iter().map(|rule| rule.name).collect::<Vec<_>>();
+    for expected in [
+        "pricing-summary",
+        "minimum-cost-supplier",
+        "shipping-priority-revenue",
+        "order-priority-exists-count",
+        "regional-supplier-revenue",
+        "promo-revenue-ratio",
+        "bilateral-shipping-volume",
+        "nation-market-share",
+        "profit-by-nation-year",
+        "returned-customer-revenue",
+        "important-stock-value",
+        "shipping-mode-priority-counts",
+        "derived-left-join-count-distribution",
+        "top-supplier-revenue",
+        "parts-supplier-relationship",
+        "join-with-correlated-avg-threshold",
+        "join-with-grouped-sum-semijoin",
+        "supplier-wait-count-antijoin",
+        "discounted-revenue-or-predicate",
+        "prefix-part-supplier-threshold",
+        "derived-prefix-avg-anti-join-aggregate",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "expected TPC-H native/vector rule {expected} in registry: {names:?}"
+        );
+    }
+}
+
+#[test]
+fn tpch_fast_path_cleanup_regressions_do_not_reappear() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut matches = Vec::new();
+    for directory in ["src", "tests", "scripts"] {
+        collect_tpch_fast_path_cleanup_matches(&root.join(directory), &mut matches);
+    }
+    assert!(
+        matches.is_empty(),
+        "removed TPC-H fast-path cleanup patterns should stay out of source:\n{}",
+        matches.join("\n")
+    );
+}
+
+fn collect_tpch_fast_path_cleanup_matches(path: &Path, matches: &mut Vec<String>) {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    if metadata.is_dir() {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            collect_tpch_fast_path_cleanup_matches(&entry.path(), matches);
+        }
+        return;
+    }
+    if !metadata.is_file()
+        || path
+            .extension()
+            .is_some_and(|extension| extension == "lock")
+    {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for (line_index, line) in text.lines().enumerate() {
+        if contains_tpch_fast_path_cleanup_pattern(line) {
+            matches.push(format!("{}:{}", path.display(), line_index + 1));
+        }
+    }
+}
+
+fn contains_tpch_fast_path_cleanup_pattern(line: &str) -> bool {
+    let query_prefix = ["DODAM", "_Q"].concat();
+    let supplier_wait_prefix = ["DODAM", "_SupplierWait"].concat();
+    let has_query_env_gate = line.match_indices(&query_prefix).any(|(index, _)| {
+        line[index + query_prefix.len()..]
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_digit())
+    }) || line.contains(&supplier_wait_prefix);
+    has_query_env_gate
+        || line.contains(&["#[allow", "(dead_code)]"].concat())
+        || line.contains(&["if", " false"].concat())
+        || [
+            ["SortedI64", "Lookup"].concat(),
+            ["DenseOrder", "States"].concat(),
+            ["DenseFinalOrder", "Index"].concat(),
+            ["Selection", "Vector"].concat(),
+            ["Dense", "Fanout"].concat(),
+            ["Small", "Fanout"].concat(),
+            ["matched", "_index"].concat(),
+            ["raw", "_complement"].concat(),
+            ["q04_collect_late", "_candidate_orderkeys"].concat(),
+        ]
+        .iter()
+        .any(|pattern| line.contains(pattern))
 }
 
 async fn classify_query_support(sql: &str) -> String {

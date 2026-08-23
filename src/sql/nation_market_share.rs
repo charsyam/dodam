@@ -158,7 +158,15 @@ pub(super) async fn try_execute_nation_market_share_sql(
     if order_years.is_empty() {
         return Ok(Some(q08_output(Vec::new())?));
     }
-    let part_keys = q08_part_keys(engine, part.path, batch_size, &part_type).await?;
+    let part_keys = collect_i64_utf8_eq_set(
+        engine,
+        part.path,
+        batch_size,
+        "p_partkey",
+        "p_type",
+        &part_type,
+    )
+    .await?;
     if part_keys.is_empty() {
         return Ok(Some(q08_output(Vec::new())?));
     }
@@ -181,61 +189,7 @@ pub(super) async fn try_execute_nation_market_share_sql(
     Ok(Some(q08_output(rows)?))
 }
 
-async fn q08_part_keys(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-    part_type: &str,
-) -> Result<HashSet<i64>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec!["p_partkey".to_string(), "p_type".to_string()]),
-            None,
-        )
-        .await?;
-    let mut keys = HashSet::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        q08_part_keys_view_into(BatchView::new(&batch), part_type, &mut keys)?;
-    }
-    Ok(keys)
-}
-
-fn q08_part_keys_view_into(
-    view: BatchView<'_>,
-    part_type: &str,
-    keys: &mut HashSet<i64>,
-) -> Result<()> {
-    if view.num_columns() == 2
-        && let (Ok(partkeys), Ok(types)) = (view.required_i64(0), view.required_utf8(1))
-    {
-        for row in 0..view.num_rows() {
-            if partkeys.is_valid(row) && types.is_valid(row) && types.value(row) == part_type {
-                keys.insert(partkeys.value(row));
-            }
-        }
-        return Ok(());
-    }
-    let Some(batch) = view.try_record_batch() else {
-        return Err(DodamError::UnsupportedSql(
-            "Q08 part-key raw vector columns have unsupported types".to_string(),
-        ));
-    };
-    let partkeys = batch_column(batch, "p_partkey")?;
-    let types = batch_string_column(batch, "p_type")?;
-    for row in 0..batch.num_rows() {
-        if types.is_valid(row)
-            && types.value(row) == part_type
-            && let Some(partkey) = numeric_i64_value(partkeys, row)?
-        {
-            keys.insert(partkey);
-        }
-    }
-    Ok(())
-}
+type Q08OrderYears = DenseI64I32Map;
 
 async fn q08_order_years(
     engine: &DodamEngine,
@@ -244,7 +198,28 @@ async fn q08_order_years(
     customer_nations: &FastHashMap<i64, i64>,
     start_days: i32,
     end_days: i32,
-) -> Result<HashMap<i64, i32>> {
+) -> Result<Q08OrderYears> {
+    let customer_nations = Arc::new(AdaptiveI64Map::from_hash(customer_nations.clone()));
+    let row_groups = (0..engine.parquet_row_group_count(&path)?).collect::<Vec<_>>();
+    if let Some((mut orders, _metrics)) = engine
+        .collect_parquet_i32_predicate_i64_lookup_selected_i64_mapped_parallel(
+            path.clone(),
+            row_groups,
+            ("o_orderdate".to_string(), DirectPrimitiveColumnType::Date32),
+            "o_custkey".to_string(),
+            "o_orderkey".to_string(),
+            (1, 3),
+            |orderdate| (orderdate >= start_days && orderdate <= end_days).then_some(orderdate),
+            |custkey| customer_nations.get(custkey).is_some(),
+        )?
+    {
+        let mut year_cache = Date32YearCache::default();
+        for (_, orderdate) in &mut orders {
+            *orderdate = year_cache.year(*orderdate)?;
+        }
+        return Ok(q08_build_order_years(orders));
+    }
+
     let mut stream = engine
         .scan_parquet_batches(
             path,
@@ -258,62 +233,55 @@ async fn q08_order_years(
             None,
         )
         .await?;
-    let customer_nations = Arc::new(AdaptiveI64Map::from_hash(customer_nations.clone()));
-    parallel_batch_fold_view_chunks(
+    let orders = parallel_batch_collect_pairs_view_chunks(
         &mut stream,
         4,
-        HashMap::<i64, i32>::new,
         move |view, orders| {
-            merge_maps(
-                orders,
-                q08_order_years_view(view, &customer_nations, start_days, end_days)?,
-            );
+            orders.extend(q08_order_years_view(
+                view,
+                &customer_nations,
+                start_days,
+                end_days,
+            )?);
             Ok(Some(()))
         },
-        Ok,
-        HashMap::<i64, i32>::new(),
-        merge_maps,
         "Q08 order years",
-    )
+    )?;
+    Ok(q08_build_order_years(orders))
 }
 
-fn q08_order_years_batch(
-    batch: RecordBatch,
-    customer_nations: &AdaptiveI64Map<i64>,
-    start_days: i32,
-    end_days: i32,
-) -> Result<HashMap<i64, i32>> {
-    let orderkeys = batch_column(&batch, "o_orderkey")?;
-    let custkeys = batch_column(&batch, "o_custkey")?;
-    let orderdates = batch_column(&batch, "o_orderdate")?;
-    if let Some(orders) = q08_order_years_batch_typed(
-        orderkeys,
-        custkeys,
-        orderdates,
-        customer_nations,
-        start_days,
-        end_days,
-    )? {
-        return Ok(orders);
+fn q08_build_order_years(orders: Vec<(i64, i32)>) -> Q08OrderYears {
+    let row_count = orders.len();
+    let order_years = Q08OrderYears::from_pairs_with_dense_range_policy(
+        orders,
+        0,
+        q08_order_year_max_dense_entries(row_count),
+        q08_order_year_dense_max_amplification(),
+    );
+    q08_log_order_year_layout(&order_years);
+    order_years
+}
+
+fn q08_order_year_max_dense_entries(row_count: usize) -> usize {
+    let byte_entries = dense_i32_max_entries(DEFAULT_ORDER_YEAR_DENSE_BYTES);
+    let amplification_entries =
+        ((row_count as f64) * q08_order_year_dense_max_amplification()) as usize;
+    byte_entries.min(amplification_entries.max(row_count))
+}
+
+fn q08_order_year_dense_max_amplification() -> f64 {
+    dense_max_amplification(8.5)
+}
+
+fn q08_log_order_year_layout(order_years: &Q08OrderYears) {
+    if !tpch_profile_enabled() {
+        return;
     }
-    let mut orders = HashMap::new();
-    let mut year_cache = Date32YearCache::default();
-    for row in 0..batch.num_rows() {
-        let (Some(orderkey), Some(custkey), Some(orderdate)) = (
-            numeric_i64_value(orderkeys, row)?,
-            numeric_i64_value(custkeys, row)?,
-            date32_value(orderdates, row)?,
-        ) else {
-            continue;
-        };
-        if orderdate >= start_days
-            && orderdate <= end_days
-            && customer_nations.get(custkey).is_some()
-        {
-            orders.insert(orderkey, year_cache.year(orderdate)?);
-        }
-    }
-    Ok(orders)
+    eprintln!(
+        "[dodam:tpch-profile] Q08 order-year layout: dense={} len={}",
+        order_years.dense_slice().is_some(),
+        order_years.len(),
+    );
 }
 
 fn q08_order_years_view(
@@ -321,129 +289,24 @@ fn q08_order_years_view(
     customer_nations: &AdaptiveI64Map<i64>,
     start_days: i32,
     end_days: i32,
-) -> Result<HashMap<i64, i32>> {
-    if view.num_columns() == 3
-        && let (Some(orderkeys), Some(custkeys), Some(orderdates)) = (
-            view.i64_vector(0),
-            view.i64_vector(1),
-            view.date32_vector(2),
-        )
-    {
-        return q08_order_years_vector(
-            orderkeys,
-            custkeys,
-            orderdates,
-            customer_nations,
-            start_days,
-            end_days,
-        );
-    }
-    let Some(batch) = view.try_record_batch() else {
-        return Err(DodamError::UnsupportedSql(
-            "Q08 order year raw vector columns have unsupported types".to_string(),
-        ));
-    };
-    q08_order_years_batch(batch.clone(), customer_nations, start_days, end_days)
-}
-
-fn q08_order_years_vector(
-    orderkeys: I64VectorView<'_>,
-    custkeys: I64VectorView<'_>,
-    orderdates: Date32VectorView<'_>,
-    customer_nations: &AdaptiveI64Map<i64>,
-    start_days: i32,
-    end_days: i32,
-) -> Result<HashMap<i64, i32>> {
-    let mut orders = HashMap::new();
+) -> Result<Vec<(i64, i32)>> {
     let mut year_cache = Date32YearCache::default();
-    if let (Some(orderkey_values), Some(custkey_values), Some(orderdate_values)) = (
-        orderkeys.values_if_null_free(),
-        custkeys.values_if_null_free(),
-        orderdates.values_if_null_free(),
-    ) {
-        if let Some((_nation_values, nation_present)) = customer_nations.dense_slices() {
-            for row in 0..orderkey_values.len() {
-                let orderdate = orderdate_values[row];
-                if orderdate < start_days || orderdate > end_days {
-                    continue;
-                }
-                let Ok(custkey) = usize::try_from(custkey_values[row]) else {
-                    continue;
-                };
-                if nation_present.get(custkey).copied().unwrap_or(false) {
-                    orders.insert(orderkey_values[row], year_cache.year(orderdate)?);
-                }
-            }
-            return Ok(orders);
-        }
-        for row in 0..orderkey_values.len() {
-            let orderdate = orderdate_values[row];
-            if orderdate >= start_days
-                && orderdate <= end_days
-                && customer_nations.get(custkey_values[row]).is_some()
+    let dense_nations = customer_nations.dense_word_slices();
+    collect_i64_i64_date32_pairs_view(
+        view,
+        "Q08 order year raw vector columns have unsupported types",
+        |_, custkey, orderdate| {
+            if orderdate < start_days
+                || orderdate > end_days
+                || customer_nations
+                    .get_cached_words(dense_nations, custkey)
+                    .is_none()
             {
-                orders.insert(orderkey_values[row], year_cache.year(orderdate)?);
+                return Ok(None);
             }
-        }
-        return Ok(orders);
-    }
-    for row in 0..orderkeys.len() {
-        if orderkeys.is_null(row) || custkeys.is_null(row) || orderdates.is_null(row) {
-            continue;
-        }
-        let orderdate = orderdates.value(row);
-        if orderdate >= start_days
-            && orderdate <= end_days
-            && customer_nations.get(custkeys.value(row)).is_some()
-        {
-            orders.insert(orderkeys.value(row), year_cache.year(orderdate)?);
-        }
-    }
-    Ok(orders)
-}
-
-fn q08_order_years_batch_typed(
-    orderkeys: &ArrayRef,
-    custkeys: &ArrayRef,
-    orderdates: &ArrayRef,
-    customer_nations: &AdaptiveI64Map<i64>,
-    start_days: i32,
-    end_days: i32,
-) -> Result<Option<HashMap<i64, i32>>> {
-    let (Some(orderkeys), Some(custkeys), Some(orderdates)) = (
-        orderkeys.as_any().downcast_ref::<Int64Array>(),
-        custkeys.as_any().downcast_ref::<Int64Array>(),
-        orderdates.as_any().downcast_ref::<Date32Array>(),
-    ) else {
-        return Ok(None);
-    };
-    let mut orders = HashMap::new();
-    let mut year_cache = Date32YearCache::default();
-    if orderkeys.null_count() == 0 && custkeys.null_count() == 0 && orderdates.null_count() == 0 {
-        for row in 0..orderkeys.len() {
-            let orderdate = orderdates.value(row);
-            if orderdate >= start_days
-                && orderdate <= end_days
-                && customer_nations.get(custkeys.value(row)).is_some()
-            {
-                orders.insert(orderkeys.value(row), year_cache.year(orderdate)?);
-            }
-        }
-        return Ok(Some(orders));
-    }
-    for row in 0..orderkeys.len() {
-        if orderkeys.is_null(row) || custkeys.is_null(row) || orderdates.is_null(row) {
-            continue;
-        }
-        let orderdate = orderdates.value(row);
-        if orderdate >= start_days
-            && orderdate <= end_days
-            && customer_nations.get(custkeys.value(row)).is_some()
-        {
-            orders.insert(orderkeys.value(row), year_cache.year(orderdate)?);
-        }
-    }
-    Ok(Some(orders))
+            Ok(Some(year_cache.year(orderdate)?))
+        },
+    )
 }
 
 async fn q08_supplier_is_brazil(
@@ -451,61 +314,16 @@ async fn q08_supplier_is_brazil(
     path: PathBuf,
     batch_size: usize,
     nation_names: &HashMap<i64, String>,
-) -> Result<HashMap<i64, bool>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec!["s_suppkey".to_string(), "s_nationkey".to_string()]),
-            None,
-        )
-        .await?;
-    let mut suppliers = HashMap::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        q08_supplier_is_brazil_view_into(BatchView::new(&batch), nation_names, &mut suppliers)?;
-    }
-    Ok(suppliers)
-}
-
-fn q08_supplier_is_brazil_view_into(
-    view: BatchView<'_>,
-    nation_names: &HashMap<i64, String>,
-    suppliers: &mut HashMap<i64, bool>,
-) -> Result<()> {
-    if view.num_columns() == 2
-        && let (Ok(suppkeys), Ok(nationkeys)) = (view.required_i64(0), view.required_i64(1))
-    {
-        for row in 0..view.num_rows() {
-            if suppkeys.is_null(row) || nationkeys.is_null(row) {
-                continue;
-            }
-            if let Some(name) = nation_names.get(&nationkeys.value(row)) {
-                suppliers.insert(suppkeys.value(row), name == "BRAZIL");
-            }
-        }
-        return Ok(());
-    }
-    let Some(batch) = view.try_record_batch() else {
-        return Err(DodamError::UnsupportedSql(
-            "Q08 supplier raw vector columns have unsupported types".to_string(),
-        ));
-    };
-    let suppkeys = batch_column(batch, "s_suppkey")?;
-    let nationkeys = batch_column(batch, "s_nationkey")?;
-    for row in 0..batch.num_rows() {
-        let (Some(suppkey), Some(nationkey)) = (
-            numeric_i64_value(suppkeys, row)?,
-            numeric_i64_value(nationkeys, row)?,
-        ) else {
-            continue;
-        };
-        if let Some(name) = nation_names.get(&nationkey) {
-            suppliers.insert(suppkey, name == "BRAZIL");
-        }
-    }
-    Ok(())
+) -> Result<FastHashMap<i64, bool>> {
+    collect_i64_by_i64_mapped_hash_map(
+        engine,
+        path,
+        batch_size,
+        "s_suppkey",
+        "s_nationkey",
+        |nationkey| nation_names.get(&nationkey).map(|name| name == "BRAZIL"),
+    )
+    .await
 }
 
 struct Q08Row {
@@ -517,20 +335,28 @@ async fn q08_market_share_rows(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-    order_years: &HashMap<i64, i32>,
+    order_years: &Q08OrderYears,
     part_keys: &HashSet<i64>,
-    supplier_is_brazil: &HashMap<i64, bool>,
+    supplier_is_brazil: &FastHashMap<i64, bool>,
 ) -> Result<Vec<Q08Row>> {
-    if q08_late_materialized_enabled()
-        && let Some(rows) = q08_market_share_rows_late_materialized(
-            engine,
-            path.clone(),
-            batch_size,
-            order_years,
-            part_keys,
-            supplier_is_brazil,
-        )
-        .await?
+    if let Some(rows) = q08_market_share_rows_direct_dictionary_selected(
+        engine,
+        &path,
+        order_years,
+        part_keys,
+        supplier_is_brazil,
+    )? {
+        return Ok(rows);
+    }
+    if let Some(rows) = q08_market_share_rows_late_materialized(
+        engine,
+        path.clone(),
+        batch_size,
+        order_years,
+        part_keys,
+        supplier_is_brazil,
+    )
+    .await?
     {
         return Ok(rows);
     }
@@ -542,16 +368,14 @@ async fn q08_market_share_rows(
         "l_discount".to_string(),
     ]);
     let mut pruning_predicates = Vec::new();
-    if let Some((min_key, max_key)) = selective_i64_key_range(order_years.keys().copied()) {
+    if let Some((min_key, max_key)) = order_years.selective_key_range() {
         pruning_predicates.extend(i64_range_pruning_predicates("l_orderkey", min_key, max_key));
     }
     if let Some((min_key, max_key)) = selective_i64_key_range(part_keys.iter().copied()) {
         pruning_predicates.extend(i64_range_pruning_predicates("l_partkey", min_key, max_key));
     }
-    let mut stream = if should_use_i64_set_row_filter_for_keys(
+    let mut stream = if should_use_i64_set_row_filter_for_keys_auto(
         true,
-        "DODAM_Q08_DISABLE_PARTKEY_ROW_FILTER",
-        None,
         part_keys,
         projection_column_count(&projection),
     ) {
@@ -574,7 +398,7 @@ async fn q08_market_share_rows(
             .scan_parquet_batches(path, batch_size, None, projection, None)
             .await?
     };
-    let order_years = Arc::new(AdaptiveI64Map::from_hash(order_years.clone()));
+    let order_years = Arc::new(order_years.clone());
     let part_keys = Arc::new(AdaptiveI64Set::from_hash(part_keys.clone()));
     let supplier_is_brazil = Arc::new(AdaptiveI64Map::from_hash(supplier_is_brazil.clone()));
     let groups = parallel_batch_fold_view_chunks(
@@ -604,15 +428,169 @@ async fn q08_market_share_rows(
         .collect())
 }
 
+fn q08_market_share_rows_direct_dictionary_selected(
+    engine: &DodamEngine,
+    path: &Path,
+    order_years: &Q08OrderYears,
+    part_keys: &HashSet<i64>,
+    supplier_is_brazil: &FastHashMap<i64, bool>,
+) -> Result<Option<Vec<Q08Row>>> {
+    let Some((extendedprice_precision, extendedprice_scale)) =
+        engine.parquet_decimal128_type(path, "l_extendedprice")?
+    else {
+        return Ok(None);
+    };
+    let Some((discount_precision, discount_scale)) =
+        engine.parquet_decimal128_type(path, "l_discount")?
+    else {
+        return Ok(None);
+    };
+    if extendedprice_precision > 18 || discount_precision > 18 {
+        return Ok(None);
+    }
+    let Ok(discount_scale_power) = u32::try_from(discount_scale) else {
+        return Ok(None);
+    };
+    let Some(discount_factor) = 10_i64.checked_pow(discount_scale_power) else {
+        return Ok(None);
+    };
+
+    let part_keys = Arc::new(AdaptiveI64Set::from_hash(part_keys.clone()));
+    let order_years = Arc::new(order_years.clone());
+    let supplier_is_brazil = Arc::new(AdaptiveI64Map::from_hash(supplier_is_brazil.clone()));
+    let output = Arc::new(Mutex::new(HashMap::<i32, (i128, i128)>::new()));
+    let lookup_part_keys = part_keys.clone();
+    let predicate_order_years = order_years.clone();
+    let predicate_suppliers = supplier_is_brazil.clone();
+    let consume_output = output.clone();
+    let row_groups = (0..engine.parquet_row_group_count(path)?).collect::<Vec<_>>();
+    let Some(_metrics) = engine
+        .scan_parquet_i64_lookup_staged_two_i64_selected_primitive_columns_parallel(
+            path.to_path_buf(),
+            row_groups,
+            "l_partkey".to_string(),
+            "l_orderkey".to_string(),
+            "l_suppkey".to_string(),
+            vec![
+                (
+                    "l_extendedprice".to_string(),
+                    DirectPrimitiveColumnType::Decimal128Int64Raw {
+                        precision: extendedprice_precision,
+                        scale: extendedprice_scale,
+                    },
+                ),
+                (
+                    "l_discount".to_string(),
+                    DirectPrimitiveColumnType::Decimal128Int64Raw {
+                        precision: discount_precision,
+                        scale: discount_scale,
+                    },
+                ),
+            ],
+            (1, 5),
+            move |partkey| lookup_part_keys.contains(partkey),
+            move |orderkey| predicate_order_years.get(orderkey),
+            move |o_year, suppkey| Some((o_year, predicate_suppliers.get(suppkey)?)),
+            move |tags, view| {
+                let (Some(extendedprices), Some(discounts)) =
+                    (view.decimal128_vector(0), view.decimal128_vector(1))
+                else {
+                    return Err(DodamError::UnsupportedSql(
+                        "Q08 selected payload vector shape mismatch".to_string(),
+                    ));
+                };
+                let (Some(extendedprices), Some(discounts)) =
+                    (extendedprices.raw_i64_values(), discounts.raw_i64_values())
+                else {
+                    return Err(DodamError::UnsupportedSql(
+                        "Q08 selected payload requires raw i64 decimals".to_string(),
+                    ));
+                };
+                if tags.len() != extendedprices.len() || tags.len() != discounts.len() {
+                    return Err(DodamError::UnsupportedSql(
+                        "Q08 selected payload length mismatch".to_string(),
+                    ));
+                }
+                let mut local = HashMap::<i32, (i128, i128)>::new();
+                for ((&(o_year, is_brazil), &extendedprice), &discount) in
+                    tags.iter().zip(extendedprices.iter()).zip(discounts.iter())
+                {
+                    let multiplier = discount_factor.checked_sub(discount).ok_or_else(|| {
+                        DodamError::UnsupportedSql(
+                            "Q08 selected payload discount overflow".to_string(),
+                        )
+                    })?;
+                    let volume = i128::from(extendedprice)
+                        .checked_mul(i128::from(multiplier))
+                        .ok_or_else(|| {
+                            DodamError::UnsupportedSql(
+                                "Q08 selected payload revenue overflow".to_string(),
+                            )
+                        })?;
+                    let group = local.entry(o_year).or_insert((0, 0));
+                    if is_brazil {
+                        group.0 = group.0.checked_add(volume).ok_or_else(|| {
+                            DodamError::UnsupportedSql(
+                                "Q08 selected Brazil revenue overflow".to_string(),
+                            )
+                        })?;
+                    }
+                    group.1 = group.1.checked_add(volume).ok_or_else(|| {
+                        DodamError::UnsupportedSql(
+                            "Q08 selected total revenue overflow".to_string(),
+                        )
+                    })?;
+                }
+                let mut output = consume_output.lock().map_err(|_| {
+                    DodamError::UnsupportedSql(
+                        "Q08 selected payload output lock poisoned".to_string(),
+                    )
+                })?;
+                for (o_year, (brazil, total)) in local {
+                    let group = output.entry(o_year).or_insert((0, 0));
+                    group.0 = group.0.checked_add(brazil).ok_or_else(|| {
+                        DodamError::UnsupportedSql(
+                            "Q08 selected global Brazil revenue overflow".to_string(),
+                        )
+                    })?;
+                    group.1 = group.1.checked_add(total).ok_or_else(|| {
+                        DodamError::UnsupportedSql(
+                            "Q08 selected global total revenue overflow".to_string(),
+                        )
+                    })?;
+                }
+                Ok(())
+            },
+        )?
+    else {
+        return Ok(None);
+    };
+
+    let output = output.lock().map_err(|_| {
+        DodamError::UnsupportedSql("Q08 selected payload output lock poisoned".to_string())
+    })?;
+    Ok(Some(
+        output
+            .iter()
+            .filter_map(|(&o_year, &(brazil, total))| {
+                (total > 0).then_some(Q08Row {
+                    o_year,
+                    mkt_share: brazil as f64 / total as f64,
+                })
+            })
+            .collect(),
+    ))
+}
+
 async fn q08_market_share_rows_late_materialized(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
-    order_years: &HashMap<i64, i32>,
+    order_years: &Q08OrderYears,
     part_keys: &HashSet<i64>,
-    supplier_is_brazil: &HashMap<i64, bool>,
+    supplier_is_brazil: &FastHashMap<i64, bool>,
 ) -> Result<Option<Vec<Q08Row>>> {
-    let order_years = Arc::new(AdaptiveI64Map::from_hash(order_years.clone()));
+    let order_years = Arc::new(order_years.clone());
     let part_keys = Arc::new(AdaptiveI64Set::from_hash(part_keys.clone()));
     let supplier_is_brazil = Arc::new(AdaptiveI64Map::from_hash(supplier_is_brazil.clone()));
     let Some(chunks) = engine
@@ -641,23 +619,27 @@ async fn q08_market_share_rows_late_materialized(
                     part_keys: part_keys.clone(),
                     supplier_is_brazil: supplier_is_brazil.clone(),
                     groups: HashMap::new(),
+                    profile: Q08LateCallbackProfile::default(),
                 }
             },
             q08_late_build_partkey_selection_view,
             q08_late_consume_market_payload_view,
-            |state, _metrics| Ok(Some(state.groups)),
+            |state, _metrics| Ok(Some((state.groups, state.profile))),
         )
         .await?
     else {
         return Ok(None);
     };
     let mut metrics = LateMaterializedMetrics::default();
+    let mut profile = Q08LateCallbackProfile::default();
     let mut groups = HashMap::<i32, (f64, f64)>::new();
     for chunk in chunks {
         metrics.add(chunk.metrics);
-        q08_merge_market_share_groups(&mut groups, chunk.output);
+        q08_merge_market_share_groups(&mut groups, chunk.output.0);
+        profile.add(chunk.output.1);
     }
     q08_log_late_market_profile(metrics, q08_late_row_group_chunk());
+    q08_log_late_callback_profile(profile);
     Ok(Some(
         groups
             .into_iter()
@@ -671,47 +653,55 @@ async fn q08_market_share_rows_late_materialized(
     ))
 }
 
-fn q08_late_materialized_enabled() -> bool {
-    std::env::var_os("DODAM_Q08_DISABLE_LATE").is_none()
-}
-
 fn q08_partkey_row_filter_row_group_chunk() -> usize {
-    std::env::var("DODAM_Q08_PARTKEY_ROW_FILTER_ROW_GROUP_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(8)
+    i64_set_row_filter_row_group_chunk(8)
 }
 
 fn q08_late_row_group_chunk() -> usize {
-    std::env::var("DODAM_Q08_LATE_ROW_GROUP_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(4)
+    late_materialization_row_group_chunk(4)
 }
 
 fn q08_late_max_selected_ratio() -> f64 {
-    std::env::var("DODAM_Q08_LATE_MAX_SELECTED_RATIO")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.05)
+    late_materialization_max_selected_ratio(0.05)
 }
 
 fn q08_late_max_selector_run_ratio() -> f64 {
-    std::env::var("DODAM_Q08_LATE_MAX_SELECTOR_RUN_RATIO")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.05)
+    late_materialization_max_selector_run_ratio(0.05)
 }
 
 struct Q08LateMarketState {
-    order_years: Arc<AdaptiveI64Map<i32>>,
+    order_years: Arc<Q08OrderYears>,
     part_keys: Arc<AdaptiveI64Set>,
     supplier_is_brazil: Arc<AdaptiveI64Map<bool>>,
     groups: HashMap<i32, (f64, f64)>,
+    profile: Q08LateCallbackProfile,
+}
+
+#[derive(Default, Clone, Copy)]
+struct Q08LateCallbackProfile {
+    selection_nanos: u64,
+    payload_nanos: u64,
+    selection_batches: usize,
+    payload_batches: usize,
+    payload_i64_batches: usize,
+    payload_i128_batches: usize,
+}
+
+impl Q08LateCallbackProfile {
+    fn add(&mut self, other: Self) {
+        self.selection_nanos = self.selection_nanos.saturating_add(other.selection_nanos);
+        self.payload_nanos = self.payload_nanos.saturating_add(other.payload_nanos);
+        self.selection_batches = self
+            .selection_batches
+            .saturating_add(other.selection_batches);
+        self.payload_batches = self.payload_batches.saturating_add(other.payload_batches);
+        self.payload_i64_batches = self
+            .payload_i64_batches
+            .saturating_add(other.payload_i64_batches);
+        self.payload_i128_batches = self
+            .payload_i128_batches
+            .saturating_add(other.payload_i128_batches);
+    }
 }
 
 fn q08_late_build_partkey_selection_batch(
@@ -740,24 +730,49 @@ fn q08_late_build_partkey_selection_view(
     selection: &mut LateSelectionBuilder,
     state: &mut Q08LateMarketState,
 ) -> Result<Option<()>> {
+    let profile_started = tpch_profile_enabled().then(Instant::now);
     if view.num_columns() == 1 {
         let Some(partkeys) = view.i64_vector(0) else {
             return Ok(None);
         };
         let dense_part_keys = state.part_keys.dense_contains_slice();
+        let dense_part_words = state.part_keys.dense_word_slice();
         if let Some(partkey_values) = partkeys.values_if_null_free() {
-            for &partkey in partkey_values {
-                selection.push(state.part_keys.contains_cached(dense_part_keys, partkey));
+            if let Some(words) = dense_part_words {
+                for &partkey in partkey_values {
+                    selection.push(crate::dense::adaptive_i64_words_contains(words, partkey));
+                }
+            } else {
+                for &partkey in partkey_values {
+                    selection.push(state.part_keys.contains_cached(dense_part_keys, partkey));
+                }
+            }
+            if let Some(started) = profile_started {
+                state.profile.selection_batches += 1;
+                state.profile.selection_nanos = state
+                    .profile
+                    .selection_nanos
+                    .saturating_add(sql_elapsed_nanos(started));
             }
             return Ok(Some(()));
         }
         for row in 0..partkeys.len() {
-            selection.push(
-                !partkeys.is_null(row)
-                    && state
+            let selected = !partkeys.is_null(row)
+                && if let Some(words) = dense_part_words {
+                    crate::dense::adaptive_i64_words_contains(words, partkeys.value(row))
+                } else {
+                    state
                         .part_keys
-                        .contains_cached(dense_part_keys, partkeys.value(row)),
-            );
+                        .contains_cached(dense_part_keys, partkeys.value(row))
+                };
+            selection.push(selected);
+        }
+        if let Some(started) = profile_started {
+            state.profile.selection_batches += 1;
+            state.profile.selection_nanos = state
+                .profile
+                .selection_nanos
+                .saturating_add(sql_elapsed_nanos(started));
         }
         return Ok(Some(()));
     }
@@ -783,59 +798,23 @@ fn q08_late_consume_market_payload_batch(
     ) else {
         return Ok(None);
     };
-    if orderkeys.null_count() == 0
-        && suppkeys.null_count() == 0
-        && extendedprices.null_count() == 0
-        && discounts.null_count() == 0
-    {
-        let orderkey_values = orderkeys.values().as_ref();
-        let suppkey_values = suppkeys.values().as_ref();
-        let extendedprice_values = extendedprices.raw_values();
-        let discount_values = discounts.raw_values();
-        let (discount_scale, revenue_scale) =
-            decimal_discounted_revenue_scales(extendedprices, discounts);
-        for row in 0..orderkey_values.len() {
-            let Some(o_year) = state.order_years.get(orderkey_values[row]) else {
-                continue;
-            };
-            let Some(is_brazil) = state.supplier_is_brazil.get(suppkey_values[row]) else {
-                continue;
-            };
-            let volume = decimal_discounted_revenue_raw(
-                extendedprice_values[row],
-                discount_values[row],
-                discount_scale,
-                revenue_scale,
-            );
-            let group = state.groups.entry(o_year).or_insert((0.0, 0.0));
-            if is_brazil {
-                group.0 += volume;
-            }
-            group.1 += volume;
-        }
-        return Ok(Some(()));
-    }
-    for row in 0..batch.num_rows() {
-        if orderkeys.is_null(row)
-            || suppkeys.is_null(row)
-            || extendedprices.is_null(row)
-            || discounts.is_null(row)
-        {
-            continue;
-        }
-        let Some(o_year) = state.order_years.get(orderkeys.value(row)) else {
-            continue;
-        };
-        let Some(is_brazil) = state.supplier_is_brazil.get(suppkeys.value(row)) else {
-            continue;
-        };
-        let volume = extendedprices.value(row) * (1.0 - discounts.value(row));
-        let group = state.groups.entry(o_year).or_insert((0.0, 0.0));
-        if is_brazil {
-            group.0 += volume;
-        }
-        group.1 += volume;
-    }
+    let extendedprices = Decimal128VectorView::Arrow {
+        values: extendedprices.values,
+        precision: extendedprices.precision,
+        scale: extendedprices.scale,
+    };
+    let discounts = Decimal128VectorView::Arrow {
+        values: discounts.values,
+        precision: discounts.precision,
+        scale: discounts.scale,
+    };
+    q08_late_consume_market_payload_vector(
+        I64VectorView::Arrow(orderkeys),
+        I64VectorView::Arrow(suppkeys),
+        extendedprices,
+        discounts,
+        state,
+    )?;
     Ok(Some(()))
 }
 
@@ -857,7 +836,7 @@ fn q08_late_consume_market_payload_view(
             extendedprices,
             discounts,
             state,
-        );
+        )?;
         return Ok(Some(()));
     }
     let Some(batch) = view.try_record_batch() else {
@@ -872,79 +851,107 @@ fn q08_late_consume_market_payload_vector(
     extendedprices: Decimal128VectorView<'_>,
     discounts: Decimal128VectorView<'_>,
     state: &mut Q08LateMarketState,
-) {
+) -> Result<()> {
+    let profile_started = tpch_profile_enabled().then(Instant::now);
+    let row_state = std::cell::Cell::new(None::<(i32, bool)>);
     if let (Some(orderkey_values), Some(suppkey_values)) = (
         orderkeys.values_if_null_free(),
         suppkeys.values_if_null_free(),
-    ) && extendedprices.null_count() == 0
-        && discounts.null_count() == 0
-    {
-        let extendedprice_values = extendedprices.raw_values();
-        let discount_values = discounts.raw_values();
-        let discount_scale = discounts.scale();
-        let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
-        for row in 0..orderkey_values.len() {
-            let Some(o_year) = state.order_years.get(orderkey_values[row]) else {
-                continue;
-            };
-            let Some(is_brazil) = state.supplier_is_brazil.get(suppkey_values[row]) else {
-                continue;
-            };
-            let volume = decimal_discounted_revenue_raw(
-                extendedprice_values[row],
-                discount_values[row],
-                discount_scale,
-                revenue_scale,
-            );
-            let group = state.groups.entry(o_year).or_insert((0.0, 0.0));
-            if is_brazil {
-                group.0 += volume;
-            }
-            group.1 += volume;
-        }
-        return;
+    ) {
+        consume_filtered_discounted_revenue_decimal128_vectors(
+            extendedprices,
+            discounts,
+            orderkey_values.len(),
+            |row| {
+                row_state.set(None);
+                let Some(o_year) = state.order_years.get(orderkey_values[row]) else {
+                    return Ok(false);
+                };
+                let Some(is_brazil) = state.supplier_is_brazil.get(suppkey_values[row]) else {
+                    return Ok(false);
+                };
+                row_state.set(Some((o_year, is_brazil)));
+                Ok(true)
+            },
+            |_, volume| {
+                if let Some((o_year, is_brazil)) = row_state.get() {
+                    let group = state.groups.entry(o_year).or_insert((0.0, 0.0));
+                    if is_brazil {
+                        group.0 += volume;
+                    }
+                    group.1 += volume;
+                }
+                Ok(())
+            },
+        )?;
+    } else {
+        consume_filtered_discounted_revenue_decimal128_vectors(
+            extendedprices,
+            discounts,
+            orderkeys.len(),
+            |row| {
+                row_state.set(None);
+                if orderkeys.is_null(row) || suppkeys.is_null(row) {
+                    return Ok(false);
+                }
+                let Some(o_year) = state.order_years.get(orderkeys.value(row)) else {
+                    return Ok(false);
+                };
+                let Some(is_brazil) = state.supplier_is_brazil.get(suppkeys.value(row)) else {
+                    return Ok(false);
+                };
+                row_state.set(Some((o_year, is_brazil)));
+                Ok(true)
+            },
+            |_, volume| {
+                if let Some((o_year, is_brazil)) = row_state.get() {
+                    let group = state.groups.entry(o_year).or_insert((0.0, 0.0));
+                    if is_brazil {
+                        group.0 += volume;
+                    }
+                    group.1 += volume;
+                }
+                Ok(())
+            },
+        )?;
     }
-    for row in 0..orderkeys.len() {
-        if orderkeys.is_null(row)
-            || suppkeys.is_null(row)
-            || extendedprices.is_null(row)
-            || discounts.is_null(row)
-        {
-            continue;
+    if let Some(started) = profile_started {
+        state.profile.payload_batches += 1;
+        if extendedprices.raw_i64_values().is_some() && discounts.raw_i64_values().is_some() {
+            state.profile.payload_i64_batches += 1;
+        } else {
+            state.profile.payload_i128_batches += 1;
         }
-        let Some(o_year) = state.order_years.get(orderkeys.value(row)) else {
-            continue;
-        };
-        let Some(is_brazil) = state.supplier_is_brazil.get(suppkeys.value(row)) else {
-            continue;
-        };
-        let volume = extendedprices.value(row) * (1.0 - discounts.value(row));
-        let group = state.groups.entry(o_year).or_insert((0.0, 0.0));
-        if is_brazil {
-            group.0 += volume;
-        }
-        group.1 += volume;
+        state.profile.payload_nanos = state
+            .profile
+            .payload_nanos
+            .saturating_add(sql_elapsed_nanos(started));
     }
+    Ok(())
 }
 
 fn q08_log_late_market_profile(metrics: LateMaterializedMetrics, row_group_chunk: usize) {
+    tpch_profile_late_materialized("Q08 market share", metrics, row_group_chunk);
+}
+
+fn q08_log_late_callback_profile(profile: Q08LateCallbackProfile) {
     if !tpch_profile_enabled() {
         return;
     }
-    let ratio = if metrics.total_rows == 0 {
-        0.0
-    } else {
-        metrics.selected_rows as f64 / metrics.total_rows as f64
-    };
     eprintln!(
-        "[dodam:tpch-profile] Q08 market share: late_materialized rows={} selected={} ratio={:.6} selector_runs={} row_group_chunk={}",
-        metrics.total_rows, metrics.selected_rows, ratio, metrics.selector_runs, row_group_chunk
+        "[dodam:tpch-profile] Q08 late callbacks: selection={:.3} ms payload={:.3} ms selection_batches={} payload_batches={} payload_i64={} payload_i128={}",
+        sql_nanos_to_millis(profile.selection_nanos),
+        sql_nanos_to_millis(profile.payload_nanos),
+        profile.selection_batches,
+        profile.payload_batches,
+        profile.payload_i64_batches,
+        profile.payload_i128_batches,
     );
 }
 
 fn q08_market_share_batch(
     batch: RecordBatch,
-    order_years: &AdaptiveI64Map<i32>,
+    order_years: &Q08OrderYears,
     part_keys: &AdaptiveI64Set,
     supplier_is_brazil: &AdaptiveI64Map<bool>,
 ) -> Result<HashMap<i32, (f64, f64)>> {
@@ -1001,7 +1008,7 @@ fn q08_market_share_batch(
 
 fn q08_market_share_view(
     view: BatchView<'_>,
-    order_years: &AdaptiveI64Map<i32>,
+    order_years: &Q08OrderYears,
     part_keys: &AdaptiveI64Set,
     supplier_is_brazil: &AdaptiveI64Map<bool>,
 ) -> Result<HashMap<i32, (f64, f64)>> {
@@ -1020,7 +1027,7 @@ fn q08_market_share_view(
             view.decimal128_vector(4),
         )
     {
-        return Ok(q08_market_share_vector(
+        return q08_market_share_vector(
             orderkeys,
             partkeys,
             suppkeys,
@@ -1029,7 +1036,7 @@ fn q08_market_share_view(
             order_years,
             part_keys,
             supplier_is_brazil,
-        ));
+        );
     }
     let Some(batch) = view.try_record_batch() else {
         return Err(DodamError::UnsupportedSql(
@@ -1045,112 +1052,131 @@ fn q08_market_share_vector(
     suppkeys: I64VectorView<'_>,
     extendedprices: Decimal128VectorView<'_>,
     discounts: Decimal128VectorView<'_>,
-    order_years: &AdaptiveI64Map<i32>,
+    order_years: &Q08OrderYears,
     part_keys: &AdaptiveI64Set,
     supplier_is_brazil: &AdaptiveI64Map<bool>,
-) -> HashMap<i32, (f64, f64)> {
+) -> Result<HashMap<i32, (f64, f64)>> {
     let mut groups = HashMap::<i32, (f64, f64)>::new();
     if let (Some(orderkey_values), Some(partkey_values), Some(suppkey_values)) = (
         orderkeys.values_if_null_free(),
         partkeys.values_if_null_free(),
         suppkeys.values_if_null_free(),
-    ) && extendedprices.null_count() == 0
-        && discounts.null_count() == 0
-    {
-        let extendedprice_values = extendedprices.raw_values();
-        let discount_values = discounts.raw_values();
-        let discount_scale = discounts.scale();
-        let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
+    ) {
         let part_contains = part_keys.dense_contains_slice();
+        let row_state = std::cell::Cell::new(None::<(i32, bool)>);
         if let (
-            Some((order_year_values, order_year_present)),
+            Some((order_year_values, order_year_base, order_year_missing)),
             Some((brazil_values, brazil_present)),
-        ) = (
-            order_years.dense_slices(),
-            supplier_is_brazil.dense_slices(),
-        ) {
-            for row in 0..orderkey_values.len() {
+        ) = (order_years.dense_slice(), supplier_is_brazil.dense_slices())
+        {
+            consume_filtered_discounted_revenue_decimal128_vectors(
+                extendedprices,
+                discounts,
+                orderkey_values.len(),
+                |row| {
+                    row_state.set(None);
+                    if !part_keys.contains_cached(part_contains, partkey_values[row]) {
+                        return Ok(false);
+                    }
+                    let Some(orderkey) = orderkey_values[row]
+                        .checked_sub(order_year_base)
+                        .and_then(|index| usize::try_from(index).ok())
+                    else {
+                        return Ok(false);
+                    };
+                    let Some(&o_year) = order_year_values.get(orderkey) else {
+                        return Ok(false);
+                    };
+                    if o_year == order_year_missing {
+                        return Ok(false);
+                    }
+                    let Ok(suppkey) = usize::try_from(suppkey_values[row]) else {
+                        return Ok(false);
+                    };
+                    if !brazil_present.get(suppkey).copied().unwrap_or(false) {
+                        return Ok(false);
+                    }
+                    row_state.set(Some((o_year, brazil_values[suppkey])));
+                    Ok(true)
+                },
+                |_, volume| {
+                    if let Some((o_year, is_brazil)) = row_state.get() {
+                        let group = groups.entry(o_year).or_insert((0.0, 0.0));
+                        if is_brazil {
+                            group.0 += volume;
+                        }
+                        group.1 += volume;
+                    }
+                    Ok(())
+                },
+            )?;
+            return Ok(groups);
+        }
+        consume_filtered_discounted_revenue_decimal128_vectors(
+            extendedprices,
+            discounts,
+            orderkey_values.len(),
+            |row| {
+                row_state.set(None);
                 if !part_keys.contains_cached(part_contains, partkey_values[row]) {
-                    continue;
+                    return Ok(false);
                 }
-                let Ok(orderkey) = usize::try_from(orderkey_values[row]) else {
-                    continue;
+                let Some(o_year) = order_years.get(orderkey_values[row]) else {
+                    return Ok(false);
                 };
-                if !order_year_present.get(orderkey).copied().unwrap_or(false) {
-                    continue;
-                }
-                let Ok(suppkey) = usize::try_from(suppkey_values[row]) else {
-                    continue;
+                let Some(is_brazil) = supplier_is_brazil.get(suppkey_values[row]) else {
+                    return Ok(false);
                 };
-                if !brazil_present.get(suppkey).copied().unwrap_or(false) {
-                    continue;
+                row_state.set(Some((o_year, is_brazil)));
+                Ok(true)
+            },
+            |_, volume| {
+                if let Some((o_year, is_brazil)) = row_state.get() {
+                    let group = groups.entry(o_year).or_insert((0.0, 0.0));
+                    if is_brazil {
+                        group.0 += volume;
+                    }
+                    group.1 += volume;
                 }
-                let volume = decimal_discounted_revenue_raw(
-                    extendedprice_values[row],
-                    discount_values[row],
-                    discount_scale,
-                    revenue_scale,
-                );
-                let group = groups
-                    .entry(order_year_values[orderkey])
-                    .or_insert((0.0, 0.0));
-                if brazil_values[suppkey] {
+                Ok(())
+            },
+        )?;
+        return Ok(groups);
+    }
+    let row_state = std::cell::Cell::new(None::<(i32, bool)>);
+    consume_filtered_discounted_revenue_decimal128_vectors(
+        extendedprices,
+        discounts,
+        orderkeys.len(),
+        |row| {
+            row_state.set(None);
+            if orderkeys.is_null(row) || partkeys.is_null(row) || suppkeys.is_null(row) {
+                return Ok(false);
+            }
+            if !part_keys.contains(partkeys.value(row)) {
+                return Ok(false);
+            }
+            let Some(o_year) = order_years.get(orderkeys.value(row)) else {
+                return Ok(false);
+            };
+            let Some(is_brazil) = supplier_is_brazil.get(suppkeys.value(row)) else {
+                return Ok(false);
+            };
+            row_state.set(Some((o_year, is_brazil)));
+            Ok(true)
+        },
+        |_, volume| {
+            if let Some((o_year, is_brazil)) = row_state.get() {
+                let group = groups.entry(o_year).or_insert((0.0, 0.0));
+                if is_brazil {
                     group.0 += volume;
                 }
                 group.1 += volume;
             }
-            return groups;
-        }
-        for row in 0..orderkey_values.len() {
-            if !part_keys.contains_cached(part_contains, partkey_values[row]) {
-                continue;
-            }
-            let Some(o_year) = order_years.get(orderkey_values[row]) else {
-                continue;
-            };
-            let Some(is_brazil) = supplier_is_brazil.get(suppkey_values[row]) else {
-                continue;
-            };
-            let volume = decimal_discounted_revenue_raw(
-                extendedprice_values[row],
-                discount_values[row],
-                discount_scale,
-                revenue_scale,
-            );
-            let group = groups.entry(o_year).or_insert((0.0, 0.0));
-            if is_brazil {
-                group.0 += volume;
-            }
-            group.1 += volume;
-        }
-        return groups;
-    }
-    for row in 0..orderkeys.len() {
-        if orderkeys.is_null(row)
-            || partkeys.is_null(row)
-            || suppkeys.is_null(row)
-            || extendedprices.is_null(row)
-            || discounts.is_null(row)
-        {
-            continue;
-        }
-        if !part_keys.contains(partkeys.value(row)) {
-            continue;
-        }
-        let Some(o_year) = order_years.get(orderkeys.value(row)) else {
-            continue;
-        };
-        let Some(is_brazil) = supplier_is_brazil.get(suppkeys.value(row)) else {
-            continue;
-        };
-        let volume = extendedprices.value(row) * (1.0 - discounts.value(row));
-        let group = groups.entry(o_year).or_insert((0.0, 0.0));
-        if is_brazil {
-            group.0 += volume;
-        }
-        group.1 += volume;
-    }
-    groups
+            Ok(())
+        },
+    )?;
+    Ok(groups)
 }
 
 fn q08_market_share_batch_typed(
@@ -1159,7 +1185,7 @@ fn q08_market_share_batch_typed(
     suppkeys: &ArrayRef,
     extendedprices: &ArrayRef,
     discounts: &ArrayRef,
-    order_years: &AdaptiveI64Map<i32>,
+    order_years: &Q08OrderYears,
     part_keys: &AdaptiveI64Set,
     supplier_is_brazil: &AdaptiveI64Map<bool>,
 ) -> Result<Option<HashMap<i32, (f64, f64)>>> {
@@ -1172,58 +1198,27 @@ fn q08_market_share_batch_typed(
     ) else {
         return Ok(None);
     };
-    let mut groups = HashMap::<i32, (f64, f64)>::new();
-    if orderkeys.null_count() == 0
-        && partkeys.null_count() == 0
-        && suppkeys.null_count() == 0
-        && extendedprices.null_count() == 0
-        && discounts.null_count() == 0
-    {
-        for row in 0..orderkeys.len() {
-            if !part_keys.contains(partkeys.value(row)) {
-                continue;
-            }
-            let Some(o_year) = order_years.get(orderkeys.value(row)) else {
-                continue;
-            };
-            let Some(is_brazil) = supplier_is_brazil.get(suppkeys.value(row)) else {
-                continue;
-            };
-            let volume = extendedprices.value(row) * (1.0 - discounts.value(row));
-            let group = groups.entry(o_year).or_insert((0.0, 0.0));
-            if is_brazil {
-                group.0 += volume;
-            }
-            group.1 += volume;
-        }
-        return Ok(Some(groups));
-    }
-    for row in 0..orderkeys.len() {
-        if orderkeys.is_null(row)
-            || partkeys.is_null(row)
-            || suppkeys.is_null(row)
-            || extendedprices.is_null(row)
-            || discounts.is_null(row)
-        {
-            continue;
-        }
-        if !part_keys.contains(partkeys.value(row)) {
-            continue;
-        }
-        let Some(o_year) = order_years.get(orderkeys.value(row)) else {
-            continue;
-        };
-        let Some(is_brazil) = supplier_is_brazil.get(suppkeys.value(row)) else {
-            continue;
-        };
-        let volume = extendedprices.value(row) * (1.0 - discounts.value(row));
-        let group = groups.entry(o_year).or_insert((0.0, 0.0));
-        if is_brazil {
-            group.0 += volume;
-        }
-        group.1 += volume;
-    }
-    Ok(Some(groups))
+    let extendedprices = Decimal128VectorView::Arrow {
+        values: extendedprices.values,
+        precision: extendedprices.precision,
+        scale: extendedprices.scale,
+    };
+    let discounts = Decimal128VectorView::Arrow {
+        values: discounts.values,
+        precision: discounts.precision,
+        scale: discounts.scale,
+    };
+    q08_market_share_vector(
+        I64VectorView::Arrow(orderkeys),
+        I64VectorView::Arrow(partkeys),
+        I64VectorView::Arrow(suppkeys),
+        extendedprices,
+        discounts,
+        order_years,
+        part_keys,
+        supplier_is_brazil,
+    )
+    .map(Some)
 }
 
 fn q08_merge_market_share_groups<S>(

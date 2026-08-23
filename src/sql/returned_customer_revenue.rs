@@ -310,15 +310,14 @@ async fn returned_customer_rows(
     customer_keys: &AdaptiveI64Set,
     customer_key_filter: &HashSet<i64>,
 ) -> Result<HashMap<i64, ReturnedCustomer>> {
-    if customer_late_materialized_enabled()
-        && let Some(customers) = returned_customer_rows_late_materialized(
-            engine,
-            path.clone(),
-            batch_size,
-            customer_keys.clone(),
-            customer_key_filter.clone(),
-        )
-        .await?
+    if let Some(customers) = returned_customer_rows_late_materialized(
+        engine,
+        path.clone(),
+        batch_size,
+        customer_keys.clone(),
+        customer_key_filter.clone(),
+    )
+    .await?
     {
         return Ok(customers);
     }
@@ -331,10 +330,8 @@ async fn returned_customer_rows(
         "c_phone".to_string(),
         "c_comment".to_string(),
     ]);
-    let mut stream = if should_use_i64_set_row_filter_for_keys(
+    let mut stream = if should_use_i64_set_row_filter_for_keys_auto(
         true,
-        "DODAM_Q10_DISABLE_CUSTOMER_ROW_FILTER",
-        None,
         customer_key_filter,
         projection_column_count(&projection),
     ) {
@@ -447,10 +444,6 @@ async fn returned_customer_rows(
     Ok(customers)
 }
 
-fn customer_late_materialized_enabled() -> bool {
-    std::env::var_os("DODAM_Q10_DISABLE_CUSTOMER_LATE").is_none()
-}
-
 async fn returned_customer_rows_late_materialized(
     engine: &DodamEngine,
     path: PathBuf,
@@ -518,27 +511,15 @@ async fn returned_customer_rows_late_materialized(
 }
 
 fn customer_late_row_group_chunk() -> usize {
-    std::env::var("DODAM_Q10_CUSTOMER_LATE_ROW_GROUP_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(1)
+    late_materialization_row_group_chunk(1)
 }
 
 fn customer_late_max_selected_ratio() -> f64 {
-    std::env::var("DODAM_Q10_CUSTOMER_LATE_MAX_SELECTED_RATIO")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.01)
+    late_materialization_max_selected_ratio(0.01)
 }
 
 fn customer_late_max_selector_run_ratio() -> f64 {
-    std::env::var("DODAM_Q10_CUSTOMER_LATE_MAX_SELECTOR_RUN_RATIO")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.01)
+    late_materialization_max_selector_run_ratio(0.01)
 }
 
 struct I64SetLateSelectionState<T> {
@@ -573,7 +554,6 @@ impl<T> I64SetLateSelectionState<T> {
 
 #[derive(Default)]
 pub(super) struct I64SetLateSelectionBatchMetrics {
-    pub(super) total_rows: usize,
     pub(super) selected_rows: usize,
 }
 
@@ -638,10 +618,7 @@ pub(super) fn i64_set_late_build_selection_batch_into(
         return Ok(None);
     };
     let dense_key_filter = key_filter.dense_contains_slice();
-    let mut metrics = I64SetLateSelectionBatchMetrics {
-        total_rows: keys.len(),
-        selected_rows: 0,
-    };
+    let mut metrics = I64SetLateSelectionBatchMetrics { selected_rows: 0 };
     if keys.null_count() == 0 {
         for &key in keys.values().as_ref() {
             let selected = key_filter.contains_cached(dense_key_filter, key);
@@ -804,18 +781,7 @@ fn customer_late_consume_payload_view(
 }
 
 fn log_customer_late_profile(metrics: LateMaterializedMetrics, row_group_chunk: usize) {
-    if !tpch_profile_enabled() {
-        return;
-    }
-    let ratio = if metrics.total_rows == 0 {
-        0.0
-    } else {
-        metrics.selected_rows as f64 / metrics.total_rows as f64
-    };
-    eprintln!(
-        "[dodam:tpch-profile] returned customers: late_materialized rows={} selected={} ratio={:.6} selector_runs={} row_group_chunk={}",
-        metrics.total_rows, metrics.selected_rows, ratio, metrics.selector_runs, row_group_chunk
-    );
+    tpch_profile_late_materialized("returned customers", metrics, row_group_chunk);
 }
 
 async fn order_customer_keys(
@@ -838,123 +804,33 @@ async fn order_customer_keys(
             None,
         )
         .await?;
-    parallel_batch_fold_view_chunks(
+    let orders = parallel_batch_collect_pairs_view_chunks(
         &mut stream,
         4,
-        fast_hash_map::<i64, i64>,
         move |view, orders| {
-            merge_maps(
-                orders,
-                order_customer_keys_view(view, start_days, end_days)?,
-            );
+            orders.extend(order_customer_keys_view(view, start_days, end_days)?);
             Ok(Some(()))
         },
-        Ok,
-        fast_hash_map::<i64, i64>(),
-        merge_maps,
         "returned order customers",
-    )
-}
-
-fn order_customer_keys_batch(
-    batch: RecordBatch,
-    start_days: i32,
-    end_days: i32,
-) -> Result<FastHashMap<i64, i64>> {
-    let orderkeys = batch_column(&batch, "o_orderkey")?;
-    let custkeys = batch_column(&batch, "o_custkey")?;
-    let orderdates = batch_column(&batch, "o_orderdate")?;
-    if let Some(orders) =
-        order_customer_keys_batch_typed(orderkeys, custkeys, orderdates, start_days, end_days)?
-    {
-        return Ok(orders);
-    }
-    let mut orders = fast_hash_map::<i64, i64>();
-    for row in 0..batch.num_rows() {
-        let Some(orderdate) = date32_value(orderdates, row)? else {
-            continue;
-        };
-        if orderdate < start_days || orderdate >= end_days {
-            continue;
-        }
-        let (Some(orderkey), Some(custkey)) = (
-            numeric_i64_value(orderkeys, row)?,
-            numeric_i64_value(custkeys, row)?,
-        ) else {
-            continue;
-        };
-        orders.insert(orderkey, custkey);
-    }
-    Ok(orders)
+    )?;
+    Ok(fast_hash_map_from_pairs_profiled(
+        orders,
+        "returned order customers build",
+    ))
 }
 
 fn order_customer_keys_view(
     view: BatchView<'_>,
     start_days: i32,
     end_days: i32,
-) -> Result<FastHashMap<i64, i64>> {
-    if view.num_columns() == 3
-        && let (Some(orderkeys), Some(custkeys), Some(orderdates)) = (
-            view.i64_vector(0),
-            view.i64_vector(1),
-            view.date32_vector(2),
-        )
-    {
-        let mut orders = fast_hash_map::<i64, i64>();
-        if let (Some(orderkey_values), Some(custkey_values), Some(orderdate_values)) = (
-            orderkeys.values_if_null_free(),
-            custkeys.values_if_null_free(),
-            orderdates.values_if_null_free(),
-        ) {
-            for row in 0..view.num_rows() {
-                let orderdate = orderdate_values[row];
-                if orderdate >= start_days && orderdate < end_days {
-                    orders.insert(orderkey_values[row], custkey_values[row]);
-                }
-            }
-            return Ok(orders);
-        }
-        for row in 0..view.num_rows() {
-            if orderkeys.is_null(row) || custkeys.is_null(row) || orderdates.is_null(row) {
-                continue;
-            }
-            let orderdate = orderdates.value(row);
-            if orderdate >= start_days && orderdate < end_days {
-                orders.insert(orderkeys.value(row), custkeys.value(row));
-            }
-        }
-        return Ok(orders);
-    }
-    let Some(batch) = view.try_record_batch() else {
-        return Err(DodamError::UnsupportedSql(
-            "Q10 order customer raw vector columns have unsupported types".to_string(),
-        ));
-    };
-    order_customer_keys_batch(batch.clone(), start_days, end_days)
-}
-
-fn order_customer_keys_batch_typed(
-    orderkeys: &ArrayRef,
-    custkeys: &ArrayRef,
-    orderdates: &ArrayRef,
-    start_days: i32,
-    end_days: i32,
-) -> Result<Option<FastHashMap<i64, i64>>> {
-    let mut orders = fast_hash_map::<i64, i64>();
-    if !try_for_each_i64_i64_date32(
-        orderkeys,
-        custkeys,
-        orderdates,
-        |orderkey, custkey, orderdate| {
-            if orderdate >= start_days && orderdate < end_days {
-                orders.insert(orderkey, custkey);
-            }
-            Ok(())
+) -> Result<Vec<(i64, i64)>> {
+    collect_i64_i64_date32_pairs_view(
+        view,
+        "Q10 order customer raw vector columns have unsupported types",
+        |_, custkey, orderdate| {
+            Ok((orderdate >= start_days && orderdate < end_days).then_some(custkey))
         },
-    )? {
-        return Ok(None);
-    };
-    Ok(Some(orders))
+    )
 }
 
 async fn returned_revenue_by_customer(
@@ -963,9 +839,8 @@ async fn returned_revenue_by_customer(
     batch_size: usize,
     order_customers: &FastHashMap<i64, i64>,
 ) -> Result<FastHashMap<i64, f64>> {
-    if returned_revenue_late_enabled()
-        && let Some(revenues) =
-            returned_revenue_late(engine, path.clone(), batch_size, order_customers).await?
+    if let Some(revenues) =
+        returned_revenue_late(engine, path.clone(), batch_size, order_customers).await?
     {
         return Ok(revenues);
     }
@@ -1017,10 +892,7 @@ async fn returned_revenue_late(
             ]),
             Vec::new(),
             returned_revenue_late_row_group_chunk(),
-            late_materialization_policy_from_env(
-                "DODAM_Q10_RETURNED_LATE_MAX_SELECTED_RATIO",
-                0.50,
-            ),
+            generic_late_materialization_policy(0.50),
             {
                 let order_customers = order_customers.clone();
                 move || ReturnedRevenueLateState {
@@ -1055,16 +927,8 @@ async fn returned_revenue_late(
     Ok(Some(revenues))
 }
 
-fn returned_revenue_late_enabled() -> bool {
-    std::env::var_os("DODAM_Q10_DISABLE_RETURNED_LATE").is_none()
-}
-
 fn returned_revenue_late_row_group_chunk() -> usize {
-    std::env::var("DODAM_Q10_RETURNED_LATE_ROW_GROUP_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(2)
+    late_materialization_row_group_chunk(2)
 }
 
 struct ReturnedRevenueLateState {
@@ -1173,40 +1037,31 @@ fn returned_revenue_late_consume_payload_batch(
     else {
         return Ok(None);
     };
-    if extendedprices.null_count() == 0 && discounts.null_count() == 0 {
-        let extendedprice_values = extendedprices.raw_values();
-        let discount_values = discounts.raw_values();
-        let (discount_scale, revenue_scale) =
-            decimal_discounted_revenue_scales(extendedprices, discounts);
-        for row in 0..batch.num_rows() {
+    consume_discounted_revenue_decimal128_vectors(
+        Decimal128VectorView::Arrow {
+            values: extendedprices.values,
+            precision: extendedprices.precision,
+            scale: extendedprices.scale,
+        },
+        Decimal128VectorView::Arrow {
+            values: discounts.values,
+            precision: discounts.precision,
+            scale: discounts.scale,
+        },
+        batch.num_rows(),
+        |_, revenue| {
             let Some(&custkey) = state.selected_custkeys.get(state.payload_offset) else {
                 return Err(DodamError::UnsupportedSql(
                     "returned revenue payload row overflow".to_string(),
                 ));
             };
             state.payload_offset += 1;
-            *state.revenues.entry(custkey).or_insert(0.0) += decimal_discounted_revenue_raw(
-                extendedprice_values[row],
-                discount_values[row],
-                discount_scale,
-                revenue_scale,
-            );
-        }
-        return Ok(Some(()));
-    }
-    for row in 0..batch.num_rows() {
-        let Some(&custkey) = state.selected_custkeys.get(state.payload_offset) else {
-            return Err(DodamError::UnsupportedSql(
-                "returned revenue payload row overflow".to_string(),
-            ));
-        };
-        state.payload_offset += 1;
-        if extendedprices.is_null(row) || discounts.is_null(row) {
-            continue;
-        }
-        *state.revenues.entry(custkey).or_insert(0.0) +=
-            extendedprices.value(row) * (1.0 - discounts.value(row));
-    }
+            if let Some(revenue) = revenue {
+                *state.revenues.entry(custkey).or_insert(0.0) += revenue;
+            }
+            Ok(())
+        },
+    )?;
     Ok(Some(()))
 }
 
@@ -1223,40 +1078,23 @@ fn returned_revenue_late_consume_payload_view(
             };
             return returned_revenue_late_consume_payload_batch(batch.clone(), state);
         };
-        if extendedprices.null_count() == 0 && discounts.null_count() == 0 {
-            let extendedprice_values = extendedprices.raw_values();
-            let discount_values = discounts.raw_values();
-            let discount_scale = discounts.scale();
-            let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
-            for row in 0..view.num_rows() {
+        consume_discounted_revenue_decimal128_vectors(
+            extendedprices,
+            discounts,
+            view.num_rows(),
+            |_, revenue| {
                 let Some(&custkey) = state.selected_custkeys.get(state.payload_offset) else {
                     return Err(DodamError::UnsupportedSql(
                         "returned revenue payload row overflow".to_string(),
                     ));
                 };
                 state.payload_offset += 1;
-                *state.revenues.entry(custkey).or_insert(0.0) += decimal_discounted_revenue_raw(
-                    extendedprice_values[row],
-                    discount_values[row],
-                    discount_scale,
-                    revenue_scale,
-                );
-            }
-            return Ok(Some(()));
-        }
-        for row in 0..view.num_rows() {
-            let Some(&custkey) = state.selected_custkeys.get(state.payload_offset) else {
-                return Err(DodamError::UnsupportedSql(
-                    "returned revenue payload row overflow".to_string(),
-                ));
-            };
-            state.payload_offset += 1;
-            if extendedprices.is_null(row) || discounts.is_null(row) {
-                continue;
-            }
-            *state.revenues.entry(custkey).or_insert(0.0) +=
-                extendedprices.value(row) * (1.0 - discounts.value(row));
-        }
+                if let Some(revenue) = revenue {
+                    *state.revenues.entry(custkey).or_insert(0.0) += revenue;
+                }
+                Ok(())
+            },
+        )?;
         return Ok(Some(()));
     }
     let Some(batch) = view.try_record_batch() else {
@@ -1266,18 +1104,7 @@ fn returned_revenue_late_consume_payload_view(
 }
 
 fn log_returned_revenue_late_profile(metrics: LateMaterializedMetrics, row_group_chunk: usize) {
-    if !tpch_profile_enabled() {
-        return;
-    }
-    let ratio = if metrics.total_rows == 0 {
-        0.0
-    } else {
-        metrics.selected_rows as f64 / metrics.total_rows as f64
-    };
-    eprintln!(
-        "[dodam:tpch-profile] returned revenue: late_materialized rows={} selected={} ratio={:.6} selector_runs={} row_group_chunk={}",
-        metrics.total_rows, metrics.selected_rows, ratio, metrics.selector_runs, row_group_chunk
-    );
+    tpch_profile_late_materialized("returned revenue", metrics, row_group_chunk);
 }
 
 fn returned_revenue_batch(
@@ -1296,48 +1123,71 @@ fn returned_revenue_batch(
     ) {
         let returnflag_offsets = returnflags.value_offsets();
         let returnflag_data = returnflags.value_data();
-        if orderkeys.null_count() == 0
-            && extendedprices.null_count() == 0
-            && discounts.null_count() == 0
+        let customer_key = std::cell::Cell::new(None::<i64>);
+        let extendedprices = Decimal128VectorView::Arrow {
+            values: extendedprices.values,
+            precision: extendedprices.precision,
+            scale: extendedprices.scale,
+        };
+        let discounts = Decimal128VectorView::Arrow {
+            values: discounts.values,
+            precision: discounts.precision,
+            scale: discounts.scale,
+        };
+        if let Some(orderkey_values) =
+            (orderkeys.null_count() == 0).then(|| orderkeys.values().as_ref())
         {
-            let orderkey_values = orderkeys.values().as_ref();
-            let extendedprice_values = extendedprices.raw_values();
-            let discount_values = discounts.raw_values();
-            let (discount_scale, revenue_scale) =
-                decimal_discounted_revenue_scales(extendedprices, discounts);
-            for row in 0..batch.num_rows() {
-                if returnflags.is_null(row)
-                    || !utf8_value_is_one_byte(returnflag_offsets, returnflag_data, row, b'R')
-                {
-                    continue;
-                }
-                let Some(custkey) = order_customers.get(&orderkey_values[row]).copied() else {
-                    continue;
-                };
-                *revenues.entry(custkey).or_insert(0.0) += decimal_discounted_revenue_raw(
-                    extendedprice_values[row],
-                    discount_values[row],
-                    discount_scale,
-                    revenue_scale,
-                );
-            }
+            consume_filtered_discounted_revenue_decimal128_vectors(
+                extendedprices,
+                discounts,
+                batch.num_rows(),
+                |row| {
+                    customer_key.set(None);
+                    if returnflags.is_null(row)
+                        || !utf8_value_is_one_byte(returnflag_offsets, returnflag_data, row, b'R')
+                    {
+                        return Ok(false);
+                    }
+                    let Some(custkey) = order_customers.get(&orderkey_values[row]).copied() else {
+                        return Ok(false);
+                    };
+                    customer_key.set(Some(custkey));
+                    Ok(true)
+                },
+                |_, revenue| {
+                    if let Some(custkey) = customer_key.get() {
+                        *revenues.entry(custkey).or_insert(0.0) += revenue;
+                    }
+                    Ok(())
+                },
+            )?;
             return Ok(revenues);
         }
-        for row in 0..batch.num_rows() {
-            if returnflags.is_null(row)
-                || !utf8_value_is_one_byte(returnflag_offsets, returnflag_data, row, b'R')
-                || orderkeys.is_null(row)
-                || extendedprices.is_null(row)
-                || discounts.is_null(row)
-            {
-                continue;
-            }
-            let Some(custkey) = order_customers.get(&orderkeys.value(row)).copied() else {
-                continue;
-            };
-            *revenues.entry(custkey).or_insert(0.0) +=
-                extendedprices.value(row) * (1.0 - discounts.value(row));
-        }
+        consume_filtered_discounted_revenue_decimal128_vectors(
+            extendedprices,
+            discounts,
+            batch.num_rows(),
+            |row| {
+                customer_key.set(None);
+                if returnflags.is_null(row)
+                    || !utf8_value_is_one_byte(returnflag_offsets, returnflag_data, row, b'R')
+                    || orderkeys.is_null(row)
+                {
+                    return Ok(false);
+                }
+                let Some(custkey) = order_customers.get(&orderkeys.value(row)).copied() else {
+                    return Ok(false);
+                };
+                customer_key.set(Some(custkey));
+                Ok(true)
+            },
+            |_, revenue| {
+                if let Some(custkey) = customer_key.get() {
+                    *revenues.entry(custkey).or_insert(0.0) += revenue;
+                }
+                Ok(())
+            },
+        )?;
         return Ok(revenues);
     }
     let returnflag_offsets = returnflags.value_offsets();
@@ -1384,44 +1234,37 @@ fn returned_revenue_view(
         let mut revenues = fast_hash_map::<i64, f64>();
         if let Some(orderkey_values) = orderkeys.values_if_null_free()
             && returnflags.null_count() == 0
-            && extendedprices.null_count() == 0
-            && discounts.null_count() == 0
         {
-            let extendedprice_values = extendedprices.raw_values();
-            let discount_values = discounts.raw_values();
-            let discount_scale = discounts.scale();
-            let revenue_scale = 1.0 / (extendedprices.scale() * discounts.scale());
-            for row in 0..view.num_rows() {
-                if returnflags.value_bytes(row) != b"R" {
-                    continue;
-                }
-                let Some(custkey) = order_customers.get(&orderkey_values[row]).copied() else {
-                    continue;
-                };
-                *revenues.entry(custkey).or_insert(0.0) += decimal_discounted_revenue_raw(
-                    extendedprice_values[row],
-                    discount_values[row],
-                    discount_scale,
-                    revenue_scale,
-                );
-            }
+            consume_filtered_discounted_revenue_decimal128_vectors(
+                extendedprices,
+                discounts,
+                view.num_rows(),
+                |row| Ok(returnflags.value_bytes(row) == b"R"),
+                |row, revenue| {
+                    if let Some(custkey) = order_customers.get(&orderkey_values[row]).copied() {
+                        *revenues.entry(custkey).or_insert(0.0) += revenue;
+                    }
+                    Ok(())
+                },
+            )?;
             return Ok(revenues);
         }
-        for row in 0..view.num_rows() {
-            if returnflags.is_null(row)
-                || returnflags.value_bytes(row) != b"R"
-                || orderkeys.is_null(row)
-                || extendedprices.is_null(row)
-                || discounts.is_null(row)
-            {
-                continue;
-            }
-            let Some(custkey) = order_customers.get(&orderkeys.value(row)).copied() else {
-                continue;
-            };
-            *revenues.entry(custkey).or_insert(0.0) +=
-                extendedprices.value(row) * (1.0 - discounts.value(row));
-        }
+        consume_filtered_discounted_revenue_decimal128_vectors(
+            extendedprices,
+            discounts,
+            view.num_rows(),
+            |row| {
+                Ok(!returnflags.is_null(row)
+                    && returnflags.value_bytes(row) == b"R"
+                    && !orderkeys.is_null(row))
+            },
+            |row, revenue| {
+                if let Some(custkey) = order_customers.get(&orderkeys.value(row)).copied() {
+                    *revenues.entry(custkey).or_insert(0.0) += revenue;
+                }
+                Ok(())
+            },
+        )?;
         return Ok(revenues);
     }
     let Some(batch) = view.try_record_batch() else {

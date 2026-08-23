@@ -11,46 +11,37 @@ pub(super) fn literal_date_days(expr: &SqlExpr) -> Result<i32> {
     i32::try_from(days).map_err(|_| DodamError::UnsupportedSql("DATE overflow".to_string()))
 }
 
-pub(super) fn should_use_i64_set_row_filter(
+pub(super) fn should_use_i64_set_row_filter_for_keys_auto(
     default_enabled: bool,
-    disable_env: &str,
-    enable_env: Option<&str>,
-    key_count: usize,
-    projected_columns: usize,
-) -> bool {
-    if env_flag_enabled(disable_env) {
-        return false;
-    }
-    let enabled = enable_env.is_some_and(env_flag_enabled) || default_enabled;
-    enabled
-        && key_count > 0
-        && key_count <= i64_set_row_filter_max_keys()
-        && projected_columns >= i64_set_row_filter_min_projected_columns()
-}
-
-pub(super) fn should_use_i64_set_row_filter_for_keys(
-    default_enabled: bool,
-    disable_env: &str,
-    enable_env: Option<&str>,
     keys: &HashSet<i64>,
     projected_columns: usize,
 ) -> bool {
-    let forced_enabled = enable_env.is_some_and(env_flag_enabled);
-    if !should_use_i64_set_row_filter(
-        default_enabled,
-        disable_env,
-        enable_env,
-        keys.len(),
-        projected_columns,
-    ) {
-        return false;
-    }
-    if forced_enabled {
-        return true;
-    }
     let Some((min_key, max_key)) = raw_i64_key_range(keys.iter().copied()) else {
         return false;
     };
+    should_use_i64_set_row_filter_for_key_stats(
+        default_enabled,
+        keys.len(),
+        min_key,
+        max_key,
+        projected_columns,
+    )
+}
+
+pub(super) fn should_use_i64_set_row_filter_for_key_stats(
+    default_enabled: bool,
+    key_count: usize,
+    min_key: i64,
+    max_key: i64,
+    projected_columns: usize,
+) -> bool {
+    if !default_enabled
+        || key_count == 0
+        || key_count > i64_set_row_filter_max_keys()
+        || projected_columns < i64_set_row_filter_min_projected_columns()
+    {
+        return false;
+    }
     let Some(width) = max_key
         .checked_sub(min_key)
         .and_then(|width| width.checked_add(1))
@@ -61,9 +52,9 @@ pub(super) fn should_use_i64_set_row_filter_for_keys(
     if width == 0 {
         return false;
     }
-    let density = keys.len() as f64 / width as f64;
+    let density = key_count as f64 / width as f64;
     density <= i64_set_row_filter_max_density()
-        || keys.len() <= i64_set_row_filter_always_allow_keys()
+        || key_count <= i64_set_row_filter_always_allow_keys()
 }
 
 pub(super) fn env_flag_enabled(name: &str) -> bool {
@@ -73,11 +64,15 @@ pub(super) fn env_flag_enabled(name: &str) -> bool {
 }
 
 pub(super) fn i64_set_row_filter_max_keys() -> usize {
+    i64_set_row_filter_max_keys_with_default(1_000_000)
+}
+
+pub(super) fn i64_set_row_filter_max_keys_with_default(default_max_keys: usize) -> usize {
     std::env::var("DODAM_I64_SET_ROW_FILTER_MAX_KEYS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(1_000_000)
+        .unwrap_or(default_max_keys)
 }
 
 pub(super) fn i64_set_row_filter_min_projected_columns() -> usize {
@@ -100,6 +95,58 @@ pub(super) fn i64_set_row_filter_always_allow_keys() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(4096)
+}
+
+pub(super) fn i64_set_row_filter_row_group_chunk(default_chunk: usize) -> usize {
+    std::env::var("DODAM_I64_SET_ROW_FILTER_ROW_GROUP_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default_chunk)
+}
+
+pub(super) fn dense_i32_max_entries(default_bytes: usize) -> usize {
+    std::env::var("DODAM_DENSE_I32_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|bytes| bytes / std::mem::size_of::<i32>())
+        .filter(|entries| *entries > 0)
+        .unwrap_or_else(|| default_bytes / std::mem::size_of::<i32>())
+}
+
+pub(super) fn dense_max_amplification(default_amplification: f64) -> f64 {
+    std::env::var("DODAM_DENSE_MAX_AMPLIFICATION")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 1.0)
+        .unwrap_or(default_amplification)
+}
+
+pub(super) fn dense_i64_probe_max_key(default_bytes: usize) -> usize {
+    std::env::var("DODAM_DENSE_I64_PROBE_MAX_KEY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            dense_i64_probe_bytes(default_bytes)
+                .saturating_mul(8)
+                .saturating_sub(1)
+        })
+}
+
+pub(super) fn dense_i64_probe_bytes(default_bytes: usize) -> usize {
+    std::env::var("DODAM_DENSE_I64_PROBE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default_bytes)
+}
+
+pub(super) fn dense_i64_rank_map_bytes(default_bytes: usize) -> usize {
+    std::env::var("DODAM_DENSE_I64_RANK_MAP_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(default_bytes)
 }
 
 pub(super) fn raw_i64_key_range(keys: impl IntoIterator<Item = i64>) -> Option<(i64, i64)> {

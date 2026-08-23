@@ -186,25 +186,6 @@ impl PricingSummaryGroupSlots {
         );
     }
 
-    fn update_key_raw_values(
-        &mut self,
-        returnflag: u8,
-        linestatus: u8,
-        quantity: f64,
-        extendedprice: f64,
-        discounted: f64,
-        charge: f64,
-        discount: f64,
-    ) {
-        let state = self.state_for_key_mut(returnflag, linestatus);
-        state.sum_qty += quantity;
-        state.sum_base_price += extendedprice;
-        state.sum_disc_price += discounted;
-        state.sum_charge += charge;
-        state.sum_discount += discount;
-        state.count_order += 1;
-    }
-
     fn state_for_key_mut(&mut self, returnflag: u8, linestatus: u8) -> &mut PricingSummaryState {
         let key = (u16::from(returnflag) << 8) | u16::from(linestatus);
         for index in 0..self.len {
@@ -285,54 +266,24 @@ async fn pricing_summary_rows(
         "l_tax".to_string(),
         "l_shipdate".to_string(),
     ]);
-    if pricing_summary_row_group_map_enabled() && !pricing_summary_pruning_enabled() {
-        let groups = engine
-            .parquet_scan_accumulate_chunks_view(
-                path.clone(),
-                batch_size,
-                projection.clone(),
-                pricing_summary_row_group_map_chunk(),
-                pricing_summary_chunk_size(),
-                scan_aggregate_fusion_enabled(),
-                PricingSummaryGroupSlots::new,
-                PricingSummaryGroupSlots::new,
-                move |view, groups| {
-                    pricing_summary_projected_view_into(view, cutoff_days, groups)?;
-                    Ok(Some(()))
-                },
-                |groups, rows| groups.merge_slots(rows),
-                "pricing summary aggregate",
-            )
-            .await?;
-        return Ok(pricing_summary_sorted_rows(groups));
-    }
-    let mut stream = if pricing_summary_pruning_enabled() {
-        engine
-            .scan_parquet_batches_pruned(
-                path,
-                batch_size,
-                projection,
-                pricing_summary_shipdate_pruning_predicates(cutoff_days),
-            )
-            .await?
-    } else {
-        engine
-            .scan_parquet_batches(path, batch_size, None, projection, None)
-            .await?
-    };
-    let groups = parallel_batch_fold_view_chunks(
-        &mut stream,
-        pricing_summary_chunk_size(),
-        PricingSummaryGroupSlots::new,
-        move |view, groups| {
-            pricing_summary_projected_view_into(view, cutoff_days, groups)?;
-            Ok(Some(()))
-        },
-        Ok,
-        PricingSummaryGroupSlots::new(),
-        |groups, rows| groups.merge_slots(rows),
-        "pricing summary aggregate",
-    )?;
+    let groups = engine
+        .parquet_scan_accumulate_chunks_view(
+            path,
+            batch_size,
+            projection,
+            pricing_summary_row_group_map_chunk(),
+            pricing_summary_chunk_size(),
+            scan_aggregate_fusion_enabled(),
+            PricingSummaryGroupSlots::new,
+            PricingSummaryGroupSlots::new,
+            move |view, groups| {
+                pricing_summary_projected_view_into(view, cutoff_days, groups)?;
+                Ok(Some(()))
+            },
+            |groups, rows| groups.merge_slots(rows),
+            "pricing summary aggregate",
+        )
+        .await?;
     Ok(pricing_summary_sorted_rows(groups))
 }
 
@@ -346,40 +297,12 @@ fn pricing_summary_sorted_rows(groups: PricingSummaryGroupSlots) -> Vec<PricingS
     rows
 }
 
-fn pricing_summary_row_group_map_enabled() -> bool {
-    match std::env::var("DODAM_Q01_DISABLE_ROW_GROUP_MAP") {
-        Ok(value) => !matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"),
-        Err(_) => true,
-    }
-}
-
 fn pricing_summary_row_group_map_chunk() -> usize {
-    std::env::var("DODAM_Q01_ROW_GROUP_MAP_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(2)
-}
-
-fn pricing_summary_pruning_enabled() -> bool {
-    std::env::var("DODAM_Q01_ENABLE_PRUNING")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-}
-
-fn pricing_summary_shipdate_pruning_predicates(cutoff_days: i32) -> Vec<Expr> {
-    vec![Expr::Comparison(ComparisonExpr {
-        column: "l_shipdate".to_string(),
-        op: ComparisonOp::LtEq,
-        value: LiteralValue::Int64(i64::from(cutoff_days)),
-    })]
+    generic_row_group_map_chunk_size(2)
 }
 
 fn pricing_summary_chunk_size() -> usize {
-    std::env::var("DODAM_Q01_CHUNK_SIZE")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(4)
+    rule_chunk_size(4)
 }
 
 fn pricing_summary_batch_into(
@@ -521,29 +444,6 @@ fn pricing_summary_update_decimal_batch(
                 && discounts.precision <= 18
                 && taxes.precision <= 18
             {
-                if pricing_summary_raw_complement_enabled()
-                    && let (Some(discount_one), Some(tax_one)) =
-                        (discounts.scale_i64(), taxes.scale_i64())
-                {
-                    pricing_summary_update_raw_complement_batch(
-                        groups,
-                        cutoff_days,
-                        shipdate_values,
-                        quantity_values,
-                        extendedprice_values,
-                        discount_values,
-                        tax_values,
-                        returnflag_bytes,
-                        linestatus_bytes,
-                        quantity_scale,
-                        extendedprice_scale,
-                        discount_scale,
-                        tax_scale,
-                        discount_one,
-                        tax_one,
-                    );
-                    return Ok(true);
-                }
                 let row_count = shipdate_values.len();
                 debug_assert_eq!(quantity_values.len(), row_count);
                 debug_assert_eq!(extendedprice_values.len(), row_count);
@@ -701,29 +601,6 @@ fn pricing_summary_update_decimal_view(
                 && discounts.precision() <= 18
                 && taxes.precision() <= 18
             {
-                if pricing_summary_raw_complement_enabled()
-                    && let (Some(discount_one), Some(tax_one)) =
-                        (discounts.scale_i64(), taxes.scale_i64())
-                {
-                    pricing_summary_update_raw_complement_batch(
-                        groups,
-                        cutoff_days,
-                        shipdate_values,
-                        quantity_values,
-                        extendedprice_values,
-                        discount_values,
-                        tax_values,
-                        returnflag_bytes,
-                        linestatus_bytes,
-                        quantity_scale,
-                        extendedprice_scale,
-                        discount_scale,
-                        tax_scale,
-                        discount_one,
-                        tax_one,
-                    );
-                    return Ok(true);
-                }
                 for row in 0..shipdate_values.len() {
                     let shipdate = shipdate_values[row];
                     if shipdate > cutoff_days {
@@ -800,82 +677,6 @@ fn pricing_summary_update_decimal_view(
         });
     }
     Ok(true)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn pricing_summary_update_raw_complement_batch(
-    groups: &mut PricingSummaryGroupSlots,
-    cutoff_days: i32,
-    shipdate_values: &[i32],
-    quantity_values: &[i128],
-    extendedprice_values: &[i128],
-    discount_values: &[i128],
-    tax_values: &[i128],
-    returnflag_bytes: &[u8],
-    linestatus_bytes: &[u8],
-    quantity_scale: f64,
-    extendedprice_scale: f64,
-    discount_scale: f64,
-    tax_scale: f64,
-    discount_one: i64,
-    tax_one: i64,
-) {
-    let discounted_scale = extendedprice_scale * discount_scale;
-    let charge_scale = discounted_scale * tax_scale;
-    let row_count = shipdate_values.len();
-    debug_assert_eq!(quantity_values.len(), row_count);
-    debug_assert_eq!(extendedprice_values.len(), row_count);
-    debug_assert_eq!(discount_values.len(), row_count);
-    debug_assert_eq!(tax_values.len(), row_count);
-    debug_assert_eq!(returnflag_bytes.len(), row_count);
-    debug_assert_eq!(linestatus_bytes.len(), row_count);
-    for row in 0..row_count {
-        let (
-            shipdate,
-            quantity_raw,
-            extendedprice_raw,
-            discount_raw,
-            tax_raw,
-            returnflag,
-            linestatus,
-        ) = unsafe {
-            (
-                *shipdate_values.get_unchecked(row),
-                *quantity_values.get_unchecked(row) as i64,
-                *extendedprice_values.get_unchecked(row) as i64,
-                *discount_values.get_unchecked(row) as i64,
-                *tax_values.get_unchecked(row) as i64,
-                *returnflag_bytes.get_unchecked(row),
-                *linestatus_bytes.get_unchecked(row),
-            )
-        };
-        if shipdate > cutoff_days {
-            continue;
-        }
-        let quantity = quantity_raw as f64 * quantity_scale;
-        let extendedprice = extendedprice_raw as f64 * extendedprice_scale;
-        let discount = discount_raw as f64 * discount_scale;
-        let discounted =
-            extendedprice_raw as f64 * (discount_one - discount_raw) as f64 * discounted_scale;
-        let charge = extendedprice_raw as f64
-            * (discount_one - discount_raw) as f64
-            * (tax_one + tax_raw) as f64
-            * charge_scale;
-        groups.update_key_raw_values(
-            returnflag,
-            linestatus,
-            quantity,
-            extendedprice,
-            discounted,
-            charge,
-            discount,
-        );
-    }
-}
-
-fn pricing_summary_raw_complement_enabled() -> bool {
-    std::env::var("DODAM_Q01_RAW_COMPLEMENT")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 fn pricing_summary_group_state<'a>(

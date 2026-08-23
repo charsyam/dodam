@@ -1095,7 +1095,6 @@ fn try_write_same_source_union_all_streaming_primitive_topk_to_sink_inner(
                 .collect::<Result<Vec<_>>>()?,
         ),
         DirectPrimitiveColumnType::Date32
-        | DirectPrimitiveColumnType::Decimal128Int64 { .. }
         | DirectPrimitiveColumnType::Decimal128Int64Raw { .. } => return Ok(false),
     };
     let row_groups = (0..row_group_count).collect::<Vec<_>>();

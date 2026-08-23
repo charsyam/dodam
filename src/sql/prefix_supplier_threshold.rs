@@ -52,7 +52,15 @@ pub(super) async fn try_execute_prefix_part_supplier_threshold_sql(
     };
 
     let stage = tpch_profile_start();
-    let forest_parts = prefix_part_keys(engine, part_path, batch_size).await?;
+    let forest_parts = collect_i64_utf8_prefix_set(
+        engine,
+        part_path,
+        batch_size,
+        "p_partkey",
+        "p_name",
+        "forest",
+    )
+    .await?;
     tpch_profile_elapsed("PrefixSupplierThreshold forest part keys", stage);
     if forest_parts.is_empty() {
         return Ok(Some(prefix_supplier_threshold_output(Vec::new())?));
@@ -104,43 +112,18 @@ pub(super) fn prefix_part_supplier_threshold_shape(select: &Select, selection: &
         && text.contains("n_name = 'canada'")
 }
 
-pub(super) async fn prefix_part_keys(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-) -> Result<HashSet<i64>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec!["p_partkey".to_string(), "p_name".to_string()]),
-            None,
-        )
-        .await?;
-    let mut keys = HashSet::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let partkeys = batch_column(&batch, "p_partkey")?;
-        let names = batch_string_column(&batch, "p_name")?;
-        for row in 0..batch.num_rows() {
-            if names.is_valid(row)
-                && names.value(row).starts_with("forest")
-                && let Some(key) = numeric_i64_value(partkeys, row)?
-            {
-                keys.insert(key);
-            }
-        }
-    }
-    Ok(keys)
-}
-
 pub(super) async fn lineitem_quantity_sums_for_parts(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
     forest_parts: &AdaptiveI64Set,
 ) -> Result<HashMap<(i64, i64), f64>> {
+    if let Some(sums) =
+        lineitem_quantity_sums_for_parts_late(engine, path.clone(), batch_size, forest_parts)
+            .await?
+    {
+        return Ok(sums);
+    }
     let forest_parts = Arc::new(forest_parts.clone());
     engine
         .parquet_scan_accumulate_chunks_view(
@@ -165,6 +148,259 @@ pub(super) async fn lineitem_quantity_sums_for_parts(
             "PrefixSupplierThreshold lineitem quantity aggregate",
         )
         .await
+}
+
+async fn lineitem_quantity_sums_for_parts_late(
+    engine: &DodamEngine,
+    path: PathBuf,
+    batch_size: usize,
+    forest_parts: &AdaptiveI64Set,
+) -> Result<Option<HashMap<(i64, i64), f64>>> {
+    let predicate_projection =
+        Projection::Columns(vec!["l_partkey".to_string(), "l_shipdate".to_string()]);
+    let payload_projection =
+        Projection::Columns(vec!["l_suppkey".to_string(), "l_quantity".to_string()]);
+    let policy = generic_late_materialization_policy_for_projection(
+        &predicate_projection,
+        &payload_projection,
+        0.35,
+        Some(0.60),
+    );
+    let forest_parts = Arc::new(forest_parts.clone());
+    let Some(chunks) = engine
+        .late_materialized_parquet_map_pruned_with_policy_view(
+            path,
+            batch_size,
+            predicate_projection,
+            payload_projection,
+            Vec::new(),
+            prefix_supplier_threshold_late_row_group_chunk(),
+            policy,
+            {
+                let forest_parts = forest_parts.clone();
+                move || PrefixLineitemLateState {
+                    forest_parts: forest_parts.clone(),
+                    selected_partkeys: Vec::new(),
+                    payload_offset: 0,
+                    sums: HashMap::<(i64, i64), f64>::new(),
+                }
+            },
+            prefix_lineitem_late_build_selection_view,
+            prefix_lineitem_late_consume_payload_view,
+            |state, metrics| {
+                if state.payload_offset != state.selected_partkeys.len() {
+                    return Err(DodamError::UnsupportedSql(
+                        "PrefixSupplierThreshold late payload row mismatch".to_string(),
+                    ));
+                }
+                Ok(Some((state.sums, metrics)))
+            },
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let mut sums = HashMap::<(i64, i64), f64>::new();
+    let mut metrics = LateMaterializedMetrics::default();
+    for chunk in chunks {
+        let (chunk_sums, chunk_metrics) = chunk.output;
+        metrics.add(chunk_metrics);
+        merge_f64_groups(&mut sums, chunk_sums);
+    }
+    tpch_profile_late_materialized(
+        "PrefixSupplierThreshold lineitem quantity aggregate",
+        metrics,
+        prefix_supplier_threshold_late_row_group_chunk(),
+    );
+    Ok(Some(sums))
+}
+
+fn prefix_supplier_threshold_late_row_group_chunk() -> usize {
+    late_materialization_row_group_chunk(2)
+}
+
+struct PrefixLineitemLateState {
+    forest_parts: Arc<AdaptiveI64Set>,
+    selected_partkeys: Vec<i64>,
+    payload_offset: usize,
+    sums: HashMap<(i64, i64), f64>,
+}
+
+fn prefix_lineitem_late_build_selection_view(
+    view: BatchView<'_>,
+    selection: &mut LateSelectionBuilder,
+    state: &mut PrefixLineitemLateState,
+) -> Result<Option<()>> {
+    if view.num_columns() == 2
+        && let (Some(partkeys), Some(shipdates)) = (view.i64_vector(0), view.date32_vector(1))
+    {
+        let dense_part_keys = state.forest_parts.dense_contains_slice();
+        let dense_part_words = state.forest_parts.dense_word_slice();
+        if let (Some(partkey_values), Some(shipdate_values)) = (
+            partkeys.values_if_null_free(),
+            shipdates.values_if_null_free(),
+        ) {
+            for row in 0..partkey_values.len() {
+                let partkey = partkey_values[row];
+                let selected = (8_766..9_131).contains(&shipdate_values[row])
+                    && prefix_forest_part_contains(
+                        &state.forest_parts,
+                        dense_part_keys,
+                        dense_part_words,
+                        partkey,
+                    );
+                selection.push(selected);
+                if selected {
+                    state.selected_partkeys.push(partkey);
+                }
+            }
+            return Ok(Some(()));
+        }
+        for row in 0..partkeys.len() {
+            let selected = !partkeys.is_null(row)
+                && !shipdates.is_null(row)
+                && (8_766..9_131).contains(&shipdates.value(row))
+                && prefix_forest_part_contains(
+                    &state.forest_parts,
+                    dense_part_keys,
+                    dense_part_words,
+                    partkeys.value(row),
+                );
+            selection.push(selected);
+            if selected {
+                state.selected_partkeys.push(partkeys.value(row));
+            }
+        }
+        return Ok(Some(()));
+    }
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    prefix_lineitem_late_build_selection_batch(batch.clone(), selection, state)
+}
+
+fn prefix_forest_part_contains(
+    forest_parts: &AdaptiveI64Set,
+    dense_part_keys: Option<&[bool]>,
+    dense_part_words: Option<&[u64]>,
+    partkey: i64,
+) -> bool {
+    if let Some(words) = dense_part_words {
+        crate::dense::adaptive_i64_words_contains(words, partkey)
+    } else {
+        forest_parts.contains_cached(dense_part_keys, partkey)
+    }
+}
+
+fn prefix_lineitem_late_build_selection_batch(
+    batch: RecordBatch,
+    selection: &mut LateSelectionBuilder,
+    state: &mut PrefixLineitemLateState,
+) -> Result<Option<()>> {
+    let partkeys = batch_column(&batch, "l_partkey")?;
+    let shipdates = batch_column(&batch, "l_shipdate")?;
+    let (Some(partkeys), Some(shipdates)) = (
+        partkeys.as_any().downcast_ref::<Int64Array>(),
+        shipdates.as_any().downcast_ref::<Date32Array>(),
+    ) else {
+        return Ok(None);
+    };
+    let dense_part_keys = state.forest_parts.dense_contains_slice();
+    let dense_part_words = state.forest_parts.dense_word_slice();
+    for row in 0..batch.num_rows() {
+        let selected = partkeys.is_valid(row)
+            && shipdates.is_valid(row)
+            && (8_766..9_131).contains(&shipdates.value(row))
+            && prefix_forest_part_contains(
+                &state.forest_parts,
+                dense_part_keys,
+                dense_part_words,
+                partkeys.value(row),
+            );
+        selection.push(selected);
+        if selected {
+            state.selected_partkeys.push(partkeys.value(row));
+        }
+    }
+    Ok(Some(()))
+}
+
+fn prefix_lineitem_late_consume_payload_view(
+    view: BatchView<'_>,
+    state: &mut PrefixLineitemLateState,
+) -> Result<Option<()>> {
+    if view.num_columns() == 2
+        && let (Some(suppkeys), Some(quantities)) = (view.i64_vector(0), view.decimal128_vector(1))
+    {
+        if let Some(suppkey_values) = suppkeys.values_if_null_free()
+            && quantities.null_count() == 0
+        {
+            let quantity_values = quantities.raw_values();
+            let quantity_scale = quantities.scale();
+            for row in 0..suppkey_values.len() {
+                let Some(partkey) = state.selected_partkeys.get(state.payload_offset).copied()
+                else {
+                    return Err(DodamError::UnsupportedSql(
+                        "PrefixSupplierThreshold late payload row overflow".to_string(),
+                    ));
+                };
+                state.payload_offset += 1;
+                *state
+                    .sums
+                    .entry((partkey, suppkey_values[row]))
+                    .or_insert(0.0) += quantity_values[row] as f64 / quantity_scale;
+            }
+            return Ok(Some(()));
+        }
+        for row in 0..suppkeys.len() {
+            let Some(partkey) = state.selected_partkeys.get(state.payload_offset).copied() else {
+                return Err(DodamError::UnsupportedSql(
+                    "PrefixSupplierThreshold late payload row overflow".to_string(),
+                ));
+            };
+            state.payload_offset += 1;
+            if !suppkeys.is_null(row) && !quantities.is_null(row) {
+                *state
+                    .sums
+                    .entry((partkey, suppkeys.value(row)))
+                    .or_insert(0.0) += quantities.value(row);
+            }
+        }
+        return Ok(Some(()));
+    }
+    let Some(batch) = view.try_record_batch() else {
+        return Ok(None);
+    };
+    prefix_lineitem_late_consume_payload_batch(batch.clone(), state)
+}
+
+fn prefix_lineitem_late_consume_payload_batch(
+    batch: RecordBatch,
+    state: &mut PrefixLineitemLateState,
+) -> Result<Option<()>> {
+    let suppkeys = batch_column(&batch, "l_suppkey")?;
+    let quantities = batch_column(&batch, "l_quantity")?;
+    let Some(suppkeys) = suppkeys.as_any().downcast_ref::<Int64Array>() else {
+        return Ok(None);
+    };
+    let Some(quantities) = decimal_input(quantities)? else {
+        return Ok(None);
+    };
+    for row in 0..batch.num_rows() {
+        let Some(partkey) = state.selected_partkeys.get(state.payload_offset).copied() else {
+            return Err(DodamError::UnsupportedSql(
+                "PrefixSupplierThreshold late payload row overflow".to_string(),
+            ));
+        };
+        state.payload_offset += 1;
+        if !suppkeys.is_null(row) && !quantities.is_null(row) {
+            *state
+                .sums
+                .entry((partkey, suppkeys.value(row)))
+                .or_insert(0.0) += quantities.value(row);
+        }
+    }
+    Ok(Some(()))
 }
 
 pub(super) fn lineitem_quantity_sums_view_into(
@@ -344,101 +580,41 @@ pub(super) async fn eligible_supplier_keys_by_threshold(
     forest_parts: &AdaptiveI64Set,
     lineitem_sums: &HashMap<(i64, i64), f64>,
 ) -> Result<HashSet<i64>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec![
-                "ps_partkey".to_string(),
-                "ps_suppkey".to_string(),
-                "ps_availqty".to_string(),
-            ]),
-            None,
-        )
-        .await?;
-    let mut suppliers = HashSet::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let partkeys = batch_column(&batch, "ps_partkey")?;
-        let suppkeys = batch_column(&batch, "ps_suppkey")?;
-        let availqty = batch_column(&batch, "ps_availqty")?;
-        if let Some(batch_suppliers) =
-            eligible_supplier_keys_typed(partkeys, suppkeys, availqty, forest_parts, lineitem_sums)
-        {
-            suppliers.extend(batch_suppliers);
-            continue;
-        }
-        for row in 0..batch.num_rows() {
-            let (Some(partkey), Some(suppkey), Some(availqty)) = (
-                numeric_i64_value(partkeys, row)?,
-                numeric_i64_value(suppkeys, row)?,
-                numeric_f64_value(availqty, row)?,
-            ) else {
-                continue;
-            };
-            if !forest_parts.contains(partkey) {
-                continue;
-            }
-            let Some(quantity_sum) = lineitem_sums.get(&(partkey, suppkey)) else {
-                continue;
-            };
-            if availqty > 0.5 * *quantity_sum {
-                suppliers.insert(suppkey);
-            }
-        }
-    }
-    Ok(suppliers)
+    collect_i64_i64_i64_mapped_set(
+        engine,
+        path,
+        batch_size,
+        "ps_partkey",
+        "ps_suppkey",
+        "ps_availqty",
+        |partkey, suppkey, availqty| {
+            eligible_supplier_key(
+                partkey,
+                suppkey,
+                availqty as f64,
+                forest_parts,
+                lineitem_sums,
+            )
+        },
+        |partkey, suppkey, availqty| {
+            eligible_supplier_key(partkey, suppkey, availqty, forest_parts, lineitem_sums)
+        },
+    )
+    .await
 }
 
-pub(super) fn eligible_supplier_keys_typed(
-    partkeys: &ArrayRef,
-    suppkeys: &ArrayRef,
-    availqtys: &ArrayRef,
+fn eligible_supplier_key(
+    partkey: i64,
+    suppkey: i64,
+    availqty: f64,
     forest_parts: &AdaptiveI64Set,
     lineitem_sums: &HashMap<(i64, i64), f64>,
-) -> Option<HashSet<i64>> {
-    let (Some(partkeys), Some(suppkeys), Some(availqtys)) = (
-        partkeys.as_any().downcast_ref::<Int64Array>(),
-        suppkeys.as_any().downcast_ref::<Int64Array>(),
-        availqtys.as_any().downcast_ref::<Int32Array>(),
-    ) else {
+) -> Option<i64> {
+    if !forest_parts.contains(partkey) {
         return None;
-    };
-    let mut suppliers = HashSet::new();
-    if partkeys.null_count() == 0 && suppkeys.null_count() == 0 && availqtys.null_count() == 0 {
-        for row in 0..partkeys.len() {
-            let partkey = partkeys.value(row);
-            if !forest_parts.contains(partkey) {
-                continue;
-            }
-            let suppkey = suppkeys.value(row);
-            let Some(quantity_sum) = lineitem_sums.get(&(partkey, suppkey)) else {
-                continue;
-            };
-            if f64::from(availqtys.value(row)) > 0.5 * *quantity_sum {
-                suppliers.insert(suppkey);
-            }
-        }
-        return Some(suppliers);
     }
-    for row in 0..partkeys.len() {
-        if partkeys.is_null(row) || suppkeys.is_null(row) || availqtys.is_null(row) {
-            continue;
-        }
-        let partkey = partkeys.value(row);
-        if !forest_parts.contains(partkey) {
-            continue;
-        }
-        let suppkey = suppkeys.value(row);
-        let Some(quantity_sum) = lineitem_sums.get(&(partkey, suppkey)) else {
-            continue;
-        };
-        if f64::from(availqtys.value(row)) > 0.5 * *quantity_sum {
-            suppliers.insert(suppkey);
-        }
-    }
-    Some(suppliers)
+    let quantity_sum = lineitem_sums.get(&(partkey, suppkey))?;
+    (availqty > 0.5 * *quantity_sum).then_some(suppkey)
 }
 
 pub(super) struct PrefixSupplierThresholdRow {
@@ -453,47 +629,24 @@ pub(super) async fn supplier_rows_by_nation_and_eligibility(
     nation_keys: &HashSet<i64>,
     eligible_suppliers: &HashSet<i64>,
 ) -> Result<Vec<PrefixSupplierThresholdRow>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec![
-                "s_suppkey".to_string(),
-                "s_nationkey".to_string(),
-                "s_name".to_string(),
-                "s_address".to_string(),
-            ]),
-            None,
-        )
-        .await?;
-    let mut rows = Vec::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let suppkeys = batch_column(&batch, "s_suppkey")?;
-        let nationkeys = batch_column(&batch, "s_nationkey")?;
-        let names = batch_string_column(&batch, "s_name")?;
-        let addresses = batch_string_column(&batch, "s_address")?;
-        for row in 0..batch.num_rows() {
-            let (Some(suppkey), Some(nationkey)) = (
-                numeric_i64_value(suppkeys, row)?,
-                numeric_i64_value(nationkeys, row)?,
-            ) else {
-                continue;
-            };
-            if eligible_suppliers.contains(&suppkey)
-                && nation_keys.contains(&nationkey)
-                && names.is_valid(row)
-                && addresses.is_valid(row)
-            {
-                rows.push(PrefixSupplierThresholdRow {
-                    s_name: names.value(row).to_string(),
-                    s_address: addresses.value(row).to_string(),
-                });
-            }
-        }
-    }
-    Ok(rows)
+    collect_i64_i64_two_utf8_mapped_rows(
+        engine,
+        path,
+        batch_size,
+        "s_suppkey",
+        "s_nationkey",
+        "s_name",
+        "s_address",
+        |suppkey, nationkey, name, address| {
+            (eligible_suppliers.contains(&suppkey) && nation_keys.contains(&nationkey)).then(|| {
+                PrefixSupplierThresholdRow {
+                    s_name: name.to_string(),
+                    s_address: address.to_string(),
+                }
+            })
+        },
+    )
+    .await
 }
 
 pub(super) fn prefix_supplier_threshold_output(

@@ -19,8 +19,9 @@ use crate::catalog::{
     TableScanSource, TableStatistics,
 };
 use crate::cost::{
-    JoinCostInput, LateMaterializationCostInput, WorkerCostInput, choose_join_strategy,
-    choose_late_materialization, choose_parallel_workers,
+    JoinCostInput, LateMaterializationCostInput, RowGroupMapChunkCostInput, WorkerCostInput,
+    choose_join_strategy, choose_late_coalesce_max_gap, choose_late_materialization,
+    choose_parallel_workers, choose_row_group_map_chunk,
 };
 use crate::dense::DenseI64BoolLookup;
 use crate::error::{DodamError, Result};
@@ -43,18 +44,22 @@ use crate::plan::{
     PlanTableSource, TaskInput, TaskPlan,
 };
 use crate::storage::{
-    DirectByteArrayPayloadReader, DirectColumnScanMetrics, DirectI32I32DictionaryI64SelectedBatch,
-    DirectI32I64DecimalI32SelectedBatch, DirectI64DateDecimalDecimalSelectedBatch,
-    DirectI64I32I32ScanMetrics, DirectOrderedPrimitiveBatch, DirectPrimitiveColumnScanMetrics,
-    DirectPrimitiveColumnSpec, DirectPrimitiveColumnType, DirectSelectedPrimitivePageBatch,
-    I64BloomPredicate, LocalFileSystemObjectStore, ObjectStore, ParquetBatchReader,
-    ParquetFileCache, ParquetFileCacheStats, ParquetMetadataCache, PrimitiveRowGroupMinMax,
-    parquet_column_monotonic_by_scan, parquet_row_group_count_with_store,
-    parquet_row_groups_monotonic_by_column, parquet_total_row_count_with_store,
-    plan_parquet_scan_tasks, read_parquet_file_statistics, read_parquet_i64_column_constant,
-    read_parquet_i64_column_max, read_parquet_i128_column_min_max,
-    read_parquet_i128_column_min_max_relaxed, read_parquet_primitive_column_min_max_by_row_group,
-    read_parquet_projection_compressed_bytes, scan_parquet_i32_byte_array_columns_with_store,
+    DirectColumnScanMetrics, DirectI32I32DictionaryI64SelectedBatch,
+    DirectI32I64DecimalI32SelectedBatch, DirectOrderedPrimitiveBatch,
+    DirectPrimitiveColumnScanMetrics, DirectPrimitiveColumnSpec, DirectPrimitiveColumnType,
+    DirectSelectedPrimitivePageBatch, I64BloomPredicate, LocalFileSystemObjectStore, ObjectStore,
+    ParquetBatchReader, ParquetFileCache, ParquetFileCacheStats, ParquetMetadataCache,
+    PrimitiveRowGroupMinMax,
+    collect_parquet_i32_predicate_i64_lookup_selected_i64_mapped_with_store,
+    collect_parquet_i64_by_utf8_dictionary_predicate_with_store,
+    collect_parquet_i64_two_utf8_i64_mapped_with_store, parquet_column_monotonic_by_scan,
+    parquet_row_group_count_with_store, parquet_row_groups_monotonic_by_column,
+    parquet_total_row_count_with_store, plan_parquet_scan_tasks, read_parquet_file_statistics,
+    read_parquet_i64_column_constant, read_parquet_i64_column_max,
+    read_parquet_i128_column_min_max, read_parquet_i128_column_min_max_relaxed,
+    read_parquet_primitive_column_min_max_by_row_group, read_parquet_projection_compressed_bytes,
+    scan_parquet_dictionary_date_range_selected_primitive_columns_with_store,
+    scan_parquet_i32_byte_array_columns_with_store,
     scan_parquet_i32_byte_array_selected_by_i32_with_store,
     scan_parquet_i32_dictionary_id_columns_raw_with_store,
     scan_parquet_i32_dictionary_id_columns_with_store, scan_parquet_i32_i32_columns_with_store,
@@ -64,12 +69,9 @@ use crate::storage::{
     scan_parquet_i32_i64_decimal_i32_selected_with_store,
     scan_parquet_i32_i64_dictionary_id_columns_with_store,
     scan_parquet_i32_selected_by_byte_array_prefix_with_store,
-    scan_parquet_i64_byte_array_payload_columns_with_store,
-    scan_parquet_i64_byte_array_selected_by_i32x3_dictionary_with_store,
-    scan_parquet_i64_date_decimal_decimal_selected_typed_with_store,
-    scan_parquet_i64_dictionary_i32x3_columns_with_store,
-    scan_parquet_i64_dictionary_i32x3_dict_columns_with_store,
-    scan_parquet_i64_dictionary_i32x3_page_columns_with_store,
+    scan_parquet_i64_i64_selected_raw_columns_with_store,
+    scan_parquet_i64_lookup_decimal_utf8_selected_primitive_columns_with_store,
+    scan_parquet_i64_lookup_staged_two_i64_selected_primitive_columns_with_store,
     scan_parquet_primitive_columns_with_store,
     scan_parquet_primitive_columns_with_store_page_reader,
     scan_parquet_required_plain_primitive_in_list_desc_selected_pages_with_store,
@@ -644,6 +646,7 @@ struct LocalShuffleReadMetrics {
 struct ParquetMapChunkMetrics {
     chunks: usize,
     row_groups: usize,
+    projected_columns: usize,
     rows: usize,
     batches: usize,
     zero_batches: usize,
@@ -663,6 +666,7 @@ impl ParquetMapChunkMetrics {
     fn add(&mut self, other: Self) {
         self.chunks = self.chunks.saturating_add(other.chunks);
         self.row_groups = self.row_groups.saturating_add(other.row_groups);
+        self.projected_columns = self.projected_columns.max(other.projected_columns);
         self.rows = self.rows.saturating_add(other.rows);
         self.batches = self.batches.saturating_add(other.batches);
         self.zero_batches = self.zero_batches.saturating_add(other.zero_batches);
@@ -1152,6 +1156,25 @@ impl DodamEngine {
         )
     }
 
+    pub fn parquet_pruned_row_groups(
+        &self,
+        path: impl AsRef<Path>,
+        projection: &Projection,
+        pruning_predicates: &[Expr],
+    ) -> Result<Vec<usize>> {
+        Ok(plan_parquet_scan_tasks(
+            path,
+            projection,
+            pruning_predicates,
+            &self.metadata_cache,
+            self.object_store.as_ref(),
+        )?
+        .tasks
+        .into_iter()
+        .map(|task| task.row_group)
+        .collect())
+    }
+
     pub fn parquet_total_row_count(&self, path: impl AsRef<Path>) -> Result<usize> {
         parquet_total_row_count_with_store(
             path.as_ref(),
@@ -1203,34 +1226,6 @@ impl DodamEngine {
             .collect()
     }
 
-    pub(crate) fn scan_parquet_i64_i32_i32_columns_view<F>(
-        &self,
-        path: impl AsRef<Path>,
-        batch_size: usize,
-        row_groups: &[usize],
-        columns: [&str; 3],
-        consume: F,
-    ) -> Result<Option<DirectI64I32I32ScanMetrics>>
-    where
-        F: for<'a> FnMut(BatchView<'a>) -> Result<()>,
-    {
-        let specs = [
-            DirectPrimitiveColumnSpec {
-                name: columns[0],
-                column_type: DirectPrimitiveColumnType::I64,
-            },
-            DirectPrimitiveColumnSpec {
-                name: columns[1],
-                column_type: DirectPrimitiveColumnType::Date32,
-            },
-            DirectPrimitiveColumnSpec {
-                name: columns[2],
-                column_type: DirectPrimitiveColumnType::Date32,
-            },
-        ];
-        self.scan_parquet_primitive_columns_view(path, batch_size, row_groups, &specs, consume)
-    }
-
     pub(crate) fn scan_parquet_primitive_columns_view<F>(
         &self,
         path: impl AsRef<Path>,
@@ -1273,6 +1268,546 @@ impl DodamEngine {
             self.object_store.as_ref(),
             move |columns| consume(BatchView::from_raw_columns(columns)),
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn scan_parquet_dictionary_date_range_selected_primitive_columns_parallel<F>(
+        &self,
+        path: impl Into<PathBuf>,
+        row_groups: Vec<usize>,
+        predicate_column: String,
+        start_days: i32,
+        end_days: i32,
+        payload_columns: Vec<(String, DirectPrimitiveColumnType)>,
+        consume: F,
+    ) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
+    where
+        F: for<'a> Fn(BatchView<'a>) -> Result<()> + Sync,
+    {
+        let path = path.into();
+        let payload_columns = payload_columns
+            .into_iter()
+            .map(|(name, column_type)| OwnedDirectPrimitiveColumnSpec { name, column_type })
+            .collect::<Vec<_>>();
+        let mut scan_metrics = DirectPrimitiveColumnScanMetrics::default();
+        if row_groups.is_empty() {
+            return Ok(Some(scan_metrics));
+        }
+        let workers = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4)
+            .min(row_groups.len());
+        let (sender, receiver) = mpsc::channel();
+        let row_group_partitions = partition_row_groups_balanced(&row_groups, workers);
+        std::thread::scope(|scope| {
+            for row_group_partition in row_group_partitions {
+                let sender = sender.clone();
+                let engine = self.clone();
+                let path = path.clone();
+                let predicate_column = predicate_column.clone();
+                let payload_columns = payload_columns.clone();
+                let consume = &consume;
+                scope.spawn(move || {
+                    let specs = OwnedDirectPrimitiveColumnSpec::borrowed_specs(&payload_columns);
+                    let result =
+                        scan_parquet_dictionary_date_range_selected_primitive_columns_with_store(
+                            &path,
+                            &row_group_partition,
+                            &predicate_column,
+                            start_days,
+                            end_days,
+                            &specs,
+                            engine.file_cache.clone(),
+                            engine.object_store.as_ref(),
+                            |columns| consume(BatchView::from_raw_columns(columns)),
+                        );
+                    let _ = sender.send(result);
+                });
+            }
+        });
+        drop(sender);
+        for received in receiver {
+            let Some(metrics) = received? else {
+                return Ok(None);
+            };
+            scan_metrics.merge_from(metrics);
+        }
+        let mut profile_columns = Vec::with_capacity(payload_columns.len() + 1);
+        profile_columns.push(OwnedDirectPrimitiveColumnSpec {
+            name: predicate_column,
+            column_type: DirectPrimitiveColumnType::Date32,
+        });
+        profile_columns.extend(payload_columns);
+        log_direct_primitive_fold_profile(&path, &profile_columns, &scan_metrics);
+        Ok(Some(scan_metrics))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn scan_parquet_i64_lookup_decimal_utf8_selected_primitive_columns_parallel<
+        Lookup,
+        Predicate,
+        Consume,
+    >(
+        &self,
+        path: impl Into<PathBuf>,
+        row_groups: Vec<usize>,
+        key_column: String,
+        quantity_column: (String, DirectPrimitiveColumnType),
+        first_utf8_column: String,
+        second_utf8_column: String,
+        payload_columns: Vec<(String, DirectPrimitiveColumnType)>,
+        lookup: Lookup,
+        predicate: Predicate,
+        consume: Consume,
+    ) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
+    where
+        Lookup: Fn(i64) -> Option<u8> + Sync,
+        Predicate: Fn(u8, i64, &[u8], &[u8]) -> bool + Sync,
+        Consume: for<'a> Fn(BatchView<'a>) -> Result<()> + Sync,
+    {
+        let path = path.into();
+        let quantity_column = OwnedDirectPrimitiveColumnSpec {
+            name: quantity_column.0,
+            column_type: quantity_column.1,
+        };
+        let payload_columns = payload_columns
+            .into_iter()
+            .map(|(name, column_type)| OwnedDirectPrimitiveColumnSpec { name, column_type })
+            .collect::<Vec<_>>();
+        let mut scan_metrics = DirectPrimitiveColumnScanMetrics::default();
+        if row_groups.is_empty() {
+            return Ok(Some(scan_metrics));
+        }
+        let workers = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4)
+            .min(row_groups.len());
+        let (sender, receiver) = mpsc::channel();
+        let row_group_partitions = partition_row_groups_balanced(&row_groups, workers);
+        std::thread::scope(|scope| {
+            for row_group_partition in row_group_partitions {
+                let sender = sender.clone();
+                let engine = self.clone();
+                let path = path.clone();
+                let key_column = key_column.clone();
+                let quantity_column = quantity_column.clone();
+                let first_utf8_column = first_utf8_column.clone();
+                let second_utf8_column = second_utf8_column.clone();
+                let payload_columns = payload_columns.clone();
+                let lookup = &lookup;
+                let predicate = &predicate;
+                let consume = &consume;
+                scope.spawn(move || {
+                    let quantity_spec = DirectPrimitiveColumnSpec {
+                        name: &quantity_column.name,
+                        column_type: quantity_column.column_type,
+                    };
+                    let payload_specs =
+                        OwnedDirectPrimitiveColumnSpec::borrowed_specs(&payload_columns);
+                    let result =
+                        scan_parquet_i64_lookup_decimal_utf8_selected_primitive_columns_with_store(
+                            &path,
+                            &row_group_partition,
+                            &key_column,
+                            quantity_spec,
+                            &first_utf8_column,
+                            &second_utf8_column,
+                            &payload_specs,
+                            engine.file_cache.clone(),
+                            engine.object_store.as_ref(),
+                            lookup,
+                            predicate,
+                            |columns| consume(BatchView::from_raw_columns(columns)),
+                        );
+                    let _ = sender.send(result);
+                });
+            }
+        });
+        drop(sender);
+        for received in receiver {
+            let Some(metrics) = received? else {
+                return Ok(None);
+            };
+            scan_metrics.merge_from(metrics);
+        }
+        let mut profile_columns = Vec::with_capacity(payload_columns.len() + 4);
+        profile_columns.push(OwnedDirectPrimitiveColumnSpec {
+            name: key_column,
+            column_type: DirectPrimitiveColumnType::I64,
+        });
+        profile_columns.push(quantity_column);
+        profile_columns.push(OwnedDirectPrimitiveColumnSpec {
+            name: first_utf8_column,
+            column_type: DirectPrimitiveColumnType::I32,
+        });
+        profile_columns.push(OwnedDirectPrimitiveColumnSpec {
+            name: second_utf8_column,
+            column_type: DirectPrimitiveColumnType::I32,
+        });
+        profile_columns.extend(payload_columns);
+        log_direct_primitive_fold_profile(&path, &profile_columns, &scan_metrics);
+        Ok(Some(scan_metrics))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn collect_parquet_i64_by_utf8_dictionary_predicate_parallel<Predicate>(
+        &self,
+        path: impl Into<PathBuf>,
+        row_groups: Vec<usize>,
+        key_column: String,
+        predicate_column: String,
+        max_selected_ratio: (usize, usize),
+        predicate: Predicate,
+    ) -> Result<Option<(Vec<i64>, DirectPrimitiveColumnScanMetrics)>>
+    where
+        Predicate: Fn(&[u8]) -> bool + Sync,
+    {
+        let path = path.into();
+        let mut output = Vec::new();
+        let mut scan_metrics = DirectPrimitiveColumnScanMetrics::default();
+        if row_groups.is_empty() {
+            return Ok(Some((output, scan_metrics)));
+        }
+        let workers = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4)
+            .min(row_groups.len());
+        let (sender, receiver) = mpsc::channel();
+        let row_group_partitions = partition_row_groups_balanced(&row_groups, workers);
+        std::thread::scope(|scope| {
+            for row_group_partition in row_group_partitions {
+                let sender = sender.clone();
+                let engine = self.clone();
+                let path = path.clone();
+                let key_column = key_column.clone();
+                let predicate_column = predicate_column.clone();
+                let predicate = &predicate;
+                scope.spawn(move || {
+                    let result = collect_parquet_i64_by_utf8_dictionary_predicate_with_store(
+                        &path,
+                        &row_group_partition,
+                        &key_column,
+                        &predicate_column,
+                        max_selected_ratio,
+                        engine.file_cache.clone(),
+                        engine.object_store.as_ref(),
+                        predicate,
+                    );
+                    let _ = sender.send(result);
+                });
+            }
+        });
+        drop(sender);
+        for received in receiver {
+            let Some((mut rows, metrics)) = received? else {
+                return Ok(None);
+            };
+            output.append(&mut rows);
+            scan_metrics.merge_from(metrics);
+        }
+        log_direct_primitive_named_profile(
+            &path,
+            &[key_column.as_str(), predicate_column.as_str()],
+            &scan_metrics,
+        );
+        Ok(Some((output, scan_metrics)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn collect_parquet_i32_predicate_i64_lookup_selected_i64_mapped_parallel<
+        Tag,
+        Predicate,
+        Lookup,
+    >(
+        &self,
+        path: impl Into<PathBuf>,
+        row_groups: Vec<usize>,
+        predicate_column: (String, DirectPrimitiveColumnType),
+        key_column: String,
+        payload_column: String,
+        max_candidate_ratio: (usize, usize),
+        predicate: Predicate,
+        lookup: Lookup,
+    ) -> Result<Option<(Vec<(i64, Tag)>, DirectPrimitiveColumnScanMetrics)>>
+    where
+        Tag: Copy + Send,
+        Predicate: Fn(i32) -> Option<Tag> + Sync,
+        Lookup: Fn(i64) -> bool + Sync,
+    {
+        let path = path.into();
+        let mut output = Vec::new();
+        let mut scan_metrics = DirectPrimitiveColumnScanMetrics::default();
+        if row_groups.is_empty() {
+            return Ok(Some((output, scan_metrics)));
+        }
+        let workers = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4)
+            .min(row_groups.len());
+        let (sender, receiver) = mpsc::channel();
+        let row_group_partitions = partition_row_groups_balanced(&row_groups, workers);
+        std::thread::scope(|scope| {
+            for row_group_partition in row_group_partitions {
+                let sender = sender.clone();
+                let engine = self.clone();
+                let path = path.clone();
+                let predicate_column = predicate_column.clone();
+                let key_column = key_column.clone();
+                let payload_column = payload_column.clone();
+                let predicate = &predicate;
+                let lookup = &lookup;
+                scope.spawn(move || {
+                    let predicate_spec = DirectPrimitiveColumnSpec {
+                        name: &predicate_column.0,
+                        column_type: predicate_column.1,
+                    };
+                    let result =
+                        collect_parquet_i32_predicate_i64_lookup_selected_i64_mapped_with_store(
+                            &path,
+                            &row_group_partition,
+                            predicate_spec,
+                            &key_column,
+                            &payload_column,
+                            max_candidate_ratio,
+                            engine.file_cache.clone(),
+                            engine.object_store.as_ref(),
+                            predicate,
+                            lookup,
+                        );
+                    let _ = sender.send(result);
+                });
+            }
+        });
+        drop(sender);
+        for received in receiver {
+            let Some((mut rows, metrics)) = received? else {
+                return Ok(None);
+            };
+            output.append(&mut rows);
+            scan_metrics.merge_from(metrics);
+        }
+        let profile_columns = vec![
+            OwnedDirectPrimitiveColumnSpec {
+                name: predicate_column.0,
+                column_type: predicate_column.1,
+            },
+            OwnedDirectPrimitiveColumnSpec {
+                name: key_column,
+                column_type: DirectPrimitiveColumnType::I64,
+            },
+            OwnedDirectPrimitiveColumnSpec {
+                name: payload_column,
+                column_type: DirectPrimitiveColumnType::I64,
+            },
+        ];
+        log_direct_primitive_fold_profile(&path, &profile_columns, &scan_metrics);
+        Ok(Some((output, scan_metrics)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn collect_parquet_i64_two_utf8_i64_mapped_parallel<V, Map>(
+        &self,
+        path: impl Into<PathBuf>,
+        batch_size: usize,
+        row_groups: Vec<usize>,
+        key_column: String,
+        first_utf8_column: String,
+        second_utf8_column: String,
+        numeric_column: String,
+        map: Map,
+    ) -> Result<Option<(Vec<(i64, V)>, DirectPrimitiveColumnScanMetrics)>>
+    where
+        V: Copy + Send,
+        Map: Fn(&[u8], &[u8], i64) -> Option<V> + Sync,
+    {
+        let path = path.into();
+        let mut output = Vec::new();
+        let mut scan_metrics = DirectPrimitiveColumnScanMetrics::default();
+        if row_groups.is_empty() {
+            return Ok(Some((output, scan_metrics)));
+        }
+        let workers = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4)
+            .min(row_groups.len());
+        let (sender, receiver) = mpsc::channel();
+        let row_group_partitions = partition_row_groups_balanced(&row_groups, workers);
+        std::thread::scope(|scope| {
+            for row_group_partition in row_group_partitions {
+                let sender = sender.clone();
+                let engine = self.clone();
+                let path = path.clone();
+                let key_column = key_column.clone();
+                let first_utf8_column = first_utf8_column.clone();
+                let second_utf8_column = second_utf8_column.clone();
+                let numeric_column = numeric_column.clone();
+                let map = &map;
+                scope.spawn(move || {
+                    let result = collect_parquet_i64_two_utf8_i64_mapped_with_store(
+                        &path,
+                        batch_size,
+                        &row_group_partition,
+                        &key_column,
+                        &first_utf8_column,
+                        &second_utf8_column,
+                        &numeric_column,
+                        engine.file_cache.clone(),
+                        engine.object_store.as_ref(),
+                        map,
+                    );
+                    let _ = sender.send(result);
+                });
+            }
+        });
+        drop(sender);
+        for received in receiver {
+            let Some((mut rows, metrics)) = received? else {
+                return Ok(None);
+            };
+            output.append(&mut rows);
+            scan_metrics.merge_from(metrics);
+        }
+        let profile_columns = vec![
+            OwnedDirectPrimitiveColumnSpec {
+                name: key_column,
+                column_type: DirectPrimitiveColumnType::I64,
+            },
+            OwnedDirectPrimitiveColumnSpec {
+                name: first_utf8_column,
+                column_type: DirectPrimitiveColumnType::I32,
+            },
+            OwnedDirectPrimitiveColumnSpec {
+                name: second_utf8_column,
+                column_type: DirectPrimitiveColumnType::I32,
+            },
+            OwnedDirectPrimitiveColumnSpec {
+                name: numeric_column,
+                column_type: DirectPrimitiveColumnType::I64,
+            },
+        ];
+        log_direct_primitive_fold_profile(&path, &profile_columns, &scan_metrics);
+        Ok(Some((output, scan_metrics)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn scan_parquet_i64_lookup_staged_two_i64_selected_primitive_columns_parallel<
+        FirstTag,
+        FinalTag,
+        Lookup,
+        FirstPredicate,
+        SecondPredicate,
+        Consume,
+    >(
+        &self,
+        path: impl Into<PathBuf>,
+        row_groups: Vec<usize>,
+        key_column: String,
+        first_predicate_column: String,
+        second_predicate_column: String,
+        payload_columns: Vec<(String, DirectPrimitiveColumnType)>,
+        max_candidate_ratio: (usize, usize),
+        lookup: Lookup,
+        first_predicate: FirstPredicate,
+        second_predicate: SecondPredicate,
+        consume: Consume,
+    ) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
+    where
+        FirstTag: Copy + Send + Sync,
+        FinalTag: Copy + Send + Sync,
+        Lookup: Fn(i64) -> bool + Sync,
+        FirstPredicate: Fn(i64) -> Option<FirstTag> + Sync,
+        SecondPredicate: Fn(FirstTag, i64) -> Option<FinalTag> + Sync,
+        Consume: for<'a> Fn(&[FinalTag], BatchView<'a>) -> Result<()> + Sync,
+    {
+        let path = path.into();
+        let payload_columns = payload_columns
+            .into_iter()
+            .map(|(name, column_type)| OwnedDirectPrimitiveColumnSpec { name, column_type })
+            .collect::<Vec<_>>();
+        let mut scan_metrics = DirectPrimitiveColumnScanMetrics::default();
+        if row_groups.is_empty() {
+            return Ok(Some(scan_metrics));
+        }
+        let workers = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4)
+            .min(row_groups.len());
+        let (sender, receiver) = mpsc::channel();
+        let row_group_partitions = partition_row_groups_balanced(&row_groups, workers);
+        std::thread::scope(|scope| {
+            for (partition_index, row_group_partition) in
+                row_group_partitions.into_iter().enumerate()
+            {
+                let sender = sender.clone();
+                let engine = self.clone();
+                let path = path.clone();
+                let key_column = key_column.clone();
+                let first_predicate_column = first_predicate_column.clone();
+                let second_predicate_column = second_predicate_column.clone();
+                let payload_columns = payload_columns.clone();
+                let lookup = &lookup;
+                let first_predicate = &first_predicate;
+                let second_predicate = &second_predicate;
+                let consume = &consume;
+                scope.spawn(move || {
+                    let partition_profile = direct_primitive_profile_enabled();
+                    let partition_started = partition_profile.then(Instant::now);
+                    let partition_row_groups = row_group_partition.len();
+                    let payload_specs =
+                        OwnedDirectPrimitiveColumnSpec::borrowed_specs(&payload_columns);
+                    let result = scan_parquet_i64_lookup_staged_two_i64_selected_primitive_columns_with_store(
+                        &path,
+                        &row_group_partition,
+                        &key_column,
+                        &first_predicate_column,
+                        &second_predicate_column,
+                        &payload_specs,
+                        max_candidate_ratio,
+                        engine.file_cache.clone(),
+                        engine.object_store.as_ref(),
+                        lookup,
+                        first_predicate,
+                        second_predicate,
+                        |tags, columns| consume(tags, BatchView::from_raw_columns(columns)),
+                    );
+                    let elapsed = partition_started
+                        .map(|started| elapsed_nanos(started.elapsed()))
+                        .unwrap_or_default();
+                    let _ = sender.send((partition_index, partition_row_groups, elapsed, result));
+                });
+            }
+        });
+        drop(sender);
+        for (partition_index, partition_row_groups, elapsed, received) in receiver {
+            if direct_primitive_profile_enabled() {
+                eprintln!(
+                    "[dodam:direct-primitive-partition-profile] partition={} row_groups={} elapsed={:.3} ms",
+                    partition_index,
+                    partition_row_groups,
+                    nanos_to_millis(elapsed),
+                );
+            }
+            let Some(metrics) = received? else {
+                return Ok(None);
+            };
+            scan_metrics.merge_from(metrics);
+        }
+        let mut profile_columns = Vec::with_capacity(payload_columns.len() + 3);
+        profile_columns.push(OwnedDirectPrimitiveColumnSpec {
+            name: key_column,
+            column_type: DirectPrimitiveColumnType::I64,
+        });
+        profile_columns.push(OwnedDirectPrimitiveColumnSpec {
+            name: first_predicate_column,
+            column_type: DirectPrimitiveColumnType::I64,
+        });
+        profile_columns.push(OwnedDirectPrimitiveColumnSpec {
+            name: second_predicate_column,
+            column_type: DirectPrimitiveColumnType::I64,
+        });
+        profile_columns.extend(payload_columns);
+        log_direct_primitive_fold_profile(&path, &profile_columns, &scan_metrics);
+        Ok(Some(scan_metrics))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1719,88 +2254,6 @@ impl DodamEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn scan_parquet_i64_date_decimal_decimal_selected_typed_fold<
-        S,
-        Init,
-        Consume,
-        Merge,
-    >(
-        &self,
-        path: impl AsRef<Path>,
-        batch_size: usize,
-        row_groups: &[usize],
-        columns: [&str; 4],
-        date_min: Option<i32>,
-        date_max: Option<i32>,
-        init: Init,
-        consume: Consume,
-        merge: Merge,
-    ) -> Result<Option<(S, DirectPrimitiveColumnScanMetrics)>>
-    where
-        S: Send,
-        Init: Fn() -> S + Sync,
-        Consume:
-            for<'a> Fn(&mut S, DirectI64DateDecimalDecimalSelectedBatch<'a>) -> Result<()> + Sync,
-        Merge: Fn(&mut S, S) -> Result<()> + Sync,
-    {
-        let path = path.as_ref();
-        let mut state = init();
-        let mut scan_metrics = DirectPrimitiveColumnScanMetrics::default();
-        if row_groups.is_empty() {
-            return Ok(Some((state, scan_metrics)));
-        }
-        let workers = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(4)
-            .min(row_groups.len());
-        let (sender, receiver) = mpsc::channel();
-        let row_group_partitions = partition_row_groups_balanced(row_groups, workers);
-        std::thread::scope(|scope| {
-            for row_group_partition in row_group_partitions {
-                let sender = sender.clone();
-                let engine = self.clone();
-                let path = path.to_path_buf();
-                let row_groups = row_group_partition;
-                let init = &init;
-                let consume = &consume;
-                scope.spawn(move || {
-                    let mut state = init();
-                    let result = scan_parquet_i64_date_decimal_decimal_selected_typed_with_store(
-                        &path,
-                        batch_size,
-                        &row_groups,
-                        columns,
-                        date_min,
-                        date_max,
-                        engine.file_cache.clone(),
-                        engine.object_store.as_ref(),
-                        |batch| consume(&mut state, batch),
-                    );
-                    let _ =
-                        sender.send(result.map(|metrics| metrics.map(|metrics| (state, metrics))));
-                });
-            }
-        });
-        drop(sender);
-        for received in receiver {
-            let Some((partial, metrics)) = received? else {
-                return Ok(None);
-            };
-            merge(&mut state, partial)?;
-            scan_metrics.merge_from(metrics);
-        }
-        let profile_columns = columns
-            .iter()
-            .map(|name| OwnedDirectPrimitiveColumnSpec {
-                name: (*name).to_string(),
-                column_type: DirectPrimitiveColumnType::I64,
-            })
-            .collect::<Vec<_>>();
-        log_direct_primitive_fold_profile(path, &profile_columns, &scan_metrics);
-        Ok(Some((state, scan_metrics)))
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn scan_parquet_i32_i32_dictionary_i64_decimal_selected_fold<
         S,
         Init,
@@ -1885,28 +2338,6 @@ impl DodamEngine {
             .collect::<Vec<_>>();
         log_direct_primitive_fold_profile(path, &profile_columns, &scan_metrics);
         Ok(Some((state, scan_metrics)))
-    }
-
-    pub(crate) fn scan_parquet_i64_byte_array_payload_columns<F>(
-        &self,
-        path: impl AsRef<Path>,
-        batch_size: usize,
-        row_groups: &[usize],
-        columns: [&str; 2],
-        consume: F,
-    ) -> Result<Option<DirectColumnScanMetrics>>
-    where
-        F: for<'a> FnMut(&[i64], &mut DirectByteArrayPayloadReader<'a>) -> Result<Option<()>>,
-    {
-        scan_parquet_i64_byte_array_payload_columns_with_store(
-            path.as_ref(),
-            batch_size,
-            row_groups,
-            columns,
-            self.file_cache.clone(),
-            self.object_store.as_ref(),
-            consume,
-        )
     }
 
     pub(crate) fn scan_parquet_i32_i64_byte_array_columns<F>(
@@ -2131,521 +2562,6 @@ impl DodamEngine {
         Ok(None)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn scan_parquet_i64_dictionary_i32x3_fold<
-        State,
-        Output,
-        BuildState,
-        ConsumeBatch,
-        Finish,
-        Merge,
-    >(
-        &self,
-        path: PathBuf,
-        batch_size: usize,
-        columns: [&'static str; 5],
-        pruning_predicates: Vec<Expr>,
-        row_group_chunk: usize,
-        build_state: BuildState,
-        consume_batch: ConsumeBatch,
-        finish: Finish,
-        merge: Merge,
-    ) -> Result<Option<Output>>
-    where
-        State: Send + 'static,
-        Output: Send + 'static,
-        BuildState: Fn() -> State + Clone + Send + Sync + 'static,
-        ConsumeBatch: Fn(&mut State, &[i64], &[i32], &[bytes::Bytes], &[i32], &[i32], &[i32]) -> Result<()>
-            + Clone
-            + Send
-            + Sync
-            + 'static,
-        Finish: Fn(State) -> Result<Output> + Clone + Send + Sync + 'static,
-        Merge: Fn(&mut Output, Output) -> Result<()> + Clone + Send + Sync + 'static,
-    {
-        let source = self.plan_table_source(path.clone()).await?;
-        if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
-            return Ok(None);
-        }
-        let local_path = source.fragments[0].parquet_local_path()?.to_path_buf();
-        let projection =
-            Projection::Columns(columns.iter().map(|column| (*column).to_string()).collect());
-        let row_groups =
-            self.direct_primitive_row_groups(&local_path, &projection, &pruning_predicates)?;
-        if row_groups.is_empty() {
-            return Ok(Some(finish(build_state())?));
-        }
-        let chunks = row_groups
-            .chunks(row_group_chunk.max(1))
-            .map(|chunk| chunk.to_vec())
-            .collect::<Vec<_>>();
-        let (sender, receiver) = mpsc::channel();
-        for row_groups in chunks {
-            let sender = sender.clone();
-            let engine = self.clone();
-            let path = local_path.clone();
-            let build_state = build_state.clone();
-            let consume_batch = consume_batch.clone();
-            let finish = finish.clone();
-            rayon::spawn(move || {
-                let mut state = build_state();
-                let result = scan_parquet_i64_dictionary_i32x3_columns_with_store(
-                    &path,
-                    batch_size,
-                    &row_groups,
-                    columns,
-                    engine.file_cache.clone(),
-                    engine.object_store.as_ref(),
-                    |keys, dictionary_ids, dictionary, first, second, third| {
-                        consume_batch(
-                            &mut state,
-                            keys,
-                            dictionary_ids,
-                            dictionary,
-                            first,
-                            second,
-                            third,
-                        )?;
-                        Ok(Some(()))
-                    },
-                )
-                .and_then(|metrics| match metrics {
-                    Some(metrics) => finish(state).map(|output| Some((output, metrics))),
-                    None => Ok(None),
-                });
-                let _ = sender.send(result);
-            });
-        }
-        drop(sender);
-        let mut output = None::<Output>;
-        let mut scan_metrics = DirectColumnScanMetrics::default();
-        for received in receiver {
-            let Some((partial, metrics)) = received? else {
-                return Ok(None);
-            };
-            scan_metrics.row_groups = scan_metrics.row_groups.saturating_add(metrics.row_groups);
-            scan_metrics.batches = scan_metrics.batches.saturating_add(metrics.batches);
-            scan_metrics.rows = scan_metrics.rows.saturating_add(metrics.rows);
-            scan_metrics.read_nanos = scan_metrics.read_nanos.saturating_add(metrics.read_nanos);
-            scan_metrics.consume_nanos = scan_metrics
-                .consume_nanos
-                .saturating_add(metrics.consume_nanos);
-            scan_metrics.selected_rows = scan_metrics
-                .selected_rows
-                .saturating_add(metrics.selected_rows);
-            scan_metrics.selected_runs = scan_metrics
-                .selected_runs
-                .saturating_add(metrics.selected_runs);
-            scan_metrics.selected_predicate_nanos = scan_metrics
-                .selected_predicate_nanos
-                .saturating_add(metrics.selected_predicate_nanos);
-            scan_metrics.selected_payload_nanos = scan_metrics
-                .selected_payload_nanos
-                .saturating_add(metrics.selected_payload_nanos);
-            if let Some(output) = output.as_mut() {
-                merge(output, partial)?;
-            } else {
-                output = Some(partial);
-            }
-        }
-        log_direct_i64_dictionary_i32x3_fold_profile(&local_path, &columns, &scan_metrics);
-        Ok(output)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn scan_parquet_i64_dictionary_i32x3_page_fold<
-        State,
-        Output,
-        BuildState,
-        ConsumeBatch,
-        Finish,
-        Merge,
-    >(
-        &self,
-        path: PathBuf,
-        batch_size: usize,
-        columns: [&'static str; 5],
-        pruning_predicates: Vec<Expr>,
-        row_group_chunk: usize,
-        build_state: BuildState,
-        consume_batch: ConsumeBatch,
-        finish: Finish,
-        merge: Merge,
-    ) -> Result<Option<Output>>
-    where
-        State: Send + 'static,
-        Output: Send + 'static,
-        BuildState: Fn() -> State + Clone + Send + Sync + 'static,
-        ConsumeBatch: Fn(&mut State, &[u8], &[i32], &[bytes::Bytes], &[u8], &[u8], &[u8], usize) -> Result<()>
-            + Clone
-            + Send
-            + Sync
-            + 'static,
-        Finish: Fn(State) -> Result<Output> + Clone + Send + Sync + 'static,
-        Merge: Fn(&mut Output, Output) -> Result<()> + Clone + Send + Sync + 'static,
-    {
-        let source = self.plan_table_source(path.clone()).await?;
-        if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
-            return Ok(None);
-        }
-        let local_path = source.fragments[0].parquet_local_path()?.to_path_buf();
-        let projection =
-            Projection::Columns(columns.iter().map(|column| (*column).to_string()).collect());
-        let row_groups =
-            self.direct_primitive_row_groups(&local_path, &projection, &pruning_predicates)?;
-        if row_groups.is_empty() {
-            return Ok(Some(finish(build_state())?));
-        }
-        let chunks = row_groups
-            .chunks(row_group_chunk.max(1))
-            .map(|chunk| chunk.to_vec())
-            .collect::<Vec<_>>();
-        let (sender, receiver) = mpsc::channel();
-        for row_groups in chunks {
-            let sender = sender.clone();
-            let engine = self.clone();
-            let path = local_path.clone();
-            let build_state = build_state.clone();
-            let consume_batch = consume_batch.clone();
-            let finish = finish.clone();
-            rayon::spawn(move || {
-                let mut state = build_state();
-                let result = scan_parquet_i64_dictionary_i32x3_page_columns_with_store(
-                    &path,
-                    batch_size,
-                    &row_groups,
-                    columns,
-                    engine.file_cache.clone(),
-                    engine.object_store.as_ref(),
-                    |key_bytes,
-                     dictionary_ids,
-                     dictionary,
-                     first_bytes,
-                     second_bytes,
-                     third_bytes,
-                     records| {
-                        consume_batch(
-                            &mut state,
-                            key_bytes,
-                            dictionary_ids,
-                            dictionary,
-                            first_bytes,
-                            second_bytes,
-                            third_bytes,
-                            records,
-                        )?;
-                        Ok(Some(()))
-                    },
-                )
-                .and_then(|metrics| match metrics {
-                    Some(metrics) => finish(state).map(|output| Some((output, metrics))),
-                    None => Ok(None),
-                });
-                let _ = sender.send(result);
-            });
-        }
-        drop(sender);
-        let mut output = None::<Output>;
-        let mut scan_metrics = DirectColumnScanMetrics::default();
-        for received in receiver {
-            let Some((partial, metrics)) = received? else {
-                return Ok(None);
-            };
-            scan_metrics.row_groups = scan_metrics.row_groups.saturating_add(metrics.row_groups);
-            scan_metrics.batches = scan_metrics.batches.saturating_add(metrics.batches);
-            scan_metrics.rows = scan_metrics.rows.saturating_add(metrics.rows);
-            scan_metrics.read_nanos = scan_metrics.read_nanos.saturating_add(metrics.read_nanos);
-            scan_metrics.consume_nanos = scan_metrics
-                .consume_nanos
-                .saturating_add(metrics.consume_nanos);
-            scan_metrics.selected_rows = scan_metrics
-                .selected_rows
-                .saturating_add(metrics.selected_rows);
-            scan_metrics.selected_runs = scan_metrics
-                .selected_runs
-                .saturating_add(metrics.selected_runs);
-            scan_metrics.selected_predicate_nanos = scan_metrics
-                .selected_predicate_nanos
-                .saturating_add(metrics.selected_predicate_nanos);
-            scan_metrics.selected_payload_nanos = scan_metrics
-                .selected_payload_nanos
-                .saturating_add(metrics.selected_payload_nanos);
-            if let Some(output) = output.as_mut() {
-                merge(output, partial)?;
-            } else {
-                output = Some(partial);
-            }
-        }
-        log_direct_i64_dictionary_i32x3_page_fold_profile(&local_path, &columns, &scan_metrics);
-        Ok(output)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn scan_parquet_i64_dictionary_i32x3_dict_fold<
-        State,
-        Output,
-        BuildState,
-        ConsumeBatch,
-        Finish,
-        Merge,
-    >(
-        &self,
-        path: PathBuf,
-        batch_size: usize,
-        columns: [&'static str; 5],
-        pruning_predicates: Vec<Expr>,
-        row_group_chunk: usize,
-        build_state: BuildState,
-        consume_batch: ConsumeBatch,
-        finish: Finish,
-        merge: Merge,
-    ) -> Result<Option<Output>>
-    where
-        State: Send + 'static,
-        Output: Send + 'static,
-        BuildState: Fn() -> State + Clone + Send + Sync + 'static,
-        ConsumeBatch: Fn(
-                &mut State,
-                &[i32],
-                &[i64],
-                &[i32],
-                &[bytes::Bytes],
-                &[i32],
-                &[i32],
-                &[i32],
-                &[i32],
-                &[i32],
-                &[i32],
-            ) -> Result<()>
-            + Clone
-            + Send
-            + Sync
-            + 'static,
-        Finish: Fn(State) -> Result<Output> + Clone + Send + Sync + 'static,
-        Merge: Fn(&mut Output, Output) -> Result<()> + Clone + Send + Sync + 'static,
-    {
-        let source = self.plan_table_source(path.clone()).await?;
-        if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
-            return Ok(None);
-        }
-        let local_path = source.fragments[0].parquet_local_path()?.to_path_buf();
-        let projection =
-            Projection::Columns(columns.iter().map(|column| (*column).to_string()).collect());
-        let row_groups =
-            self.direct_primitive_row_groups(&local_path, &projection, &pruning_predicates)?;
-        if row_groups.is_empty() {
-            return Ok(Some(finish(build_state())?));
-        }
-        let chunks = row_groups
-            .chunks(row_group_chunk.max(1))
-            .map(|chunk| chunk.to_vec())
-            .collect::<Vec<_>>();
-        let (sender, receiver) = mpsc::channel();
-        for row_groups in chunks {
-            let sender = sender.clone();
-            let engine = self.clone();
-            let path = local_path.clone();
-            let build_state = build_state.clone();
-            let consume_batch = consume_batch.clone();
-            let finish = finish.clone();
-            rayon::spawn(move || {
-                let mut state = build_state();
-                let result = scan_parquet_i64_dictionary_i32x3_dict_columns_with_store(
-                    &path,
-                    batch_size,
-                    &row_groups,
-                    columns,
-                    engine.file_cache.clone(),
-                    engine.object_store.as_ref(),
-                    |key_ids,
-                     key_dictionary,
-                     mode_ids,
-                     mode_dictionary,
-                     first_ids,
-                     first_dictionary,
-                     second_ids,
-                     second_dictionary,
-                     third_ids,
-                     third_dictionary| {
-                        consume_batch(
-                            &mut state,
-                            key_ids,
-                            key_dictionary,
-                            mode_ids,
-                            mode_dictionary,
-                            first_ids,
-                            first_dictionary,
-                            second_ids,
-                            second_dictionary,
-                            third_ids,
-                            third_dictionary,
-                        )?;
-                        Ok(Some(()))
-                    },
-                )
-                .and_then(|metrics| match metrics {
-                    Some(metrics) => finish(state).map(|output| Some((output, metrics))),
-                    None => Ok(None),
-                });
-                let _ = sender.send(result);
-            });
-        }
-        drop(sender);
-        let mut output = None::<Output>;
-        let mut scan_metrics = DirectColumnScanMetrics::default();
-        for received in receiver {
-            let Some((partial, metrics)) = received? else {
-                return Ok(None);
-            };
-            scan_metrics.row_groups = scan_metrics.row_groups.saturating_add(metrics.row_groups);
-            scan_metrics.batches = scan_metrics.batches.saturating_add(metrics.batches);
-            scan_metrics.rows = scan_metrics.rows.saturating_add(metrics.rows);
-            scan_metrics.read_nanos = scan_metrics.read_nanos.saturating_add(metrics.read_nanos);
-            scan_metrics.consume_nanos = scan_metrics
-                .consume_nanos
-                .saturating_add(metrics.consume_nanos);
-            scan_metrics.selected_rows = scan_metrics
-                .selected_rows
-                .saturating_add(metrics.selected_rows);
-            scan_metrics.selected_runs = scan_metrics
-                .selected_runs
-                .saturating_add(metrics.selected_runs);
-            scan_metrics.selected_predicate_nanos = scan_metrics
-                .selected_predicate_nanos
-                .saturating_add(metrics.selected_predicate_nanos);
-            scan_metrics.selected_payload_nanos = scan_metrics
-                .selected_payload_nanos
-                .saturating_add(metrics.selected_payload_nanos);
-            if let Some(output) = output.as_mut() {
-                merge(output, partial)?;
-            } else {
-                output = Some(partial);
-            }
-        }
-        log_direct_i64_dictionary_i32x3_dict_fold_profile(&local_path, &columns, &scan_metrics);
-        Ok(output)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn scan_parquet_i64_byte_array_selected_by_i32x3_dictionary_fold<
-        State,
-        Output,
-        BuildState,
-        Predicate,
-        ConsumeBatch,
-        Finish,
-        Merge,
-    >(
-        &self,
-        path: PathBuf,
-        columns: [&'static str; 5],
-        pruning_predicates: Vec<Expr>,
-        row_group_chunk: usize,
-        build_state: BuildState,
-        predicate: Predicate,
-        consume_batch: ConsumeBatch,
-        finish: Finish,
-        merge: Merge,
-    ) -> Result<Option<Output>>
-    where
-        State: Send + 'static,
-        Output: Send + 'static,
-        BuildState: Fn() -> State + Clone + Send + Sync + 'static,
-        Predicate: Fn(i32, i32, i32) -> bool + Clone + Send + Sync + 'static,
-        ConsumeBatch: Fn(&mut State, &[i64], &[i32], &[bytes::Bytes]) -> Result<()>
-            + Clone
-            + Send
-            + Sync
-            + 'static,
-        Finish: Fn(State) -> Result<Output> + Clone + Send + Sync + 'static,
-        Merge: Fn(&mut Output, Output) -> Result<()> + Clone + Send + Sync + 'static,
-    {
-        let source = self.plan_table_source(path.clone()).await?;
-        if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
-            return Ok(None);
-        }
-        let local_path = source.fragments[0].parquet_local_path()?.to_path_buf();
-        let projection =
-            Projection::Columns(columns.iter().map(|column| (*column).to_string()).collect());
-        let row_groups =
-            self.direct_primitive_row_groups(&local_path, &projection, &pruning_predicates)?;
-        if row_groups.is_empty() {
-            return Ok(Some(finish(build_state())?));
-        }
-        let chunks = row_groups
-            .chunks(row_group_chunk.max(1))
-            .map(|chunk| chunk.to_vec())
-            .collect::<Vec<_>>();
-        let (sender, receiver) = mpsc::channel();
-        for row_groups in chunks {
-            let sender = sender.clone();
-            let engine = self.clone();
-            let path = local_path.clone();
-            let build_state = build_state.clone();
-            let predicate = predicate.clone();
-            let consume_batch = consume_batch.clone();
-            let finish = finish.clone();
-            rayon::spawn(move || {
-                let mut state = build_state();
-                let result = scan_parquet_i64_byte_array_selected_by_i32x3_dictionary_with_store(
-                    &path,
-                    &row_groups,
-                    columns,
-                    engine.file_cache.clone(),
-                    engine.object_store.as_ref(),
-                    predicate,
-                    |keys, dictionary_ids, dictionary| {
-                        consume_batch(&mut state, keys, dictionary_ids, dictionary)?;
-                        Ok(Some(()))
-                    },
-                )
-                .and_then(|metrics| match metrics {
-                    Some(metrics) => finish(state).map(|output| Some((output, metrics))),
-                    None => Ok(None),
-                });
-                let _ = sender.send(result);
-            });
-        }
-        drop(sender);
-        let mut output = None::<Output>;
-        let mut scan_metrics = DirectColumnScanMetrics::default();
-        for received in receiver {
-            let Some((partial, metrics)) = received? else {
-                return Ok(None);
-            };
-            scan_metrics.row_groups = scan_metrics.row_groups.saturating_add(metrics.row_groups);
-            scan_metrics.batches = scan_metrics.batches.saturating_add(metrics.batches);
-            scan_metrics.rows = scan_metrics.rows.saturating_add(metrics.rows);
-            scan_metrics.read_nanos = scan_metrics.read_nanos.saturating_add(metrics.read_nanos);
-            scan_metrics.consume_nanos = scan_metrics
-                .consume_nanos
-                .saturating_add(metrics.consume_nanos);
-            scan_metrics.selected_rows = scan_metrics
-                .selected_rows
-                .saturating_add(metrics.selected_rows);
-            scan_metrics.selected_runs = scan_metrics
-                .selected_runs
-                .saturating_add(metrics.selected_runs);
-            scan_metrics.selected_predicate_nanos = scan_metrics
-                .selected_predicate_nanos
-                .saturating_add(metrics.selected_predicate_nanos);
-            scan_metrics.selected_payload_nanos = scan_metrics
-                .selected_payload_nanos
-                .saturating_add(metrics.selected_payload_nanos);
-            if let Some(output) = output.as_mut() {
-                merge(output, partial)?;
-            } else {
-                output = Some(partial);
-            }
-        }
-        log_direct_i64_byte_array_selected_by_i32x3_dictionary_profile(
-            &local_path,
-            &columns,
-            &scan_metrics,
-        );
-        Ok(output)
-    }
-
     pub async fn scan_parquet(
         &self,
         path: PathBuf,
@@ -2749,35 +2665,6 @@ impl DodamEngine {
     ) -> Result<SendableBatchStream> {
         let source = self.plan_table_source(path).await?;
         self.scan_table_source_batches(source, batch_size, limit, projection, filter, None)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) async fn scan_parquet_batches_fold<S, C, F, O>(
-        &self,
-        path: PathBuf,
-        batch_size: usize,
-        limit: Option<usize>,
-        projection: Projection,
-        filter: Option<FilterExpr>,
-        mut state: S,
-        mut consume: C,
-        finish: F,
-    ) -> Result<O>
-    where
-        C: FnMut(&RecordBatch, &mut S) -> Result<()>,
-        F: FnOnce(S) -> Result<O>,
-    {
-        let source = self.plan_table_source(path).await?;
-        let plan =
-            self.plan_table_source_scan(source, batch_size, limit, projection, filter, None)?;
-        self.build_physical_scan_plan(plan)
-            .for_each_batch(&mut |batch| {
-                if batch.num_rows() > 0 {
-                    consume(batch, &mut state)?;
-                }
-                Ok(())
-            })?;
-        finish(state)
     }
 
     pub(crate) async fn scan_parquet_batches_fold_view<S, C, F, O>(
@@ -3478,83 +3365,65 @@ impl DodamEngine {
         discount_high: f64,
         quantity_limit: f64,
     ) -> Result<Option<(f64, u64)>> {
-        let source = self.plan_table_source(path.clone()).await?;
-        if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
-            return Ok(None);
-        }
-        let local_path = source.fragments[0].parquet_local_path()?.to_path_buf();
         let predicate_projection = Projection::Columns(vec![
             "l_shipdate".to_string(),
             "l_discount".to_string(),
             "l_quantity".to_string(),
         ]);
-        let plan = plan_parquet_scan_tasks(
-            &local_path,
-            &predicate_projection,
-            &[],
-            &self.metadata_cache,
-            self.object_store.as_ref(),
-        )?;
-        let row_groups = plan
-            .tasks
-            .into_iter()
-            .map(|task| task.row_group)
-            .collect::<Vec<_>>();
-        if row_groups.is_empty() {
-            return Ok(Some((0.0, 0)));
-        }
-        let chunks = row_groups
-            .chunks(q06_late_materialized_row_group_chunk())
-            .map(|chunk| chunk.to_vec())
-            .collect::<Vec<_>>();
-        let (sender, receiver) = mpsc::channel();
-        for (index, row_groups) in chunks.iter().cloned().enumerate() {
-            let sender = sender.clone();
-            let path = local_path.clone();
-            let metadata_cache = self.metadata_cache.clone();
-            let file_cache = self.file_cache.clone();
-            let object_store = self.object_store.clone();
-            rayon::spawn(move || {
-                let result = q06_late_materialized_revenue_sum_chunk(
-                    path,
-                    batch_size,
-                    row_groups,
-                    start_days,
-                    end_days,
-                    discount_low,
-                    discount_high,
-                    quantity_limit,
-                    &metadata_cache,
-                    file_cache,
-                    object_store.as_ref(),
-                );
-                let _ = sender.send((index, result));
-            });
-        }
-        drop(sender);
-
-        let mut partials = (0..chunks.len())
-            .map(|_| None)
-            .collect::<Vec<Option<Option<LateMaterializedChunkResult<(f64, u64)>>>>>();
-        for _ in 0..chunks.len() {
-            let (index, result) = receiver.recv().map_err(|_| {
-                DodamError::UnsupportedSql("Q06 late materialized worker stopped".to_string())
-            })?;
-            partials[index] = Some(result?);
-        }
+        let payload_projection = Projection::Columns(vec!["l_extendedprice".to_string()]);
+        let chunks = self
+            .late_materialized_parquet_map_pruned_with_policy_view(
+                path,
+                batch_size,
+                predicate_projection,
+                payload_projection,
+                Vec::new(),
+                selected_discount_revenue_row_group_chunk(),
+                LateMaterializationPolicy::always(),
+                || SelectedDiscountRevenueState {
+                    selected_discounts: Vec::new(),
+                    discount_scale: None,
+                    extendedprice_scale: None,
+                    discount_offset: 0,
+                    revenue: 0.0,
+                },
+                move |view, selection, state| {
+                    build_date32_discount_quantity_selection_view(
+                        view,
+                        start_days,
+                        end_days,
+                        discount_low,
+                        discount_high,
+                        quantity_limit,
+                        selection,
+                        state,
+                    )
+                },
+                consume_selected_discount_revenue_view,
+                |state, _metrics| {
+                    if state.discount_offset != state.selected_discounts.len() {
+                        return Err(DodamError::UnsupportedSql(
+                            "selected discount revenue payload mismatch".to_string(),
+                        ));
+                    }
+                    Ok(Some((state.revenue, state.selected_discounts.len() as u64)))
+                },
+            )
+            .await?;
+        let Some(chunks) = chunks else {
+            return Ok(None);
+        };
+        let chunk_count = chunks.len();
         let mut sum = 0.0;
         let mut count = 0_u64;
         let mut metrics = LateMaterializedMetrics::default();
-        for partial in partials {
-            let Some(Some(partial)) = partial else {
-                return Ok(None);
-            };
-            let (partial_sum, partial_count) = partial.output;
+        for chunk in chunks {
+            let (partial_sum, partial_count) = chunk.output;
             sum += partial_sum;
             count += partial_count;
-            metrics.add(partial.metrics);
+            metrics.add(chunk.metrics);
         }
-        log_late_materialized_metrics("Q06", metrics, chunks.len());
+        log_late_materialized_metrics("Q06", metrics, chunk_count);
         Ok(Some((sum, count)))
     }
 
@@ -3564,80 +3433,52 @@ impl DodamEngine {
         batch_size: usize,
         start_days: i32,
         end_days: i32,
-        promo_parts: Arc<DenseI64BoolLookup>,
+        lookup: Arc<DenseI64BoolLookup>,
     ) -> Result<Option<(f64, f64)>> {
-        let source = self.plan_table_source(path.clone()).await?;
-        if source.format != StorageFormat::Parquet || source.fragments.len() != 1 {
-            return Ok(None);
-        }
-        let local_path = source.fragments[0].parquet_local_path()?.to_path_buf();
         let predicate_projection = Projection::Columns(vec!["l_shipdate".to_string()]);
-        let plan = plan_parquet_scan_tasks(
-            &local_path,
-            &predicate_projection,
-            &[],
-            &self.metadata_cache,
-            self.object_store.as_ref(),
-        )?;
-        let row_groups = plan
-            .tasks
-            .into_iter()
-            .map(|task| task.row_group)
-            .collect::<Vec<_>>();
-        if row_groups.is_empty() {
-            return Ok(Some((0.0, 0.0)));
-        }
-        let chunks = row_groups
-            .chunks(q14_late_materialized_row_group_chunk())
-            .map(|chunk| chunk.to_vec())
-            .collect::<Vec<_>>();
-        let (sender, receiver) = mpsc::channel();
-        for (index, row_groups) in chunks.iter().cloned().enumerate() {
-            let sender = sender.clone();
-            let path = local_path.clone();
-            let promo_parts = promo_parts.clone();
-            let metadata_cache = self.metadata_cache.clone();
-            let file_cache = self.file_cache.clone();
-            let object_store = self.object_store.clone();
-            rayon::spawn(move || {
-                let result = q14_late_materialized_promo_revenue_chunk(
-                    path,
-                    batch_size,
-                    row_groups,
-                    start_days,
-                    end_days,
-                    promo_parts,
-                    &metadata_cache,
-                    file_cache,
-                    object_store.as_ref(),
-                );
-                let _ = sender.send((index, result));
-            });
-        }
-        drop(sender);
-
-        let mut partials = (0..chunks.len())
-            .map(|_| None)
-            .collect::<Vec<Option<Option<LateMaterializedChunkResult<(f64, f64)>>>>>();
-        for _ in 0..chunks.len() {
-            let (index, result) = receiver.recv().map_err(|_| {
-                DodamError::UnsupportedSql("Q14 late materialized worker stopped".to_string())
-            })?;
-            partials[index] = Some(result?);
-        }
+        let payload_projection = Projection::Columns(vec![
+            "l_partkey".to_string(),
+            "l_extendedprice".to_string(),
+            "l_discount".to_string(),
+        ]);
+        let chunks = self
+            .late_materialized_parquet_map_pruned_with_policy_view(
+                path,
+                batch_size,
+                predicate_projection,
+                payload_projection,
+                Vec::new(),
+                bool_lookup_discounted_revenue_row_group_chunk(),
+                LateMaterializationPolicy::always(),
+                {
+                    let lookup = lookup.clone();
+                    move || BoolLookupDiscountedRevenueState {
+                        lookup: lookup.clone(),
+                        matched: 0.0,
+                        total: 0.0,
+                    }
+                },
+                move |view, selection, _state| {
+                    build_date32_range_selection_view(view, start_days, end_days, selection)
+                },
+                consume_discounted_revenue_by_i64_bool_lookup_view,
+                |state, _metrics| Ok(Some((state.matched, state.total))),
+            )
+            .await?;
+        let Some(chunks) = chunks else {
+            return Ok(None);
+        };
+        let chunk_count = chunks.len();
         let mut promo = 0.0;
         let mut total = 0.0;
         let mut metrics = LateMaterializedMetrics::default();
-        for partial in partials {
-            let Some(Some(partial)) = partial else {
-                return Ok(None);
-            };
-            let (partial_promo, partial_total) = partial.output;
+        for chunk in chunks {
+            let (partial_promo, partial_total) = chunk.output;
             promo += partial_promo;
             total += partial_total;
-            metrics.add(partial.metrics);
+            metrics.add(chunk.metrics);
         }
-        log_late_materialized_metrics("Q14", metrics, chunks.len());
+        log_late_materialized_metrics("Q14", metrics, chunk_count);
         Ok(Some((promo, total)))
     }
 
@@ -7524,6 +7365,18 @@ fn log_direct_primitive_fold_profile(
     columns: &[OwnedDirectPrimitiveColumnSpec],
     metrics: &DirectPrimitiveColumnScanMetrics,
 ) {
+    let columns = columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect::<Vec<_>>();
+    log_direct_primitive_named_profile(path, &columns, metrics);
+}
+
+fn log_direct_primitive_named_profile(
+    path: &Path,
+    columns: &[&str],
+    metrics: &DirectPrimitiveColumnScanMetrics,
+) {
     if !direct_primitive_profile_enabled() {
         return;
     }
@@ -7531,11 +7384,7 @@ fn log_direct_primitive_fold_profile(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("scan");
-    let columns = columns
-        .iter()
-        .map(|column| column.name.as_str())
-        .collect::<Vec<_>>()
-        .join(",");
+    let columns = columns.join(",");
     let column_read = metrics
         .column_read_nanos
         .iter()
@@ -7549,7 +7398,8 @@ fn log_direct_primitive_fold_profile(
         metrics.selected_rows as f64 / metrics.rows as f64
     };
     eprintln!(
-        "[dodam:direct-primitive-profile] {table}[{columns}]: row_groups={} rows={} batches={} read={:.3} ms consume={:.3} ms column_read=[{}] selected_predicate={:.3} ms selected_payload={:.3} ms selected_dictionary={:.3} ms selected_rows={} selected_ratio={:.3} selected_runs={} selected_batches={} full_batches={} selected_skip_calls={} selected_skipped_rows={} selected_read_calls={} selected_read_rows={}",
+        "[dodam:direct-primitive-profile] {table}[{columns}]: reader_kind={} row_groups={} rows={} batches={} read={:.3} ms consume={:.3} ms column_read=[{}] selected_predicate={:.3} ms selected_payload={:.3} ms selected_dictionary={:.3} ms selected_rows={} selected_ratio={:.3} selected_runs={} selected_batches={} full_batches={} selected_skip_calls={} selected_skipped_rows={} selected_read_calls={} selected_read_rows={} dictionary_range_pages={} dictionary_block_pages={} dictionary_block_rows={} selected_page_skip_pages={} selected_page_skip_rows={}",
+        metrics.reader_kind,
         metrics.row_groups,
         metrics.rows,
         metrics.batches,
@@ -7568,108 +7418,11 @@ fn log_direct_primitive_fold_profile(
         metrics.selected_skipped_rows,
         metrics.selected_read_calls,
         metrics.selected_read_rows,
-    );
-}
-
-fn log_direct_i64_dictionary_i32x3_fold_profile(
-    path: &Path,
-    columns: &[&str; 5],
-    metrics: &DirectColumnScanMetrics,
-) {
-    if !direct_primitive_profile_enabled() {
-        return;
-    }
-    let table = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("scan");
-    let columns = columns.join(",");
-    eprintln!(
-        "[dodam:direct-i64-dict-i32x3-profile] {table}[{columns}]: row_groups={} rows={} batches={} read={:.3} ms consume={:.3} ms",
-        metrics.row_groups,
-        metrics.rows,
-        metrics.batches,
-        nanos_to_millis(metrics.read_nanos),
-        nanos_to_millis(metrics.consume_nanos),
-    );
-}
-
-fn log_direct_i64_dictionary_i32x3_page_fold_profile(
-    path: &Path,
-    columns: &[&str; 5],
-    metrics: &DirectColumnScanMetrics,
-) {
-    if !direct_primitive_profile_enabled() {
-        return;
-    }
-    let table = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("scan");
-    let columns = columns.join(",");
-    eprintln!(
-        "[dodam:direct-i64-dict-i32x3-page-profile] {table}[{columns}]: row_groups={} rows={} batches={} read={:.3} ms consume={:.3} ms",
-        metrics.row_groups,
-        metrics.rows,
-        metrics.batches,
-        nanos_to_millis(metrics.read_nanos),
-        nanos_to_millis(metrics.consume_nanos),
-    );
-}
-
-fn log_direct_i64_dictionary_i32x3_dict_fold_profile(
-    path: &Path,
-    columns: &[&str; 5],
-    metrics: &DirectColumnScanMetrics,
-) {
-    if !direct_primitive_profile_enabled() {
-        return;
-    }
-    let table = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("scan");
-    let columns = columns.join(",");
-    eprintln!(
-        "[dodam:direct-i64-dict-i32x3-dict-profile] {table}[{columns}]: row_groups={} rows={} batches={} read={:.3} ms consume={:.3} ms",
-        metrics.row_groups,
-        metrics.rows,
-        metrics.batches,
-        nanos_to_millis(metrics.read_nanos),
-        nanos_to_millis(metrics.consume_nanos),
-    );
-}
-
-fn log_direct_i64_byte_array_selected_by_i32x3_dictionary_profile(
-    path: &Path,
-    columns: &[&str; 5],
-    metrics: &DirectColumnScanMetrics,
-) {
-    if !direct_primitive_profile_enabled() {
-        return;
-    }
-    let table = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("scan");
-    let columns = columns.join(",");
-    let selected_ratio = if metrics.rows == 0 {
-        0.0
-    } else {
-        metrics.selected_rows as f64 / metrics.rows as f64
-    };
-    eprintln!(
-        "[dodam:direct-i64-bytearray-selected-i32x3-dict-profile] {table}[{columns}]: row_groups={} rows={} batches={} read={:.3} ms consume={:.3} ms selected_predicate={:.3} ms selected_payload={:.3} ms selected_rows={} selected_ratio={:.3} selected_runs={}",
-        metrics.row_groups,
-        metrics.rows,
-        metrics.batches,
-        nanos_to_millis(metrics.read_nanos),
-        nanos_to_millis(metrics.consume_nanos),
-        nanos_to_millis(metrics.selected_predicate_nanos),
-        nanos_to_millis(metrics.selected_payload_nanos),
-        metrics.selected_rows,
-        selected_ratio,
-        metrics.selected_runs,
+        metrics.selected_dictionary_range_pages,
+        metrics.selected_dictionary_block_pages,
+        metrics.selected_dictionary_block_rows,
+        metrics.selected_page_skip_pages,
+        metrics.selected_page_skip_rows,
     );
 }
 
@@ -8110,11 +7863,7 @@ fn fused_parquet_aggregate_enabled() -> bool {
 }
 
 fn fused_parquet_aggregate_row_group_chunk() -> usize {
-    std::env::var("DODAM_FUSED_PARQUET_AGG_ROW_GROUP_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(4)
+    row_group_map_chunk_size("DODAM_FUSED_PARQUET_AGG_ROW_GROUP_CHUNK", 4)
 }
 
 fn late_materialized_aggregate_enabled() -> bool {
@@ -8129,11 +7878,19 @@ fn filtered_dictionary_aggregate_enabled() -> bool {
 }
 
 fn filtered_dictionary_aggregate_row_group_chunk() -> usize {
-    std::env::var("DODAM_FILTERED_DICTIONARY_AGG_ROW_GROUP_CHUNK")
+    row_group_map_chunk_size("DODAM_FILTERED_DICTIONARY_AGG_ROW_GROUP_CHUNK", 1)
+}
+
+fn row_group_map_chunk_size(query_env: &str, default_chunk: usize) -> usize {
+    let requested_chunk = std::env::var("DODAM_ROW_GROUP_MAP_CHUNK")
+        .or_else(|_| std::env::var(query_env))
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(1)
+        .filter(|value| *value > 0);
+    choose_row_group_map_chunk(RowGroupMapChunkCostInput {
+        requested_chunk,
+        default_chunk,
+    })
 }
 
 fn filtered_count_sum_aggregate_enabled() -> bool {
@@ -8215,7 +7972,7 @@ fn late_materialized_aggregate_row_group_chunk() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(4)
+        .unwrap_or(16)
 }
 
 fn late_materialized_aggregate_max_selected_ratio() -> f64 {
@@ -8793,6 +8550,11 @@ pub struct LateMaterializedMetrics {
     pub total_rows: usize,
     pub selected_rows: usize,
     pub selector_runs: usize,
+    pub predicate_read_nanos: u128,
+    pub payload_read_nanos: u128,
+    pub predicate_batches: usize,
+    pub payload_batches: usize,
+    pub payload_rows: usize,
 }
 
 impl LateMaterializedMetrics {
@@ -8800,6 +8562,25 @@ impl LateMaterializedMetrics {
         self.total_rows = self.total_rows.saturating_add(other.total_rows);
         self.selected_rows = self.selected_rows.saturating_add(other.selected_rows);
         self.selector_runs = self.selector_runs.saturating_add(other.selector_runs);
+        self.predicate_read_nanos = self
+            .predicate_read_nanos
+            .saturating_add(other.predicate_read_nanos);
+        self.payload_read_nanos = self
+            .payload_read_nanos
+            .saturating_add(other.payload_read_nanos);
+        self.predicate_batches = self
+            .predicate_batches
+            .saturating_add(other.predicate_batches);
+        self.payload_batches = self.payload_batches.saturating_add(other.payload_batches);
+        self.payload_rows = self.payload_rows.saturating_add(other.payload_rows);
+    }
+
+    pub fn selected_ratio(&self) -> f64 {
+        if self.total_rows == 0 {
+            0.0
+        } else {
+            self.selected_rows as f64 / self.total_rows as f64
+        }
     }
 }
 
@@ -8907,19 +8688,25 @@ fn log_late_materialization_policy_decision(
     } else {
         metrics.selector_runs as f64 / metrics.total_rows as f64
     };
+    let selector_runs_per_selected = if metrics.selected_rows == 0 {
+        0.0
+    } else {
+        metrics.selector_runs as f64 / metrics.selected_rows as f64
+    };
     let io_saving = crate::cost::late_materialization_estimated_io_saving(
         selected_ratio,
         predicate_compressed_bytes,
         payload_compressed_bytes,
     );
     eprintln!(
-        "[dodam:late-materialization-profile] {label} accepted={} rows={} selected={} selected_ratio={:.6} selector_runs={} selector_run_ratio={:.6} predicate_bytes={} payload_bytes={} io_saving={:.6} max_selected_ratio={} max_selector_run_ratio={} io_cost_gate={}",
+        "[dodam:late-materialization-profile] {label} accepted={} rows={} selected={} selected_ratio={:.6} selector_runs={} selector_run_ratio={:.6} selector_runs_per_selected={:.6} predicate_bytes={} payload_bytes={} io_saving={:.6} max_selected_ratio={} max_selector_run_ratio={} max_selector_runs_per_selected={} io_cost_gate={}",
         accepted,
         metrics.total_rows,
         metrics.selected_rows,
         selected_ratio,
         metrics.selector_runs,
         selector_run_ratio,
+        selector_runs_per_selected,
         predicate_compressed_bytes,
         payload_compressed_bytes,
         io_saving,
@@ -8929,6 +8716,10 @@ fn log_late_materialization_policy_decision(
             .unwrap_or_else(|| "n/a".to_string()),
         policy
             .max_selector_run_ratio
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_else(|| "n/a".to_string()),
+        policy
+            .max_selector_runs_per_selected
             .map(|value| format!("{value:.6}"))
             .unwrap_or_else(|| "n/a".to_string()),
         policy.io_cost_gate,
@@ -8947,6 +8738,125 @@ fn late_materialization_min_estimated_io_saving_ratio() -> f64 {
 fn late_materialization_io_override_enabled() -> bool {
     !std::env::var("DODAM_DISABLE_LATE_IO_OVERRIDE")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn late_materialized_direct_raw_i64_payload_enabled() -> bool {
+    std::env::var("DODAM_ENABLE_LATE_DIRECT_RAW_I64_PAYLOAD")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn late_materialized_decimal_i64_payload_columns(
+    path: &Path,
+    payload_projection: &Projection,
+    metadata_cache: &ParquetMetadataCache,
+    object_store: &dyn ObjectStore,
+) -> Result<Option<([String; 2], [DirectPrimitiveColumnType; 2])>> {
+    let Projection::Columns(columns) = payload_projection else {
+        return Ok(None);
+    };
+    let [first, second] = columns.as_slice() else {
+        return Ok(None);
+    };
+    let metadata = metadata_cache.get_with_store(path, object_store)?;
+    let Ok(first_field) = metadata.schema().field_with_name(first) else {
+        return Ok(None);
+    };
+    let Ok(second_field) = metadata.schema().field_with_name(second) else {
+        return Ok(None);
+    };
+    let DataType::Decimal128(first_precision, first_scale) = first_field.data_type() else {
+        return Ok(None);
+    };
+    let DataType::Decimal128(second_precision, second_scale) = second_field.data_type() else {
+        return Ok(None);
+    };
+    Ok(Some((
+        [first.clone(), second.clone()],
+        [
+            DirectPrimitiveColumnType::Decimal128Int64Raw {
+                precision: *first_precision,
+                scale: *first_scale,
+            },
+            DirectPrimitiveColumnType::Decimal128Int64Raw {
+                precision: *second_precision,
+                scale: *second_scale,
+            },
+        ],
+    )))
+}
+
+fn late_materialized_selector_runs_by_row_group(
+    path: &Path,
+    row_groups: &[usize],
+    selectors: &[RowSelector],
+    metadata_cache: &ParquetMetadataCache,
+    object_store: &dyn ObjectStore,
+) -> Result<Option<Vec<Vec<(usize, usize)>>>> {
+    let metadata = metadata_cache.get_with_store(path, object_store)?;
+    let mut row_group_rows = Vec::with_capacity(row_groups.len());
+    for &row_group in row_groups {
+        let Some(metadata) = metadata.metadata().row_groups().get(row_group) else {
+            return Ok(None);
+        };
+        row_group_rows.push(usize::try_from(metadata.num_rows()).map_err(|_| {
+            DodamError::UnsupportedSql("row group row count out of range".to_string())
+        })?);
+    }
+    Ok(Some(split_late_selectors_by_row_group(
+        selectors,
+        &row_group_rows,
+    )))
+}
+
+fn split_late_selectors_by_row_group(
+    selectors: &[RowSelector],
+    row_group_rows: &[usize],
+) -> Vec<Vec<(usize, usize)>> {
+    let mut runs = row_group_rows
+        .iter()
+        .map(|_| Vec::<(usize, usize)>::new())
+        .collect::<Vec<_>>();
+    let mut selector_start = 0usize;
+    let mut row_group_index = 0usize;
+    let mut row_group_start = 0usize;
+    let mut row_group_end = row_group_rows.first().copied().unwrap_or(0);
+    for selector in selectors {
+        let selector_end = selector_start.saturating_add(selector.row_count);
+        if selector.skip {
+            selector_start = selector_end;
+            continue;
+        }
+        while row_group_index < row_group_rows.len() && row_group_end <= selector_start {
+            row_group_index += 1;
+            row_group_start = row_group_end;
+            row_group_end = row_group_end.saturating_add(
+                row_group_rows
+                    .get(row_group_index)
+                    .copied()
+                    .unwrap_or_default(),
+            );
+        }
+        let mut start = selector_start;
+        while row_group_index < row_group_rows.len() && start < selector_end {
+            let end = selector_end.min(row_group_end);
+            if end > start {
+                runs[row_group_index].push((start - row_group_start, end - start));
+            }
+            start = end;
+            if start >= row_group_end {
+                row_group_index += 1;
+                row_group_start = row_group_end;
+                row_group_end = row_group_end.saturating_add(
+                    row_group_rows
+                        .get(row_group_index)
+                        .copied()
+                        .unwrap_or_default(),
+                );
+            }
+        }
+        selector_start = selector_end;
+    }
+    runs
 }
 
 pub struct LateMaterializedChunkResult<T> {
@@ -9078,15 +8988,105 @@ impl LateSelectionBuilder {
         self.selected_rows += appended_selected;
     }
 
+    pub fn push_selected_u32_offsets_coalesced<F>(
+        &mut self,
+        row_count: usize,
+        selected_offsets: &[u32],
+        max_gap: usize,
+        mut push_payload_marker: F,
+    ) where
+        F: FnMut(Option<usize>),
+    {
+        let max_gap = choose_late_coalesce_max_gap(
+            selected_offsets,
+            max_gap,
+            late_coalesce_selector_run_cost_rows(),
+            late_coalesce_max_payload_expansion_rows_per_selected(),
+        );
+        let mut consumed = 0usize;
+        let mut payload_rows = 0usize;
+        for &selected_offset in selected_offsets {
+            let selected_offset = selected_offset as usize;
+            if selected_offset >= row_count || selected_offset < consumed {
+                continue;
+            }
+            let skipped = selected_offset - consumed;
+            if skipped > 0 {
+                if max_gap > 0 && skipped <= max_gap && payload_rows > 0 {
+                    append_late_selector_run(
+                        &mut self.selectors,
+                        &mut self.current_selected,
+                        &mut self.run_len,
+                        true,
+                        skipped,
+                    );
+                    for _ in 0..skipped {
+                        push_payload_marker(None);
+                    }
+                    payload_rows += skipped;
+                } else {
+                    append_late_selector_run(
+                        &mut self.selectors,
+                        &mut self.current_selected,
+                        &mut self.run_len,
+                        false,
+                        skipped,
+                    );
+                }
+            }
+            append_late_selector_run(
+                &mut self.selectors,
+                &mut self.current_selected,
+                &mut self.run_len,
+                true,
+                1,
+            );
+            push_payload_marker(Some(selected_offset));
+            consumed = selected_offset + 1;
+            payload_rows += 1;
+        }
+        if consumed < row_count {
+            append_late_selector_run(
+                &mut self.selectors,
+                &mut self.current_selected,
+                &mut self.run_len,
+                false,
+                row_count - consumed,
+            );
+        }
+        self.total_rows += row_count;
+        self.selected_rows += payload_rows;
+    }
+
     fn finish(mut self) -> (Option<RowSelection>, LateMaterializedMetrics) {
         finish_late_selector_run(&mut self.selectors, self.current_selected, self.run_len);
         let metrics = LateMaterializedMetrics {
             total_rows: self.total_rows,
             selected_rows: self.selected_rows,
             selector_runs: self.selectors.len(),
+            ..Default::default()
         };
         let selection = (self.selected_rows > 0).then(|| RowSelection::from(self.selectors));
         (selection, metrics)
+    }
+
+    fn finish_with_selectors(
+        mut self,
+    ) -> (
+        Option<RowSelection>,
+        Vec<RowSelector>,
+        LateMaterializedMetrics,
+    ) {
+        finish_late_selector_run(&mut self.selectors, self.current_selected, self.run_len);
+        let metrics = LateMaterializedMetrics {
+            total_rows: self.total_rows,
+            selected_rows: self.selected_rows,
+            selector_runs: self.selectors.len(),
+            ..Default::default()
+        };
+        let selectors = self.selectors;
+        let selection = (self.selected_rows > 0).then(|| RowSelection::from(selectors.clone()));
+        (selection, selectors, metrics)
     }
 }
 
@@ -9106,16 +9106,16 @@ fn parallel_i64_set_filter_row_group_chunk() -> usize {
         .unwrap_or(4)
 }
 
-fn q06_late_materialized_row_group_chunk() -> usize {
-    std::env::var("DODAM_Q06_LATE_ROW_GROUP_CHUNK")
+fn selected_discount_revenue_row_group_chunk() -> usize {
+    std::env::var("DODAM_SELECTED_DISCOUNT_REVENUE_ROW_GROUP_CHUNK")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(2)
 }
 
-fn q14_late_materialized_row_group_chunk() -> usize {
-    std::env::var("DODAM_Q14_LATE_ROW_GROUP_CHUNK")
+fn bool_lookup_discounted_revenue_row_group_chunk() -> usize {
+    std::env::var("DODAM_BOOL_LOOKUP_DISCOUNTED_REVENUE_ROW_GROUP_CHUNK")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -9127,6 +9127,21 @@ fn late_materialization_sample_row_groups() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(1)
+}
+
+fn late_coalesce_selector_run_cost_rows() -> usize {
+    std::env::var("DODAM_LATE_COALESCE_SELECTOR_RUN_COST_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(16)
+}
+
+fn late_coalesce_max_payload_expansion_rows_per_selected() -> usize {
+    std::env::var("DODAM_LATE_COALESCE_MAX_PAYLOAD_EXPANSION_PER_SELECTED")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(8)
 }
 
 fn late_materialization_sample_enabled(
@@ -9169,13 +9184,25 @@ where
         object_store,
     )?;
     let mut selection_builder = LateSelectionBuilder::default();
-    while let Some(batch) = predicate_reader.next() {
+    let mut predicate_read_nanos = 0_u128;
+    let mut predicate_batches = 0_usize;
+    loop {
+        let read_started = Instant::now();
+        let batch = predicate_reader.next();
+        predicate_read_nanos =
+            predicate_read_nanos.saturating_add(read_started.elapsed().as_nanos());
+        let Some(batch) = batch else {
+            break;
+        };
         let batch = batch?;
+        predicate_batches = predicate_batches.saturating_add(1);
         if build_selection(BatchView::new(&batch), &mut selection_builder, &mut state)?.is_none() {
             return Ok(None);
         }
     }
-    let (_, metrics) = selection_builder.finish();
+    let (_, mut metrics) = selection_builder.finish();
+    metrics.predicate_read_nanos = predicate_read_nanos;
+    metrics.predicate_batches = predicate_batches;
     Ok(Some(metrics))
 }
 
@@ -9214,13 +9241,25 @@ where
         object_store,
     )?;
     let mut selection_builder = LateSelectionBuilder::default();
-    while let Some(batch) = predicate_reader.next() {
+    let mut predicate_read_nanos = 0_u128;
+    let mut predicate_batches = 0_usize;
+    loop {
+        let read_started = Instant::now();
+        let batch = predicate_reader.next();
+        predicate_read_nanos =
+            predicate_read_nanos.saturating_add(read_started.elapsed().as_nanos());
+        let Some(batch) = batch else {
+            break;
+        };
         let batch = batch?;
+        predicate_batches = predicate_batches.saturating_add(1);
         if build_selection(BatchView::new(&batch), &mut selection_builder, &mut state)?.is_none() {
             return Ok(None);
         }
     }
-    let (row_selection, metrics) = selection_builder.finish();
+    let (row_selection, selectors, mut metrics) = selection_builder.finish_with_selectors();
+    metrics.predicate_read_nanos = predicate_read_nanos;
+    metrics.predicate_batches = predicate_batches;
     if !late_materialization_policy_accepts_with_io(
         policy,
         &metrics,
@@ -9230,6 +9269,48 @@ where
         return Ok(None);
     }
     if let Some(row_selection) = row_selection {
+        if payload_dictionary_columns.is_empty()
+            && late_materialized_direct_raw_i64_payload_enabled()
+            && let Some((payload_columns, payload_types)) =
+                late_materialized_decimal_i64_payload_columns(
+                    &path,
+                    payload_projection,
+                    metadata_cache,
+                    object_store,
+                )?
+            && let Some(row_group_runs) = late_materialized_selector_runs_by_row_group(
+                &path,
+                &row_groups,
+                &selectors,
+                metadata_cache,
+                object_store,
+            )?
+        {
+            if let Some(direct_metrics) = scan_parquet_i64_i64_selected_raw_columns_with_store(
+                &path,
+                &row_groups,
+                [payload_columns[0].as_str(), payload_columns[1].as_str()],
+                payload_types,
+                &row_group_runs,
+                file_cache.clone(),
+                object_store,
+                |columns| {
+                    consume_payload(BatchView::from_raw_columns(columns), &mut state)?.ok_or_else(
+                        || {
+                            DodamError::UnsupportedSql(
+                                "direct late raw payload consumer rejected batch".to_string(),
+                            )
+                        },
+                    )
+                },
+            )? {
+                metrics.payload_read_nanos = u128::from(direct_metrics.read_nanos);
+                metrics.payload_batches = direct_metrics.batches;
+                metrics.payload_rows = direct_metrics.selected_rows;
+                let output = finish(state, metrics)?;
+                return Ok(output.map(|output| LateMaterializedChunkResult { output, metrics }));
+            }
+        }
         let mut payload_reader = if payload_dictionary_columns.is_empty() {
             ParquetBatchReader::try_new_with_row_groups_selection(
                 path,
@@ -9254,8 +9335,18 @@ where
                 object_store,
             )?
         };
-        while let Some(batch) = payload_reader.next() {
+        loop {
+            let read_started = Instant::now();
+            let batch = payload_reader.next();
+            metrics.payload_read_nanos = metrics
+                .payload_read_nanos
+                .saturating_add(read_started.elapsed().as_nanos());
+            let Some(batch) = batch else {
+                break;
+            };
             let batch = batch?;
+            metrics.payload_batches = metrics.payload_batches.saturating_add(1);
+            metrics.payload_rows = metrics.payload_rows.saturating_add(batch.num_rows());
             if consume_payload(BatchView::new(&batch), &mut state)?.is_none() {
                 return Ok(None);
             }
@@ -9325,6 +9416,7 @@ where
     let metrics = ParquetMapChunkMetrics {
         chunks: 1,
         row_groups: row_groups.len(),
+        projected_columns: reader.projected_columns(),
         rows,
         batches,
         zero_batches: reader.zero_row_batches(),
@@ -9430,6 +9522,7 @@ where
     let metrics = ParquetMapChunkMetrics {
         chunks: 1,
         row_groups: row_groups.len(),
+        projected_columns: reader.projected_columns(),
         rows,
         batches,
         zero_batches: reader.zero_row_batches(),
@@ -9537,6 +9630,7 @@ where
     let metrics = ParquetMapChunkMetrics {
         chunks: 1,
         row_groups: row_groups.len(),
+        projected_columns: reader.projected_columns(),
         rows,
         batches,
         zero_batches: reader.zero_row_batches(),
@@ -9644,6 +9738,7 @@ where
     let metrics = ParquetMapChunkMetrics {
         chunks: 1,
         row_groups: row_groups.len(),
+        projected_columns: reader.projected_columns(),
         rows,
         batches,
         zero_batches: reader.zero_row_batches(),
@@ -9695,14 +9790,44 @@ fn log_late_materialized_metrics(label: &str, metrics: LateMaterializedMetrics, 
     if std::env::var_os("DODAM_TPCH_PROFILE").is_none() {
         return;
     }
-    let ratio = if metrics.total_rows == 0 {
+    let ratio = metrics.selected_ratio();
+    let selector_runs_per_selected = if metrics.selected_rows == 0 {
         0.0
     } else {
-        metrics.selected_rows as f64 / metrics.total_rows as f64
+        metrics.selector_runs as f64 / metrics.selected_rows as f64
     };
     eprintln!(
-        "[dodam:tpch-profile] {label}: late_materialized rows={} selected={} ratio={:.6} selector_runs={} chunks={chunks}",
-        metrics.total_rows, metrics.selected_rows, ratio, metrics.selector_runs
+        "[dodam:tpch-profile] {label}: late_materialized rows={} selected={} ratio={:.6} selector_runs={} chunks={chunks} predicate_read={:.3} ms payload_read={:.3} ms predicate_batches={} payload_batches={} payload_rows={} selector_runs_per_selected={:.6}",
+        metrics.total_rows,
+        metrics.selected_rows,
+        ratio,
+        metrics.selector_runs,
+        metrics.predicate_read_nanos as f64 / 1_000_000.0,
+        metrics.payload_read_nanos as f64 / 1_000_000.0,
+        metrics.predicate_batches,
+        metrics.payload_batches,
+        metrics.payload_rows,
+        selector_runs_per_selected
+    );
+    let status = if metrics.selected_rows > 0
+        && metrics.selector_runs as f64 / metrics.selected_rows as f64 > 0.50
+    {
+        "fragmented_late_materialized"
+    } else {
+        "late_materialized_blocked_path"
+    };
+    eprintln!(
+        "[dodam:physical] kind=late_materialized status={status} rows={} selected={} selected_ratio={:.6} selector_runs={} selector_runs_per_selected={:.6} chunks={chunks} predicate_read_ms={:.3} payload_read_ms={:.3} predicate_batches={} payload_batches={} payload_rows={} label={label}",
+        metrics.total_rows,
+        metrics.selected_rows,
+        ratio,
+        metrics.selector_runs,
+        selector_runs_per_selected,
+        metrics.predicate_read_nanos as f64 / 1_000_000.0,
+        metrics.payload_read_nanos as f64 / 1_000_000.0,
+        metrics.predicate_batches,
+        metrics.payload_batches,
+        metrics.payload_rows
     );
 }
 
@@ -9711,9 +9836,10 @@ fn log_parquet_map_summary(kind: &str, label: Option<&str>, metrics: ParquetMapC
         return;
     };
     eprintln!(
-        "[dodam:scan-profile] {kind}_summary {label}: chunks={} row_groups={} rows={} batches={} zero_batches={} total_sum={:.3} ms read_next={:.3} ms reader_next={:.3} ms reader_next_avg={:.3} ms reader_next_p95_max={:.3} ms reader_next_max={:.3} ms reader_calls={} reader_eof={} avg_batch_rows={:.1} consume={:.3} ms compressed={}/{}",
+        "[dodam:scan-profile] {kind}_summary {label}: chunks={} row_groups={} projected_columns={} rows={} batches={} zero_batches={} total_sum={:.3} ms read_next={:.3} ms reader_next={:.3} ms reader_next_avg={:.3} ms reader_next_p95_max={:.3} ms reader_next_max={:.3} ms reader_calls={} reader_eof={} avg_batch_rows={:.1} consume={:.3} ms compressed={}/{}",
         metrics.chunks,
         metrics.row_groups,
+        metrics.projected_columns,
         metrics.rows,
         metrics.batches,
         metrics.zero_batches,
@@ -9730,60 +9856,49 @@ fn log_parquet_map_summary(kind: &str, label: Option<&str>, metrics: ParquetMapC
         metrics.compressed_bytes_scanned,
         metrics.compressed_bytes_total,
     );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn q14_late_materialized_promo_revenue_chunk(
-    path: PathBuf,
-    batch_size: usize,
-    row_groups: Vec<usize>,
-    start_days: i32,
-    end_days: i32,
-    promo_parts: Arc<DenseI64BoolLookup>,
-    metadata_cache: &ParquetMetadataCache,
-    file_cache: Arc<ParquetFileCache>,
-    object_store: &dyn ObjectStore,
-) -> Result<Option<LateMaterializedChunkResult<(f64, f64)>>> {
-    let predicate_projection = Projection::Columns(vec!["l_shipdate".to_string()]);
-    let payload_projection = Projection::Columns(vec![
-        "l_partkey".to_string(),
-        "l_extendedprice".to_string(),
-        "l_discount".to_string(),
-    ]);
-    let state = Q14LateState {
-        promo_parts,
-        promo: 0.0,
-        total: 0.0,
+    let total = metrics.total_nanos as f64;
+    let read_fraction = if total > 0.0 {
+        metrics.read_nanos as f64 / total
+    } else {
+        0.0
     };
-    late_materialized_chunk_view(
-        path,
-        batch_size,
-        row_groups,
-        &predicate_projection,
-        &payload_projection,
-        &[],
-        metadata_cache,
-        file_cache,
-        object_store,
-        LateMaterializationPolicy::always(),
-        0,
-        0,
-        state,
-        |view, selection, _state| {
-            q14_build_date_selection_view(view, start_days, end_days, selection)
+    let consume_fraction = if total > 0.0 {
+        metrics.consume_nanos as f64 / total
+    } else {
+        0.0
+    };
+    let bottleneck = if read_fraction >= 0.60 {
+        if metrics.projected_columns <= 4 {
+            "read-heavy-narrow"
+        } else if metrics.projected_columns >= 8 {
+            "read-heavy-wide"
+        } else {
+            "read-heavy"
+        }
+    } else if consume_fraction >= 0.50 {
+        "consume-heavy"
+    } else {
+        "mixed"
+    };
+    eprintln!(
+        "[dodam:physical] kind={kind}_summary status=blocked_row_group_map bottleneck={bottleneck} read_fraction={read_fraction:.6} consume_fraction={consume_fraction:.6} rows={} batches={} compressed_ratio={:.6} label={label}",
+        metrics.rows,
+        metrics.batches,
+        if metrics.compressed_bytes_total > 0 {
+            metrics.compressed_bytes_scanned as f64 / metrics.compressed_bytes_total as f64
+        } else {
+            0.0
         },
-        q14_consume_payload_view,
-        |state, _metrics| Ok(Some((state.promo, state.total))),
-    )
+    );
 }
 
-struct Q14LateState {
-    promo_parts: Arc<DenseI64BoolLookup>,
-    promo: f64,
+struct BoolLookupDiscountedRevenueState {
+    lookup: Arc<DenseI64BoolLookup>,
+    matched: f64,
     total: f64,
 }
 
-fn q14_build_date_selection_batch(
+fn build_date32_range_selection_batch(
     batch: RecordBatch,
     start_days: i32,
     end_days: i32,
@@ -9806,7 +9921,7 @@ fn q14_build_date_selection_batch(
     Ok(Some(()))
 }
 
-fn q14_build_date_selection_view(
+fn build_date32_range_selection_view(
     view: BatchView<'_>,
     start_days: i32,
     end_days: i32,
@@ -9827,10 +9942,13 @@ fn q14_build_date_selection_view(
     let Some(batch) = view.try_record_batch() else {
         return Ok(None);
     };
-    q14_build_date_selection_batch(batch.clone(), start_days, end_days, selection)
+    build_date32_range_selection_batch(batch.clone(), start_days, end_days, selection)
 }
 
-fn q14_consume_payload_batch(batch: RecordBatch, state: &mut Q14LateState) -> Result<Option<()>> {
+fn consume_discounted_revenue_by_i64_bool_lookup_batch(
+    batch: RecordBatch,
+    state: &mut BoolLookupDiscountedRevenueState,
+) -> Result<Option<()>> {
     let partkey_index = physical_batch_column_index(&batch, "l_partkey")?;
     let extendedprice_index = physical_batch_column_index(&batch, "l_extendedprice")?;
     let discount_index = physical_batch_column_index(&batch, "l_discount")?;
@@ -9859,10 +9977,13 @@ fn q14_consume_payload_batch(batch: RecordBatch, state: &mut Q14LateState) -> Re
     {
         return Ok(None);
     }
-    q14_consume_payload_arrays(partkeys, extendedprices, discounts, state)
+    consume_discounted_revenue_by_i64_bool_lookup_arrays(partkeys, extendedprices, discounts, state)
 }
 
-fn q14_consume_payload_view(view: BatchView<'_>, state: &mut Q14LateState) -> Result<Option<()>> {
+fn consume_discounted_revenue_by_i64_bool_lookup_view(
+    view: BatchView<'_>,
+    state: &mut BoolLookupDiscountedRevenueState,
+) -> Result<Option<()>> {
     if view.num_columns() == 3 {
         let (Some(partkeys), Some(extendedprices), Some(discounts)) = (
             view.i64_vector(0),
@@ -9871,19 +9992,24 @@ fn q14_consume_payload_view(view: BatchView<'_>, state: &mut Q14LateState) -> Re
         ) else {
             return Ok(None);
         };
-        return q14_consume_payload_vectors(partkeys, extendedprices, discounts, state);
+        return consume_discounted_revenue_by_i64_bool_lookup_vectors(
+            partkeys,
+            extendedprices,
+            discounts,
+            state,
+        );
     }
     let Some(batch) = view.try_record_batch() else {
         return Ok(None);
     };
-    q14_consume_payload_batch(batch.clone(), state)
+    consume_discounted_revenue_by_i64_bool_lookup_batch(batch.clone(), state)
 }
 
-fn q14_consume_payload_vectors(
+fn consume_discounted_revenue_by_i64_bool_lookup_vectors(
     partkeys: I64VectorView<'_>,
     extendedprices: Decimal128VectorView<'_>,
     discounts: Decimal128VectorView<'_>,
-    state: &mut Q14LateState,
+    state: &mut BoolLookupDiscountedRevenueState,
 ) -> Result<Option<()>> {
     let (Some(partkey_values), Some(price_scale), Some(discount_scale)) = (
         partkeys.values_if_null_free(),
@@ -9903,25 +10029,25 @@ fn q14_consume_payload_vectors(
     let extendedprice_values = extendedprices.raw_values();
     let discount_values = discounts.raw_values();
     for row in 0..partkey_values.len() {
-        let Some(is_promo) = state.promo_parts.get(partkey_values[row]) else {
+        let Some(is_promo) = state.lookup.get(partkey_values[row]) else {
             continue;
         };
         let value = ((extendedprice_values[row] as i64)
             * (discount_scale - discount_values[row] as i64)) as f64
             * revenue_scale;
         if is_promo {
-            state.promo += value;
+            state.matched += value;
         }
         state.total += value;
     }
     Ok(Some(()))
 }
 
-fn q14_consume_payload_arrays(
+fn consume_discounted_revenue_by_i64_bool_lookup_arrays(
     partkeys: &Int64Array,
     extendedprices: &Decimal128Array,
     discounts: &Decimal128Array,
-    state: &mut Q14LateState,
+    state: &mut BoolLookupDiscountedRevenueState,
 ) -> Result<Option<()>> {
     if partkeys.null_count() != 0 || extendedprices.null_count() != 0 || discounts.null_count() != 0
     {
@@ -9936,95 +10062,30 @@ fn q14_consume_payload_arrays(
     let discount_scale = decimal_scale_i64(discount_decimal_scale)?;
     let revenue_scale = 1.0 / ((price_scale as f64) * (discount_scale as f64));
     for row in 0..partkeys.len() {
-        let Some(is_promo) = state.promo_parts.get(partkeys.value(row)) else {
+        let Some(is_promo) = state.lookup.get(partkeys.value(row)) else {
             continue;
         };
         let value = ((extendedprices.values()[row] as i64)
             * (discount_scale - discounts.values()[row] as i64)) as f64
             * revenue_scale;
         if is_promo {
-            state.promo += value;
+            state.matched += value;
         }
         state.total += value;
     }
     Ok(Some(()))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn q06_late_materialized_revenue_sum_chunk(
-    path: PathBuf,
-    batch_size: usize,
-    row_groups: Vec<usize>,
-    start_days: i32,
-    end_days: i32,
-    discount_low: f64,
-    discount_high: f64,
-    quantity_limit: f64,
-    metadata_cache: &ParquetMetadataCache,
-    file_cache: Arc<ParquetFileCache>,
-    object_store: &dyn ObjectStore,
-) -> Result<Option<LateMaterializedChunkResult<(f64, u64)>>> {
-    let predicate_projection = Projection::Columns(vec![
-        "l_shipdate".to_string(),
-        "l_discount".to_string(),
-        "l_quantity".to_string(),
-    ]);
-    let payload_projection = Projection::Columns(vec!["l_extendedprice".to_string()]);
-    let state = Q06LateState {
-        selected_discounts: Vec::new(),
-        discount_scale: None,
-        extendedprice_scale: None,
-        discount_offset: 0,
-        sum: 0.0,
-    };
-    late_materialized_chunk_view(
-        path,
-        batch_size,
-        row_groups,
-        &predicate_projection,
-        &payload_projection,
-        &[],
-        metadata_cache,
-        file_cache,
-        object_store,
-        LateMaterializationPolicy::always(),
-        0,
-        0,
-        state,
-        |view, selection, state| {
-            q06_build_selection_view(
-                view,
-                start_days,
-                end_days,
-                discount_low,
-                discount_high,
-                quantity_limit,
-                selection,
-                state,
-            )
-        },
-        q06_consume_payload_view,
-        |state, _metrics| {
-            if state.discount_offset != state.selected_discounts.len() {
-                return Err(DodamError::UnsupportedSql(
-                    "Q06 row selection payload mismatch".to_string(),
-                ));
-            }
-            Ok(Some((state.sum, state.selected_discounts.len() as u64)))
-        },
-    )
-}
-
-struct Q06LateState {
+struct SelectedDiscountRevenueState {
     selected_discounts: Vec<i64>,
     discount_scale: Option<i64>,
     extendedprice_scale: Option<i64>,
     discount_offset: usize,
-    sum: f64,
+    revenue: f64,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn q06_build_selection_batch(
+fn build_date32_discount_quantity_selection_batch(
     batch: RecordBatch,
     start_days: i32,
     end_days: i32,
@@ -10032,7 +10093,7 @@ fn q06_build_selection_batch(
     discount_high: f64,
     quantity_limit: f64,
     selection: &mut LateSelectionBuilder,
-    state: &mut Q06LateState,
+    state: &mut SelectedDiscountRevenueState,
 ) -> Result<Option<()>> {
     let shipdate_index = physical_batch_column_index(&batch, "l_shipdate")?;
     let discount_index = physical_batch_column_index(&batch, "l_discount")?;
@@ -10098,7 +10159,7 @@ fn q06_build_selection_batch(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn q06_build_selection_view(
+fn build_date32_discount_quantity_selection_view(
     view: BatchView<'_>,
     start_days: i32,
     end_days: i32,
@@ -10106,7 +10167,7 @@ fn q06_build_selection_view(
     discount_high: f64,
     quantity_limit: f64,
     selection: &mut LateSelectionBuilder,
-    state: &mut Q06LateState,
+    state: &mut SelectedDiscountRevenueState,
 ) -> Result<Option<()>> {
     if view.num_columns() == 3 {
         let (Some(shipdates), Some(discounts), Some(quantities)) = (
@@ -10116,7 +10177,7 @@ fn q06_build_selection_view(
         ) else {
             return Ok(None);
         };
-        return q06_build_selection_vectors(
+        return build_date32_discount_quantity_selection_vectors(
             shipdates,
             discounts,
             quantities,
@@ -10132,7 +10193,7 @@ fn q06_build_selection_view(
     let Some(batch) = view.try_record_batch() else {
         return Ok(None);
     };
-    q06_build_selection_batch(
+    build_date32_discount_quantity_selection_batch(
         batch.clone(),
         start_days,
         end_days,
@@ -10145,7 +10206,7 @@ fn q06_build_selection_view(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn q06_build_selection_vectors(
+fn build_date32_discount_quantity_selection_vectors(
     shipdates: Date32VectorView<'_>,
     discounts: Decimal128VectorView<'_>,
     quantities: Decimal128VectorView<'_>,
@@ -10155,7 +10216,7 @@ fn q06_build_selection_vectors(
     discount_high: f64,
     quantity_limit: f64,
     selection: &mut LateSelectionBuilder,
-    state: &mut Q06LateState,
+    state: &mut SelectedDiscountRevenueState,
 ) -> Result<Option<()>> {
     let (Some(shipdate_values), Some(discount_scale_value), Some(quantity_scale_value)) = (
         shipdates.values_if_null_free(),
@@ -10199,7 +10260,10 @@ fn q06_build_selection_vectors(
     Ok(Some(()))
 }
 
-fn q06_consume_payload_batch(batch: RecordBatch, state: &mut Q06LateState) -> Result<Option<()>> {
+fn consume_selected_discount_revenue_batch(
+    batch: RecordBatch,
+    state: &mut SelectedDiscountRevenueState,
+) -> Result<Option<()>> {
     let extendedprice_index = physical_batch_column_index(&batch, "l_extendedprice")?;
     let Some(extendedprices) = batch
         .column(extendedprice_index)
@@ -10223,39 +10287,42 @@ fn q06_consume_payload_batch(batch: RecordBatch, state: &mut Q06LateState) -> Re
     } else {
         state.extendedprice_scale = Some(price_scale);
     }
-    let discount_scale = state
-        .discount_scale
-        .ok_or_else(|| DodamError::UnsupportedSql("Q06 missing discount scale".to_string()))?;
+    let discount_scale = state.discount_scale.ok_or_else(|| {
+        DodamError::UnsupportedSql("selected discount revenue missing discount scale".to_string())
+    })?;
     let revenue_scale = 1.0 / ((price_scale as f64) * (discount_scale as f64));
     for &extendedprice in extendedprices.values() {
         let discount = *state
             .selected_discounts
             .get(state.discount_offset)
             .ok_or_else(|| {
-                DodamError::UnsupportedSql("Q06 row selection payload mismatch".to_string())
+                DodamError::UnsupportedSql("selected discount revenue payload mismatch".to_string())
             })?;
-        state.sum += ((extendedprice as i64) * discount) as f64 * revenue_scale;
+        state.revenue += ((extendedprice as i64) * discount) as f64 * revenue_scale;
         state.discount_offset += 1;
     }
     Ok(Some(()))
 }
 
-fn q06_consume_payload_view(view: BatchView<'_>, state: &mut Q06LateState) -> Result<Option<()>> {
+fn consume_selected_discount_revenue_view(
+    view: BatchView<'_>,
+    state: &mut SelectedDiscountRevenueState,
+) -> Result<Option<()>> {
     if view.num_columns() == 1 {
         let Some(extendedprices) = view.decimal128_vector(0) else {
             return Ok(None);
         };
-        return q06_consume_payload_vectors(extendedprices, state);
+        return consume_selected_discount_revenue_vectors(extendedprices, state);
     }
     let Some(batch) = view.try_record_batch() else {
         return Ok(None);
     };
-    q06_consume_payload_batch(batch.clone(), state)
+    consume_selected_discount_revenue_batch(batch.clone(), state)
 }
 
-fn q06_consume_payload_vectors(
+fn consume_selected_discount_revenue_vectors(
     extendedprices: Decimal128VectorView<'_>,
-    state: &mut Q06LateState,
+    state: &mut SelectedDiscountRevenueState,
 ) -> Result<Option<()>> {
     if extendedprices.null_count() != 0 || extendedprices.precision() > 18 {
         return Ok(None);
@@ -10270,18 +10337,18 @@ fn q06_consume_payload_vectors(
     } else {
         state.extendedprice_scale = Some(price_scale);
     }
-    let discount_scale = state
-        .discount_scale
-        .ok_or_else(|| DodamError::UnsupportedSql("Q06 missing discount scale".to_string()))?;
+    let discount_scale = state.discount_scale.ok_or_else(|| {
+        DodamError::UnsupportedSql("selected discount revenue missing discount scale".to_string())
+    })?;
     let revenue_scale = 1.0 / ((price_scale as f64) * (discount_scale as f64));
     for &extendedprice in extendedprices.raw_values() {
         let discount = *state
             .selected_discounts
             .get(state.discount_offset)
             .ok_or_else(|| {
-                DodamError::UnsupportedSql("Q06 row selection payload mismatch".to_string())
+                DodamError::UnsupportedSql("selected discount revenue payload mismatch".to_string())
             })?;
-        state.sum += ((extendedprice as i64) * discount) as f64 * revenue_scale;
+        state.revenue += ((extendedprice as i64) * discount) as f64 * revenue_scale;
         state.discount_offset += 1;
     }
     Ok(Some(()))

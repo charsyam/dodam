@@ -2,7 +2,8 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 use std::time::SystemTime;
@@ -18,9 +19,9 @@ use parquet::arrow::arrow_reader::{
     ParquetRecordBatchReaderBuilder, RowFilter, RowSelection,
 };
 use parquet::basic::{Encoding, Type as ParquetPhysicalType};
-use parquet::column::page::{Page, PageReader};
+use parquet::column::page::{Page, PageMetadata, PageReader};
 use parquet::column::reader::{ColumnReader, ColumnReaderImpl};
-use parquet::data_type::{ByteArray, ByteArrayType, FixedLenByteArray, Int32Type, Int64Type};
+use parquet::data_type::{ByteArray, FixedLenByteArray, Int32Type, Int64Type};
 use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::metadata::PageIndexPolicy;
 use parquet::file::reader::{ChunkReader, FileReader as ParquetFileReader, Length};
@@ -29,15 +30,12 @@ use parquet::file::statistics::Statistics;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
-use crate::cost::{
-    FragmentedSelectedPayloadCostInput, SelectedPayloadCostInput,
-    choose_fragmented_selected_payload_full_decode, choose_selected_payload,
-};
+use crate::cost::{SelectedPayloadCostInput, choose_selected_payload};
 use crate::error::{DodamError, Result};
 use crate::execution::{
     ComparisonExpr, ComparisonOp, Expr, FilterExpr, Projection, evaluate_filter_mask,
 };
-use crate::vector::{DictionaryStringValues, RawColumnView, SelectionRuns, SelectionRunsBuilder};
+use crate::vector::{RawColumnView, SelectionRuns, SelectionRunsBuilder};
 
 mod selected_i64_decoder;
 
@@ -56,14 +54,6 @@ pub(crate) struct DirectI32I64DecimalI32SelectedBatch<'a> {
     pub(crate) sums: &'a [i64],
     pub(crate) decimals: &'a [i64],
     pub(crate) dates: &'a [i32],
-    pub(crate) predicate_applied: bool,
-}
-
-pub(crate) struct DirectI64DateDecimalDecimalSelectedBatch<'a> {
-    pub(crate) keys: &'a [i64],
-    pub(crate) dates: &'a [i32],
-    pub(crate) left_decimals: &'a [i64],
-    pub(crate) right_decimals: &'a [i64],
     pub(crate) predicate_applied: bool,
 }
 
@@ -1459,6 +1449,7 @@ fn percentile_nanos(samples: &[u64], percentile: usize) -> u64 {
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct DirectPrimitiveColumnScanMetrics {
+    pub reader_kind: &'static str,
     pub row_groups: usize,
     pub batches: usize,
     pub rows: usize,
@@ -1476,9 +1467,12 @@ pub(crate) struct DirectPrimitiveColumnScanMetrics {
     pub selected_predicate_nanos: u64,
     pub selected_payload_nanos: u64,
     pub selected_dictionary_nanos: u64,
+    pub selected_dictionary_range_pages: usize,
+    pub selected_dictionary_block_pages: usize,
+    pub selected_dictionary_block_rows: usize,
+    pub selected_page_skip_pages: usize,
+    pub selected_page_skip_rows: usize,
 }
-
-pub(crate) type DirectI64I32I32ScanMetrics = DirectPrimitiveColumnScanMetrics;
 
 pub(crate) enum DirectPrimitiveCountSumPageBatch<'a> {
     I32I64 {
@@ -1589,6 +1583,7 @@ pub(crate) struct DirectSelectedPrimitivePageBatch<'a> {
 
 impl DirectPrimitiveColumnScanMetrics {
     pub(crate) fn merge_from(&mut self, other: Self) {
+        self.reader_kind = merged_reader_kind(self.reader_kind, other.reader_kind);
         self.row_groups = self.row_groups.saturating_add(other.row_groups);
         self.batches = self.batches.saturating_add(other.batches);
         self.rows = self.rows.saturating_add(other.rows);
@@ -1623,6 +1618,21 @@ impl DirectPrimitiveColumnScanMetrics {
         self.selected_dictionary_nanos = self
             .selected_dictionary_nanos
             .saturating_add(other.selected_dictionary_nanos);
+        self.selected_dictionary_range_pages = self
+            .selected_dictionary_range_pages
+            .saturating_add(other.selected_dictionary_range_pages);
+        self.selected_dictionary_block_pages = self
+            .selected_dictionary_block_pages
+            .saturating_add(other.selected_dictionary_block_pages);
+        self.selected_dictionary_block_rows = self
+            .selected_dictionary_block_rows
+            .saturating_add(other.selected_dictionary_block_rows);
+        self.selected_page_skip_pages = self
+            .selected_page_skip_pages
+            .saturating_add(other.selected_page_skip_pages);
+        self.selected_page_skip_rows = self
+            .selected_page_skip_rows
+            .saturating_add(other.selected_page_skip_rows);
         if self.column_read_nanos.len() < other.column_read_nanos.len() {
             self.column_read_nanos
                 .resize(other.column_read_nanos.len(), 0);
@@ -1667,23 +1677,28 @@ impl DirectPrimitiveColumnScanMetrics {
         self.selected_read_calls = self.selected_read_calls.saturating_add(1);
         self.selected_read_rows = self.selected_read_rows.saturating_add(rows);
     }
+
+    fn add_selected_page_skip(&mut self, rows: usize) {
+        self.selected_page_skip_pages = self.selected_page_skip_pages.saturating_add(1);
+        self.selected_page_skip_rows = self.selected_page_skip_rows.saturating_add(rows);
+    }
+}
+
+fn merged_reader_kind(left: &'static str, right: &'static str) -> &'static str {
+    match (left, right) {
+        ("", kind) => kind,
+        (kind, "") => kind,
+        (left, right) if left == right => left,
+        _ => "mixed",
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum DirectPrimitiveColumnType {
     I64,
-    #[allow(dead_code)]
     I32,
     Date32,
-    #[allow(dead_code)]
-    Decimal128Int64 {
-        precision: u8,
-        scale: i8,
-    },
-    Decimal128Int64Raw {
-        precision: u8,
-        scale: i8,
-    },
+    Decimal128Int64Raw { precision: u8, scale: i8 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1767,74 +1782,7 @@ impl DirectColumnScanMetrics {
     }
 }
 
-pub(crate) struct DirectByteArrayPayloadReader<'a> {
-    reader: &'a mut ColumnReaderImpl<ByteArrayType>,
-    read_nanos: u64,
-}
-
-impl<'a> DirectByteArrayPayloadReader<'a> {
-    fn new(reader: &'a mut ColumnReaderImpl<ByteArrayType>) -> Self {
-        Self {
-            reader,
-            read_nanos: 0,
-        }
-    }
-
-    pub(crate) fn read_records(
-        &mut self,
-        records: usize,
-        def_levels: &mut Vec<i16>,
-        values: &mut Vec<ByteArray>,
-    ) -> Result<(usize, usize, usize)> {
-        let started = Instant::now();
-        let result = self
-            .reader
-            .read_records(records, Some(def_levels), None, values)?;
-        self.read_nanos = self.read_nanos.saturating_add(elapsed_nanos(started));
-        Ok(result)
-    }
-
-    pub(crate) fn skip_records(&mut self, records: usize) -> Result<usize> {
-        let started = Instant::now();
-        let skipped = self.reader.skip_records(records)?;
-        self.read_nanos = self.read_nanos.saturating_add(elapsed_nanos(started));
-        Ok(skipped)
-    }
-
-    fn take_read_nanos(&mut self) -> u64 {
-        let read_nanos = self.read_nanos;
-        self.read_nanos = 0;
-        read_nanos
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn scan_parquet_i64_byte_array_payload_columns_with_store<F>(
-    path: &Path,
-    batch_size: usize,
-    row_groups: &[usize],
-    columns: [&str; 2],
-    file_cache: Arc<ParquetFileCache>,
-    store: &dyn ObjectStore,
-    consume: F,
-) -> Result<Option<DirectColumnScanMetrics>>
-where
-    F: for<'a> FnMut(&[i64], &mut DirectByteArrayPayloadReader<'a>) -> Result<Option<()>>,
-{
-    if file_cache.enabled() {
-        let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
-        let reader = SerializedFileReader::new(reader)?;
-        return scan_parquet_i64_byte_array_payload_columns_reader(
-            reader, batch_size, row_groups, columns, consume,
-        );
-    }
-    let file = store.open(path)?;
-    let reader = SerializedFileReader::new(file)?;
-    scan_parquet_i64_byte_array_payload_columns_reader(
-        reader, batch_size, row_groups, columns, consume,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn scan_parquet_i32_i64_byte_array_columns_with_store<F>(
     path: &Path,
@@ -2132,951 +2080,6 @@ where
     scan_parquet_i32_dictionary_id_columns_raw_page_reader(
         reader, batch_size, row_groups, columns, consume,
     )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn scan_parquet_i64_dictionary_i32x3_columns_with_store<F>(
-    path: &Path,
-    batch_size: usize,
-    row_groups: &[usize],
-    columns: [&str; 5],
-    file_cache: Arc<ParquetFileCache>,
-    store: &dyn ObjectStore,
-    consume: F,
-) -> Result<Option<DirectColumnScanMetrics>>
-where
-    F: FnMut(&[i64], &[i32], &[Bytes], &[i32], &[i32], &[i32]) -> Result<Option<()>>,
-{
-    if file_cache.enabled() {
-        let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
-        let reader = SerializedFileReader::new(reader)?;
-        return scan_parquet_i64_dictionary_i32x3_columns_reader(
-            reader, batch_size, row_groups, columns, consume,
-        );
-    }
-    let file = store.open(path)?;
-    let reader = SerializedFileReader::new(file)?;
-    scan_parquet_i64_dictionary_i32x3_columns_reader(
-        reader, batch_size, row_groups, columns, consume,
-    )
-}
-
-pub(crate) fn scan_parquet_i64_dictionary_i32x3_page_columns_with_store<F>(
-    path: &Path,
-    batch_size: usize,
-    row_groups: &[usize],
-    columns: [&str; 5],
-    file_cache: Arc<ParquetFileCache>,
-    store: &dyn ObjectStore,
-    consume: F,
-) -> Result<Option<DirectColumnScanMetrics>>
-where
-    F: FnMut(&[u8], &[i32], &[Bytes], &[u8], &[u8], &[u8], usize) -> Result<Option<()>>,
-{
-    if file_cache.enabled() {
-        let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
-        let reader = SerializedFileReader::new(reader)?;
-        return scan_parquet_i64_dictionary_i32x3_page_columns_reader(
-            reader, batch_size, row_groups, columns, consume,
-        );
-    }
-    let file = store.open(path)?;
-    let reader = SerializedFileReader::new(file)?;
-    scan_parquet_i64_dictionary_i32x3_page_columns_reader(
-        reader, batch_size, row_groups, columns, consume,
-    )
-}
-
-pub(crate) fn scan_parquet_i64_dictionary_i32x3_dict_columns_with_store<F>(
-    path: &Path,
-    batch_size: usize,
-    row_groups: &[usize],
-    columns: [&str; 5],
-    file_cache: Arc<ParquetFileCache>,
-    store: &dyn ObjectStore,
-    consume: F,
-) -> Result<Option<DirectColumnScanMetrics>>
-where
-    F: FnMut(
-        &[i32],
-        &[i64],
-        &[i32],
-        &[Bytes],
-        &[i32],
-        &[i32],
-        &[i32],
-        &[i32],
-        &[i32],
-        &[i32],
-    ) -> Result<Option<()>>,
-{
-    if file_cache.enabled() {
-        let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
-        let reader = SerializedFileReader::new(reader)?;
-        return scan_parquet_i64_dictionary_i32x3_dict_columns_reader(
-            reader, batch_size, row_groups, columns, consume,
-        );
-    }
-    let file = store.open(path)?;
-    let reader = SerializedFileReader::new(file)?;
-    scan_parquet_i64_dictionary_i32x3_dict_columns_reader(
-        reader, batch_size, row_groups, columns, consume,
-    )
-}
-
-pub(crate) fn scan_parquet_i64_byte_array_selected_by_i32x3_dictionary_with_store<P, F>(
-    path: &Path,
-    row_groups: &[usize],
-    columns: [&str; 5],
-    file_cache: Arc<ParquetFileCache>,
-    store: &dyn ObjectStore,
-    predicate: P,
-    consume: F,
-) -> Result<Option<DirectColumnScanMetrics>>
-where
-    P: Fn(i32, i32, i32) -> bool,
-    F: FnMut(&[i64], &[i32], &[Bytes]) -> Result<Option<()>>,
-{
-    if file_cache.enabled() {
-        let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
-        let reader = SerializedFileReader::new(reader)?;
-        return scan_parquet_i64_byte_array_selected_by_i32x3_dictionary_reader(
-            reader, row_groups, columns, predicate, consume,
-        );
-    }
-    let file = store.open(path)?;
-    let reader = SerializedFileReader::new(file)?;
-    scan_parquet_i64_byte_array_selected_by_i32x3_dictionary_reader(
-        reader, row_groups, columns, predicate, consume,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn scan_parquet_i64_byte_array_selected_by_i32x3_dictionary_reader<R, P, F>(
-    reader: SerializedFileReader<R>,
-    row_groups: &[usize],
-    columns: [&str; 5],
-    predicate: P,
-    mut consume: F,
-) -> Result<Option<DirectColumnScanMetrics>>
-where
-    R: ChunkReader + 'static,
-    P: Fn(i32, i32, i32) -> bool,
-    F: FnMut(&[i64], &[i32], &[Bytes]) -> Result<Option<()>>,
-{
-    let trace_fallback = || {
-        std::env::var_os("DODAM_TPCH_PROFILE").is_some()
-            || std::env::var_os("DODAM_DIRECT_PRIMITIVE_PROFILE").is_some()
-    };
-    let Some(column_indices) = parquet_column_indices_by_name(&reader, &columns) else {
-        if trace_fallback() {
-            eprintln!("[dodam:direct-selected-i32x3-fallback] missing columns");
-        }
-        return Ok(None);
-    };
-    let [
-        key_column,
-        byte_array_column,
-        first_column,
-        second_column,
-        third_column,
-    ] = <[usize; 5]>::try_from(column_indices).map_err(|_| {
-        DodamError::UnsupportedSql("direct parquet column index shape mismatch".to_string())
-    })?;
-    let schema = reader.metadata().file_metadata().schema_descr();
-    let key_required = schema.column(key_column).max_def_level() == 0;
-    let mut metrics = DirectColumnScanMetrics {
-        row_groups: row_groups.len(),
-        ..DirectColumnScanMetrics::default()
-    };
-    for &row_group_index in row_groups {
-        let row_group = reader.get_row_group(row_group_index)?;
-        let row_count = usize::try_from(row_group.metadata().num_rows()).map_err(|_| {
-            DodamError::UnsupportedSql("row group row count out of range".to_string())
-        })?;
-
-        let read_started = Instant::now();
-        let predicate_started = Instant::now();
-        let mut selected_runs =
-            Vec::<(usize, usize)>::with_capacity((row_count / 64).clamp(16, 16_384));
-        let mut selected_builder = SelectionRunsBuilder::default();
-        if build_i32x3_dictionary_selected_runs_for_row_group_pagewise(
-            &*row_group,
-            [first_column, second_column, third_column],
-            row_count,
-            &predicate,
-            &mut selected_runs,
-            &mut selected_builder,
-        )?
-        .is_none()
-        {
-            let Some((first_ids, first_dictionary)) =
-                read_i32_dictionary_ids_for_row_group(&*row_group, first_column)?
-            else {
-                if trace_fallback() {
-                    eprintln!(
-                        "[dodam:direct-selected-i32x3-fallback] first predicate dictionary unsupported"
-                    );
-                }
-                return Ok(None);
-            };
-            let Some((second_ids, second_dictionary)) =
-                read_i32_dictionary_ids_for_row_group(&*row_group, second_column)?
-            else {
-                if trace_fallback() {
-                    eprintln!(
-                        "[dodam:direct-selected-i32x3-fallback] second predicate dictionary unsupported"
-                    );
-                }
-                return Ok(None);
-            };
-            let Some((third_ids, third_dictionary)) =
-                read_i32_dictionary_ids_for_row_group(&*row_group, third_column)?
-            else {
-                if trace_fallback() {
-                    eprintln!(
-                        "[dodam:direct-selected-i32x3-fallback] third predicate dictionary unsupported"
-                    );
-                }
-                return Ok(None);
-            };
-            if first_ids.len() != row_count
-                || second_ids.len() != row_count
-                || third_ids.len() != row_count
-            {
-                return Ok(None);
-            }
-            append_i32x3_dictionary_selected_runs(
-                &first_ids,
-                &first_dictionary,
-                &second_ids,
-                &second_dictionary,
-                &third_ids,
-                &third_dictionary,
-                &predicate,
-                &mut selected_runs,
-                &mut selected_builder,
-            );
-        }
-        metrics.add_selected_predicate_nanos(elapsed_nanos(predicate_started));
-        metrics.rows = metrics.rows.saturating_add(row_count);
-        metrics.add_read_nanos(elapsed_nanos(read_started));
-
-        let selected_rows = selected_builder.selected_rows();
-        metrics.selected_rows = metrics.selected_rows.saturating_add(selected_rows);
-        metrics.selected_runs = metrics.selected_runs.saturating_add(selected_runs.len());
-        if selected_rows == 0 {
-            continue;
-        }
-
-        let payload_started = Instant::now();
-        let fragmented_payload =
-            fragmented_selected_payload_should_full_decode(selected_rows, selected_runs.len());
-        let full_payload = if fragmented_payload {
-            if let Some((key_ids, key_dictionary)) =
-                read_i64_dictionary_ids_for_row_group(&*row_group, key_column)?
-            {
-                if let Some((mode_def_levels, mode_ids, mode_dictionary)) =
-                    read_byte_array_dictionary_ids_for_row_group(&*row_group, byte_array_column)?
-                {
-                    if mode_def_levels.is_empty()
-                        && key_ids.len() == row_count
-                        && mode_ids.len() == row_count
-                    {
-                        let selected_offsets =
-                            materialize_selected_u32_offsets(&selected_runs, selected_rows)?;
-                        let mut keys = Vec::<i64>::with_capacity(selected_rows);
-                        compact_i64_dictionary_selected_offsets(
-                            &key_ids,
-                            &key_dictionary,
-                            &selected_offsets,
-                            &mut keys,
-                        )?;
-                        let mut selected_mode_ids = Vec::<i32>::with_capacity(selected_rows);
-                        compact_selected_i32_offsets(
-                            &mode_ids,
-                            &selected_offsets,
-                            &mut selected_mode_ids,
-                        )?;
-                        Some((keys, selected_mode_ids, mode_dictionary))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let (selected_keys, selected_byte_array_ids, byte_array_dictionary) = if let Some(payload) =
-            full_payload
-        {
-            payload
-        } else {
-            let selected_keys = if let Some(keys) =
-                read_i64_dictionary_values_selected_for_row_group(
-                    &*row_group,
-                    key_column,
-                    &selected_runs,
-                )? {
-                keys
-            } else if let Some((key_ids, key_dictionary)) =
-                read_i64_dictionary_ids_for_row_group(&*row_group, key_column)?
-            {
-                let mut keys = Vec::<i64>::with_capacity(selected_rows);
-                compact_i64_dictionary_selected_runs(
-                    &key_ids,
-                    &key_dictionary,
-                    &selected_runs,
-                    &mut keys,
-                )?;
-                keys
-            } else {
-                let mut keys = Vec::<i64>::with_capacity(selected_rows);
-                let mut key_def_levels = Vec::<i16>::new();
-                let mut key_metrics = DirectPrimitiveColumnScanMetrics::default();
-                let mut key_reader = match row_group.get_column_reader(key_column)? {
-                    ColumnReader::Int64ColumnReader(reader) => reader,
-                    _ => {
-                        if trace_fallback() {
-                            eprintln!(
-                                "[dodam:direct-selected-i32x3-fallback] key column is not int64"
-                            );
-                        }
-                        return Ok(None);
-                    }
-                };
-                if !read_i64_selected_runs(
-                    &mut key_reader,
-                    row_count,
-                    &selected_runs,
-                    key_required,
-                    &mut key_def_levels,
-                    &mut keys,
-                    &mut key_metrics,
-                )? {
-                    if trace_fallback() {
-                        eprintln!(
-                            "[dodam:direct-selected-i32x3-fallback] selected key read failed"
-                        );
-                    }
-                    return Ok(None);
-                }
-                keys
-            };
-            let Some((selected_byte_array_ids, byte_array_dictionary)) =
-                read_byte_array_dictionary_ids_selected_for_row_group(
-                    &*row_group,
-                    byte_array_column,
-                    &selected_runs,
-                    &[],
-                )?
-            else {
-                if trace_fallback() {
-                    eprintln!(
-                        "[dodam:direct-selected-i32x3-fallback] selected byte-array dictionary read failed"
-                    );
-                }
-                return Ok(None);
-            };
-            (
-                selected_keys,
-                selected_byte_array_ids,
-                byte_array_dictionary,
-            )
-        };
-        if selected_keys.len() != selected_rows || selected_byte_array_ids.len() != selected_rows {
-            if trace_fallback() {
-                eprintln!(
-                    "[dodam:direct-selected-i32x3-fallback] selected payload length mismatch keys={} ids={} selected={}",
-                    selected_keys.len(),
-                    selected_byte_array_ids.len(),
-                    selected_rows
-                );
-            }
-            return Ok(None);
-        }
-        let payload_nanos = elapsed_nanos(payload_started);
-        metrics.add_selected_payload_nanos(payload_nanos);
-        metrics.add_read_nanos(payload_nanos);
-        metrics.batches += 1;
-
-        let consume_started = Instant::now();
-        if consume(
-            &selected_keys,
-            &selected_byte_array_ids,
-            &byte_array_dictionary,
-        )?
-        .is_none()
-        {
-            return Ok(None);
-        }
-        metrics.add_consume_nanos(elapsed_nanos(consume_started));
-    }
-    Ok(Some(metrics))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn append_i32x3_dictionary_selected_runs<P>(
-    first_ids: &[i32],
-    first_dictionary: &[i32],
-    second_ids: &[i32],
-    second_dictionary: &[i32],
-    third_ids: &[i32],
-    third_dictionary: &[i32],
-    predicate: &P,
-    runs: &mut Vec<(usize, usize)>,
-    builder: &mut SelectionRunsBuilder,
-) where
-    P: Fn(i32, i32, i32) -> bool,
-{
-    let rows = first_ids.len().min(second_ids.len()).min(third_ids.len());
-    let mut run_start = None::<usize>;
-    let mut run_len = 0usize;
-    for row in 0..rows {
-        let selected = i32_dictionary_lookup(first_ids[row], first_dictionary)
-            .zip(i32_dictionary_lookup(second_ids[row], second_dictionary))
-            .zip(i32_dictionary_lookup(third_ids[row], third_dictionary))
-            .is_some_and(|((first, second), third)| predicate(first, second, third));
-        if selected {
-            if run_start.is_none() {
-                run_start = Some(row);
-                run_len = 1;
-            } else {
-                run_len += 1;
-            }
-        } else if let Some(start) = run_start.take() {
-            builder.push_disjoint_run(runs, start, run_len);
-            run_len = 0;
-        }
-    }
-    if let Some(start) = run_start {
-        builder.push_disjoint_run(runs, start, run_len);
-    }
-}
-
-fn compact_i64_dictionary_selected_runs(
-    ids: &[i32],
-    dictionary: &[i64],
-    runs: &[(usize, usize)],
-    output: &mut Vec<i64>,
-) -> Result<()> {
-    for &(start, len) in runs {
-        let end = start.saturating_add(len);
-        let Some(slice) = ids.get(start..end) else {
-            return Err(DodamError::UnsupportedSql(
-                "selected i64 dictionary run is out of range".to_string(),
-            ));
-        };
-        for &id in slice {
-            let id = usize::try_from(id).map_err(|_| {
-                DodamError::UnsupportedSql("negative i64 dictionary id".to_string())
-            })?;
-            let Some(value) = dictionary.get(id) else {
-                return Err(DodamError::UnsupportedSql(
-                    "i64 dictionary id is out of range".to_string(),
-                ));
-            };
-            output.push(*value);
-        }
-    }
-    Ok(())
-}
-
-fn materialize_selected_u32_offsets(
-    runs: &[(usize, usize)],
-    selected_rows: usize,
-) -> Result<Vec<u32>> {
-    let mut offsets = Vec::with_capacity(selected_rows);
-    for &(start, len) in runs {
-        let end = start.checked_add(len).ok_or_else(|| {
-            DodamError::UnsupportedSql("selected run end is out of range".to_string())
-        })?;
-        if end > usize::try_from(u32::MAX).unwrap_or(usize::MAX) {
-            return Err(DodamError::UnsupportedSql(
-                "selected offset is out of u32 range".to_string(),
-            ));
-        }
-        offsets.extend((start..end).map(|offset| offset as u32));
-    }
-    if offsets.len() != selected_rows {
-        return Err(DodamError::UnsupportedSql(
-            "selected offset count mismatch".to_string(),
-        ));
-    }
-    Ok(offsets)
-}
-
-fn compact_i64_dictionary_selected_offsets(
-    ids: &[i32],
-    dictionary: &[i64],
-    offsets: &[u32],
-    output: &mut Vec<i64>,
-) -> Result<()> {
-    for &offset in offsets {
-        let Some(&id) = ids.get(offset as usize) else {
-            return Err(DodamError::UnsupportedSql(
-                "selected i64 dictionary offset is out of range".to_string(),
-            ));
-        };
-        let id = usize::try_from(id)
-            .map_err(|_| DodamError::UnsupportedSql("negative i64 dictionary id".to_string()))?;
-        let Some(value) = dictionary.get(id) else {
-            return Err(DodamError::UnsupportedSql(
-                "i64 dictionary id is out of range".to_string(),
-            ));
-        };
-        output.push(*value);
-    }
-    Ok(())
-}
-
-fn compact_selected_i32_offsets(
-    values: &[i32],
-    offsets: &[u32],
-    output: &mut Vec<i32>,
-) -> Result<()> {
-    for &offset in offsets {
-        let Some(&value) = values.get(offset as usize) else {
-            return Err(DodamError::UnsupportedSql(
-                "selected i32 offset is out of range".to_string(),
-            ));
-        };
-        output.push(value);
-    }
-    Ok(())
-}
-
-fn fragmented_selected_payload_should_full_decode(
-    selected_rows: usize,
-    selected_runs: usize,
-) -> bool {
-    let min_selected_runs = std::env::var("DODAM_FRAGMENTED_FULL_PAYLOAD_MIN_RUNS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(4096);
-    let max_average_run_len = std::env::var("DODAM_FRAGMENTED_FULL_PAYLOAD_MAX_AVG_RUN_LEN")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(2);
-    choose_fragmented_selected_payload_full_decode(FragmentedSelectedPayloadCostInput {
-        selected_rows,
-        selected_runs,
-        min_selected_runs,
-        max_average_run_len,
-    })
-}
-
-#[inline(always)]
-fn i32_dictionary_lookup(id: i32, dictionary: &[i32]) -> Option<i32> {
-    let id = usize::try_from(id).ok()?;
-    dictionary.get(id).copied()
-}
-
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
-fn scan_parquet_i64_dictionary_i32x3_dict_columns_reader<R, F>(
-    reader: SerializedFileReader<R>,
-    batch_size: usize,
-    row_groups: &[usize],
-    columns: [&str; 5],
-    mut consume: F,
-) -> Result<Option<DirectColumnScanMetrics>>
-where
-    R: ChunkReader + 'static,
-    F: FnMut(
-        &[i32],
-        &[i64],
-        &[i32],
-        &[Bytes],
-        &[i32],
-        &[i32],
-        &[i32],
-        &[i32],
-        &[i32],
-        &[i32],
-    ) -> Result<Option<()>>,
-{
-    let Some(column_indices) = parquet_column_indices_by_name(&reader, &columns) else {
-        return Ok(None);
-    };
-    let [
-        key_column,
-        dictionary_column,
-        first_column,
-        second_column,
-        third_column,
-    ] = <[usize; 5]>::try_from(column_indices).map_err(|_| {
-        DodamError::UnsupportedSql("direct parquet column index shape mismatch".to_string())
-    })?;
-    let mut metrics = DirectColumnScanMetrics {
-        row_groups: row_groups.len(),
-        ..DirectColumnScanMetrics::default()
-    };
-    for &row_group_index in row_groups {
-        let row_group = reader.get_row_group(row_group_index)?;
-        let row_count = usize::try_from(row_group.metadata().num_rows()).map_err(|_| {
-            DodamError::UnsupportedSql("row group row count out of range".to_string())
-        })?;
-        let read_started = Instant::now();
-        let Some((key_ids, key_dictionary)) =
-            read_i64_dictionary_ids_for_row_group(&*row_group, key_column)?
-        else {
-            return Ok(None);
-        };
-        let Some((mode_def_levels, mode_ids, mode_dictionary)) =
-            read_byte_array_dictionary_ids_for_row_group(&*row_group, dictionary_column)?
-        else {
-            return Ok(None);
-        };
-        if !mode_def_levels.is_empty() && !direct_all_present(false, &mode_def_levels) {
-            return Ok(None);
-        }
-        let Some((first_ids, first_dictionary)) =
-            read_i32_dictionary_ids_for_row_group(&*row_group, first_column)?
-        else {
-            return Ok(None);
-        };
-        let Some((second_ids, second_dictionary)) =
-            read_i32_dictionary_ids_for_row_group(&*row_group, second_column)?
-        else {
-            return Ok(None);
-        };
-        let Some((third_ids, third_dictionary)) =
-            read_i32_dictionary_ids_for_row_group(&*row_group, third_column)?
-        else {
-            return Ok(None);
-        };
-        if key_ids.len() != row_count
-            || mode_ids.len() != row_count
-            || first_ids.len() != row_count
-            || second_ids.len() != row_count
-            || third_ids.len() != row_count
-        {
-            return Ok(None);
-        }
-        metrics.add_read_nanos(elapsed_nanos(read_started));
-        let mut row_offset = 0usize;
-        while row_offset < row_count {
-            let records = batch_size.min(row_count - row_offset);
-            metrics.batches += 1;
-            metrics.rows = metrics.rows.saturating_add(records);
-            let consume_started = Instant::now();
-            if consume(
-                &key_ids[row_offset..row_offset + records],
-                &key_dictionary,
-                &mode_ids[row_offset..row_offset + records],
-                &mode_dictionary,
-                &first_ids[row_offset..row_offset + records],
-                &first_dictionary,
-                &second_ids[row_offset..row_offset + records],
-                &second_dictionary,
-                &third_ids[row_offset..row_offset + records],
-                &third_dictionary,
-            )?
-            .is_none()
-            {
-                return Ok(None);
-            }
-            metrics.add_consume_nanos(elapsed_nanos(consume_started));
-            row_offset += records;
-        }
-    }
-    Ok(Some(metrics))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn scan_parquet_i64_dictionary_i32x3_page_columns_reader<R, F>(
-    reader: SerializedFileReader<R>,
-    batch_size: usize,
-    row_groups: &[usize],
-    columns: [&str; 5],
-    mut consume: F,
-) -> Result<Option<DirectColumnScanMetrics>>
-where
-    R: ChunkReader + 'static,
-    F: FnMut(&[u8], &[i32], &[Bytes], &[u8], &[u8], &[u8], usize) -> Result<Option<()>>,
-{
-    let Some(column_indices) = parquet_column_indices_by_name(&reader, &columns) else {
-        return Ok(None);
-    };
-    let [
-        key_column,
-        dictionary_column,
-        first_column,
-        second_column,
-        third_column,
-    ] = <[usize; 5]>::try_from(column_indices).map_err(|_| {
-        DodamError::UnsupportedSql("direct parquet column index shape mismatch".to_string())
-    })?;
-    let schema = reader.metadata().file_metadata().schema_descr();
-    if schema.column(key_column).physical_type() != ParquetPhysicalType::INT64
-        || schema.column(dictionary_column).physical_type() != ParquetPhysicalType::BYTE_ARRAY
-        || schema.column(first_column).physical_type() != ParquetPhysicalType::INT32
-        || schema.column(second_column).physical_type() != ParquetPhysicalType::INT32
-        || schema.column(third_column).physical_type() != ParquetPhysicalType::INT32
-        || schema.column(key_column).max_rep_level() != 0
-        || schema.column(dictionary_column).max_rep_level() != 0
-        || schema.column(first_column).max_rep_level() != 0
-        || schema.column(second_column).max_rep_level() != 0
-        || schema.column(third_column).max_rep_level() != 0
-    {
-        return Ok(None);
-    }
-    let mut metrics = DirectColumnScanMetrics {
-        row_groups: row_groups.len(),
-        ..DirectColumnScanMetrics::default()
-    };
-    for &row_group_index in row_groups {
-        let row_group = reader.get_row_group(row_group_index)?;
-        let row_count = usize::try_from(row_group.metadata().num_rows()).map_err(|_| {
-            DodamError::UnsupportedSql("row group row count out of range".to_string())
-        })?;
-        let read_started = Instant::now();
-        let Some((dictionary_def_levels, dictionary_ids, dictionary)) =
-            read_byte_array_dictionary_ids_for_row_group(&*row_group, dictionary_column)?
-        else {
-            return Ok(None);
-        };
-        if !dictionary_def_levels.is_empty() && !direct_all_present(false, &dictionary_def_levels) {
-            return Ok(None);
-        }
-        if dictionary_ids.len() != row_count {
-            return Ok(None);
-        }
-        metrics.add_read_nanos(elapsed_nanos(read_started));
-
-        let mut key_cursor = RequiredPlainPrimitivePageCursor::new(
-            row_group.get_column_page_reader(key_column)?,
-            DirectPrimitiveColumnType::I64,
-            schema.column(key_column).max_def_level(),
-        );
-        let mut first_cursor = RequiredPlainPrimitivePageCursor::new(
-            row_group.get_column_page_reader(first_column)?,
-            DirectPrimitiveColumnType::I32,
-            schema.column(first_column).max_def_level(),
-        );
-        let mut second_cursor = RequiredPlainPrimitivePageCursor::new(
-            row_group.get_column_page_reader(second_column)?,
-            DirectPrimitiveColumnType::I32,
-            schema.column(second_column).max_def_level(),
-        );
-        let mut third_cursor = RequiredPlainPrimitivePageCursor::new(
-            row_group.get_column_page_reader(third_column)?,
-            DirectPrimitiveColumnType::I32,
-            schema.column(third_column).max_def_level(),
-        );
-        let mut rows_read = 0usize;
-        while rows_read < row_count {
-            let read_started = Instant::now();
-            let loaded = key_cursor.ensure_page()?
-                && first_cursor.ensure_page()?
-                && second_cursor.ensure_page()?
-                && third_cursor.ensure_page()?;
-            if !loaded {
-                metrics.add_read_nanos(elapsed_nanos(read_started));
-                return Ok(None);
-            }
-            let records = batch_size
-                .min(row_count - rows_read)
-                .min(key_cursor.available_rows())
-                .min(first_cursor.available_rows())
-                .min(second_cursor.available_rows())
-                .min(third_cursor.available_rows());
-            let Some(key_bytes) = key_cursor.raw_bytes(records) else {
-                return Ok(None);
-            };
-            let Some(first_bytes) = first_cursor.raw_bytes(records) else {
-                return Ok(None);
-            };
-            let Some(second_bytes) = second_cursor.raw_bytes(records) else {
-                return Ok(None);
-            };
-            let Some(third_bytes) = third_cursor.raw_bytes(records) else {
-                return Ok(None);
-            };
-            let mode_ids = &dictionary_ids[rows_read..rows_read + records];
-            metrics.add_read_nanos(elapsed_nanos(read_started));
-            metrics.batches += 1;
-            metrics.rows = metrics.rows.saturating_add(records);
-            let consume_started = Instant::now();
-            if consume(
-                key_bytes,
-                mode_ids,
-                &dictionary,
-                first_bytes,
-                second_bytes,
-                third_bytes,
-                records,
-            )?
-            .is_none()
-            {
-                return Ok(None);
-            }
-            metrics.add_consume_nanos(elapsed_nanos(consume_started));
-            key_cursor.advance(records);
-            first_cursor.advance(records);
-            second_cursor.advance(records);
-            third_cursor.advance(records);
-            rows_read += records;
-        }
-    }
-    Ok(Some(metrics))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn scan_parquet_i64_dictionary_i32x3_columns_reader<R, F>(
-    reader: SerializedFileReader<R>,
-    batch_size: usize,
-    row_groups: &[usize],
-    columns: [&str; 5],
-    mut consume: F,
-) -> Result<Option<DirectColumnScanMetrics>>
-where
-    R: ChunkReader + 'static,
-    F: FnMut(&[i64], &[i32], &[Bytes], &[i32], &[i32], &[i32]) -> Result<Option<()>>,
-{
-    let Some(column_indices) = parquet_column_indices_by_name(&reader, &columns) else {
-        return Ok(None);
-    };
-    let [
-        key_column,
-        dictionary_column,
-        first_column,
-        second_column,
-        third_column,
-    ] = <[usize; 5]>::try_from(column_indices).map_err(|_| {
-        DodamError::UnsupportedSql("direct parquet column index shape mismatch".to_string())
-    })?;
-    let schema = reader.metadata().file_metadata().schema_descr();
-    let key_required = schema.column(key_column).max_def_level() == 0;
-    let first_required = schema.column(first_column).max_def_level() == 0;
-    let second_required = schema.column(second_column).max_def_level() == 0;
-    let third_required = schema.column(third_column).max_def_level() == 0;
-    let mut metrics = DirectColumnScanMetrics {
-        row_groups: row_groups.len(),
-        ..DirectColumnScanMetrics::default()
-    };
-    for &row_group_index in row_groups {
-        let row_group = reader.get_row_group(row_group_index)?;
-        let read_started = Instant::now();
-        let Some((dictionary_def_levels, dictionary_ids, dictionary)) =
-            read_byte_array_dictionary_ids_for_row_group(&*row_group, dictionary_column)?
-        else {
-            return Ok(None);
-        };
-        if !dictionary_def_levels.is_empty() && !direct_all_present(false, &dictionary_def_levels) {
-            return Ok(None);
-        }
-        metrics.add_read_nanos(elapsed_nanos(read_started));
-
-        let mut key_reader = match row_group.get_column_reader(key_column)? {
-            ColumnReader::Int64ColumnReader(reader) => reader,
-            _ => return Ok(None),
-        };
-        let mut first_reader = match row_group.get_column_reader(first_column)? {
-            ColumnReader::Int32ColumnReader(reader) => reader,
-            _ => return Ok(None),
-        };
-        let mut second_reader = match row_group.get_column_reader(second_column)? {
-            ColumnReader::Int32ColumnReader(reader) => reader,
-            _ => return Ok(None),
-        };
-        let mut third_reader = match row_group.get_column_reader(third_column)? {
-            ColumnReader::Int32ColumnReader(reader) => reader,
-            _ => return Ok(None),
-        };
-        let mut key_values = Vec::<i64>::with_capacity(batch_size);
-        let mut key_def_levels = Vec::<i16>::with_capacity(batch_size);
-        let mut first_values = Vec::<i32>::with_capacity(batch_size);
-        let mut first_def_levels = Vec::<i16>::with_capacity(batch_size);
-        let mut second_values = Vec::<i32>::with_capacity(batch_size);
-        let mut second_def_levels = Vec::<i16>::with_capacity(batch_size);
-        let mut third_values = Vec::<i32>::with_capacity(batch_size);
-        let mut third_def_levels = Vec::<i16>::with_capacity(batch_size);
-        let mut row_offset = 0usize;
-        loop {
-            key_values.clear();
-            key_def_levels.clear();
-            first_values.clear();
-            first_def_levels.clear();
-            second_values.clear();
-            second_def_levels.clear();
-            third_values.clear();
-            third_def_levels.clear();
-            let read_started = Instant::now();
-            let (records, key_value_count, _) = key_reader.read_records(
-                batch_size,
-                (!key_required).then_some(&mut key_def_levels),
-                None,
-                &mut key_values,
-            )?;
-            if records == 0 {
-                metrics.add_read_nanos(elapsed_nanos(read_started));
-                break;
-            }
-            let (first_records, first_value_count, _) = first_reader.read_records(
-                records,
-                (!first_required).then_some(&mut first_def_levels),
-                None,
-                &mut first_values,
-            )?;
-            let (second_records, second_value_count, _) = second_reader.read_records(
-                records,
-                (!second_required).then_some(&mut second_def_levels),
-                None,
-                &mut second_values,
-            )?;
-            let (third_records, third_value_count, _) = third_reader.read_records(
-                records,
-                (!third_required).then_some(&mut third_def_levels),
-                None,
-                &mut third_values,
-            )?;
-            metrics.add_read_nanos(elapsed_nanos(read_started));
-            if first_records != records
-                || second_records != records
-                || third_records != records
-                || key_value_count != records
-                || first_value_count != records
-                || second_value_count != records
-                || third_value_count != records
-                || (!key_required && !direct_all_present(false, &key_def_levels))
-                || (!first_required && !direct_all_present(false, &first_def_levels))
-                || (!second_required && !direct_all_present(false, &second_def_levels))
-                || (!third_required && !direct_all_present(false, &third_def_levels))
-                || row_offset + records > dictionary_ids.len()
-            {
-                return Ok(None);
-            }
-            let batch_dictionary_ids = &dictionary_ids[row_offset..row_offset + records];
-            metrics.batches += 1;
-            metrics.rows = metrics.rows.saturating_add(records);
-            let consume_started = Instant::now();
-            if consume(
-                &key_values,
-                batch_dictionary_ids,
-                &dictionary,
-                &first_values,
-                &second_values,
-                &third_values,
-            )?
-            .is_none()
-            {
-                return Ok(None);
-            }
-            metrics.add_consume_nanos(elapsed_nanos(consume_started));
-            row_offset += records;
-        }
-        if row_offset != row_group.metadata().num_rows() as usize
-            || row_offset != dictionary_ids.len()
-        {
-            return Ok(None);
-        }
-    }
-    Ok(Some(metrics))
 }
 
 fn scan_parquet_i32_i64_dictionary_id_columns_reader<R, F>(
@@ -4189,264 +3192,6 @@ fn read_i32_dictionary_ids_for_row_group(
     Ok(Some((ids, dictionary)))
 }
 
-fn build_i32x3_dictionary_selected_runs_for_row_group_pagewise<P>(
-    row_group: &dyn parquet::file::reader::RowGroupReader,
-    columns: [usize; 3],
-    row_count: usize,
-    predicate: &P,
-    runs: &mut Vec<(usize, usize)>,
-    builder: &mut SelectionRunsBuilder,
-) -> Result<Option<()>>
-where
-    P: Fn(i32, i32, i32) -> bool,
-{
-    let schema = row_group.metadata().schema_descr();
-    for column in columns {
-        let column_desc = schema.column(column);
-        if column_desc.physical_type() != ParquetPhysicalType::INT32
-            || column_desc.max_rep_level() != 0
-            || column_desc.max_def_level() > 1
-        {
-            return Ok(None);
-        }
-    }
-    let mut first = I32DictionaryPageCursor::new(
-        row_group.get_column_page_reader(columns[0])?,
-        schema.column(columns[0]).max_def_level(),
-    );
-    let mut second = I32DictionaryPageCursor::new(
-        row_group.get_column_page_reader(columns[1])?,
-        schema.column(columns[1]).max_def_level(),
-    );
-    let mut third = I32DictionaryPageCursor::new(
-        row_group.get_column_page_reader(columns[2])?,
-        schema.column(columns[2]).max_def_level(),
-    );
-    let mut row_offset = 0usize;
-    let mut run_start = None::<usize>;
-    let mut run_len = 0usize;
-    while row_offset < row_count {
-        if !first.ensure_page()? || !second.ensure_page()? || !third.ensure_page()? {
-            return Ok(None);
-        }
-        let records = (row_count - row_offset)
-            .min(first.available_rows())
-            .min(second.available_rows())
-            .min(third.available_rows());
-        if records == 0 {
-            return Ok(None);
-        }
-        let first_ids = &first.ids[first.offset..first.offset + records];
-        let second_ids = &second.ids[second.offset..second.offset + records];
-        let third_ids = &third.ids[third.offset..third.offset + records];
-        let Some(first_dictionary) = first.dictionary.as_deref() else {
-            return Ok(None);
-        };
-        let Some(second_dictionary) = second.dictionary.as_deref() else {
-            return Ok(None);
-        };
-        let Some(third_dictionary) = third.dictionary.as_deref() else {
-            return Ok(None);
-        };
-        for (local, ((&first_id, &second_id), &third_id)) in first_ids
-            .iter()
-            .zip(second_ids.iter())
-            .zip(third_ids.iter())
-            .enumerate()
-        {
-            let first_idx = first_id as usize;
-            let second_idx = second_id as usize;
-            let third_idx = third_id as usize;
-            // Dictionary ids are validated by decode_dictionary_indices before this hot loop.
-            let selected = unsafe {
-                predicate(
-                    *first_dictionary.get_unchecked(first_idx),
-                    *second_dictionary.get_unchecked(second_idx),
-                    *third_dictionary.get_unchecked(third_idx),
-                )
-            };
-            if selected {
-                if run_start.is_none() {
-                    run_start = Some(row_offset + local);
-                    run_len = 1;
-                } else {
-                    run_len += 1;
-                }
-            } else if let Some(start) = run_start.take() {
-                builder.push_disjoint_run(runs, start, run_len);
-                run_len = 0;
-            }
-        }
-        first.advance(records);
-        second.advance(records);
-        third.advance(records);
-        row_offset += records;
-    }
-    if let Some(start) = run_start {
-        builder.push_disjoint_run(runs, start, run_len);
-    }
-    Ok(Some(()))
-}
-
-struct I32DictionaryPageCursor {
-    page_reader: Box<dyn PageReader>,
-    max_def_level: i16,
-    dictionary: Option<Vec<i32>>,
-    ids: Vec<i32>,
-    offset: usize,
-}
-
-impl I32DictionaryPageCursor {
-    fn new(page_reader: Box<dyn PageReader>, max_def_level: i16) -> Self {
-        Self {
-            page_reader,
-            max_def_level,
-            dictionary: None,
-            ids: Vec::new(),
-            offset: 0,
-        }
-    }
-
-    fn ensure_page(&mut self) -> Result<bool> {
-        if self.available_rows() > 0 {
-            return Ok(true);
-        }
-        self.load_next_data_page()
-    }
-
-    fn available_rows(&self) -> usize {
-        self.ids.len().saturating_sub(self.offset)
-    }
-
-    fn advance(&mut self, records: usize) {
-        self.offset += records;
-        if self.offset >= self.ids.len() {
-            self.ids.clear();
-            self.offset = 0;
-        }
-    }
-
-    fn load_next_data_page(&mut self) -> Result<bool> {
-        while let Some(page) = self.page_reader.get_next_page()? {
-            match page {
-                Page::DictionaryPage {
-                    buf,
-                    num_values,
-                    encoding,
-                    ..
-                } => {
-                    if encoding != Encoding::PLAIN || self.dictionary.is_some() {
-                        return Ok(false);
-                    }
-                    let mut values = Vec::with_capacity(num_values as usize);
-                    decode_plain_i32_values(buf, num_values as usize, &mut values)?;
-                    if values.len() != num_values as usize {
-                        return Ok(false);
-                    }
-                    self.dictionary = Some(values);
-                }
-                Page::DataPage {
-                    buf,
-                    num_values,
-                    encoding,
-                    def_level_encoding,
-                    ..
-                } => {
-                    if !matches!(
-                        encoding,
-                        Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
-                    ) {
-                        return Ok(false);
-                    }
-                    let Some(dictionary) = self.dictionary.as_ref() else {
-                        return Ok(false);
-                    };
-                    let mut offset = 0usize;
-                    let values = if self.max_def_level > 0 {
-                        if def_level_encoding != Encoding::RLE {
-                            return Ok(false);
-                        }
-                        let (bytes_read, level_data) =
-                            parse_v1_rle_level_data(buf.slice(offset..))?;
-                        offset += bytes_read;
-                        if !plain_page_all_present(
-                            level_data,
-                            self.max_def_level,
-                            num_values as usize,
-                        )? {
-                            return Ok(false);
-                        }
-                        num_values as usize
-                    } else {
-                        num_values as usize
-                    };
-                    self.ids.clear();
-                    decode_dictionary_indices(
-                        buf.slice(offset..),
-                        values,
-                        dictionary.len(),
-                        &mut self.ids,
-                    )?;
-                    if self.ids.len() != values {
-                        return Ok(false);
-                    }
-                    self.offset = 0;
-                    return Ok(true);
-                }
-                Page::DataPageV2 {
-                    buf,
-                    num_values,
-                    encoding,
-                    num_nulls,
-                    rep_levels_byte_len,
-                    def_levels_byte_len,
-                    ..
-                } => {
-                    if !matches!(
-                        encoding,
-                        Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
-                    ) {
-                        return Ok(false);
-                    }
-                    let Some(dictionary) = self.dictionary.as_ref() else {
-                        return Ok(false);
-                    };
-                    if self.max_def_level > 0 && num_nulls > 0 {
-                        let def_start = rep_levels_byte_len as usize;
-                        let def_end = def_start + def_levels_byte_len as usize;
-                        if def_end > buf.len()
-                            || !plain_page_all_present(
-                                buf.slice(def_start..def_end),
-                                self.max_def_level,
-                                num_values as usize,
-                            )?
-                        {
-                            return Ok(false);
-                        }
-                    }
-                    let value_start = (rep_levels_byte_len + def_levels_byte_len) as usize;
-                    if value_start > buf.len() {
-                        return Ok(false);
-                    }
-                    self.ids.clear();
-                    decode_dictionary_indices(
-                        buf.slice(value_start..),
-                        num_values as usize,
-                        dictionary.len(),
-                        &mut self.ids,
-                    )?;
-                    if self.ids.len() != num_values as usize {
-                        return Ok(false);
-                    }
-                    self.offset = 0;
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
-    }
-}
-
 struct ByteArrayDictionaryPageCursor {
     page_reader: Box<dyn PageReader>,
     max_def_level: i16,
@@ -4764,138 +3509,6 @@ impl ByteArrayDictionaryPageCursor {
     }
 }
 
-fn read_i64_dictionary_ids_for_row_group(
-    row_group: &dyn parquet::file::reader::RowGroupReader,
-    column: usize,
-) -> Result<Option<(Vec<i32>, Vec<i64>)>> {
-    let column_desc = row_group.metadata().schema_descr().column(column);
-    if column_desc.physical_type() != ParquetPhysicalType::INT64
-        || column_desc.max_rep_level() != 0
-        || column_desc.max_def_level() > 1
-    {
-        return Ok(None);
-    }
-    let row_count = usize::try_from(row_group.metadata().num_rows())
-        .map_err(|_| DodamError::UnsupportedSql("row group row count out of range".to_string()))?;
-    let mut page_reader = row_group.get_column_page_reader(column)?;
-    let mut dictionary: Option<Vec<i64>> = None;
-    let mut ids = Vec::<i32>::with_capacity(row_count);
-    let mut rows = 0usize;
-    while let Some(page) = page_reader.get_next_page()? {
-        match page {
-            Page::DictionaryPage {
-                buf,
-                num_values,
-                encoding,
-                ..
-            } => {
-                if encoding != Encoding::PLAIN || dictionary.is_some() {
-                    return Ok(None);
-                }
-                let mut values = Vec::with_capacity(num_values as usize);
-                decode_plain_i64_values(buf, num_values as usize, &mut values)?;
-                if values.len() != num_values as usize {
-                    return Ok(None);
-                }
-                dictionary = Some(values);
-            }
-            Page::DataPage {
-                buf,
-                num_values,
-                encoding,
-                def_level_encoding,
-                ..
-            } => {
-                if !matches!(
-                    encoding,
-                    Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
-                ) {
-                    return Ok(None);
-                }
-                let Some(dictionary) = dictionary.as_ref() else {
-                    return Ok(None);
-                };
-                let mut offset = 0usize;
-                let values = if column_desc.max_def_level() > 0 {
-                    if def_level_encoding != Encoding::RLE {
-                        return Ok(None);
-                    }
-                    let (bytes_read, level_data) = parse_v1_rle_level_data(buf.slice(offset..))?;
-                    offset += bytes_read;
-                    let mut def_levels = Vec::with_capacity(num_values as usize);
-                    decode_rle_i16_values(
-                        level_data,
-                        num_required_bits_i16(column_desc.max_def_level()),
-                        num_values as usize,
-                        &mut def_levels,
-                    )?;
-                    if def_levels.len() != num_values as usize
-                        || def_levels
-                            .iter()
-                            .any(|level| *level != column_desc.max_def_level())
-                    {
-                        return Ok(None);
-                    }
-                    num_values as usize
-                } else {
-                    num_values as usize
-                };
-                decode_dictionary_indices(buf.slice(offset..), values, dictionary.len(), &mut ids)?;
-                rows = rows.saturating_add(values);
-            }
-            Page::DataPageV2 {
-                buf,
-                num_values,
-                encoding,
-                rep_levels_byte_len,
-                def_levels_byte_len,
-                ..
-            } => {
-                if !matches!(
-                    encoding,
-                    Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
-                ) {
-                    return Ok(None);
-                }
-                let Some(dictionary) = dictionary.as_ref() else {
-                    return Ok(None);
-                };
-                if column_desc.max_def_level() > 0 {
-                    let def_start = rep_levels_byte_len as usize;
-                    let def_end = def_start + def_levels_byte_len as usize;
-                    if def_end > buf.len()
-                        || !plain_page_all_present(
-                            buf.slice(def_start..def_end),
-                            column_desc.max_def_level(),
-                            num_values as usize,
-                        )?
-                    {
-                        return Ok(None);
-                    }
-                }
-                let value_start = (rep_levels_byte_len + def_levels_byte_len) as usize;
-                if value_start > buf.len() {
-                    return Ok(None);
-                }
-                decode_dictionary_indices(
-                    buf.slice(value_start..),
-                    num_values as usize,
-                    dictionary.len(),
-                    &mut ids,
-                )?;
-                rows = rows.saturating_add(num_values as usize);
-            }
-        }
-    }
-    let Some(dictionary) = dictionary else {
-        return Ok(None);
-    };
-    if rows != row_count || ids.len() != row_count {
-        return Ok(None);
-    }
-    Ok(Some((ids, dictionary)))
-}
-
 fn read_byte_array_dictionary_ids_selected_for_row_group(
     row_group: &dyn parquet::file::reader::RowGroupReader,
     column: usize,
@@ -5091,206 +3704,6 @@ fn read_byte_array_dictionary_ids_selected_for_row_group(
     Ok(Some((selected_ids, dictionary)))
 }
 
-fn read_i64_dictionary_values_selected_for_row_group(
-    row_group: &dyn parquet::file::reader::RowGroupReader,
-    column: usize,
-    selected_runs: &[(usize, usize)],
-) -> Result<Option<Vec<i64>>> {
-    let column_desc = row_group.metadata().schema_descr().column(column);
-    if column_desc.physical_type() != ParquetPhysicalType::INT64
-        || column_desc.max_rep_level() != 0
-        || column_desc.max_def_level() > 1
-    {
-        return Ok(None);
-    }
-    let mut page_reader = row_group.get_column_page_reader(column)?;
-    let mut dictionary: Option<Vec<i64>> = None;
-    let mut selected_ids = Vec::<i32>::new();
-    let mut page_row_start = 0usize;
-    let mut run_cursor = 0usize;
-    while let Some(page) = page_reader.get_next_page()? {
-        match page {
-            Page::DictionaryPage {
-                buf,
-                num_values,
-                encoding,
-                ..
-            } => {
-                if encoding != Encoding::PLAIN || dictionary.is_some() {
-                    return Ok(None);
-                }
-                let mut values = Vec::with_capacity(num_values as usize);
-                decode_plain_i64_values(buf, num_values as usize, &mut values)?;
-                if values.len() != num_values as usize {
-                    return Ok(None);
-                }
-                dictionary = Some(values);
-            }
-            Page::DataPage {
-                buf,
-                num_values,
-                encoding,
-                def_level_encoding,
-                ..
-            } => {
-                if !matches!(
-                    encoding,
-                    Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
-                ) {
-                    return Ok(None);
-                }
-                let Some(dictionary) = dictionary.as_ref() else {
-                    return Ok(None);
-                };
-                let page_rows = num_values as usize;
-                let page_row_end = page_row_start + page_rows;
-                advance_run_cursor(selected_runs, &mut run_cursor, page_row_start);
-                if !runs_overlap_from(selected_runs, run_cursor, page_row_start, page_row_end) {
-                    page_row_start = page_row_end;
-                    continue;
-                }
-                let mut offset = 0usize;
-                let mut page_def_levels = Vec::<i16>::new();
-                let values = if column_desc.max_def_level() > 0 {
-                    let (bytes_read, level_data) = parse_v1_rle_level_data(buf.slice(offset..))?;
-                    offset += bytes_read;
-                    if def_level_encoding != Encoding::RLE {
-                        return Ok(None);
-                    }
-                    decode_rle_i16_values(
-                        level_data,
-                        num_required_bits_i16(column_desc.max_def_level()),
-                        page_rows,
-                        &mut page_def_levels,
-                    )?;
-                    page_def_levels
-                        .iter()
-                        .filter(|level| **level == column_desc.max_def_level())
-                        .count()
-                } else {
-                    page_rows
-                };
-                if page_def_levels.is_empty() {
-                    decode_dictionary_indices_selected_ranges(
-                        buf.slice(offset..),
-                        values,
-                        dictionary.len(),
-                        &selected_runs[run_cursor..],
-                        page_row_start,
-                        page_rows,
-                        &mut selected_ids,
-                    )?;
-                } else {
-                    decode_dictionary_indices_selected_nullable_ranges(
-                        buf.slice(offset..),
-                        values,
-                        dictionary.len(),
-                        &selected_runs[run_cursor..],
-                        page_row_start,
-                        page_rows,
-                        &page_def_levels,
-                        column_desc.max_def_level(),
-                        &mut selected_ids,
-                    )?;
-                }
-                page_row_start = page_row_end;
-            }
-            Page::DataPageV2 {
-                buf,
-                num_values,
-                encoding,
-                num_nulls,
-                def_levels_byte_len,
-                rep_levels_byte_len,
-                ..
-            } => {
-                if !matches!(
-                    encoding,
-                    Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
-                ) {
-                    return Ok(None);
-                }
-                let Some(dictionary) = dictionary.as_ref() else {
-                    return Ok(None);
-                };
-                let page_rows = num_values as usize;
-                let page_row_end = page_row_start + page_rows;
-                advance_run_cursor(selected_runs, &mut run_cursor, page_row_start);
-                if !runs_overlap_from(selected_runs, run_cursor, page_row_start, page_row_end) {
-                    page_row_start = page_row_end;
-                    continue;
-                }
-                let mut page_def_levels = Vec::<i16>::new();
-                let values = if column_desc.max_def_level() > 0 {
-                    let def_start = rep_levels_byte_len as usize;
-                    let def_end = def_start + def_levels_byte_len as usize;
-                    if def_end > buf.len() {
-                        return Ok(None);
-                    }
-                    decode_rle_i16_values(
-                        buf.slice(def_start..def_end),
-                        num_required_bits_i16(column_desc.max_def_level()),
-                        page_rows,
-                        &mut page_def_levels,
-                    )?;
-                    let values = page_def_levels
-                        .iter()
-                        .filter(|level| **level == column_desc.max_def_level())
-                        .count();
-                    if values != (num_values - num_nulls) as usize {
-                        return Ok(None);
-                    }
-                    values
-                } else {
-                    page_rows
-                };
-                let value_start = (rep_levels_byte_len + def_levels_byte_len) as usize;
-                if value_start > buf.len() {
-                    return Ok(None);
-                }
-                if page_def_levels.is_empty() {
-                    decode_dictionary_indices_selected_ranges(
-                        buf.slice(value_start..),
-                        values,
-                        dictionary.len(),
-                        &selected_runs[run_cursor..],
-                        page_row_start,
-                        page_rows,
-                        &mut selected_ids,
-                    )?;
-                } else {
-                    decode_dictionary_indices_selected_nullable_ranges(
-                        buf.slice(value_start..),
-                        values,
-                        dictionary.len(),
-                        &selected_runs[run_cursor..],
-                        page_row_start,
-                        page_rows,
-                        &page_def_levels,
-                        column_desc.max_def_level(),
-                        &mut selected_ids,
-                    )?;
-                }
-                page_row_start = page_row_end;
-            }
-        }
-    }
-    let Some(dictionary) = dictionary else {
-        return Ok(None);
-    };
-    let mut output = Vec::with_capacity(selected_ids.len());
-    for id in selected_ids {
-        let id = usize::try_from(id).map_err(|_| {
-            DodamError::UnsupportedSql("negative selected i64 dictionary id".to_string())
-        })?;
-        let Some(value) = dictionary.get(id) else {
-            return Ok(None);
-        };
-        output.push(*value);
-    }
-    Ok(Some(output))
-}
-
 fn build_i64_dictionary_selected_runs_for_row_group(
     row_group: &dyn parquet::file::reader::RowGroupReader,
     column: usize,
@@ -5462,6 +3875,1323 @@ fn build_i64_dictionary_selected_runs_for_row_group(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn build_i32_dictionary_range_selected_runs_for_row_group(
+    row_group: &dyn parquet::file::reader::RowGroupReader,
+    column: usize,
+    records: usize,
+    min_value: i32,
+    max_value_exclusive: i32,
+    runs: &mut Vec<(usize, usize)>,
+    builder: &mut SelectionRunsBuilder,
+) -> Result<Option<usize>> {
+    let column_desc = row_group.metadata().schema_descr().column(column);
+    if column_desc.physical_type() != ParquetPhysicalType::INT32
+        || column_desc.max_rep_level() != 0
+        || column_desc.max_def_level() > 1
+    {
+        return Ok(None);
+    }
+    let mut page_reader = row_group.get_column_page_reader(column)?;
+    let mut dictionary: Option<Vec<i32>> = None;
+    let mut selected_dictionary_ids = Vec::<bool>::new();
+    let mut def_levels = Vec::<i16>::new();
+    let mut page_row_start = 0usize;
+    while let Some(page) = page_reader.get_next_page()? {
+        match page {
+            Page::DictionaryPage {
+                buf,
+                num_values,
+                encoding,
+                ..
+            } => {
+                if encoding != Encoding::PLAIN || dictionary.is_some() {
+                    return Ok(None);
+                }
+                let mut values = Vec::<i32>::with_capacity(num_values as usize);
+                decode_plain_i32_values(buf, num_values as usize, &mut values)?;
+                if values.len() != num_values as usize {
+                    return Ok(None);
+                }
+                selected_dictionary_ids = values
+                    .iter()
+                    .map(|value| *value >= min_value && *value < max_value_exclusive)
+                    .collect();
+                dictionary = Some(values);
+            }
+            Page::DataPage {
+                buf,
+                num_values,
+                encoding,
+                def_level_encoding,
+                ..
+            } => {
+                if !matches!(
+                    encoding,
+                    Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
+                ) {
+                    return Ok(None);
+                }
+                let Some(dictionary) = dictionary.as_ref() else {
+                    return Ok(None);
+                };
+                let page_rows = num_values as usize;
+                let mut offset = 0usize;
+                let present_values = if column_desc.max_def_level() > 0 {
+                    let (bytes_read, level_data) = parse_v1_rle_level_data(buf.slice(offset..))?;
+                    offset += bytes_read;
+                    if def_level_encoding != Encoding::RLE {
+                        return Ok(None);
+                    }
+                    def_levels.clear();
+                    decode_rle_i16_values(
+                        level_data,
+                        num_required_bits_i16(column_desc.max_def_level()),
+                        page_rows,
+                        &mut def_levels,
+                    )?;
+                    def_levels
+                        .iter()
+                        .filter(|level| **level == column_desc.max_def_level())
+                        .count()
+                } else {
+                    def_levels.clear();
+                    page_rows
+                };
+                append_dictionary_id_selected_runs_from_encoded(
+                    buf.slice(offset..),
+                    present_values,
+                    dictionary.len(),
+                    if def_levels.is_empty() {
+                        None
+                    } else {
+                        Some((&def_levels, column_desc.max_def_level()))
+                    },
+                    &selected_dictionary_ids,
+                    page_row_start,
+                    page_rows,
+                    runs,
+                    builder,
+                )?;
+                page_row_start += page_rows;
+            }
+            Page::DataPageV2 {
+                buf,
+                num_values,
+                encoding,
+                num_nulls,
+                def_levels_byte_len,
+                rep_levels_byte_len,
+                ..
+            } => {
+                if !matches!(
+                    encoding,
+                    Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
+                ) {
+                    return Ok(None);
+                }
+                let Some(dictionary) = dictionary.as_ref() else {
+                    return Ok(None);
+                };
+                let page_rows = num_values as usize;
+                let present_values = if column_desc.max_def_level() > 0 && num_nulls != 0 {
+                    let def_start = rep_levels_byte_len as usize;
+                    let def_end = def_start + def_levels_byte_len as usize;
+                    if def_end > buf.len() {
+                        return Ok(None);
+                    }
+                    def_levels.clear();
+                    decode_rle_i16_values(
+                        buf.slice(def_start..def_end),
+                        num_required_bits_i16(column_desc.max_def_level()),
+                        page_rows,
+                        &mut def_levels,
+                    )?;
+                    def_levels
+                        .iter()
+                        .filter(|level| **level == column_desc.max_def_level())
+                        .count()
+                } else {
+                    def_levels.clear();
+                    page_rows
+                };
+                let value_start = (rep_levels_byte_len + def_levels_byte_len) as usize;
+                if value_start > buf.len() {
+                    return Ok(None);
+                }
+                append_dictionary_id_selected_runs_from_encoded(
+                    buf.slice(value_start..),
+                    present_values,
+                    dictionary.len(),
+                    if def_levels.is_empty() {
+                        None
+                    } else {
+                        Some((&def_levels, column_desc.max_def_level()))
+                    },
+                    &selected_dictionary_ids,
+                    page_row_start,
+                    page_rows,
+                    runs,
+                    builder,
+                )?;
+                page_row_start += page_rows;
+            }
+        }
+    }
+    if dictionary.is_none() || page_row_start != records {
+        return Ok(None);
+    }
+    Ok(Some(builder.selected_rows()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_byte_array_dictionary_predicate_selected_runs_for_row_group<Predicate>(
+    row_group: &dyn parquet::file::reader::RowGroupReader,
+    column: usize,
+    records: usize,
+    predicate: &Predicate,
+    runs: &mut Vec<(usize, usize)>,
+    builder: &mut SelectionRunsBuilder,
+) -> Result<Option<usize>>
+where
+    Predicate: Fn(&[u8]) -> bool,
+{
+    let column_desc = row_group.metadata().schema_descr().column(column);
+    if column_desc.physical_type() != ParquetPhysicalType::BYTE_ARRAY
+        || column_desc.max_rep_level() != 0
+        || column_desc.max_def_level() > 1
+    {
+        return Ok(None);
+    }
+    let mut page_reader = row_group.get_column_page_reader(column)?;
+    let mut dictionary = None;
+    let mut selected_dictionary_ids = Vec::<bool>::new();
+    let mut def_levels = Vec::<i16>::new();
+    let mut page_row_start = 0usize;
+    while let Some(page) = page_reader.get_next_page()? {
+        match page {
+            Page::DictionaryPage {
+                buf,
+                num_values,
+                encoding,
+                ..
+            } => {
+                if encoding != Encoding::PLAIN || dictionary.is_some() {
+                    return Ok(None);
+                }
+                let values = decode_plain_byte_array_dictionary(buf, num_values as usize)?;
+                if values.len() != num_values as usize {
+                    return Ok(None);
+                }
+                selected_dictionary_ids = values
+                    .iter()
+                    .map(|value| predicate(value.as_ref()))
+                    .collect();
+                dictionary = Some(values);
+            }
+            Page::DataPage {
+                buf,
+                num_values,
+                encoding,
+                def_level_encoding,
+                ..
+            } => {
+                if !matches!(
+                    encoding,
+                    Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
+                ) {
+                    return Ok(None);
+                }
+                let Some(dictionary) = dictionary.as_ref() else {
+                    return Ok(None);
+                };
+                let page_rows = num_values as usize;
+                let mut offset = 0usize;
+                let present_values = if column_desc.max_def_level() > 0 {
+                    let (bytes_read, level_data) = parse_v1_rle_level_data(buf.slice(offset..))?;
+                    offset += bytes_read;
+                    if def_level_encoding != Encoding::RLE {
+                        return Ok(None);
+                    }
+                    def_levels.clear();
+                    decode_rle_i16_values(
+                        level_data,
+                        num_required_bits_i16(column_desc.max_def_level()),
+                        page_rows,
+                        &mut def_levels,
+                    )?;
+                    def_levels
+                        .iter()
+                        .filter(|level| **level == column_desc.max_def_level())
+                        .count()
+                } else {
+                    def_levels.clear();
+                    page_rows
+                };
+                append_dictionary_id_selected_runs_from_encoded(
+                    buf.slice(offset..),
+                    present_values,
+                    dictionary.len(),
+                    if def_levels.is_empty() {
+                        None
+                    } else {
+                        Some((&def_levels, column_desc.max_def_level()))
+                    },
+                    &selected_dictionary_ids,
+                    page_row_start,
+                    page_rows,
+                    runs,
+                    builder,
+                )?;
+                page_row_start += page_rows;
+            }
+            Page::DataPageV2 {
+                buf,
+                num_values,
+                encoding,
+                num_nulls,
+                def_levels_byte_len,
+                rep_levels_byte_len,
+                ..
+            } => {
+                if !matches!(
+                    encoding,
+                    Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
+                ) {
+                    return Ok(None);
+                }
+                let Some(dictionary) = dictionary.as_ref() else {
+                    return Ok(None);
+                };
+                let page_rows = num_values as usize;
+                let present_values = if column_desc.max_def_level() > 0 && num_nulls != 0 {
+                    let def_start = rep_levels_byte_len as usize;
+                    let def_end = def_start + def_levels_byte_len as usize;
+                    if def_end > buf.len() {
+                        return Ok(None);
+                    }
+                    def_levels.clear();
+                    decode_rle_i16_values(
+                        buf.slice(def_start..def_end),
+                        num_required_bits_i16(column_desc.max_def_level()),
+                        page_rows,
+                        &mut def_levels,
+                    )?;
+                    let present_values = def_levels
+                        .iter()
+                        .filter(|level| **level == column_desc.max_def_level())
+                        .count();
+                    if present_values != (num_values - num_nulls) as usize {
+                        return Ok(None);
+                    }
+                    present_values
+                } else {
+                    def_levels.clear();
+                    page_rows
+                };
+                let value_start = (rep_levels_byte_len + def_levels_byte_len) as usize;
+                if value_start > buf.len() {
+                    return Ok(None);
+                }
+                append_dictionary_id_selected_runs_from_encoded(
+                    buf.slice(value_start..),
+                    present_values,
+                    dictionary.len(),
+                    if def_levels.is_empty() {
+                        None
+                    } else {
+                        Some((&def_levels, column_desc.max_def_level()))
+                    },
+                    &selected_dictionary_ids,
+                    page_row_start,
+                    page_rows,
+                    runs,
+                    builder,
+                )?;
+                page_row_start += page_rows;
+            }
+        }
+    }
+    if dictionary.is_none() || page_row_start != records {
+        return Ok(None);
+    }
+    Ok(Some(builder.selected_rows()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_i32_dictionary_tagged_selected_runs_for_row_group<Tag, Predicate>(
+    row_group: &dyn parquet::file::reader::RowGroupReader,
+    column: usize,
+    records: usize,
+    predicate: &Predicate,
+    selected_tags: &mut Vec<Tag>,
+    runs: &mut Vec<(usize, usize)>,
+    builder: &mut SelectionRunsBuilder,
+) -> Result<Option<usize>>
+where
+    Tag: Copy,
+    Predicate: Fn(i32) -> Option<Tag>,
+{
+    let column_desc = row_group.metadata().schema_descr().column(column);
+    if column_desc.physical_type() != ParquetPhysicalType::INT32
+        || column_desc.max_rep_level() != 0
+        || column_desc.max_def_level() > 1
+    {
+        return Ok(None);
+    }
+    let mut page_reader = row_group.get_column_page_reader(column)?;
+    let mut dictionary_tags = None;
+    let mut page_row_start = 0usize;
+    while let Some(page) = page_reader.get_next_page()? {
+        match page {
+            Page::DictionaryPage {
+                buf,
+                num_values,
+                encoding,
+                ..
+            } => {
+                if encoding != Encoding::PLAIN || dictionary_tags.is_some() {
+                    return Ok(None);
+                }
+                let mut dictionary = Vec::with_capacity(num_values as usize);
+                decode_plain_i32_values(buf, num_values as usize, &mut dictionary)?;
+                if dictionary.len() != num_values as usize {
+                    return Ok(None);
+                }
+                dictionary_tags = Some(
+                    dictionary
+                        .into_iter()
+                        .map(predicate)
+                        .collect::<Vec<Option<Tag>>>(),
+                );
+            }
+            Page::DataPage {
+                buf,
+                num_values,
+                encoding,
+                def_level_encoding,
+                ..
+            } => {
+                if !matches!(
+                    encoding,
+                    Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
+                ) {
+                    return Ok(None);
+                }
+                let Some(dictionary_tags) = dictionary_tags.as_ref() else {
+                    return Ok(None);
+                };
+                let page_rows = num_values as usize;
+                let mut value_start = 0usize;
+                if column_desc.max_def_level() > 0 {
+                    if def_level_encoding != Encoding::RLE {
+                        return Ok(None);
+                    }
+                    let (bytes_read, level_data) = parse_v1_rle_level_data(buf.slice(0..))?;
+                    value_start = bytes_read;
+                    if !plain_page_all_present(level_data, column_desc.max_def_level(), page_rows)?
+                    {
+                        return Ok(None);
+                    }
+                }
+                if !append_dictionary_tag_selected_runs_from_encoded(
+                    buf.slice(value_start..),
+                    page_rows,
+                    dictionary_tags,
+                    page_row_start,
+                    page_rows,
+                    selected_tags,
+                    runs,
+                    builder,
+                )? {
+                    return Ok(None);
+                }
+                page_row_start += page_rows;
+            }
+            Page::DataPageV2 {
+                buf,
+                num_values,
+                encoding,
+                num_nulls,
+                def_levels_byte_len,
+                rep_levels_byte_len,
+                ..
+            } => {
+                if !matches!(
+                    encoding,
+                    Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
+                ) || (column_desc.max_def_level() > 0 && num_nulls != 0)
+                {
+                    return Ok(None);
+                }
+                let Some(dictionary_tags) = dictionary_tags.as_ref() else {
+                    return Ok(None);
+                };
+                let page_rows = num_values as usize;
+                let value_start = (rep_levels_byte_len + def_levels_byte_len) as usize;
+                if value_start > buf.len() {
+                    return Ok(None);
+                }
+                if !append_dictionary_tag_selected_runs_from_encoded(
+                    buf.slice(value_start..),
+                    page_rows,
+                    dictionary_tags,
+                    page_row_start,
+                    page_rows,
+                    selected_tags,
+                    runs,
+                    builder,
+                )? {
+                    return Ok(None);
+                }
+                page_row_start += page_rows;
+            }
+        }
+    }
+    if dictionary_tags.is_none()
+        || page_row_start != records
+        || selected_tags.len() != builder.selected_rows()
+    {
+        return Ok(None);
+    }
+    Ok(Some(builder.selected_rows()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_dictionary_tag_selected_runs_from_encoded<Tag>(
+    data: Bytes,
+    values: usize,
+    dictionary_tags: &[Option<Tag>],
+    row_offset: usize,
+    rows: usize,
+    selected_tags: &mut Vec<Tag>,
+    runs: &mut Vec<(usize, usize)>,
+    builder: &mut SelectionRunsBuilder,
+) -> Result<bool>
+where
+    Tag: Copy,
+{
+    if data.is_empty() || values != rows {
+        return Ok(false);
+    }
+    let bit_width = data[0];
+    if bit_width > 32 {
+        return Ok(false);
+    }
+    let data = data.slice(1..);
+    let mut pos = 0usize;
+    let mut row = 0usize;
+    let mut decoded = 0usize;
+    let mut block = DictionaryIdBlock::new();
+    while decoded < values && row < rows {
+        let Some(header) = read_hybrid_varint(&data, &mut pos)? else {
+            return Ok(false);
+        };
+        if header & 1 == 0 {
+            let len = ((header >> 1) as usize)
+                .min(values - decoded)
+                .min(rows - row);
+            let bytes = usize::from(bit_width).div_ceil(8);
+            if pos + bytes > data.len() {
+                return Ok(false);
+            }
+            let mut id = 0u32;
+            for index in 0..bytes {
+                id |= u32::from(data[pos + index]) << (index * 8);
+            }
+            pos += bytes;
+            let tag = *dictionary_tags
+                .get(id as usize)
+                .ok_or_else(invalid_dictionary_id_error)?;
+            if let Some(tag) = tag {
+                selected_tags.extend(std::iter::repeat_n(tag, len));
+                builder.push_run(runs, row_offset + row, len);
+            }
+            row += len;
+            decoded += len;
+            continue;
+        }
+
+        let groups = (header >> 1) as usize;
+        let count = groups
+            .saturating_mul(8)
+            .min(values - decoded)
+            .min(rows - row);
+        let bytes = groups
+            .saturating_mul(8)
+            .saturating_mul(usize::from(bit_width))
+            .div_ceil(8);
+        if pos + bytes > data.len() {
+            return Ok(false);
+        }
+        let mut bitpacked_reader =
+            BitpackedDictionaryIdBlockReader::new(&data, pos, pos + bytes, bit_width);
+        let mut local = 0usize;
+        while local < count {
+            let block_len = DICTIONARY_ID_BLOCK.min(count - local);
+            bitpacked_reader.decode_block(block_len, &mut block)?;
+            let mut selected_start = None;
+            let mut selected_len = 0usize;
+            for (lane, id) in block.as_slice().iter().copied().enumerate() {
+                let tag = *dictionary_tags
+                    .get(id as usize)
+                    .ok_or_else(invalid_dictionary_id_error)?;
+                if let Some(tag) = tag {
+                    selected_tags.push(tag);
+                    if selected_start.is_none() {
+                        selected_start = Some(row_offset + row + lane);
+                        selected_len = 1;
+                    } else {
+                        selected_len += 1;
+                    }
+                } else if let Some(start) = selected_start.take() {
+                    builder.push_run(runs, start, selected_len);
+                    selected_len = 0;
+                }
+            }
+            if let Some(start) = selected_start {
+                builder.push_run(runs, start, selected_len);
+            }
+            row += block_len;
+            decoded += block_len;
+            local += block_len;
+        }
+        pos += bytes;
+    }
+    if decoded != values || row != rows {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn i64_lookup_candidate_masks_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("DODAM_DISABLE_I64_LOOKUP_MASK_ELISION")
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_i64_dictionary_lookup_selected_runs_for_row_group<Lookup>(
+    row_group: &dyn parquet::file::reader::RowGroupReader,
+    column: usize,
+    records: usize,
+    lookup: &Lookup,
+    selected_masks: &mut Vec<u8>,
+    collect_selected_masks: bool,
+    runs: &mut Vec<(usize, usize)>,
+    builder: &mut SelectionRunsBuilder,
+) -> Result<Option<usize>>
+where
+    Lookup: Fn(i64) -> Option<u8>,
+{
+    let column_desc = row_group.metadata().schema_descr().column(column);
+    if column_desc.physical_type() != ParquetPhysicalType::INT64
+        || column_desc.max_rep_level() != 0
+        || column_desc.max_def_level() > 1
+    {
+        return Ok(None);
+    }
+    let mut page_reader = row_group.get_column_page_reader(column)?;
+    let mut dictionary_masks = None;
+    let mut page_row_start = 0usize;
+    while let Some(page) = page_reader.get_next_page()? {
+        match page {
+            Page::DictionaryPage {
+                buf,
+                num_values,
+                encoding,
+                ..
+            } => {
+                if encoding != Encoding::PLAIN || dictionary_masks.is_some() {
+                    return Ok(None);
+                }
+                let mut dictionary = Vec::with_capacity(num_values as usize);
+                decode_plain_i64_values(buf, num_values as usize, &mut dictionary)?;
+                if dictionary.len() != num_values as usize {
+                    return Ok(None);
+                }
+                dictionary_masks = Some(
+                    dictionary
+                        .into_iter()
+                        .map(|value| lookup(value).unwrap_or(0))
+                        .collect::<Vec<_>>(),
+                );
+            }
+            Page::DataPage {
+                buf,
+                num_values,
+                encoding,
+                def_level_encoding,
+                ..
+            } => {
+                if !matches!(
+                    encoding,
+                    Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
+                ) {
+                    return Ok(None);
+                }
+                let Some(dictionary_masks) = dictionary_masks.as_ref() else {
+                    return Ok(None);
+                };
+                let page_rows = num_values as usize;
+                let mut value_start = 0usize;
+                if column_desc.max_def_level() > 0 {
+                    if def_level_encoding != Encoding::RLE {
+                        return Ok(None);
+                    }
+                    let (bytes_read, level_data) = parse_v1_rle_level_data(buf.slice(0..))?;
+                    value_start = bytes_read;
+                    if !plain_page_all_present(level_data, column_desc.max_def_level(), page_rows)?
+                    {
+                        return Ok(None);
+                    }
+                }
+                if !append_dictionary_mask_selected_runs_from_encoded(
+                    buf.slice(value_start..),
+                    page_rows,
+                    dictionary_masks,
+                    page_row_start,
+                    page_rows,
+                    selected_masks,
+                    collect_selected_masks,
+                    runs,
+                    builder,
+                )? {
+                    return Ok(None);
+                }
+                page_row_start += page_rows;
+            }
+            Page::DataPageV2 {
+                buf,
+                num_values,
+                encoding,
+                num_nulls,
+                def_levels_byte_len,
+                rep_levels_byte_len,
+                ..
+            } => {
+                if !matches!(
+                    encoding,
+                    Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
+                ) || (column_desc.max_def_level() > 0 && num_nulls != 0)
+                {
+                    return Ok(None);
+                }
+                let Some(dictionary_masks) = dictionary_masks.as_ref() else {
+                    return Ok(None);
+                };
+                let page_rows = num_values as usize;
+                let value_start = (rep_levels_byte_len + def_levels_byte_len) as usize;
+                if value_start > buf.len() {
+                    return Ok(None);
+                }
+                if !append_dictionary_mask_selected_runs_from_encoded(
+                    buf.slice(value_start..),
+                    page_rows,
+                    dictionary_masks,
+                    page_row_start,
+                    page_rows,
+                    selected_masks,
+                    collect_selected_masks,
+                    runs,
+                    builder,
+                )? {
+                    return Ok(None);
+                }
+                page_row_start += page_rows;
+            }
+        }
+    }
+    if dictionary_masks.is_none()
+        || page_row_start != records
+        || (collect_selected_masks && selected_masks.len() != builder.selected_rows())
+    {
+        return Ok(None);
+    }
+    Ok(Some(builder.selected_rows()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_dictionary_mask_selected_runs_from_encoded(
+    data: Bytes,
+    values: usize,
+    dictionary_masks: &[u8],
+    row_offset: usize,
+    rows: usize,
+    selected_masks: &mut Vec<u8>,
+    collect_selected_masks: bool,
+    runs: &mut Vec<(usize, usize)>,
+    builder: &mut SelectionRunsBuilder,
+) -> Result<bool> {
+    if data.is_empty() || values != rows {
+        return Ok(false);
+    }
+    let bit_width = data[0];
+    if bit_width > 32 {
+        return Ok(false);
+    }
+    let data = data.slice(1..);
+    let mut pos = 0usize;
+    let mut row = 0usize;
+    let mut decoded = 0usize;
+    let mut block = DictionaryIdBlock::new();
+    while decoded < values && row < rows {
+        let Some(header) = read_hybrid_varint(&data, &mut pos)? else {
+            return Ok(false);
+        };
+        if header & 1 == 0 {
+            let len = ((header >> 1) as usize)
+                .min(values - decoded)
+                .min(rows - row);
+            let bytes = usize::from(bit_width).div_ceil(8);
+            if pos + bytes > data.len() {
+                return Ok(false);
+            }
+            let mut id = 0u32;
+            for index in 0..bytes {
+                id |= u32::from(data[pos + index]) << (index * 8);
+            }
+            pos += bytes;
+            let mask = *dictionary_masks
+                .get(id as usize)
+                .ok_or_else(invalid_dictionary_id_error)?;
+            if mask != 0 {
+                if collect_selected_masks {
+                    selected_masks.extend(std::iter::repeat_n(mask, len));
+                }
+                builder.push_run(runs, row_offset + row, len);
+            }
+            row += len;
+            decoded += len;
+            continue;
+        }
+
+        let groups = (header >> 1) as usize;
+        let count = groups
+            .saturating_mul(8)
+            .min(values - decoded)
+            .min(rows - row);
+        let bytes = groups
+            .saturating_mul(8)
+            .saturating_mul(usize::from(bit_width))
+            .div_ceil(8);
+        if pos + bytes > data.len() {
+            return Ok(false);
+        }
+        let mut bitpacked_reader =
+            BitpackedDictionaryIdBlockReader::new(&data, pos, pos + bytes, bit_width);
+        let mut local = 0usize;
+        while local < count {
+            let block_len = DICTIONARY_ID_BLOCK.min(count - local);
+            bitpacked_reader.decode_block(block_len, &mut block)?;
+            let mut selected_start = None;
+            let mut selected_len = 0usize;
+            for (lane, id) in block.as_slice().iter().copied().enumerate() {
+                let mask = *dictionary_masks
+                    .get(id as usize)
+                    .ok_or_else(invalid_dictionary_id_error)?;
+                if mask != 0 {
+                    if collect_selected_masks {
+                        selected_masks.push(mask);
+                    }
+                    if selected_start.is_none() {
+                        selected_start = Some(row_offset + row + lane);
+                        selected_len = 1;
+                    } else {
+                        selected_len += 1;
+                    }
+                } else if let Some(start) = selected_start.take() {
+                    builder.push_run(runs, start, selected_len);
+                    selected_len = 0;
+                }
+            }
+            if let Some(start) = selected_start {
+                builder.push_run(runs, start, selected_len);
+            }
+            row += block_len;
+            decoded += block_len;
+            local += block_len;
+        }
+        pos += bytes;
+    }
+    if decoded != values || row != rows {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_dictionary_selected_direct_primitive_values_for_row_group(
+    row_group: &dyn parquet::file::reader::RowGroupReader,
+    column: usize,
+    column_type: DirectPrimitiveColumnType,
+    records: usize,
+    selected_runs: &[(usize, usize)],
+    selected_rows: usize,
+    metrics: &mut DirectPrimitiveColumnScanMetrics,
+) -> Result<Option<DirectPrimitiveColumnValues>> {
+    let column_desc = row_group.metadata().schema_descr().column(column);
+    if column_desc.max_rep_level() != 0
+        || column_desc.max_def_level() > 1
+        || !direct_primitive_page_column_type_matches(column_desc.physical_type(), column_type)
+    {
+        return Ok(None);
+    }
+    let mut page_reader = row_group.get_column_page_reader(column)?;
+    let mut dictionary = None;
+    let mut output = DirectPrimitiveColumnValues::new(column_type, selected_rows);
+    let mut selected_ids = Vec::<i32>::new();
+    let mut page_row_start = 0usize;
+    let mut run_cursor = 0usize;
+    let mut page_rows_hint = None;
+    let mut predecode_page_pruning_candidate = None;
+    let adaptive_block_candidate = direct_adaptive_selected_dictionary_decode_enabled()
+        && should_use_blocked_selected_dictionary_decode(
+            records,
+            selected_rows,
+            selected_runs.len(),
+        );
+    loop {
+        let use_predecode_page_pruning = if !direct_predecode_selected_page_pruning_enabled() {
+            false
+        } else if let Some(candidate) = predecode_page_pruning_candidate {
+            candidate
+        } else if let Some(page_rows) = page_rows_hint {
+            let candidate = selected_runs_have_page_sized_gap(records, selected_runs, page_rows);
+            predecode_page_pruning_candidate = Some(candidate);
+            candidate
+        } else {
+            false
+        };
+        if use_predecode_page_pruning
+            && !skip_unselected_direct_primitive_pages(
+                page_reader.as_mut(),
+                selected_runs,
+                &mut run_cursor,
+                &mut page_row_start,
+                &mut page_rows_hint,
+                records,
+                metrics,
+            )?
+        {
+            break;
+        }
+        let Some(page) = page_reader.get_next_page()? else {
+            break;
+        };
+        match page {
+            Page::DictionaryPage {
+                buf,
+                num_values,
+                encoding,
+                ..
+            } => {
+                if encoding != Encoding::PLAIN || dictionary.is_some() {
+                    return Ok(None);
+                }
+                let values = num_values as usize;
+                let Some(raw_dictionary) =
+                    DirectPrimitiveDictionary::from_plain(buf, values, column_type)
+                else {
+                    return Ok(None);
+                };
+                dictionary = Some(raw_dictionary);
+            }
+            Page::DataPage {
+                buf,
+                num_values,
+                encoding,
+                def_level_encoding,
+                ..
+            } => {
+                let page_rows = num_values as usize;
+                page_rows_hint = Some(page_rows);
+                let page_row_end = page_row_start + page_rows;
+                advance_run_cursor(selected_runs, &mut run_cursor, page_row_start);
+                if !runs_overlap_from(selected_runs, run_cursor, page_row_start, page_row_end) {
+                    page_row_start = page_row_end;
+                    continue;
+                }
+                let mut value_start = 0usize;
+                if column_desc.max_def_level() > 0 {
+                    if def_level_encoding != Encoding::RLE {
+                        return Ok(None);
+                    }
+                    let (bytes_read, level_data) = parse_v1_rle_level_data(buf.slice(0..))?;
+                    value_start = bytes_read;
+                    if !plain_page_all_present(level_data, column_desc.max_def_level(), page_rows)?
+                    {
+                        return Ok(None);
+                    }
+                }
+                if !append_selected_direct_primitive_page_values(
+                    buf,
+                    value_start,
+                    encoding,
+                    dictionary.as_ref(),
+                    &selected_runs[run_cursor..],
+                    page_row_start,
+                    page_rows,
+                    adaptive_block_candidate,
+                    &mut selected_ids,
+                    &mut output,
+                    metrics,
+                )? {
+                    return Ok(None);
+                }
+                page_row_start = page_row_end;
+            }
+            Page::DataPageV2 {
+                buf,
+                num_values,
+                encoding,
+                num_nulls,
+                def_levels_byte_len,
+                rep_levels_byte_len,
+                ..
+            } => {
+                let page_rows = num_values as usize;
+                page_rows_hint = Some(page_rows);
+                let page_row_end = page_row_start + page_rows;
+                advance_run_cursor(selected_runs, &mut run_cursor, page_row_start);
+                if !runs_overlap_from(selected_runs, run_cursor, page_row_start, page_row_end) {
+                    page_row_start = page_row_end;
+                    continue;
+                }
+                if column_desc.max_def_level() > 0 && num_nulls != 0 {
+                    return Ok(None);
+                }
+                let value_start = (rep_levels_byte_len + def_levels_byte_len) as usize;
+                if value_start > buf.len() {
+                    return Ok(None);
+                }
+                if !append_selected_direct_primitive_page_values(
+                    buf,
+                    value_start,
+                    encoding,
+                    dictionary.as_ref(),
+                    &selected_runs[run_cursor..],
+                    page_row_start,
+                    page_rows,
+                    adaptive_block_candidate,
+                    &mut selected_ids,
+                    &mut output,
+                    metrics,
+                )? {
+                    return Ok(None);
+                }
+                page_row_start = page_row_end;
+            }
+        }
+    }
+    if page_row_start != records || output.value_count() != selected_rows {
+        return Ok(None);
+    }
+    Ok(Some(output))
+}
+
+fn skip_unselected_direct_primitive_pages(
+    page_reader: &mut dyn PageReader,
+    selected_runs: &[(usize, usize)],
+    run_cursor: &mut usize,
+    page_row_start: &mut usize,
+    page_rows_hint: &mut Option<usize>,
+    records: usize,
+    metrics: &mut DirectPrimitiveColumnScanMetrics,
+) -> Result<bool> {
+    loop {
+        let Some(predicted_page_rows) = *page_rows_hint else {
+            return Ok(true);
+        };
+        if let Some(predicted_page_end) = page_row_start.checked_add(predicted_page_rows)
+            && predicted_page_end <= records
+        {
+            advance_run_cursor(selected_runs, run_cursor, *page_row_start);
+            if runs_overlap_from(
+                selected_runs,
+                *run_cursor,
+                *page_row_start,
+                predicted_page_end,
+            ) {
+                return Ok(true);
+            }
+        }
+        let Some(metadata) = page_reader.peek_next_page()? else {
+            return Ok(false);
+        };
+        if metadata.is_dict {
+            return Ok(true);
+        }
+        let Some(page_rows) = direct_primitive_page_rows(&metadata) else {
+            return Ok(true);
+        };
+        let Some(page_row_end) = page_row_start.checked_add(page_rows) else {
+            return Ok(true);
+        };
+        if page_row_end > records {
+            return Ok(true);
+        }
+        advance_run_cursor(selected_runs, run_cursor, *page_row_start);
+        if runs_overlap_from(selected_runs, *run_cursor, *page_row_start, page_row_end) {
+            return Ok(true);
+        }
+        page_reader.skip_next_page()?;
+        metrics.add_selected_page_skip(page_rows);
+        *page_rows_hint = Some(page_rows);
+        *page_row_start = page_row_end;
+    }
+}
+
+fn direct_primitive_page_rows(metadata: &PageMetadata) -> Option<usize> {
+    (!metadata.is_dict)
+        .then(|| metadata.num_rows.or(metadata.num_levels))
+        .flatten()
+}
+
+fn selected_runs_have_page_sized_gap(
+    records: usize,
+    selected_runs: &[(usize, usize)],
+    page_rows: usize,
+) -> bool {
+    if page_rows == 0 {
+        return false;
+    }
+    let mut selected_end = 0usize;
+    for &(start, len) in selected_runs {
+        if start.saturating_sub(selected_end) >= page_rows {
+            return true;
+        }
+        selected_end = selected_end.max(start.saturating_add(len));
+    }
+    records.saturating_sub(selected_end) >= page_rows
+}
+
+#[cfg(test)]
+mod selected_page_skip_tests {
+    use std::collections::VecDeque;
+
+    use super::*;
+
+    struct MetadataOnlyPageReader {
+        pages: VecDeque<PageMetadata>,
+        skipped: usize,
+    }
+
+    impl Iterator for MetadataOnlyPageReader {
+        type Item = ParquetResult<Page>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.get_next_page().transpose()
+        }
+    }
+
+    impl PageReader for MetadataOnlyPageReader {
+        fn get_next_page(&mut self) -> ParquetResult<Option<Page>> {
+            panic!("metadata-only page reader cannot materialize pages")
+        }
+
+        fn peek_next_page(&mut self) -> ParquetResult<Option<PageMetadata>> {
+            Ok(self.pages.front().cloned())
+        }
+
+        fn skip_next_page(&mut self) -> ParquetResult<()> {
+            self.pages.pop_front();
+            self.skipped += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn skips_v1_pages_before_the_next_selected_run() {
+        let mut reader = MetadataOnlyPageReader {
+            pages: VecDeque::from([
+                PageMetadata {
+                    num_rows: None,
+                    num_levels: Some(10),
+                    is_dict: false,
+                },
+                PageMetadata {
+                    num_rows: Some(10),
+                    num_levels: Some(10),
+                    is_dict: false,
+                },
+            ]),
+            skipped: 0,
+        };
+        let mut run_cursor = 0;
+        let mut page_row_start = 0;
+        let mut page_rows_hint = Some(10);
+        let mut metrics = DirectPrimitiveColumnScanMetrics::default();
+
+        assert!(
+            skip_unselected_direct_primitive_pages(
+                &mut reader,
+                &[(15, 2)],
+                &mut run_cursor,
+                &mut page_row_start,
+                &mut page_rows_hint,
+                20,
+                &mut metrics,
+            )
+            .expect("selected page pruning")
+        );
+
+        assert_eq!(reader.skipped, 1);
+        assert_eq!(reader.pages.len(), 1);
+        assert_eq!(page_row_start, 10);
+        assert_eq!(metrics.selected_page_skip_pages, 1);
+        assert_eq!(metrics.selected_page_skip_rows, 10);
+    }
+
+    #[test]
+    fn skips_all_pages_when_no_selection_overlaps() {
+        let mut reader = MetadataOnlyPageReader {
+            pages: VecDeque::from([
+                PageMetadata {
+                    num_rows: Some(8),
+                    num_levels: Some(8),
+                    is_dict: false,
+                },
+                PageMetadata {
+                    num_rows: Some(12),
+                    num_levels: Some(12),
+                    is_dict: false,
+                },
+            ]),
+            skipped: 0,
+        };
+        let mut run_cursor = 0;
+        let mut page_row_start = 0;
+        let mut page_rows_hint = Some(8);
+        let mut metrics = DirectPrimitiveColumnScanMetrics::default();
+
+        assert!(
+            !skip_unselected_direct_primitive_pages(
+                &mut reader,
+                &[],
+                &mut run_cursor,
+                &mut page_row_start,
+                &mut page_rows_hint,
+                20,
+                &mut metrics,
+            )
+            .expect("empty selected page pruning")
+        );
+
+        assert_eq!(reader.skipped, 2);
+        assert_eq!(page_row_start, 20);
+        assert_eq!(metrics.selected_page_skip_pages, 2);
+        assert_eq!(metrics.selected_page_skip_rows, 20);
+    }
+
+    #[test]
+    fn enables_predecode_pruning_only_for_page_sized_selection_gaps() {
+        assert!(!selected_runs_have_page_sized_gap(
+            32,
+            &[(0, 2), (7, 2), (14, 2), (21, 2), (28, 2)],
+            8,
+        ));
+        assert!(selected_runs_have_page_sized_gap(
+            32,
+            &[(0, 2), (18, 2), (30, 2)],
+            8,
+        ));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_selected_direct_primitive_page_values(
+    buf: Bytes,
+    value_start: usize,
+    encoding: Encoding,
+    dictionary: Option<&DirectPrimitiveDictionary>,
+    selected_runs: &[(usize, usize)],
+    page_row_start: usize,
+    page_rows: usize,
+    adaptive_block_candidate: bool,
+    selected_ids: &mut Vec<i32>,
+    output: &mut DirectPrimitiveColumnValues,
+    metrics: &mut DirectPrimitiveColumnScanMetrics,
+) -> Result<bool> {
+    if encoding == Encoding::PLAIN {
+        match output {
+            DirectPrimitiveColumnValues::I32(output) => compact_plain_i32_page_selected_ranges(
+                buf,
+                value_start,
+                page_row_start,
+                page_rows,
+                selected_runs,
+                output,
+                metrics,
+            ),
+            DirectPrimitiveColumnValues::I64(output) => compact_plain_i64_page_selected_ranges(
+                buf,
+                value_start,
+                page_row_start,
+                page_rows,
+                selected_runs,
+                output,
+                metrics,
+            ),
+        }?;
+        return Ok(true);
+    }
+    if !matches!(
+        encoding,
+        Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
+    ) {
+        return Ok(false);
+    }
+    let Some(dictionary) = dictionary else {
+        return Ok(false);
+    };
+    selected_ids.clear();
+    let selected_stats = adaptive_block_candidate
+        .then(|| selected_page_run_stats(selected_runs, page_row_start, page_rows));
+    if selected_stats.is_some_and(|stats| {
+        should_use_blocked_selected_dictionary_decode(page_rows, stats.rows, stats.runs)
+    }) {
+        if !decode_dictionary_indices_selected_ranges_blocked(
+            buf.slice(value_start..),
+            page_rows,
+            dictionary.value_count(),
+            selected_runs,
+            page_row_start,
+            page_rows,
+            selected_ids,
+        )? {
+            return Ok(false);
+        }
+        metrics.selected_dictionary_block_pages =
+            metrics.selected_dictionary_block_pages.saturating_add(1);
+        metrics.selected_dictionary_block_rows = metrics
+            .selected_dictionary_block_rows
+            .saturating_add(page_rows);
+    } else {
+        decode_dictionary_indices_selected_ranges(
+            buf.slice(value_start..),
+            page_rows,
+            dictionary.value_count(),
+            selected_runs,
+            page_row_start,
+            page_rows,
+            selected_ids,
+        )?;
+        metrics.selected_dictionary_range_pages =
+            metrics.selected_dictionary_range_pages.saturating_add(1);
+    }
+    if selected_stats.is_some_and(|stats| selected_ids.len() != stats.rows) {
+        return Ok(false);
+    }
+    metrics.add_selected_read(selected_ids.len());
+    if !dictionary.append_selected_values(selected_ids, output)? {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn append_dictionary_id_selected_runs_from_encoded(
     data: Bytes,
     values: usize,
@@ -5556,13 +5286,38 @@ fn append_dictionary_id_selected_runs_non_null_from_encoded_fast(
     runs: &mut Vec<(usize, usize)>,
     builder: &mut SelectionRunsBuilder,
 ) -> Result<()> {
+    let selected_matcher = DictionaryIdMatcher::from_selected(selected_dictionary_ids);
+    append_dictionary_id_selected_runs_non_null_from_encoded_fast_with_matcher(
+        data,
+        bit_width,
+        values,
+        dictionary_len,
+        &selected_matcher,
+        row_offset,
+        rows,
+        runs,
+        builder,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_dictionary_id_selected_runs_non_null_from_encoded_fast_with_matcher(
+    data: Bytes,
+    bit_width: u8,
+    values: usize,
+    dictionary_len: usize,
+    selected_matcher: &DictionaryIdMatcher,
+    row_offset: usize,
+    rows: usize,
+    runs: &mut Vec<(usize, usize)>,
+    builder: &mut SelectionRunsBuilder,
+) -> Result<()> {
     let mut pos = 0usize;
     let mut row = 0usize;
     let mut decoded = 0usize;
     let mut run_start = None;
     let mut run_len = 0usize;
     let mut block = DictionaryIdBlock::new();
-    let selected_matcher = DictionaryIdMatcher::from_selected(selected_dictionary_ids);
     while decoded < values && row < rows {
         let Some(header) = read_hybrid_varint(&data, &mut pos)? else {
             return Ok(());
@@ -5618,7 +5373,7 @@ fn append_dictionary_id_selected_runs_non_null_from_encoded_fast(
                 let mask = if let Some(mask) = bitpacked_reader.decode_selected_mask_block(
                     block_len,
                     dictionary_len,
-                    &selected_matcher,
+                    selected_matcher,
                 )? {
                     mask
                 } else {
@@ -5626,7 +5381,7 @@ fn append_dictionary_id_selected_runs_non_null_from_encoded_fast(
                     let Some(mask) = dictionary_id_block_selected_mask_bitset(
                         &block,
                         dictionary_len,
-                        &selected_matcher,
+                        selected_matcher,
                     ) else {
                         return Ok(());
                     };
@@ -5693,44 +5448,77 @@ enum DictionaryIdMatcher {
     BitSet { words: Vec<u64> },
 }
 
+struct DictionaryIdMatcherBuilder {
+    len: usize,
+    selected_count: usize,
+    ranges: Vec<(u32, u32)>,
+    open_range: Option<u32>,
+    ranges_exceeded: bool,
+    words: Vec<u64>,
+}
+
+impl DictionaryIdMatcherBuilder {
+    fn with_capacity(len: usize) -> Self {
+        Self {
+            len: 0,
+            selected_count: 0,
+            ranges: Vec::with_capacity(8),
+            open_range: None,
+            ranges_exceeded: false,
+            words: vec![0; len.div_ceil(64)],
+        }
+    }
+
+    fn push(&mut self, selected: bool) {
+        let index = self.len;
+        self.len += 1;
+        if selected {
+            self.selected_count += 1;
+            self.words[index / 64] |= 1u64 << (index % 64);
+            if !self.ranges_exceeded && self.open_range.is_none() {
+                self.open_range = Some(index as u32);
+            }
+        } else {
+            self.close_range(index as u32);
+        }
+    }
+
+    fn close_range(&mut self, end: u32) {
+        let Some(start) = self.open_range.take() else {
+            return;
+        };
+        if self.ranges.len() < 8 {
+            self.ranges.push((start, end));
+        } else {
+            self.ranges.clear();
+            self.ranges_exceeded = true;
+        }
+    }
+
+    fn finish(mut self) -> DictionaryIdMatcher {
+        self.close_range(self.len as u32);
+        if self.selected_count == 0 {
+            DictionaryIdMatcher::None
+        } else if self.selected_count == self.len {
+            DictionaryIdMatcher::All { len: self.len }
+        } else if !self.ranges_exceeded {
+            DictionaryIdMatcher::Ranges {
+                len: self.len,
+                ranges: self.ranges,
+            }
+        } else {
+            DictionaryIdMatcher::BitSet { words: self.words }
+        }
+    }
+}
+
 impl DictionaryIdMatcher {
     fn from_selected(selected: &[bool]) -> Self {
-        let mut selected_count = 0usize;
-        let mut ranges = Vec::<(u32, u32)>::new();
-        let mut index = 0usize;
-        while index < selected.len() {
-            if !selected[index] {
-                index += 1;
-                continue;
-            }
-            let start = index;
-            while index < selected.len() && selected[index] {
-                index += 1;
-            }
-            selected_count += index - start;
-            ranges.push((start as u32, index as u32));
+        let mut builder = DictionaryIdMatcherBuilder::with_capacity(selected.len());
+        for selected in selected.iter().copied() {
+            builder.push(selected);
         }
-        if selected_count == 0 {
-            return Self::None;
-        }
-        if selected_count == selected.len() {
-            return Self::All {
-                len: selected.len(),
-            };
-        }
-        if ranges.len() <= 8 {
-            return Self::Ranges {
-                len: selected.len(),
-                ranges,
-            };
-        }
-        let mut words = vec![0u64; selected.len().div_ceil(64)];
-        for (index, is_selected) in selected.iter().copied().enumerate() {
-            if is_selected {
-                words[index / 64] |= 1u64 << (index % 64);
-            }
-        }
-        Self::BitSet { words }
+        builder.finish()
     }
 
     fn contains(&self, id: u32) -> bool {
@@ -5797,12 +5585,17 @@ impl DictionaryIdMatcher {
                 Ok(mask)
             }
             Self::BitSet { words } => {
+                for id in ids.iter().copied() {
+                    if id as usize >= dictionary_len {
+                        return Err(invalid_dictionary_id_error());
+                    }
+                }
+                if let Some(mask) = dictionary_id_bitset_mask_simd(words, ids, base_lane) {
+                    return Ok(mask);
+                }
                 let mut mask = 0u64;
                 for (offset, id) in ids.iter().copied().enumerate() {
                     let index = id as usize;
-                    if index >= dictionary_len {
-                        return Err(invalid_dictionary_id_error());
-                    }
                     if words
                         .get(index / 64)
                         .map(|word| (word >> (index % 64)) & 1 != 0)
@@ -5815,6 +5608,17 @@ impl DictionaryIdMatcher {
             }
         }
     }
+}
+
+fn dictionary_id_bitset_mask_simd(words: &[u64], ids: &[u32], base_lane: usize) -> Option<u64> {
+    #[cfg(target_arch = "x86_64")]
+    if ids.len() >= 4 && ids.len().is_multiple_of(4) && dictionary_id_avx2_enabled() {
+        unsafe {
+            return Some(dictionary_id_bitset_mask_avx2(words, ids, base_lane));
+        }
+    }
+    let _ = (words, ids, base_lane);
+    None
 }
 
 fn dictionary_id_block_selected_mask_bitset(
@@ -5899,6 +5703,7 @@ struct BitpackedDictionaryIdBlockReader<'a> {
     pos: usize,
     end: usize,
     bit_width: u8,
+    decode_17bit_avx2: bool,
     bit_buffer: u64,
     buffered_bits: u8,
 }
@@ -5910,6 +5715,7 @@ impl<'a> BitpackedDictionaryIdBlockReader<'a> {
             pos,
             end,
             bit_width,
+            decode_17bit_avx2: bit_width == 17 && dictionary_id_avx2_enabled(),
             bit_buffer: 0,
             buffered_bits: 0,
         }
@@ -6013,6 +5819,33 @@ impl<'a> BitpackedDictionaryIdBlockReader<'a> {
                 }
                 Ok(Some(mask))
             }
+            12 => {
+                if len % 2 != 0 {
+                    return Ok(None);
+                }
+                let required = len / 2 * 3;
+                if self.pos + required > self.end {
+                    return Err(DodamError::Parquet(ParquetError::General(
+                        "not enough data to decode parquet dictionary id block".to_string(),
+                    )));
+                }
+                let mut mask = 0u64;
+                let mut lane = 0usize;
+                let end = self.pos + required;
+                while self.pos < end {
+                    let b0 = u32::from(self.data[self.pos]);
+                    let b1 = u32::from(self.data[self.pos + 1]);
+                    let b2 = u32::from(self.data[self.pos + 2]);
+                    let ids = [
+                        (b0 | ((b1 & 0x0f) << 8)) & 0x0fff,
+                        ((b1 >> 4) | (b2 << 4)) & 0x0fff,
+                    ];
+                    mask |= matcher.mask_ids(&ids, lane, dictionary_len)?;
+                    lane += ids.len();
+                    self.pos += 3;
+                }
+                Ok(Some(mask))
+            }
             14 => {
                 if len % 4 != 0 {
                     return Ok(None);
@@ -6043,6 +5876,27 @@ impl<'a> BitpackedDictionaryIdBlockReader<'a> {
                     mask |= matcher.mask_ids(&ids, lane, dictionary_len)?;
                     lane += ids.len();
                     self.pos += 7;
+                }
+                Ok(Some(mask))
+            }
+            17 => {
+                if len % 8 != 0 {
+                    return Ok(None);
+                }
+                let required = len / 8 * 17;
+                if self.pos + required > self.end {
+                    return Err(DodamError::Parquet(ParquetError::General(
+                        "not enough data to decode parquet dictionary id block".to_string(),
+                    )));
+                }
+                let mut mask = 0u64;
+                let mut lane = 0usize;
+                let end = self.pos + required;
+                while self.pos < end {
+                    let ids = self.decode_17bit_group(self.pos);
+                    mask |= matcher.mask_ids(&ids, lane, dictionary_len)?;
+                    lane += ids.len();
+                    self.pos += 17;
                 }
                 Ok(Some(mask))
             }
@@ -6118,6 +5972,16 @@ impl<'a> BitpackedDictionaryIdBlockReader<'a> {
                     self.pos += 7;
                 }
             }
+            12 => {
+                while output.len + 2 <= len && self.pos + 3 <= self.end {
+                    let b0 = u32::from(self.data[self.pos]);
+                    let b1 = u32::from(self.data[self.pos + 1]);
+                    let b2 = u32::from(self.data[self.pos + 2]);
+                    output.push((b0 | ((b1 & 0x0f) << 8)) & 0x0fff);
+                    output.push(((b1 >> 4) | (b2 << 4)) & 0x0fff);
+                    self.pos += 3;
+                }
+            }
             14 => {
                 while output.len + 4 <= len && self.pos + 7 <= self.end {
                     let word = u64::from(self.data[self.pos])
@@ -6132,6 +5996,36 @@ impl<'a> BitpackedDictionaryIdBlockReader<'a> {
                     output.push(((word >> 28) & 0x3fff) as u32);
                     output.push(((word >> 42) & 0x3fff) as u32);
                     self.pos += 7;
+                }
+            }
+            15 => {
+                let width = usize::from(self.bit_width);
+                let mask = (1_u32 << self.bit_width) - 1;
+                while output.len + 8 <= len && self.pos + width <= self.end {
+                    let group_start = self.pos;
+                    let group_end = group_start + width;
+                    for lane in 0..8 {
+                        let bit_offset = lane * width;
+                        let byte_offset = group_start + bit_offset / 8;
+                        let shift = bit_offset % 8;
+                        let mut word = 0_u32;
+                        for byte in 0..4 {
+                            if byte_offset + byte < group_end {
+                                word |= u32::from(self.data[byte_offset + byte]) << (byte * 8);
+                            }
+                        }
+                        output.push((word >> shift) & mask);
+                    }
+                    self.pos = group_end;
+                }
+            }
+            17 => {
+                while output.len + 8 <= len && self.pos + 17 <= self.end {
+                    let ids = self.decode_17bit_group(self.pos);
+                    for id in ids {
+                        output.push(id);
+                    }
+                    self.pos += 17;
                 }
             }
             16 => {
@@ -6156,6 +6050,154 @@ impl<'a> BitpackedDictionaryIdBlockReader<'a> {
             }
             _ => {}
         }
+    }
+
+    fn decode_17bit_group(&self, pos: usize) -> [u32; 8] {
+        if self.decode_17bit_avx2 && pos + 18 <= self.end {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                return decode_17bit_eight_avx2(self.data.as_ptr().add(pos));
+            }
+        }
+        decode_17bit_eight_swar(&self.data[pos..pos + 17])
+    }
+}
+
+fn decode_17bit_eight_swar(data: &[u8]) -> [u32; 8] {
+    debug_assert!(data.len() >= 17);
+    let low = u128::from_le_bytes(data[..16].try_into().expect("17-bit group has 16 bytes"));
+    let mask = 0x1ffff_u32;
+    [
+        (low as u32) & mask,
+        ((low >> 17) as u32) & mask,
+        ((low >> 34) as u32) & mask,
+        ((low >> 51) as u32) & mask,
+        ((low >> 68) as u32) & mask,
+        ((low >> 85) as u32) & mask,
+        ((low >> 102) as u32) & mask,
+        (((low >> 119) as u32) | (u32::from(data[16]) << 9)) & mask,
+    ]
+}
+
+fn dictionary_id_avx2_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let disabled = std::env::var("DODAM_DISABLE_DICTIONARY_ID_SIMD")
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
+        !disabled && dictionary_id_avx2_available()
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn dictionary_id_avx2_available() -> bool {
+    std::is_x86_feature_detected!("avx2")
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn dictionary_id_avx2_available() -> bool {
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dictionary_id_bitset_mask_avx2(words: &[u64], ids: &[u32], base_lane: usize) -> u64 {
+    use std::arch::x86_64::{
+        __m128i, _mm_loadu_si128, _mm256_and_si256, _mm256_castsi256_pd, _mm256_cmpeq_epi64,
+        _mm256_cvtepu32_epi64, _mm256_i64gather_epi64, _mm256_movemask_pd, _mm256_set1_epi64x,
+        _mm256_srli_epi64, _mm256_srlv_epi64,
+    };
+
+    let mut mask = 0u64;
+    unsafe {
+        let one = _mm256_set1_epi64x(1);
+        let lane_mask = _mm256_set1_epi64x(63);
+        for offset in (0..ids.len()).step_by(4) {
+            let ids32 = _mm_loadu_si128(ids.as_ptr().add(offset).cast::<__m128i>());
+            let ids64 = _mm256_cvtepu32_epi64(ids32);
+            let word_indices = _mm256_srli_epi64::<6>(ids64);
+            let shifts = _mm256_and_si256(ids64, lane_mask);
+            let selected_words =
+                _mm256_i64gather_epi64(words.as_ptr().cast::<i64>(), word_indices, 8);
+            let selected_bits = _mm256_and_si256(_mm256_srlv_epi64(selected_words, shifts), one);
+            let selected = _mm256_cmpeq_epi64(selected_bits, one);
+            let selected = _mm256_movemask_pd(_mm256_castsi256_pd(selected)) as u64;
+            mask |= selected << (base_lane + offset);
+        }
+    }
+    mask
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn decode_17bit_eight_avx2(data: *const u8) -> [u32; 8] {
+    use std::arch::x86_64::{
+        __m256i, _mm256_and_si256, _mm256_i32gather_epi32, _mm256_set1_epi32, _mm256_setr_epi32,
+        _mm256_srlv_epi32, _mm256_storeu_si256,
+    };
+
+    let mut output = [0_u32; 8];
+    unsafe {
+        let offsets = _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14);
+        let shifts = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+        let words = _mm256_i32gather_epi32(data.cast::<i32>(), offsets, 1);
+        let ids = _mm256_and_si256(_mm256_srlv_epi32(words, shifts), _mm256_set1_epi32(0x1ffff));
+        _mm256_storeu_si256(output.as_mut_ptr().cast::<__m256i>(), ids);
+    }
+    output
+}
+
+#[cfg(test)]
+mod dictionary_id_17bit_tests {
+    use super::*;
+
+    fn encode_17bit_eight(ids: [u32; 8]) -> Vec<u8> {
+        let mut encoded = vec![0_u8; 17];
+        for (lane, id) in ids.into_iter().enumerate() {
+            assert!(id <= 0x1ffff);
+            for bit in 0..17 {
+                if id & (1 << bit) != 0 {
+                    let output_bit = lane * 17 + bit;
+                    encoded[output_bit / 8] |= 1 << (output_bit % 8);
+                }
+            }
+        }
+        encoded
+    }
+
+    #[test]
+    fn decodes_17bit_dictionary_ids_with_swar_and_avx2() {
+        let expected = [0, 1, 0x1ffff, 0x15555, 0x0aaaa, 65536, 99999, 17];
+        let mut encoded = encode_17bit_eight(expected);
+        assert_eq!(decode_17bit_eight_swar(&encoded), expected);
+
+        if dictionary_id_avx2_available() {
+            encoded.push(0);
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                assert_eq!(decode_17bit_eight_avx2(encoded.as_ptr()), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn builds_17bit_selected_mask_without_materializing_ids() {
+        let ids = [3, 17, 42, 65536, 99999, 100000, 131070, 131071];
+        let encoded = Bytes::from(encode_17bit_eight(ids));
+        let mut selected = vec![false; 131072];
+        for id in [
+            17_usize, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 65536, 100000, 131071,
+        ] {
+            selected[id] = true;
+        }
+        let matcher = DictionaryIdMatcher::from_selected(&selected);
+        assert!(matches!(&matcher, DictionaryIdMatcher::BitSet { .. }));
+        let mut reader = BitpackedDictionaryIdBlockReader::new(&encoded, 0, encoded.len(), 17);
+        let mask = reader
+            .decode_selected_mask_block(8, selected.len(), &matcher)
+            .expect("17-bit selected mask decode")
+            .expect("17-bit direct selected mask path");
+        assert_eq!(mask, 0b1010_1010);
+        assert_eq!(reader.pos, 17);
     }
 }
 
@@ -6403,6 +6445,189 @@ fn decode_dictionary_indices_selected_ranges(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectedPageRunStats {
+    rows: usize,
+    runs: usize,
+}
+
+fn selected_page_run_stats(
+    selected_runs: &[(usize, usize)],
+    page_row_start: usize,
+    page_rows: usize,
+) -> SelectedPageRunStats {
+    let page_row_end = page_row_start.saturating_add(page_rows);
+    let mut rows = 0usize;
+    let mut runs = 0usize;
+    for &(run_start, run_len) in selected_runs {
+        if run_start >= page_row_end {
+            break;
+        }
+        let run_end = run_start.saturating_add(run_len);
+        let start = run_start.max(page_row_start);
+        let end = run_end.min(page_row_end);
+        if start < end {
+            rows = rows.saturating_add(end - start);
+            runs += 1;
+        }
+    }
+    SelectedPageRunStats { rows, runs }
+}
+
+fn should_use_blocked_selected_dictionary_decode(
+    page_rows: usize,
+    selected_rows: usize,
+    selected_runs: usize,
+) -> bool {
+    selected_rows.saturating_add(selected_runs.saturating_mul(8)) >= page_rows
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_dictionary_indices_selected_ranges_blocked(
+    data: Bytes,
+    values: usize,
+    dictionary_len: usize,
+    selected_runs: &[(usize, usize)],
+    page_row_start: usize,
+    page_rows: usize,
+    output: &mut Vec<i32>,
+) -> Result<bool> {
+    if data.is_empty() || values != page_rows {
+        return Ok(false);
+    }
+    let bit_width = data[0];
+    if bit_width > 32 {
+        return Ok(false);
+    }
+    let data = data.slice(1..);
+    let mut pos = 0usize;
+    let mut decoded = 0usize;
+    let mut selected_run_cursor = 0usize;
+    let mut block = DictionaryIdBlock::new();
+    while decoded < values {
+        let Some(header) = read_hybrid_varint(&data, &mut pos)? else {
+            return Ok(false);
+        };
+        if header & 1 == 0 {
+            let run_len = ((header >> 1) as usize).min(values - decoded);
+            let bytes = usize::from(bit_width).div_ceil(8);
+            if pos + bytes > data.len() {
+                return Ok(false);
+            }
+            let mut id = 0u32;
+            for index in 0..bytes {
+                id |= u32::from(data[pos + index]) << (index * 8);
+            }
+            pos += bytes;
+            let id = checked_dictionary_id_i32(id, dictionary_len)?;
+            append_repeated_id_for_selected_ranges(
+                id,
+                page_row_start + decoded,
+                run_len,
+                selected_runs,
+                &mut selected_run_cursor,
+                output,
+            );
+            decoded += run_len;
+            continue;
+        }
+
+        let groups = (header >> 1) as usize;
+        let count = groups.saturating_mul(8).min(values - decoded);
+        let bytes = groups
+            .saturating_mul(8)
+            .saturating_mul(usize::from(bit_width))
+            .div_ceil(8);
+        if pos + bytes > data.len() {
+            return Ok(false);
+        }
+        let mut reader = BitpackedDictionaryIdBlockReader::new(&data, pos, pos + bytes, bit_width);
+        let mut local = 0usize;
+        while local < count {
+            let block_len = DICTIONARY_ID_BLOCK.min(count - local);
+            reader.decode_block(block_len, &mut block)?;
+            append_id_block_for_selected_ranges(
+                block.as_slice(),
+                dictionary_len,
+                page_row_start + decoded + local,
+                selected_runs,
+                &mut selected_run_cursor,
+                output,
+            )?;
+            local += block_len;
+        }
+        pos += bytes;
+        decoded += count;
+    }
+    Ok(decoded == values)
+}
+
+fn append_repeated_id_for_selected_ranges(
+    id: i32,
+    block_row_start: usize,
+    block_rows: usize,
+    selected_runs: &[(usize, usize)],
+    selected_run_cursor: &mut usize,
+    output: &mut Vec<i32>,
+) {
+    let block_row_end = block_row_start.saturating_add(block_rows);
+    advance_run_cursor(selected_runs, selected_run_cursor, block_row_start);
+    let mut cursor = *selected_run_cursor;
+    while let Some(&(run_start, run_len)) = selected_runs.get(cursor) {
+        if run_start >= block_row_end {
+            break;
+        }
+        let run_end = run_start.saturating_add(run_len);
+        let start = run_start.max(block_row_start);
+        let end = run_end.min(block_row_end);
+        if start < end {
+            output.extend(std::iter::repeat_n(id, end - start));
+        }
+        if run_end > block_row_end {
+            break;
+        }
+        cursor += 1;
+    }
+    *selected_run_cursor = cursor;
+}
+
+fn append_id_block_for_selected_ranges(
+    ids: &[u32],
+    dictionary_len: usize,
+    block_row_start: usize,
+    selected_runs: &[(usize, usize)],
+    selected_run_cursor: &mut usize,
+    output: &mut Vec<i32>,
+) -> Result<()> {
+    let block_row_end = block_row_start.saturating_add(ids.len());
+    advance_run_cursor(selected_runs, selected_run_cursor, block_row_start);
+    let mut cursor = *selected_run_cursor;
+    while let Some(&(run_start, run_len)) = selected_runs.get(cursor) {
+        if run_start >= block_row_end {
+            break;
+        }
+        let run_end = run_start.saturating_add(run_len);
+        let start = run_start.max(block_row_start);
+        let end = run_end.min(block_row_end);
+        for &id in &ids[start - block_row_start..end - block_row_start] {
+            output.push(checked_dictionary_id_i32(id, dictionary_len)?);
+        }
+        if run_end > block_row_end {
+            break;
+        }
+        cursor += 1;
+    }
+    *selected_run_cursor = cursor;
+    Ok(())
+}
+
+fn checked_dictionary_id_i32(id: u32, dictionary_len: usize) -> Result<i32> {
+    if id as usize >= dictionary_len {
+        return Err(invalid_dictionary_id_error());
+    }
+    i32::try_from(id).map_err(|_| invalid_dictionary_id_error())
 }
 
 fn decode_dictionary_indices_selected_nullable_ranges(
@@ -7470,72 +7695,6 @@ where
     Ok(Some(metrics))
 }
 
-fn scan_parquet_i64_byte_array_payload_columns_reader<R, F>(
-    reader: SerializedFileReader<R>,
-    batch_size: usize,
-    row_groups: &[usize],
-    columns: [&str; 2],
-    mut consume: F,
-) -> Result<Option<DirectColumnScanMetrics>>
-where
-    R: ChunkReader + 'static,
-    F: for<'a> FnMut(&[i64], &mut DirectByteArrayPayloadReader<'a>) -> Result<Option<()>>,
-{
-    let Some(column_indices) = parquet_column_indices_by_name(&reader, &columns) else {
-        return Ok(None);
-    };
-    let [key_column, payload_column] = <[usize; 2]>::try_from(column_indices).map_err(|_| {
-        DodamError::UnsupportedSql("direct parquet column index shape mismatch".to_string())
-    })?;
-    let mut metrics = DirectColumnScanMetrics {
-        row_groups: row_groups.len(),
-        ..DirectColumnScanMetrics::default()
-    };
-    for &row_group_index in row_groups {
-        let row_group = reader.get_row_group(row_group_index)?;
-        let mut key_reader = match row_group.get_column_reader(key_column)? {
-            ColumnReader::Int64ColumnReader(reader) => reader,
-            _ => return Ok(None),
-        };
-        let mut payload_reader = match row_group.get_column_reader(payload_column)? {
-            ColumnReader::ByteArrayColumnReader(reader) => reader,
-            _ => return Ok(None),
-        };
-        let mut key_values = Vec::<i64>::with_capacity(batch_size);
-        let mut key_def_levels = Vec::<i16>::with_capacity(batch_size);
-        loop {
-            key_values.clear();
-            key_def_levels.clear();
-            let read_started = Instant::now();
-            let (key_records, key_value_count, _key_levels) = key_reader.read_records(
-                batch_size,
-                Some(&mut key_def_levels),
-                None,
-                &mut key_values,
-            )?;
-            metrics.add_read_nanos(elapsed_nanos(read_started));
-            if key_records == 0 {
-                break;
-            }
-            if key_value_count != key_records {
-                return Ok(None);
-            }
-            metrics.batches += 1;
-            metrics.rows = metrics.rows.saturating_add(key_records);
-            let consume_started = Instant::now();
-            let mut payload = DirectByteArrayPayloadReader::new(&mut payload_reader);
-            if consume(&key_values, &mut payload)?.is_none() {
-                return Ok(None);
-            }
-            let payload_read_nanos = payload.take_read_nanos();
-            let consume_nanos = elapsed_nanos(consume_started);
-            metrics.add_read_nanos(payload_read_nanos);
-            metrics.add_consume_nanos(consume_nanos.saturating_sub(payload_read_nanos));
-        }
-    }
-    Ok(Some(metrics))
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn scan_parquet_primitive_columns_with_store<F>(
     path: &Path,
@@ -7552,6 +7711,1856 @@ where
     scan_parquet_primitive_columns_with_store_impl(
         path, batch_size, row_groups, columns, file_cache, store, false, consume,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scan_parquet_dictionary_date_range_selected_primitive_columns_with_store<F>(
+    path: &Path,
+    row_groups: &[usize],
+    predicate_column: &str,
+    start_days: i32,
+    end_days: i32,
+    payload_columns: &[DirectPrimitiveColumnSpec<'_>],
+    file_cache: Arc<ParquetFileCache>,
+    store: &dyn ObjectStore,
+    consume: F,
+) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
+where
+    F: for<'a> FnMut(&[RawColumnView<'a>]) -> Result<()>,
+{
+    if file_cache.enabled() {
+        let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
+        let reader = SerializedFileReader::new(reader)?;
+        return scan_parquet_dictionary_date_range_selected_primitive_columns_reader(
+            reader,
+            row_groups,
+            predicate_column,
+            start_days,
+            end_days,
+            payload_columns,
+            consume,
+        );
+    }
+    let file = store.open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    scan_parquet_dictionary_date_range_selected_primitive_columns_reader(
+        reader,
+        row_groups,
+        predicate_column,
+        start_days,
+        end_days,
+        payload_columns,
+        consume,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scan_parquet_i64_lookup_decimal_utf8_selected_primitive_columns_with_store<
+    Lookup,
+    Predicate,
+    Consume,
+>(
+    path: &Path,
+    row_groups: &[usize],
+    key_column: &str,
+    quantity_column: DirectPrimitiveColumnSpec<'_>,
+    first_utf8_column: &str,
+    second_utf8_column: &str,
+    payload_columns: &[DirectPrimitiveColumnSpec<'_>],
+    file_cache: Arc<ParquetFileCache>,
+    store: &dyn ObjectStore,
+    lookup: &Lookup,
+    predicate: &Predicate,
+    consume: Consume,
+) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
+where
+    Lookup: Fn(i64) -> Option<u8>,
+    Predicate: Fn(u8, i64, &[u8], &[u8]) -> bool,
+    Consume: for<'a> FnMut(&[RawColumnView<'a>]) -> Result<()>,
+{
+    if file_cache.enabled() {
+        let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
+        let reader = SerializedFileReader::new(reader)?;
+        return scan_parquet_i64_lookup_decimal_utf8_selected_primitive_columns_reader(
+            reader,
+            row_groups,
+            key_column,
+            quantity_column,
+            first_utf8_column,
+            second_utf8_column,
+            payload_columns,
+            lookup,
+            predicate,
+            consume,
+        );
+    }
+    let file = store.open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    scan_parquet_i64_lookup_decimal_utf8_selected_primitive_columns_reader(
+        reader,
+        row_groups,
+        key_column,
+        quantity_column,
+        first_utf8_column,
+        second_utf8_column,
+        payload_columns,
+        lookup,
+        predicate,
+        consume,
+    )
+}
+
+fn build_tagged_selection_runs<Tag, Predicate>(
+    source_runs: &[(usize, usize)],
+    source_value_count: usize,
+    output_runs: &mut Vec<(usize, usize)>,
+    output_builder: &mut SelectionRunsBuilder,
+    output_tags: &mut Vec<Tag>,
+    mut predicate: Predicate,
+) -> bool
+where
+    Tag: Copy,
+    Predicate: FnMut(usize) -> Option<Tag>,
+{
+    let mut value_offset = 0usize;
+    for &(source_start, source_len) in source_runs {
+        let source_end = source_start.saturating_add(source_len);
+        let mut row = source_start;
+        let mut selected_start = None;
+        let mut selected_len = 0usize;
+        while row < source_end {
+            let block_end = row.saturating_add(64).min(source_end);
+            while row < block_end {
+                if value_offset >= source_value_count {
+                    return false;
+                }
+                if let Some(tag) = predicate(value_offset) {
+                    output_tags.push(tag);
+                    if selected_start.is_none() {
+                        selected_start = Some(row);
+                        selected_len = 1;
+                    } else {
+                        selected_len += 1;
+                    }
+                } else if let Some(start) = selected_start.take() {
+                    output_builder.push_run(output_runs, start, selected_len);
+                    selected_len = 0;
+                }
+                value_offset += 1;
+                row += 1;
+            }
+        }
+        if let Some(start) = selected_start {
+            output_builder.push_run(output_runs, start, selected_len);
+        }
+    }
+    value_offset == source_value_count && output_tags.len() == output_builder.selected_rows()
+}
+
+#[cfg(test)]
+mod staged_selection_tests {
+    use super::*;
+
+    #[test]
+    fn preserves_physical_rows_and_tags_across_staged_selection() {
+        let source_runs = vec![(10, 4), (20, 3)];
+        let mut first_runs = Vec::new();
+        let mut first_builder = SelectionRunsBuilder::default();
+        let mut first_tags = Vec::new();
+        assert!(build_tagged_selection_runs(
+            &source_runs,
+            7,
+            &mut first_runs,
+            &mut first_builder,
+            &mut first_tags,
+            |offset| (offset % 2 == 0).then_some(100 + offset),
+        ));
+        assert_eq!(first_runs, vec![(10, 1), (12, 1), (20, 1), (22, 1)]);
+        assert_eq!(first_tags, vec![100, 102, 104, 106]);
+
+        let mut final_runs = Vec::new();
+        let mut final_builder = SelectionRunsBuilder::default();
+        let mut final_tags = Vec::new();
+        assert!(build_tagged_selection_runs(
+            &first_runs,
+            first_tags.len(),
+            &mut final_runs,
+            &mut final_builder,
+            &mut final_tags,
+            |offset| (offset != 1).then_some((first_tags[offset], offset)),
+        ));
+        assert_eq!(final_runs, vec![(10, 1), (20, 1), (22, 1)]);
+        assert_eq!(final_tags, vec![(100, 0), (104, 2), (106, 3)]);
+    }
+
+    #[test]
+    fn decodes_bitpacked_dictionary_tags_into_physical_runs() {
+        let encoded = Bytes::from_static(&[2, 3, 0xe4, 0xe4]);
+        let dictionary_tags = [None, Some(10), None, Some(30)];
+        let mut selected_tags = Vec::new();
+        let mut runs = Vec::new();
+        let mut builder = SelectionRunsBuilder::default();
+        assert!(
+            append_dictionary_tag_selected_runs_from_encoded(
+                encoded,
+                8,
+                &dictionary_tags,
+                100,
+                8,
+                &mut selected_tags,
+                &mut runs,
+                &mut builder,
+            )
+            .expect("bit-packed dictionary tag decode")
+        );
+        assert_eq!(selected_tags, vec![10, 30, 10, 30]);
+        assert_eq!(runs, vec![(101, 1), (103, 1), (105, 1), (107, 1)]);
+        assert_eq!(builder.selected_rows(), selected_tags.len());
+    }
+
+    #[test]
+    fn chooses_blocked_dictionary_decode_for_fragmented_pages() {
+        assert!(!should_use_blocked_selected_dictionary_decode(100, 4, 3));
+        assert!(should_use_blocked_selected_dictionary_decode(100, 20, 10));
+        assert!(should_use_blocked_selected_dictionary_decode(100, 100, 1));
+    }
+
+    #[test]
+    fn decodes_only_selected_ids_from_bitpacked_blocks() {
+        let encoded = Bytes::from_static(&[2, 3, 0xe4, 0xe4]);
+        let selected_runs = [(99, 2), (103, 2), (107, 2)];
+        assert_eq!(
+            selected_page_run_stats(&selected_runs, 100, 8),
+            SelectedPageRunStats { rows: 4, runs: 3 }
+        );
+        let mut selected_ids = Vec::new();
+        assert!(
+            decode_dictionary_indices_selected_ranges_blocked(
+                encoded,
+                8,
+                4,
+                &selected_runs,
+                100,
+                8,
+                &mut selected_ids,
+            )
+            .expect("blocked selected dictionary decode")
+        );
+        assert_eq!(selected_ids, vec![0, 3, 0, 3]);
+    }
+
+    #[test]
+    fn gathers_selected_values_from_raw_fixed_width_dictionary() {
+        let mut dictionary_bytes = Vec::new();
+        for value in [10_i64, 20, 30, 40] {
+            dictionary_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let dictionary = DirectPrimitiveDictionary::from_plain(
+            Bytes::from(dictionary_bytes),
+            4,
+            DirectPrimitiveColumnType::I64,
+        )
+        .expect("raw i64 dictionary");
+        let encoded = Bytes::from_static(&[2, 3, 0xe4, 0xe4]);
+        let selected_runs = [(101, 1), (103, 2), (107, 1)];
+        let mut selected_ids = Vec::new();
+        let mut output = DirectPrimitiveColumnValues::I64(Vec::new());
+        let mut metrics = DirectPrimitiveColumnScanMetrics::default();
+
+        assert!(
+            append_selected_direct_primitive_page_values(
+                encoded,
+                0,
+                Encoding::RLE_DICTIONARY,
+                Some(&dictionary),
+                &selected_runs,
+                100,
+                8,
+                false,
+                &mut selected_ids,
+                &mut output,
+                &mut metrics,
+            )
+            .expect("selected dictionary gather")
+        );
+        let DirectPrimitiveColumnValues::I64(output) = output else {
+            panic!("expected i64 output");
+        };
+        assert_eq!(output, vec![20, 40, 10, 40]);
+        assert_eq!(metrics.selected_read_calls, 1);
+        assert_eq!(metrics.selected_read_rows, 4);
+
+        let mut i32_dictionary_bytes = Vec::new();
+        for value in [100_i32, 200, 300, 400] {
+            i32_dictionary_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let i32_dictionary = DirectPrimitiveDictionary::from_plain(
+            Bytes::from(i32_dictionary_bytes),
+            4,
+            DirectPrimitiveColumnType::I32,
+        )
+        .expect("raw i32 dictionary");
+        let mut i32_output = DirectPrimitiveColumnValues::I32(Vec::new());
+        assert!(
+            i32_dictionary
+                .append_selected_values(&[1, 3, 0], &mut i32_output)
+                .expect("selected i32 dictionary gather")
+        );
+        let DirectPrimitiveColumnValues::I32(i32_output) = i32_output else {
+            panic!("expected i32 output");
+        };
+        assert_eq!(i32_output, vec![200, 400, 100]);
+        assert!(
+            DirectPrimitiveDictionary::from_plain(
+                Bytes::from(vec![0_u8; 7]),
+                1,
+                DirectPrimitiveColumnType::I64,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn intersects_rle_dictionary_ids_with_selected_runs() {
+        let encoded = Bytes::from_static(&[2, 16, 2]);
+        let selected_runs = [(101, 2), (106, 1)];
+        let mut selected_ids = Vec::new();
+        assert!(
+            decode_dictionary_indices_selected_ranges_blocked(
+                encoded,
+                8,
+                4,
+                &selected_runs,
+                100,
+                8,
+                &mut selected_ids,
+            )
+            .expect("blocked selected dictionary RLE decode")
+        );
+        assert_eq!(selected_ids, vec![2, 2, 2]);
+    }
+
+    #[test]
+    fn preserves_selected_runs_across_dictionary_id_blocks() {
+        let first_ids = (0_u32..64).collect::<Vec<_>>();
+        let second_ids = (64_u32..128).collect::<Vec<_>>();
+        let selected_runs = [(62, 4)];
+        let mut selected_run_cursor = 0usize;
+        let mut selected_ids = Vec::new();
+        append_id_block_for_selected_ranges(
+            &first_ids,
+            128,
+            0,
+            &selected_runs,
+            &mut selected_run_cursor,
+            &mut selected_ids,
+        )
+        .expect("first selected dictionary block");
+        append_id_block_for_selected_ranges(
+            &second_ids,
+            128,
+            64,
+            &selected_runs,
+            &mut selected_run_cursor,
+            &mut selected_ids,
+        )
+        .expect("second selected dictionary block");
+        assert_eq!(selected_ids, vec![62, 63, 64, 65]);
+        assert_eq!(selected_run_cursor, 1);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scan_parquet_i64_lookup_staged_two_i64_selected_primitive_columns_with_store<
+    FirstTag,
+    FinalTag,
+    Lookup,
+    FirstPredicate,
+    SecondPredicate,
+    Consume,
+>(
+    path: &Path,
+    row_groups: &[usize],
+    key_column: &str,
+    first_predicate_column: &str,
+    second_predicate_column: &str,
+    payload_columns: &[DirectPrimitiveColumnSpec<'_>],
+    max_candidate_ratio: (usize, usize),
+    file_cache: Arc<ParquetFileCache>,
+    store: &dyn ObjectStore,
+    lookup: &Lookup,
+    first_predicate: &FirstPredicate,
+    second_predicate: &SecondPredicate,
+    consume: Consume,
+) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
+where
+    FirstTag: Copy,
+    FinalTag: Copy,
+    Lookup: Fn(i64) -> bool,
+    FirstPredicate: Fn(i64) -> Option<FirstTag>,
+    SecondPredicate: Fn(FirstTag, i64) -> Option<FinalTag>,
+    Consume: for<'a> FnMut(&[FinalTag], &[RawColumnView<'a>]) -> Result<()>,
+{
+    if file_cache.enabled() {
+        let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
+        let reader = SerializedFileReader::new(reader)?;
+        return scan_parquet_i64_lookup_staged_two_i64_selected_primitive_columns_reader(
+            &reader,
+            row_groups,
+            key_column,
+            first_predicate_column,
+            second_predicate_column,
+            payload_columns,
+            max_candidate_ratio,
+            lookup,
+            first_predicate,
+            second_predicate,
+            consume,
+        );
+    }
+    let file = store.open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    scan_parquet_i64_lookup_staged_two_i64_selected_primitive_columns_reader(
+        &reader,
+        row_groups,
+        key_column,
+        first_predicate_column,
+        second_predicate_column,
+        payload_columns,
+        max_candidate_ratio,
+        lookup,
+        first_predicate,
+        second_predicate,
+        consume,
+    )
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn scan_parquet_i64_lookup_staged_two_i64_selected_primitive_columns_dynamic_with_store<
+    FirstTag,
+    FinalTag,
+    Lookup,
+    FirstPredicate,
+    SecondPredicate,
+    Consume,
+>(
+    path: &Path,
+    row_groups: &[usize],
+    workers: usize,
+    key_column: &str,
+    first_predicate_column: &str,
+    second_predicate_column: &str,
+    payload_columns: &[DirectPrimitiveColumnSpec<'_>],
+    max_candidate_ratio: (usize, usize),
+    file_cache: Arc<ParquetFileCache>,
+    store: &dyn ObjectStore,
+    lookup: &Lookup,
+    first_predicate: &FirstPredicate,
+    second_predicate: &SecondPredicate,
+    consume: &Consume,
+) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
+where
+    FirstTag: Copy + Send + Sync,
+    FinalTag: Copy + Send + Sync,
+    Lookup: Fn(i64) -> bool + Sync,
+    FirstPredicate: Fn(i64) -> Option<FirstTag> + Sync,
+    SecondPredicate: Fn(FirstTag, i64) -> Option<FinalTag> + Sync,
+    Consume: for<'a> Fn(&[FinalTag], &[RawColumnView<'a>]) -> Result<()> + Sync,
+{
+    if row_groups.is_empty() {
+        return Ok(Some(DirectPrimitiveColumnScanMetrics::default()));
+    }
+    let next_row_group = Arc::new(AtomicUsize::new(0));
+    let (sender, receiver) = mpsc::channel();
+    let workers = workers.min(row_groups.len()).max(1);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let sender = sender.clone();
+            let file_cache = file_cache.clone();
+            let next_row_group = next_row_group.clone();
+            scope.spawn(move || {
+                let result = (|| -> Result<Option<DirectPrimitiveColumnScanMetrics>> {
+                    if file_cache.enabled() {
+                    let chunk_reader = CachedParquetChunkReader::new(path, store, file_cache)?;
+                    let reader = SerializedFileReader::new(chunk_reader)?;
+                    scan_parquet_i64_lookup_staged_two_i64_selected_primitive_columns_dynamic_reader(
+                        &reader,
+                        row_groups,
+                        &next_row_group,
+                        key_column,
+                        first_predicate_column,
+                        second_predicate_column,
+                        payload_columns,
+                        max_candidate_ratio,
+                        lookup,
+                        first_predicate,
+                        second_predicate,
+                        consume,
+                    )
+                    } else {
+                    let file = store.open(path)?;
+                    let reader = SerializedFileReader::new(file)?;
+                    scan_parquet_i64_lookup_staged_two_i64_selected_primitive_columns_dynamic_reader(
+                        &reader,
+                        row_groups,
+                        &next_row_group,
+                        key_column,
+                        first_predicate_column,
+                        second_predicate_column,
+                        payload_columns,
+                        max_candidate_ratio,
+                        lookup,
+                        first_predicate,
+                        second_predicate,
+                        consume,
+                    )
+                    }
+                })();
+                let _ = sender.send(result);
+            });
+        }
+    });
+    drop(sender);
+
+    let mut metrics = DirectPrimitiveColumnScanMetrics::default();
+    for result in receiver {
+        let Some(worker_metrics) = result? else {
+            return Ok(None);
+        };
+        metrics.merge_from(worker_metrics);
+    }
+    Ok(Some(metrics))
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
+fn scan_parquet_i64_lookup_staged_two_i64_selected_primitive_columns_dynamic_reader<
+    R,
+    FirstTag,
+    FinalTag,
+    Lookup,
+    FirstPredicate,
+    SecondPredicate,
+    Consume,
+>(
+    reader: &SerializedFileReader<R>,
+    row_groups: &[usize],
+    next_row_group: &AtomicUsize,
+    key_column: &str,
+    first_predicate_column: &str,
+    second_predicate_column: &str,
+    payload_columns: &[DirectPrimitiveColumnSpec<'_>],
+    max_candidate_ratio: (usize, usize),
+    lookup: &Lookup,
+    first_predicate: &FirstPredicate,
+    second_predicate: &SecondPredicate,
+    consume: &Consume,
+) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
+where
+    R: ChunkReader + 'static,
+    FirstTag: Copy,
+    FinalTag: Copy,
+    Lookup: Fn(i64) -> bool,
+    FirstPredicate: Fn(i64) -> Option<FirstTag>,
+    SecondPredicate: Fn(FirstTag, i64) -> Option<FinalTag>,
+    Consume: for<'a> Fn(&[FinalTag], &[RawColumnView<'a>]) -> Result<()>,
+{
+    let mut metrics = DirectPrimitiveColumnScanMetrics::default();
+    loop {
+        let index = next_row_group.fetch_add(1, Ordering::Relaxed);
+        let Some(&row_group) = row_groups.get(index) else {
+            break;
+        };
+        let row_group_metrics =
+            scan_parquet_i64_lookup_staged_two_i64_selected_primitive_columns_reader(
+                &reader,
+                std::slice::from_ref(&row_group),
+                key_column,
+                first_predicate_column,
+                second_predicate_column,
+                payload_columns,
+                max_candidate_ratio,
+                lookup,
+                first_predicate,
+                second_predicate,
+                |tags, columns| consume(tags, columns),
+            )?;
+        let Some(row_group_metrics) = row_group_metrics else {
+            return Ok(None);
+        };
+        metrics.merge_from(row_group_metrics);
+    }
+    Ok(Some(metrics))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_parquet_i64_lookup_staged_two_i64_selected_primitive_columns_reader<
+    R,
+    FirstTag,
+    FinalTag,
+    Lookup,
+    FirstPredicate,
+    SecondPredicate,
+    Consume,
+>(
+    reader: &SerializedFileReader<R>,
+    row_groups: &[usize],
+    key_column: &str,
+    first_predicate_column: &str,
+    second_predicate_column: &str,
+    payload_columns: &[DirectPrimitiveColumnSpec<'_>],
+    max_candidate_ratio: (usize, usize),
+    lookup: &Lookup,
+    first_predicate: &FirstPredicate,
+    second_predicate: &SecondPredicate,
+    mut consume: Consume,
+) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
+where
+    R: ChunkReader + 'static,
+    FirstTag: Copy,
+    FinalTag: Copy,
+    Lookup: Fn(i64) -> bool,
+    FirstPredicate: Fn(i64) -> Option<FirstTag>,
+    SecondPredicate: Fn(FirstTag, i64) -> Option<FinalTag>,
+    Consume: for<'a> FnMut(&[FinalTag], &[RawColumnView<'a>]) -> Result<()>,
+{
+    let (max_candidate_numerator, max_candidate_denominator) = max_candidate_ratio;
+    if payload_columns.is_empty()
+        || max_candidate_denominator == 0
+        || max_candidate_numerator > max_candidate_denominator
+    {
+        return Ok(None);
+    }
+    let mut names = Vec::with_capacity(payload_columns.len() + 3);
+    names.extend([key_column, first_predicate_column, second_predicate_column]);
+    names.extend(payload_columns.iter().map(|column| column.name));
+    let Some(column_indices) = parquet_column_indices_by_name(&reader, &names) else {
+        return Ok(None);
+    };
+    let key_index = column_indices[0];
+    let first_predicate_index = column_indices[1];
+    let second_predicate_index = column_indices[2];
+    let payload_indices = &column_indices[3..];
+    let schema = reader.metadata().file_metadata().schema_descr();
+    let key_desc = schema.column(key_index);
+    let first_predicate_desc = schema.column(first_predicate_index);
+    let second_predicate_desc = schema.column(second_predicate_index);
+    if key_desc.physical_type() != ParquetPhysicalType::INT64
+        || key_desc.max_rep_level() != 0
+        || key_desc.max_def_level() > 1
+        || [first_predicate_desc, second_predicate_desc]
+            .iter()
+            .any(|desc| {
+                desc.physical_type() != ParquetPhysicalType::INT64
+                    || desc.max_rep_level() != 0
+                    || desc.max_def_level() > 1
+            })
+        || payload_columns
+            .iter()
+            .zip(payload_indices.iter())
+            .any(|(column, &index)| {
+                let desc = schema.column(index);
+                desc.max_rep_level() != 0
+                    || desc.max_def_level() > 1
+                    || !direct_primitive_page_column_type_matches(
+                        desc.physical_type(),
+                        column.column_type,
+                    )
+            })
+    {
+        return Ok(None);
+    }
+
+    let lookup_mask = |value| lookup(value).then_some(1_u8);
+    let collect_candidate_masks = i64_lookup_candidate_masks_enabled();
+    let mut metrics = DirectPrimitiveColumnScanMetrics {
+        reader_kind: "dictionary-lookup-staged-two-i64-selected-page",
+        row_groups: row_groups.len(),
+        column_read_nanos: vec![0; payload_columns.len() + 3],
+        ..DirectPrimitiveColumnScanMetrics::default()
+    };
+    for &row_group_index in row_groups {
+        let row_group = reader.get_row_group(row_group_index)?;
+        let row_count = usize::try_from(row_group.metadata().num_rows()).map_err(|_| {
+            DodamError::UnsupportedSql("row group row count out of range".to_string())
+        })?;
+        let read_started = Instant::now();
+        let predicate_started = Instant::now();
+        let key_started = Instant::now();
+        let mut candidate_runs = Vec::new();
+        let mut candidate_builder = SelectionRunsBuilder::default();
+        let mut candidate_masks = Vec::new();
+        let Some(candidate_rows) = build_i64_dictionary_lookup_selected_runs_for_row_group(
+            &*row_group,
+            key_index,
+            row_count,
+            &lookup_mask,
+            &mut candidate_masks,
+            collect_candidate_masks,
+            &mut candidate_runs,
+            &mut candidate_builder,
+        )?
+        else {
+            return Ok(None);
+        };
+        metrics.add_column_read_nanos(0, elapsed_nanos(key_started));
+        metrics.rows = metrics.rows.saturating_add(row_count);
+        if (collect_candidate_masks && candidate_masks.len() != candidate_rows)
+            || candidate_rows.saturating_mul(max_candidate_denominator)
+                > row_count.saturating_mul(max_candidate_numerator)
+        {
+            return Ok(None);
+        }
+        if candidate_rows == 0 {
+            metrics.add_selected_predicate_nanos(elapsed_nanos(predicate_started));
+            metrics.add_read_nanos(elapsed_nanos(read_started));
+            continue;
+        }
+
+        let first_started = Instant::now();
+        let Some(first_values) = read_dictionary_selected_direct_primitive_values_for_row_group(
+            &*row_group,
+            first_predicate_index,
+            DirectPrimitiveColumnType::I64,
+            row_count,
+            &candidate_runs,
+            candidate_rows,
+            &mut metrics,
+        )?
+        else {
+            return Ok(None);
+        };
+        metrics.add_column_read_nanos(1, elapsed_nanos(first_started));
+        let DirectPrimitiveColumnValues::I64(first_values) = first_values else {
+            return Ok(None);
+        };
+        if first_values.len() != candidate_rows {
+            return Ok(None);
+        }
+
+        let mut first_selected_runs = Vec::new();
+        let mut first_selected_builder = SelectionRunsBuilder::default();
+        let mut first_selected_tags = Vec::new();
+        if !build_tagged_selection_runs(
+            &candidate_runs,
+            candidate_rows,
+            &mut first_selected_runs,
+            &mut first_selected_builder,
+            &mut first_selected_tags,
+            |offset| first_predicate(first_values[offset]),
+        ) {
+            return Ok(None);
+        }
+        let first_selected_rows = first_selected_builder.selected_rows();
+        if first_selected_rows == 0 {
+            metrics.add_selected_predicate_nanos(elapsed_nanos(predicate_started));
+            metrics.add_read_nanos(elapsed_nanos(read_started));
+            continue;
+        }
+
+        let second_started = Instant::now();
+        let Some(second_values) = read_dictionary_selected_direct_primitive_values_for_row_group(
+            &*row_group,
+            second_predicate_index,
+            DirectPrimitiveColumnType::I64,
+            row_count,
+            &first_selected_runs,
+            first_selected_rows,
+            &mut metrics,
+        )?
+        else {
+            return Ok(None);
+        };
+        metrics.add_column_read_nanos(2, elapsed_nanos(second_started));
+        let DirectPrimitiveColumnValues::I64(second_values) = second_values else {
+            return Ok(None);
+        };
+        if second_values.len() != first_selected_rows {
+            return Ok(None);
+        }
+
+        let mut selected_runs = Vec::new();
+        let mut selected_builder = SelectionRunsBuilder::default();
+        let mut selected_tags = Vec::new();
+        if !build_tagged_selection_runs(
+            &first_selected_runs,
+            first_selected_rows,
+            &mut selected_runs,
+            &mut selected_builder,
+            &mut selected_tags,
+            |offset| second_predicate(first_selected_tags[offset], second_values[offset]),
+        ) {
+            return Ok(None);
+        }
+        let selected_rows = selected_builder.selected_rows();
+        if selected_tags.len() != selected_rows {
+            return Ok(None);
+        }
+        metrics.selected_rows = metrics.selected_rows.saturating_add(selected_rows);
+        metrics.selected_runs = metrics.selected_runs.saturating_add(selected_runs.len());
+        metrics.add_selected_predicate_nanos(elapsed_nanos(predicate_started));
+        if selected_rows == 0 {
+            metrics.add_read_nanos(elapsed_nanos(read_started));
+            continue;
+        }
+
+        let payload_started = Instant::now();
+        let mut payload_values = Vec::with_capacity(payload_columns.len());
+        for (payload_offset, (column, &column_index)) in payload_columns
+            .iter()
+            .zip(payload_indices.iter())
+            .enumerate()
+        {
+            let column_started = Instant::now();
+            let Some(values) = read_dictionary_selected_direct_primitive_values_for_row_group(
+                &*row_group,
+                column_index,
+                column.column_type,
+                row_count,
+                &selected_runs,
+                selected_rows,
+                &mut metrics,
+            )?
+            else {
+                return Ok(None);
+            };
+            metrics.add_column_read_nanos(payload_offset + 3, elapsed_nanos(column_started));
+            payload_values.push(values);
+        }
+        metrics.add_selected_payload_nanos(elapsed_nanos(payload_started));
+        metrics.add_read_nanos(elapsed_nanos(read_started));
+        metrics.batches += 1;
+        metrics.selected_payload_batches += 1;
+        let consume_started = Instant::now();
+        let required_columns = vec![true; payload_columns.len()];
+        let def_levels = vec![Vec::new(); payload_columns.len()];
+        let views = direct_primitive_views(
+            &payload_values,
+            payload_columns,
+            &required_columns,
+            &def_levels,
+        );
+        consume(&selected_tags, &views)?;
+        metrics.add_consume_nanos(elapsed_nanos(consume_started));
+    }
+    Ok(Some(metrics))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn collect_parquet_i64_by_utf8_dictionary_predicate_with_store<Predicate>(
+    path: &Path,
+    row_groups: &[usize],
+    key_column: &str,
+    predicate_column: &str,
+    max_selected_ratio: (usize, usize),
+    file_cache: Arc<ParquetFileCache>,
+    store: &dyn ObjectStore,
+    predicate: &Predicate,
+) -> Result<Option<(Vec<i64>, DirectPrimitiveColumnScanMetrics)>>
+where
+    Predicate: Fn(&[u8]) -> bool,
+{
+    if file_cache.enabled() {
+        let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
+        let reader = SerializedFileReader::new(reader)?;
+        return collect_parquet_i64_by_utf8_dictionary_predicate_reader(
+            reader,
+            row_groups,
+            key_column,
+            predicate_column,
+            max_selected_ratio,
+            predicate,
+        );
+    }
+    let file = store.open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    collect_parquet_i64_by_utf8_dictionary_predicate_reader(
+        reader,
+        row_groups,
+        key_column,
+        predicate_column,
+        max_selected_ratio,
+        predicate,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_parquet_i64_by_utf8_dictionary_predicate_reader<R, Predicate>(
+    reader: SerializedFileReader<R>,
+    row_groups: &[usize],
+    key_column: &str,
+    predicate_column: &str,
+    max_selected_ratio: (usize, usize),
+    predicate: &Predicate,
+) -> Result<Option<(Vec<i64>, DirectPrimitiveColumnScanMetrics)>>
+where
+    R: ChunkReader + 'static,
+    Predicate: Fn(&[u8]) -> bool,
+{
+    let (max_selected_numerator, max_selected_denominator) = max_selected_ratio;
+    if max_selected_denominator == 0 || max_selected_numerator > max_selected_denominator {
+        return Ok(None);
+    }
+    let names = [key_column, predicate_column];
+    let Some(column_indices) = parquet_column_indices_by_name(&reader, &names) else {
+        return Ok(None);
+    };
+    let [key_index, predicate_index] = column_indices.as_slice() else {
+        return Ok(None);
+    };
+    let schema = reader.metadata().file_metadata().schema_descr();
+    let key_desc = schema.column(*key_index);
+    let predicate_desc = schema.column(*predicate_index);
+    if key_desc.physical_type() != ParquetPhysicalType::INT64
+        || predicate_desc.physical_type() != ParquetPhysicalType::BYTE_ARRAY
+        || [&key_desc, &predicate_desc]
+            .iter()
+            .any(|desc| desc.max_rep_level() != 0 || desc.max_def_level() > 1)
+    {
+        return Ok(None);
+    }
+
+    let mut output = Vec::new();
+    let mut metrics = DirectPrimitiveColumnScanMetrics {
+        reader_kind: "utf8-dictionary-selected-i64",
+        row_groups: row_groups.len(),
+        column_read_nanos: vec![0; names.len()],
+        ..DirectPrimitiveColumnScanMetrics::default()
+    };
+    for &row_group_index in row_groups {
+        let row_group = reader.get_row_group(row_group_index)?;
+        let row_count = usize::try_from(row_group.metadata().num_rows()).map_err(|_| {
+            DodamError::UnsupportedSql("row group row count out of range".to_string())
+        })?;
+        let read_started = Instant::now();
+
+        let predicate_started = Instant::now();
+        let mut selected_runs = Vec::new();
+        let mut selected_builder = SelectionRunsBuilder::default();
+        let Some(selected_rows) =
+            build_byte_array_dictionary_predicate_selected_runs_for_row_group(
+                &*row_group,
+                *predicate_index,
+                row_count,
+                predicate,
+                &mut selected_runs,
+                &mut selected_builder,
+            )?
+        else {
+            return Ok(None);
+        };
+        let predicate_nanos = elapsed_nanos(predicate_started);
+        metrics.add_column_read_nanos(1, predicate_nanos);
+        metrics.add_selected_predicate_nanos(predicate_nanos);
+        metrics.rows = metrics.rows.saturating_add(row_count);
+        metrics.selected_rows = metrics.selected_rows.saturating_add(selected_rows);
+        metrics.selected_runs = metrics.selected_runs.saturating_add(selected_runs.len());
+        if selected_rows.saturating_mul(max_selected_denominator)
+            > row_count.saturating_mul(max_selected_numerator)
+        {
+            return Ok(None);
+        }
+        if selected_rows == 0 {
+            metrics.add_read_nanos(elapsed_nanos(read_started));
+            continue;
+        }
+
+        let payload_started = Instant::now();
+        let Some(key_values) = read_dictionary_selected_direct_primitive_values_for_row_group(
+            &*row_group,
+            *key_index,
+            DirectPrimitiveColumnType::I64,
+            row_count,
+            &selected_runs,
+            selected_rows,
+            &mut metrics,
+        )?
+        else {
+            return Ok(None);
+        };
+        let payload_nanos = elapsed_nanos(payload_started);
+        metrics.add_column_read_nanos(0, payload_nanos);
+        metrics.add_selected_payload_nanos(payload_nanos);
+        metrics.add_read_nanos(elapsed_nanos(read_started));
+        let DirectPrimitiveColumnValues::I64(key_values) = key_values else {
+            return Ok(None);
+        };
+        if key_values.len() != selected_rows {
+            return Ok(None);
+        }
+        let consume_started = Instant::now();
+        output.extend(key_values);
+        metrics.add_consume_nanos(elapsed_nanos(consume_started));
+        metrics.batches += 1;
+        metrics.selected_payload_batches += 1;
+    }
+    Ok(Some((output, metrics)))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn collect_parquet_i32_predicate_i64_lookup_selected_i64_mapped_with_store<
+    Tag,
+    Predicate,
+    Lookup,
+>(
+    path: &Path,
+    row_groups: &[usize],
+    predicate_column: DirectPrimitiveColumnSpec<'_>,
+    key_column: &str,
+    payload_column: &str,
+    max_candidate_ratio: (usize, usize),
+    file_cache: Arc<ParquetFileCache>,
+    store: &dyn ObjectStore,
+    predicate: &Predicate,
+    lookup: &Lookup,
+) -> Result<Option<(Vec<(i64, Tag)>, DirectPrimitiveColumnScanMetrics)>>
+where
+    Tag: Copy,
+    Predicate: Fn(i32) -> Option<Tag>,
+    Lookup: Fn(i64) -> bool,
+{
+    if file_cache.enabled() {
+        let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
+        let reader = SerializedFileReader::new(reader)?;
+        return collect_parquet_i32_predicate_i64_lookup_selected_i64_mapped_reader(
+            reader,
+            row_groups,
+            predicate_column,
+            key_column,
+            payload_column,
+            max_candidate_ratio,
+            predicate,
+            lookup,
+        );
+    }
+    let file = store.open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    collect_parquet_i32_predicate_i64_lookup_selected_i64_mapped_reader(
+        reader,
+        row_groups,
+        predicate_column,
+        key_column,
+        payload_column,
+        max_candidate_ratio,
+        predicate,
+        lookup,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_parquet_i32_predicate_i64_lookup_selected_i64_mapped_reader<R, Tag, Predicate, Lookup>(
+    reader: SerializedFileReader<R>,
+    row_groups: &[usize],
+    predicate_column: DirectPrimitiveColumnSpec<'_>,
+    key_column: &str,
+    payload_column: &str,
+    max_candidate_ratio: (usize, usize),
+    predicate: &Predicate,
+    lookup: &Lookup,
+) -> Result<Option<(Vec<(i64, Tag)>, DirectPrimitiveColumnScanMetrics)>>
+where
+    R: ChunkReader + 'static,
+    Tag: Copy,
+    Predicate: Fn(i32) -> Option<Tag>,
+    Lookup: Fn(i64) -> bool,
+{
+    let (max_candidate_numerator, max_candidate_denominator) = max_candidate_ratio;
+    if max_candidate_denominator == 0
+        || max_candidate_numerator > max_candidate_denominator
+        || !matches!(
+            predicate_column.column_type,
+            DirectPrimitiveColumnType::I32 | DirectPrimitiveColumnType::Date32
+        )
+    {
+        return Ok(None);
+    }
+    let names = [predicate_column.name, key_column, payload_column];
+    let Some(column_indices) = parquet_column_indices_by_name(&reader, &names) else {
+        return Ok(None);
+    };
+    let [predicate_index, key_index, payload_index] = column_indices.as_slice() else {
+        return Ok(None);
+    };
+    let schema = reader.metadata().file_metadata().schema_descr();
+    let predicate_desc = schema.column(*predicate_index);
+    let key_desc = schema.column(*key_index);
+    let payload_desc = schema.column(*payload_index);
+    if key_desc.physical_type() != ParquetPhysicalType::INT64
+        || payload_desc.physical_type() != ParquetPhysicalType::INT64
+        || [&predicate_desc, &key_desc, &payload_desc]
+            .iter()
+            .any(|desc| desc.max_rep_level() != 0 || desc.max_def_level() > 1)
+        || !direct_primitive_page_column_type_matches(
+            predicate_desc.physical_type(),
+            predicate_column.column_type,
+        )
+    {
+        return Ok(None);
+    }
+
+    let mut output = Vec::new();
+    let mut metrics = DirectPrimitiveColumnScanMetrics {
+        reader_kind: "i32-dictionary-predicate-i64-lookup-selected-i64-map",
+        row_groups: row_groups.len(),
+        column_read_nanos: vec![0; names.len()],
+        ..DirectPrimitiveColumnScanMetrics::default()
+    };
+    for &row_group_index in row_groups {
+        let row_group = reader.get_row_group(row_group_index)?;
+        let row_count = usize::try_from(row_group.metadata().num_rows()).map_err(|_| {
+            DodamError::UnsupportedSql("row group row count out of range".to_string())
+        })?;
+        let read_started = Instant::now();
+        let predicate_started = Instant::now();
+
+        let first_started = Instant::now();
+        let mut candidate_runs = Vec::new();
+        let mut candidate_builder = SelectionRunsBuilder::default();
+        let mut candidate_tags = Vec::new();
+        let Some(candidate_rows) = build_i32_dictionary_tagged_selected_runs_for_row_group(
+            &*row_group,
+            *predicate_index,
+            row_count,
+            predicate,
+            &mut candidate_tags,
+            &mut candidate_runs,
+            &mut candidate_builder,
+        )?
+        else {
+            return Ok(None);
+        };
+        metrics.add_column_read_nanos(0, elapsed_nanos(first_started));
+        metrics.rows = metrics.rows.saturating_add(row_count);
+        if candidate_tags.len() != candidate_rows
+            || candidate_rows.saturating_mul(max_candidate_denominator)
+                > row_count.saturating_mul(max_candidate_numerator)
+        {
+            return Ok(None);
+        }
+        if candidate_rows == 0 {
+            metrics.add_selected_predicate_nanos(elapsed_nanos(predicate_started));
+            metrics.add_read_nanos(elapsed_nanos(read_started));
+            continue;
+        }
+
+        let key_started = Instant::now();
+        let Some(key_values) = read_dictionary_selected_direct_primitive_values_for_row_group(
+            &*row_group,
+            *key_index,
+            DirectPrimitiveColumnType::I64,
+            row_count,
+            &candidate_runs,
+            candidate_rows,
+            &mut metrics,
+        )?
+        else {
+            return Ok(None);
+        };
+        metrics.add_column_read_nanos(1, elapsed_nanos(key_started));
+        let DirectPrimitiveColumnValues::I64(key_values) = key_values else {
+            return Ok(None);
+        };
+        if key_values.len() != candidate_rows {
+            return Ok(None);
+        }
+
+        let mut selected_runs = Vec::new();
+        let mut selected_builder = SelectionRunsBuilder::default();
+        let mut selected_tags = Vec::new();
+        if !build_tagged_selection_runs(
+            &candidate_runs,
+            candidate_rows,
+            &mut selected_runs,
+            &mut selected_builder,
+            &mut selected_tags,
+            |offset| lookup(key_values[offset]).then_some(candidate_tags[offset]),
+        ) {
+            return Ok(None);
+        }
+        let selected_rows = selected_builder.selected_rows();
+        if selected_tags.len() != selected_rows {
+            return Ok(None);
+        }
+        metrics.selected_rows = metrics.selected_rows.saturating_add(selected_rows);
+        metrics.selected_runs = metrics.selected_runs.saturating_add(selected_runs.len());
+        metrics.add_selected_predicate_nanos(elapsed_nanos(predicate_started));
+        if selected_rows == 0 {
+            metrics.add_read_nanos(elapsed_nanos(read_started));
+            continue;
+        }
+
+        let payload_started = Instant::now();
+        let Some(payload_values) = read_dictionary_selected_direct_primitive_values_for_row_group(
+            &*row_group,
+            *payload_index,
+            DirectPrimitiveColumnType::I64,
+            row_count,
+            &selected_runs,
+            selected_rows,
+            &mut metrics,
+        )?
+        else {
+            return Ok(None);
+        };
+        let payload_nanos = elapsed_nanos(payload_started);
+        metrics.add_column_read_nanos(2, payload_nanos);
+        metrics.add_selected_payload_nanos(payload_nanos);
+        metrics.add_read_nanos(elapsed_nanos(read_started));
+        let DirectPrimitiveColumnValues::I64(payload_values) = payload_values else {
+            return Ok(None);
+        };
+        if payload_values.len() != selected_rows {
+            return Ok(None);
+        }
+        let consume_started = Instant::now();
+        output.extend(payload_values.into_iter().zip(selected_tags));
+        metrics.add_consume_nanos(elapsed_nanos(consume_started));
+        metrics.batches += 1;
+        metrics.selected_payload_batches += 1;
+    }
+    Ok(Some((output, metrics)))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn collect_parquet_i64_two_utf8_i64_mapped_with_store<V, Map>(
+    path: &Path,
+    batch_size: usize,
+    row_groups: &[usize],
+    key_column: &str,
+    first_utf8_column: &str,
+    second_utf8_column: &str,
+    numeric_column: &str,
+    file_cache: Arc<ParquetFileCache>,
+    store: &dyn ObjectStore,
+    map: &Map,
+) -> Result<Option<(Vec<(i64, V)>, DirectPrimitiveColumnScanMetrics)>>
+where
+    V: Copy,
+    Map: Fn(&[u8], &[u8], i64) -> Option<V>,
+{
+    if file_cache.enabled() {
+        let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
+        let reader = SerializedFileReader::new(reader)?;
+        return collect_parquet_i64_two_utf8_i64_mapped_reader(
+            reader,
+            batch_size,
+            row_groups,
+            key_column,
+            first_utf8_column,
+            second_utf8_column,
+            numeric_column,
+            map,
+        );
+    }
+    let file = store.open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    collect_parquet_i64_two_utf8_i64_mapped_reader(
+        reader,
+        batch_size,
+        row_groups,
+        key_column,
+        first_utf8_column,
+        second_utf8_column,
+        numeric_column,
+        map,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_parquet_i64_two_utf8_i64_mapped_reader<R, V, Map>(
+    reader: SerializedFileReader<R>,
+    batch_size: usize,
+    row_groups: &[usize],
+    key_column: &str,
+    first_utf8_column: &str,
+    second_utf8_column: &str,
+    numeric_column: &str,
+    map: &Map,
+) -> Result<Option<(Vec<(i64, V)>, DirectPrimitiveColumnScanMetrics)>>
+where
+    R: ChunkReader + 'static,
+    V: Copy,
+    Map: Fn(&[u8], &[u8], i64) -> Option<V>,
+{
+    let names = [
+        key_column,
+        first_utf8_column,
+        second_utf8_column,
+        numeric_column,
+    ];
+    let Some(column_indices) = parquet_column_indices_by_name(&reader, &names) else {
+        return Ok(None);
+    };
+    let [
+        key_index,
+        first_utf8_index,
+        second_utf8_index,
+        numeric_index,
+    ] = column_indices.as_slice()
+    else {
+        return Ok(None);
+    };
+    let schema = reader.metadata().file_metadata().schema_descr();
+    let key_desc = schema.column(*key_index);
+    let first_utf8_desc = schema.column(*first_utf8_index);
+    let second_utf8_desc = schema.column(*second_utf8_index);
+    let numeric_desc = schema.column(*numeric_index);
+    let numeric_column_type = match numeric_desc.physical_type() {
+        ParquetPhysicalType::INT32 => DirectPrimitiveColumnType::I32,
+        ParquetPhysicalType::INT64 => DirectPrimitiveColumnType::I64,
+        _ => return Ok(None),
+    };
+    if key_desc.physical_type() != ParquetPhysicalType::INT64
+        || first_utf8_desc.physical_type() != ParquetPhysicalType::BYTE_ARRAY
+        || second_utf8_desc.physical_type() != ParquetPhysicalType::BYTE_ARRAY
+        || [key_desc, first_utf8_desc, second_utf8_desc, numeric_desc]
+            .iter()
+            .any(|desc| desc.max_rep_level() != 0 || desc.max_def_level() != 0)
+    {
+        return Ok(None);
+    }
+
+    let batch_size = batch_size.max(1);
+    let mut output = Vec::new();
+    let mut metrics = DirectPrimitiveColumnScanMetrics {
+        reader_kind: "dictionary-tuple-map",
+        row_groups: row_groups.len(),
+        column_read_nanos: vec![0; names.len()],
+        ..DirectPrimitiveColumnScanMetrics::default()
+    };
+    for &row_group_index in row_groups {
+        let row_group = reader.get_row_group(row_group_index)?;
+        let row_count = usize::try_from(row_group.metadata().num_rows()).map_err(|_| {
+            DodamError::UnsupportedSql("row group row count out of range".to_string())
+        })?;
+
+        let first_started = Instant::now();
+        let Some((first_def_levels, first_ids, first_dictionary)) =
+            read_byte_array_dictionary_ids_for_row_group(&*row_group, *first_utf8_index)?
+        else {
+            return Ok(None);
+        };
+        let first_nanos = elapsed_nanos(first_started);
+        metrics.add_column_read_nanos(1, first_nanos);
+        metrics.add_read_nanos(first_nanos);
+
+        let second_started = Instant::now();
+        let Some((second_def_levels, second_ids, second_dictionary)) =
+            read_byte_array_dictionary_ids_for_row_group(&*row_group, *second_utf8_index)?
+        else {
+            return Ok(None);
+        };
+        let second_nanos = elapsed_nanos(second_started);
+        metrics.add_column_read_nanos(2, second_nanos);
+        metrics.add_read_nanos(second_nanos);
+        if !first_def_levels.is_empty()
+            || !second_def_levels.is_empty()
+            || first_ids.len() != row_count
+            || second_ids.len() != row_count
+        {
+            return Ok(None);
+        }
+
+        let mut key_reader = match row_group.get_column_reader(*key_index)? {
+            ColumnReader::Int64ColumnReader(reader) => reader,
+            _ => return Ok(None),
+        };
+        let mut numeric_reader = match (
+            numeric_column_type,
+            row_group.get_column_reader(*numeric_index)?,
+        ) {
+            (DirectPrimitiveColumnType::I32, ColumnReader::Int32ColumnReader(reader)) => {
+                DirectPrimitiveColumnReader::I32(reader)
+            }
+            (DirectPrimitiveColumnType::I64, ColumnReader::Int64ColumnReader(reader)) => {
+                DirectPrimitiveColumnReader::I64(reader)
+            }
+            _ => return Ok(None),
+        };
+        let mut keys = Vec::<i64>::with_capacity(batch_size.min(row_count));
+        let mut numbers =
+            DirectPrimitiveColumnValues::new(numeric_column_type, batch_size.min(row_count));
+        let mut numeric_def_levels = Vec::new();
+        let mut rows_read = 0usize;
+        while rows_read < row_count {
+            keys.clear();
+            numbers.clear();
+            numeric_def_levels.clear();
+            let records_to_read = batch_size.min(row_count - rows_read);
+            let key_started = Instant::now();
+            let (key_records, key_values, key_levels) =
+                key_reader.read_records(records_to_read, None, None, &mut keys)?;
+            let key_nanos = elapsed_nanos(key_started);
+            metrics.add_column_read_nanos(0, key_nanos);
+            metrics.add_read_nanos(key_nanos);
+            if key_records == 0
+                || key_records != records_to_read
+                || key_values != key_records
+                || !direct_def_levels_match(key_levels, key_records, true)
+                || keys.len() != key_records
+            {
+                return Ok(None);
+            }
+
+            let numeric_started = Instant::now();
+            let (numeric_records, numeric_values, numeric_levels) = read_direct_primitive_records(
+                &mut numeric_reader,
+                &mut numbers,
+                key_records,
+                true,
+                &mut numeric_def_levels,
+            )?;
+            let numeric_nanos = elapsed_nanos(numeric_started);
+            metrics.add_column_read_nanos(3, numeric_nanos);
+            metrics.add_read_nanos(numeric_nanos);
+            if numeric_records != key_records
+                || numeric_values != numeric_records
+                || !direct_def_levels_match(numeric_levels, numeric_records, true)
+                || numbers.value_count() != numeric_records
+            {
+                return Ok(None);
+            }
+
+            let map_started = Instant::now();
+            let output_start = output.len();
+            for block_start in (0..key_records).step_by(64) {
+                let block_end = (block_start + 64).min(key_records);
+                for row in block_start..block_end {
+                    let dictionary_row = rows_read + row;
+                    let first =
+                        selected_dictionary_bytes(&first_ids, &first_dictionary, dictionary_row)?;
+                    let second =
+                        selected_dictionary_bytes(&second_ids, &second_dictionary, dictionary_row)?;
+                    let number = match &numbers {
+                        DirectPrimitiveColumnValues::I32(values) => i64::from(values[row]),
+                        DirectPrimitiveColumnValues::I64(values) => values[row],
+                    };
+                    if let Some(value) = map(first, second, number) {
+                        output.push((keys[row], value));
+                    }
+                }
+            }
+            metrics.add_consume_nanos(elapsed_nanos(map_started));
+            metrics.rows = metrics.rows.saturating_add(key_records);
+            metrics.selected_rows = metrics
+                .selected_rows
+                .saturating_add(output.len().saturating_sub(output_start));
+            metrics.batches += 1;
+            rows_read += key_records;
+        }
+    }
+    Ok(Some((output, metrics)))
+}
+
+fn scan_parquet_dictionary_date_range_selected_primitive_columns_reader<R, F>(
+    reader: SerializedFileReader<R>,
+    row_groups: &[usize],
+    predicate_column: &str,
+    start_days: i32,
+    end_days: i32,
+    payload_columns: &[DirectPrimitiveColumnSpec<'_>],
+    mut consume: F,
+) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
+where
+    R: ChunkReader + 'static,
+    F: for<'a> FnMut(&[RawColumnView<'a>]) -> Result<()>,
+{
+    if start_days >= end_days || payload_columns.is_empty() {
+        return Ok(None);
+    }
+    let mut names = Vec::with_capacity(payload_columns.len() + 1);
+    names.push(predicate_column);
+    names.extend(payload_columns.iter().map(|column| column.name));
+    let Some(column_indices) = parquet_column_indices_by_name(&reader, &names) else {
+        return Ok(None);
+    };
+    let predicate_index = column_indices[0];
+    let payload_indices = &column_indices[1..];
+    let schema = reader.metadata().file_metadata().schema_descr();
+    let predicate_desc = schema.column(predicate_index);
+    if predicate_desc.physical_type() != ParquetPhysicalType::INT32
+        || predicate_desc.max_rep_level() != 0
+        || predicate_desc.max_def_level() > 1
+        || payload_columns
+            .iter()
+            .zip(payload_indices.iter())
+            .any(|(column, &index)| {
+                let desc = schema.column(index);
+                desc.max_rep_level() != 0
+                    || desc.max_def_level() > 1
+                    || !direct_primitive_page_column_type_matches(
+                        desc.physical_type(),
+                        column.column_type,
+                    )
+            })
+    {
+        return Ok(None);
+    }
+
+    let mut metrics = DirectPrimitiveColumnScanMetrics {
+        reader_kind: "dictionary-range-selected-page",
+        row_groups: row_groups.len(),
+        column_read_nanos: vec![0; payload_columns.len() + 1],
+        ..DirectPrimitiveColumnScanMetrics::default()
+    };
+    for &row_group_index in row_groups {
+        let row_group = reader.get_row_group(row_group_index)?;
+        let row_count = usize::try_from(row_group.metadata().num_rows()).map_err(|_| {
+            DodamError::UnsupportedSql("row group row count out of range".to_string())
+        })?;
+        let read_started = Instant::now();
+        let predicate_started = Instant::now();
+        let mut selected_runs = Vec::new();
+        let mut selected_runs_builder = SelectionRunsBuilder::default();
+        let Some(selected_rows) = build_i32_dictionary_range_selected_runs_for_row_group(
+            &*row_group,
+            predicate_index,
+            row_count,
+            start_days,
+            end_days,
+            &mut selected_runs,
+            &mut selected_runs_builder,
+        )?
+        else {
+            return Ok(None);
+        };
+        let predicate_nanos = elapsed_nanos(predicate_started);
+        metrics.add_column_read_nanos(0, predicate_nanos);
+        metrics.add_selected_predicate_nanos(predicate_nanos);
+        metrics.rows = metrics.rows.saturating_add(row_count);
+        metrics.selected_rows = metrics.selected_rows.saturating_add(selected_rows);
+        metrics.selected_runs = metrics.selected_runs.saturating_add(selected_runs.len());
+        if selected_rows.saturating_mul(5) > row_count {
+            return Ok(None);
+        }
+        if selected_rows == 0 {
+            metrics.add_read_nanos(elapsed_nanos(read_started));
+            continue;
+        }
+
+        let payload_started = Instant::now();
+        let mut payload_values = Vec::with_capacity(payload_columns.len());
+        for (payload_offset, (column, &column_index)) in payload_columns
+            .iter()
+            .zip(payload_indices.iter())
+            .enumerate()
+        {
+            let column_started = Instant::now();
+            let Some(values) = read_dictionary_selected_direct_primitive_values_for_row_group(
+                &*row_group,
+                column_index,
+                column.column_type,
+                row_count,
+                &selected_runs,
+                selected_rows,
+                &mut metrics,
+            )?
+            else {
+                return Ok(None);
+            };
+            metrics.add_column_read_nanos(payload_offset + 1, elapsed_nanos(column_started));
+            payload_values.push(values);
+        }
+        metrics.add_selected_payload_nanos(elapsed_nanos(payload_started));
+        metrics.add_read_nanos(elapsed_nanos(read_started));
+        metrics.batches += 1;
+        metrics.selected_payload_batches += 1;
+        let consume_started = Instant::now();
+        let required_columns = vec![true; payload_columns.len()];
+        let def_levels = vec![Vec::new(); payload_columns.len()];
+        let views = direct_primitive_views(
+            &payload_values,
+            payload_columns,
+            &required_columns,
+            &def_levels,
+        );
+        consume(&views)?;
+        metrics.add_consume_nanos(elapsed_nanos(consume_started));
+    }
+    Ok(Some(metrics))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_parquet_i64_lookup_decimal_utf8_selected_primitive_columns_reader<
+    R,
+    Lookup,
+    Predicate,
+    Consume,
+>(
+    reader: SerializedFileReader<R>,
+    row_groups: &[usize],
+    key_column: &str,
+    quantity_column: DirectPrimitiveColumnSpec<'_>,
+    first_utf8_column: &str,
+    second_utf8_column: &str,
+    payload_columns: &[DirectPrimitiveColumnSpec<'_>],
+    lookup: &Lookup,
+    predicate: &Predicate,
+    mut consume: Consume,
+) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
+where
+    R: ChunkReader + 'static,
+    Lookup: Fn(i64) -> Option<u8>,
+    Predicate: Fn(u8, i64, &[u8], &[u8]) -> bool,
+    Consume: for<'a> FnMut(&[RawColumnView<'a>]) -> Result<()>,
+{
+    if payload_columns.is_empty()
+        || !matches!(
+            quantity_column.column_type,
+            DirectPrimitiveColumnType::Decimal128Int64Raw { .. }
+        )
+    {
+        return Ok(None);
+    }
+    let mut names = Vec::with_capacity(payload_columns.len() + 4);
+    names.extend([
+        key_column,
+        quantity_column.name,
+        first_utf8_column,
+        second_utf8_column,
+    ]);
+    names.extend(payload_columns.iter().map(|column| column.name));
+    let Some(column_indices) = parquet_column_indices_by_name(&reader, &names) else {
+        return Ok(None);
+    };
+    let key_index = column_indices[0];
+    let quantity_index = column_indices[1];
+    let first_utf8_index = column_indices[2];
+    let second_utf8_index = column_indices[3];
+    let payload_indices = &column_indices[4..];
+    let schema = reader.metadata().file_metadata().schema_descr();
+    let key_desc = schema.column(key_index);
+    let quantity_desc = schema.column(quantity_index);
+    let first_utf8_desc = schema.column(first_utf8_index);
+    let second_utf8_desc = schema.column(second_utf8_index);
+    if key_desc.physical_type() != ParquetPhysicalType::INT64
+        || key_desc.max_rep_level() != 0
+        || key_desc.max_def_level() > 1
+        || quantity_desc.max_rep_level() != 0
+        || quantity_desc.max_def_level() > 1
+        || !direct_primitive_page_column_type_matches(
+            quantity_desc.physical_type(),
+            quantity_column.column_type,
+        )
+        || [first_utf8_desc, second_utf8_desc].iter().any(|desc| {
+            desc.physical_type() != ParquetPhysicalType::BYTE_ARRAY
+                || desc.max_rep_level() != 0
+                || desc.max_def_level() > 1
+        })
+        || payload_columns
+            .iter()
+            .zip(payload_indices.iter())
+            .any(|(column, &index)| {
+                let desc = schema.column(index);
+                desc.max_rep_level() != 0
+                    || desc.max_def_level() > 1
+                    || !direct_primitive_page_column_type_matches(
+                        desc.physical_type(),
+                        column.column_type,
+                    )
+            })
+    {
+        return Ok(None);
+    }
+
+    let mut metrics = DirectPrimitiveColumnScanMetrics {
+        reader_kind: "dictionary-lookup-selected-page",
+        row_groups: row_groups.len(),
+        column_read_nanos: vec![0; payload_columns.len() + 4],
+        ..DirectPrimitiveColumnScanMetrics::default()
+    };
+    for &row_group_index in row_groups {
+        let row_group = reader.get_row_group(row_group_index)?;
+        let row_count = usize::try_from(row_group.metadata().num_rows()).map_err(|_| {
+            DodamError::UnsupportedSql("row group row count out of range".to_string())
+        })?;
+        let read_started = Instant::now();
+        let predicate_started = Instant::now();
+        let key_started = Instant::now();
+        let mut candidate_runs = Vec::new();
+        let mut candidate_builder = SelectionRunsBuilder::default();
+        let mut candidate_masks = Vec::new();
+        let Some(candidate_rows) = build_i64_dictionary_lookup_selected_runs_for_row_group(
+            &*row_group,
+            key_index,
+            row_count,
+            lookup,
+            &mut candidate_masks,
+            true,
+            &mut candidate_runs,
+            &mut candidate_builder,
+        )?
+        else {
+            return Ok(None);
+        };
+        metrics.add_column_read_nanos(0, elapsed_nanos(key_started));
+        metrics.rows = metrics.rows.saturating_add(row_count);
+        if candidate_rows.saturating_mul(5) > row_count || candidate_masks.len() != candidate_rows {
+            return Ok(None);
+        }
+        if candidate_rows == 0 {
+            let predicate_nanos = elapsed_nanos(predicate_started);
+            metrics.add_selected_predicate_nanos(predicate_nanos);
+            metrics.add_read_nanos(elapsed_nanos(read_started));
+            continue;
+        }
+
+        let quantity_started = Instant::now();
+        let Some(quantity_values) = read_dictionary_selected_direct_primitive_values_for_row_group(
+            &*row_group,
+            quantity_index,
+            quantity_column.column_type,
+            row_count,
+            &candidate_runs,
+            candidate_rows,
+            &mut metrics,
+        )?
+        else {
+            return Ok(None);
+        };
+        metrics.add_column_read_nanos(1, elapsed_nanos(quantity_started));
+        let DirectPrimitiveColumnValues::I64(quantity_values) = quantity_values else {
+            return Ok(None);
+        };
+
+        let first_utf8_started = Instant::now();
+        let Some((first_utf8_ids, first_utf8_dictionary)) =
+            read_byte_array_dictionary_ids_selected_for_row_group(
+                &*row_group,
+                first_utf8_index,
+                &candidate_runs,
+                &[],
+            )?
+        else {
+            return Ok(None);
+        };
+        metrics.add_column_read_nanos(2, elapsed_nanos(first_utf8_started));
+        let second_utf8_started = Instant::now();
+        let Some((second_utf8_ids, second_utf8_dictionary)) =
+            read_byte_array_dictionary_ids_selected_for_row_group(
+                &*row_group,
+                second_utf8_index,
+                &candidate_runs,
+                &[],
+            )?
+        else {
+            return Ok(None);
+        };
+        metrics.add_column_read_nanos(3, elapsed_nanos(second_utf8_started));
+        if quantity_values.len() != candidate_rows
+            || first_utf8_ids.len() != candidate_rows
+            || second_utf8_ids.len() != candidate_rows
+        {
+            return Ok(None);
+        }
+
+        let mut selected_runs = Vec::new();
+        let mut selected_builder = SelectionRunsBuilder::default();
+        let mut candidate_offset = 0usize;
+        let mut run_start = None;
+        let mut run_len = 0usize;
+        for &(candidate_start, candidate_len) in &candidate_runs {
+            for row in candidate_start..candidate_start + candidate_len {
+                let first_utf8 = selected_dictionary_bytes(
+                    &first_utf8_ids,
+                    &first_utf8_dictionary,
+                    candidate_offset,
+                )?;
+                let second_utf8 = selected_dictionary_bytes(
+                    &second_utf8_ids,
+                    &second_utf8_dictionary,
+                    candidate_offset,
+                )?;
+                let selected = predicate(
+                    candidate_masks[candidate_offset],
+                    quantity_values[candidate_offset],
+                    first_utf8,
+                    second_utf8,
+                );
+                candidate_offset += 1;
+                if selected {
+                    if run_start.is_none() {
+                        run_start = Some(row);
+                        run_len = 1;
+                    } else {
+                        run_len += 1;
+                    }
+                } else if let Some(start) = run_start.take() {
+                    selected_builder.push_run(&mut selected_runs, start, run_len);
+                    run_len = 0;
+                }
+            }
+            if let Some(start) = run_start.take() {
+                selected_builder.push_run(&mut selected_runs, start, run_len);
+                run_len = 0;
+            }
+        }
+        if candidate_offset != candidate_rows {
+            return Ok(None);
+        }
+        let selected_rows = selected_builder.selected_rows();
+        metrics.selected_rows = metrics.selected_rows.saturating_add(selected_rows);
+        metrics.selected_runs = metrics.selected_runs.saturating_add(selected_runs.len());
+        metrics.add_selected_predicate_nanos(elapsed_nanos(predicate_started));
+        if selected_rows == 0 {
+            metrics.add_read_nanos(elapsed_nanos(read_started));
+            continue;
+        }
+
+        let payload_started = Instant::now();
+        let mut payload_values = Vec::with_capacity(payload_columns.len());
+        for (payload_offset, (column, &column_index)) in payload_columns
+            .iter()
+            .zip(payload_indices.iter())
+            .enumerate()
+        {
+            let column_started = Instant::now();
+            let Some(values) = read_dictionary_selected_direct_primitive_values_for_row_group(
+                &*row_group,
+                column_index,
+                column.column_type,
+                row_count,
+                &selected_runs,
+                selected_rows,
+                &mut metrics,
+            )?
+            else {
+                return Ok(None);
+            };
+            metrics.add_column_read_nanos(payload_offset + 4, elapsed_nanos(column_started));
+            payload_values.push(values);
+        }
+        metrics.add_selected_payload_nanos(elapsed_nanos(payload_started));
+        metrics.add_read_nanos(elapsed_nanos(read_started));
+        metrics.batches += 1;
+        metrics.selected_payload_batches += 1;
+        let consume_started = Instant::now();
+        let required_columns = vec![true; payload_columns.len()];
+        let def_levels = vec![Vec::new(); payload_columns.len()];
+        let views = direct_primitive_views(
+            &payload_values,
+            payload_columns,
+            &required_columns,
+            &def_levels,
+        );
+        consume(&views)?;
+        metrics.add_consume_nanos(elapsed_nanos(consume_started));
+    }
+    Ok(Some(metrics))
+}
+
+fn selected_dictionary_bytes<'a>(
+    ids: &[i32],
+    dictionary: &'a [Bytes],
+    index: usize,
+) -> Result<&'a [u8]> {
+    let id = *ids.get(index).ok_or_else(|| {
+        DodamError::UnsupportedSql("selected UTF-8 dictionary index is missing".to_string())
+    })?;
+    let id = usize::try_from(id).map_err(|_| invalid_dictionary_id_error())?;
+    dictionary
+        .get(id)
+        .map(Bytes::as_ref)
+        .ok_or_else(invalid_dictionary_id_error)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7791,7 +9800,6 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
 pub(crate) fn scan_parquet_i32_i64_decimal_i32_selected_with_store<F>(
     path: &Path,
     batch_size: usize,
@@ -7837,6 +9845,173 @@ where
             consume(&views)
         },
     )
+}
+
+pub(crate) fn scan_parquet_i64_i64_selected_raw_columns_with_store<F>(
+    path: &Path,
+    row_groups: &[usize],
+    columns: [&str; 2],
+    column_types: [DirectPrimitiveColumnType; 2],
+    selected_runs_by_row_group: &[Vec<(usize, usize)>],
+    file_cache: Arc<ParquetFileCache>,
+    store: &dyn ObjectStore,
+    consume: F,
+) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
+where
+    F: for<'a> FnMut(&[RawColumnView<'a>]) -> Result<()>,
+{
+    if file_cache.enabled() {
+        let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
+        let reader = SerializedFileReader::new(reader)?;
+        return scan_parquet_i64_i64_selected_raw_columns_reader(
+            reader,
+            row_groups,
+            columns,
+            column_types,
+            selected_runs_by_row_group,
+            consume,
+        );
+    }
+    let file = store.open(path)?;
+    let reader = SerializedFileReader::new(file)?;
+    scan_parquet_i64_i64_selected_raw_columns_reader(
+        reader,
+        row_groups,
+        columns,
+        column_types,
+        selected_runs_by_row_group,
+        consume,
+    )
+}
+
+fn scan_parquet_i64_i64_selected_raw_columns_reader<R, F>(
+    reader: SerializedFileReader<R>,
+    row_groups: &[usize],
+    columns: [&str; 2],
+    column_types: [DirectPrimitiveColumnType; 2],
+    selected_runs_by_row_group: &[Vec<(usize, usize)>],
+    mut consume: F,
+) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
+where
+    R: ChunkReader + 'static,
+    F: for<'a> FnMut(&[RawColumnView<'a>]) -> Result<()>,
+{
+    let Some(column_indices) = parquet_column_indices_by_name(&reader, &columns) else {
+        return Ok(None);
+    };
+    let [first_column, second_column] = <[usize; 2]>::try_from(column_indices).map_err(|_| {
+        DodamError::UnsupportedSql("selected raw column shape mismatch".to_string())
+    })?;
+    let [
+        DirectPrimitiveColumnType::Decimal128Int64Raw {
+            precision: first_precision,
+            scale: first_scale,
+        },
+        DirectPrimitiveColumnType::Decimal128Int64Raw {
+            precision: second_precision,
+            scale: second_scale,
+        },
+    ] = column_types
+    else {
+        return Ok(None);
+    };
+    if selected_runs_by_row_group.len() != row_groups.len() {
+        return Ok(None);
+    }
+    let mut metrics = DirectPrimitiveColumnScanMetrics {
+        reader_kind: "selected-raw-i64-page",
+        row_groups: row_groups.len(),
+        column_read_nanos: vec![0; 2],
+        ..DirectPrimitiveColumnScanMetrics::default()
+    };
+    let selected_capacity = selected_runs_by_row_group
+        .iter()
+        .flatten()
+        .map(|(_, len)| *len)
+        .fold(0_usize, usize::saturating_add);
+    let mut first_values = Vec::<i64>::with_capacity(selected_capacity);
+    let mut second_values = Vec::<i64>::with_capacity(selected_capacity);
+    for (&row_group_index, selected_runs) in
+        row_groups.iter().zip(selected_runs_by_row_group.iter())
+    {
+        let row_group = reader.get_row_group(row_group_index)?;
+        let row_count = usize::try_from(row_group.metadata().num_rows()).map_err(|_| {
+            DodamError::UnsupportedSql("row group row count out of range".to_string())
+        })?;
+        let selected_rows = selected_runs
+            .iter()
+            .map(|(_, len)| *len)
+            .fold(0_usize, usize::saturating_add);
+        metrics.rows = metrics.rows.saturating_add(row_count);
+        metrics.selected_rows = metrics.selected_rows.saturating_add(selected_rows);
+        metrics.selected_runs = metrics.selected_runs.saturating_add(selected_runs.len());
+        if selected_rows == 0 {
+            continue;
+        }
+        let read_started = Instant::now();
+        let first_start = first_values.len();
+        let second_start = second_values.len();
+        let first_started = Instant::now();
+        if selected_i64_decoder::read_plain_i64_selected_runs(
+            &*row_group,
+            first_column,
+            row_count,
+            selected_runs,
+            &mut first_values,
+            &mut metrics,
+        )?
+        .is_none()
+        {
+            return Ok(None);
+        }
+        metrics.add_column_read_nanos(0, elapsed_nanos(first_started));
+        let second_started = Instant::now();
+        if selected_i64_decoder::read_plain_i64_selected_runs(
+            &*row_group,
+            second_column,
+            row_count,
+            selected_runs,
+            &mut second_values,
+            &mut metrics,
+        )?
+        .is_none()
+        {
+            return Ok(None);
+        }
+        metrics.add_column_read_nanos(1, elapsed_nanos(second_started));
+        if first_values.len().saturating_sub(first_start) != selected_rows
+            || second_values.len().saturating_sub(second_start) != selected_rows
+        {
+            return Ok(None);
+        }
+        metrics.add_selected_payload_nanos(elapsed_nanos(read_started));
+        metrics.add_read_nanos(elapsed_nanos(read_started));
+    }
+    if !first_values.is_empty() {
+        if first_values.len() != metrics.selected_rows
+            || second_values.len() != metrics.selected_rows
+        {
+            return Ok(None);
+        }
+        let columns = [
+            RawColumnView::Decimal128I64 {
+                values: &first_values,
+                precision: first_precision,
+                scale: first_scale,
+            },
+            RawColumnView::Decimal128I64 {
+                values: &second_values,
+                precision: second_precision,
+                scale: second_scale,
+            },
+        ];
+        let consume_started = Instant::now();
+        consume(&columns)?;
+        metrics.add_consume_nanos(elapsed_nanos(consume_started));
+        metrics.selected_payload_batches = 1;
+        metrics.batches = 1;
+    }
+    Ok(Some(metrics))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7889,77 +10064,6 @@ where
         date_min,
         date_max,
         consume,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn scan_parquet_i64_date_decimal_decimal_selected_typed_with_store<F>(
-    path: &Path,
-    batch_size: usize,
-    row_groups: &[usize],
-    columns: [&str; 4],
-    date_min: Option<i32>,
-    date_max: Option<i32>,
-    file_cache: Arc<ParquetFileCache>,
-    store: &dyn ObjectStore,
-    consume: F,
-) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
-where
-    F: for<'a> FnMut(DirectI64DateDecimalDecimalSelectedBatch<'a>) -> Result<()>,
-{
-    if file_cache.enabled() {
-        let reader = CachedParquetChunkReader::new(path, store, file_cache)?;
-        let reader = SerializedFileReader::new(reader)?;
-        return scan_parquet_i64_date_decimal_decimal_selected_reader(
-            reader, batch_size, row_groups, columns, date_min, date_max, consume,
-        );
-    }
-    let file = store.open(path)?;
-    let reader = SerializedFileReader::new(file)?;
-    scan_parquet_i64_date_decimal_decimal_selected_reader(
-        reader, batch_size, row_groups, columns, date_min, date_max, consume,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-pub(crate) fn scan_parquet_i32_i32_dictionary_i64_decimal_selected_with_store<F>(
-    path: &Path,
-    batch_size: usize,
-    row_groups: &[usize],
-    columns: [&str; 5],
-    fallback: &[u8],
-    decimal_min: Option<i64>,
-    decimal_max: Option<i64>,
-    file_cache: Arc<ParquetFileCache>,
-    store: &dyn ObjectStore,
-    mut consume: F,
-) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
-where
-    F: for<'a> FnMut(&[RawColumnView<'a>]) -> Result<()>,
-{
-    scan_parquet_i32_i32_dictionary_i64_decimal_selected_typed_with_store(
-        path,
-        batch_size,
-        row_groups,
-        columns,
-        fallback,
-        decimal_min,
-        decimal_max,
-        file_cache,
-        store,
-        |batch| {
-            let views = [
-                RawColumnView::I32(batch.first()),
-                RawColumnView::Date32(batch.second()),
-                RawColumnView::DictionaryI32 {
-                    keys: batch.dictionary_ids(),
-                    values: DictionaryStringValues::Bytes(batch.dictionary()),
-                },
-                RawColumnView::I64(batch.sums()),
-            ];
-            consume(&views)
-        },
     )
 }
 
@@ -8042,6 +10146,7 @@ where
     let sum_required = schema.column(sum_column).max_def_level() == 0;
     let decimal_required = schema.column(decimal_column).max_def_level() == 0;
     let mut metrics = DirectPrimitiveColumnScanMetrics {
+        reader_kind: "selected-column-reader",
         row_groups: row_groups.len(),
         column_read_nanos: vec![0; 5],
         ..DirectPrimitiveColumnScanMetrics::default()
@@ -8930,6 +11035,7 @@ where
     let decimal_required = schema.column(decimal_column).max_def_level() == 0;
     let date_required = schema.column(date_column).max_def_level() == 0;
     let mut metrics = DirectPrimitiveColumnScanMetrics {
+        reader_kind: "selected-column-reader",
         row_groups: row_groups.len(),
         column_read_nanos: vec![0; 4],
         ..DirectPrimitiveColumnScanMetrics::default()
@@ -9121,303 +11227,6 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn scan_parquet_i64_date_decimal_decimal_selected_reader<R, F>(
-    reader: SerializedFileReader<R>,
-    batch_size: usize,
-    row_groups: &[usize],
-    columns: [&str; 4],
-    date_min: Option<i32>,
-    date_max: Option<i32>,
-    mut consume: F,
-) -> Result<Option<DirectPrimitiveColumnScanMetrics>>
-where
-    R: ChunkReader + 'static,
-    F: for<'a> FnMut(DirectI64DateDecimalDecimalSelectedBatch<'a>) -> Result<()>,
-{
-    let trace = std::env::var("DODAM_DIRECT_SELECTION_TRACE")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
-    let Some(column_indices) = parquet_column_indices_by_name(&reader, &columns) else {
-        if trace {
-            eprintln!(
-                "[dodam:direct-selected] i64-date-decimal-decimal reject: missing columns {columns:?}"
-            );
-        }
-        return Ok(None);
-    };
-    let [
-        key_column,
-        date_column,
-        left_decimal_column,
-        right_decimal_column,
-    ] = <[usize; 4]>::try_from(column_indices).map_err(|_| {
-        DodamError::UnsupportedSql(
-            "direct selected discounted revenue column shape mismatch".to_string(),
-        )
-    })?;
-    let schema = reader.metadata().file_metadata().schema_descr();
-    let key_required = schema.column(key_column).max_def_level() == 0;
-    let date_required = schema.column(date_column).max_def_level() == 0;
-    let left_required = schema.column(left_decimal_column).max_def_level() == 0;
-    let right_required = schema.column(right_decimal_column).max_def_level() == 0;
-    let mut metrics = DirectPrimitiveColumnScanMetrics {
-        row_groups: row_groups.len(),
-        column_read_nanos: vec![0; 4],
-        ..DirectPrimitiveColumnScanMetrics::default()
-    };
-    for &row_group_index in row_groups {
-        let row_group = reader.get_row_group(row_group_index)?;
-        let mut key_reader = match row_group.get_column_reader(key_column)? {
-            ColumnReader::Int64ColumnReader(reader) => reader,
-            _ => {
-                if trace {
-                    eprintln!(
-                        "[dodam:direct-selected] i64-date-decimal-decimal reject: key is not INT64"
-                    );
-                }
-                return Ok(None);
-            }
-        };
-        let mut date_reader = match row_group.get_column_reader(date_column)? {
-            ColumnReader::Int32ColumnReader(reader) => reader,
-            _ => {
-                if trace {
-                    eprintln!(
-                        "[dodam:direct-selected] i64-date-decimal-decimal reject: date is not INT32"
-                    );
-                }
-                return Ok(None);
-            }
-        };
-        let mut left_reader = match row_group.get_column_reader(left_decimal_column)? {
-            ColumnReader::Int64ColumnReader(reader) => reader,
-            _ => {
-                if trace {
-                    eprintln!(
-                        "[dodam:direct-selected] i64-date-decimal-decimal reject: left decimal is not INT64"
-                    );
-                }
-                return Ok(None);
-            }
-        };
-        let mut right_reader = match row_group.get_column_reader(right_decimal_column)? {
-            ColumnReader::Int64ColumnReader(reader) => reader,
-            _ => {
-                if trace {
-                    eprintln!(
-                        "[dodam:direct-selected] i64-date-decimal-decimal reject: right decimal is not INT64"
-                    );
-                }
-                return Ok(None);
-            }
-        };
-        let mut date_values = Vec::<i32>::with_capacity(batch_size);
-        let mut key_def_levels = Vec::<i16>::with_capacity(batch_size);
-        let mut date_def_levels = Vec::<i16>::with_capacity(batch_size);
-        let mut left_def_levels = Vec::<i16>::with_capacity(batch_size);
-        let mut right_def_levels = Vec::<i16>::with_capacity(batch_size);
-        let mut selected_keys = Vec::<i64>::with_capacity(batch_size);
-        let mut selected_dates = Vec::<i32>::with_capacity(batch_size);
-        let mut selected_left = Vec::<i64>::with_capacity(batch_size);
-        let mut selected_right = Vec::<i64>::with_capacity(batch_size);
-        let mut selected_runs = Vec::<(usize, usize)>::new();
-        loop {
-            date_values.clear();
-            key_def_levels.clear();
-            date_def_levels.clear();
-            left_def_levels.clear();
-            right_def_levels.clear();
-            selected_keys.clear();
-            selected_dates.clear();
-            selected_left.clear();
-            selected_right.clear();
-            selected_runs.clear();
-            let read_started = Instant::now();
-            let date_started = Instant::now();
-            let (records, value_count, level_count) = date_reader.read_records(
-                batch_size,
-                (!date_required).then_some(&mut date_def_levels),
-                None,
-                &mut date_values,
-            )?;
-            metrics.add_column_read_nanos(1, elapsed_nanos(date_started));
-            if records == 0 {
-                metrics.add_read_nanos(elapsed_nanos(read_started));
-                break;
-            }
-            if value_count != records
-                || !direct_def_levels_match(level_count, records, date_required)
-                || !direct_all_present(date_required, &date_def_levels)
-            {
-                if trace {
-                    eprintln!(
-                        "[dodam:direct-selected] i64-date-decimal-decimal reject: date levels records={records} values={value_count} levels={level_count} required={date_required}"
-                    );
-                }
-                metrics.add_read_nanos(elapsed_nanos(read_started));
-                return Ok(None);
-            }
-            build_date_selected_runs(
-                &date_values,
-                date_min,
-                date_max,
-                &mut selected_runs,
-                &mut selected_dates,
-            );
-            metrics.selected_rows = metrics.selected_rows.saturating_add(selected_dates.len());
-            metrics.selected_runs = metrics.selected_runs.saturating_add(selected_runs.len());
-            let use_selected_payload =
-                direct_selection_payload_gate(records, selected_dates.len(), selected_runs.len());
-            let key_started = Instant::now();
-            if use_selected_payload {
-                if !read_i64_selected_runs(
-                    &mut key_reader,
-                    records,
-                    &selected_runs,
-                    key_required,
-                    &mut key_def_levels,
-                    &mut selected_keys,
-                    &mut metrics,
-                )? {
-                    if trace {
-                        eprintln!(
-                            "[dodam:direct-selected] i64-date-decimal-decimal reject: selected key read failed"
-                        );
-                    }
-                    metrics.add_read_nanos(elapsed_nanos(read_started));
-                    return Ok(None);
-                }
-            } else {
-                let (key_records, key_value_count, key_level_count) = key_reader.read_records(
-                    records,
-                    (!key_required).then_some(&mut key_def_levels),
-                    None,
-                    &mut selected_keys,
-                )?;
-                if key_records != records
-                    || key_value_count != records
-                    || !direct_def_levels_match(key_level_count, records, key_required)
-                    || !direct_all_present(key_required, &key_def_levels)
-                {
-                    if trace {
-                        eprintln!(
-                            "[dodam:direct-selected] i64-date-decimal-decimal reject: key levels records={key_records}/{records} values={key_value_count} levels={key_level_count} required={key_required}"
-                        );
-                    }
-                    metrics.add_read_nanos(elapsed_nanos(read_started));
-                    return Ok(None);
-                }
-            }
-            metrics.add_column_read_nanos(0, elapsed_nanos(key_started));
-            let left_started = Instant::now();
-            if use_selected_payload {
-                if !read_i64_selected_runs(
-                    &mut left_reader,
-                    records,
-                    &selected_runs,
-                    left_required,
-                    &mut left_def_levels,
-                    &mut selected_left,
-                    &mut metrics,
-                )? {
-                    if trace {
-                        eprintln!(
-                            "[dodam:direct-selected] i64-date-decimal-decimal reject: selected left decimal read failed"
-                        );
-                    }
-                    metrics.add_read_nanos(elapsed_nanos(read_started));
-                    return Ok(None);
-                }
-            } else {
-                let (left_records, left_value_count, left_level_count) = left_reader.read_records(
-                    records,
-                    (!left_required).then_some(&mut left_def_levels),
-                    None,
-                    &mut selected_left,
-                )?;
-                if left_records != records
-                    || left_value_count != records
-                    || !direct_def_levels_match(left_level_count, records, left_required)
-                    || !direct_all_present(left_required, &left_def_levels)
-                {
-                    if trace {
-                        eprintln!(
-                            "[dodam:direct-selected] i64-date-decimal-decimal reject: left levels records={left_records}/{records} values={left_value_count} levels={left_level_count} required={left_required}"
-                        );
-                    }
-                    metrics.add_read_nanos(elapsed_nanos(read_started));
-                    return Ok(None);
-                }
-            }
-            metrics.add_column_read_nanos(2, elapsed_nanos(left_started));
-            let right_started = Instant::now();
-            if use_selected_payload {
-                if !read_i64_selected_runs(
-                    &mut right_reader,
-                    records,
-                    &selected_runs,
-                    right_required,
-                    &mut right_def_levels,
-                    &mut selected_right,
-                    &mut metrics,
-                )? {
-                    if trace {
-                        eprintln!(
-                            "[dodam:direct-selected] i64-date-decimal-decimal reject: selected right decimal read failed"
-                        );
-                    }
-                    metrics.add_read_nanos(elapsed_nanos(read_started));
-                    return Ok(None);
-                }
-                metrics.selected_payload_batches += 1;
-            } else {
-                let (right_records, right_value_count, right_level_count) = right_reader
-                    .read_records(
-                        records,
-                        (!right_required).then_some(&mut right_def_levels),
-                        None,
-                        &mut selected_right,
-                    )?;
-                if right_records != records
-                    || right_value_count != records
-                    || !direct_def_levels_match(right_level_count, records, right_required)
-                    || !direct_all_present(right_required, &right_def_levels)
-                {
-                    if trace {
-                        eprintln!(
-                            "[dodam:direct-selected] i64-date-decimal-decimal reject: right levels records={right_records}/{records} values={right_value_count} levels={right_level_count} required={right_required}"
-                        );
-                    }
-                    metrics.add_read_nanos(elapsed_nanos(read_started));
-                    return Ok(None);
-                }
-                metrics.full_payload_batches += 1;
-            }
-            metrics.add_column_read_nanos(3, elapsed_nanos(right_started));
-            metrics.add_read_nanos(elapsed_nanos(read_started));
-            metrics.batches += 1;
-            metrics.rows = metrics.rows.saturating_add(records);
-            if selected_keys.is_empty() {
-                continue;
-            }
-            let consume_started = Instant::now();
-            let date_view = if use_selected_payload {
-                selected_dates.as_slice()
-            } else {
-                date_values.as_slice()
-            };
-            consume(DirectI64DateDecimalDecimalSelectedBatch {
-                keys: &selected_keys,
-                dates: date_view,
-                left_decimals: &selected_left,
-                right_decimals: &selected_right,
-                predicate_applied: use_selected_payload,
-            })?;
-            metrics.add_consume_nanos(elapsed_nanos(consume_started));
-        }
-    }
-    Ok(Some(metrics))
-}
-
 enum DirectPrimitiveColumnReader {
     I64(ColumnReaderImpl<Int64Type>),
     I32(ColumnReaderImpl<Int32Type>),
@@ -9426,10 +11235,76 @@ enum DirectPrimitiveColumnReader {
 enum DirectPrimitiveColumnValues {
     I64(Vec<i64>),
     I32(Vec<i32>),
-    Decimal128 {
-        values: Vec<i128>,
-        raw_i64: Vec<i64>,
-    },
+}
+
+enum DirectPrimitiveDictionary {
+    RawI64 { data: Bytes, values: usize },
+    RawI32 { data: Bytes, values: usize },
+}
+
+impl DirectPrimitiveDictionary {
+    fn from_plain(
+        data: Bytes,
+        values: usize,
+        column_type: DirectPrimitiveColumnType,
+    ) -> Option<Self> {
+        let width = match column_type {
+            DirectPrimitiveColumnType::I32 | DirectPrimitiveColumnType::Date32 => {
+                std::mem::size_of::<i32>()
+            }
+            DirectPrimitiveColumnType::I64
+            | DirectPrimitiveColumnType::Decimal128Int64Raw { .. } => std::mem::size_of::<i64>(),
+        };
+        let bytes = values.checked_mul(width)?;
+        if data.len() < bytes {
+            return None;
+        }
+        let data = data.slice(..bytes);
+        Some(match column_type {
+            DirectPrimitiveColumnType::I32 | DirectPrimitiveColumnType::Date32 => {
+                Self::RawI32 { data, values }
+            }
+            DirectPrimitiveColumnType::I64
+            | DirectPrimitiveColumnType::Decimal128Int64Raw { .. } => Self::RawI64 { data, values },
+        })
+    }
+
+    fn value_count(&self) -> usize {
+        match self {
+            Self::RawI64 { values, .. } | Self::RawI32 { values, .. } => *values,
+        }
+    }
+
+    fn append_selected_values(
+        &self,
+        selected_ids: &[i32],
+        output: &mut DirectPrimitiveColumnValues,
+    ) -> Result<bool> {
+        match (self, output) {
+            (Self::RawI32 { data, values }, DirectPrimitiveColumnValues::I32(output)) => {
+                output.reserve(selected_ids.len());
+                for &id in selected_ids {
+                    let id = usize::try_from(id).map_err(|_| invalid_dictionary_id_error())?;
+                    if id >= *values {
+                        return Err(invalid_dictionary_id_error());
+                    }
+                    output.push(read_i32_le_unchecked(data, id));
+                }
+            }
+            (Self::RawI64 { data, values }, DirectPrimitiveColumnValues::I64(output)) => {
+                output.reserve(selected_ids.len());
+                for &id in selected_ids {
+                    let id = usize::try_from(id).map_err(|_| invalid_dictionary_id_error())?;
+                    if id >= *values {
+                        return Err(invalid_dictionary_id_error());
+                    }
+                    output.push(read_i64_le_unchecked(data, id));
+                }
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
 }
 
 impl DirectPrimitiveColumnValues {
@@ -9439,10 +11314,6 @@ impl DirectPrimitiveColumnValues {
             DirectPrimitiveColumnType::I32 | DirectPrimitiveColumnType::Date32 => {
                 Self::I32(Vec::with_capacity(capacity))
             }
-            DirectPrimitiveColumnType::Decimal128Int64 { .. } => Self::Decimal128 {
-                values: Vec::with_capacity(capacity),
-                raw_i64: Vec::with_capacity(capacity),
-            },
             DirectPrimitiveColumnType::Decimal128Int64Raw { .. } => {
                 Self::I64(Vec::with_capacity(capacity))
             }
@@ -9453,10 +11324,6 @@ impl DirectPrimitiveColumnValues {
         match self {
             Self::I64(values) => values.clear(),
             Self::I32(values) => values.clear(),
-            Self::Decimal128 { values, raw_i64 } => {
-                values.clear();
-                raw_i64.clear();
-            }
         }
     }
 
@@ -9464,7 +11331,6 @@ impl DirectPrimitiveColumnValues {
         match self {
             Self::I64(values) => values.len(),
             Self::I32(values) => values.len(),
-            Self::Decimal128 { values, .. } => values.len(),
         }
     }
 
@@ -9489,14 +11355,6 @@ impl DirectPrimitiveColumnValues {
                 RawColumnView::I32Nullable { values, def_levels }
             }
             (Self::I32(values), DirectPrimitiveColumnType::Date32) => RawColumnView::Date32(values),
-            (
-                Self::Decimal128 { values, .. },
-                DirectPrimitiveColumnType::Decimal128Int64 { precision, scale },
-            ) => RawColumnView::Decimal128 {
-                values,
-                precision,
-                scale,
-            },
             (
                 Self::I64(values),
                 DirectPrimitiveColumnType::Decimal128Int64Raw { precision, scale },
@@ -9532,19 +11390,6 @@ fn read_direct_primitive_records(
                 Ok(reader.read_records(records, Some(def_levels), None, values)?)
             }
         }
-        (
-            DirectPrimitiveColumnReader::I64(reader),
-            DirectPrimitiveColumnValues::Decimal128 { values, raw_i64 },
-        ) => {
-            raw_i64.clear();
-            let result = if required {
-                reader.read_records(records, None, None, raw_i64)?
-            } else {
-                reader.read_records(records, Some(def_levels), None, raw_i64)?
-            };
-            values.extend(raw_i64.iter().copied().map(i128::from));
-            Ok(result)
-        }
         _ => Err(DodamError::UnsupportedSql(
             "direct primitive column reader/value type mismatch".to_string(),
         )),
@@ -9573,6 +11418,7 @@ where
         .map(|&index| skip_required_def_levels && schema.column(index).max_def_level() == 0)
         .collect();
     let mut metrics = DirectPrimitiveColumnScanMetrics {
+        reader_kind: "column-reader",
         row_groups: row_groups.len(),
         column_read_nanos: vec![0; columns.len()],
         ..DirectPrimitiveColumnScanMetrics::default()
@@ -9595,8 +11441,7 @@ where
                     DirectPrimitiveColumnReader::I32(reader)
                 }
                 (
-                    DirectPrimitiveColumnType::Decimal128Int64 { .. }
-                    | DirectPrimitiveColumnType::Decimal128Int64Raw { .. },
+                    DirectPrimitiveColumnType::Decimal128Int64Raw { .. },
                     ColumnReader::Int64ColumnReader(reader),
                 ) => DirectPrimitiveColumnReader::I64(reader),
                 _ => return Ok(None),
@@ -9710,6 +11555,7 @@ where
         }
     }
     let mut metrics = DirectPrimitiveColumnScanMetrics {
+        reader_kind: "required-page-stream",
         row_groups: row_groups.len(),
         column_read_nanos: vec![0; columns.len()],
         ..DirectPrimitiveColumnScanMetrics::default()
@@ -9809,6 +11655,7 @@ where
     }
 
     let mut metrics = DirectPrimitiveColumnScanMetrics {
+        reader_kind: "ordered-page-stream",
         row_groups: row_groups.len(),
         column_read_nanos: vec![0; columns.len()],
         ..DirectPrimitiveColumnScanMetrics::default()
@@ -10036,6 +11883,7 @@ where
     }
 
     let mut metrics = DirectPrimitiveColumnScanMetrics {
+        reader_kind: "selected-page-stream",
         row_groups: row_groups.len(),
         column_read_nanos: vec![0; columns.len()],
         ..DirectPrimitiveColumnScanMetrics::default()
@@ -10435,6 +12283,7 @@ where
         return Ok(None);
     }
     let mut metrics = DirectPrimitiveColumnScanMetrics {
+        reader_kind: "count-sum-page-stream",
         row_groups: row_groups.len(),
         column_read_nanos: vec![0; 2],
         ..DirectPrimitiveColumnScanMetrics::default()
@@ -10636,8 +12485,7 @@ impl RequiredPlainPrimitivePageCursor {
             DirectPrimitiveColumnType::I32 => RawColumnView::I32Bytes { data, len: records },
             DirectPrimitiveColumnType::Date32 => RawColumnView::Date32Bytes { data, len: records },
             DirectPrimitiveColumnType::I64 => RawColumnView::I64Bytes { data, len: records },
-            DirectPrimitiveColumnType::Decimal128Int64Raw { precision, scale }
-            | DirectPrimitiveColumnType::Decimal128Int64 { precision, scale } => {
+            DirectPrimitiveColumnType::Decimal128Int64Raw { precision, scale } => {
                 RawColumnView::Decimal128I64Bytes {
                     data,
                     len: records,
@@ -10892,9 +12740,7 @@ impl NullablePlainPrimitivePageCursor {
 fn direct_primitive_byte_width(column_type: DirectPrimitiveColumnType) -> usize {
     match column_type {
         DirectPrimitiveColumnType::I32 | DirectPrimitiveColumnType::Date32 => 4,
-        DirectPrimitiveColumnType::I64
-        | DirectPrimitiveColumnType::Decimal128Int64 { .. }
-        | DirectPrimitiveColumnType::Decimal128Int64Raw { .. } => 8,
+        DirectPrimitiveColumnType::I64 | DirectPrimitiveColumnType::Decimal128Int64Raw { .. } => 8,
     }
 }
 
@@ -10919,6 +12765,7 @@ where
         .map(|&index| schema.column(index).max_def_level() == 0)
         .collect();
     let mut metrics = DirectPrimitiveColumnScanMetrics {
+        reader_kind: "page-materialized",
         row_groups: row_groups.len(),
         column_read_nanos: vec![0; columns.len()],
         ..DirectPrimitiveColumnScanMetrics::default()
@@ -11092,21 +12939,6 @@ fn direct_primitive_non_null_page_batch_view<'a>(
                 ));
             }
             Ok(RawColumnView::Date32(&values[start..end]))
-        }
-        (
-            DirectPrimitiveColumnValues::Decimal128 { values, .. },
-            DirectPrimitiveColumnType::Decimal128Int64 { precision, scale },
-        ) => {
-            if end > values.len() {
-                return Err(DodamError::UnsupportedSql(
-                    "direct primitive page value length mismatch".to_string(),
-                ));
-            }
-            Ok(RawColumnView::Decimal128 {
-                values: &values[start..end],
-                precision,
-                scale,
-            })
         }
         (
             DirectPrimitiveColumnValues::I64(values),
@@ -11284,8 +13116,7 @@ fn direct_primitive_page_column_type_matches(
             | (ParquetPhysicalType::INT64, DirectPrimitiveColumnType::I64)
             | (
                 ParquetPhysicalType::INT64,
-                DirectPrimitiveColumnType::Decimal128Int64 { .. }
-                    | DirectPrimitiveColumnType::Decimal128Int64Raw { .. }
+                DirectPrimitiveColumnType::Decimal128Int64Raw { .. },
             )
     )
 }
@@ -11303,18 +13134,6 @@ fn decode_plain_direct_primitive_values(
         ) => decode_plain_i32_values(data, values, output),
         (DirectPrimitiveColumnType::I64, DirectPrimitiveColumnValues::I64(output)) => {
             decode_plain_i64_values(data, values, output)
-        }
-        (
-            DirectPrimitiveColumnType::Decimal128Int64 { .. },
-            DirectPrimitiveColumnValues::Decimal128 {
-                values: output,
-                raw_i64,
-            },
-        ) => {
-            let before = raw_i64.len();
-            decode_plain_i64_values(data, values, raw_i64)?;
-            output.extend(raw_i64[before..].iter().copied().map(i128::from));
-            Ok(())
         }
         (
             DirectPrimitiveColumnType::Decimal128Int64Raw { .. },
@@ -11410,36 +13229,6 @@ fn build_selected_runs(
         if selected {
             selected_decimals.push(decimals[row]);
             selected_dates.push(dates[row]);
-            if run_start.is_none() {
-                run_start = Some(row);
-                run_len = 1;
-            } else {
-                run_len += 1;
-            }
-        } else if let Some(start) = run_start.take() {
-            runs.push((start, run_len));
-            run_len = 0;
-        }
-    }
-    if let Some(start) = run_start {
-        runs.push((start, run_len));
-    }
-}
-
-fn build_date_selected_runs(
-    dates: &[i32],
-    date_min: Option<i32>,
-    date_max: Option<i32>,
-    runs: &mut Vec<(usize, usize)>,
-    selected_dates: &mut Vec<i32>,
-) {
-    let mut run_start = None;
-    let mut run_len = 0usize;
-    for (row, date) in dates.iter().copied().enumerate() {
-        let selected =
-            date_min.is_none_or(|min| date >= min) && date_max.is_none_or(|max| date <= max);
-        if selected {
-            selected_dates.push(date);
             if run_start.is_none() {
                 run_start = Some(row);
                 run_len = 1;
@@ -12426,6 +14215,22 @@ fn direct_dictionary_selected_full_payload_enabled() -> bool {
 fn direct_dictionary_selected_page_decode_enabled() -> bool {
     !std::env::var("DODAM_DISABLE_FUSED_DICT_SELECTED_PAGE_DECODE")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn direct_adaptive_selected_dictionary_decode_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("DODAM_DISABLE_ADAPTIVE_SELECTED_DICTIONARY_DECODE")
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    })
+}
+
+fn direct_predecode_selected_page_pruning_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("DODAM_DISABLE_PREDECODE_SELECTED_PAGE_PRUNING")
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    })
 }
 
 fn direct_dictionary_selected_full_primitive_payload_enabled() -> bool {

@@ -66,15 +66,14 @@ pub(super) async fn try_execute_supplier_wait_count_antijoin_sql(
         return Ok(Some(supplier_wait_output(Vec::new())?));
     }
     let stage = tpch_profile_start();
-    let counts = if supplier_wait_ordered_lineitem_enabled()
-        && let Some(counts) = lineitem_supplier_wait_counts_ordered(
-            engine,
-            lineitem.path.clone(),
-            batch_size,
-            &final_orders,
-            &suppliers,
-        )
-        .await?
+    let counts = if let Some(counts) = lineitem_supplier_wait_counts_ordered(
+        engine,
+        lineitem.path.clone(),
+        batch_size,
+        &final_orders,
+        &suppliers,
+    )
+    .await?
     {
         tpch_profile_elapsed("SupplierWait ordered lineitem counts", stage);
         counts
@@ -109,10 +108,6 @@ pub(super) async fn try_execute_supplier_wait_count_antijoin_sql(
     Ok(Some(supplier_wait_output(rows)?))
 }
 
-pub(super) fn supplier_wait_ordered_lineitem_enabled() -> bool {
-    std::env::var_os("DODAM_SupplierWait_DISABLE_ORDERED_LINEITEM").is_none()
-}
-
 pub(super) fn supplier_wait_count_antijoin_shape(
     select: &Select,
     query: &Query,
@@ -134,30 +129,15 @@ pub(super) async fn nation_keys_by_name(
     batch_size: usize,
     nation_name: &str,
 ) -> Result<HashSet<i64>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec!["n_nationkey".to_string(), "n_name".to_string()]),
-            None,
-        )
-        .await?;
-    let mut keys = HashSet::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let nationkeys = batch_column(&batch, "n_nationkey")?;
-        let names = batch_string_column(&batch, "n_name")?;
-        for row in 0..batch.num_rows() {
-            if names.is_valid(row)
-                && names.value(row) == nation_name
-                && let Some(key) = numeric_i64_value(nationkeys, row)?
-            {
-                keys.insert(key);
-            }
-        }
-    }
-    Ok(keys)
+    collect_i64_utf8_eq_set(
+        engine,
+        path,
+        batch_size,
+        "n_nationkey",
+        "n_name",
+        nation_name,
+    )
+    .await
 }
 
 pub(super) async fn supplier_names_by_nation_keys(
@@ -166,38 +146,16 @@ pub(super) async fn supplier_names_by_nation_keys(
     batch_size: usize,
     nation_keys: &HashSet<i64>,
 ) -> Result<HashMap<i64, String>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec![
-                "s_suppkey".to_string(),
-                "s_nationkey".to_string(),
-                "s_name".to_string(),
-            ]),
-            None,
-        )
-        .await?;
-    let mut suppliers = HashMap::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let suppkeys = batch_column(&batch, "s_suppkey")?;
-        let nationkeys = batch_column(&batch, "s_nationkey")?;
-        let names = batch_string_column(&batch, "s_name")?;
-        for row in 0..batch.num_rows() {
-            let (Some(suppkey), Some(nationkey)) = (
-                numeric_i64_value(suppkeys, row)?,
-                numeric_i64_value(nationkeys, row)?,
-            ) else {
-                continue;
-            };
-            if nation_keys.contains(&nationkey) && names.is_valid(row) {
-                suppliers.insert(suppkey, names.value(row).to_string());
-            }
-        }
-    }
-    Ok(suppliers)
+    collect_i64_i64_utf8_mapped_hash_map(
+        engine,
+        path,
+        batch_size,
+        "s_suppkey",
+        "s_nationkey",
+        "s_name",
+        |_, nationkey, name| nation_keys.contains(&nationkey).then(|| name.to_string()),
+    )
+    .await
 }
 
 pub(super) async fn final_order_keys_by_status(
@@ -205,9 +163,7 @@ pub(super) async fn final_order_keys_by_status(
     path: PathBuf,
     batch_size: usize,
 ) -> Result<FinalOrderKeys> {
-    if atomic_final_orders_enabled()
-        && let Some(keys) = final_order_keys_atomic(engine, path.clone(), batch_size).await?
-    {
+    if let Some(keys) = final_order_keys_atomic(engine, path.clone(), batch_size).await? {
         return Ok(keys);
     }
     let mut stream = engine
@@ -228,11 +184,6 @@ pub(super) async fn final_order_keys_by_status(
 }
 
 pub(super) type FinalOrderKeys = AdaptiveI64Set;
-
-pub(super) fn atomic_final_orders_enabled() -> bool {
-    !std::env::var("DODAM_SupplierWait_DISABLE_ATOMIC_FINAL_ORDERS")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-}
 
 pub(super) async fn final_order_keys_atomic(
     engine: &DodamEngine,
@@ -278,11 +229,7 @@ pub(super) async fn final_order_keys_atomic(
 }
 
 pub(super) fn atomic_final_order_row_group_chunk() -> usize {
-    std::env::var("DODAM_SupplierWait_ATOMIC_FINAL_ORDER_ROW_GROUP_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(8)
+    generic_row_group_map_chunk_size(8)
 }
 
 pub(super) fn final_orders_atomic_view_into(
@@ -506,13 +453,6 @@ pub(super) async fn lineitem_order_states(
     batch_size: usize,
     final_orders: FinalOrderKeys,
 ) -> Result<SupplierWaitOrderStateMap> {
-    if dense_order_state_enabled()
-        && let Some(dense_index) = dense_final_order_index(&final_orders)
-        && let Some(states) =
-            lineitem_order_states_dense(engine, path.clone(), batch_size, dense_index).await?
-    {
-        return Ok(states);
-    }
     let projection = Projection::Columns(vec![
         "l_orderkey".to_string(),
         "l_suppkey".to_string(),
@@ -521,24 +461,23 @@ pub(super) async fn lineitem_order_states(
     ]);
     let output_capacity = final_orders.len();
     let final_orders = Arc::new(final_orders);
-    if supplier_wait_row_group_map_enabled()
-        && let Some(partials) = engine
-            .parquet_row_group_map_view(
-                path.clone(),
-                batch_size,
-                projection.clone(),
-                supplier_wait_row_group_map_chunk(),
-                supplier_wait_order_state_map,
-                {
-                    let final_orders = final_orders.clone();
-                    move |view, states| {
-                        lineitem_order_states_projected_view_into(view, &final_orders, states)?;
-                        Ok(Some(()))
-                    }
-                },
-                |states| Ok(Some(states)),
-            )
-            .await?
+    if let Some(partials) = engine
+        .parquet_row_group_map_view(
+            path.clone(),
+            batch_size,
+            projection.clone(),
+            supplier_wait_row_group_map_chunk(),
+            supplier_wait_order_state_map,
+            {
+                let final_orders = final_orders.clone();
+                move |view, states| {
+                    lineitem_order_states_projected_view_into(view, &final_orders, states)?;
+                    Ok(Some(()))
+                }
+            },
+            |states| Ok(Some(states)),
+        )
+        .await?
     {
         let mut output = supplier_wait_order_state_map_with_capacity(output_capacity);
         for partial in partials {
@@ -563,274 +502,8 @@ pub(super) async fn lineitem_order_states(
     )
 }
 
-pub(super) fn supplier_wait_row_group_map_enabled() -> bool {
-    std::env::var_os("DODAM_SupplierWait_DISABLE_ROW_GROUP_MAP").is_none()
-}
-
 pub(super) fn supplier_wait_row_group_map_chunk() -> usize {
-    std::env::var("DODAM_SupplierWait_ROW_GROUP_MAP_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(2)
-}
-
-pub(super) fn dense_order_state_enabled() -> bool {
-    std::env::var("DODAM_SupplierWait_ENABLE_DENSE_ORDER_STATE")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
-}
-
-pub(super) fn dense_order_state_max_orders() -> usize {
-    std::env::var("DODAM_SupplierWait_DENSE_STATE_MAX_ORDERS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(2_000_000)
-}
-
-pub(super) struct DenseFinalOrderIndex {
-    index_by_orderkey: Vec<i32>,
-    orderkeys: Vec<i64>,
-}
-
-pub(super) fn dense_final_order_index(
-    final_orders: &FinalOrderKeys,
-) -> Option<Arc<DenseFinalOrderIndex>> {
-    let contains = final_orders.dense_contains_slice()?;
-    let selected = final_orders.len();
-    if selected > dense_order_state_max_orders() {
-        return None;
-    }
-    let mut index_by_orderkey = vec![-1_i32; contains.len()];
-    let mut orderkeys = Vec::with_capacity(selected);
-    for (orderkey, selected) in contains.iter().copied().enumerate() {
-        if !selected {
-            continue;
-        }
-        let index = i32::try_from(orderkeys.len()).ok()?;
-        index_by_orderkey[orderkey] = index;
-        orderkeys.push(orderkey as i64);
-    }
-    Some(Arc::new(DenseFinalOrderIndex {
-        index_by_orderkey,
-        orderkeys,
-    }))
-}
-
-pub(super) async fn lineitem_order_states_dense(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-    dense_index: Arc<DenseFinalOrderIndex>,
-) -> Result<Option<SupplierWaitOrderStateMap>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec![
-                "l_orderkey".to_string(),
-                "l_suppkey".to_string(),
-                "l_receiptdate".to_string(),
-                "l_commitdate".to_string(),
-            ]),
-            None,
-        )
-        .await?;
-    parallel_dense_order_states(&mut stream, lineitem_order_state_chunk_size(), dense_index)
-}
-
-pub(super) fn parallel_dense_order_states(
-    stream: &mut SendableBatchStream,
-    chunk_size: usize,
-    dense_index: Arc<DenseFinalOrderIndex>,
-) -> Result<Option<SupplierWaitOrderStateMap>> {
-    let profile = tpch_profile_enabled();
-    let started = profile.then(Instant::now);
-    let (sender, receiver) = mpsc::channel();
-    let chunk_size = chunk_size.max(1);
-    let mut pending_chunks = 0_usize;
-    let mut chunk = Vec::with_capacity(chunk_size);
-    let stream_started = profile.then(Instant::now);
-    while let Some(batch) = stream.next() {
-        chunk.push(batch?);
-        if chunk.len() < chunk_size {
-            continue;
-        }
-        let sender = sender.clone();
-        let dense_index = dense_index.clone();
-        let task_chunk = std::mem::replace(&mut chunk, Vec::with_capacity(chunk_size));
-        pending_chunks += 1;
-        rayon::spawn(move || {
-            let _ = sender.send(dense_order_states_chunk(task_chunk, dense_index));
-        });
-    }
-    if !chunk.is_empty() {
-        let sender = sender.clone();
-        let dense_index = dense_index.clone();
-        pending_chunks += 1;
-        rayon::spawn(move || {
-            let _ = sender.send(dense_order_states_chunk(chunk, dense_index));
-        });
-    }
-    let stream_ms = stream_started
-        .map(|started| started.elapsed().as_secs_f64() * 1000.0)
-        .unwrap_or_default();
-    drop(sender);
-    let merge_started = profile.then(Instant::now);
-    let mut output = DenseOrderStates::new(dense_index.orderkeys.len());
-    for _ in 0..pending_chunks {
-        let partial = receiver.recv().map_err(|_| {
-            DodamError::UnsupportedSql("SupplierWait dense worker stopped".to_string())
-        })??;
-        output.merge(partial);
-    }
-    let states = output.into_map(&dense_index.orderkeys);
-    if let Some(started) = started {
-        let merge_ms = merge_started
-            .map(|started| started.elapsed().as_secs_f64() * 1000.0)
-            .unwrap_or_default();
-        eprintln!(
-            "[dodam:tpch-profile] SupplierWait dense lineitem order states: total={:.3} ms stream_read={:.3} ms worker_wait_merge={:.3} ms chunks={pending_chunks}",
-            started.elapsed().as_secs_f64() * 1000.0,
-            stream_ms,
-            merge_ms
-        );
-    }
-    Ok(Some(states))
-}
-
-pub(super) fn dense_order_states_chunk(
-    batches: Vec<RecordBatch>,
-    dense_index: Arc<DenseFinalOrderIndex>,
-) -> Result<DenseOrderStates> {
-    let mut states = DenseOrderStates::new(dense_index.orderkeys.len());
-    for batch in batches {
-        if !dense_order_states_batch_into(&batch, &dense_index, &mut states)? {
-            return Err(DodamError::UnsupportedSql(
-                "SupplierWait dense order-state path requires typed lineitem columns".to_string(),
-            ));
-        }
-    }
-    Ok(states)
-}
-
-pub(super) struct DenseOrderStates {
-    positions: Vec<i32>,
-    states: Vec<SupplierWaitOrderState>,
-    touched: Vec<usize>,
-}
-
-impl DenseOrderStates {
-    fn new(len: usize) -> Self {
-        Self {
-            positions: vec![-1; len],
-            states: Vec::new(),
-            touched: Vec::new(),
-        }
-    }
-
-    fn state_mut(&mut self, index: usize) -> &mut SupplierWaitOrderState {
-        let position = self.positions[index];
-        let position = if position < 0 {
-            let position = self.states.len();
-            self.positions[index] =
-                i32::try_from(position).expect("SupplierWait state index overflow");
-            self.states.push(SupplierWaitOrderState::default());
-            self.touched.push(index);
-            position
-        } else {
-            position as usize
-        };
-        &mut self.states[position]
-    }
-
-    fn merge(&mut self, other: Self) {
-        for index in other.touched {
-            let position = other.positions[index];
-            debug_assert!(position >= 0);
-            self.state_mut(index).merge(other.states[position as usize]);
-        }
-    }
-
-    fn into_map(self, orderkeys: &[i64]) -> SupplierWaitOrderStateMap {
-        let mut output = supplier_wait_order_state_map_with_capacity(self.touched.len());
-        for index in self.touched {
-            let position = self.positions[index];
-            debug_assert!(position >= 0);
-            output.insert(orderkeys[index], self.states[position as usize]);
-        }
-        output
-    }
-}
-
-pub(super) fn dense_order_states_batch_into(
-    batch: &RecordBatch,
-    dense_index: &DenseFinalOrderIndex,
-    states: &mut DenseOrderStates,
-) -> Result<bool> {
-    let orderkeys = batch_column(batch, "l_orderkey")?;
-    let suppkeys = batch_column(batch, "l_suppkey")?;
-    let receipt = batch_column(batch, "l_receiptdate")?;
-    let commit = batch_column(batch, "l_commitdate")?;
-    let (Some(orderkeys), Some(suppkeys), Some(receipt), Some(commit)) = (
-        orderkeys.as_any().downcast_ref::<Int64Array>(),
-        suppkeys.as_any().downcast_ref::<Int64Array>(),
-        receipt.as_any().downcast_ref::<Date32Array>(),
-        commit.as_any().downcast_ref::<Date32Array>(),
-    ) else {
-        return Ok(false);
-    };
-    if orderkeys.null_count() == 0
-        && suppkeys.null_count() == 0
-        && receipt.null_count() == 0
-        && commit.null_count() == 0
-    {
-        let orderkeys = orderkeys.values().as_ref();
-        let suppkeys = suppkeys.values().as_ref();
-        let receipts = receipt.values().as_ref();
-        let commits = commit.values().as_ref();
-        for row in 0..orderkeys.len() {
-            let Some(index) = dense_order_index(dense_index, orderkeys[row]) else {
-                continue;
-            };
-            let state = states.state_mut(index);
-            let suppkey = suppkeys[row];
-            state.add_supplier(suppkey);
-            if receipts[row] > commits[row] {
-                state.add_late_supplier(suppkey);
-            }
-        }
-        return Ok(true);
-    }
-    for row in 0..orderkeys.len() {
-        if orderkeys.is_null(row) || suppkeys.is_null(row) {
-            continue;
-        }
-        let Some(index) = dense_order_index(dense_index, orderkeys.value(row)) else {
-            continue;
-        };
-        let state = states.state_mut(index);
-        let suppkey = suppkeys.value(row);
-        state.add_supplier(suppkey);
-        if receipt.is_null(row) || commit.is_null(row) {
-            continue;
-        }
-        if receipt.value(row) > commit.value(row) {
-            state.add_late_supplier(suppkey);
-        }
-    }
-    Ok(true)
-}
-
-pub(super) fn dense_order_index(
-    dense_index: &DenseFinalOrderIndex,
-    orderkey: i64,
-) -> Option<usize> {
-    let index = usize::try_from(orderkey).ok()?;
-    let compact = *dense_index.index_by_orderkey.get(index)?;
-    usize::try_from(compact).ok()
+    generic_row_group_map_chunk_size(2)
 }
 
 pub(super) fn parallel_batch_order_states<Map>(
@@ -881,17 +554,10 @@ where
             DodamError::UnsupportedSql("SupplierWait worker stopped".to_string())
         })??);
     }
-    let output = if supplier_wait_parallel_merge_enabled() {
-        partials
-            .into_par_iter()
-            .reduce(supplier_wait_order_state_map, merge_order_states_owned)
-    } else {
-        let mut output = supplier_wait_order_state_map_with_capacity(output_capacity);
-        for partial in partials {
-            merge_order_states(&mut output, partial);
-        }
-        output
-    };
+    let mut output = supplier_wait_order_state_map_with_capacity(output_capacity);
+    for partial in partials {
+        merge_order_states(&mut output, partial);
+    }
     if let Some(started) = started {
         let merge_ms = merge_started
             .map(|started| started.elapsed().as_secs_f64() * 1000.0)
@@ -906,18 +572,8 @@ where
     Ok(output)
 }
 
-pub(super) fn supplier_wait_parallel_merge_enabled() -> bool {
-    std::env::var("DODAM_SupplierWait_ENABLE_PARALLEL_MERGE")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
-}
-
 pub(super) fn lineitem_order_state_chunk_size() -> usize {
-    std::env::var("DODAM_SupplierWait_CHUNK_SIZE")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(48)
+    rule_chunk_size(48)
 }
 
 pub(super) fn lineitem_order_states_batch_into(
@@ -1547,17 +1203,6 @@ pub(super) fn merge_order_states(
     for (orderkey, batch_state) in batch_states {
         states.entry(orderkey).or_default().merge(batch_state);
     }
-}
-
-pub(super) fn merge_order_states_owned(
-    mut left: SupplierWaitOrderStateMap,
-    mut right: SupplierWaitOrderStateMap,
-) -> SupplierWaitOrderStateMap {
-    if left.len() < right.len() {
-        std::mem::swap(&mut left, &mut right);
-    }
-    merge_order_states(&mut left, right);
-    left
 }
 
 pub(super) struct SupplierWaitRow {

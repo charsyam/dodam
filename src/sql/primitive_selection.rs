@@ -93,7 +93,6 @@ pub(super) fn primitive_ordered_selected_batch(
                 });
             }
             DirectPrimitiveColumnType::Date32
-            | DirectPrimitiveColumnType::Decimal128Int64 { .. }
             | DirectPrimitiveColumnType::Decimal128Int64Raw { .. } => return Ok(None),
         }
     }
@@ -915,7 +914,6 @@ fn primitive_ordered_selected_batch_null_free_fast(
                 columns.push(NullFreePrimitiveColumn::I64(values));
             }
             DirectPrimitiveColumnType::Date32
-            | DirectPrimitiveColumnType::Decimal128Int64 { .. }
             | DirectPrimitiveColumnType::Decimal128Int64Raw { .. } => return Ok(None),
         }
     }

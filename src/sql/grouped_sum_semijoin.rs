@@ -133,25 +133,22 @@ async fn qualifying_order_quantities(
     batch_size: usize,
     threshold: f64,
 ) -> Result<HashMap<i64, f64>> {
-    if std::env::var_os("DODAM_Q18_DISABLE_ORDERED").is_none() {
-        if std::env::var_os("DODAM_Q18_DISABLE_PARALLEL_ORDERED").is_none()
-            && let Some(ordered) = engine
-                .ordered_i64_decimal_group_sum_above(
-                    path.clone(),
-                    batch_size,
-                    "l_orderkey",
-                    "l_quantity",
-                    threshold,
-                )
-                .await?
-        {
-            return Ok(ordered);
-        }
-        if let Some(ordered) =
-            qualifying_order_quantities_ordered(engine, path.clone(), batch_size, threshold).await?
-        {
-            return Ok(ordered);
-        }
+    if let Some(ordered) = engine
+        .ordered_i64_decimal_group_sum_above(
+            path.clone(),
+            batch_size,
+            "l_orderkey",
+            "l_quantity",
+            threshold,
+        )
+        .await?
+    {
+        return Ok(ordered);
+    }
+    if let Some(ordered) =
+        qualifying_order_quantities_ordered(engine, path.clone(), batch_size, threshold).await?
+    {
+        return Ok(ordered);
     }
     let max_dense_orderkey = engine
         .parquet_i64_column_max(path.clone(), "l_orderkey")

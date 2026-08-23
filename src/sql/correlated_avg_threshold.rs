@@ -61,11 +61,14 @@ pub(super) async fn try_execute_join_with_correlated_avg_threshold_sql(
         .and_then(select_item_alias)
         .unwrap_or_else(|| "avg_yearly".to_string());
 
-    let part_keys = matching_part_keys(
+    let part_keys = collect_i64_two_utf8_eq_set(
         engine,
         part.path,
         batch_size,
+        "p_partkey",
+        "p_brand",
         brand.as_str(),
+        "p_container",
         container.as_str(),
     )
     .await?;
@@ -99,55 +102,14 @@ fn correlated_avg_threshold_filter_shape(selection: &SqlExpr) -> bool {
         && text.contains("l_partkey = p_partkey")
 }
 
-async fn matching_part_keys(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-    brand: &str,
-    container: &str,
-) -> Result<HashSet<i64>> {
-    let mut stream = engine
-        .scan_parquet_batches(
-            path,
-            batch_size,
-            None,
-            Projection::Columns(vec![
-                "p_partkey".to_string(),
-                "p_brand".to_string(),
-                "p_container".to_string(),
-            ]),
-            None,
-        )
-        .await?;
-    let mut keys = HashSet::new();
-    while let Some(batch) = stream.next() {
-        let batch = batch?;
-        let key = batch_column(&batch, "p_partkey")?;
-        let brands = batch_string_column(&batch, "p_brand")?;
-        let containers = batch_string_column(&batch, "p_container")?;
-        for row in 0..batch.num_rows() {
-            if brands.is_valid(row)
-                && containers.is_valid(row)
-                && brands.value(row) == brand
-                && containers.value(row) == container
-                && let Some(value) = numeric_i64_value(key, row)?
-            {
-                keys.insert(value);
-            }
-        }
-    }
-    Ok(keys)
-}
-
 async fn lineitem_revenue_from_matching_parts(
     engine: &DodamEngine,
     path: PathBuf,
     batch_size: usize,
     part_keys: &HashSet<i64>,
 ) -> Result<Option<f64>> {
-    if lineitem_late_materialized_enabled()
-        && let Some(sum) =
-            lineitem_revenue_late_materialized(engine, path.clone(), batch_size, part_keys).await?
+    if let Some(sum) =
+        lineitem_revenue_late_materialized(engine, path.clone(), batch_size, part_keys).await?
     {
         return Ok(sum);
     }
@@ -453,56 +415,24 @@ fn merge_quantity_state(output: &mut HashMap<i64, (f64, u64)>, input: HashMap<i6
     }
 }
 
-fn lineitem_late_materialized_enabled() -> bool {
-    !std::env::var("DODAM_DISABLE_Q17_LATE_MATERIALIZATION")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-}
-
 fn late_materialized_row_group_chunk() -> usize {
-    std::env::var("DODAM_Q17_LATE_ROW_GROUP_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(2)
+    late_materialization_row_group_chunk(2)
 }
 
 fn late_materialized_max_selected_ratio() -> f64 {
-    std::env::var("DODAM_Q17_LATE_MAX_SELECTED_RATIO")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.20)
+    late_materialization_max_selected_ratio(0.20)
 }
 
 fn late_materialized_max_selector_run_ratio() -> f64 {
-    std::env::var("DODAM_Q17_LATE_MAX_SELECTOR_RUN_RATIO")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.20)
+    late_materialization_max_selector_run_ratio(0.20)
 }
 
 fn log_late_materialized_profile(metrics: LateMaterializedMetrics, row_group_chunk: usize) {
-    if !tpch_profile_enabled() {
-        return;
-    }
-    let ratio = if metrics.total_rows == 0 {
-        0.0
-    } else {
-        metrics.selected_rows as f64 / metrics.total_rows as f64
-    };
-    eprintln!(
-        "[dodam:tpch-profile] correlated average lineitem: late_materialized rows={} selected={} ratio={:.6} selector_runs={} row_group_chunk={}",
-        metrics.total_rows, metrics.selected_rows, ratio, metrics.selector_runs, row_group_chunk
-    );
+    tpch_profile_late_materialized("correlated average lineitem", metrics, row_group_chunk);
 }
 
 fn lineitem_chunk_size() -> usize {
-    std::env::var("DODAM_Q17_LINEITEM_CHUNK_SIZE")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(64)
+    rule_chunk_size(64)
 }
 
 fn lineitem_partial_new(part_key_count: usize) -> LineitemPartial {

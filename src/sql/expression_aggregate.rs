@@ -1232,15 +1232,6 @@ fn aggregate_order_by_prefix_matches(group_by: &[String], order_by: Option<&Sort
         .all(|(sort, group)| !sort.descending && !sort.nulls_first && sort.column == *group)
 }
 
-#[allow(dead_code)]
-fn evaluate_filter_mask_for_projected_view(
-    view: BatchView<'_>,
-    columns: &[String],
-    filter: &FilterExpr,
-) -> Result<Option<BooleanArray>> {
-    evaluate_expr_mask_for_projected_view(view, columns, filter.expr())
-}
-
 pub(super) fn push_projected_view_filter_selection(
     view: BatchView<'_>,
     columns: &[String],
@@ -1519,291 +1510,8 @@ fn push_in_list_selection_for_projected_view(
     Ok(false)
 }
 
-fn evaluate_expr_mask_for_projected_view(
-    view: BatchView<'_>,
-    columns: &[String],
-    expr: &Expr,
-) -> Result<Option<BooleanArray>> {
-    match expr {
-        Expr::Boolean(value) => Ok(Some(BooleanArray::from(vec![*value; view.num_rows()]))),
-        Expr::Comparison(comparison) => {
-            evaluate_comparison_mask_for_projected_view(view, columns, comparison)
-        }
-        Expr::InList {
-            column,
-            values,
-            negated,
-            has_null,
-        } => evaluate_in_list_mask_for_projected_view(
-            view, columns, column, values, *negated, *has_null,
-        ),
-        Expr::Not(expr) => {
-            let Some(mask) = evaluate_expr_mask_for_projected_view(view, columns, expr)? else {
-                return Ok(None);
-            };
-            Ok(Some(boolean_not(&mask)))
-        }
-        Expr::And(left, right) => {
-            let Some(left) = evaluate_expr_mask_for_projected_view(view, columns, left)? else {
-                return Ok(None);
-            };
-            let Some(right) = evaluate_expr_mask_for_projected_view(view, columns, right)? else {
-                return Ok(None);
-            };
-            Ok(Some(boolean_and(&left, &right)))
-        }
-        Expr::Or(left, right) => {
-            let Some(left) = evaluate_expr_mask_for_projected_view(view, columns, left)? else {
-                return Ok(None);
-            };
-            let Some(right) = evaluate_expr_mask_for_projected_view(view, columns, right)? else {
-                return Ok(None);
-            };
-            Ok(Some(boolean_or(&left, &right)))
-        }
-        Expr::ColumnComparison { .. } | Expr::Like { .. } | Expr::IsNull { .. } => Ok(None),
-    }
-}
-
-fn evaluate_comparison_mask_for_projected_view(
-    view: BatchView<'_>,
-    columns: &[String],
-    comparison: &ComparisonExpr,
-) -> Result<Option<BooleanArray>> {
-    if matches!(comparison.value, LiteralValue::Null) {
-        return Ok(Some(BooleanArray::from(vec![None; view.num_rows()])));
-    }
-    let Some(index) = projected_view_column_index(columns, &comparison.column) else {
-        return Ok(None);
-    };
-    if let Some(values) = view.i64_vector(index) {
-        let value = comparison.value.as_i64(&comparison.column)?;
-        return Ok(Some(compare_i64_view(values, comparison.op, value)));
-    }
-    if let Some(values) = view.i32_vector(index) {
-        let value = comparison.value.as_i32(&comparison.column)?;
-        return Ok(Some(compare_i32_view(values, comparison.op, value)));
-    }
-    if let Some(values) = view.date32_vector(index) {
-        let Some(value) = literal_as_date32_for_type(&comparison.value)? else {
-            return Ok(None);
-        };
-        return Ok(Some(compare_date32_view(values, comparison.op, value)));
-    }
-    if let Some(values) = view.decimal128_vector(index) {
-        let Some(value) = literal_to_decimal_scaled(&comparison.value, values.scale_i64())? else {
-            return Ok(None);
-        };
-        return Ok(Some(compare_decimal128_view(values, comparison.op, value)));
-    }
-    Ok(None)
-}
-
-fn evaluate_in_list_mask_for_projected_view(
-    view: BatchView<'_>,
-    columns: &[String],
-    column: &str,
-    values: &[LiteralValue],
-    negated: bool,
-    has_null: bool,
-) -> Result<Option<BooleanArray>> {
-    let Some(index) = projected_view_column_index(columns, column) else {
-        return Ok(None);
-    };
-    if let Some(probe) = view.i64_vector(index) {
-        let values = values
-            .iter()
-            .filter(|value| !matches!(value, LiteralValue::Null))
-            .map(|value| value.as_i64(column))
-            .collect::<Result<Vec<_>>>()?;
-        return Ok(Some(in_list_i64_view(probe, &values, negated, has_null)));
-    }
-    if let Some(probe) = view.i32_vector(index) {
-        let values = values
-            .iter()
-            .filter(|value| !matches!(value, LiteralValue::Null))
-            .map(|value| value.as_i32(column))
-            .collect::<Result<Vec<_>>>()?;
-        return Ok(Some(in_list_i32_view(probe, &values, negated, has_null)));
-    }
-    Ok(None)
-}
-
 fn projected_view_column_index(columns: &[String], column: &str) -> Option<usize> {
     columns.iter().position(|candidate| candidate == column)
-}
-
-fn compare_i64_view(values: I64VectorView<'_>, op: ComparisonOp, literal: i64) -> BooleanArray {
-    if let Some(raw) = values.values_if_null_free() {
-        return boolean_array_no_nulls_from_len(raw.len(), |row| {
-            compare_i64(raw[row], op, literal)
-        });
-    }
-    if let Some((data, len)) = values.raw_bytes() {
-        return boolean_array_no_nulls_from_i64_bytes(data, len, |value| {
-            compare_i64(value, op, literal)
-        });
-    }
-    let mut output = BooleanBuilder::with_capacity(values.len());
-    for row in 0..values.len() {
-        if values.is_null(row) {
-            output.append_null();
-        } else {
-            output.append_value(compare_i64(values.value(row), op, literal));
-        }
-    }
-    output.finish()
-}
-
-fn compare_i32_view(values: I32VectorView<'_>, op: ComparisonOp, literal: i32) -> BooleanArray {
-    if let Some(raw) = values.values_if_null_free() {
-        return boolean_array_no_nulls_from_len(raw.len(), |row| {
-            compare_i32(raw[row], op, literal)
-        });
-    }
-    if let Some((data, len)) = values.raw_bytes() {
-        return boolean_array_no_nulls_from_i32_bytes(data, len, |value| {
-            compare_i32(value, op, literal)
-        });
-    }
-    let mut output = BooleanBuilder::with_capacity(values.len());
-    for row in 0..values.len() {
-        if values.is_null(row) {
-            output.append_null();
-        } else {
-            output.append_value(compare_i32(values.value(row), op, literal));
-        }
-    }
-    output.finish()
-}
-
-fn compare_date32_view(
-    values: Date32VectorView<'_>,
-    op: ComparisonOp,
-    literal: i32,
-) -> BooleanArray {
-    if let Some(raw) = values.values_if_null_free() {
-        return boolean_array_no_nulls_from_len(raw.len(), |row| {
-            compare_i32(raw[row], op, literal)
-        });
-    }
-    if let Some((data, len)) = values.raw_bytes() {
-        return boolean_array_no_nulls_from_i32_bytes(data, len, |value| {
-            compare_i32(value, op, literal)
-        });
-    }
-    let mut output = BooleanBuilder::with_capacity(values.len());
-    for row in 0..values.len() {
-        if values.is_null(row) {
-            output.append_null();
-        } else {
-            output.append_value(compare_i32(values.value(row), op, literal));
-        }
-    }
-    output.finish()
-}
-
-fn compare_decimal128_view(
-    values: Decimal128VectorView<'_>,
-    op: ComparisonOp,
-    literal: i128,
-) -> BooleanArray {
-    let mut output = BooleanBuilder::with_capacity(values_len_decimal128(values));
-    if let Some(raw) = values.raw_i64_values() {
-        for row in 0..raw.len() {
-            if values.is_null(row) {
-                output.append_null();
-            } else {
-                output.append_value(compare_i128(i128::from(raw[row]), op, literal));
-            }
-        }
-    } else if let Some((data, len)) = values.raw_i64_bytes() {
-        for row in 0..len {
-            output.append_value(compare_i128(
-                i128::from(read_i64_le_unaligned(data, row)),
-                op,
-                literal,
-            ));
-        }
-    } else {
-        let raw = values.raw_values();
-        for row in 0..raw.len() {
-            if values.is_null(row) {
-                output.append_null();
-            } else {
-                output.append_value(compare_i128(raw[row], op, literal));
-            }
-        }
-    }
-    output.finish()
-}
-
-fn values_len_decimal128(values: Decimal128VectorView<'_>) -> usize {
-    values.len()
-}
-
-fn in_list_i64_view(
-    values: I64VectorView<'_>,
-    list: &[i64],
-    negated: bool,
-    has_null: bool,
-) -> BooleanArray {
-    if !has_null && let Some(raw) = values.values_if_null_free() {
-        return boolean_array_no_nulls_from_len(raw.len(), |row| {
-            selected_in_list_result(small_in_list_match_i64(raw[row], list), negated, false)
-        });
-    }
-    if !has_null && let Some((data, len)) = values.raw_bytes() {
-        return boolean_array_no_nulls_from_i64_bytes(data, len, |value| {
-            selected_in_list_result(small_in_list_match_i64(value, list), negated, false)
-        });
-    }
-    let mut output = BooleanBuilder::with_capacity(values.len());
-    for row in 0..values.len() {
-        if values.is_null(row) {
-            output.append_null();
-            continue;
-        }
-        append_in_list_result(
-            &mut output,
-            small_in_list_match_i64(values.value(row), list),
-            negated,
-            has_null,
-        );
-    }
-    output.finish()
-}
-
-fn in_list_i32_view(
-    values: I32VectorView<'_>,
-    list: &[i32],
-    negated: bool,
-    has_null: bool,
-) -> BooleanArray {
-    if !has_null && let Some(raw) = values.values_if_null_free() {
-        return boolean_array_no_nulls_from_len(raw.len(), |row| {
-            selected_in_list_result(small_in_list_match_i32(raw[row], list), negated, false)
-        });
-    }
-    if !has_null && let Some((data, len)) = values.raw_bytes() {
-        return boolean_array_no_nulls_from_i32_bytes(data, len, |value| {
-            selected_in_list_result(small_in_list_match_i32(value, list), negated, false)
-        });
-    }
-    let mut output = BooleanBuilder::with_capacity(values.len());
-    for row in 0..values.len() {
-        if values.is_null(row) {
-            output.append_null();
-            continue;
-        }
-        append_in_list_result(
-            &mut output,
-            small_in_list_match_i32(values.value(row), list),
-            negated,
-            has_null,
-        );
-    }
-    output.finish()
 }
 
 fn small_in_list_match_i64(value: i64, list: &[i64]) -> bool {
@@ -1828,21 +1536,6 @@ fn small_in_list_match_i32(value: i32, list: &[i32]) -> bool {
     }
 }
 
-fn append_in_list_result(
-    output: &mut BooleanBuilder,
-    matched: bool,
-    negated: bool,
-    has_null: bool,
-) {
-    if matched {
-        output.append_value(!negated);
-    } else if has_null {
-        output.append_null();
-    } else {
-        output.append_value(negated);
-    }
-}
-
 fn selected_in_list_result(matched: bool, negated: bool, has_null: bool) -> bool {
     if matched {
         !negated
@@ -1860,32 +1553,6 @@ pub(super) fn boolean_array_no_nulls_from_len(
     let mut values = BooleanBufferBuilder::new(len);
     for row in 0..len {
         values.append(value_at(row));
-    }
-    BooleanArray::new(values.build(), None)
-}
-
-fn boolean_array_no_nulls_from_i32_bytes(
-    data: &[u8],
-    len: usize,
-    mut value_at: impl FnMut(i32) -> bool,
-) -> BooleanArray {
-    debug_assert!(data.len() >= len.saturating_mul(std::mem::size_of::<i32>()));
-    let mut values = BooleanBufferBuilder::new(len);
-    for row in 0..len {
-        values.append(value_at(read_i32_le_unaligned(data, row)));
-    }
-    BooleanArray::new(values.build(), None)
-}
-
-fn boolean_array_no_nulls_from_i64_bytes(
-    data: &[u8],
-    len: usize,
-    mut value_at: impl FnMut(i64) -> bool,
-) -> BooleanArray {
-    debug_assert!(data.len() >= len.saturating_mul(std::mem::size_of::<i64>()));
-    let mut values = BooleanBufferBuilder::new(len);
-    for row in 0..len {
-        values.append(value_at(read_i64_le_unaligned(data, row)));
     }
     BooleanArray::new(values.build(), None)
 }
@@ -2551,11 +2218,10 @@ fn expression_aggregate_dictionary_columns(group_keys: &[GroupKeyExpr]) -> Vec<S
 }
 
 fn expression_aggregate_row_group_map_chunk() -> usize {
-    std::env::var("DODAM_EXPRESSION_AGG_ROW_GROUP_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or_else(scan_aggregate_row_group_chunk)
+    row_group_map_chunk_size(
+        "DODAM_EXPRESSION_AGG_ROW_GROUP_CHUNK",
+        scan_aggregate_row_group_chunk(),
+    )
 }
 
 pub(super) fn group_key_exprs_for_aggregate(

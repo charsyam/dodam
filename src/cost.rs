@@ -298,27 +298,6 @@ pub fn choose_selected_payload_by_spread(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct FragmentedSelectedPayloadCostInput {
-    pub selected_rows: usize,
-    pub selected_runs: usize,
-    pub min_selected_runs: usize,
-    pub max_average_run_len: usize,
-}
-
-pub fn choose_fragmented_selected_payload_full_decode(
-    input: FragmentedSelectedPayloadCostInput,
-) -> bool {
-    if input.selected_rows == 0 || input.selected_runs == 0 {
-        return false;
-    }
-    input.selected_runs >= input.min_selected_runs.max(1)
-        && input.selected_rows
-            <= input
-                .selected_runs
-                .saturating_mul(input.max_average_run_len.max(1))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LateMaterializationCostInput {
     pub total_rows: usize,
     pub selected_rows: usize,
@@ -428,6 +407,125 @@ pub fn choose_late_materialization_projection_selected_ratio(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LateCoalesceGapCostInput {
+    pub selected_rows: usize,
+    pub natural_selector_runs: usize,
+    pub candidate_selector_runs: usize,
+    pub candidate_payload_rows: usize,
+    pub selector_run_cost_rows: usize,
+    pub max_payload_expansion_rows_per_selected: usize,
+}
+
+pub fn choose_late_coalesce_candidate(input: LateCoalesceGapCostInput) -> bool {
+    if input.selected_rows == 0 {
+        return false;
+    }
+    if input.candidate_payload_rows < input.selected_rows {
+        return false;
+    }
+    let max_payload_rows = input.selected_rows.saturating_add(
+        input
+            .selected_rows
+            .saturating_mul(input.max_payload_expansion_rows_per_selected),
+    );
+    if input.candidate_payload_rows > max_payload_rows {
+        return false;
+    }
+    let run_cost = input.selector_run_cost_rows.max(1);
+    let natural_cost = input
+        .selected_rows
+        .saturating_add(input.natural_selector_runs.saturating_mul(run_cost));
+    let candidate_cost = input
+        .candidate_payload_rows
+        .saturating_add(input.candidate_selector_runs.saturating_mul(run_cost));
+    candidate_cost < natural_cost
+}
+
+pub fn choose_late_coalesce_max_gap(
+    selected_offsets: &[u32],
+    max_gap: usize,
+    selector_run_cost_rows: usize,
+    max_payload_expansion_rows_per_selected: usize,
+) -> usize {
+    if max_gap == 0 || selected_offsets.len() <= 1 {
+        return 0;
+    }
+    let mut best_gap = 0usize;
+    let mut best_cost = selected_offsets.len().saturating_add(
+        selected_offsets
+            .len()
+            .saturating_mul(selector_run_cost_rows.max(1)),
+    );
+    let mut candidate = 1usize;
+    while candidate <= max_gap {
+        let (candidate_runs, candidate_payload_rows) =
+            late_coalesce_candidate_metrics(selected_offsets, candidate);
+        if choose_late_coalesce_candidate(LateCoalesceGapCostInput {
+            selected_rows: selected_offsets.len(),
+            natural_selector_runs: selected_offsets.len(),
+            candidate_selector_runs: candidate_runs,
+            candidate_payload_rows,
+            selector_run_cost_rows,
+            max_payload_expansion_rows_per_selected,
+        }) {
+            let candidate_cost = candidate_payload_rows
+                .saturating_add(candidate_runs.saturating_mul(selector_run_cost_rows.max(1)));
+            if candidate_cost < best_cost {
+                best_cost = candidate_cost;
+                best_gap = candidate;
+            }
+        }
+        candidate = candidate.saturating_mul(2);
+        if candidate == 0 {
+            break;
+        }
+    }
+    if best_gap < max_gap {
+        let (candidate_runs, candidate_payload_rows) =
+            late_coalesce_candidate_metrics(selected_offsets, max_gap);
+        if choose_late_coalesce_candidate(LateCoalesceGapCostInput {
+            selected_rows: selected_offsets.len(),
+            natural_selector_runs: selected_offsets.len(),
+            candidate_selector_runs: candidate_runs,
+            candidate_payload_rows,
+            selector_run_cost_rows,
+            max_payload_expansion_rows_per_selected,
+        }) {
+            let candidate_cost = candidate_payload_rows
+                .saturating_add(candidate_runs.saturating_mul(selector_run_cost_rows.max(1)));
+            if candidate_cost < best_cost {
+                best_gap = max_gap;
+            }
+        }
+    }
+    best_gap
+}
+
+fn late_coalesce_candidate_metrics(selected_offsets: &[u32], max_gap: usize) -> (usize, usize) {
+    if selected_offsets.is_empty() {
+        return (0, 0);
+    }
+    let mut runs = 1usize;
+    let mut payload_rows = 1usize;
+    let mut previous = selected_offsets[0] as usize;
+    for &offset in &selected_offsets[1..] {
+        let offset = offset as usize;
+        if offset <= previous {
+            continue;
+        }
+        let gap = offset - previous - 1;
+        if gap <= max_gap {
+            payload_rows = payload_rows.saturating_add(gap).saturating_add(1);
+        } else {
+            runs = runs.saturating_add(1);
+            payload_rows = payload_rows.saturating_add(1);
+        }
+        previous = offset;
+    }
+    (runs, payload_rows)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExpressionAggregateLateChunkCostInput {
     pub ordered_output: bool,
     pub output_limit: Option<usize>,
@@ -444,6 +542,19 @@ pub fn choose_expression_aggregate_late_row_group_chunk(
     } else {
         default_chunk
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowGroupMapChunkCostInput {
+    pub requested_chunk: Option<usize>,
+    pub default_chunk: usize,
+}
+
+pub fn choose_row_group_map_chunk(input: RowGroupMapChunkCostInput) -> usize {
+    input
+        .requested_chunk
+        .filter(|chunk| *chunk > 0)
+        .unwrap_or_else(|| input.default_chunk.max(1))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -658,34 +769,6 @@ mod tests {
     }
 
     #[test]
-    fn fragmented_selected_payload_full_decode_requires_many_short_runs() {
-        assert!(choose_fragmented_selected_payload_full_decode(
-            FragmentedSelectedPayloadCostInput {
-                selected_rows: 108_434,
-                selected_runs: 98_786,
-                min_selected_runs: 4096,
-                max_average_run_len: 2,
-            }
-        ));
-        assert!(!choose_fragmented_selected_payload_full_decode(
-            FragmentedSelectedPayloadCostInput {
-                selected_rows: 108_434,
-                selected_runs: 100,
-                min_selected_runs: 4096,
-                max_average_run_len: 2,
-            }
-        ));
-        assert!(!choose_fragmented_selected_payload_full_decode(
-            FragmentedSelectedPayloadCostInput {
-                selected_rows: 10_000,
-                selected_runs: 1000,
-                min_selected_runs: 4096,
-                max_average_run_len: 2,
-            }
-        ));
-    }
-
-    #[test]
     fn parallel_workers_are_bounded() {
         assert_eq!(
             choose_parallel_workers(WorkerCostInput {
@@ -736,6 +819,36 @@ mod tests {
     }
 
     #[test]
+    fn late_materialization_rejects_fragmented_selected_payload() {
+        assert!(!choose_late_materialization(LateMaterializationCostInput {
+            total_rows: 1_000,
+            selected_rows: 100,
+            selector_runs: 201,
+            max_selected_ratio: Some(0.2),
+            max_selector_run_ratio: Some(0.5),
+            max_selector_runs_per_selected: Some(2.0),
+            io_cost_gate: false,
+            predicate_compressed_bytes: 1,
+            payload_compressed_bytes: 100,
+            min_io_saving_ratio: 0.2,
+            io_override: true,
+        }));
+        assert!(choose_late_materialization(LateMaterializationCostInput {
+            total_rows: 1_000,
+            selected_rows: 100,
+            selector_runs: 200,
+            max_selected_ratio: Some(0.2),
+            max_selector_run_ratio: Some(0.5),
+            max_selector_runs_per_selected: Some(2.0),
+            io_cost_gate: false,
+            predicate_compressed_bytes: 1,
+            payload_compressed_bytes: 100,
+            min_io_saving_ratio: 0.2,
+            io_override: true,
+        }));
+    }
+
+    #[test]
     fn projection_selected_ratio_caps_narrow_payload() {
         assert_eq!(
             choose_late_materialization_projection_selected_ratio(ProjectionSelectivityCostInput {
@@ -755,6 +868,14 @@ mod tests {
             }),
             0.75
         );
+    }
+
+    #[test]
+    fn late_coalesce_gap_balances_runs_against_payload_rows() {
+        assert_eq!(choose_late_coalesce_max_gap(&[1, 3, 5, 100], 8, 4, 8), 1);
+        assert_eq!(choose_late_coalesce_max_gap(&[1, 20, 40], 8, 4, 8), 0);
+        assert_eq!(choose_late_coalesce_max_gap(&[1, 3, 5, 7], 8, 4, 0), 0);
+        assert_eq!(choose_late_coalesce_max_gap(&[1, 3, 5, 7], 8, 4, 8), 1);
     }
 
     #[test]
@@ -900,6 +1021,31 @@ mod tests {
                 }
             ),
             2
+        );
+    }
+
+    #[test]
+    fn row_group_map_chunk_uses_requested_or_sanitized_default() {
+        assert_eq!(
+            choose_row_group_map_chunk(RowGroupMapChunkCostInput {
+                requested_chunk: Some(8),
+                default_chunk: 2,
+            }),
+            8
+        );
+        assert_eq!(
+            choose_row_group_map_chunk(RowGroupMapChunkCostInput {
+                requested_chunk: Some(0),
+                default_chunk: 2,
+            }),
+            2
+        );
+        assert_eq!(
+            choose_row_group_map_chunk(RowGroupMapChunkCostInput {
+                requested_chunk: None,
+                default_chunk: 0,
+            }),
+            1
         );
     }
 }

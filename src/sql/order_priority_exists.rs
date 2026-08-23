@@ -139,27 +139,20 @@ async fn q04_candidate_order_priorities(
     start_days: i32,
     end_days: i32,
 ) -> Result<(Vec<u8>, Vec<String>, usize)> {
-    if q04_candidate_row_group_map_enabled()
-        && let Some(candidates) = q04_candidate_order_priorities_row_group_map(
-            engine,
-            path.clone(),
-            batch_size,
-            start_days,
-            end_days,
-        )
-        .await?
+    if let Some(candidates) = q04_candidate_order_priorities_row_group_map(
+        engine,
+        path.clone(),
+        batch_size,
+        start_days,
+        end_days,
+    )
+    .await?
     {
         return Ok(candidates);
     }
-    if std::env::var_os("DODAM_Q04_DISABLE_LATE_CANDIDATES").is_none()
-        && let Some(candidates) = q04_candidate_order_priorities_late(
-            engine,
-            path.clone(),
-            batch_size,
-            start_days,
-            end_days,
-        )
-        .await?
+    if let Some(candidates) =
+        q04_candidate_order_priorities_late(engine, path.clone(), batch_size, start_days, end_days)
+            .await?
     {
         return Ok(candidates);
     }
@@ -202,9 +195,7 @@ async fn q04_candidate_order_priorities_row_group_map(
     start_days: i32,
     end_days: i32,
 ) -> Result<Option<(Vec<u8>, Vec<String>, usize)>> {
-    let dictionary_columns = q04_candidate_dictionary_priority_enabled()
-        .then(|| vec!["o_orderpriority".to_string()])
-        .unwrap_or_default();
+    let dictionary_columns = vec!["o_orderpriority".to_string()];
     let Some(partials) = engine
         .parquet_row_group_map_scan_view(
             path,
@@ -234,20 +225,8 @@ async fn q04_candidate_order_priorities_row_group_map(
     Ok(Some(q04_candidate_priorities_from_partials(partials)?))
 }
 
-fn q04_candidate_row_group_map_enabled() -> bool {
-    std::env::var_os("DODAM_Q04_DISABLE_CANDIDATE_ROW_GROUP_MAP").is_none()
-}
-
-fn q04_candidate_dictionary_priority_enabled() -> bool {
-    std::env::var_os("DODAM_Q04_DISABLE_CANDIDATE_DICTIONARY_PRIORITY").is_none()
-}
-
 fn q04_candidate_row_group_map_chunk() -> usize {
-    std::env::var("DODAM_Q04_CANDIDATE_ROW_GROUP_MAP_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(2)
+    generic_row_group_map_chunk_size(2)
 }
 
 async fn q04_candidate_order_priorities_late(
@@ -268,12 +247,10 @@ async fn q04_candidate_order_priorities_late(
             payload_projection.clone(),
             date_range_pruning_predicates("o_orderdate", start_days, end_days),
             q04_late_candidate_row_group_chunk(),
-            late_materialization_policy_from_projection_env(
+            generic_late_materialization_policy_for_projection(
                 &predicate_projection,
                 &payload_projection,
-                "DODAM_Q04_LATE_MAX_SELECTED_RATIO",
                 0.60,
-                None,
                 None,
             ),
             move || Q04LateCandidateState {
@@ -316,11 +293,7 @@ async fn q04_candidate_order_priorities_late(
 }
 
 fn q04_late_candidate_row_group_chunk() -> usize {
-    std::env::var("DODAM_Q04_LATE_CANDIDATE_ROW_GROUP_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(4)
+    late_materialization_row_group_chunk(4)
 }
 
 struct Q04LateCandidateState {
@@ -802,18 +775,7 @@ fn q04_candidate_priorities_from_partials(
 }
 
 fn q04_log_late_candidate_profile(metrics: LateMaterializedMetrics, row_group_chunk: usize) {
-    if !tpch_profile_enabled() {
-        return;
-    }
-    let ratio = if metrics.total_rows == 0 {
-        0.0
-    } else {
-        metrics.selected_rows as f64 / metrics.total_rows as f64
-    };
-    eprintln!(
-        "[dodam:tpch-profile] Q04 candidates: late_materialized rows={} selected={} ratio={:.6} selector_runs={} row_group_chunk={}",
-        metrics.total_rows, metrics.selected_rows, ratio, metrics.selector_runs, row_group_chunk
-    );
+    tpch_profile_late_materialized("Q04 candidates", metrics, row_group_chunk);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -982,38 +944,25 @@ async fn q04_count_late_candidate_priorities(
     candidate_count: usize,
     priority_count: usize,
 ) -> Result<Vec<u64>> {
-    if q04_lineitem_direct_column_reader_enabled()
-        && let Some(counts) = q04_count_late_candidate_priorities_direct_column_reader(
-            engine,
-            path.clone(),
-            batch_size,
-            candidate_priorities,
-            priority_count,
-        )?
+    if let Some(counts) = q04_count_late_candidate_priorities_late_materialized(
+        engine,
+        path.clone(),
+        batch_size,
+        candidate_priorities,
+        priority_count,
+    )
+    .await?
     {
         return Ok(counts);
     }
-    if q04_lineitem_late_materialized_enabled()
-        && let Some(counts) = q04_count_late_candidate_priorities_late_materialized(
-            engine,
-            path.clone(),
-            batch_size,
-            candidate_priorities,
-            priority_count,
-        )
-        .await?
-    {
-        return Ok(counts);
-    }
-    if q04_lineitem_row_group_map_enabled()
-        && let Some(counts) = q04_count_late_candidate_priorities_row_group_map(
-            engine,
-            path.clone(),
-            batch_size,
-            candidate_priorities,
-            priority_count,
-        )
-        .await?
+    if let Some(counts) = q04_count_late_candidate_priorities_row_group_map(
+        engine,
+        path.clone(),
+        batch_size,
+        candidate_priorities,
+        priority_count,
+    )
+    .await?
     {
         return Ok(counts);
     }
@@ -1061,180 +1010,6 @@ async fn q04_count_late_candidate_priorities(
     Ok(counts)
 }
 
-fn q04_lineitem_direct_column_reader_enabled() -> bool {
-    std::env::var("DODAM_Q04_ENABLE_LINEITEM_DIRECT_COLUMN_READER")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-}
-
-fn q04_count_late_candidate_priorities_direct_column_reader(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-    candidate_priorities: &[u8],
-    priority_count: usize,
-) -> Result<Option<Vec<u64>>> {
-    let started = tpch_profile_start();
-    let row_groups = (0..engine.parquet_row_group_count(&path)?).collect::<Vec<_>>();
-    let candidate_bloom = Arc::new(q04_candidate_bloom(candidate_priorities));
-    let candidate_priorities = q04_atomic_candidate_priorities(candidate_priorities);
-    let chunks = row_groups
-        .chunks(q04_lineitem_direct_row_group_chunk())
-        .map(|chunk| chunk.to_vec())
-        .collect::<Vec<_>>();
-    let profile = tpch_profile_enabled();
-    let partials = chunks
-        .into_par_iter()
-        .map(|row_groups| {
-            q04_lineitem_direct_column_chunk_scan(
-                engine,
-                path.clone(),
-                batch_size,
-                row_groups,
-                candidate_priorities.clone(),
-                candidate_bloom.clone(),
-                priority_count,
-                profile,
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut counts = vec![0_u64; priority_count];
-    let mut metrics = Q04LineitemDirectMetrics::default();
-    for partial in partials {
-        let Some(partial) = partial else {
-            return Ok(None);
-        };
-        for (index, count) in partial.counts.into_iter().enumerate() {
-            counts[index] += count;
-        }
-        metrics.add(partial.metrics);
-    }
-    if let Some(started) = started {
-        eprintln!(
-            "[dodam:tpch-profile] Q04 lineitem direct_column_reader: total={:.3} ms row_groups={} batches={} rows={} hits={} misses={} read={:.3} ms consume={:.3} ms",
-            started.elapsed().as_secs_f64() * 1000.0,
-            metrics.row_groups,
-            metrics.batches,
-            metrics.rows,
-            metrics.hits,
-            metrics.misses,
-            sql_nanos_to_millis(metrics.read_nanos),
-            sql_nanos_to_millis(metrics.consume_nanos),
-        );
-    }
-    Ok(Some(counts))
-}
-
-fn q04_lineitem_direct_row_group_chunk() -> usize {
-    std::env::var("DODAM_Q04_LINEITEM_DIRECT_ROW_GROUP_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(2)
-}
-
-struct Q04LineitemDirectPartial {
-    counts: Vec<u64>,
-    metrics: Q04LineitemDirectMetrics,
-}
-
-#[derive(Default)]
-struct Q04LineitemDirectMetrics {
-    row_groups: usize,
-    batches: usize,
-    rows: usize,
-    hits: usize,
-    misses: usize,
-    read_nanos: u64,
-    consume_nanos: u64,
-}
-
-impl Q04LineitemDirectMetrics {
-    fn from_scan_metrics(metrics: DirectI64I32I32ScanMetrics, hits: usize, misses: usize) -> Self {
-        Self {
-            row_groups: metrics.row_groups,
-            batches: metrics.batches,
-            rows: metrics.rows,
-            hits,
-            misses,
-            read_nanos: metrics.read_nanos,
-            consume_nanos: metrics.consume_nanos,
-        }
-    }
-
-    fn add(&mut self, other: Self) {
-        self.row_groups = self.row_groups.saturating_add(other.row_groups);
-        self.batches = self.batches.saturating_add(other.batches);
-        self.rows = self.rows.saturating_add(other.rows);
-        self.hits = self.hits.saturating_add(other.hits);
-        self.misses = self.misses.saturating_add(other.misses);
-        self.read_nanos = self.read_nanos.saturating_add(other.read_nanos);
-        self.consume_nanos = self.consume_nanos.saturating_add(other.consume_nanos);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn q04_lineitem_direct_column_chunk_scan(
-    engine: &DodamEngine,
-    path: PathBuf,
-    batch_size: usize,
-    row_groups: Vec<usize>,
-    candidate_priorities: Arc<Vec<AtomicU8>>,
-    candidate_bloom: Arc<Option<Q04CandidateBloom>>,
-    priority_count: usize,
-    profile: bool,
-) -> Result<Option<Q04LineitemDirectPartial>> {
-    let started = profile.then(Instant::now);
-    let mut partial = Q04LineitemDirectPartial {
-        counts: vec![0_u64; priority_count],
-        metrics: Q04LineitemDirectMetrics::default(),
-    };
-    let mut hits = 0usize;
-    let mut misses = 0usize;
-    let Some(scan_metrics) = engine.scan_parquet_i64_i32_i32_columns_view(
-        &path,
-        batch_size,
-        &row_groups,
-        ["l_orderkey", "l_commitdate", "l_receiptdate"],
-        |view| {
-            if let Some((orderkeys, _, _)) = view.raw_i64_i32_i32() {
-                let batch_hits = q04_count_late_candidate_priorities_atomic_view_hits(
-                    view,
-                    &candidate_priorities,
-                    candidate_bloom.as_ref().as_ref(),
-                    &mut partial.counts,
-                )?;
-                hits = hits.saturating_add(batch_hits);
-                misses = misses.saturating_add(orderkeys.len().saturating_sub(batch_hits));
-                return Ok(());
-            }
-            q04_count_late_candidate_priorities_atomic_view(
-                view,
-                &candidate_priorities,
-                candidate_bloom.as_ref().as_ref(),
-                &mut partial.counts,
-            )?;
-            Ok(())
-        },
-    )?
-    else {
-        return Ok(None);
-    };
-    partial.metrics = Q04LineitemDirectMetrics::from_scan_metrics(scan_metrics, hits, misses);
-    if let Some(started) = started {
-        eprintln!(
-            "[dodam:tpch-profile] Q04 lineitem direct_column_chunk: row_groups={} rows={} hits={} misses={} elapsed={:.3} ms read={:.3} ms consume={:.3} ms",
-            partial.metrics.row_groups,
-            partial.metrics.rows,
-            partial.metrics.hits,
-            partial.metrics.misses,
-            started.elapsed().as_secs_f64() * 1000.0,
-            sql_nanos_to_millis(partial.metrics.read_nanos),
-            sql_nanos_to_millis(partial.metrics.consume_nanos),
-        );
-    }
-    Ok(Some(partial))
-}
-
 async fn q04_count_late_candidate_priorities_late_materialized(
     engine: &DodamEngine,
     path: PathBuf,
@@ -1259,12 +1034,10 @@ async fn q04_count_late_candidate_priorities_late_materialized(
             payload_projection.clone(),
             pruning_predicates,
             q04_lineitem_late_materialized_row_group_chunk(),
-            late_materialization_policy_from_projection_env(
+            generic_late_materialization_policy_for_projection(
                 &predicate_projection,
                 &payload_projection,
-                "DODAM_Q04_LINEITEM_LATE_MAX_SELECTED_RATIO",
                 0.10,
-                Some("DODAM_Q04_LINEITEM_LATE_MAX_SELECTOR_RUN_RATIO"),
                 Some(0.50),
             ),
             {
@@ -1307,21 +1080,8 @@ async fn q04_count_late_candidate_priorities_late_materialized(
     Ok(Some(counts))
 }
 
-fn q04_lineitem_late_materialized_enabled() -> bool {
-    if std::env::var("DODAM_Q04_DISABLE_LINEITEM_LATE_MATERIALIZE")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-    {
-        return false;
-    }
-    true
-}
-
 fn q04_lineitem_late_materialized_row_group_chunk() -> usize {
-    std::env::var("DODAM_Q04_LINEITEM_LATE_ROW_GROUP_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(2)
+    late_materialization_row_group_chunk(2)
 }
 
 struct Q04LineitemLateState {
@@ -1540,18 +1300,7 @@ fn q04_log_lineitem_late_materialized_profile(
     metrics: LateMaterializedMetrics,
     row_group_chunk: usize,
 ) {
-    if !tpch_profile_enabled() {
-        return;
-    }
-    let ratio = if metrics.total_rows == 0 {
-        0.0
-    } else {
-        metrics.selected_rows as f64 / metrics.total_rows as f64
-    };
-    eprintln!(
-        "[dodam:tpch-profile] Q04 lineitem: late_materialized rows={} selected={} ratio={:.6} selector_runs={} row_group_chunk={}",
-        metrics.total_rows, metrics.selected_rows, ratio, metrics.selector_runs, row_group_chunk
-    );
+    tpch_profile_late_materialized("Q04 lineitem", metrics, row_group_chunk);
 }
 
 fn q04_candidate_key_set(candidate_priorities: &[u8]) -> HashSet<i64> {
@@ -1579,63 +1328,16 @@ async fn q04_count_late_candidate_priorities_row_group_map(
     let pruning_predicates = selective_candidate_priority_range(candidate_priorities)
         .map(|(min_key, max_key)| i64_range_pruning_predicates("l_orderkey", min_key, max_key))
         .unwrap_or_default();
-    if q04_atomic_lineitem_probe_enabled() {
-        return q04_count_late_candidate_priorities_atomic_row_group_map(
-            engine,
-            path,
-            batch_size,
-            projection,
-            pruning_predicates,
-            candidate_priorities,
-            priority_count,
-        )
-        .await;
-    }
-    let candidate_priorities = Arc::new(candidate_priorities.to_vec());
-    let Some(mut partials) = engine
-        .parquet_row_group_map_pruned_view(
-            path,
-            batch_size,
-            projection,
-            pruning_predicates,
-            q04_lineitem_row_group_map_chunk(),
-            Vec::<i64>::new,
-            {
-                let candidate_priorities = candidate_priorities.clone();
-                move |view, matched_orderkeys: &mut Vec<i64>| {
-                    q04_collect_late_candidate_orderkeys_view(
-                        view,
-                        &candidate_priorities,
-                        matched_orderkeys,
-                    )
-                }
-            },
-            |matched_orderkeys| Ok(Some(matched_orderkeys)),
-        )
-        .await?
-    else {
-        return Ok(None);
-    };
-    let mut matched_orderkeys = Vec::new();
-    for partial in partials.iter_mut() {
-        matched_orderkeys.append(partial);
-    }
-    matched_orderkeys.sort_unstable();
-    matched_orderkeys.dedup();
-    let mut counts = vec![0_u64; priority_count];
-    for orderkey in matched_orderkeys {
-        let Ok(orderkey) = usize::try_from(orderkey) else {
-            continue;
-        };
-        let Some(priority_marker) = candidate_priorities.get(orderkey).copied() else {
-            continue;
-        };
-        if priority_marker == 0 {
-            continue;
-        }
-        counts[usize::from(priority_marker - 1)] += 1;
-    }
-    Ok(Some(counts))
+    q04_count_late_candidate_priorities_atomic_row_group_map(
+        engine,
+        path,
+        batch_size,
+        projection,
+        pruning_predicates,
+        candidate_priorities,
+        priority_count,
+    )
+    .await
 }
 
 async fn q04_count_late_candidate_priorities_atomic_row_group_map(
@@ -1647,7 +1349,6 @@ async fn q04_count_late_candidate_priorities_atomic_row_group_map(
     candidate_priorities: &[u8],
     priority_count: usize,
 ) -> Result<Option<Vec<u64>>> {
-    let candidate_bloom = Arc::new(q04_candidate_bloom(candidate_priorities));
     let candidate_priorities = q04_atomic_candidate_priorities(candidate_priorities);
     let Some(partials) = engine
         .parquet_row_group_map_pruned_view(
@@ -1659,12 +1360,10 @@ async fn q04_count_late_candidate_priorities_atomic_row_group_map(
             move || vec![0_u64; priority_count],
             {
                 let candidate_priorities = candidate_priorities.clone();
-                let candidate_bloom = candidate_bloom.clone();
                 move |view, counts: &mut Vec<u64>| {
                     q04_count_late_candidate_priorities_atomic_view(
                         view,
                         &candidate_priorities,
-                        candidate_bloom.as_ref().as_ref(),
                         counts,
                     )
                 }
@@ -1687,22 +1386,15 @@ async fn q04_count_late_candidate_priorities_atomic_row_group_map(
 fn q04_count_late_candidate_priorities_atomic_view(
     view: BatchView<'_>,
     candidate_priorities: &[AtomicU8],
-    candidate_bloom: Option<&Q04CandidateBloom>,
     counts: &mut [u64],
 ) -> Result<Option<()>> {
-    q04_count_late_candidate_priorities_atomic_view_hits(
-        view,
-        candidate_priorities,
-        candidate_bloom,
-        counts,
-    )?;
+    q04_count_late_candidate_priorities_atomic_view_hits(view, candidate_priorities, counts)?;
     Ok(Some(()))
 }
 
 fn q04_count_late_candidate_priorities_atomic_view_hits(
     view: BatchView<'_>,
     candidate_priorities: &[AtomicU8],
-    candidate_bloom: Option<&Q04CandidateBloom>,
     counts: &mut [u64],
 ) -> Result<usize> {
     if let Some((orderkeys, commitdates, receiptdates)) = view.raw_i64_i32_i32() {
@@ -1711,7 +1403,6 @@ fn q04_count_late_candidate_priorities_atomic_view_hits(
             commitdates,
             receiptdates,
             candidate_priorities,
-            candidate_bloom,
             counts,
         ));
     }
@@ -1727,7 +1418,6 @@ fn q04_count_late_candidate_priorities_atomic_view_hits(
             commitdates,
             receiptdates,
             candidate_priorities,
-            candidate_bloom,
             counts,
         );
         return Ok(0);
@@ -1740,206 +1430,30 @@ fn q04_count_late_candidate_priorities_atomic_view_hits(
     let _ = q04_count_late_candidate_priorities_atomic_batch(
         batch.clone(),
         candidate_priorities,
-        candidate_bloom,
         counts,
     )?;
     Ok(0)
 }
 
 fn q04_lineitem_row_filter_enabled(candidate_key_count: usize) -> bool {
-    if std::env::var("DODAM_Q04_DISABLE_LINEITEM_ROW_FILTER")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-    {
-        return false;
-    }
-    if std::env::var("DODAM_Q04_ENABLE_LINEITEM_ROW_FILTER")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-    {
-        return true;
-    }
     candidate_key_count <= q04_lineitem_row_filter_max_keys()
 }
 
 fn q04_lineitem_row_filter_max_keys() -> usize {
-    std::env::var("DODAM_Q04_LINEITEM_ROW_FILTER_MAX_KEYS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(100_000)
-}
-
-fn q04_atomic_lineitem_probe_enabled() -> bool {
-    std::env::var("DODAM_Q04_DISABLE_ATOMIC_LINEITEM_PROBE")
-        .map(|value| !matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(true)
+    i64_set_row_filter_max_keys_with_default(100_000)
 }
 
 fn q04_atomic_candidate_priorities(candidate_priorities: &[u8]) -> Arc<Vec<AtomicU8>> {
     Arc::new(DenseAtomicU8::from_values_parallel(candidate_priorities).into_markers())
 }
 
-fn q04_lineitem_row_group_map_enabled() -> bool {
-    if std::env::var("DODAM_Q04_DISABLE_LINEITEM_ROW_GROUP_MAP")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-    {
-        return false;
-    }
-    true
-}
-
 fn q04_lineitem_row_group_map_chunk() -> usize {
-    std::env::var("DODAM_Q04_LINEITEM_ROW_GROUP_MAP_CHUNK")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(2)
-}
-
-#[derive(Clone)]
-struct Q04CandidateBloom {
-    bits: Vec<u64>,
-    mask: u64,
-}
-
-impl Q04CandidateBloom {
-    fn with_candidate_count(candidate_count: usize) -> Self {
-        let bit_count = candidate_count
-            .saturating_mul(16)
-            .max(64 * 1024)
-            .next_power_of_two();
-        let words = bit_count / 64;
-        Self {
-            bits: vec![0; words],
-            mask: bit_count as u64 - 1,
-        }
-    }
-
-    fn insert(&mut self, key: usize) {
-        let (first, second) = self.indexes(key);
-        self.set(first);
-        self.set(second);
-    }
-
-    fn might_contain(&self, key: usize) -> bool {
-        let (first, second) = self.indexes(key);
-        self.get(first) && self.get(second)
-    }
-
-    fn indexes(&self, key: usize) -> (u64, u64) {
-        let key = key as u64;
-        let first = key.wrapping_mul(0x9E37_79B1_85EB_CA87) & self.mask;
-        let mixed = key ^ key.rotate_left(32) ^ 0xC2B2_AE3D_27D4_EB4F;
-        let second = mixed.wrapping_mul(0x1656_67B1_9E37_79F9) & self.mask;
-        (first, second)
-    }
-
-    fn set(&mut self, bit: u64) {
-        let word = (bit >> 6) as usize;
-        let mask = 1_u64 << (bit & 63);
-        self.bits[word] |= mask;
-    }
-
-    fn get(&self, bit: u64) -> bool {
-        let word = (bit >> 6) as usize;
-        let mask = 1_u64 << (bit & 63);
-        self.bits[word] & mask != 0
-    }
-}
-
-fn q04_candidate_bloom(candidate_priorities: &[u8]) -> Option<Q04CandidateBloom> {
-    if !std::env::var("DODAM_Q04_ENABLE_CANDIDATE_BLOOM")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-    {
-        return None;
-    }
-    let candidate_count = candidate_priorities
-        .iter()
-        .filter(|&&priority| priority != 0)
-        .count();
-    if candidate_count < 1024 {
-        return None;
-    }
-    let mut bloom = Q04CandidateBloom::with_candidate_count(candidate_count);
-    for (key, priority) in candidate_priorities.iter().copied().enumerate() {
-        if priority != 0 {
-            bloom.insert(key);
-        }
-    }
-    Some(bloom)
-}
-
-fn q04_collect_late_candidate_orderkeys_batch(
-    batch: RecordBatch,
-    candidate_priorities: &[u8],
-    matched_orderkeys: &mut Vec<i64>,
-) -> Result<Option<()>> {
-    let orderkeys = batch_column(&batch, "l_orderkey")?;
-    let commitdates = batch_column(&batch, "l_commitdate")?;
-    let receiptdates = batch_column(&batch, "l_receiptdate")?;
-    if q04_collect_late_candidate_orderkeys_typed(
-        orderkeys,
-        commitdates,
-        receiptdates,
-        candidate_priorities,
-        matched_orderkeys,
-    )? {
-        return Ok(Some(()));
-    }
-    for row in 0..batch.num_rows() {
-        let (Some(orderkey), Some(commitdate), Some(receiptdate)) = (
-            numeric_i64_value(orderkeys, row)?,
-            date32_value(commitdates, row)?,
-            date32_value(receiptdates, row)?,
-        ) else {
-            continue;
-        };
-        if commitdate >= receiptdate || orderkey < 0 {
-            continue;
-        }
-        let Ok(index) = usize::try_from(orderkey) else {
-            continue;
-        };
-        if candidate_priorities.get(index).copied().unwrap_or_default() != 0 {
-            matched_orderkeys.push(orderkey);
-        }
-    }
-    Ok(Some(()))
-}
-
-fn q04_collect_late_candidate_orderkeys_view(
-    view: BatchView<'_>,
-    candidate_priorities: &[u8],
-    matched_orderkeys: &mut Vec<i64>,
-) -> Result<Option<()>> {
-    if view.num_columns() == 3
-        && let (Some(orderkeys), Some(commitdates), Some(receiptdates)) = (
-            view.i64_vector(0),
-            view.date32_vector(1),
-            view.date32_vector(2),
-        )
-    {
-        q04_collect_late_candidate_orderkeys_vector(
-            orderkeys,
-            commitdates,
-            receiptdates,
-            candidate_priorities,
-            matched_orderkeys,
-        );
-        return Ok(Some(()));
-    }
-    let Some(batch) = view.try_record_batch() else {
-        return Ok(None);
-    };
-    q04_collect_late_candidate_orderkeys_batch(
-        batch.clone(),
-        candidate_priorities,
-        matched_orderkeys,
-    )
+    generic_row_group_map_chunk_size(2)
 }
 
 fn q04_count_late_candidate_priorities_atomic_batch(
     batch: RecordBatch,
     candidate_priorities: &[AtomicU8],
-    candidate_bloom: Option<&Q04CandidateBloom>,
     counts: &mut [u64],
 ) -> Result<Option<()>> {
     if batch.num_columns() == 3
@@ -1948,7 +1462,6 @@ fn q04_count_late_candidate_priorities_atomic_batch(
             batch.column(1),
             batch.column(2),
             candidate_priorities,
-            candidate_bloom,
             counts,
         )?
     {
@@ -1962,7 +1475,6 @@ fn q04_count_late_candidate_priorities_atomic_batch(
         commitdates,
         receiptdates,
         candidate_priorities,
-        candidate_bloom,
         counts,
     )? {
         return Ok(Some(()));
@@ -1986,9 +1498,6 @@ fn q04_count_late_candidate_priorities_atomic_batch(
         let Ok(orderkey) = usize::try_from(orderkey) else {
             continue;
         };
-        if candidate_bloom.is_some_and(|bloom| !bloom.might_contain(orderkey)) {
-            continue;
-        }
         let Some(marker) = candidate_priorities.get(orderkey) else {
             continue;
         };
@@ -2010,7 +1519,6 @@ fn q04_count_late_candidate_priorities_atomic_typed(
     commitdates: &ArrayRef,
     receiptdates: &ArrayRef,
     candidate_priorities: &[AtomicU8],
-    candidate_bloom: Option<&Q04CandidateBloom>,
     counts: &mut [u64],
 ) -> Result<bool> {
     let (Some(orderkeys), Some(commitdates), Some(receiptdates)) = (
@@ -2027,24 +1535,6 @@ fn q04_count_late_candidate_priorities_atomic_typed(
         let orderkey_values = orderkeys.values().as_ref();
         let commitdate_values = commitdates.values().as_ref();
         let receiptdate_values = receiptdates.values().as_ref();
-        if q04_lineitem_selection_vector_enabled() {
-            let mut selected = SelectionVector::with_capacity(orderkey_values.len().min(4096));
-            for row in 0..orderkey_values.len() {
-                if commitdate_values[row] < receiptdate_values[row] {
-                    selected.push(row);
-                }
-            }
-            if q04_should_use_lineitem_selection_vector(selected.len(), orderkey_values.len()) {
-                q04_count_late_candidate_priorities_atomic_selected_rows(
-                    selected.as_slice(),
-                    orderkey_values,
-                    candidate_priorities,
-                    candidate_bloom,
-                    counts,
-                );
-                return Ok(true);
-            }
-        }
         for row in 0..orderkey_values.len() {
             if commitdate_values[row] >= receiptdate_values[row] {
                 continue;
@@ -2054,9 +1544,6 @@ fn q04_count_late_candidate_priorities_atomic_typed(
             else {
                 continue;
             };
-            if candidate_bloom.is_some_and(|bloom| !bloom.might_contain(orderkey)) {
-                continue;
-            }
             count_dense_atomic_marker(orderkey, candidate_priorities, counts);
         }
         return Ok(true);
@@ -2073,9 +1560,6 @@ fn q04_count_late_candidate_priorities_atomic_typed(
         else {
             continue;
         };
-        if candidate_bloom.is_some_and(|bloom| !bloom.might_contain(orderkey)) {
-            continue;
-        }
         count_dense_atomic_marker(orderkey, candidate_priorities, counts);
     }
     Ok(true)
@@ -2086,7 +1570,6 @@ fn q04_count_late_candidate_priorities_atomic_vector(
     commitdates: Date32VectorView<'_>,
     receiptdates: Date32VectorView<'_>,
     candidate_priorities: &[AtomicU8],
-    candidate_bloom: Option<&Q04CandidateBloom>,
     counts: &mut [u64],
 ) {
     if let (Some(orderkey_values), Some(commitdate_values), Some(receiptdate_values)) = (
@@ -2094,24 +1577,6 @@ fn q04_count_late_candidate_priorities_atomic_vector(
         commitdates.values_if_null_free(),
         receiptdates.values_if_null_free(),
     ) {
-        if q04_lineitem_selection_vector_enabled() {
-            let mut selected = SelectionVector::with_capacity(orderkey_values.len().min(4096));
-            for row in 0..orderkey_values.len() {
-                if commitdate_values[row] < receiptdate_values[row] {
-                    selected.push(row);
-                }
-            }
-            if q04_should_use_lineitem_selection_vector(selected.len(), orderkey_values.len()) {
-                q04_count_late_candidate_priorities_atomic_selected_rows(
-                    selected.as_slice(),
-                    orderkey_values,
-                    candidate_priorities,
-                    candidate_bloom,
-                    counts,
-                );
-                return;
-            }
-        }
         for row in 0..orderkey_values.len() {
             if commitdate_values[row] >= receiptdate_values[row] {
                 continue;
@@ -2121,9 +1586,6 @@ fn q04_count_late_candidate_priorities_atomic_vector(
             else {
                 continue;
             };
-            if candidate_bloom.is_some_and(|bloom| !bloom.might_contain(orderkey)) {
-                continue;
-            }
             count_dense_atomic_marker(orderkey, candidate_priorities, counts);
         }
         return;
@@ -2141,9 +1603,6 @@ fn q04_count_late_candidate_priorities_atomic_vector(
         else {
             continue;
         };
-        if candidate_bloom.is_some_and(|bloom| !bloom.might_contain(orderkey)) {
-            continue;
-        }
         count_dense_atomic_marker(orderkey, candidate_priorities, counts);
     }
 }
@@ -2153,7 +1612,6 @@ fn q04_count_late_candidate_priorities_atomic_raw(
     commitdates: &[i32],
     receiptdates: &[i32],
     candidate_priorities: &[AtomicU8],
-    candidate_bloom: Option<&Q04CandidateBloom>,
     counts: &mut [u64],
 ) -> usize {
     let mut hits = 0usize;
@@ -2165,54 +1623,11 @@ fn q04_count_late_candidate_priorities_atomic_raw(
         else {
             continue;
         };
-        if candidate_bloom.is_some_and(|bloom| !bloom.might_contain(orderkey)) {
-            continue;
-        }
         if count_dense_atomic_marker(orderkey, candidate_priorities, counts) {
             hits += 1;
         }
     }
     hits
-}
-
-fn q04_lineitem_selection_vector_enabled() -> bool {
-    std::env::var("DODAM_Q04_ENABLE_LINEITEM_SELECTION_VECTOR")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-}
-
-fn q04_lineitem_selection_vector_max_ratio() -> f64 {
-    std::env::var("DODAM_Q04_LINEITEM_SELECTION_VECTOR_MAX_RATIO")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.70)
-}
-
-fn q04_should_use_lineitem_selection_vector(selected_rows: usize, total_rows: usize) -> bool {
-    if selected_rows == 0 || total_rows == 0 {
-        return selected_rows == 0;
-    }
-    (selected_rows as f64 / total_rows as f64) <= q04_lineitem_selection_vector_max_ratio()
-}
-
-fn q04_count_late_candidate_priorities_atomic_selected_rows(
-    selected_rows: &[u32],
-    orderkey_values: &[i64],
-    candidate_priorities: &[AtomicU8],
-    candidate_bloom: Option<&Q04CandidateBloom>,
-    counts: &mut [u64],
-) {
-    for &row in selected_rows {
-        let Some(orderkey) =
-            dense_marker_index_i64(orderkey_values[row as usize], candidate_priorities.len())
-        else {
-            continue;
-        };
-        if candidate_bloom.is_some_and(|bloom| !bloom.might_contain(orderkey)) {
-            continue;
-        }
-        count_dense_atomic_marker(orderkey, candidate_priorities, counts);
-    }
 }
 
 #[inline(always)]
@@ -2249,115 +1664,6 @@ fn count_dense_atomic_marker(index: usize, markers: &[AtomicU8], counts: &mut [u
     }
     counts[usize::from(priority_marker - 1)] += 1;
     true
-}
-
-fn q04_collect_late_candidate_orderkeys_typed(
-    orderkeys: &ArrayRef,
-    commitdates: &ArrayRef,
-    receiptdates: &ArrayRef,
-    candidate_priorities: &[u8],
-    matched_orderkeys: &mut Vec<i64>,
-) -> Result<bool> {
-    let (Some(orderkeys), Some(commitdates), Some(receiptdates)) = (
-        orderkeys.as_any().downcast_ref::<Int64Array>(),
-        commitdates.as_any().downcast_ref::<Date32Array>(),
-        receiptdates.as_any().downcast_ref::<Date32Array>(),
-    ) else {
-        return Ok(false);
-    };
-    if orderkeys.null_count() == 0
-        && commitdates.null_count() == 0
-        && receiptdates.null_count() == 0
-    {
-        let orderkeys = orderkeys.values().as_ref();
-        let commitdates = commitdates.values().as_ref();
-        let receiptdates = receiptdates.values().as_ref();
-        for row in 0..orderkeys.len() {
-            if commitdates[row] >= receiptdates[row] {
-                continue;
-            }
-            let orderkey = orderkeys[row];
-            if orderkey < 0 {
-                continue;
-            }
-            let Ok(index) = usize::try_from(orderkey) else {
-                continue;
-            };
-            if candidate_priorities.get(index).copied().unwrap_or_default() != 0 {
-                matched_orderkeys.push(orderkey);
-            }
-        }
-        return Ok(true);
-    }
-    for row in 0..orderkeys.len() {
-        if orderkeys.is_null(row) || commitdates.is_null(row) || receiptdates.is_null(row) {
-            continue;
-        }
-        if commitdates.value(row) >= receiptdates.value(row) {
-            continue;
-        }
-        let orderkey = orderkeys.value(row);
-        if orderkey < 0 {
-            continue;
-        }
-        let Ok(index) = usize::try_from(orderkey) else {
-            continue;
-        };
-        if candidate_priorities.get(index).copied().unwrap_or_default() != 0 {
-            matched_orderkeys.push(orderkey);
-        }
-    }
-    Ok(true)
-}
-
-fn q04_collect_late_candidate_orderkeys_vector(
-    orderkeys: I64VectorView<'_>,
-    commitdates: Date32VectorView<'_>,
-    receiptdates: Date32VectorView<'_>,
-    candidate_priorities: &[u8],
-    matched_orderkeys: &mut Vec<i64>,
-) {
-    if let (Some(orderkey_values), Some(commitdate_values), Some(receiptdate_values)) = (
-        orderkeys.values_if_null_free(),
-        commitdates.values_if_null_free(),
-        receiptdates.values_if_null_free(),
-    ) {
-        for row in 0..orderkey_values.len() {
-            if commitdate_values[row] >= receiptdate_values[row] {
-                continue;
-            }
-            let orderkey = orderkey_values[row];
-            if orderkey < 0 {
-                continue;
-            }
-            let Ok(index) = usize::try_from(orderkey) else {
-                continue;
-            };
-            if candidate_priorities.get(index).copied().unwrap_or_default() != 0 {
-                matched_orderkeys.push(orderkey);
-            }
-        }
-        return;
-    }
-
-    for row in 0..orderkeys.len() {
-        if orderkeys.is_null(row) || commitdates.is_null(row) || receiptdates.is_null(row) {
-            continue;
-        }
-        if commitdates.value(row) >= receiptdates.value(row) {
-            continue;
-        }
-        let orderkey = orderkeys.value(row);
-        if orderkey < 0 {
-            continue;
-        }
-        let Ok(index) = usize::try_from(orderkey) else {
-            continue;
-        };
-        if candidate_priorities.get(index).copied().unwrap_or_default() != 0 {
-            matched_orderkeys.push(orderkey);
-        }
-    }
 }
 
 fn q04_count_late_candidate_priorities_view_into(
