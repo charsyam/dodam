@@ -9,12 +9,25 @@ shaped so the same logical flow can later run across multiple workers:
 1. `catalog`: resolves a table into immutable file fragments.
 2. `execution/logical`: owns query-facing expressions such as filters,
    projections, sort keys, and aggregate calls.
-3. `execution/physical`: turns fragments into physical operators that exchange
+3. `optimizer`: rewrites the shared `plan::LogicalPlan` and estimates join
+   alternatives without introducing query-specific execution paths.
+4. `plan`: lowers optimized logical nodes into physical pipelines, including
+   scan pushdown, exchanges, and cost-based join strategy selection.
+5. `execution/physical`: turns fragments into physical operators that exchange
    Arrow `RecordBatch` streams.
-4. `execution/aggregate`: consumes batch streams into global or grouped
+6. `execution/aggregate`: consumes batch streams into global or grouped
    aggregate results.
-5. `storage`: reads columnar files into Arrow batches.
-6. `engine`: exposes the public API used by the CLI or future SQL/server layer.
+7. `storage`: reads columnar files into Arrow batches.
+8. `engine`: exposes the public API used by the CLI or future SQL/server layer.
+
+The general optimizer folds projection, filter, sort/top-N, limit, and distinct
+nodes into a scan only when their relational ordering is preserved. The
+physical scan reads the union of output, predicate, and ordering columns once,
+sends prunable conjuncts to Parquet row-group pruning, and keeps the full
+predicate as a vectorized residual filter. Joins choose the smaller estimated
+input as the hash build side and switch to partitioned hash when that build
+exceeds the configured memory budget. `DODAM_OPTIMIZER_TRACE=1` prints the
+logical rules selected for a scan.
 
 ## Current CLI
 
@@ -262,6 +275,19 @@ counts and non-numeric values matched DuckDB; numeric values had at most
 `3.856e-14` relative error at SF100. The final SF200 Q09 output matched the
 previously validated 175-row result exactly, and the DuckDB differential
 TPC-H-lite test passed after the Q06, Q09, Q11, and Q22 changes.
+
+The generalized optimizer was regression-checked at SF100 with the same
+five-run, one-warmup protocol. This is a focused validation rather than a
+replacement for the full-suite table above.
+
+| Query | Dodam ms | DuckDB ms | ratio |
+|---|---:|---:|---:|
+| Q06 | 1,010.601 | 1,706.408 | 0.592x |
+| Q09 | 6,861.022 | 9,176.985 | 0.748x |
+
+Q06's single output differed by about `3e-16` relatively because of floating
+point accumulation order. All 175 Q09 keys matched and its maximum relative
+numeric difference was `2.43e-15`.
 
 The host used an AMD Ryzen 9 7945HX (16 cores/32 threads), Linux 6.14, Rust
 1.89.0, and DuckDB 1.5.4. Dodam used its default 16-thread Rayon pool; DuckDB

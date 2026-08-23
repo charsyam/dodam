@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::execution::{ComparisonExpr, Expr, FilterExpr, Projection, SortKey};
+use crate::plan::LogicalPlan;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ColumnRangeStats {
@@ -168,31 +169,35 @@ pub struct LogicalJoinGraph {
     pub edges: Vec<LogicalJoinEdge>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum LogicalPlanNode {
-    Scan {
-        table: String,
-        projection: Projection,
-        filter: Option<FilterExpr>,
-    },
-    Project {
-        input: Box<LogicalPlanNode>,
-        projection: Projection,
-    },
-    Filter {
-        input: Box<LogicalPlanNode>,
-        filter: FilterExpr,
-    },
-    Aggregate {
-        input: Box<LogicalPlanNode>,
-        group_by: Vec<String>,
-        aggregates: Vec<String>,
-    },
-    SortLimit {
-        input: Box<LogicalPlanNode>,
-        order_by: Option<SortKey>,
-        limit: Option<usize>,
-    },
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptimizerRule {
+    FilterIntoScan,
+    ProjectionIntoScan,
+    SortIntoScan,
+    LimitIntoScan,
+    DistinctIntoScan,
+    CombineFilters,
+    LimitIntoSort,
+}
+
+#[derive(Debug, Clone)]
+pub struct OptimizedLogicalPlan {
+    pub plan: LogicalPlan,
+    pub applied_rules: Vec<OptimizerRule>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LogicalOptimizer;
+
+impl LogicalOptimizer {
+    pub fn optimize(&self, plan: LogicalPlan) -> OptimizedLogicalPlan {
+        let mut applied_rules = Vec::new();
+        let plan = optimize_logical_node(plan, &mut applied_rules);
+        OptimizedLogicalPlan {
+            plan,
+            applied_rules,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,91 +247,196 @@ pub fn estimate_join_aggregate_lookup_fusion_cost(
         .saturating_add(group_state_cost.saturating_mul(32))
 }
 
-impl LogicalPlanNode {
-    pub fn push_scan_projection_filter(self) -> Self {
-        match self {
-            Self::Project { input, projection } => match *input {
-                Self::Filter { input, filter } => match *input {
-                    Self::Scan {
-                        table,
-                        projection: scan_projection,
-                        filter: scan_filter,
-                    } => Self::Scan {
-                        table,
-                        projection: merge_scan_projection(scan_projection, projection, &filter),
-                        filter: combine_filter_exprs(scan_filter, Some(filter)),
-                    },
-                    other => Self::Project {
-                        input: Box::new(Self::Filter {
-                            input: Box::new(other.push_scan_projection_filter()),
-                            filter,
-                        }),
-                        projection,
-                    },
-                },
-                other => Self::Project {
-                    input: Box::new(other.push_scan_projection_filter()),
+fn optimize_logical_node(plan: LogicalPlan, applied_rules: &mut Vec<OptimizerRule>) -> LogicalPlan {
+    match plan {
+        LogicalPlan::TableScan(scan) => LogicalPlan::TableScan(scan),
+        LogicalPlan::Projection { input, projection } => {
+            let input = optimize_logical_node(*input, applied_rules);
+            match input {
+                LogicalPlan::TableScan(mut scan)
+                    if !scan.distinct && projection_can_replace(&scan.projection, &projection) =>
+                {
+                    scan.projection = replace_projection(scan.projection, projection);
+                    applied_rules.push(OptimizerRule::ProjectionIntoScan);
+                    LogicalPlan::TableScan(scan)
+                }
+                input => LogicalPlan::Projection {
+                    input: Box::new(input),
                     projection,
                 },
-            },
-            Self::Filter { input, filter } => match *input {
-                Self::Scan {
-                    table,
-                    projection,
-                    filter: scan_filter,
-                } => Self::Scan {
-                    table,
-                    projection,
-                    filter: combine_filter_exprs(scan_filter, Some(filter)),
-                },
-                other => Self::Filter {
-                    input: Box::new(other.push_scan_projection_filter()),
+            }
+        }
+        LogicalPlan::Filter { input, filter } => {
+            let input = optimize_logical_node(*input, applied_rules);
+            match input {
+                LogicalPlan::TableScan(mut scan)
+                    if scan.limit.is_none()
+                        && projection_contains_columns(
+                            &scan.projection,
+                            &filter.referenced_columns(),
+                        ) =>
+                {
+                    scan.filter = combine_filter_exprs(scan.filter, Some(filter));
+                    applied_rules.push(OptimizerRule::FilterIntoScan);
+                    LogicalPlan::TableScan(scan)
+                }
+                LogicalPlan::Filter {
+                    input,
+                    filter: inner,
+                } => {
+                    applied_rules.push(OptimizerRule::CombineFilters);
+                    optimize_logical_node(
+                        LogicalPlan::Filter {
+                            input,
+                            filter: combine_filter_exprs(Some(inner), Some(filter))
+                                .expect("two filters always combine"),
+                        },
+                        applied_rules,
+                    )
+                }
+                input => LogicalPlan::Filter {
+                    input: Box::new(input),
                     filter,
                 },
-            },
-            Self::Aggregate {
-                input,
-                group_by,
-                aggregates,
-            } => Self::Aggregate {
-                input: Box::new(input.push_scan_projection_filter()),
-                group_by,
-                aggregates,
-            },
-            Self::SortLimit {
-                input,
-                order_by,
-                limit,
-            } => Self::SortLimit {
-                input: Box::new(input.push_scan_projection_filter()),
-                order_by,
-                limit,
-            },
-            scan @ Self::Scan { .. } => scan,
+            }
+        }
+        LogicalPlan::Aggregate {
+            input,
+            aggregates,
+            group_by,
+        } => LogicalPlan::Aggregate {
+            input: Box::new(optimize_logical_node(*input, applied_rules)),
+            aggregates,
+            group_by,
+        },
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            left_keys,
+            right_keys,
+            left_prefix,
+            right_prefix,
+            output_projection,
+        } => LogicalPlan::Join {
+            left: Box::new(optimize_logical_node(*left, applied_rules)),
+            right: Box::new(optimize_logical_node(*right, applied_rules)),
+            join_type,
+            left_keys,
+            right_keys,
+            left_prefix,
+            right_prefix,
+            output_projection,
+        },
+        LogicalPlan::Sort {
+            input,
+            order_by,
+            limit,
+        } => {
+            let input = optimize_logical_node(*input, applied_rules);
+            match input {
+                LogicalPlan::TableScan(mut scan)
+                    if scan.order_by.is_none()
+                        && scan.limit.is_none()
+                        && projection_contains_columns(
+                            &scan.projection,
+                            &order_by
+                                .expressions
+                                .iter()
+                                .map(|expression| expression.column.clone())
+                                .collect::<Vec<_>>(),
+                        ) =>
+                {
+                    scan.order_by = Some(order_by);
+                    scan.limit = limit;
+                    applied_rules.push(OptimizerRule::SortIntoScan);
+                    LogicalPlan::TableScan(scan)
+                }
+                input => LogicalPlan::Sort {
+                    input: Box::new(input),
+                    order_by,
+                    limit,
+                },
+            }
+        }
+        LogicalPlan::Limit { input, limit } => {
+            let input = optimize_logical_node(*input, applied_rules);
+            match input {
+                LogicalPlan::TableScan(mut scan) => {
+                    scan.limit = Some(scan.limit.map_or(limit, |current| current.min(limit)));
+                    applied_rules.push(OptimizerRule::LimitIntoScan);
+                    LogicalPlan::TableScan(scan)
+                }
+                LogicalPlan::Sort {
+                    input,
+                    order_by,
+                    limit: sort_limit,
+                } => {
+                    let sort_limit = Some(sort_limit.map_or(limit, |current| current.min(limit)));
+                    applied_rules.push(OptimizerRule::LimitIntoSort);
+                    LogicalPlan::Limit {
+                        input: Box::new(LogicalPlan::Sort {
+                            input,
+                            order_by,
+                            limit: sort_limit,
+                        }),
+                        limit,
+                    }
+                }
+                input => LogicalPlan::Limit {
+                    input: Box::new(input),
+                    limit,
+                },
+            }
+        }
+        LogicalPlan::Distinct { input } => {
+            let input = optimize_logical_node(*input, applied_rules);
+            match input {
+                LogicalPlan::TableScan(mut scan)
+                    if scan.limit.is_none() && scan.order_by.is_none() =>
+                {
+                    scan.distinct = true;
+                    applied_rules.push(OptimizerRule::DistinctIntoScan);
+                    LogicalPlan::TableScan(scan)
+                }
+                input => LogicalPlan::Distinct {
+                    input: Box::new(input),
+                },
+            }
+        }
+        LogicalPlan::Copy {
+            input,
+            format,
+            target,
+        } => LogicalPlan::Copy {
+            input: Box::new(optimize_logical_node(*input, applied_rules)),
+            format,
+            target,
+        },
+    }
+}
+
+fn projection_can_replace(scan: &Projection, output: &Projection) -> bool {
+    match (scan, output) {
+        (_, Projection::All) | (Projection::All, Projection::Columns(_)) => true,
+        (Projection::Columns(scan), Projection::Columns(output)) => {
+            output.iter().all(|column| scan.contains(column))
         }
     }
 }
 
-fn merge_scan_projection(
-    scan_projection: Projection,
-    output_projection: Projection,
-    filter: &FilterExpr,
-) -> Projection {
-    let mut columns = match (scan_projection, output_projection) {
-        (Projection::All, Projection::All)
-        | (Projection::All, Projection::Columns(_))
-        | (Projection::Columns(_), Projection::All) => return Projection::All,
-        (Projection::Columns(mut scan), Projection::Columns(output)) => {
-            for column in output {
-                add_column_once(&mut scan, column);
-            }
-            scan
-        }
-    };
-    for column in filter.referenced_columns() {
-        add_column_once(&mut columns, column);
+fn projection_contains_columns(projection: &Projection, required: &[String]) -> bool {
+    match projection {
+        Projection::All => true,
+        Projection::Columns(columns) => required.iter().all(|required| columns.contains(required)),
     }
-    Projection::Columns(columns)
+}
+
+fn replace_projection(scan: Projection, output: Projection) -> Projection {
+    match output {
+        Projection::All => scan,
+        output => output,
+    }
 }
 
 fn combine_filter_exprs(left: Option<FilterExpr>, right: Option<FilterExpr>) -> Option<FilterExpr> {
@@ -915,15 +1025,33 @@ fn strip_join_prefix<'a>(column: &'a str, prefix: &str) -> Option<&'a str> {
 mod tests {
     use std::collections::HashMap;
 
+    use crate::catalog::{StorageFormat, TableStatistics};
     use crate::execution::{
         ComparisonExpr, ComparisonOp, Expr, FilterExpr, LiteralValue, Projection, SortExpr, SortKey,
     };
+    use crate::plan::{LogicalPlan, LogicalScan, PlanTableSource};
 
     use super::{
         ColumnRangeStats, JoinAggregateLookupFusionCostInput, LogicalJoinEdge, LogicalJoinGraph,
-        LogicalJoinPlanTree, LogicalJoinTableStats, LogicalPlanNode,
+        LogicalJoinPlanTree, LogicalJoinTableStats, LogicalOptimizer, OptimizerRule,
         estimate_join_aggregate_lookup_fusion_cost, plan_join_inputs,
     };
+
+    fn logical_scan() -> LogicalPlan {
+        LogicalPlan::TableScan(LogicalScan {
+            source: PlanTableSource {
+                fragments: Vec::new(),
+                format: StorageFormat::Parquet,
+                statistics: TableStatistics::default(),
+            },
+            batch_size: 1024,
+            projection: Projection::All,
+            filter: None,
+            order_by: None,
+            limit: None,
+            distinct: false,
+        })
+    }
 
     fn table_stats(rows: u128, row_width: u128, keys: &[(&str, u128)]) -> LogicalJoinTableStats {
         LogicalJoinTableStats {
@@ -1131,29 +1259,86 @@ mod tests {
             op: ComparisonOp::Eq,
             value: LiteralValue::Int64(7),
         }));
-        let plan = LogicalPlanNode::Project {
-            input: Box::new(LogicalPlanNode::Filter {
-                input: Box::new(LogicalPlanNode::Scan {
-                    table: "facts".to_string(),
-                    projection: Projection::Columns(vec!["id".to_string()]),
-                    filter: None,
-                }),
+        let plan = LogicalPlan::Projection {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(logical_scan()),
                 filter: filter.clone(),
             }),
             projection: Projection::Columns(vec!["value".to_string()]),
         };
+        let optimized = LogicalOptimizer.optimize(plan);
 
         assert_eq!(
-            plan.push_scan_projection_filter(),
-            LogicalPlanNode::Scan {
-                table: "facts".to_string(),
-                projection: Projection::Columns(vec![
-                    "id".to_string(),
-                    "value".to_string(),
-                    "bucket".to_string()
-                ]),
-                filter: Some(filter),
-            }
+            optimized.applied_rules,
+            vec![
+                OptimizerRule::FilterIntoScan,
+                OptimizerRule::ProjectionIntoScan
+            ]
+        );
+        let LogicalPlan::TableScan(scan) = optimized.plan else {
+            panic!("expected canonical scan");
+        };
+        assert_eq!(
+            scan.projection,
+            Projection::Columns(vec!["value".to_string()])
+        );
+        assert_eq!(scan.filter, Some(filter));
+    }
+
+    #[test]
+    fn logical_plan_rewrite_preserves_limit_filter_barrier() {
+        let filter = FilterExpr::new(Expr::Comparison(ComparisonExpr {
+            column: "bucket".to_string(),
+            op: ComparisonOp::Eq,
+            value: LiteralValue::Int64(7),
+        }));
+        let plan = LogicalPlan::Filter {
+            input: Box::new(LogicalPlan::Limit {
+                input: Box::new(logical_scan()),
+                limit: 10,
+            }),
+            filter: filter.clone(),
+        };
+        let optimized = LogicalOptimizer.optimize(plan);
+
+        let LogicalPlan::Filter {
+            input,
+            filter: optimized_filter,
+        } = optimized.plan
+        else {
+            panic!("filter must remain above limit");
+        };
+        assert_eq!(optimized_filter, filter);
+        assert!(matches!(
+            *input,
+            LogicalPlan::TableScan(LogicalScan {
+                limit: Some(10),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn logical_plan_rewrite_preserves_projection_filter_barrier() {
+        let filter = FilterExpr::new(Expr::Comparison(ComparisonExpr {
+            column: "payload".to_string(),
+            op: ComparisonOp::Eq,
+            value: LiteralValue::Utf8("a".to_string()),
+        }));
+        let plan = LogicalPlan::Filter {
+            input: Box::new(LogicalPlan::Projection {
+                input: Box::new(logical_scan()),
+                projection: Projection::Columns(vec!["id".to_string()]),
+            }),
+            filter,
+        };
+
+        let optimized = LogicalOptimizer.optimize(plan);
+
+        assert!(matches!(optimized.plan, LogicalPlan::Filter { .. }));
+        assert_eq!(
+            optimized.applied_rules,
+            vec![OptimizerRule::ProjectionIntoScan]
         );
     }
 

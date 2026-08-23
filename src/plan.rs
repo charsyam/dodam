@@ -1,5 +1,8 @@
 use crate::catalog::{FileFragment, StorageFormat, TableStatistics};
-use crate::execution::{AggregateExpr, FilterExpr, JoinBuildSide, JoinType, Projection, SortKey};
+use crate::execution::{
+    AggregateExpr, FilterExpr, JoinBuildSide, JoinType, PredicateSet, Projection, SortKey,
+};
+use crate::optimizer::LogicalOptimizer;
 use arrow::record_batch::RecordBatch;
 
 #[derive(Debug, Clone)]
@@ -258,8 +261,11 @@ pub struct OutputOrdering {
     pub expressions: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PhysicalJoinStrategy {
+    Auto {
+        memory_limit_bytes: u64,
+    },
     Hash {
         build_side: JoinBuildSide,
     },
@@ -280,8 +286,8 @@ pub struct PhysicalPlanningOptions {
 impl Default for PhysicalPlanningOptions {
     fn default() -> Self {
         Self {
-            default_join_strategy: PhysicalJoinStrategy::Hash {
-                build_side: JoinBuildSide::Right,
+            default_join_strategy: PhysicalJoinStrategy::Auto {
+                memory_limit_bytes: 128 * 1024 * 1024,
             },
             insert_exchanges: false,
             default_shuffle_partitions: 1,
@@ -295,6 +301,7 @@ pub struct PhysicalPlanner {
 }
 
 struct PhysicalJoinPlanningInput<'a> {
+    strategy: PhysicalJoinStrategy,
     join_type: JoinType,
     left_keys: &'a [String],
     right_keys: &'a [String],
@@ -345,10 +352,15 @@ impl PhysicalPlanner {
     }
 
     pub fn plan(&self, logical: &LogicalPlan) -> PhysicalPlanNode {
+        let optimized = LogicalOptimizer.optimize(logical.clone());
+        self.plan_node(&optimized.plan)
+    }
+
+    fn plan_node(&self, logical: &LogicalPlan) -> PhysicalPlanNode {
         match logical {
             LogicalPlan::TableScan(scan) => self.plan_scan(scan),
             LogicalPlan::Projection { input, projection } => {
-                let input = self.plan(input);
+                let input = self.plan_node(input);
                 let partitioning = input.partitioning_ref().clone();
                 PhysicalPlanNode::new("ProjectionExec")
                     .attr("projection", projection_display(projection))
@@ -359,7 +371,7 @@ impl PhysicalPlanner {
                     .partitioning(partitioning)
             }
             LogicalPlan::Filter { input, filter } => {
-                let input = self.plan(input);
+                let input = self.plan_node(input);
                 let partitioning = input.partitioning_ref().clone();
                 PhysicalPlanNode::new("FilterExec")
                     .attr("predicate", "logical")
@@ -409,14 +421,15 @@ impl PhysicalPlanner {
                 right_prefix,
                 output_projection,
             } => self.plan_join(PhysicalJoinPlanningInput {
+                strategy: self.choose_join_strategy(left, right, *join_type),
                 join_type: *join_type,
                 left_keys,
                 right_keys,
                 left_prefix,
                 right_prefix,
                 output_projection,
-                left: self.plan(left),
-                right: self.plan(right),
+                left: self.plan_node(left),
+                right: self.plan_node(right),
             }),
             LogicalPlan::Sort {
                 input,
@@ -434,7 +447,7 @@ impl PhysicalPlanner {
                     order_by: order_by.clone(),
                     limit: *limit,
                 })
-                .child(self.ensure_single(self.plan(input)))
+                .child(self.ensure_single(self.plan_node(input)))
                 .ordering(OutputOrdering {
                     expressions: order_by
                         .expressions
@@ -445,11 +458,11 @@ impl PhysicalPlanner {
             LogicalPlan::Limit { input, limit } => PhysicalPlanNode::new("LimitExec")
                 .attr("limit", *limit)
                 .execution(PhysicalExecutionConfig::Limit { limit: *limit })
-                .child(self.ensure_single(self.plan(input)))
+                .child(self.ensure_single(self.plan_node(input)))
                 .partitioning(Partitioning::Single),
             LogicalPlan::Distinct { input } => PhysicalPlanNode::new("DistinctExec")
                 .execution(PhysicalExecutionConfig::Distinct)
-                .child(self.ensure_single(self.plan(input)))
+                .child(self.ensure_single(self.plan_node(input)))
                 .partitioning(Partitioning::Single),
             LogicalPlan::Copy {
                 input,
@@ -459,11 +472,13 @@ impl PhysicalPlanner {
                 CopyFormat::Csv => "CsvSinkExec",
             })
             .attr("target", target)
-            .child(self.plan(input)),
+            .child(self.plan_node(input)),
         }
     }
 
     fn plan_scan(&self, scan: &LogicalScan) -> PhysicalPlanNode {
+        let scan_projection = logical_scan_projection(scan);
+        let predicates = PredicateSet::new(scan.filter.clone());
         let mut current = PhysicalPlanNode::new("ScanExec")
             .attr("format", format!("{:?}", scan.source.format))
             .attr("fragments", scan.source.fragments.len())
@@ -471,18 +486,19 @@ impl PhysicalPlanner {
             .attr("row_groups", scan.source.statistics.row_groups)
             .attr("compressed_bytes", scan.source.statistics.compressed_bytes)
             .attr("batch_size", scan.batch_size)
-            .attr("projection", projection_display(&scan.projection))
+            .attr("projection", projection_display(&scan_projection))
+            .attr("pushdown_predicates", predicates.pushdown().len())
             .execution(PhysicalExecutionConfig::Scan {
                 fragments: scan.source.fragments.clone(),
                 batch_size: scan.batch_size,
-                projection: scan.projection.clone(),
-                pushdown_predicates: Vec::new(),
+                projection: scan_projection.clone(),
+                pushdown_predicates: predicates.pushdown().to_vec(),
             })
             .partitioning(Partitioning::FileRange {
                 partitions: scan.source.fragments.len().max(1),
             });
 
-        if let Some(filter) = &scan.filter {
+        if let Some(filter) = predicates.residual() {
             let partitioning = current.partitioning_ref().clone();
             current = PhysicalPlanNode::new("FilterExec")
                 .attr("predicate", "logical")
@@ -493,16 +509,12 @@ impl PhysicalPlanner {
                 .partitioning(partitioning);
         }
 
-        let partitioning = current.partitioning_ref().clone();
-        current = PhysicalPlanNode::new("ProjectionExec")
-            .attr("projection", projection_display(&scan.projection))
-            .execution(PhysicalExecutionConfig::Projection {
-                projection: scan.projection.clone(),
-            })
-            .child(current)
-            .partitioning(partitioning);
+        let needs_output_projection = scan_projection != scan.projection;
 
         if scan.distinct {
+            if needs_output_projection {
+                current = self.project_scan_output(current, &scan.projection);
+            }
             current = PhysicalPlanNode::new("DistinctExec")
                 .execution(PhysicalExecutionConfig::Distinct)
                 .child(self.ensure_single(current))
@@ -510,6 +522,7 @@ impl PhysicalPlanner {
         }
 
         if let Some(order_by) = &scan.order_by {
+            current = self.ensure_single(current);
             current = PhysicalPlanNode::new("SortExec")
                 .attr("order_by", sort_key_display(order_by))
                 .attr(
@@ -532,19 +545,38 @@ impl PhysicalPlanner {
                 });
         }
 
+        if !scan.distinct && needs_output_projection {
+            current = self.project_scan_output(current, &scan.projection);
+        }
+
         if let Some(limit) = scan.limit {
             current = PhysicalPlanNode::new("LimitExec")
                 .attr("limit", limit)
                 .execution(PhysicalExecutionConfig::Limit { limit })
-                .child(current)
+                .child(self.ensure_single(current))
                 .partitioning(Partitioning::Single);
         }
 
         current
     }
 
+    fn project_scan_output(
+        &self,
+        input: PhysicalPlanNode,
+        projection: &Projection,
+    ) -> PhysicalPlanNode {
+        let partitioning = input.partitioning_ref().clone();
+        PhysicalPlanNode::new("ProjectionExec")
+            .attr("projection", projection_display(projection))
+            .execution(PhysicalExecutionConfig::Projection {
+                projection: projection.clone(),
+            })
+            .child(input)
+            .partitioning(partitioning)
+    }
+
     fn plan_aggregate_input(&self, input: &LogicalPlan, group_by: &[String]) -> PhysicalPlanNode {
-        let input = self.plan(input);
+        let input = self.plan_node(input);
         if group_by.is_empty() {
             self.ensure_single(input)
         } else {
@@ -553,7 +585,7 @@ impl PhysicalPlanner {
     }
 
     fn plan_join(&self, input: PhysicalJoinPlanningInput<'_>) -> PhysicalPlanNode {
-        let (left, right) = match self.options.default_join_strategy {
+        let (left, right) = match input.strategy {
             PhysicalJoinStrategy::PartitionedHash { partitions, .. } => (
                 self.ensure_hash(input.left, input.left_keys, partitions),
                 self.ensure_hash(input.right, input.right_keys, partitions),
@@ -561,8 +593,10 @@ impl PhysicalPlanner {
             PhysicalJoinStrategy::Hash { .. } | PhysicalJoinStrategy::SortMerge => {
                 (input.left, input.right)
             }
+            PhysicalJoinStrategy::Auto { .. } => unreachable!("auto join strategy is resolved"),
         };
-        let mut node = match self.options.default_join_strategy {
+        let mut node = match input.strategy {
+            PhysicalJoinStrategy::Auto { .. } => unreachable!("auto join strategy is resolved"),
             PhysicalJoinStrategy::Hash { build_side } => PhysicalPlanNode::new("JoinExec")
                 .attr("strategy", "hash")
                 .attr("build", format!("{build_side:?}"))
@@ -611,9 +645,7 @@ impl PhysicalPlanner {
                 projection_display(input.output_projection),
             );
 
-        if let PhysicalJoinStrategy::PartitionedHash { partitions, .. } =
-            self.options.default_join_strategy
-        {
+        if let PhysicalJoinStrategy::PartitionedHash { partitions, .. } = input.strategy {
             node = node.partitioning(Partitioning::Hash {
                 keys: input.left_keys.to_vec(),
                 partitions,
@@ -621,6 +653,42 @@ impl PhysicalPlanner {
         }
 
         node.child(left).child(right)
+    }
+
+    fn choose_join_strategy(
+        &self,
+        left: &LogicalPlan,
+        right: &LogicalPlan,
+        join_type: JoinType,
+    ) -> PhysicalJoinStrategy {
+        let PhysicalJoinStrategy::Auto { memory_limit_bytes } = self.options.default_join_strategy
+        else {
+            return self.options.default_join_strategy;
+        };
+        let memory_limit_bytes = memory_limit_bytes.max(1);
+        let left_bytes = estimated_logical_bytes(left);
+        let right_bytes = estimated_logical_bytes(right);
+        let build_side = if join_type == JoinType::Semi {
+            JoinBuildSide::Right
+        } else if left_bytes <= right_bytes {
+            JoinBuildSide::Left
+        } else {
+            JoinBuildSide::Right
+        };
+        let build_bytes = match build_side {
+            JoinBuildSide::Left => left_bytes,
+            JoinBuildSide::Right => right_bytes,
+        };
+        if matches!(join_type, JoinType::Inner | JoinType::Full | JoinType::Semi)
+            && build_bytes > memory_limit_bytes
+        {
+            PhysicalJoinStrategy::PartitionedHash {
+                partitions: crate::cost::partition_count(build_bytes, memory_limit_bytes),
+                memory_limit_bytes,
+            }
+        } else {
+            PhysicalJoinStrategy::Hash { build_side }
+        }
     }
 
     fn ensure_single(&self, input: PhysicalPlanNode) -> PhysicalPlanNode {
@@ -1023,6 +1091,52 @@ fn projection_display(projection: &Projection) -> String {
     }
 }
 
+fn logical_scan_projection(scan: &LogicalScan) -> Projection {
+    let Projection::Columns(output_columns) = &scan.projection else {
+        return Projection::All;
+    };
+    let mut columns = output_columns.clone();
+    if let Some(filter) = &scan.filter {
+        for column in filter.referenced_columns() {
+            add_column_once(&mut columns, column);
+        }
+    }
+    if !scan.distinct
+        && let Some(order_by) = &scan.order_by
+    {
+        for expression in &order_by.expressions {
+            add_column_once(&mut columns, expression.column.clone());
+        }
+    }
+    Projection::Columns(columns)
+}
+
+fn add_column_once(columns: &mut Vec<String>, column: String) {
+    if !columns.iter().any(|existing| existing == &column) {
+        columns.push(column);
+    }
+}
+
+fn estimated_logical_bytes(plan: &LogicalPlan) -> u64 {
+    match plan {
+        LogicalPlan::TableScan(scan) => scan
+            .source
+            .statistics
+            .compressed_bytes
+            .max((scan.source.statistics.rows as u64).saturating_mul(8)),
+        LogicalPlan::Projection { input, .. }
+        | LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Distinct { input }
+        | LogicalPlan::Copy { input, .. } => estimated_logical_bytes(input),
+        LogicalPlan::Aggregate { input, .. } => estimated_logical_bytes(input),
+        LogicalPlan::Join { left, right, .. } => {
+            estimated_logical_bytes(left).saturating_add(estimated_logical_bytes(right))
+        }
+    }
+}
+
 fn sort_key_display(sort: &SortKey) -> String {
     format!(
         "[{}]",
@@ -1089,6 +1203,63 @@ mod tests {
             limit: None,
             distinct: false,
         })
+    }
+
+    fn scan_with_statistics(rows: usize, compressed_bytes: u64) -> LogicalPlan {
+        let LogicalPlan::TableScan(mut scan) = empty_scan() else {
+            unreachable!();
+        };
+        scan.source.statistics = TableStatistics {
+            fragments: 1,
+            rows,
+            row_groups: 1,
+            compressed_bytes,
+        };
+        LogicalPlan::TableScan(scan)
+    }
+
+    fn logical_inner_join(left: LogicalPlan, right: LogicalPlan) -> LogicalPlan {
+        LogicalPlan::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: JoinType::Inner,
+            left_keys: vec!["k".to_string()],
+            right_keys: vec!["id".to_string()],
+            left_prefix: "l".to_string(),
+            right_prefix: "r".to_string(),
+            output_projection: Projection::All,
+        }
+    }
+
+    #[test]
+    fn cost_based_join_planner_builds_the_smaller_input() {
+        let logical = logical_inner_join(
+            scan_with_statistics(1_000, 8_000),
+            scan_with_statistics(1_000_000, 8_000_000),
+        );
+
+        let physical = PhysicalPlanner::default().plan(&logical);
+
+        assert_eq!(physical.operator(), &PhysicalOperator::HashJoin);
+        assert!(physical.render_text().contains("build=Left"));
+    }
+
+    #[test]
+    fn cost_based_join_planner_partitions_an_oversized_build() {
+        let logical = logical_inner_join(
+            scan_with_statistics(1_000, 8_000),
+            scan_with_statistics(2_000, 16_000),
+        );
+        let physical = PhysicalPlanner::new(PhysicalPlanningOptions {
+            default_join_strategy: PhysicalJoinStrategy::Auto {
+                memory_limit_bytes: 1_024,
+            },
+            ..PhysicalPlanningOptions::default()
+        })
+        .plan(&logical);
+
+        assert_eq!(physical.operator(), &PhysicalOperator::PartitionedHashJoin);
+        assert!(physical.render_text().contains("partitions=8"));
     }
 
     #[test]

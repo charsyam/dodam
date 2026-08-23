@@ -751,7 +751,7 @@ async fn scan_plan_exposes_logical_and_declarative_physical_nodes() {
             2,
             Some(2),
             Projection::Columns(vec!["id".to_string()]),
-            Some(FilterExpr::parse("id >= 2").expect("filter")),
+            Some(FilterExpr::parse("payload = 'a'").expect("filter")),
             Some(SortKey::from(SortExpr::parse("id desc").expect("sort"))),
         )
         .await
@@ -760,11 +760,11 @@ async fn scan_plan_exposes_logical_and_declarative_physical_nodes() {
     let logical = plan.to_logical_plan();
     let planned_from_logical = logical.to_physical_plan();
     assert_eq!(planned_from_logical.operator(), &PhysicalOperator::Limit);
-    assert!(
-        planned_from_logical
-            .render_text()
-            .contains("ScanExec format=Parquet")
-    );
+    let planned_text = planned_from_logical.render_text();
+    assert!(planned_text.contains("ScanExec format=Parquet"));
+    assert!(planned_text.contains("projection=[id,payload]"));
+    assert!(planned_text.contains("pushdown_predicates=1"));
+    assert!(planned_text.contains("ProjectionExec projection=[id]"));
     let LogicalPlan::TableScan(scan) = logical else {
         panic!("expected logical table scan");
     };
@@ -784,7 +784,7 @@ async fn scan_plan_exposes_logical_and_declarative_physical_nodes() {
         .expect("execute lowered physical plan")
         .collect::<Result<Vec<_>, _>>()
         .expect("collect lowered scan");
-    assert_eq!(ids_from_batches(&batches), vec![5, 4]);
+    assert_eq!(ids_from_batches(&batches), vec![4, 2]);
 
     let graph = StagePlanner::plan_execution_graph(plan.to_logical_plan().to_physical_plan());
     let streams = DodamEngine::default()
@@ -798,7 +798,7 @@ async fn scan_plan_exposes_logical_and_declarative_physical_nodes() {
                 .expect("collect task stream")
         })
         .collect::<Vec<_>>();
-    assert_eq!(ids_from_batches(&task_rows), vec![5, 4]);
+    assert_eq!(ids_from_batches(&task_rows), vec![4, 2]);
 
     let gather_physical = PhysicalPlanner::new(PhysicalPlanningOptions {
         insert_exchanges: true,
@@ -817,7 +817,7 @@ async fn scan_plan_exposes_logical_and_declarative_physical_nodes() {
                 .expect("collect gather stream")
         })
         .collect::<Vec<_>>();
-    assert_eq!(ids_from_batches(&gather_rows), vec![5, 4]);
+    assert_eq!(ids_from_batches(&gather_rows), vec![4, 2]);
 }
 
 #[tokio::test]

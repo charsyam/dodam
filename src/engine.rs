@@ -38,6 +38,7 @@ use crate::execution::{
     collect_grouped_aggregates, collect_metrics, evaluate_filter_mask,
     merge_partial_aggregate_metrics, scan_projection, write_stream_to_sink,
 };
+use crate::optimizer::LogicalOptimizer;
 use crate::plan::{
     DirectPrimitiveFoldMode, ExchangeKind, ExecutionGraphPlan, LogicalPlan, LogicalScan,
     PhysicalExecutionConfig, PhysicalJoinStrategy, PhysicalOperator, PhysicalPlanNode,
@@ -5244,39 +5245,60 @@ impl DodamEngine {
         options: ScanPlanOptions,
     ) -> Result<ScanPlan> {
         let (source, filter) = prune_table_source_partitions(source, options.filter.clone());
-        let scan_projection = if options.distinct {
-            scan_projection(&options.projection, filter.as_ref())
+        let logical = logical_scan_plan(
+            &source,
+            options.batch_size,
+            options.limit,
+            options.projection,
+            filter,
+            options.order_by,
+            options.distinct,
+        );
+        let optimized = LogicalOptimizer.optimize(logical);
+        if optimizer_trace_enabled() {
+            eprintln!(
+                "[dodam:optimizer] phase=logical rules={:?}",
+                optimized.applied_rules
+            );
+        }
+        let LogicalPlan::TableScan(scan) = optimized.plan else {
+            return Err(DodamError::UnsupportedSql(
+                "logical optimizer could not canonicalize scan plan".to_string(),
+            ));
+        };
+        let scan_projection = if scan.distinct {
+            scan_projection(&scan.projection, scan.filter.as_ref())
         } else {
             scan_projection_with_sort(
-                &options.projection,
-                filter.as_ref(),
-                options.order_by.as_ref(),
+                &scan.projection,
+                scan.filter.as_ref(),
+                scan.order_by.as_ref(),
             )
         };
-        let predicates = PredicateSet::new(filter.clone());
+        let predicates = PredicateSet::new(scan.filter.clone());
         let estimated_bytes =
-            self.estimate_scan_source_bytes(&source, &scan_projection, filter.as_ref())?;
+            self.estimate_scan_source_bytes(&source, &scan_projection, scan.filter.as_ref())?;
         let pushdown_predicates = predicates.pushdown().to_vec();
         let residual_filter = predicates.residual().cloned();
         let operators = scan_operators(
-            options.limit,
-            options.distinct,
-            filter.is_some(),
-            options.order_by.is_some(),
+            scan.limit,
+            scan.distinct,
+            scan.filter.is_some(),
+            scan.order_by.is_some(),
         );
         Ok(ScanPlan {
             source,
-            batch_size: options.batch_size,
-            limit: options.limit,
-            output_projection: options.projection,
+            batch_size: scan.batch_size,
+            limit: scan.limit,
+            output_projection: scan.projection,
             scan_projection,
-            filter: filter.clone(),
+            filter: scan.filter.clone(),
             residual_filter,
             pushdown_predicates,
             row_filter_predicates: Vec::new(),
-            has_filter: filter.is_some(),
-            distinct: options.distinct,
-            order_by: options.order_by,
+            has_filter: scan.filter.is_some(),
+            distinct: scan.distinct,
+            order_by: scan.order_by,
             estimated_bytes,
             operators,
             preserve_order: false,
@@ -8107,6 +8129,67 @@ fn exprs_to_filter(exprs: Vec<Expr>) -> Option<FilterExpr> {
     Some(FilterExpr::new(exprs.fold(first, |left, right| {
         Expr::And(Box::new(left), Box::new(right))
     })))
+}
+
+fn logical_scan_plan(
+    source: &TableScanSource,
+    batch_size: usize,
+    limit: Option<usize>,
+    projection: Projection,
+    filter: Option<FilterExpr>,
+    order_by: Option<SortKey>,
+    distinct: bool,
+) -> LogicalPlan {
+    let mut plan = LogicalPlan::TableScan(LogicalScan {
+        source: plan_table_source_from_scan_source(source),
+        batch_size,
+        projection: Projection::All,
+        filter: None,
+        order_by: None,
+        limit: None,
+        distinct: false,
+    });
+    if let Some(filter) = filter {
+        plan = LogicalPlan::Filter {
+            input: Box::new(plan),
+            filter,
+        };
+    }
+    if distinct {
+        plan = LogicalPlan::Projection {
+            input: Box::new(plan),
+            projection,
+        };
+        plan = LogicalPlan::Distinct {
+            input: Box::new(plan),
+        };
+        if let Some(order_by) = order_by {
+            plan = LogicalPlan::Sort {
+                input: Box::new(plan),
+                order_by,
+                limit: None,
+            };
+        }
+    } else {
+        if let Some(order_by) = order_by {
+            plan = LogicalPlan::Sort {
+                input: Box::new(plan),
+                order_by,
+                limit: None,
+            };
+        }
+        plan = LogicalPlan::Projection {
+            input: Box::new(plan),
+            projection,
+        };
+    }
+    if let Some(limit) = limit {
+        plan = LogicalPlan::Limit {
+            input: Box::new(plan),
+            limit,
+        };
+    }
+    plan
 }
 
 fn plan_table_source_from_scan_source(source: &TableScanSource) -> PlanTableSource {
