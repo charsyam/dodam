@@ -4472,7 +4472,7 @@ fn i64_lookup_candidate_masks_enabled() -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_i64_dictionary_lookup_selected_runs_for_row_group<Lookup>(
+fn build_i64_lookup_selected_runs_for_row_group<Lookup>(
     row_group: &dyn parquet::file::reader::RowGroupReader,
     column: usize,
     records: usize,
@@ -4494,6 +4494,7 @@ where
     }
     let mut page_reader = row_group.get_column_page_reader(column)?;
     let mut dictionary_masks = None;
+    let mut saw_data_page = false;
     let mut page_row_start = 0usize;
     while let Some(page) = page_reader.get_next_page()? {
         match page {
@@ -4525,15 +4526,6 @@ where
                 def_level_encoding,
                 ..
             } => {
-                if !matches!(
-                    encoding,
-                    Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
-                ) {
-                    return Ok(None);
-                }
-                let Some(dictionary_masks) = dictionary_masks.as_ref() else {
-                    return Ok(None);
-                };
                 let page_rows = num_values as usize;
                 let mut value_start = 0usize;
                 if column_desc.max_def_level() > 0 {
@@ -4547,19 +4539,41 @@ where
                         return Ok(None);
                     }
                 }
-                if !append_dictionary_mask_selected_runs_from_encoded(
-                    buf.slice(value_start..),
-                    page_rows,
-                    dictionary_masks,
-                    page_row_start,
-                    page_rows,
-                    selected_masks,
-                    collect_selected_masks,
-                    runs,
-                    builder,
-                )? {
+                let values = buf.slice(value_start..);
+                let appended = match encoding {
+                    Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY => {
+                        let Some(dictionary_masks) = dictionary_masks.as_ref() else {
+                            return Ok(None);
+                        };
+                        append_dictionary_mask_selected_runs_from_encoded(
+                            values,
+                            page_rows,
+                            dictionary_masks,
+                            page_row_start,
+                            page_rows,
+                            selected_masks,
+                            collect_selected_masks,
+                            runs,
+                            builder,
+                        )?
+                    }
+                    Encoding::PLAIN => append_plain_i64_lookup_selected_runs(
+                        values,
+                        page_rows,
+                        lookup,
+                        page_row_start,
+                        page_rows,
+                        selected_masks,
+                        collect_selected_masks,
+                        runs,
+                        builder,
+                    )?,
+                    _ => return Ok(None),
+                };
+                if !appended {
                     return Ok(None);
                 }
+                saw_data_page = true;
                 page_row_start += page_rows;
             }
             Page::DataPageV2 {
@@ -4571,45 +4585,116 @@ where
                 rep_levels_byte_len,
                 ..
             } => {
-                if !matches!(
-                    encoding,
-                    Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
-                ) || (column_desc.max_def_level() > 0 && num_nulls != 0)
-                {
+                if column_desc.max_def_level() > 0 && num_nulls != 0 {
                     return Ok(None);
                 }
-                let Some(dictionary_masks) = dictionary_masks.as_ref() else {
-                    return Ok(None);
-                };
                 let page_rows = num_values as usize;
                 let value_start = (rep_levels_byte_len + def_levels_byte_len) as usize;
                 if value_start > buf.len() {
                     return Ok(None);
                 }
-                if !append_dictionary_mask_selected_runs_from_encoded(
-                    buf.slice(value_start..),
-                    page_rows,
-                    dictionary_masks,
-                    page_row_start,
-                    page_rows,
-                    selected_masks,
-                    collect_selected_masks,
-                    runs,
-                    builder,
-                )? {
+                let values = buf.slice(value_start..);
+                let appended = match encoding {
+                    Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY => {
+                        let Some(dictionary_masks) = dictionary_masks.as_ref() else {
+                            return Ok(None);
+                        };
+                        append_dictionary_mask_selected_runs_from_encoded(
+                            values,
+                            page_rows,
+                            dictionary_masks,
+                            page_row_start,
+                            page_rows,
+                            selected_masks,
+                            collect_selected_masks,
+                            runs,
+                            builder,
+                        )?
+                    }
+                    Encoding::PLAIN => append_plain_i64_lookup_selected_runs(
+                        values,
+                        page_rows,
+                        lookup,
+                        page_row_start,
+                        page_rows,
+                        selected_masks,
+                        collect_selected_masks,
+                        runs,
+                        builder,
+                    )?,
+                    _ => return Ok(None),
+                };
+                if !appended {
                     return Ok(None);
                 }
+                saw_data_page = true;
                 page_row_start += page_rows;
             }
         }
     }
-    if dictionary_masks.is_none()
+    if !saw_data_page
         || page_row_start != records
         || (collect_selected_masks && selected_masks.len() != builder.selected_rows())
     {
         return Ok(None);
     }
     Ok(Some(builder.selected_rows()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_plain_i64_lookup_selected_runs<Lookup>(
+    data: Bytes,
+    values: usize,
+    lookup: &Lookup,
+    row_offset: usize,
+    rows: usize,
+    selected_masks: &mut Vec<u8>,
+    collect_selected_masks: bool,
+    runs: &mut Vec<(usize, usize)>,
+    builder: &mut SelectionRunsBuilder,
+) -> Result<bool>
+where
+    Lookup: Fn(i64) -> Option<u8>,
+{
+    const LOOKUP_BLOCK_ROWS: usize = 256;
+
+    let Some(byte_len) = values.checked_mul(std::mem::size_of::<i64>()) else {
+        return Ok(false);
+    };
+    if values != rows || data.len() < byte_len {
+        return Ok(false);
+    }
+
+    let mut masks = [0_u8; LOOKUP_BLOCK_ROWS];
+    let mut block_start = 0usize;
+    while block_start < values {
+        let block_rows = LOOKUP_BLOCK_ROWS.min(values - block_start);
+        for (lane, mask) in masks[..block_rows].iter_mut().enumerate() {
+            *mask = lookup(read_i64_le_unchecked(&data, block_start + lane)).unwrap_or(0);
+        }
+
+        let mut lane = 0usize;
+        while lane < block_rows {
+            if masks[lane] == 0 {
+                lane += 1;
+                continue;
+            }
+            let selected_start = lane;
+            while lane < block_rows && masks[lane] != 0 {
+                if collect_selected_masks {
+                    selected_masks.push(masks[lane]);
+                }
+                lane += 1;
+            }
+            builder.push_run(
+                runs,
+                row_offset + block_start + selected_start,
+                lane - selected_start,
+            );
+        }
+        block_start += block_rows;
+    }
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7919,6 +8004,38 @@ mod staged_selection_tests {
     }
 
     #[test]
+    fn builds_lookup_runs_across_plain_i64_blocks() {
+        let values = (0_i64..300).collect::<Vec<_>>();
+        let mut bytes = Vec::with_capacity(values.len() * std::mem::size_of::<i64>());
+        for value in &values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut selected_masks = Vec::new();
+        let mut runs = Vec::new();
+        let mut builder = SelectionRunsBuilder::default();
+
+        assert!(
+            append_plain_i64_lookup_selected_runs(
+                Bytes::from(bytes),
+                values.len(),
+                &|value| (250..=260)
+                    .contains(&value)
+                    .then_some((value % 2 + 1) as u8),
+                1_000,
+                values.len(),
+                &mut selected_masks,
+                true,
+                &mut runs,
+                &mut builder,
+            )
+            .expect("plain i64 lookup")
+        );
+        assert_eq!(runs, vec![(1_250, 11)]);
+        assert_eq!(builder.selected_rows(), 11);
+        assert_eq!(selected_masks, vec![1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1]);
+    }
+
+    #[test]
     fn chooses_blocked_dictionary_decode_for_fragmented_pages() {
         assert!(!should_use_blocked_selected_dictionary_decode(100, 4, 3));
         assert!(should_use_blocked_selected_dictionary_decode(100, 20, 10));
@@ -8328,12 +8445,14 @@ where
         || max_candidate_denominator == 0
         || max_candidate_numerator > max_candidate_denominator
     {
+        log_staged_direct_reject(None, "invalid-options", "", 0, 0);
         return Ok(None);
     }
     let mut names = Vec::with_capacity(payload_columns.len() + 3);
     names.extend([key_column, first_predicate_column, second_predicate_column]);
     names.extend(payload_columns.iter().map(|column| column.name));
     let Some(column_indices) = parquet_column_indices_by_name(&reader, &names) else {
+        log_staged_direct_reject(None, "missing-column", "", 0, 0);
         return Ok(None);
     };
     let key_index = column_indices[0];
@@ -8367,13 +8486,14 @@ where
                     )
             })
     {
+        log_staged_direct_reject(None, "unsupported-schema", "", 0, 0);
         return Ok(None);
     }
 
     let lookup_mask = |value| lookup(value).then_some(1_u8);
     let collect_candidate_masks = i64_lookup_candidate_masks_enabled();
     let mut metrics = DirectPrimitiveColumnScanMetrics {
-        reader_kind: "dictionary-lookup-staged-two-i64-selected-page",
+        reader_kind: "i64-lookup-staged-two-i64-selected-page",
         row_groups: row_groups.len(),
         column_read_nanos: vec![0; payload_columns.len() + 3],
         ..DirectPrimitiveColumnScanMetrics::default()
@@ -8389,7 +8509,7 @@ where
         let mut candidate_runs = Vec::new();
         let mut candidate_builder = SelectionRunsBuilder::default();
         let mut candidate_masks = Vec::new();
-        let Some(candidate_rows) = build_i64_dictionary_lookup_selected_runs_for_row_group(
+        let Some(candidate_rows) = build_i64_lookup_selected_runs_for_row_group(
             &*row_group,
             key_index,
             row_count,
@@ -8400,6 +8520,13 @@ where
             &mut candidate_builder,
         )?
         else {
+            log_staged_direct_reject(
+                Some(row_group_index),
+                "key-lookup-selection",
+                key_column,
+                row_count,
+                0,
+            );
             return Ok(None);
         };
         metrics.add_column_read_nanos(0, elapsed_nanos(key_started));
@@ -8408,6 +8535,13 @@ where
             || candidate_rows.saturating_mul(max_candidate_denominator)
                 > row_count.saturating_mul(max_candidate_numerator)
         {
+            log_staged_direct_reject(
+                Some(row_group_index),
+                "candidate-shape-or-ratio",
+                key_column,
+                row_count,
+                candidate_rows,
+            );
             return Ok(None);
         }
         if candidate_rows == 0 {
@@ -8427,13 +8561,34 @@ where
             &mut metrics,
         )?
         else {
+            log_staged_direct_reject(
+                Some(row_group_index),
+                "first-predicate-read",
+                first_predicate_column,
+                row_count,
+                candidate_rows,
+            );
             return Ok(None);
         };
         metrics.add_column_read_nanos(1, elapsed_nanos(first_started));
         let DirectPrimitiveColumnValues::I64(first_values) = first_values else {
+            log_staged_direct_reject(
+                Some(row_group_index),
+                "first-predicate-type",
+                first_predicate_column,
+                row_count,
+                candidate_rows,
+            );
             return Ok(None);
         };
         if first_values.len() != candidate_rows {
+            log_staged_direct_reject(
+                Some(row_group_index),
+                "first-predicate-length",
+                first_predicate_column,
+                row_count,
+                first_values.len(),
+            );
             return Ok(None);
         }
 
@@ -8448,6 +8603,13 @@ where
             &mut first_selected_tags,
             |offset| first_predicate(first_values[offset]),
         ) {
+            log_staged_direct_reject(
+                Some(row_group_index),
+                "first-predicate-selection",
+                first_predicate_column,
+                row_count,
+                candidate_rows,
+            );
             return Ok(None);
         }
         let first_selected_rows = first_selected_builder.selected_rows();
@@ -8468,13 +8630,34 @@ where
             &mut metrics,
         )?
         else {
+            log_staged_direct_reject(
+                Some(row_group_index),
+                "second-predicate-read",
+                second_predicate_column,
+                row_count,
+                first_selected_rows,
+            );
             return Ok(None);
         };
         metrics.add_column_read_nanos(2, elapsed_nanos(second_started));
         let DirectPrimitiveColumnValues::I64(second_values) = second_values else {
+            log_staged_direct_reject(
+                Some(row_group_index),
+                "second-predicate-type",
+                second_predicate_column,
+                row_count,
+                first_selected_rows,
+            );
             return Ok(None);
         };
         if second_values.len() != first_selected_rows {
+            log_staged_direct_reject(
+                Some(row_group_index),
+                "second-predicate-length",
+                second_predicate_column,
+                row_count,
+                second_values.len(),
+            );
             return Ok(None);
         }
 
@@ -8489,10 +8672,24 @@ where
             &mut selected_tags,
             |offset| second_predicate(first_selected_tags[offset], second_values[offset]),
         ) {
+            log_staged_direct_reject(
+                Some(row_group_index),
+                "second-predicate-selection",
+                second_predicate_column,
+                row_count,
+                first_selected_rows,
+            );
             return Ok(None);
         }
         let selected_rows = selected_builder.selected_rows();
         if selected_tags.len() != selected_rows {
+            log_staged_direct_reject(
+                Some(row_group_index),
+                "selected-tag-length",
+                second_predicate_column,
+                row_count,
+                selected_rows,
+            );
             return Ok(None);
         }
         metrics.selected_rows = metrics.selected_rows.saturating_add(selected_rows);
@@ -8521,6 +8718,13 @@ where
                 &mut metrics,
             )?
             else {
+                log_staged_direct_reject(
+                    Some(row_group_index),
+                    "payload-read",
+                    column.name,
+                    row_count,
+                    selected_rows,
+                );
                 return Ok(None);
             };
             metrics.add_column_read_nanos(payload_offset + 3, elapsed_nanos(column_started));
@@ -8543,6 +8747,28 @@ where
         metrics.add_consume_nanos(elapsed_nanos(consume_started));
     }
     Ok(Some(metrics))
+}
+
+fn log_staged_direct_reject(
+    row_group: Option<usize>,
+    stage: &str,
+    column: &str,
+    rows: usize,
+    selected_rows: usize,
+) {
+    if !parquet_column_profile_enabled() {
+        return;
+    }
+    eprintln!(
+        "[dodam:direct-primitive-reject] reader=i64-lookup-staged-two-i64-selected-page row_group={} stage={} column={} rows={} selected_rows={}",
+        row_group
+            .map(|row_group| row_group.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        stage,
+        column,
+        rows,
+        selected_rows,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9379,7 +9605,7 @@ where
         let mut candidate_runs = Vec::new();
         let mut candidate_builder = SelectionRunsBuilder::default();
         let mut candidate_masks = Vec::new();
-        let Some(candidate_rows) = build_i64_dictionary_lookup_selected_runs_for_row_group(
+        let Some(candidate_rows) = build_i64_lookup_selected_runs_for_row_group(
             &*row_group,
             key_index,
             row_count,
