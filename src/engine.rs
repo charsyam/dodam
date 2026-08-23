@@ -9155,7 +9155,7 @@ fn late_materialization_sample_enabled(
     if std::env::var_os("DODAM_LATE_SAMPLE_FORCE").is_some() {
         return true;
     }
-    payload_columns >= predicate_columns.saturating_mul(2).max(1)
+    policy.io_cost_gate || payload_columns >= predicate_columns.saturating_mul(2).max(1)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -320,8 +320,11 @@ async fn try_collect_filtered_product_sum_late_materialized(
 }
 
 fn should_try_filtered_product_sum_late_materialized(spec: &DecimalProductSumSpec) -> bool {
-    spec.product_factor_count() <= 2
-        || std::env::var_os("DODAM_ENABLE_THREE_FACTOR_PRODUCT_SUM_LATE").is_some()
+    let factor_count_supported = spec.product_factor_count() <= 2
+        || std::env::var_os("DODAM_ENABLE_THREE_FACTOR_PRODUCT_SUM_LATE").is_some();
+    factor_count_supported
+        && (spec.predicates.len() < spec.product_payload_column_count()
+            || std::env::var_os("DODAM_ENABLE_WIDE_PREDICATE_PRODUCT_SUM_LATE").is_some())
 }
 
 pub(super) fn product_vector_scan_batch_size(batch_size: usize) -> usize {
@@ -485,6 +488,20 @@ impl DecimalProductSumSpec {
 
     fn product_factor_count(&self) -> usize {
         2 + usize::from(self.third_kind.is_some())
+    }
+
+    fn product_payload_column_count(&self) -> usize {
+        let mut count = 1;
+        if self.right_column != self.left_column {
+            count += 1;
+        }
+        if let Some(third_column) = &self.third_column
+            && third_column != &self.left_column
+            && third_column != &self.right_column
+        {
+            count += 1;
+        }
+        count
     }
 }
 

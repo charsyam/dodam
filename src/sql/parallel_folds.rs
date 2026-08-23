@@ -400,6 +400,11 @@ pub(super) async fn collect_i64_adaptive_set(
     batch_size: usize,
     key_column: &str,
 ) -> Result<AdaptiveI64Set> {
+    if let Some(keys) =
+        collect_i64_adaptive_set_direct_atomic(engine, &path, batch_size, key_column)?
+    {
+        return Ok(keys);
+    }
     let mut stream = engine
         .scan_parquet_batches(
             path,
@@ -415,6 +420,120 @@ pub(super) async fn collect_i64_adaptive_set(
         collect_i64_adaptive_set_batch(&batch, key_column, &mut keys)?;
     }
     Ok(keys)
+}
+
+fn collect_i64_adaptive_set_direct_atomic(
+    engine: &DodamEngine,
+    path: &Path,
+    batch_size: usize,
+    key_column: &str,
+) -> Result<Option<AdaptiveI64Set>> {
+    let Some(ranges) = engine.parquet_primitive_column_min_max_by_row_group(path, key_column)?
+    else {
+        return Ok(None);
+    };
+    if ranges.is_empty() {
+        return Ok(Some(AdaptiveI64Set::new_dense()));
+    }
+    let Some(min_key) = ranges.iter().map(|range| range.min).min() else {
+        return Ok(None);
+    };
+    let Some(max_key) = ranges.iter().map(|range| range.max).max() else {
+        return Ok(None);
+    };
+    if min_key < 0 {
+        return Ok(None);
+    }
+    let Ok(max_key) = usize::try_from(max_key) else {
+        return Ok(None);
+    };
+    let Some(marker_len) = max_key.checked_add(1) else {
+        return Ok(None);
+    };
+    let Some(total_rows) = ranges
+        .iter()
+        .try_fold(0_usize, |rows, range| rows.checked_add(range.rows))
+    else {
+        return Ok(None);
+    };
+    if marker_len as f64 > total_rows as f64 * dense_max_amplification(8.0) {
+        return Ok(None);
+    }
+    let Some(marker_bytes) =
+        marker_len.checked_mul(std::mem::size_of::<std::sync::atomic::AtomicU8>())
+    else {
+        return Ok(None);
+    };
+    if marker_bytes > direct_atomic_i64_set_max_bytes() {
+        return Ok(None);
+    }
+    let Some(column_types) =
+        engine.parquet_direct_primitive_column_types(path, &[key_column.to_string()])?
+    else {
+        return Ok(None);
+    };
+    if !matches!(column_types.as_slice(), [DirectPrimitiveColumnType::I64]) {
+        return Ok(None);
+    }
+
+    let markers = Arc::new(DenseAtomicU8::zeroed(marker_len));
+    let row_groups = (0..engine.parquet_row_group_count(path)?).collect::<Vec<_>>();
+    let Some((_state, _metrics)) = engine.scan_parquet_primitive_columns_parallel_view_fold(
+        path.to_path_buf(),
+        batch_size,
+        row_groups,
+        vec![(key_column.to_string(), DirectPrimitiveColumnType::I64)],
+        || (),
+        {
+            let markers = markers.clone();
+            move |(), view| store_i64_vector_in_atomic_set(view, &markers)
+        },
+        |(), ()| Ok(()),
+    )?
+    else {
+        return Ok(None);
+    };
+    let markers = Arc::try_unwrap(markers).map_err(|_| {
+        DodamError::UnsupportedSql("direct atomic i64 set marker still shared".to_string())
+    })?;
+    Ok(Some(markers.into_adaptive_i64_set()))
+}
+
+fn store_i64_vector_in_atomic_set(view: BatchView<'_>, markers: &DenseAtomicU8) -> Result<()> {
+    let Some(keys) = view.i64_vector(0) else {
+        return Err(DodamError::UnsupportedSql(
+            "direct atomic i64 set vector shape mismatch".to_string(),
+        ));
+    };
+    if let Some(values) = keys.values_if_null_free() {
+        for block in values.chunks(256) {
+            for &key in block {
+                if let Ok(index) = usize::try_from(key) {
+                    markers.store_present(index);
+                }
+            }
+        }
+        return Ok(());
+    }
+    for block_start in (0..keys.len()).step_by(256) {
+        let block_end = (block_start + 256).min(keys.len());
+        for row in block_start..block_end {
+            if !keys.is_null(row)
+                && let Ok(index) = usize::try_from(keys.value(row))
+            {
+                markers.store_present(index);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn direct_atomic_i64_set_max_bytes() -> usize {
+    std::env::var("DODAM_DIRECT_ATOMIC_I64_SET_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(256 * 1024 * 1024)
 }
 
 pub(super) async fn collect_i64_by_i64_set_adaptive_set(

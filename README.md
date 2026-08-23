@@ -201,9 +201,11 @@ execution and no warmup because the full-suite session was not reliable on the
 `Dodam / DuckDB`.
 
 Q09 and Q11 use the measurements taken after the dense-layout boundary
-improvements in commit `35a7895`. The SF100 aggregate substitutes their new
-medians into the original 22-query record, while the SF200 aggregate sums the
-22 individual executions.
+improvements in commit `35a7895`. Q06 and Q22 use the measurements taken after
+removing an unprofitable late-materialization attempt and adding a direct
+atomic dense-set build, respectively. The SF100 aggregate substitutes the four
+new medians into the original 22-query record, while the SF200 aggregate sums
+the 22 individual executions.
 
 ```sh
 scripts/gen_tpchgen_parquet.sh 100 /tmp/dodam-tpchgen-sf100
@@ -226,7 +228,7 @@ python3 scripts/compare_tpch_duckdb.py \
 | Q03 | 2,037.043 | 3,292.490 | 0.619x | 5,509.412 | 8,009.946 | 0.688x |
 | Q04 | 1,336.434 | 1,801.345 | 0.742x | 3,521.010 | 3,792.233 | 0.928x |
 | Q05 | 3,803.138 | 4,243.518 | 0.896x | 9,686.127 | 9,268.823 | 1.045x |
-| Q06 | 1,378.774 | 1,669.688 | 0.826x | 4,114.202 | 3,357.521 | 1.225x |
+| Q06 | 987.902 | 1,640.959 | 0.602x | 3,662.726 | 3,284.201 | 1.115x |
 | Q07 | 3,396.210 | 4,328.756 | 0.785x | 10,519.008 | 10,872.687 | 0.967x |
 | Q08 | 4,220.724 | 5,399.882 | 0.782x | 11,934.727 | 12,576.822 | 0.949x |
 | Q09 | 6,899.102 | 8,848.585 | 0.780x | 17,145.217 | 26,793.000 | 0.640x |
@@ -242,13 +244,15 @@ python3 scripts/compare_tpch_duckdb.py \
 | Q19 | 2,259.660 | 3,956.652 | 0.571x | 6,352.603 | 7,675.516 | 0.828x |
 | Q20 | 3,219.416 | 3,805.236 | 0.846x | 8,202.987 | 8,076.513 | 1.016x |
 | Q21 | 3,356.837 | 8,421.781 | 0.399x | 8,070.544 | 18,133.437 | 0.445x |
-| Q22 | 827.516 | 1,070.676 | 0.773x | 2,666.801 | 2,116.535 | 1.260x |
-| **Aggregate** | **54,671.202** | **79,188.064** | **0.690x** | **142,115.644** | **175,883.993** | **0.808x** |
+| Q22 | 629.042 | 913.394 | 0.689x | 2,012.324 | 2,040.707 | 0.986x |
+| **Aggregate** | **54,081.856** | **79,002.053** | **0.685x** | **141,009.691** | **175,734.845** | **0.802x** |
 
-Dodam is 31.0% faster by the SF100 aggregate and 19.2% faster by the SF200
-aggregate. It wins 22 of 22 queries at SF100 and 15 of 22 at SF200. At SF200,
-Q09 improved from 45,570.507 ms to 17,145.217 ms (2.658x), and Q11 improved
-from 1,317.365 ms to 745.616 ms (1.766x).
+Dodam is 31.5% faster by the SF100 aggregate and 19.8% faster by the SF200
+aggregate. It wins 22 of 22 queries at SF100 and 16 of 22 at SF200. At SF200,
+Q09 improved from 45,570.507 ms to 17,145.217 ms (2.658x), Q11 improved from
+1,317.365 ms to 745.616 ms (1.766x), Q06 improved from 4,114.202 ms to
+3,662.726 ms (1.123x), and Q22 improved from 2,666.801 ms to 2,012.324 ms
+(1.325x).
 
 Dodam completed all 22 SF200 queries with its default settings. DuckDB completed
 21 with its defaults: Q09 was killed by the host OOM handler after reaching
@@ -257,7 +261,7 @@ with a 12 GiB memory limit, 16 threads, and temporary spilling. Final-run row
 counts and non-numeric values matched DuckDB; numeric values had at most
 `3.856e-14` relative error at SF100. The final SF200 Q09 output matched the
 previously validated 175-row result exactly, and the DuckDB differential
-TPC-H-lite test passed after the Q09 and Q11 changes.
+TPC-H-lite test passed after the Q06, Q09, Q11, and Q22 changes.
 
 The host used an AMD Ryzen 9 7945HX (16 cores/32 threads), Linux 6.14, Rust
 1.89.0, and DuckDB 1.5.4. Dodam used its default 16-thread Rayon pool; DuckDB
