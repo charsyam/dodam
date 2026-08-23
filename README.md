@@ -197,6 +197,10 @@ result as Snappy Parquet. Each query ran five times sequentially; the table uses
 the median of the final four runs after discarding the first run as warmup.
 Lower is better, and the ratio is `Dodam / DuckDB`.
 
+Q09 and Q11 were remeasured with the same procedure after the dense-layout
+boundary improvements in commit `35a7895`. The median sum substitutes those two
+new medians into the original 22-query record.
+
 ```sh
 scripts/gen_tpchgen_parquet.sh 100 /tmp/dodam-tpchgen-sf100
 cargo build --release --bin tpch_real_inprocess
@@ -221,9 +225,9 @@ python3 scripts/compare_tpch_duckdb.py \
 | Q06 | 1,378.774 | 1,669.688 | 0.826x |
 | Q07 | 3,396.210 | 4,328.756 | 0.785x |
 | Q08 | 4,220.724 | 5,399.882 | 0.782x |
-| Q09 | 8,509.201 | 9,717.426 | 0.876x |
+| Q09 | 6,899.103 | 8,848.585 | 0.780x |
 | Q10 | 3,580.100 | 4,362.929 | 0.821x |
-| Q11 | 573.116 | 574.369 | 0.998x |
+| Q11 | 336.453 | 469.825 | 0.716x |
 | Q12 | 1,889.470 | 2,326.796 | 0.812x |
 | Q13 | 2,354.430 | 4,082.296 | 0.577x |
 | Q14 | 2,820.988 | 3,632.703 | 0.777x |
@@ -235,15 +239,34 @@ python3 scripts/compare_tpch_duckdb.py \
 | Q20 | 3,219.416 | 3,805.236 | 0.846x |
 | Q21 | 3,356.837 | 8,421.781 | 0.399x |
 | Q22 | 827.516 | 1,070.676 | 0.773x |
-| **Median sum** | **56,517.964** | **80,161.449** | **0.705x** |
+| **Median sum** | **54,671.202** | **79,188.064** | **0.690x** |
 
-Dodam completed all 110 measured executions successfully. Final-run row counts
-and non-numeric values matched DuckDB; numeric values had at most `3.856e-14`
-relative error from `DOUBLE` versus `DECIMAL` representation. Dodam's
-median-sum elapsed time was 29.5% lower than DuckDB's, and no individual query
-was slower in this run. The host used an AMD Ryzen 9 7945HX (16 cores/32
-threads), Linux 6.14, Rust 1.89.0, and DuckDB 1.5.4. Dodam used its default
-16-thread Rayon pool; DuckDB used its default CLI settings.
+All original full-suite executions and the targeted Q09/Q11 remeasurements
+completed successfully. Final-run row counts and non-numeric values matched
+DuckDB; numeric values had at most `3.856e-14` relative error from `DOUBLE`
+versus `DECIMAL` representation. The substituted median-sum elapsed time is
+31.0% lower than DuckDB's, and no individual query is slower. The host used an
+AMD Ryzen 9 7945HX (16 cores/32 threads), Linux 6.14, Rust 1.89.0, and DuckDB
+1.5.4. Dodam used its default 16-thread Rayon pool; DuckDB used its default CLI
+settings.
+
+### TPC-H SF200 dense-boundary follow-up
+
+Q09 and Q11 were also run individually at SF200 with one execution and no
+warmup, because running the full suite in one session was not reliable on the
+30 GiB host. `Dodam speedup` is the previous Dodam time divided by the improved
+time, so larger is better.
+
+| Query | Dodam before (ms) | Dodam after (ms) | Dodam speedup | Time reduction | DuckDB (ms) | After / DuckDB |
+|---|---:|---:|---:|---:|---:|---:|
+| Q09 | 45,570.507 | 17,145.217 | 2.658x | 62.4% | 26,793.000 | 0.640x |
+| Q11 | 1,316.990 | 745.616 | 1.766x | 43.4% | 871.150 | 0.856x |
+
+DuckDB Q09 used a 12 GiB memory limit and temporary spilling; its default
+configuration was killed by the host OOM handler. Q11 used DuckDB's default CLI
+settings. The final SF200 Q09 output matched the previously validated 175-row
+result exactly, and the DuckDB differential TPC-H-lite test passed after both
+changes.
 
 ## Roadmap
 
