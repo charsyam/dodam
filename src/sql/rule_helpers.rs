@@ -106,12 +106,20 @@ pub(super) fn i64_set_row_filter_row_group_chunk(default_chunk: usize) -> usize 
 }
 
 pub(super) fn dense_i32_max_entries(default_bytes: usize) -> usize {
-    std::env::var("DODAM_DENSE_I32_BYTES")
+    dense_value_max_entries::<i32>("DODAM_DENSE_I32_BYTES", default_bytes)
+}
+
+pub(super) fn dense_u8_max_entries(default_bytes: usize) -> usize {
+    dense_value_max_entries::<u8>("DODAM_DENSE_U8_BYTES", default_bytes)
+}
+
+fn dense_value_max_entries<T>(env_name: &str, default_bytes: usize) -> usize {
+    std::env::var(env_name)
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .map(|bytes| bytes / std::mem::size_of::<i32>())
+        .map(|bytes| bytes / std::mem::size_of::<T>())
         .filter(|entries| *entries > 0)
-        .unwrap_or_else(|| default_bytes / std::mem::size_of::<i32>())
+        .unwrap_or_else(|| default_bytes / std::mem::size_of::<T>())
 }
 
 pub(super) fn dense_max_amplification(default_amplification: f64) -> f64 {
@@ -143,6 +151,14 @@ pub(super) fn dense_i64_probe_bytes(default_bytes: usize) -> usize {
 
 pub(super) fn dense_i64_rank_map_bytes(default_bytes: usize) -> usize {
     std::env::var("DODAM_DENSE_I64_RANK_MAP_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(default_bytes)
+}
+
+pub(super) fn dense_f64_sum_bytes(default_bytes: usize) -> usize {
+    std::env::var("DODAM_DENSE_F64_SUM_BYTES")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|bytes| *bytes > 0)

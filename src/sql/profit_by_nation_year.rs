@@ -228,21 +228,103 @@ async fn q09_order_years(
             None,
         )
         .await?;
-    let mut years = Q09OrderYears::new(0);
-    let mut year_cache = Date32YearCache::default();
+    let mut partial = Q09OrderYearPartial::new();
     while let Some(batch) = stream.next() {
         let batch = batch?;
-        q09_order_years_batch_into(&batch, &mut years, &mut year_cache)?;
+        q09_order_years_partial_batch_into(batch, &mut partial)?;
     }
-    Ok(years)
+    Ok(q09_order_years_from_partials(vec![partial]))
 }
 
-type Q09OrderYears = DenseI64I32Map;
+#[derive(Clone)]
+enum Q09OrderYears {
+    Compact {
+        years: DenseI64U8Map,
+        year_base: i32,
+    },
+    Wide(DenseI64I32Map),
+}
+
+#[derive(Clone, Copy)]
+enum Q09DenseOrderYears<'a> {
+    Compact {
+        values: &'a [u8],
+        key_base: i64,
+        missing: u8,
+        year_base: i32,
+    },
+    Wide {
+        values: &'a [i32],
+        key_base: i64,
+        missing: i32,
+    },
+}
+
+impl Q09DenseOrderYears<'_> {
+    #[inline]
+    fn get(self, orderkey: i64) -> Option<i32> {
+        match self {
+            Self::Compact {
+                values,
+                key_base,
+                missing,
+                year_base,
+            } => {
+                let index = usize::try_from(orderkey.checked_sub(key_base)?).ok()?;
+                let code = values.get(index).copied().filter(|code| *code != missing)?;
+                year_base.checked_add(i32::from(code))
+            }
+            Self::Wide {
+                values,
+                key_base,
+                missing,
+            } => {
+                let index = usize::try_from(orderkey.checked_sub(key_base)?).ok()?;
+                values.get(index).copied().filter(|year| *year != missing)
+            }
+        }
+    }
+}
+
+impl Q09OrderYears {
+    fn get(&self, orderkey: i64) -> Option<i32> {
+        match self {
+            Self::Compact { years, year_base } => years
+                .get(orderkey)
+                .and_then(|code| year_base.checked_add(i32::from(code))),
+            Self::Wide(years) => years.get(orderkey),
+        }
+    }
+
+    fn dense_slice(&self) -> Option<Q09DenseOrderYears<'_>> {
+        match self {
+            Self::Compact { years, year_base } => {
+                let (values, key_base, missing) = years.dense_slice()?;
+                Some(Q09DenseOrderYears::Compact {
+                    values,
+                    key_base,
+                    missing,
+                    year_base: *year_base,
+                })
+            }
+            Self::Wide(years) => {
+                let (values, key_base, missing) = years.dense_slice()?;
+                Some(Q09DenseOrderYears::Wide {
+                    values,
+                    key_base,
+                    missing,
+                })
+            }
+        }
+    }
+}
 
 struct Q09OrderYearPartial {
     rows: Vec<(i64, i32)>,
     min_key: i64,
     max_key: i64,
+    min_year: i32,
+    max_year: i32,
     fallback_required: bool,
     year_cache: Date32YearCache,
 }
@@ -253,6 +335,8 @@ impl Q09OrderYearPartial {
             rows: Vec::new(),
             min_key: i64::MAX,
             max_key: i64::MIN,
+            min_year: i32::MAX,
+            max_year: i32::MIN,
             fallback_required: false,
             year_cache: Date32YearCache::default(),
         }
@@ -265,6 +349,8 @@ impl Q09OrderYearPartial {
             self.min_key = self.min_key.min(orderkey);
             self.max_key = self.max_key.max(orderkey);
         }
+        self.min_year = self.min_year.min(year);
+        self.max_year = self.max_year.max(year);
         self.rows.push((orderkey, year));
     }
 }
@@ -294,6 +380,8 @@ async fn q09_order_years_row_group_map(
 fn q09_order_years_from_partials(partials: Vec<Q09OrderYearPartial>) -> Q09OrderYears {
     let mut min_key = i64::MAX;
     let mut max_key = i64::MIN;
+    let mut min_year = i32::MAX;
+    let mut max_year = i32::MIN;
     let mut fallback_required = false;
     let row_count = partials
         .iter()
@@ -303,31 +391,78 @@ fn q09_order_years_from_partials(partials: Vec<Q09OrderYearPartial>) -> Q09Order
                 min_key = min_key.min(partial.min_key);
                 max_key = max_key.max(partial.max_key);
             }
+            min_year = min_year.min(partial.min_year);
+            max_year = max_year.max(partial.max_year);
             partial.rows.len()
         })
         .sum::<usize>();
-    if fallback_required || min_key > max_key {
-        let mut years = Q09OrderYears::new(0);
-        years.convert_to_fallback();
-        let fallback = years.fallback_mut().expect("converted q09 fallback");
-        for partial in partials {
-            for (orderkey, year) in partial.rows {
-                fallback.insert(orderkey, year);
-            }
-        }
-        return years;
+    if row_count == 0 {
+        return Q09OrderYears::Compact {
+            years: DenseI64U8Map::new(0),
+            year_base: 0,
+        };
     }
-    let mut years = Q09OrderYears::new(0);
-    if !crate::dense::dense_i64_range_within_amplification(
-        min_key,
-        max_key,
-        row_count,
-        q09_order_year_dense_max_amplification(),
-    ) || !years.reserve_dense_range(
-        min_key,
-        max_key,
-        q09_order_year_max_dense_entries(Some(row_count)),
-    ) {
+
+    let compact_year_base = min_year.checked_sub(1).filter(|_| {
+        max_year
+            .checked_sub(min_year)
+            .is_some_and(|width| width < i32::from(u8::MAX))
+    });
+    if let Some(year_base) = compact_year_base {
+        let mut years = DenseI64U8Map::new(0);
+        if fallback_required
+            || min_key > max_key
+            || !crate::dense::dense_i64_range_within_amplification(
+                min_key,
+                max_key,
+                row_count,
+                q09_order_year_dense_max_amplification(),
+            )
+            || !years.reserve_dense_range(
+                min_key,
+                max_key,
+                q09_order_year_max_compact_dense_entries(Some(row_count)),
+            )
+        {
+            years.convert_to_fallback();
+        }
+        if let Some(fallback) = years.fallback_mut() {
+            for partial in partials {
+                for (orderkey, year) in partial.rows {
+                    fallback.insert(
+                        orderkey,
+                        u8::try_from(year - year_base).expect("validated compact year"),
+                    );
+                }
+            }
+        } else {
+            for partial in partials {
+                for (orderkey, year) in partial.rows {
+                    years.insert_dense_key(
+                        orderkey,
+                        u8::try_from(year - year_base).expect("validated compact year"),
+                    );
+                }
+            }
+        }
+        return Q09OrderYears::Compact { years, year_base };
+    }
+
+    let mut years = DenseI64I32Map::new(0);
+    if fallback_required
+        || min_key > max_key
+        || !crate::dense::dense_i64_range_within_amplification(
+            min_key,
+            max_key,
+            row_count,
+            q09_order_year_dense_max_amplification(),
+        )
+        || !years.reserve_dense_range(
+            min_key,
+            max_key,
+            q09_order_year_max_wide_dense_entries(Some(row_count)),
+        )
+    {
         years.convert_to_fallback();
         let fallback = years.fallback_mut().expect("converted q09 fallback");
         for partial in partials {
@@ -335,15 +470,15 @@ fn q09_order_years_from_partials(partials: Vec<Q09OrderYearPartial>) -> Q09Order
                 fallback.insert(orderkey, year);
             }
         }
-        return years;
+        return Q09OrderYears::Wide(years);
     }
     for partial in partials {
         for (orderkey, year) in partial.rows {
             years.insert_dense_key(orderkey, year);
         }
     }
-    debug_assert!(row_count == 0 || years.dense_slice().is_some());
-    years
+    debug_assert!(years.dense_slice().is_some());
+    Q09OrderYears::Wide(years)
 }
 
 fn q09_order_years_partial_batch_into(
@@ -421,8 +556,21 @@ fn q09_order_year_row_group_map_chunk() -> usize {
     generic_row_group_map_chunk_size(8)
 }
 
-fn q09_order_year_max_dense_entries(row_count: Option<usize>) -> usize {
-    let byte_entries = q09_order_year_max_dense_byte_entries();
+fn q09_order_year_max_compact_dense_entries(row_count: Option<usize>) -> usize {
+    q09_order_year_max_dense_entries(
+        row_count,
+        dense_u8_max_entries(DEFAULT_ORDER_YEAR_DENSE_BYTES),
+    )
+}
+
+fn q09_order_year_max_wide_dense_entries(row_count: Option<usize>) -> usize {
+    q09_order_year_max_dense_entries(
+        row_count,
+        dense_i32_max_entries(DEFAULT_ORDER_YEAR_DENSE_BYTES),
+    )
+}
+
+fn q09_order_year_max_dense_entries(row_count: Option<usize>, byte_entries: usize) -> usize {
     if let Some(row_count) = row_count {
         let amplification_entries =
             ((row_count as f64) * q09_order_year_dense_max_amplification()) as usize;
@@ -431,108 +579,8 @@ fn q09_order_year_max_dense_entries(row_count: Option<usize>) -> usize {
     byte_entries
 }
 
-fn q09_order_year_max_dense_byte_entries() -> usize {
-    dense_i32_max_entries(DEFAULT_ORDER_YEAR_DENSE_BYTES)
-}
-
 fn q09_order_year_dense_max_amplification() -> f64 {
     dense_max_amplification(8.5)
-}
-
-fn q09_order_years_batch_into(
-    batch: &RecordBatch,
-    years: &mut Q09OrderYears,
-    year_cache: &mut Date32YearCache,
-) -> Result<()> {
-    if let Some(fallback) = years.fallback_mut() {
-        return q09_order_years_batch_into_fallback(batch, fallback, year_cache);
-    }
-    let orderkeys = batch_column(batch, "o_orderkey")?;
-    let orderdates = batch_column(batch, "o_orderdate")?;
-    if let (Some(orderkeys), Some(orderdates)) = (
-        orderkeys.as_any().downcast_ref::<Int64Array>(),
-        orderdates.as_any().downcast_ref::<Date32Array>(),
-    ) {
-        let max_dense_entries = q09_order_year_max_dense_entries(None);
-        if orderkeys.null_count() == 0 && orderdates.null_count() == 0 {
-            let orderkey_values = orderkeys.values().as_ref();
-            let orderdate_values = orderdates.values().as_ref();
-            let mut min_orderkey = i64::MAX;
-            let mut max_orderkey = i64::MIN;
-            for &orderkey in orderkey_values {
-                if orderkey < 0 {
-                    years.convert_to_fallback();
-                    let fallback = years.fallback_mut().expect("converted q09 fallback");
-                    return q09_order_years_batch_into_fallback(batch, fallback, year_cache);
-                }
-                min_orderkey = min_orderkey.min(orderkey);
-                max_orderkey = max_orderkey.max(orderkey);
-            }
-            if !years.reserve_dense_range(min_orderkey, max_orderkey, max_dense_entries) {
-                years.convert_to_fallback();
-                let fallback = years.fallback_mut().expect("converted q09 fallback");
-                return q09_order_years_batch_into_fallback(batch, fallback, year_cache);
-            }
-            for (&orderkey, &orderdate) in orderkey_values.iter().zip(orderdate_values) {
-                years.insert_dense_key(orderkey, year_cache.year(orderdate)?);
-            }
-            return Ok(());
-        }
-        let mut min_orderkey = i64::MAX;
-        let mut max_orderkey = i64::MIN;
-        let mut has_key = false;
-        for row in 0..orderkeys.len() {
-            if orderkeys.is_null(row) || orderdates.is_null(row) {
-                continue;
-            }
-            let orderkey = orderkeys.value(row);
-            if orderkey < 0 {
-                years.convert_to_fallback();
-                let fallback = years.fallback_mut().expect("converted q09 fallback");
-                return q09_order_years_batch_into_fallback(batch, fallback, year_cache);
-            }
-            min_orderkey = min_orderkey.min(orderkey);
-            max_orderkey = max_orderkey.max(orderkey);
-            has_key = true;
-        }
-        if has_key && !years.reserve_dense_range(min_orderkey, max_orderkey, max_dense_entries) {
-            years.convert_to_fallback();
-            let fallback = years.fallback_mut().expect("converted q09 fallback");
-            return q09_order_years_batch_into_fallback(batch, fallback, year_cache);
-        }
-        for row in 0..orderkeys.len() {
-            if orderkeys.is_null(row) || orderdates.is_null(row) {
-                continue;
-            }
-            years.insert_dense_key(
-                orderkeys.value(row),
-                year_cache.year(orderdates.value(row))?,
-            );
-        }
-        return Ok(());
-    }
-    years.convert_to_fallback();
-    let fallback = years.fallback_mut().expect("converted q09 fallback");
-    q09_order_years_batch_into_fallback(batch, fallback, year_cache)
-}
-
-fn q09_order_years_batch_into_fallback(
-    batch: &RecordBatch,
-    years: &mut AdaptiveI64Map<i32>,
-    year_cache: &mut Date32YearCache,
-) -> Result<()> {
-    let orderkeys = batch_column(batch, "o_orderkey")?;
-    let orderdates = batch_column(batch, "o_orderdate")?;
-    for row in 0..orderkeys.len() {
-        let (Some(orderkey), Some(orderdate)) = (
-            numeric_i64_value(orderkeys, row)?,
-            date32_value(orderdates, row)?,
-        ) else {
-            continue;
-        };
-        years.insert(orderkey, year_cache.year(orderdate)?);
-    }
-    Ok(())
 }
 
 async fn q09_supply_costs(
@@ -1238,12 +1286,11 @@ fn q09_profit_projected_view(
 
 fn q09_order_year_get(
     order_years: &Q09OrderYears,
-    dense_order_years: Option<(&[i32], i64, i32)>,
+    dense_order_years: Option<Q09DenseOrderYears<'_>>,
     orderkey: i64,
 ) -> Option<i32> {
-    if let Some((values, base_key, missing)) = dense_order_years {
-        let index = usize::try_from(orderkey.checked_sub(base_key)?).ok()?;
-        return values.get(index).copied().filter(|value| *value != missing);
+    if let Some(dense_order_years) = dense_order_years {
+        return dense_order_years.get(orderkey);
     }
     order_years.get(orderkey)
 }
@@ -1743,40 +1790,6 @@ fn q09_profit_decimal_view(
     Some(Q09ProfitPartial { groups, profile })
 }
 
-#[allow(clippy::too_many_arguments, dead_code)]
-fn q09_profit_decimal_packed_dense_loop(
-    orderkey_values: &[i64],
-    partkey_values: &[i64],
-    suppkey_values: &[i64],
-    quantity_values: &[i128],
-    extendedprice_values: &[i128],
-    discount_values: &[i128],
-    discount_scale: f64,
-    revenue_scale: f64,
-    quantity_scale: f64,
-    dense_part_keys: &[bool],
-    dense_order_years: (&[i32], i64, i32),
-    supply_costs: &FastHashMap<u64, Q09SupplyInfo>,
-    collect_profile: bool,
-) -> Q09ProfitPartial {
-    q09_profit_decimal_packed_dense_loop_with_words(
-        orderkey_values,
-        partkey_values,
-        suppkey_values,
-        quantity_values,
-        extendedprice_values,
-        discount_values,
-        discount_scale,
-        revenue_scale,
-        quantity_scale,
-        dense_part_keys,
-        None,
-        dense_order_years,
-        supply_costs,
-        collect_profile,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn q09_profit_decimal_packed_dense_loop_with_words(
     orderkey_values: &[i64],
@@ -1790,7 +1803,7 @@ fn q09_profit_decimal_packed_dense_loop_with_words(
     quantity_scale: f64,
     dense_part_keys: &[bool],
     dense_part_words: Option<&[u64]>,
-    dense_order_years: (&[i32], i64, i32),
+    dense_order_years: Q09DenseOrderYears<'_>,
     supply_costs: &FastHashMap<u64, Q09SupplyInfo>,
     collect_profile: bool,
 ) -> Q09ProfitPartial {
@@ -1799,7 +1812,6 @@ fn q09_profit_decimal_packed_dense_loop_with_words(
     if collect_profile {
         profile.rows = partkey_values.len();
     }
-    let (order_year_values, order_year_base, order_year_missing) = dense_order_years;
     for row in 0..partkey_values.len() {
         let partkey = partkey_values[row];
         if let Some(words) = dense_part_words {
@@ -1819,18 +1831,9 @@ fn q09_profit_decimal_packed_dense_loop_with_words(
         }
 
         let orderkey = orderkey_values[row];
-        let Some(order_index) = orderkey
-            .checked_sub(order_year_base)
-            .and_then(|index| usize::try_from(index).ok())
-        else {
+        let Some(o_year) = dense_order_years.get(orderkey) else {
             continue;
         };
-        let Some(&o_year) = order_year_values.get(order_index) else {
-            continue;
-        };
-        if o_year == order_year_missing {
-            continue;
-        }
         if collect_profile {
             profile.order_hits += 1;
         }
@@ -1871,7 +1874,7 @@ fn q09_profit_decimal_i64_packed_dense_loop_with_words(
     quantity_scale: f64,
     dense_part_keys: &[bool],
     dense_part_words: Option<&[u64]>,
-    dense_order_years: (&[i32], i64, i32),
+    dense_order_years: Q09DenseOrderYears<'_>,
     supply_costs: &FastHashMap<u64, Q09SupplyInfo>,
     collect_profile: bool,
 ) -> Q09ProfitPartial {
@@ -1880,7 +1883,6 @@ fn q09_profit_decimal_i64_packed_dense_loop_with_words(
     if collect_profile {
         profile.rows = partkey_values.len();
     }
-    let (order_year_values, order_year_base, order_year_missing) = dense_order_years;
     for row in 0..partkey_values.len() {
         let partkey = partkey_values[row];
         if let Some(words) = dense_part_words {
@@ -1900,18 +1902,9 @@ fn q09_profit_decimal_i64_packed_dense_loop_with_words(
         }
 
         let orderkey = orderkey_values[row];
-        let Some(order_index) = orderkey
-            .checked_sub(order_year_base)
-            .and_then(|index| usize::try_from(index).ok())
-        else {
+        let Some(o_year) = dense_order_years.get(orderkey) else {
             continue;
         };
-        let Some(&o_year) = order_year_values.get(order_index) else {
-            continue;
-        };
-        if o_year == order_year_missing {
-            continue;
-        }
         if collect_profile {
             profile.order_hits += 1;
         }
@@ -2019,4 +2012,51 @@ fn q09_output(rows: Vec<Q09Row>) -> Result<QueryOutput> {
         metrics: AggregateMetrics::default(),
         batches: vec![batch],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn q09_order_years_compact_small_value_domain() {
+        let mut partial = Q09OrderYearPartial::new();
+        partial.push(100, 1992);
+        partial.push(102, 1998);
+
+        let years = q09_order_years_from_partials(vec![partial]);
+        let dense = years.dense_slice().expect("compact dense order years");
+        let Q09DenseOrderYears::Compact { values, .. } = dense else {
+            panic!("expected compact order years");
+        };
+        assert_eq!(values.len(), 3);
+        assert_eq!(years.get(100), Some(1992));
+        assert_eq!(years.get(101), None);
+        assert_eq!(years.get(102), Some(1998));
+    }
+
+    #[test]
+    fn q09_order_years_preserve_wide_value_domain() {
+        let mut partial = Q09OrderYearPartial::new();
+        partial.push(100, 1700);
+        partial.push(102, 2000);
+
+        let years = q09_order_years_from_partials(vec![partial]);
+        assert!(matches!(years, Q09OrderYears::Wide(_)));
+        assert!(years.dense_slice().is_some());
+        assert_eq!(years.get(100), Some(1700));
+        assert_eq!(years.get(102), Some(2000));
+    }
+
+    #[test]
+    fn q09_order_years_compact_hash_fallback_keeps_values() {
+        let mut partial = Q09OrderYearPartial::new();
+        partial.push(1, 1992);
+        partial.push(1_000_000, 1998);
+
+        let years = q09_order_years_from_partials(vec![partial]);
+        assert!(years.dense_slice().is_none());
+        assert_eq!(years.get(1), Some(1992));
+        assert_eq!(years.get(1_000_000), Some(1998));
+    }
 }

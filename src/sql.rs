@@ -50,7 +50,7 @@ use crate::cost::{
 };
 use crate::dense::{
     AdaptiveI64Map, AdaptiveI64Set, DenseAtomicU8, DenseI64BoolLookup, DenseI64F64Sum,
-    DenseI64I32Map, DenseI64RankMap, PackedU32PairDistinct, adaptive_dense_index,
+    DenseI64I32Map, DenseI64RankMap, DenseI64U8Map, PackedU32PairDistinct, adaptive_dense_index,
 };
 use crate::engine::{
     DirectPrimitiveBatchLocation, DodamEngine, JoinAlgorithm, JoinParquetRequest,
@@ -409,6 +409,7 @@ use window::try_execute_window_sql;
 use with_cte::try_execute_with_cte_sql;
 
 const DEFAULT_MAX_DENSE_I64_KEY: usize = 20_000_000;
+const DEFAULT_DENSE_F64_SUM_BYTES: usize = 512 * 1024 * 1024;
 const DEFAULT_ORDER_YEAR_DENSE_BYTES: usize = 3 * 1024 * 1024 * 1024;
 const MAX_SQL_EXTERNAL_JOIN_PARTITIONS: usize = 1024;
 

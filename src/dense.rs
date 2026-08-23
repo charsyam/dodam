@@ -932,6 +932,40 @@ impl DenseI64F64Sum {
         }
     }
 
+    pub(crate) fn try_reserve_dense_to(&mut self, max_key: usize, max_bytes: usize) -> bool {
+        if self.fallback.is_some() {
+            return false;
+        }
+        let Some(required_entries) = max_key.checked_add(1) else {
+            return false;
+        };
+        let Some(required_bytes) = required_entries.checked_mul(std::mem::size_of::<f64>()) else {
+            return false;
+        };
+        if required_bytes > max_bytes {
+            return false;
+        }
+        if required_entries > self.dense.len() {
+            let additional = required_entries - self.dense.len();
+            if self.dense.try_reserve_exact(additional).is_err() {
+                return false;
+            }
+            self.dense.resize(required_entries, 0.0);
+        }
+        true
+    }
+
+    pub(crate) fn try_add_dense_key(&mut self, key: i64, value: f64) -> bool {
+        let Ok(index) = usize::try_from(key) else {
+            return false;
+        };
+        if index >= self.dense.len() {
+            return false;
+        }
+        self.add_dense_index(index, value);
+        true
+    }
+
     pub(crate) fn has_fallback(&self) -> bool {
         self.fallback.is_some()
     }
@@ -982,15 +1016,18 @@ impl DenseI64F64Sum {
 }
 
 #[derive(Clone)]
-pub(crate) struct DenseI64I32Map {
-    dense: Vec<i32>,
+pub(crate) struct DenseI64Map<V> {
+    dense: Vec<V>,
     base_key: i64,
-    missing: i32,
-    fallback: Option<AdaptiveI64Map<i32>>,
+    missing: V,
+    fallback: Option<AdaptiveI64Map<V>>,
 }
 
-impl DenseI64I32Map {
-    pub(crate) fn new(missing: i32) -> Self {
+impl<V> DenseI64Map<V>
+where
+    V: Copy + Default + PartialEq,
+{
+    pub(crate) fn new(missing: V) -> Self {
         Self {
             dense: Vec::new(),
             base_key: 0,
@@ -1000,8 +1037,8 @@ impl DenseI64I32Map {
     }
 
     pub(crate) fn from_pairs_with_dense_range_policy(
-        pairs: Vec<(i64, i32)>,
-        missing: i32,
+        pairs: Vec<(i64, V)>,
+        missing: V,
         max_entries: usize,
         max_amplification: f64,
     ) -> Self {
@@ -1042,7 +1079,7 @@ impl DenseI64I32Map {
         map
     }
 
-    pub(crate) fn get(&self, key: i64) -> Option<i32> {
+    pub(crate) fn get(&self, key: i64) -> Option<V> {
         if let Some(fallback) = self.fallback.as_ref() {
             return fallback.get(key);
         }
@@ -1053,7 +1090,7 @@ impl DenseI64I32Map {
             .filter(|value| *value != self.missing)
     }
 
-    pub(crate) fn dense_slice(&self) -> Option<(&[i32], i64, i32)> {
+    pub(crate) fn dense_slice(&self) -> Option<(&[V], i64, V)> {
         self.fallback
             .is_none()
             .then_some((self.dense.as_slice(), self.base_key, self.missing))
@@ -1156,7 +1193,7 @@ impl DenseI64I32Map {
         true
     }
 
-    pub(crate) fn insert_dense_key(&mut self, key: i64, value: i32) {
+    pub(crate) fn insert_dense_key(&mut self, key: i64, value: V) {
         debug_assert!(self.fallback.is_none());
         if let Some(delta) = key.checked_sub(self.base_key)
             && let Ok(index) = usize::try_from(delta)
@@ -1166,7 +1203,7 @@ impl DenseI64I32Map {
         }
     }
 
-    pub(crate) fn fallback_mut(&mut self) -> Option<&mut AdaptiveI64Map<i32>> {
+    pub(crate) fn fallback_mut(&mut self) -> Option<&mut AdaptiveI64Map<V>> {
         self.fallback.as_mut()
     }
 
@@ -1174,7 +1211,7 @@ impl DenseI64I32Map {
         if self.fallback.is_some() {
             return;
         }
-        let mut fallback = AdaptiveI64Map::<i32>::new_dense();
+        let mut fallback = AdaptiveI64Map::<V>::new_dense();
         for (key, value) in self.dense.iter().copied().enumerate() {
             if value != self.missing {
                 fallback.insert(self.base_key + key as i64, value);
@@ -1184,6 +1221,9 @@ impl DenseI64I32Map {
         self.fallback = Some(fallback);
     }
 }
+
+pub(crate) type DenseI64I32Map = DenseI64Map<i32>;
+pub(crate) type DenseI64U8Map = DenseI64Map<u8>;
 
 pub(crate) fn dense_i64_range_within_amplification(
     min_key: i64,
@@ -1234,7 +1274,21 @@ pub(crate) fn adaptive_dense_index(key: i64, max_dense_key: usize) -> Option<usi
 
 #[cfg(test)]
 mod tests {
-    use super::{AdaptiveI64Set, DEFAULT_MAX_DENSE_I64_KEY, DenseI64RankMap};
+    use super::{
+        AdaptiveI64Set, DEFAULT_MAX_DENSE_I64_KEY, DenseI64F64Sum, DenseI64RankMap, DenseI64U8Map,
+    };
+
+    #[test]
+    fn dense_i64_f64_sum_respects_byte_budget() {
+        let mut sums = DenseI64F64Sum::new();
+        assert!(!sums.try_reserve_dense_to(8, 8 * std::mem::size_of::<f64>()));
+        assert!(sums.try_reserve_dense_to(7, 8 * std::mem::size_of::<f64>()));
+        assert!(sums.try_add_dense_key(7, 2.5));
+        assert!(!sums.try_add_dense_key(8, 1.0));
+
+        let values = sums.into_filtered_hash(|value| value != 0.0);
+        assert_eq!(values.get(&7), Some(&2.5));
+    }
 
     #[test]
     fn adaptive_i64_set_uses_its_bit_budget_beyond_dense_map_limit() {
@@ -1257,6 +1311,24 @@ mod tests {
         for key in [-1_i64, 0, 2, 63, 64, 66, 127, 128, 130, 131] {
             assert_eq!(set.contains(key), set.contains_cached(dense_contains, key));
         }
+    }
+
+    #[test]
+    fn dense_i64_u8_map_uses_value_width_for_dense_budget() {
+        let pairs = vec![(100_i64, 1_u8), (102, 7)];
+        let dense = DenseI64U8Map::from_pairs_with_dense_range_policy(pairs.clone(), 0, 3, 2.0);
+        let (values, base_key, missing) = dense.dense_slice().expect("dense u8 map");
+        assert_eq!(base_key, 100);
+        assert_eq!(missing, 0);
+        assert_eq!(values, &[1, 0, 7]);
+        assert_eq!(dense.get(100), Some(1));
+        assert_eq!(dense.get(101), None);
+        assert_eq!(dense.get(102), Some(7));
+
+        let fallback = DenseI64U8Map::from_pairs_with_dense_range_policy(pairs, 0, 2, 2.0);
+        assert!(fallback.dense_slice().is_none());
+        assert_eq!(fallback.get(100), Some(1));
+        assert_eq!(fallback.get(102), Some(7));
     }
 
     #[test]

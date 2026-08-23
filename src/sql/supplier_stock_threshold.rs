@@ -186,10 +186,10 @@ async fn stock_value_rows_for_suppliers_late(
     supplier_keys: &AdaptiveI64Set,
 ) -> Result<Option<Vec<SupplierStockValueRow>>> {
     let supplier_keys = Arc::new(supplier_keys.clone());
-    let max_dense_partkey = engine
+    let max_partkey = engine
         .parquet_i64_column_max(path.clone(), "ps_partkey")
         .await?
-        .and_then(|max_key| adaptive_dense_index(max_key, DEFAULT_MAX_DENSE_I64_KEY));
+        .and_then(|max_key| usize::try_from(max_key).ok());
     let Some(chunks) = engine
         .late_materialized_parquet_map_pruned_with_policy_view(
             path,
@@ -223,10 +223,13 @@ async fn stock_value_rows_for_suppliers_late(
         return Ok(None);
     };
     let mut dense_values = DenseI64F64Sum::new();
-    if let Some(max_partkey) = max_dense_partkey {
-        dense_values.reserve_dense_to(max_partkey);
-    }
-    let mut fallback_values = max_dense_partkey.is_none().then(fast_hash_map::<i64, f64>);
+    let has_dense_capacity = max_partkey.is_some_and(|max_partkey| {
+        dense_values.try_reserve_dense_to(
+            max_partkey,
+            dense_f64_sum_bytes(DEFAULT_DENSE_F64_SUM_BYTES),
+        )
+    });
+    let mut fallback_values = (!has_dense_capacity).then(fast_hash_map::<i64, f64>);
     let mut total = 0.0_f64;
     let mut metrics = LateMaterializedMetrics::default();
     for chunk in chunks {
@@ -238,7 +241,7 @@ async fn stock_value_rows_for_suppliers_late(
                 *values.entry(partkey).or_insert(0.0) += value;
                 continue;
             }
-            let Some(index) = adaptive_dense_index(partkey, DEFAULT_MAX_DENSE_I64_KEY) else {
+            if !dense_values.try_add_dense_key(partkey, value) {
                 let mut values = fast_hash_map::<i64, f64>();
                 for (key, value) in std::mem::replace(&mut dense_values, DenseI64F64Sum::new())
                     .into_filtered_hash(|_| true)
@@ -249,8 +252,7 @@ async fn stock_value_rows_for_suppliers_late(
                 let values = fallback_values.get_or_insert_with(fast_hash_map);
                 *values.entry(partkey).or_insert(0.0) += value;
                 continue;
-            };
-            dense_values.add_dense_index(index, value);
+            }
         }
     }
     stock_value_log_late_materialized_profile(
